@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"path/filepath"
+	"os"
 	"strconv"
 	"strings"
 
@@ -15,12 +16,14 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/deletion"
+	"go.kenn.io/msgvault/internal/gmail"
 	mcpserver "go.kenn.io/msgvault/internal/mcp"
 	"go.kenn.io/msgvault/internal/providercredentials"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/vector/visual"
 	"go.kenn.io/msgvault/pkg/client/generated"
+	"go.kenn.io/msgvault/internal/oauth"
 )
 
 var mcpForceSQL bool
@@ -93,6 +96,10 @@ Add to Claude Desktop config:
 			}
 		}
 
+		// Set up Gmail client factory for draft operations.
+		// If OAuth is not configured, draft tools are simply not exposed.
+		gmailFactory := buildGmailFactory(st)
+
 		// Derive from cmd.Context() so signal handling installed by
 		// the cobra root command (SIGINT/SIGTERM → ctx.Done()) reaches
 		// the MCP transport and can trigger ServeHTTPWithOptions's
@@ -121,6 +128,7 @@ Add to Claude Desktop config:
 		if mcpAllowSourceWrites {
 			opts.OperationWriteFamilies = append(opts.OperationWriteFamilies, mcpserver.OperationFamilySources)
 		}
+		opts.GmailFactory = gmailFactory
 
 		if httpAddr != "" {
 			return serveMCPHTTPWithOptions(ctx, opts, mcpserver.HTTPOptions{
@@ -520,6 +528,70 @@ func (s daemonMCPSimilarSearcher) FindSimilar(
 		},
 		Messages: resp.Messages,
 	}, nil
+}
+
+// buildGmailFactory returns a GmailClientFactory that creates authenticated
+// Gmail clients using OAuth tokens. Returns nil if OAuth is not configured.
+//
+// The stdio/HTTP mcp command talks to the daemon over a *daemonclient.Client
+// rather than a direct *store.Store, so account/OAuth-app lookups are resolved
+// through the daemon's CLI accounts API. OAuth tokens themselves live locally
+// (cfg.TokensDir()) and are read directly.
+func buildGmailFactory(st *daemonclient.Client) mcpserver.GmailClientFactory {
+	// Check if OAuth secrets are available
+	secretsPath, err := cfg.OAuth.ClientSecretsFor("")
+	if err != nil {
+		// OAuth not configured — draft tools will be disabled
+		fmt.Fprintf(os.Stderr, "Note: OAuth not configured, draft tools disabled\n")
+		return nil
+	}
+
+	return func(ctx context.Context, email string) (*gmail.Client, error) {
+		// Look up the account's OAuth app binding via the daemon.
+		accounts, err := st.GetCLIAccounts(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("lookup account %s: %w", email, err)
+		}
+		var appName string
+		found := false
+		for _, a := range accounts {
+			if a.Email == email {
+				appName = a.OAuthApp
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("account %s not found in database", email)
+		}
+
+		// Resolve the correct OAuth app for this account
+		appSecrets := secretsPath
+		if appName != "" {
+			appSecrets, err = cfg.OAuth.ClientSecretsFor(appName)
+			if err != nil {
+				return nil, fmt.Errorf("OAuth app %q: %w", appName, err)
+			}
+		}
+
+		oauthMgr, err := oauth.NewManager(appSecrets, cfg.TokensDir(), logger)
+		if err != nil {
+			return nil, fmt.Errorf("create OAuth manager: %w", err)
+		}
+
+		tokenSource, err := oauthMgr.TokenSource(ctx, email)
+		if err != nil {
+			return nil, fmt.Errorf("get token for %s: %w (run 'msgvault add-account %s' first)", email, err, email)
+		}
+
+		rateLimiter := gmail.NewRateLimiter(float64(cfg.Sync.RateLimitQPS))
+		client := gmail.NewClient(tokenSource,
+			gmail.WithLogger(logger),
+			gmail.WithRateLimiter(rateLimiter),
+		)
+
+		return client, nil
+	}
 }
 
 func init() {
