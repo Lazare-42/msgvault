@@ -41,12 +41,36 @@ type MessageDeleter interface {
 	BatchDeleteMessages(ctx context.Context, messageIDs []string) error
 }
 
+// DraftManager provides CRUD operations for Gmail drafts.
+type DraftManager interface {
+	// ListDrafts returns drafts matching the optional query.
+	ListDrafts(ctx context.Context, query string, maxResults int) ([]*Draft, error)
+
+	// GetDraft returns a single draft by ID.
+	GetDraft(ctx context.Context, draftID string) (*Draft, error)
+
+	// CreateDraft creates a new draft. If threadID is non-empty, the draft
+	// is created as a reply within that thread.
+	CreateDraft(ctx context.Context, draft *DraftCompose) (*Draft, error)
+
+	// UpdateDraft replaces the content of an existing draft.
+	UpdateDraft(ctx context.Context, draftID string, draft *DraftCompose) (*Draft, error)
+
+	// DeleteDraft permanently deletes a draft.
+	DeleteDraft(ctx context.Context, draftID string) error
+
+	// SendDraft sends a draft. The draft is removed from drafts and a
+	// message is created in the sent folder.
+	SendDraft(ctx context.Context, draftID string) (*SentMessage, error)
+}
+
 // API defines the interface for Gmail operations.
 // This interface enables mocking for tests without hitting the real API.
 type API interface {
 	AccountReader
 	MessageReader
 	MessageDeleter
+	DraftManager
 
 	// Close releases any resources held by the client.
 	Close() error
@@ -137,5 +161,43 @@ type HistoryMessage struct {
 // HistoryLabelChange represents a label change in history.
 type HistoryLabelChange struct {
 	Message  MessageID
+	LabelIDs []string
+}
+
+// Draft represents a Gmail draft with its message content.
+type Draft struct {
+	ID      string // Draft ID (used for update/send/delete)
+	Message DraftMessage
+}
+
+// DraftMessage contains the parsed fields of a draft's message.
+type DraftMessage struct {
+	ID       string // Message ID
+	ThreadID string
+	LabelIDs []string
+	Snippet  string
+	From     string
+	To       []string
+	Cc       []string
+	Bcc      []string
+	Subject  string
+	Body     string // Plain text body (or HTML if no plain text)
+	Date     int64  // Unix milliseconds
+}
+
+// DraftCompose holds the fields for creating or updating a draft.
+type DraftCompose struct {
+	To       []string
+	Cc       []string
+	Bcc      []string
+	Subject  string
+	Body     string // Plain text body
+	ThreadID string // Optional: set to reply within a thread
+}
+
+// SentMessage contains the result of sending a draft.
+type SentMessage struct {
+	ID       string
+	ThreadID string
 	LabelIDs []string
 }

@@ -258,6 +258,32 @@ func (m *MockAPI) Close() error {
 	return nil
 }
 
+// Draft stubs — MockAPI is primarily for sync testing; draft tests use real Client.
+
+func (m *MockAPI) ListDrafts(ctx context.Context, query string, maxResults int) ([]*Draft, error) {
+	return nil, nil
+}
+
+func (m *MockAPI) GetDraft(ctx context.Context, draftID string) (*Draft, error) {
+	return nil, &NotFoundError{Path: "/drafts/" + draftID}
+}
+
+func (m *MockAPI) CreateDraft(ctx context.Context, draft *DraftCompose) (*Draft, error) {
+	return &Draft{ID: "mock_draft_1"}, nil
+}
+
+func (m *MockAPI) UpdateDraft(ctx context.Context, draftID string, draft *DraftCompose) (*Draft, error) {
+	return &Draft{ID: draftID}, nil
+}
+
+func (m *MockAPI) DeleteDraft(ctx context.Context, draftID string) error {
+	return nil
+}
+
+func (m *MockAPI) SendDraft(ctx context.Context, draftID string) (*SentMessage, error) {
+	return &SentMessage{ID: "mock_sent_1", ThreadID: "mock_thread_1"}, nil
+}
+
 // getListThreadID returns the threadID to use in ListMessages for a given message ID.
 // Priority: ListThreadIDOverride > UseRawThreadID > default "thread_" + id.
 func (m *MockAPI) getListThreadID(id string) string {
