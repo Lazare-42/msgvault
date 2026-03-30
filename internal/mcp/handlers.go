@@ -17,6 +17,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/export"
+	"go.kenn.io/msgvault/internal/gmail"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/vector"
@@ -89,6 +90,7 @@ type handlers struct {
 	engine         query.Engine
 	attachmentsDir string
 	dataDir        string
+	gmailFactory GmailClientFactory
 
 	// Optional vector-search wiring. When hybridEngine is nil, the
 	// search_messages handler rejects mode=vector and mode=hybrid with
@@ -1154,4 +1156,278 @@ func (h *handlers) searchByDomains(ctx context.Context, req mcp.CallToolRequest)
 	}
 
 	return jsonResult(results)
+}
+
+// --- Draft handlers ---
+
+// getGmailClient resolves the account email and returns an authenticated Gmail client.
+// The caller must close the returned client.
+func (h *handlers) getGmailClient(ctx context.Context, args map[string]any) (*gmail.Client, string, error) {
+	if h.gmailFactory == nil {
+		return nil, "", fmt.Errorf("Gmail API not configured (OAuth credentials needed)")
+	}
+
+	account, _ := args["account"].(string)
+	if account == "" {
+		// If no account specified, try to use the first/only account
+		accounts, err := h.engine.ListAccounts(ctx)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to list accounts: %w", err)
+		}
+		if len(accounts) == 0 {
+			return nil, "", fmt.Errorf("no accounts configured")
+		}
+		if len(accounts) > 1 {
+			return nil, "", fmt.Errorf("multiple accounts configured, specify 'account' parameter (use get_stats to list accounts)")
+		}
+		account = accounts[0].Identifier
+	}
+
+	client, err := h.gmailFactory(ctx, account)
+	if err != nil {
+		return nil, "", fmt.Errorf("authenticate %s: %w", account, err)
+	}
+
+	return client, account, nil
+}
+
+func (h *handlers) listDrafts(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	client, _, err := h.getGmailClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	defer client.Close()
+
+	queryStr, _ := args["query"].(string)
+	limit := limitArg(args, "limit", 20)
+
+	drafts, err := client.ListDrafts(ctx, queryStr, limit)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("list drafts: %v", err)), nil
+	}
+
+	// Return a compact summary
+	type draftSummary struct {
+		DraftID string   `json:"draft_id"`
+		Subject string   `json:"subject"`
+		To      []string `json:"to,omitempty"`
+		Snippet string   `json:"snippet"`
+		BodyLen int      `json:"body_length"`
+	}
+
+	summaries := make([]draftSummary, len(drafts))
+	for i, d := range drafts {
+		summaries[i] = draftSummary{
+			DraftID: d.ID,
+			Subject: d.Message.Subject,
+			To:      d.Message.To,
+			Snippet: d.Message.Snippet,
+			BodyLen: len(d.Message.Body),
+		}
+	}
+
+	return jsonResult(summaries)
+}
+
+func (h *handlers) getDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	client, _, err := h.getGmailClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	defer client.Close()
+
+	draftID, _ := args["draft_id"].(string)
+	if draftID == "" {
+		return mcp.NewToolResultError("draft_id parameter is required"), nil
+	}
+
+	draft, err := client.GetDraft(ctx, draftID)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("get draft: %v", err)), nil
+	}
+
+	return jsonResult(draft)
+}
+
+func (h *handlers) createDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	client, _, err := h.getGmailClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	defer client.Close()
+
+	body, _ := args["body"].(string)
+	if body == "" {
+		return mcp.NewToolResultError("body parameter is required"), nil
+	}
+
+	compose := &gmail.DraftCompose{
+		Body: body,
+	}
+
+	if v, _ := args["to"].(string); v != "" {
+		compose.To = splitCSV(v)
+	}
+	if v, _ := args["cc"].(string); v != "" {
+		compose.Cc = splitCSV(v)
+	}
+	if v, _ := args["bcc"].(string); v != "" {
+		compose.Bcc = splitCSV(v)
+	}
+	if v, _ := args["subject"].(string); v != "" {
+		compose.Subject = v
+	}
+	if v, _ := args["thread_id"].(string); v != "" {
+		compose.ThreadID = v
+	}
+
+	draft, err := client.CreateDraft(ctx, compose)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("create draft: %v", err)), nil
+	}
+
+	resp := struct {
+		DraftID  string `json:"draft_id"`
+		Subject  string `json:"subject"`
+		NextStep string `json:"next_step"`
+	}{
+		DraftID:  draft.ID,
+		Subject:  draft.Message.Subject,
+		NextStep: "Use send_draft to send, update_draft to modify, or delete_draft to discard",
+	}
+
+	return jsonResult(resp)
+}
+
+func (h *handlers) updateDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	client, _, err := h.getGmailClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	defer client.Close()
+
+	draftID, _ := args["draft_id"].(string)
+	if draftID == "" {
+		return mcp.NewToolResultError("draft_id parameter is required"), nil
+	}
+
+	body, _ := args["body"].(string)
+	if body == "" {
+		return mcp.NewToolResultError("body parameter is required"), nil
+	}
+
+	compose := &gmail.DraftCompose{
+		Body: body,
+	}
+
+	if v, _ := args["to"].(string); v != "" {
+		compose.To = splitCSV(v)
+	}
+	if v, _ := args["cc"].(string); v != "" {
+		compose.Cc = splitCSV(v)
+	}
+	if v, _ := args["bcc"].(string); v != "" {
+		compose.Bcc = splitCSV(v)
+	}
+	if v, _ := args["subject"].(string); v != "" {
+		compose.Subject = v
+	}
+	if v, _ := args["thread_id"].(string); v != "" {
+		compose.ThreadID = v
+	}
+
+	draft, err := client.UpdateDraft(ctx, draftID, compose)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("update draft: %v", err)), nil
+	}
+
+	return jsonResult(struct {
+		DraftID string `json:"draft_id"`
+		Subject string `json:"subject"`
+		Status  string `json:"status"`
+	}{
+		DraftID: draft.ID,
+		Subject: draft.Message.Subject,
+		Status:  "updated",
+	})
+}
+
+func (h *handlers) deleteDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	client, _, err := h.getGmailClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	defer client.Close()
+
+	draftID, _ := args["draft_id"].(string)
+	if draftID == "" {
+		return mcp.NewToolResultError("draft_id parameter is required"), nil
+	}
+
+	if err := client.DeleteDraft(ctx, draftID); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("delete draft: %v", err)), nil
+	}
+
+	return jsonResult(struct {
+		DraftID string `json:"draft_id"`
+		Status  string `json:"status"`
+	}{
+		DraftID: draftID,
+		Status:  "deleted",
+	})
+}
+
+func (h *handlers) sendDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	client, _, err := h.getGmailClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	defer client.Close()
+
+	draftID, _ := args["draft_id"].(string)
+	if draftID == "" {
+		return mcp.NewToolResultError("draft_id parameter is required"), nil
+	}
+
+	sent, err := client.SendDraft(ctx, draftID)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("send draft: %v", err)), nil
+	}
+
+	return jsonResult(struct {
+		MessageID string   `json:"message_id"`
+		ThreadID  string   `json:"thread_id"`
+		LabelIDs  []string `json:"label_ids"`
+		Status    string   `json:"status"`
+	}{
+		MessageID: sent.ID,
+		ThreadID:  sent.ThreadID,
+		LabelIDs:  sent.LabelIDs,
+		Status:    "sent",
+	})
+}
+
+// splitCSV splits a comma-separated string into trimmed parts.
+func splitCSV(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }
