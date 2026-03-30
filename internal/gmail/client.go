@@ -762,12 +762,43 @@ func buildRFC822Message(d *DraftCompose) []byte {
 		fmt.Fprintf(&buf, "Bcc: %s\r\n", strings.Join(d.Bcc, ", "))
 	}
 	if d.Subject != "" {
-		fmt.Fprintf(&buf, "Subject: %s\r\n", d.Subject)
+		fmt.Fprintf(&buf, "Subject: %s\r\n", mimeEncodeHeader(d.Subject))
 	}
-	buf.WriteString("Content-Type: text/plain; charset=utf-8\r\n")
+	buf.WriteString("MIME-Version: 1.0\r\n")
+
+	ct := d.ContentType
+	if ct == "" {
+		ct = "text/plain"
+	}
+	fmt.Fprintf(&buf, "Content-Type: %s; charset=utf-8\r\n", ct)
+	buf.WriteString("Content-Transfer-Encoding: base64\r\n")
 	buf.WriteString("\r\n")
-	buf.WriteString(d.Body)
+
+	// Base64-encode the body to safely transport any UTF-8 content.
+	encoded := base64.StdEncoding.EncodeToString([]byte(d.Body))
+	// Wrap at 76 chars per RFC 2045.
+	for len(encoded) > 76 {
+		buf.WriteString(encoded[:76])
+		buf.WriteString("\r\n")
+		encoded = encoded[76:]
+	}
+	if len(encoded) > 0 {
+		buf.WriteString(encoded)
+		buf.WriteString("\r\n")
+	}
+
 	return buf.Bytes()
+}
+
+// mimeEncodeHeader encodes a header value using RFC 2047 encoded-word
+// if it contains non-ASCII characters. ASCII-only values are returned as-is.
+func mimeEncodeHeader(s string) string {
+	for i := 0; i < len(s); i++ {
+		if s[i] > 127 {
+			return "=?utf-8?B?" + base64.StdEncoding.EncodeToString([]byte(s)) + "?="
+		}
+	}
+	return s
 }
 
 // ListDrafts returns drafts matching the optional query.
