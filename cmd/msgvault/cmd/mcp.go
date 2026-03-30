@@ -6,7 +6,9 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+	"github.com/wesm/msgvault/internal/gmail"
 	mcpserver "github.com/wesm/msgvault/internal/mcp"
+	"github.com/wesm/msgvault/internal/oauth"
 	"github.com/wesm/msgvault/internal/query"
 	"github.com/wesm/msgvault/internal/store"
 )
@@ -21,7 +23,8 @@ var mcpCmd = &cobra.Command{
 
 This allows Claude Desktop (or any MCP client) to query your email archive
 using tools like search_messages, get_message, list_messages, get_stats,
-aggregate, and stage_deletion.
+aggregate, stage_deletion, and draft management (list, create, update, send,
+delete drafts).
 
 Add to Claude Desktop config:
   {
@@ -82,6 +85,11 @@ Add to Claude Desktop config:
 			engine = query.NewSQLiteEngine(s.DB())
 		}
 
+		// Set up Gmail client factory for draft operations.
+		// If OAuth is not configured, draft tools are simply not exposed.
+		var gmailFactory mcpserver.GmailClientFactory
+		gmailFactory = buildGmailFactory(s)
+
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
@@ -105,6 +113,7 @@ Add to Claude Desktop config:
 			Engine:         engine,
 			AttachmentsDir: cfg.AttachmentsDir(),
 			DataDir:        cfg.Data.DataDir,
+			GmailFactory:   gmailFactory,
 		}
 		if vf != nil {
 			opts.HybridEngine = vf.HybridEngine
@@ -113,6 +122,57 @@ Add to Claude Desktop config:
 		}
 		return mcpserver.ServeWithOptions(ctx, opts)
 	},
+}
+
+// buildGmailFactory returns a GmailClientFactory that creates authenticated
+// Gmail clients using OAuth tokens. Returns nil if OAuth is not configured.
+func buildGmailFactory(s *store.Store) mcpserver.GmailClientFactory {
+	// Check if OAuth secrets are available
+	secretsPath, err := cfg.OAuth.ClientSecretsFor("")
+	if err != nil {
+		// OAuth not configured — draft tools will be disabled
+		fmt.Fprintf(os.Stderr, "Note: OAuth not configured, draft tools disabled\n")
+		return nil
+	}
+
+	return func(ctx context.Context, email string) (*gmail.Client, error) {
+		// Look up the account's OAuth app binding
+		src, err := s.GetSourceByIdentifier(email)
+		if err != nil {
+			return nil, fmt.Errorf("lookup account %s: %w", email, err)
+		}
+		if src == nil {
+			return nil, fmt.Errorf("account %s not found in database", email)
+		}
+
+		// Resolve the correct OAuth app for this account
+		appName := sourceOAuthApp(src)
+		appSecrets := secretsPath
+		if appName != "" {
+			appSecrets, err = cfg.OAuth.ClientSecretsFor(appName)
+			if err != nil {
+				return nil, fmt.Errorf("OAuth app %q: %w", appName, err)
+			}
+		}
+
+		oauthMgr, err := oauth.NewManager(appSecrets, cfg.TokensDir(), logger)
+		if err != nil {
+			return nil, fmt.Errorf("create OAuth manager: %w", err)
+		}
+
+		tokenSource, err := oauthMgr.TokenSource(ctx, email)
+		if err != nil {
+			return nil, fmt.Errorf("get token for %s: %w (run 'msgvault add-account %s' first)", email, err, email)
+		}
+
+		rateLimiter := gmail.NewRateLimiter(float64(cfg.Sync.RateLimitQPS))
+		client := gmail.NewClient(tokenSource,
+			gmail.WithLogger(logger),
+			gmail.WithRateLimiter(rateLimiter),
+		)
+
+		return client, nil
+	}
 }
 
 func init() {

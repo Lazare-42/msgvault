@@ -25,12 +25,20 @@ const (
 	OpMessagesDelete                       // 10 units
 	OpMessagesBatchDelete                  // 50 units
 	OpProfile                              // 1 unit
+	OpDraftsList                           // 5 units
+	OpDraftsGet                            // 5 units
+	OpDraftsCreate                         // 5 units
+	OpDraftsUpdate                         // 5 units
+	OpDraftsDelete                         // 5 units
+	OpDraftsSend                           // 5 units
 )
 
 // Cost returns the quota cost for an operation.
 func (o Operation) Cost() int {
 	switch o {
 	case OpMessagesGet, OpMessagesGetRaw, OpMessagesList, OpMessagesTrash:
+		return 5
+	case OpDraftsList, OpDraftsGet, OpDraftsCreate, OpDraftsUpdate, OpDraftsDelete, OpDraftsSend:
 		return 5
 	case OpMessagesDelete:
 		return 10

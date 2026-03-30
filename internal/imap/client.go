@@ -951,3 +951,29 @@ func (c *Client) Close() error {
 	c.selectedMailbox = ""
 	return conn.Logout().Wait()
 }
+
+// Draft stubs — IMAP does not support Gmail draft operations.
+
+func (c *Client) ListDrafts(_ context.Context, _ string, _ int) ([]*gmailapi.Draft, error) {
+	return nil, fmt.Errorf("IMAP does not support Gmail draft operations")
+}
+
+func (c *Client) GetDraft(_ context.Context, _ string) (*gmailapi.Draft, error) {
+	return nil, fmt.Errorf("IMAP does not support Gmail draft operations")
+}
+
+func (c *Client) CreateDraft(_ context.Context, _ *gmailapi.DraftCompose) (*gmailapi.Draft, error) {
+	return nil, fmt.Errorf("IMAP does not support Gmail draft operations")
+}
+
+func (c *Client) UpdateDraft(_ context.Context, _ string, _ *gmailapi.DraftCompose) (*gmailapi.Draft, error) {
+	return nil, fmt.Errorf("IMAP does not support Gmail draft operations")
+}
+
+func (c *Client) DeleteDraft(_ context.Context, _ string) error {
+	return fmt.Errorf("IMAP does not support Gmail draft operations")
+}
+
+func (c *Client) SendDraft(_ context.Context, _ string) (*gmailapi.SentMessage, error) {
+	return nil, fmt.Errorf("IMAP does not support Gmail draft operations")
+}

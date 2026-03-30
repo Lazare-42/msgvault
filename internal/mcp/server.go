@@ -6,10 +6,16 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/wesm/msgvault/internal/gmail"
 	"github.com/wesm/msgvault/internal/query"
 	"github.com/wesm/msgvault/internal/vector"
 	"github.com/wesm/msgvault/internal/vector/hybrid"
 )
+
+// GmailClientFactory creates authenticated Gmail API clients for a given
+// account email. Returns nil if Gmail draft operations are not available
+// (e.g., OAuth not configured). The caller is responsible for closing the client.
+type GmailClientFactory func(ctx context.Context, email string) (*gmail.Client, error)
 
 // Tool name constants.
 const (
@@ -22,6 +28,12 @@ const (
 	ToolAggregate           = "aggregate"
 	ToolStageDeletion       = "stage_deletion"
 	ToolFindSimilarMessages = "find_similar_messages"
+	ToolListDrafts          = "list_drafts"
+	ToolGetDraft            = "get_draft"
+	ToolCreateDraft         = "create_draft"
+	ToolUpdateDraft         = "update_draft"
+	ToolDeleteDraft         = "delete_draft"
+	ToolSendDraft           = "send_draft"
 )
 
 // Common argument helpers for recurring tool option definitions.
@@ -78,6 +90,8 @@ type ServeOptions struct {
 	// Backend is optional. When nil, find_similar_messages rejects all
 	// calls with a vector_not_enabled error.
 	Backend vector.Backend
+	// GmailFactory is optional. When non-nil, draft management tools are exposed.
+	GmailFactory GmailClientFactory
 }
 
 // Serve creates an MCP server with email archive tools and serves over stdio.
@@ -87,11 +101,12 @@ type ServeOptions struct {
 // Serve is a thin wrapper around ServeWithOptions that leaves the vector
 // fields empty; callers that want vector/hybrid search should use
 // ServeWithOptions directly.
-func Serve(ctx context.Context, engine query.Engine, attachmentsDir, dataDir string) error {
+func Serve(ctx context.Context, engine query.Engine, attachmentsDir, dataDir string, gmailFactory GmailClientFactory) error {
 	return ServeWithOptions(ctx, ServeOptions{
 		Engine:         engine,
 		AttachmentsDir: attachmentsDir,
 		DataDir:        dataDir,
+		GmailFactory:   gmailFactory,
 	})
 }
 
@@ -111,6 +126,7 @@ func ServeWithOptions(ctx context.Context, opts ServeOptions) error {
 		hybridEngine:   opts.HybridEngine,
 		vectorCfg:      opts.VectorCfg,
 		backend:        opts.Backend,
+		gmailFactory:   opts.GmailFactory,
 	}
 
 	vectorAvailable := opts.HybridEngine != nil
@@ -124,6 +140,15 @@ func ServeWithOptions(ctx context.Context, opts ServeOptions) error {
 	s.AddTool(stageDeletionTool(), h.stageDeletion)
 	if opts.Backend != nil {
 		s.AddTool(findSimilarMessagesTool(), h.findSimilarMessages)
+	}
+
+	if opts.GmailFactory != nil {
+		s.AddTool(listDraftsTool(), h.listDrafts)
+		s.AddTool(getDraftTool(), h.getDraft)
+		s.AddTool(createDraftTool(), h.createDraft)
+		s.AddTool(updateDraftTool(), h.updateDraft)
+		s.AddTool(deleteDraftTool(), h.deleteDraft)
+		s.AddTool(sendDraftTool(), h.sendDraft)
 	}
 
 	stdio := server.NewStdioServer(s)
@@ -288,6 +313,108 @@ func findSimilarMessagesTool() mcp.Tool {
 		withBefore(),
 		mcp.WithBoolean("has_attachment",
 			mcp.Description("Only messages with attachments"),
+		),
+	)
+}
+
+func listDraftsTool() mcp.Tool {
+	return mcp.NewTool(ToolListDrafts,
+		mcp.WithDescription("List email drafts from Gmail. Returns draft ID, subject, recipients, and body preview for each draft."),
+		mcp.WithReadOnlyHintAnnotation(true),
+		withAccount(),
+		mcp.WithString("query",
+			mcp.Description("Optional Gmail-style search query to filter drafts (e.g. 'subject:meeting')"),
+		),
+		withLimit("20"),
+	)
+}
+
+func getDraftTool() mcp.Tool {
+	return mcp.NewTool(ToolGetDraft,
+		mcp.WithDescription("Get full details of a single Gmail draft by draft ID, including body text, recipients, and subject."),
+		mcp.WithReadOnlyHintAnnotation(true),
+		withAccount(),
+		mcp.WithString("draft_id",
+			mcp.Required(),
+			mcp.Description("Draft ID (from list_drafts response)"),
+		),
+	)
+}
+
+func createDraftTool() mcp.Tool {
+	return mcp.NewTool(ToolCreateDraft,
+		mcp.WithDescription("Create a new email draft in Gmail. The draft is saved but NOT sent. Use send_draft to send it."),
+		withAccount(),
+		mcp.WithString("to",
+			mcp.Description("Recipient email address(es), comma-separated"),
+		),
+		mcp.WithString("cc",
+			mcp.Description("CC recipients, comma-separated"),
+		),
+		mcp.WithString("bcc",
+			mcp.Description("BCC recipients, comma-separated"),
+		),
+		mcp.WithString("subject",
+			mcp.Description("Email subject line"),
+		),
+		mcp.WithString("body",
+			mcp.Required(),
+			mcp.Description("Email body (plain text)"),
+		),
+		mcp.WithString("thread_id",
+			mcp.Description("Thread ID to create a reply draft within an existing thread"),
+		),
+	)
+}
+
+func updateDraftTool() mcp.Tool {
+	return mcp.NewTool(ToolUpdateDraft,
+		mcp.WithDescription("Update an existing Gmail draft. Replaces the entire draft content."),
+		withAccount(),
+		mcp.WithString("draft_id",
+			mcp.Required(),
+			mcp.Description("Draft ID to update (from list_drafts response)"),
+		),
+		mcp.WithString("to",
+			mcp.Description("Recipient email address(es), comma-separated"),
+		),
+		mcp.WithString("cc",
+			mcp.Description("CC recipients, comma-separated"),
+		),
+		mcp.WithString("bcc",
+			mcp.Description("BCC recipients, comma-separated"),
+		),
+		mcp.WithString("subject",
+			mcp.Description("Email subject line"),
+		),
+		mcp.WithString("body",
+			mcp.Required(),
+			mcp.Description("Email body (plain text)"),
+		),
+		mcp.WithString("thread_id",
+			mcp.Description("Thread ID for reply drafts"),
+		),
+	)
+}
+
+func deleteDraftTool() mcp.Tool {
+	return mcp.NewTool(ToolDeleteDraft,
+		mcp.WithDescription("Permanently delete a Gmail draft."),
+		withAccount(),
+		mcp.WithString("draft_id",
+			mcp.Required(),
+			mcp.Description("Draft ID to delete"),
+		),
+	)
+}
+
+func sendDraftTool() mcp.Tool {
+	return mcp.NewTool(ToolSendDraft,
+		mcp.WithDescription("Send an existing Gmail draft. The draft is removed and a sent message is created. This action cannot be undone."),
+		withAccount(),
+		mcp.WithString("draft_id",
+			mcp.Required(),
+			mcp.Description("Draft ID to send"),
 		),
 	)
 }
