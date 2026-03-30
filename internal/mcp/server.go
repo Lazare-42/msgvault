@@ -39,6 +39,9 @@ const (
 	ToolUpdateDraft         = "update_draft"
 	ToolDeleteDraft         = "delete_draft"
 	ToolSendDraft           = "send_draft"
+	ToolModifyLabels        = "modify_labels"
+	ToolCreateLabel         = "create_label"
+	ToolListGmailLabels     = "list_gmail_labels"
 )
 
 // search_messages mode values (wire format).
@@ -146,6 +149,9 @@ func newMCPServer(opts ServeOptions) *server.MCPServer {
 		s.AddTool(updateDraftTool(), h.updateDraft)
 		s.AddTool(deleteDraftTool(), h.deleteDraft)
 		s.AddTool(sendDraftTool(), h.sendDraft)
+		s.AddTool(modifyLabelsTool(), h.modifyLabels)
+		s.AddTool(createLabelTool(), h.createLabel)
+		s.AddTool(listGmailLabelsTool(), h.listGmailLabels)
 	}
 
 	return s
@@ -497,5 +503,41 @@ func sendDraftTool() mcp.Tool {
 			mcp.Required(),
 			mcp.Description("Draft ID to send"),
 		),
+	)
+}
+
+func modifyLabelsTool() mcp.Tool {
+	return mcp.NewTool(ToolModifyLabels,
+		mcp.WithDescription("Add and/or remove Gmail labels on messages. Use this to label, archive (remove INBOX), mark read (remove UNREAD), star, or categorize messages. Provide Gmail message IDs (from search_messages source_message_id field). Use list_gmail_labels to find label IDs."),
+		withAccount(),
+		mcp.WithString("message_ids",
+			mcp.Required(),
+			mcp.Description("Comma-separated Gmail message IDs (the source_message_id from search results, NOT the archive numeric ID)"),
+		),
+		mcp.WithString("add_labels",
+			mcp.Description("Comma-separated label IDs to add (e.g. 'STARRED,Label_123')"),
+		),
+		mcp.WithString("remove_labels",
+			mcp.Description("Comma-separated label IDs to remove (e.g. 'INBOX,UNREAD'). Remove INBOX to archive."),
+		),
+	)
+}
+
+func createLabelTool() mcp.Tool {
+	return mcp.NewTool(ToolCreateLabel,
+		mcp.WithDescription("Create a new Gmail label. Returns the label ID which can be used with modify_labels."),
+		withAccount(),
+		mcp.WithString("name",
+			mcp.Required(),
+			mcp.Description("Label name. Use '/' for nesting (e.g. 'Projects/Acme')"),
+		),
+	)
+}
+
+func listGmailLabelsTool() mcp.Tool {
+	return mcp.NewTool(ToolListGmailLabels,
+		mcp.WithDescription("List all Gmail labels from the live account (not the archive). Returns label IDs and names for use with modify_labels."),
+		mcp.WithReadOnlyHintAnnotation(true),
+		withAccount(),
 	)
 }

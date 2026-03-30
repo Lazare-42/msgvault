@@ -64,6 +64,18 @@ type DraftManager interface {
 	SendDraft(ctx context.Context, draftID string) (*SentMessage, error)
 }
 
+// LabelManager provides operations for modifying Gmail labels on messages.
+type LabelManager interface {
+	// ModifyMessageLabels adds and/or removes labels on a single message.
+	ModifyMessageLabels(ctx context.Context, messageID string, addLabelIDs, removeLabelIDs []string) error
+
+	// BatchModifyLabels adds and/or removes labels on multiple messages (max 1000).
+	BatchModifyLabels(ctx context.Context, messageIDs, addLabelIDs, removeLabelIDs []string) error
+
+	// CreateLabel creates a new user label and returns it.
+	CreateLabel(ctx context.Context, name string) (*Label, error)
+}
+
 // API defines the interface for Gmail operations.
 // This interface enables mocking for tests without hitting the real API.
 type API interface {
@@ -71,6 +83,7 @@ type API interface {
 	MessageReader
 	MessageDeleter
 	DraftManager
+	LabelManager
 
 	// Close releases any resources held by the client.
 	Close() error
