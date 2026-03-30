@@ -942,5 +942,95 @@ func (c *Client) SendDraft(ctx context.Context, draftID string) (*SentMessage, e
 	}, nil
 }
 
+// --- Label operations ---
+
+// ModifyMessageLabels adds and/or removes labels on a single message.
+func (c *Client) ModifyMessageLabels(ctx context.Context, messageID string, addLabelIDs, removeLabelIDs []string) error {
+	body := struct {
+		AddLabelIDs    []string `json:"addLabelIds,omitempty"`
+		RemoveLabelIDs []string `json:"removeLabelIds,omitempty"`
+	}{
+		AddLabelIDs:    addLabelIDs,
+		RemoveLabelIDs: removeLabelIDs,
+	}
+
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshal modify: %w", err)
+	}
+
+	path := fmt.Sprintf("/users/%s/messages/%s/modify", c.userID, messageID)
+	_, err = c.request(ctx, OpModifyLabels, "POST", path, bodyBytes)
+	return err
+}
+
+// BatchModifyLabels adds and/or removes labels on multiple messages (max 1000).
+func (c *Client) BatchModifyLabels(ctx context.Context, messageIDs, addLabelIDs, removeLabelIDs []string) error {
+	if len(messageIDs) == 0 {
+		return nil
+	}
+	if len(messageIDs) > 1000 {
+		return fmt.Errorf("batch modify limited to 1000 messages, got %d", len(messageIDs))
+	}
+
+	body := struct {
+		IDs            []string `json:"ids"`
+		AddLabelIDs    []string `json:"addLabelIds,omitempty"`
+		RemoveLabelIDs []string `json:"removeLabelIds,omitempty"`
+	}{
+		IDs:            messageIDs,
+		AddLabelIDs:    addLabelIDs,
+		RemoveLabelIDs: removeLabelIDs,
+	}
+
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshal batch modify: %w", err)
+	}
+
+	path := fmt.Sprintf("/users/%s/messages/batchModify", c.userID)
+	_, err = c.request(ctx, OpBatchModifyLabels, "POST", path, bodyBytes)
+	return err
+}
+
+// CreateLabel creates a new user label.
+func (c *Client) CreateLabel(ctx context.Context, name string) (*Label, error) {
+	body := struct {
+		Name                  string `json:"name"`
+		MessageListVisibility string `json:"messageListVisibility"`
+		LabelListVisibility   string `json:"labelListVisibility"`
+	}{
+		Name:                  name,
+		MessageListVisibility: "show",
+		LabelListVisibility:   "labelShow",
+	}
+
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal label: %w", err)
+	}
+
+	path := fmt.Sprintf("/users/%s/labels", c.userID)
+	data, err := c.request(ctx, OpCreateLabel, "POST", path, bodyBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp gmailLabel
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("parse label: %w", err)
+	}
+
+	return &Label{
+		ID:                    resp.ID,
+		Name:                  resp.Name,
+		Type:                  resp.Type,
+		MessagesTotal:         resp.MessagesTotal,
+		MessagesUnread:        resp.MessagesUnread,
+		MessageListVisibility: resp.MessageListVisibility,
+		LabelListVisibility:   resp.LabelListVisibility,
+	}, nil
+}
+
 // Ensure Client implements API interface.
 var _ API = (*Client)(nil)

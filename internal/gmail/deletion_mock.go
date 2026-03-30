@@ -324,5 +324,19 @@ func (m *DeletionMockAPI) SendDraft(ctx context.Context, draftID string) (*SentM
 	panic("DeletionMockAPI.SendDraft not implemented")
 }
 
+// Label stubs — DeletionMockAPI is only for deletion testing.
+
+func (m *DeletionMockAPI) ModifyMessageLabels(ctx context.Context, messageID string, addLabelIDs, removeLabelIDs []string) error {
+	panic("DeletionMockAPI.ModifyMessageLabels not implemented")
+}
+
+func (m *DeletionMockAPI) BatchModifyLabels(ctx context.Context, messageIDs, addLabelIDs, removeLabelIDs []string) error {
+	panic("DeletionMockAPI.BatchModifyLabels not implemented")
+}
+
+func (m *DeletionMockAPI) CreateLabel(ctx context.Context, name string) (*Label, error) {
+	panic("DeletionMockAPI.CreateLabel not implemented")
+}
+
 // Ensure DeletionMockAPI implements API interface.
 var _ API = (*DeletionMockAPI)(nil)

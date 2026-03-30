@@ -33,6 +33,10 @@ const (
 	OpDraftsDelete // 5 units
 	OpDraftsSend   // 5 units
 
+	OpModifyLabels      // 5 units
+	OpBatchModifyLabels // 5 units
+	OpCreateLabel       // 5 units
+
 	// OpCalendarListList and the other Calendar API operations live on this
 	// shared Operation enum (rather than a parallel one in internal/gcal) so
 	// the Calendar client can reuse this package's token-bucket limiter and
@@ -50,7 +54,8 @@ func (o Operation) Cost() int {
 	switch o {
 	case OpMessagesGet, OpMessagesGetRaw, OpMessagesList, OpMessagesTrash:
 		return 5
-	case OpDraftsList, OpDraftsGet, OpDraftsCreate, OpDraftsUpdate, OpDraftsDelete, OpDraftsSend:
+	case OpDraftsList, OpDraftsGet, OpDraftsCreate, OpDraftsUpdate, OpDraftsDelete, OpDraftsSend,
+		OpModifyLabels, OpBatchModifyLabels, OpCreateLabel:
 		return 5
 	case OpMessagesDelete:
 		return 10

@@ -284,6 +284,20 @@ func (m *MockAPI) SendDraft(ctx context.Context, draftID string) (*SentMessage, 
 	return &SentMessage{ID: "mock_sent_1", ThreadID: "mock_thread_1"}, nil
 }
 
+// Label stubs — MockAPI is primarily for sync testing.
+
+func (m *MockAPI) ModifyMessageLabels(ctx context.Context, messageID string, addLabelIDs, removeLabelIDs []string) error {
+	return nil
+}
+
+func (m *MockAPI) BatchModifyLabels(ctx context.Context, messageIDs, addLabelIDs, removeLabelIDs []string) error {
+	return nil
+}
+
+func (m *MockAPI) CreateLabel(ctx context.Context, name string) (*Label, error) {
+	return &Label{ID: "Label_mock", Name: name, Type: "user"}, nil
+}
+
 // getListThreadID returns the threadID to use in ListMessages for a given message ID.
 // Priority: ListThreadIDOverride > UseRawThreadID > default "thread_" + id.
 func (m *MockAPI) getListThreadID(id string) string {

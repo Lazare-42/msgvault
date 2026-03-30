@@ -2252,6 +2252,94 @@ func (h *handlers) sendDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	})
 }
 
+// --- Label handlers ---
+
+func (h *handlers) modifyLabels(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	client, _, err := h.getGmailClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	defer client.Close()
+
+	messageIDsStr, _ := args["message_ids"].(string)
+	if messageIDsStr == "" {
+		return mcp.NewToolResultError("message_ids parameter is required"), nil
+	}
+
+	addLabelsStr, _ := args["add_labels"].(string)
+	removeLabelsStr, _ := args["remove_labels"].(string)
+
+	if addLabelsStr == "" && removeLabelsStr == "" {
+		return mcp.NewToolResultError("at least one of add_labels or remove_labels is required"), nil
+	}
+
+	messageIDs := splitCSV(messageIDsStr)
+	addLabelIDs := splitCSV(addLabelsStr)
+	removeLabelIDs := splitCSV(removeLabelsStr)
+
+	if len(messageIDs) > 1 {
+		err = client.BatchModifyLabels(ctx, messageIDs, addLabelIDs, removeLabelIDs)
+	} else {
+		err = client.ModifyMessageLabels(ctx, messageIDs[0], addLabelIDs, removeLabelIDs)
+	}
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("modify labels: %v", err)), nil
+	}
+
+	return jsonResult(struct {
+		MessageCount int      `json:"message_count"`
+		Added        []string `json:"added_labels,omitempty"`
+		Removed      []string `json:"removed_labels,omitempty"`
+		Status       string   `json:"status"`
+	}{
+		MessageCount: len(messageIDs),
+		Added:        addLabelIDs,
+		Removed:      removeLabelIDs,
+		Status:       "modified",
+	})
+}
+
+func (h *handlers) createLabel(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	client, _, err := h.getGmailClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	defer client.Close()
+
+	name, _ := args["name"].(string)
+	if name == "" {
+		return mcp.NewToolResultError("name parameter is required"), nil
+	}
+
+	label, err := client.CreateLabel(ctx, name)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("create label: %v", err)), nil
+	}
+
+	return jsonResult(label)
+}
+
+func (h *handlers) listGmailLabels(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	client, _, err := h.getGmailClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	defer client.Close()
+
+	labels, err := client.ListLabels(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("list labels: %v", err)), nil
+	}
+
+	return jsonResult(labels)
+}
+
 // splitCSV splits a comma-separated string into trimmed parts.
 func splitCSV(s string) []string {
 	parts := strings.Split(s, ",")
