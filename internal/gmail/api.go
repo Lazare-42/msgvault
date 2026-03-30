@@ -191,12 +191,13 @@ type DraftMessage struct {
 
 // DraftCompose holds the fields for creating or updating a draft.
 type DraftCompose struct {
-	To       []string
-	Cc       []string
-	Bcc      []string
-	Subject  string
-	Body     string // Plain text body
-	ThreadID string // Optional: set to reply within a thread
+	To          []string
+	Cc          []string
+	Bcc         []string
+	Subject     string
+	Body        string // Email body (plain text or HTML)
+	ContentType string // "text/plain" (default) or "text/html"
+	ThreadID    string // Optional: set to reply within a thread
 }
 
 // SentMessage contains the result of sending a draft.
