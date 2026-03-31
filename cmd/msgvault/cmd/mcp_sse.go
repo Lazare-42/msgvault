@@ -3,79 +3,60 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/spf13/cobra"
 	mcpserver "github.com/wesm/msgvault/internal/mcp"
-	"github.com/wesm/msgvault/internal/query"
-	"github.com/wesm/msgvault/internal/store"
 )
 
-var mcpSSEAddr string
-var mcpSSEForceSQL bool
-var mcpSSENoSQLiteScanner bool
+var mcpHTTPAddr string
+var mcpHTTPForceSQL bool
+var mcpHTTPNoSQLiteScanner bool
+var mcpHTTPAPIKey string
+var mcpHTTPAllowInsecure bool
 
 var mcpSSECmd = &cobra.Command{
 	Use:   "mcp-sse",
-	Short: "Run MCP server over SSE/HTTP for remote clients",
-	Long: `Start an MCP (Model Context Protocol) server over SSE (Server-Sent Events).
+	Short: "Run MCP server over HTTP for remote clients",
+	Long: `Start an MCP (Model Context Protocol) server over Streamable HTTP.
 
 This allows remote MCP clients to connect over HTTP instead of stdio,
 suitable for containerized deployments (e.g., Kubernetes).
 
-Clients connect to http://<addr>/sse for the SSE event stream.
+Clients connect to http://<addr>/mcp for the Streamable HTTP endpoint.
+
+Security: When listening on a non-loopback address, an --api-key is required
+unless --allow-insecure is set. Use SSH port-forwarding as an alternative.
 
 Example Claude Desktop config (with port-forward):
   {
     "mcpServers": {
       "msgvault": {
-        "url": "http://localhost:8080/sse"
+        "url": "http://localhost:8080/mcp"
       }
     }
   }`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		dbPath := cfg.DatabaseDSN()
-		s, err := store.Open(dbPath)
+		// Validate security: require API key for non-loopback addresses
+		host, _, _ := net.SplitHostPort(mcpHTTPAddr)
+		ip := net.ParseIP(host)
+		isLoopback := host == "" || host == "localhost" || (ip != nil && ip.IsLoopback())
+		if !isLoopback && mcpHTTPAPIKey == "" && !mcpHTTPAllowInsecure {
+			return fmt.Errorf("refusing to start: bind address %q is not loopback and no --api-key is set\n\n"+
+				"Set --api-key <key>, or --allow-insecure to override", mcpHTTPAddr)
+		}
+		if !isLoopback && mcpHTTPAPIKey == "" {
+			fmt.Fprintf(os.Stderr, "WARNING: MCP HTTP server listening on %s with no authentication\n", mcpHTTPAddr)
+		}
+
+		env, err := setupMCPEnv(mcpHTTPForceSQL, mcpHTTPNoSQLiteScanner)
 		if err != nil {
-			return fmt.Errorf("open database: %w", err)
+			return err
 		}
-		defer s.Close()
-
-		if err := s.InitSchema(); err != nil {
-			return fmt.Errorf("init schema: %w", err)
-		}
-
-		if s.NeedsFTSBackfill() {
-			go func() {
-				_, _ = s.BackfillFTS(nil)
-			}()
-		}
-
-		var engine query.Engine
-		analyticsDir := cfg.AnalyticsDir()
-
-		if !mcpSSEForceSQL && query.HasCompleteParquetData(analyticsDir) {
-			var duckOpts query.DuckDBOptions
-			if mcpSSENoSQLiteScanner {
-				duckOpts.DisableSQLiteScanner = true
-			}
-			duckEngine, err := query.NewDuckDBEngine(analyticsDir, dbPath, s.DB(), duckOpts)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: Failed to open Parquet engine: %v\n", err)
-				fmt.Fprintf(os.Stderr, "Falling back to SQLite\n")
-				engine = query.NewSQLiteEngine(s.DB())
-			} else {
-				engine = duckEngine
-				defer duckEngine.Close()
-			}
-		} else {
-			engine = query.NewSQLiteEngine(s.DB())
-		}
-
-		var gmailFactory mcpserver.GmailClientFactory
-		gmailFactory = buildGmailFactory(s)
+		defer env.Close()
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
@@ -85,24 +66,26 @@ Example Claude Desktop config (with port-forward):
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		go func() {
 			<-sigCh
-			fmt.Fprintf(os.Stderr, "Shutting down MCP SSE server...\n")
+			fmt.Fprintf(os.Stderr, "Shutting down MCP HTTP server...\n")
 			cancel()
 		}()
 
-		fmt.Fprintf(os.Stderr, "Starting MCP SSE server on %s\n", mcpSSEAddr)
-		return mcpserver.ServeSSE(ctx, mcpSSEAddr, mcpserver.ServeOptions{
-			Engine:         engine,
+		fmt.Fprintf(os.Stderr, "Starting MCP HTTP server on %s\n", mcpHTTPAddr)
+		return mcpserver.ServeStreamableHTTP(ctx, mcpHTTPAddr, mcpHTTPAPIKey, mcpserver.ServeOptions{
+			Engine:         env.Engine,
 			AttachmentsDir: cfg.AttachmentsDir(),
 			DataDir:        cfg.Data.DataDir,
-			GmailFactory:   gmailFactory,
+			GmailFactory:   env.GmailFactory,
 		})
 	},
 }
 
 func init() {
 	rootCmd.AddCommand(mcpSSECmd)
-	mcpSSECmd.Flags().StringVar(&mcpSSEAddr, "addr", "0.0.0.0:8080", "Address to listen on (host:port)")
-	mcpSSECmd.Flags().BoolVar(&mcpSSEForceSQL, "force-sql", false, "Force SQLite queries instead of Parquet")
-	mcpSSECmd.Flags().BoolVar(&mcpSSENoSQLiteScanner, "no-sqlite-scanner", false, "Disable DuckDB sqlite_scanner extension")
+	mcpSSECmd.Flags().StringVar(&mcpHTTPAddr, "addr", "0.0.0.0:8080", "Address to listen on (host:port)")
+	mcpSSECmd.Flags().StringVar(&mcpHTTPAPIKey, "api-key", "", "API key for bearer token authentication (required for non-loopback)")
+	mcpSSECmd.Flags().BoolVar(&mcpHTTPAllowInsecure, "allow-insecure", false, "Allow unauthenticated access on non-loopback addresses")
+	mcpSSECmd.Flags().BoolVar(&mcpHTTPForceSQL, "force-sql", false, "Force SQLite queries instead of Parquet")
+	mcpSSECmd.Flags().BoolVar(&mcpHTTPNoSQLiteScanner, "no-sqlite-scanner", false, "Disable DuckDB sqlite_scanner extension")
 	_ = mcpSSECmd.Flags().MarkHidden("no-sqlite-scanner")
 }

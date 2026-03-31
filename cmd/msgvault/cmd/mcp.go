@@ -36,68 +36,18 @@ Add to Claude Desktop config:
     }
   }`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		dbPath := cfg.DatabaseDSN()
-
-		// Open read-only: MCP is a query-only workload. This avoids
-		// SQLite write-lock contention when multiple MCP processes
-		// (one per Claude Code session) access the same database.
-		// Schema migrations and FTS backfill are write operations
-		// handled by init-db / sync / tui — not by MCP.
-		s, err := store.OpenReadOnly(dbPath)
+		env, err := setupMCPEnv(mcpForceSQL, mcpNoSQLiteScanner)
 		if err != nil {
-			return fmt.Errorf("open database: %w", err)
+			return err
 		}
-		defer func() { _ = s.Close() }()
-
-		if stale, col, err := s.SchemaStale(); err != nil {
-			return fmt.Errorf("check schema: %w", err)
-		} else if stale {
-			return fmt.Errorf(
-				"database schema is outdated (missing %s); "+
-					"run 'msgvault init-db' to update", col)
-		}
-
-		if s.FTS5Available() && s.NeedsFTSBackfill() {
-			fmt.Fprintf(os.Stderr,
-				"Warning: full-text search index needs populating; "+
-					"body-text search will return incomplete results "+
-					"until 'msgvault tui' or 'msgvault search' is run\n")
-		}
-
-		var engine query.Engine
-		analyticsDir := cfg.AnalyticsDir()
-
-		if !mcpForceSQL && query.HasCompleteParquetData(analyticsDir) {
-			var duckOpts query.DuckDBOptions
-			if mcpNoSQLiteScanner {
-				duckOpts.DisableSQLiteScanner = true
-			}
-			duckEngine, err := query.NewDuckDBEngine(analyticsDir, dbPath, s.DB(), duckOpts)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: Failed to open Parquet engine: %v\n", err)
-				fmt.Fprintf(os.Stderr, "Falling back to SQLite\n")
-				engine = query.NewSQLiteEngine(s.DB())
-			} else {
-				engine = duckEngine
-				defer func() { _ = duckEngine.Close() }()
-			}
-		} else {
-			engine = query.NewSQLiteEngine(s.DB())
-		}
-
-		// Set up Gmail client factory for draft operations.
-		// If OAuth is not configured, draft tools are simply not exposed.
-		var gmailFactory mcpserver.GmailClientFactory
-		gmailFactory = buildGmailFactory(s)
+		defer env.Close()
 
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 
-		// Build optional vector-search components. MCP runs as a
-		// query-only server, so the worker and enqueuer fields go
-		// unused — only Backend, HybridEngine, and VectorCfg reach
-		// the MCP layer.
-		vf, err := setupVectorFeatures(ctx, s.DB(), dbPath)
+		// Build optional vector-search components.
+		dbPath := cfg.DatabaseDSN()
+		vf, err := setupVectorFeatures(ctx, env.Store.DB(), dbPath)
 		if err != nil {
 			return fmt.Errorf("vector features: %w", err)
 		}
@@ -110,10 +60,10 @@ Add to Claude Desktop config:
 		}()
 
 		opts := mcpserver.ServeOptions{
-			Engine:         engine,
+			Engine:         env.Engine,
 			AttachmentsDir: cfg.AttachmentsDir(),
 			DataDir:        cfg.Data.DataDir,
-			GmailFactory:   gmailFactory,
+			GmailFactory:   env.GmailFactory,
 		}
 		if vf != nil {
 			opts.HybridEngine = vf.HybridEngine
@@ -122,6 +72,68 @@ Add to Claude Desktop config:
 		}
 		return mcpserver.ServeWithOptions(ctx, opts)
 	},
+}
+
+// mcpEnv holds shared resources for MCP commands (stdio and HTTP).
+type mcpEnv struct {
+	Store        *store.Store
+	Engine       query.Engine
+	GmailFactory mcpserver.GmailClientFactory
+	duckEngine   *query.DuckDBEngine // non-nil when DuckDB is used
+}
+
+// Close releases all resources held by the MCP environment.
+func (e *mcpEnv) Close() {
+	if e.duckEngine != nil {
+		e.duckEngine.Close()
+	}
+	e.Store.Close()
+}
+
+// setupMCPEnv initializes the database, query engine, FTS backfill, and Gmail
+// factory shared by all MCP transport commands.
+func setupMCPEnv(forceSQL, noSQLiteScanner bool) (*mcpEnv, error) {
+	dbPath := cfg.DatabaseDSN()
+	s, err := store.Open(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("open database: %w", err)
+	}
+
+	if err := s.InitSchema(); err != nil {
+		s.Close()
+		return nil, fmt.Errorf("init schema: %w", err)
+	}
+
+	// Build FTS index in background — MCP should start serving immediately
+	if s.NeedsFTSBackfill() {
+		go func() {
+			_, _ = s.BackfillFTS(nil)
+		}()
+	}
+
+	env := &mcpEnv{Store: s}
+
+	analyticsDir := cfg.AnalyticsDir()
+	if !forceSQL && query.HasCompleteParquetData(analyticsDir) {
+		var duckOpts query.DuckDBOptions
+		if noSQLiteScanner {
+			duckOpts.DisableSQLiteScanner = true
+		}
+		duckEngine, err := query.NewDuckDBEngine(analyticsDir, dbPath, s.DB(), duckOpts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Failed to open Parquet engine: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Falling back to SQLite\n")
+			env.Engine = query.NewSQLiteEngine(s.DB())
+		} else {
+			env.Engine = duckEngine
+			env.duckEngine = duckEngine
+		}
+	} else {
+		env.Engine = query.NewSQLiteEngine(s.DB())
+	}
+
+	env.GmailFactory = buildGmailFactory(s)
+	return env, nil
 }
 
 // buildGmailFactory returns a GmailClientFactory that creates authenticated

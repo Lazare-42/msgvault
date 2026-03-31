@@ -2,7 +2,9 @@ package mcp
 
 import (
 	"context"
+	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -161,21 +163,58 @@ func ServeWithOptions(ctx context.Context, opts ServeOptions) error {
 	return stdio.Listen(ctx, os.Stdin, os.Stdout)
 }
 
-// ServeSSE starts the MCP server over SSE transport on the given address.
+// ServeStreamableHTTP starts the MCP server over Streamable HTTP transport.
+// If apiKey is non-empty, requests must include a Bearer token matching the key.
 // It blocks until the context is cancelled or the server fails to start.
-func ServeSSE(ctx context.Context, addr string, opts ServeOptions) error {
-	mcpServer := BuildMCPServer(opts)
-	sseServer := server.NewSSEServer(mcpServer,
-		server.WithBaseURL("http://"+addr),
-		server.WithKeepAliveInterval(30*time.Second),
-	)
+func ServeStreamableHTTP(ctx context.Context, addr, apiKey string, srvOpts ServeOptions) error {
+	mcpServer := BuildMCPServer(srvOpts)
+
+	opts := []server.StreamableHTTPOption{
+		server.WithHeartbeatInterval(30 * time.Second),
+	}
+
+	// When an API key is set, wrap the MCP handler with bearer token auth.
+	if apiKey != "" {
+		opts = append(opts, server.WithStreamableHTTPServer(&http.Server{
+			Addr:    addr,
+			Handler: nil, // set below after NewStreamableHTTPServer
+		}))
+	}
+
+	httpServer := server.NewStreamableHTTPServer(mcpServer, opts...)
+
+	// If API key is configured, wrap the default handler with auth middleware.
+	if apiKey != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/mcp", requireBearer(apiKey, httpServer))
+		httpServer = server.NewStreamableHTTPServer(mcpServer,
+			server.WithHeartbeatInterval(30*time.Second),
+			server.WithStreamableHTTPServer(&http.Server{
+				Addr:    addr,
+				Handler: mux,
+			}),
+		)
+	}
 
 	go func() {
 		<-ctx.Done()
-		sseServer.Shutdown(context.Background())
+		httpServer.Shutdown(context.Background())
 	}()
 
-	return sseServer.Start(addr)
+	return httpServer.Start(addr)
+}
+
+// requireBearer wraps an http.Handler with Bearer token authentication.
+func requireBearer(apiKey string, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auth := r.Header.Get("Authorization")
+		token := strings.TrimPrefix(auth, "Bearer ")
+		if !strings.HasPrefix(auth, "Bearer ") || token != apiKey {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func searchMessagesTool(vectorAvailable bool) mcp.Tool {
