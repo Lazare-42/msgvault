@@ -74,6 +74,9 @@ type LabelManager interface {
 
 	// CreateLabel creates a new user label and returns it.
 	CreateLabel(ctx context.Context, name string) (*Label, error)
+
+	// DeleteLabel permanently deletes a user label. Messages with this label are not deleted.
+	DeleteLabel(ctx context.Context, labelID string) error
 }
 
 // API defines the interface for Gmail operations.
