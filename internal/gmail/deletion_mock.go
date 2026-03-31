@@ -338,5 +338,9 @@ func (m *DeletionMockAPI) CreateLabel(ctx context.Context, name string) (*Label,
 	panic("DeletionMockAPI.CreateLabel not implemented")
 }
 
+func (m *DeletionMockAPI) DeleteLabel(ctx context.Context, labelID string) error {
+	panic("DeletionMockAPI.DeleteLabel not implemented")
+}
+
 // Ensure DeletionMockAPI implements API interface.
 var _ API = (*DeletionMockAPI)(nil)

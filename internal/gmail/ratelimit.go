@@ -36,6 +36,7 @@ const (
 	OpModifyLabels      // 5 units
 	OpBatchModifyLabels // 5 units
 	OpCreateLabel       // 5 units
+	OpDeleteLabel       // 5 units
 
 	// OpCalendarListList and the other Calendar API operations live on this
 	// shared Operation enum (rather than a parallel one in internal/gcal) so
@@ -61,7 +62,7 @@ func (o Operation) Cost() int {
 	case OpMessagesGet, OpMessagesGetRaw, OpMessagesList, OpMessagesTrash, OpMessagesModify:
 		return 5
 	case OpDraftsList, OpDraftsGet, OpDraftsCreate, OpDraftsUpdate, OpDraftsDelete, OpDraftsSend,
-		OpModifyLabels, OpBatchModifyLabels, OpCreateLabel:
+		OpModifyLabels, OpBatchModifyLabels, OpCreateLabel, OpDeleteLabel:
 		return 5
 	case OpMessagesDelete:
 		return 10
