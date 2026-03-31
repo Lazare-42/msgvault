@@ -36,8 +36,7 @@ done
 if [[ -f "$LAST_RUN_FILE" ]]; then
     LAST_RUN=$(cat "$LAST_RUN_FILE")
 else
-    LAST_RUN=$(date -u -d '24 hours ago' '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null \
-            || date -u -v-24H '+%Y-%m-%dT%H:%M:%SZ')
+    LAST_RUN=$(date -u -d '24 hours ago' '+%Y-%m-%dT%H:%M:%SZ')
     echo "No last_run file found, defaulting to: $LAST_RUN"
 fi
 
