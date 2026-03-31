@@ -65,7 +65,6 @@ echo "Running claude triage..."
 
 set +e
 claude -p \
-    --bare \
     --model sonnet \
     --max-turns 30 \
     --mcp-config "$MCP_CONFIG" \
