@@ -41,6 +41,7 @@ const (
 	ToolSendDraft           = "send_draft"
 	ToolModifyLabels        = "modify_labels"
 	ToolCreateLabel         = "create_label"
+	ToolDeleteLabel         = "delete_label"
 	ToolListGmailLabels     = "list_gmail_labels"
 )
 
@@ -151,6 +152,7 @@ func newMCPServer(opts ServeOptions) *server.MCPServer {
 		s.AddTool(sendDraftTool(), h.sendDraft)
 		s.AddTool(modifyLabelsTool(), h.modifyLabels)
 		s.AddTool(createLabelTool(), h.createLabel)
+		s.AddTool(deleteLabelTool(), h.deleteLabel)
 		s.AddTool(listGmailLabelsTool(), h.listGmailLabels)
 	}
 
@@ -536,6 +538,17 @@ func createLabelTool() mcp.Tool {
 		mcp.WithString("name",
 			mcp.Required(),
 			mcp.Description("Label name. Use '/' for nesting (e.g. 'Projects/Acme')"),
+		),
+	)
+}
+
+func deleteLabelTool() mcp.Tool {
+	return mcp.NewTool(ToolDeleteLabel,
+		mcp.WithDescription("Permanently delete a Gmail label by ID. Messages with this label are NOT deleted; the label is simply removed from them. Only user-created labels can be deleted (not system labels like INBOX, SENT, etc.). Use list_gmail_labels to find label IDs."),
+		withAccount(),
+		mcp.WithString("label_id",
+			mcp.Required(),
+			mcp.Description("Label ID to delete (e.g. 'Label_11'). Use list_gmail_labels to find IDs."),
 		),
 	)
 }

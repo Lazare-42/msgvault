@@ -984,3 +984,7 @@ func (c *Client) BatchModifyLabels(_ context.Context, _, _, _ []string) error {
 func (c *Client) CreateLabel(_ context.Context, _ string) (*gmailapi.Label, error) {
 	return nil, fmt.Errorf("IMAP does not support Gmail label operations")
 }
+
+func (c *Client) DeleteLabel(_ context.Context, _ string) error {
+	return fmt.Errorf("IMAP does not support Gmail label operations")
+}

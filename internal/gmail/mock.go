@@ -298,6 +298,10 @@ func (m *MockAPI) CreateLabel(ctx context.Context, name string) (*Label, error) 
 	return &Label{ID: "Label_mock", Name: name, Type: "user"}, nil
 }
 
+func (m *MockAPI) DeleteLabel(ctx context.Context, labelID string) error {
+	return nil
+}
+
 // getListThreadID returns the threadID to use in ListMessages for a given message ID.
 // Priority: ListThreadIDOverride > UseRawThreadID > default "thread_" + id.
 func (m *MockAPI) getListThreadID(id string) string {

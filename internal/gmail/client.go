@@ -1063,5 +1063,13 @@ func (c *Client) CreateLabel(ctx context.Context, name string) (*Label, error) {
 	}, nil
 }
 
+// DeleteLabel permanently deletes a user label by ID.
+// Messages with this label are not deleted; the label is simply removed from them.
+func (c *Client) DeleteLabel(ctx context.Context, labelID string) error {
+	path := fmt.Sprintf("/users/%s/labels/%s", c.userID, labelID)
+	_, err := c.request(ctx, OpDeleteLabel, "DELETE", path, nil)
+	return err
+}
+
 // Ensure Client implements API interface.
 var _ API = (*Client)(nil)
