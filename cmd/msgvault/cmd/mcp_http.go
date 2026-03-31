@@ -17,9 +17,10 @@ var mcpSSENoSQLiteScanner bool
 var mcpSSEAPIKey string
 var mcpSSEAllowInsecure bool
 
-var mcpSSECmd = &cobra.Command{
-	Use:   "mcp-sse",
-	Short: "Run MCP server over HTTP for remote clients",
+var mcpHTTPCmd = &cobra.Command{
+	Use:     "mcp-http",
+	Aliases: []string{"mcp-sse"},
+	Short:   "Run MCP server over HTTP for remote clients",
 	Long: `Start an MCP (Model Context Protocol) server over Streamable HTTP.
 
 This allows remote MCP clients to connect over HTTP instead of stdio,
@@ -28,7 +29,8 @@ suitable for containerized deployments (e.g., Kubernetes).
 Clients connect to http://<addr>/mcp for the Streamable HTTP endpoint.
 
 Security: When listening on a non-loopback address, an --api-key is required
-unless --allow-insecure is set. Use SSH port-forwarding as an alternative.
+unless --allow-insecure is set. The intended deployment model is
+kubectl port-forward (loopback) or a network policy restricting access.
 
 Example Claude Desktop config (with port-forward):
   {
@@ -84,14 +86,14 @@ Example Claude Desktop config (with port-forward):
 }
 
 func init() {
-	rootCmd.AddCommand(mcpSSECmd)
-	mcpSSECmd.Flags().StringVar(&mcpSSEAddr, "addr", "0.0.0.0:8080", "Address to listen on (host:port)")
-	mcpSSECmd.Flags().StringVar(&mcpSSEAPIKey, "api-key", "", "API key for bearer token authentication (required for non-loopback)")
-	mcpSSECmd.Flags().BoolVar(&mcpSSEAllowInsecure, "allow-insecure", false, "Allow unauthenticated access on non-loopback addresses")
-	mcpSSECmd.Flags().BoolVar(&mcpSSEForceSQL, "force-sql", false, "Deprecated in 0.17.0: cache engine selection is daemon-managed")
-	mcpSSECmd.Flags().BoolVar(&mcpSSENoSQLiteScanner, "no-sqlite-scanner", false, "Deprecated in 0.17.0: cache engine selection is daemon-managed")
-	_ = mcpSSECmd.Flags().MarkDeprecated("force-sql", "deprecated in 0.17.0; cache engine selection is daemon-managed")
-	_ = mcpSSECmd.Flags().MarkDeprecated("no-sqlite-scanner", "deprecated in 0.17.0; cache engine selection is daemon-managed")
-	_ = mcpSSECmd.Flags().MarkHidden("force-sql")
-	_ = mcpSSECmd.Flags().MarkHidden("no-sqlite-scanner")
+	rootCmd.AddCommand(mcpHTTPCmd)
+	mcpHTTPCmd.Flags().StringVar(&mcpSSEAddr, "addr", "0.0.0.0:8080", "Address to listen on (host:port)")
+	mcpHTTPCmd.Flags().StringVar(&mcpSSEAPIKey, "api-key", "", "API key for bearer token authentication (required for non-loopback)")
+	mcpHTTPCmd.Flags().BoolVar(&mcpSSEAllowInsecure, "allow-insecure", false, "Allow unauthenticated access on non-loopback addresses")
+	mcpHTTPCmd.Flags().BoolVar(&mcpSSEForceSQL, "force-sql", false, "Deprecated in 0.17.0: cache engine selection is daemon-managed")
+	mcpHTTPCmd.Flags().BoolVar(&mcpSSENoSQLiteScanner, "no-sqlite-scanner", false, "Deprecated in 0.17.0: cache engine selection is daemon-managed")
+	_ = mcpHTTPCmd.Flags().MarkDeprecated("force-sql", "deprecated in 0.17.0; cache engine selection is daemon-managed")
+	_ = mcpHTTPCmd.Flags().MarkDeprecated("no-sqlite-scanner", "deprecated in 0.17.0; cache engine selection is daemon-managed")
+	_ = mcpHTTPCmd.Flags().MarkHidden("force-sql")
+	_ = mcpHTTPCmd.Flags().MarkHidden("no-sqlite-scanner")
 }
