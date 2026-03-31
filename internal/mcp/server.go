@@ -108,11 +108,6 @@ type ServeOptions struct {
 	// vector/hybrid searches with a vector_not_enabled error.
 	HybridEngine *hybrid.Engine
 	// VectorCfg should already have ApplyDefaults() called on it.
-	// The handler reads Search.MaxPageSizeHybridClamp() at request
-	// time; a positive value clamps the per-request limit, and zero
-	// disables clamping (the user can set
-	// `max_page_size_hybrid = 0` in TOML to disable; ApplyDefaults
-	// only fills in 50 when the field was omitted).
 	VectorCfg vector.Config
 	// Backend is optional. When nil, find_similar_messages rejects all
 	// calls with a vector_not_enabled error.
@@ -121,9 +116,10 @@ type ServeOptions struct {
 	GmailFactory GmailClientFactory
 }
 
-// newMCPServer builds an MCP server with all tools registered from opts.
-// Shared by ServeWithOptions (stdio) and ServeHTTPWithOptions (HTTP).
-func newMCPServer(opts ServeOptions) *server.MCPServer {
+// BuildMCPServer builds an MCP server with all tools registered from opts.
+// Shared by ServeWithOptions (stdio), ServeHTTPWithOptions (HTTP), and the
+// SSE transport. Callers choose the transport.
+func BuildMCPServer(opts ServeOptions) *server.MCPServer {
 	s := server.NewMCPServer(
 		"msgvault",
 		"1.0.0",
@@ -202,7 +198,7 @@ func Serve(ctx context.Context, engine query.Engine, attachmentsDir, dataDir str
 // ServeWithOptions creates an MCP server from opts and serves over stdio.
 // It blocks until stdin is closed or the context is cancelled.
 func ServeWithOptions(ctx context.Context, opts ServeOptions) error {
-	s := newMCPServer(opts)
+	s := BuildMCPServer(opts)
 	stdio := server.NewStdioServer(s)
 	if err := stdio.Listen(ctx, os.Stdin, os.Stdout); err != nil {
 		return fmt.Errorf("serve MCP over stdio: %w", err)
@@ -252,13 +248,30 @@ func newMCPHTTPServer(opts ServeOptions, addr, apiKey string) *http.Server {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	httpServer := server.NewStreamableHTTPServer(
-		newMCPServer(opts),
+		BuildMCPServer(opts),
 		server.WithStreamableHTTPServer(stdlibServer),
 	)
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", bearerAuthHandler(apiKey, httpServer))
 	stdlibServer.Handler = mux
 	return stdlibServer
+}
+
+// ServeSSE starts the MCP server over SSE transport on the given address.
+// It blocks until the context is cancelled or the server fails to start.
+func ServeSSE(ctx context.Context, addr string, opts ServeOptions) error {
+	mcpServer := BuildMCPServer(opts)
+	sseServer := server.NewSSEServer(mcpServer,
+		server.WithBaseURL("http://"+addr),
+		server.WithKeepAliveInterval(30*time.Second),
+	)
+
+	go func() {
+		<-ctx.Done()
+		sseServer.Shutdown(context.Background())
+	}()
+
+	return sseServer.Start(addr)
 }
 
 func bearerAuthHandler(apiKey string, next http.Handler) http.Handler {
