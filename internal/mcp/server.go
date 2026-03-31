@@ -257,22 +257,6 @@ func newMCPHTTPServer(opts ServeOptions, addr, apiKey string) *http.Server {
 	return stdlibServer
 }
 
-// ServeSSE starts the MCP server over SSE transport on the given address.
-// It blocks until the context is cancelled or the server fails to start.
-func ServeSSE(ctx context.Context, addr string, opts ServeOptions) error {
-	mcpServer := BuildMCPServer(opts)
-	sseServer := server.NewSSEServer(mcpServer,
-		server.WithBaseURL("http://"+addr),
-		server.WithKeepAliveInterval(30*time.Second),
-	)
-
-	go func() {
-		<-ctx.Done()
-		sseServer.Shutdown(context.Background())
-	}()
-
-	return sseServer.Start(addr)
-}
 
 func bearerAuthHandler(apiKey string, next http.Handler) http.Handler {
 	if apiKey == "" {
