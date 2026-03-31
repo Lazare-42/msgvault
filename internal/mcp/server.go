@@ -3,6 +3,7 @@ package mcp
 import (
 	"context"
 	"os"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -85,11 +86,6 @@ type ServeOptions struct {
 	// mode=vector and mode=hybrid with a vector_not_enabled error.
 	HybridEngine *hybrid.Engine
 	// VectorCfg should already have ApplyDefaults() called on it.
-	// The handler reads Search.MaxPageSizeHybridClamp() at request
-	// time; a positive value clamps the per-request limit, and zero
-	// disables clamping (the user can set
-	// `max_page_size_hybrid = 0` in TOML to disable; ApplyDefaults
-	// only fills in 50 when the field was omitted).
 	VectorCfg vector.Config
 	// Backend is optional. When nil, find_similar_messages rejects all
 	// calls with a vector_not_enabled error.
@@ -98,25 +94,9 @@ type ServeOptions struct {
 	GmailFactory GmailClientFactory
 }
 
-// Serve creates an MCP server with email archive tools and serves over stdio.
-// It blocks until stdin is closed or the context is cancelled.
-// dataDir is the base data directory (e.g., ~/.msgvault) used for deletions.
-//
-// Serve is a thin wrapper around ServeWithOptions that leaves the vector
-// fields empty; callers that want vector/hybrid search should use
-// ServeWithOptions directly.
-func Serve(ctx context.Context, engine query.Engine, attachmentsDir, dataDir string, gmailFactory GmailClientFactory) error {
-	return ServeWithOptions(ctx, ServeOptions{
-		Engine:         engine,
-		AttachmentsDir: attachmentsDir,
-		DataDir:        dataDir,
-		GmailFactory:   gmailFactory,
-	})
-}
-
-// ServeWithOptions creates an MCP server from opts and serves over stdio.
-// It blocks until stdin is closed or the context is cancelled.
-func ServeWithOptions(ctx context.Context, opts ServeOptions) error {
+// BuildMCPServer creates an MCPServer with all tools registered.
+// Callers choose the transport (stdio, SSE, etc.).
+func BuildMCPServer(opts ServeOptions) *server.MCPServer {
 	s := server.NewMCPServer(
 		"msgvault",
 		"1.0.0",
@@ -159,8 +139,43 @@ func ServeWithOptions(ctx context.Context, opts ServeOptions) error {
 		s.AddTool(listGmailLabelsTool(), h.listGmailLabels)
 	}
 
+	return s
+}
+
+// Serve creates an MCP server with email archive tools and serves over stdio.
+// It blocks until stdin is closed or the context is cancelled.
+func Serve(ctx context.Context, engine query.Engine, attachmentsDir, dataDir string, gmailFactory GmailClientFactory) error {
+	return ServeWithOptions(ctx, ServeOptions{
+		Engine:         engine,
+		AttachmentsDir: attachmentsDir,
+		DataDir:        dataDir,
+		GmailFactory:   gmailFactory,
+	})
+}
+
+// ServeWithOptions creates an MCP server from opts and serves over stdio.
+// It blocks until stdin is closed or the context is cancelled.
+func ServeWithOptions(ctx context.Context, opts ServeOptions) error {
+	s := BuildMCPServer(opts)
 	stdio := server.NewStdioServer(s)
 	return stdio.Listen(ctx, os.Stdin, os.Stdout)
+}
+
+// ServeSSE starts the MCP server over SSE transport on the given address.
+// It blocks until the context is cancelled or the server fails to start.
+func ServeSSE(ctx context.Context, addr string, opts ServeOptions) error {
+	mcpServer := BuildMCPServer(opts)
+	sseServer := server.NewSSEServer(mcpServer,
+		server.WithBaseURL("http://"+addr),
+		server.WithKeepAliveInterval(30*time.Second),
+	)
+
+	go func() {
+		<-ctx.Done()
+		sseServer.Shutdown(context.Background())
+	}()
+
+	return sseServer.Start(addr)
 }
 
 func searchMessagesTool(vectorAvailable bool) mcp.Tool {
