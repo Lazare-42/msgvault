@@ -18,9 +18,10 @@ var mcpHTTPNoSQLiteScanner bool
 var mcpHTTPAPIKey string
 var mcpSSEAllowInsecure bool
 
-var mcpSSECmd = &cobra.Command{
-	Use:   "mcp-sse",
-	Short: "Run MCP server over HTTP for remote clients",
+var mcpHTTPCmd = &cobra.Command{
+	Use:     "mcp-http",
+	Aliases: []string{"mcp-sse"},
+	Short:   "Run MCP server over HTTP for remote clients",
 	Long: `Start an MCP (Model Context Protocol) server over Streamable HTTP.
 
 This allows remote MCP clients to connect over HTTP instead of stdio,
@@ -29,7 +30,8 @@ suitable for containerized deployments (e.g., Kubernetes).
 Clients connect to http://<addr>/mcp for the Streamable HTTP endpoint.
 
 Security: When listening on a non-loopback address, an --api-key is required
-unless --allow-insecure is set. Use SSH port-forwarding as an alternative.
+unless --allow-insecure is set. The intended deployment model is
+kubectl port-forward (loopback) or a network policy restricting access.
 
 Example Claude Desktop config (with port-forward):
   {
@@ -81,11 +83,11 @@ Example Claude Desktop config (with port-forward):
 }
 
 func init() {
-	rootCmd.AddCommand(mcpSSECmd)
-	mcpSSECmd.Flags().StringVar(&mcpSSEAddr, "addr", "0.0.0.0:8080", "Address to listen on (host:port)")
-	mcpSSECmd.Flags().StringVar(&mcpHTTPAPIKey, "api-key", "", "API key for bearer token authentication (required for non-loopback)")
-	mcpSSECmd.Flags().BoolVar(&mcpSSEAllowInsecure, "allow-insecure", false, "Allow unauthenticated access on non-loopback addresses")
-	mcpSSECmd.Flags().BoolVar(&mcpHTTPForceSQL, "force-sql", false, "Force SQLite queries instead of Parquet")
-	mcpSSECmd.Flags().BoolVar(&mcpHTTPNoSQLiteScanner, "no-sqlite-scanner", false, "Disable DuckDB sqlite_scanner extension")
-	_ = mcpSSECmd.Flags().MarkHidden("no-sqlite-scanner")
+	rootCmd.AddCommand(mcpHTTPCmd)
+	mcpHTTPCmd.Flags().StringVar(&mcpSSEAddr, "addr", "0.0.0.0:8080", "Address to listen on (host:port)")
+	mcpHTTPCmd.Flags().StringVar(&mcpHTTPAPIKey, "api-key", "", "API key for bearer token authentication (required for non-loopback)")
+	mcpHTTPCmd.Flags().BoolVar(&mcpSSEAllowInsecure, "allow-insecure", false, "Allow unauthenticated access on non-loopback addresses")
+	mcpHTTPCmd.Flags().BoolVar(&mcpHTTPForceSQL, "force-sql", false, "Force SQLite queries instead of Parquet")
+	mcpHTTPCmd.Flags().BoolVar(&mcpHTTPNoSQLiteScanner, "no-sqlite-scanner", false, "Disable DuckDB sqlite_scanner extension")
+	_ = mcpHTTPCmd.Flags().MarkHidden("no-sqlite-scanner")
 }
