@@ -2329,6 +2329,33 @@ func (h *handlers) createLabel(ctx context.Context, req mcp.CallToolRequest) (*m
 	return jsonResult(label)
 }
 
+func (h *handlers) deleteLabel(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	client, _, err := h.getGmailClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	defer client.Close()
+
+	labelID, _ := args["label_id"].(string)
+	if labelID == "" {
+		return mcp.NewToolResultError("label_id parameter is required"), nil
+	}
+
+	if err := client.DeleteLabel(ctx, labelID); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("delete label: %v", err)), nil
+	}
+
+	return jsonResult(struct {
+		LabelID string `json:"label_id"`
+		Status  string `json:"status"`
+	}{
+		LabelID: labelID,
+		Status:  "deleted",
+	})
+}
+
 func (h *handlers) listGmailLabels(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 	args := req.GetArguments()
 
