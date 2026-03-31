@@ -69,7 +69,7 @@ claude -p \
     --max-turns 30 \
     --mcp-config "$MCP_CONFIG" \
     --allowedTools "mcp__msgvault__search_messages,mcp__msgvault__get_message,mcp__msgvault__list_messages,mcp__msgvault__list_gmail_labels,mcp__msgvault__modify_labels" \
-    --dangerously-skip-permissions \
+    --permission-mode dontAsk \
     --output-format json \
     --no-session-persistence \
     --append-system-prompt-file "$RULES_FILE" \
