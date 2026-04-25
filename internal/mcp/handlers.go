@@ -650,6 +650,36 @@ func translateVectorErr(err error) *toolResult {
 	return nil
 }
 
+type messageSummaryCompact struct {
+	ID                   int64     `json:"id"`
+	SourceMessageID      string    `json:"source_message_id"`
+	ConversationID       int64     `json:"conversation_id"`
+	SourceConversationID string    `json:"source_conversation_id"`
+	Subject              string    `json:"subject"`
+	FromEmail            string    `json:"from_email"`
+	FromName             string    `json:"from_name"`
+	SentAt               time.Time `json:"sent_at"`
+	HasAttachments       bool      `json:"has_attachments"`
+}
+
+func compactMessageSummaries(results []query.MessageSummary) []messageSummaryCompact {
+	out := make([]messageSummaryCompact, len(results))
+	for i, msg := range results {
+		out[i] = messageSummaryCompact{
+			ID:                   msg.ID,
+			SourceMessageID:      msg.SourceMessageID,
+			ConversationID:       msg.ConversationID,
+			SourceConversationID: msg.SourceConversationID,
+			Subject:              msg.Subject,
+			FromEmail:            msg.FromEmail,
+			FromName:             msg.FromName,
+			SentAt:               msg.SentAt,
+			HasAttachments:       msg.HasAttachments,
+		}
+	}
+	return out
+}
+
 // getAccountID looks up a source ID by its identifier, preferring an exact
 // match and otherwise ignoring letter case, so "Me@gmail.com" names the same
 // source as "me@gmail.com"; failing that, by its display name, which for an
