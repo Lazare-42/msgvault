@@ -134,6 +134,36 @@ func translateVectorErr(err error) *mcp.CallToolResult {
 	return nil
 }
 
+type messageSummaryCompact struct {
+	ID                   int64     `json:"id"`
+	SourceMessageID      string    `json:"source_message_id"`
+	ConversationID       int64     `json:"conversation_id"`
+	SourceConversationID string    `json:"source_conversation_id"`
+	Subject              string    `json:"subject"`
+	FromEmail            string    `json:"from_email"`
+	FromName             string    `json:"from_name"`
+	SentAt               time.Time `json:"sent_at"`
+	HasAttachments       bool      `json:"has_attachments"`
+}
+
+func compactMessageSummaries(results []query.MessageSummary) []messageSummaryCompact {
+	out := make([]messageSummaryCompact, len(results))
+	for i, msg := range results {
+		out[i] = messageSummaryCompact{
+			ID:                   msg.ID,
+			SourceMessageID:      msg.SourceMessageID,
+			ConversationID:       msg.ConversationID,
+			SourceConversationID: msg.SourceConversationID,
+			Subject:              msg.Subject,
+			FromEmail:            msg.FromEmail,
+			FromName:             msg.FromName,
+			SentAt:               msg.SentAt,
+			HasAttachments:       msg.HasAttachments,
+		}
+	}
+	return out
+}
+
 // getAccountID looks up a source ID by email address.
 // Returns nil if account is empty (no filter), or an error if not found.
 func (h *handlers) getAccountID(ctx context.Context, account string) (*int64, error) {
@@ -275,7 +305,13 @@ func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) 
 		return mcp.NewToolResultError(fmt.Sprintf("search count failed: %v", err)), nil
 	}
 
-	return jsonResult(newPaginatedResponse(results, totalMatched, offset))
+	if full, _ := args["full"].(bool); full {
+		return jsonResult(newPaginatedResponse(results, totalMatched, offset))
+	}
+
+	// Compact summaries are the default for MCP to keep agent context lean.
+	// Call get_message for a chosen hit when the full body/labels/attachments matter.
+	return jsonResult(newPaginatedResponse(compactMessageSummaries(results), totalMatched, offset))
 }
 
 // hybridScoreBreakdown exposes fused-score components for debugging.
@@ -632,7 +668,6 @@ func (h *handlers) getMessage(ctx context.Context, req mcp.CallToolRequest) (*mc
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("message not found: %v", err)), nil
 	}
-
 	return jsonResult(msg)
 }
 
@@ -834,7 +869,13 @@ func (h *handlers) listMessages(ctx context.Context, req mcp.CallToolRequest) (*
 		results = results[:pageLimit]
 	}
 
-	return jsonResult(newPaginatedResponseNoTotal(results, offset, hasMore))
+	if full, _ := args["full"].(bool); full {
+		return jsonResult(newPaginatedResponseNoTotal(results, offset, hasMore))
+	}
+
+	// Compact summaries are the default for MCP to keep common mailbox lookups
+	// cheap in both tokens and latency.
+	return jsonResult(newPaginatedResponseNoTotal(compactMessageSummaries(results), offset, hasMore))
 }
 
 // getStatsResponse is the JSON body returned by the get_stats MCP tool.

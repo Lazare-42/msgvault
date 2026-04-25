@@ -79,6 +79,13 @@ set -e
 if [[ $EXIT_CODE -eq 0 ]]; then
     echo "$NOW" > "$LAST_RUN_FILE"
     echo "Triage complete. Updated last_run to $NOW"
+
+    # Re-sync from Gmail so the local archive reflects label changes made by triage
+    MSGVAULT_BIN="$(dirname "$0")/../msgvault"
+    if [[ -x "$MSGVAULT_BIN" ]]; then
+        echo "Syncing local archive from Gmail..."
+        "$MSGVAULT_BIN" sync --home "$MSGVAULT_HOME" 2>&1 || echo "WARNING: post-triage sync failed (non-fatal)"
+    fi
 else
     echo "ERROR: claude exited with code $EXIT_CODE"
     exit $EXIT_CODE

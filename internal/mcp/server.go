@@ -292,6 +292,7 @@ func searchMessagesTool(vectorAvailable bool) mcp.Tool {
 	}
 	return mcp.NewTool(ToolSearchMessages,
 		mcp.WithDescription("Search emails using Gmail-like query syntax. Supports from:, to:, subject:, label:, has:attachment, before:, after:, and free text. "+
+			"Returns compact summaries by default; set full=true for snippets, labels, and other extra fields. "+
 			"All modes paginate via offset/limit (default limit 20, max 50). Response: data, total, returned, offset, has_more. "+
 			"total=-1 means the full match count is unknown — use has_more. "+
 			"Vector/hybrid ranking depth is capped by max_page_size_hybrid in config; beyond that use mode=fts. "+
@@ -302,6 +303,9 @@ func searchMessagesTool(vectorAvailable bool) mcp.Tool {
 			mcp.Description("Gmail-style search query (e.g. 'from:alice subject:meeting after:2024-01-01'); mode=vector|hybrid require at least one free-text term"),
 		),
 		withAccount(),
+		mcp.WithBoolean("full",
+			mcp.Description("Return full message summaries instead of compact results (default false)"),
+		),
 		withLimit("20"),
 		mcp.WithNumber("offset",
 			mcp.Description("Number of results to skip for pagination (default 0)."),
@@ -353,7 +357,7 @@ func exportAttachmentTool() mcp.Tool {
 
 func listMessagesTool() mcp.Tool {
 	return mcp.NewTool(ToolListMessages,
-		mcp.WithDescription("List messages with optional filters. Returns message summaries sorted by date. "+
+		mcp.WithDescription("List messages with optional filters. Returns compact summaries sorted by date by default; set full=true for snippets, labels, and other extra fields. "+
 			"Paginate with offset/limit (default limit 20, max 50). Response: data, total, returned, offset, has_more. "+
 			"total=-1 because the full count is not computed; use has_more for paging."),
 		mcp.WithReadOnlyHintAnnotation(true),
@@ -371,6 +375,9 @@ func listMessagesTool() mcp.Tool {
 		withBefore(),
 		mcp.WithBoolean("has_attachment",
 			mcp.Description("Only messages with attachments"),
+		),
+		mcp.WithBoolean("full",
+			mcp.Description("Return full message summaries instead of compact results (default false)"),
 		),
 		withLimit("20"),
 		withOffset(),
