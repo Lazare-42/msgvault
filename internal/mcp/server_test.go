@@ -129,6 +129,28 @@ type paginatedListMessages struct {
 	HasMore  bool                   `json:"has_more"`
 }
 
+type compactMessageSummary struct {
+	ID                   int64  `json:"id"`
+	SourceMessageID      string `json:"source_message_id"`
+	ConversationID       int64  `json:"conversation_id"`
+	SourceConversationID string `json:"source_conversation_id"`
+	Subject              string `json:"subject"`
+	FromEmail            string `json:"from_email"`
+	FromName             string `json:"from_name"`
+	SentAt               string `json:"sent_at"`
+	HasAttachments       bool   `json:"has_attachments"`
+}
+
+// paginatedCompactMessages is the default (compact) search/list response:
+// a paginated envelope whose Data is the compact summary projection.
+type paginatedCompactMessages struct {
+	Data     []compactMessageSummary `json:"data"`
+	Total    int64                   `json:"total"`
+	Returned int                     `json:"returned"`
+	Offset   int                     `json:"offset"`
+	HasMore  bool                    `json:"has_more"`
+}
+
 // newTestHandlers creates a handlers instance with the given mock engine.
 func newTestHandlers(eng query.Engine) *handlers {
 	return &handlers{engine: eng}
@@ -202,6 +224,13 @@ func TestSearchMetadata(t *testing.T) {
 		assert.Equal("thread-abc", resp.Data[0].SourceConversationID, "SourceConversationID")
 		assert.Equal(int64(99), resp.Data[0].ConversationID, "conversation_id")
 		assert.Equal(int64(1), resp.Total, "total")
+	})
+
+	t.Run("full results when requested", func(t *testing.T) {
+		resp := runTool[paginatedSearchMessages](t, "search_messages", h.searchMessages, map[string]any{"query": "from:alice", "full": true})
+		if len(resp.Data) != 1 || resp.Data[0].Subject != "Hello" {
+			t.Fatalf("unexpected result: %v", resp.Data)
+		}
 	})
 
 	t.Run("missing query", func(t *testing.T) {
@@ -2071,6 +2100,16 @@ func TestListMessages(t *testing.T) {
 		require.Len(t, resp.Data, 1, "data")
 		assert.Equal(t, "thread-list", resp.Data[0].SourceConversationID, "SourceConversationID")
 		assert.False(t, resp.HasMore, "has_more")
+	})
+
+	t.Run("full results when requested", func(t *testing.T) {
+		resp := runTool[paginatedListMessages](t, "list_messages", h.listMessages, map[string]any{
+			"from": "alice@example.com",
+			"full": true,
+		})
+		if len(resp.Data) != 1 || resp.Data[0].SourceConversationID != "thread-list" {
+			t.Fatalf("unexpected result: %v", resp.Data)
+		}
 	})
 
 	errorCases := []struct {

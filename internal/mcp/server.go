@@ -315,6 +315,9 @@ func searchMetadataTool() mcp.Tool {
 			mcp.Description(queryDesc),
 		),
 		withAccount(),
+		mcp.WithBoolean("full",
+			mcp.Description("Return full message summaries instead of compact results (default false)"),
+		),
 		withLimit("20"),
 		withOffset(),
 	)
@@ -547,6 +550,7 @@ func searchInMessageTool(vectorInMessageAvailable bool) mcp.Tool {
 func listMessagesTool() mcp.Tool {
 	return mcp.NewTool(ToolListMessages,
 		mcp.WithDescription("List messages with optional filters, newest-first. "+
+			"Returns compact summaries by default; set full=true for snippets, labels, and other extra fields. "+
 			"Pass conversation_id to enumerate a thread's messages, then call get_message(id) per message to read bodies — "+
 			"there is deliberately no bulk body fetch, to avoid loading huge threads into the context window. "+
 			"Paginate with offset/limit (default limit 20, max 50). Response: data, total, returned, offset, has_more. "+
@@ -569,6 +573,9 @@ func listMessagesTool() mcp.Tool {
 		),
 		mcp.WithNumber("conversation_id",
 			mcp.Description("Filter by conversation/thread ID"),
+		),
+		mcp.WithBoolean("full",
+			mcp.Description("Return full message summaries instead of compact results (default false)"),
 		),
 		withLimit("20"),
 		withOffset(),
