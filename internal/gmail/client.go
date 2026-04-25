@@ -770,7 +770,11 @@ func buildRFC822Message(d *DraftCompose) []byte {
 	if ct == "" {
 		ct = "text/plain"
 	}
-	fmt.Fprintf(&buf, "Content-Type: %s; charset=utf-8\r\n", ct)
+	if ct == "text/plain" {
+		fmt.Fprintf(&buf, "Content-Type: %s; charset=utf-8; format=flowed\r\n", ct)
+	} else {
+		fmt.Fprintf(&buf, "Content-Type: %s; charset=utf-8\r\n", ct)
+	}
 	buf.WriteString("Content-Transfer-Encoding: base64\r\n")
 	buf.WriteString("\r\n")
 
