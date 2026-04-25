@@ -232,13 +232,16 @@ func searchMessagesTool(vectorAvailable bool) mcp.Tool {
 		)
 	}
 	return mcp.NewTool(ToolSearchMessages,
-		mcp.WithDescription("Search emails using Gmail-like query syntax. Supports from:, to:, subject:, label:, has:attachment, before:, after:, and free text. Vector search is configured: set mode=vector for pure semantic search or mode=hybrid to fuse BM25 and vector ranking via RRF. Vector/hybrid modes require free-text terms in the query; filter-only queries must use mode=fts."),
+		mcp.WithDescription("Search emails using Gmail-like query syntax. Supports from:, to:, subject:, label:, has:attachment, before:, after:, and free text. Returns compact summaries by default; set full=true for snippets, labels, and other extra fields. Vector search is configured: set mode=vector for pure semantic search or mode=hybrid to fuse BM25 and vector ranking via RRF."),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithString("query",
 			mcp.Required(),
 			mcp.Description("Gmail-style search query (e.g. 'from:alice subject:meeting after:2024-01-01'); mode=vector|hybrid require at least one free-text term"),
 		),
 		withAccount(),
+		mcp.WithBoolean("full",
+			mcp.Description("Return full message summaries instead of compact results (default false)"),
+		),
 		withLimit("20"),
 		// offset is FTS-only here. Vector/hybrid responses don't page —
 		// callers should bump limit (capped by max_page_size_hybrid) instead.
@@ -292,7 +295,7 @@ func exportAttachmentTool() mcp.Tool {
 
 func listMessagesTool() mcp.Tool {
 	return mcp.NewTool(ToolListMessages,
-		mcp.WithDescription("List messages with optional filters. Returns message summaries sorted by date."),
+		mcp.WithDescription("List messages with optional filters. Returns compact summaries sorted by date by default; set full=true for snippets, labels, and other extra fields."),
 		mcp.WithReadOnlyHintAnnotation(true),
 		withAccount(),
 		mcp.WithString("from",
@@ -308,6 +311,9 @@ func listMessagesTool() mcp.Tool {
 		withBefore(),
 		mcp.WithBoolean("has_attachment",
 			mcp.Description("Only messages with attachments"),
+		),
+		mcp.WithBoolean("full",
+			mcp.Description("Return full message summaries instead of compact results (default false)"),
 		),
 		withLimit("20"),
 		withOffset(),

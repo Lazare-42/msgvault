@@ -46,6 +46,18 @@ type attachmentMeta struct {
 	Size     int64  `json:"size"`
 }
 
+type compactMessageSummary struct {
+	ID                   int64  `json:"id"`
+	SourceMessageID      string `json:"source_message_id"`
+	ConversationID       int64  `json:"conversation_id"`
+	SourceConversationID string `json:"source_conversation_id"`
+	Subject              string `json:"subject"`
+	FromEmail            string `json:"from_email"`
+	FromName             string `json:"from_name"`
+	SentAt               string `json:"sent_at"`
+	HasAttachments       bool   `json:"has_attachments"`
+}
+
 // newTestHandlers creates a handlers instance with the given mock engine.
 func newTestHandlers(eng *querytest.MockEngine) *handlers {
 	return &handlers{engine: eng}
@@ -109,12 +121,19 @@ func TestSearchMessages(t *testing.T) {
 	h := newTestHandlers(eng)
 
 	t.Run("valid query", func(t *testing.T) {
-		msgs := runTool[[]query.MessageSummary](t, "search_messages", h.searchMessages, map[string]any{"query": "from:alice"})
+		msgs := runTool[[]compactMessageSummary](t, "search_messages", h.searchMessages, map[string]any{"query": "from:alice"})
 		if len(msgs) != 1 || msgs[0].Subject != "Hello" {
 			t.Fatalf("unexpected result: %v", msgs)
 		}
 		if msgs[0].SourceConversationID != "thread-abc" {
 			t.Fatalf("expected SourceConversationID 'thread-abc', got %q", msgs[0].SourceConversationID)
+		}
+	})
+
+	t.Run("full results when requested", func(t *testing.T) {
+		msgs := runTool[[]query.MessageSummary](t, "search_messages", h.searchMessages, map[string]any{"query": "from:alice", "full": true})
+		if len(msgs) != 1 || msgs[0].Subject != "Hello" {
+			t.Fatalf("unexpected result: %v", msgs)
 		}
 	})
 
@@ -132,7 +151,7 @@ func TestSearchFallbackToFTS(t *testing.T) {
 	}
 	h := newTestHandlers(eng)
 
-	msgs := runTool[[]query.MessageSummary](t, "search_messages", h.searchMessages, map[string]any{"query": "important meeting notes"})
+	msgs := runTool[[]compactMessageSummary](t, "search_messages", h.searchMessages, map[string]any{"query": "important meeting notes"})
 	if len(msgs) != 1 || msgs[0].ID != 2 {
 		t.Fatalf("expected FTS fallback result, got: %v", msgs)
 	}
@@ -517,7 +536,7 @@ func TestListMessages(t *testing.T) {
 	h := newTestHandlers(eng)
 
 	t.Run("valid filters", func(t *testing.T) {
-		msgs := runTool[[]query.MessageSummary](t, "list_messages", h.listMessages, map[string]any{
+		msgs := runTool[[]compactMessageSummary](t, "list_messages", h.listMessages, map[string]any{
 			"from":  "alice@example.com",
 			"after": "2024-01-01",
 			"limit": float64(10),
@@ -527,6 +546,16 @@ func TestListMessages(t *testing.T) {
 		}
 		if msgs[0].SourceConversationID != "thread-list" {
 			t.Fatalf("expected SourceConversationID 'thread-list', got %q", msgs[0].SourceConversationID)
+		}
+	})
+
+	t.Run("full results when requested", func(t *testing.T) {
+		msgs := runTool[[]query.MessageSummary](t, "list_messages", h.listMessages, map[string]any{
+			"from": "alice@example.com",
+			"full": true,
+		})
+		if len(msgs) != 1 || msgs[0].SourceConversationID != "thread-list" {
+			t.Fatalf("unexpected result: %v", msgs)
 		}
 	})
 
