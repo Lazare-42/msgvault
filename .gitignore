@@ -45,3 +45,8 @@ result
 
 # Claude Code
 .claude/
+
+# wealthfolio runtime data — personal financial documents, NEVER commit
+integrations/*/outbox/
+integrations/*/state/
+integrations/*/lazare-local.*

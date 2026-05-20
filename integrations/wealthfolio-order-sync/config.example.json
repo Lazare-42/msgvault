@@ -1,0 +1,20 @@
+{
+  "output_dir": "/tmp/wealthfolio-order-sync/outbox",
+  "lookback_days_on_first_run": 3650,
+  "delivery": {
+    "rsync_target": "deploy@37.27.202.8:/var/www/wealthfolio/db/email-orders-inbox/",
+    "rsync_args": ["-a", "--mkpath"]
+  },
+  "rules": [
+    {
+      "name": "hsbc-executed-orders",
+      "query": "label:finances HSBC",
+      "wealthfolio_account_id": "2091ac03-229d-4d66-8d9e-7bfe3ce65678"
+    },
+    {
+      "name": "neuflize-executed-orders",
+      "query": "label:finances (Neuflize OR NOBC OR \"ABN AMRO\")",
+      "wealthfolio_account_id": "da8e6e87-c235-4150-9610-b30c47661a2e"
+    }
+  ]
+}
