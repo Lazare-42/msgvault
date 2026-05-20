@@ -10,6 +10,7 @@
 
   outputs =
     {
+      self,
       nixpkgs,
       flake-utils,
       gitignore,
@@ -61,5 +62,13 @@
 
         formatter = pkgs.nixfmt-rfc-style;
       }
-    );
+    )
+    // {
+      # Expose the package as an overlay for nixos-config wiring. This uses
+      # the per-system package built above (which scopes the Go pin to
+      # msgvault), so it does not leak goPinned into the consumer's closure.
+      overlays.default = final: _prev: {
+        msgvault = self.packages.${final.system}.default;
+      };
+    };
 }
