@@ -4,7 +4,7 @@
   };
 
   outputs =
-    { nixpkgs, ... }:
+    { self, nixpkgs, ... }:
     let
       forAllSystems =
         fn:
@@ -36,6 +36,10 @@
           ];
         };
       });
+
+      overlays.default = final: prev: {
+        msgvault = self.packages.${final.system}.default;
+      };
 
       devShells = forAllSystems (pkgs: {
         default = pkgs.mkShell {
