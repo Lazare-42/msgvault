@@ -48,3 +48,8 @@ result
 
 # Testify migration coverage baseline
 .testify-coverage/
+
+# wealthfolio runtime data — personal financial documents, NEVER commit
+integrations/*/outbox/
+integrations/*/state/
+integrations/*/lazare-local.*
