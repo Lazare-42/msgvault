@@ -69,3 +69,8 @@ docs/assets/static/
 docs/assets/generated/
 docs/screenshots/demo-data/
 .kata.local.toml
+
+# wealthfolio runtime data — personal financial documents, NEVER commit
+integrations/*/outbox/
+integrations/*/state/
+integrations/*/lazare-local.*
