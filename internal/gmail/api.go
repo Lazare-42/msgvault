@@ -198,9 +198,18 @@ type DraftCompose struct {
 	Cc          []string
 	Bcc         []string
 	Subject     string
-	Body        string // Email body (plain text or HTML)
-	ContentType string // "text/plain" (default) or "text/html"
-	ThreadID    string // Optional: set to reply within a thread
+	Body        string            // Email body (plain text or HTML)
+	ContentType string            // "text/plain" (default) or "text/html"
+	ThreadID    string            // Optional: set to reply within a thread
+	Attachments []DraftAttachment // Optional file attachments
+}
+
+// DraftAttachment is a file attached to a draft. Content holds the raw
+// (un-encoded) bytes; the message builder base64-encodes them.
+type DraftAttachment struct {
+	Filename    string
+	ContentType string // MIME type; defaults to application/octet-stream
+	Content     []byte
 }
 
 // SentMessage contains the result of sending a draft.

@@ -514,6 +514,9 @@ func createDraftTool() mcp.Tool {
 		mcp.WithString("thread_id",
 			mcp.Description("Thread ID to create a reply draft within an existing thread"),
 		),
+		mcp.WithString("attachment_ids",
+			mcp.Description("Attachment IDs to attach, comma-separated (from get_message). Attaches the archived file directly — no need to export first."),
+		),
 	)
 }
 
@@ -546,6 +549,9 @@ func updateDraftTool() mcp.Tool {
 		),
 		mcp.WithString("thread_id",
 			mcp.Description("Thread ID for reply drafts"),
+		),
+		mcp.WithString("attachment_ids",
+			mcp.Description("Attachment IDs to attach, comma-separated (from get_message). Replaces any existing attachments."),
 		),
 	)
 }

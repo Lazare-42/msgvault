@@ -749,38 +749,36 @@ func extractBody(p *gmailPayload) string {
 	return htmlFallback
 }
 
-// buildRFC822Message builds a minimal RFC 822 message from DraftCompose fields.
+// buildRFC822Message builds an RFC 822 message from DraftCompose fields. When
+// the draft has attachments it produces a multipart/mixed message; otherwise a
+// single-part message.
 func buildRFC822Message(d *DraftCompose) []byte {
-	var buf bytes.Buffer
+	if len(d.Attachments) == 0 {
+		return buildSimpleMessage(d)
+	}
+	return buildMultipartMessage(d)
+}
+
+// writeRecipientHeaders writes To/Cc/Bcc/Subject headers (and is shared by the
+// single-part and multipart builders).
+func writeRecipientHeaders(buf *bytes.Buffer, d *DraftCompose) {
 	if len(d.To) > 0 {
-		fmt.Fprintf(&buf, "To: %s\r\n", strings.Join(d.To, ", "))
+		fmt.Fprintf(buf, "To: %s\r\n", strings.Join(d.To, ", "))
 	}
 	if len(d.Cc) > 0 {
-		fmt.Fprintf(&buf, "Cc: %s\r\n", strings.Join(d.Cc, ", "))
+		fmt.Fprintf(buf, "Cc: %s\r\n", strings.Join(d.Cc, ", "))
 	}
 	if len(d.Bcc) > 0 {
-		fmt.Fprintf(&buf, "Bcc: %s\r\n", strings.Join(d.Bcc, ", "))
+		fmt.Fprintf(buf, "Bcc: %s\r\n", strings.Join(d.Bcc, ", "))
 	}
 	if d.Subject != "" {
-		fmt.Fprintf(&buf, "Subject: %s\r\n", mimeEncodeHeader(d.Subject))
+		fmt.Fprintf(buf, "Subject: %s\r\n", mimeEncodeHeader(d.Subject))
 	}
-	buf.WriteString("MIME-Version: 1.0\r\n")
+}
 
-	ct := d.ContentType
-	if ct == "" {
-		ct = "text/plain"
-	}
-	if ct == "text/plain" {
-		fmt.Fprintf(&buf, "Content-Type: %s; charset=utf-8; format=flowed\r\n", ct)
-	} else {
-		fmt.Fprintf(&buf, "Content-Type: %s; charset=utf-8\r\n", ct)
-	}
-	buf.WriteString("Content-Transfer-Encoding: base64\r\n")
-	buf.WriteString("\r\n")
-
-	// Base64-encode the body to safely transport any UTF-8 content.
-	encoded := base64.StdEncoding.EncodeToString([]byte(d.Body))
-	// Wrap at 76 chars per RFC 2045.
+// writeBase64 writes data as base64, wrapped at 76 chars per RFC 2045.
+func writeBase64(buf *bytes.Buffer, data []byte) {
+	encoded := base64.StdEncoding.EncodeToString(data)
 	for len(encoded) > 76 {
 		buf.WriteString(encoded[:76])
 		buf.WriteString("\r\n")
@@ -790,7 +788,69 @@ func buildRFC822Message(d *DraftCompose) []byte {
 		buf.WriteString(encoded)
 		buf.WriteString("\r\n")
 	}
+}
 
+// bodyContentType returns the Content-Type header value for the body part.
+func bodyContentType(d *DraftCompose) string {
+	ct := d.ContentType
+	if ct == "" {
+		ct = "text/plain"
+	}
+	if ct == "text/plain" {
+		return ct + "; charset=utf-8; format=flowed"
+	}
+	return ct + "; charset=utf-8"
+}
+
+// buildSimpleMessage builds a single-part RFC 822 message.
+func buildSimpleMessage(d *DraftCompose) []byte {
+	var buf bytes.Buffer
+	writeRecipientHeaders(&buf, d)
+	buf.WriteString("MIME-Version: 1.0\r\n")
+	fmt.Fprintf(&buf, "Content-Type: %s\r\n", bodyContentType(d))
+	buf.WriteString("Content-Transfer-Encoding: base64\r\n")
+	buf.WriteString("\r\n")
+	// Base64-encode the body to safely transport any UTF-8 content.
+	writeBase64(&buf, []byte(d.Body))
+	return buf.Bytes()
+}
+
+// buildMultipartMessage builds a multipart/mixed message with a body part
+// followed by one part per attachment.
+func buildMultipartMessage(d *DraftCompose) []byte {
+	// A random token keeps the boundary from colliding with message content.
+	boundary := fmt.Sprintf("=_msgvault_%016x", rand.Int63())
+
+	var buf bytes.Buffer
+	writeRecipientHeaders(&buf, d)
+	buf.WriteString("MIME-Version: 1.0\r\n")
+	fmt.Fprintf(&buf, "Content-Type: multipart/mixed; boundary=%q\r\n", boundary)
+	buf.WriteString("\r\n")
+
+	// Body part.
+	fmt.Fprintf(&buf, "--%s\r\n", boundary)
+	fmt.Fprintf(&buf, "Content-Type: %s\r\n", bodyContentType(d))
+	buf.WriteString("Content-Transfer-Encoding: base64\r\n")
+	buf.WriteString("\r\n")
+	writeBase64(&buf, []byte(d.Body))
+
+	// Attachment parts.
+	for i := range d.Attachments {
+		a := &d.Attachments[i]
+		mt := a.ContentType
+		if mt == "" {
+			mt = "application/octet-stream"
+		}
+		fname := mimeEncodeHeader(a.Filename)
+		fmt.Fprintf(&buf, "--%s\r\n", boundary)
+		fmt.Fprintf(&buf, "Content-Type: %s; name=%q\r\n", mt, fname)
+		buf.WriteString("Content-Transfer-Encoding: base64\r\n")
+		fmt.Fprintf(&buf, "Content-Disposition: attachment; filename=%q\r\n", fname)
+		buf.WriteString("\r\n")
+		writeBase64(&buf, a.Content)
+	}
+
+	fmt.Fprintf(&buf, "--%s--\r\n", boundary)
 	return buf.Bytes()
 }
 
