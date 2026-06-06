@@ -9,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -754,6 +755,55 @@ type searchMessageItem struct {
 	Matches          []messageMatch        `json:"matches,omitempty"`
 	MatchesTruncated bool                  `json:"matches_truncated,omitzero"`
 	Score            *hybridScoreBreakdown `json:"score,omitzero"`
+}
+
+// maxDraftAttachmentsSize caps the combined raw size of attachments on a single
+// draft. Gmail rejects messages over ~25MB; base64 inflates content by ~33%, so
+// the raw total must stay below that ceiling.
+const maxDraftAttachmentsSize = 18 * 1024 * 1024
+
+// resolveDraftAttachments loads the attachments named by the comma-separated
+// "attachment_ids" argument from the archive into draft attachments. Returns
+// (nil, nil) when no attachment_ids are provided.
+func (h *handlers) resolveDraftAttachments(ctx context.Context, args map[string]any) ([]gmail.DraftAttachment, error) {
+	raw, _ := args["attachment_ids"].(string)
+	ids := splitCSV(raw)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if h.attachmentsDir == "" {
+		return nil, fmt.Errorf("attachments directory not configured")
+	}
+
+	var atts []gmail.DraftAttachment
+	var total int64
+	for _, s := range ids {
+		id, err := strconv.ParseInt(s, 10, 64)
+		if err != nil || id < 1 {
+			return nil, fmt.Errorf("invalid attachment_id %q: must be a positive integer", s)
+		}
+		att, err := h.engine.GetAttachment(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("get attachment %d: %v", id, err)
+		}
+		if att == nil {
+			return nil, fmt.Errorf("attachment %d not found", id)
+		}
+		data, err := h.readAttachmentFile(att.ContentHash)
+		if err != nil {
+			return nil, fmt.Errorf("attachment %d: %v", id, err)
+		}
+		total += int64(len(data))
+		if total > maxDraftAttachmentsSize {
+			return nil, fmt.Errorf("total attachment size exceeds %d bytes", maxDraftAttachmentsSize)
+		}
+		atts = append(atts, gmail.DraftAttachment{
+			Filename:    att.Filename,
+			ContentType: att.MimeType,
+			Content:     data,
+		})
+	}
+	return atts, nil
 }
 
 // searchMessages preserves the legacy combined search tool while clients
@@ -2774,19 +2824,27 @@ func (h *handlers) createDraft(ctx context.Context, req mcp.CallToolRequest) (*m
 		compose.ThreadID = v
 	}
 
+	atts, err := h.resolveDraftAttachments(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	compose.Attachments = atts
+
 	draft, err := client.CreateDraft(ctx, compose)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("create draft: %v", err)), nil
 	}
 
 	resp := struct {
-		DraftID  string `json:"draft_id"`
-		Subject  string `json:"subject"`
-		NextStep string `json:"next_step"`
+		DraftID     string `json:"draft_id"`
+		Subject     string `json:"subject"`
+		Attachments int    `json:"attachments"`
+		NextStep    string `json:"next_step"`
 	}{
-		DraftID:  draft.ID,
-		Subject:  draft.Message.Subject,
-		NextStep: "Use send_draft to send, update_draft to modify, or delete_draft to discard",
+		DraftID:     draft.ID,
+		Subject:     draft.Message.Subject,
+		Attachments: len(atts),
+		NextStep:    "Use send_draft to send, update_draft to modify, or delete_draft to discard",
 	}
 
 	return jsonResult(resp)
@@ -2833,6 +2891,12 @@ func (h *handlers) updateDraft(ctx context.Context, req mcp.CallToolRequest) (*m
 	if v, _ := args["thread_id"].(string); v != "" {
 		compose.ThreadID = v
 	}
+
+	atts, err := h.resolveDraftAttachments(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	compose.Attachments = atts
 
 	draft, err := client.UpdateDraft(ctx, draftID, compose)
 	if err != nil {
