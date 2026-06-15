@@ -86,7 +86,7 @@ Important:
 echo "Running claude triage..."
 
 set +e
-claude -p \
+CLAUDE_OUT=$(claude -p \
     --model sonnet \
     --max-turns 50 \
     --allowedTools "mcp__mcpproxy__retrieve_tools,mcp__mcpproxy__call_tool_read,mcp__mcpproxy__call_tool_write" \
@@ -94,21 +94,49 @@ claude -p \
     --output-format json \
     --no-session-persistence \
     --append-system-prompt-file "$RULES_FILE" \
-    "$PROMPT"
+    "$PROMPT")
 EXIT_CODE=$?
 set -e
 
-if [[ $EXIT_CODE -eq 0 ]]; then
-    echo "$NOW" > "$LAST_RUN_FILE"
-    echo "Triage complete. Updated last_run to $NOW"
+# Emit Claude's JSON result to journald for debugging.
+printf '%s\n' "$CLAUDE_OUT"
 
-    # Re-sync from Gmail so the local archive reflects label changes made by triage
-    MSGVAULT_BIN="$(dirname "$0")/../msgvault"
-    if [[ -x "$MSGVAULT_BIN" ]]; then
-        echo "Syncing local archive from Gmail..."
-        "$MSGVAULT_BIN" sync --home "$MSGVAULT_HOME" 2>&1 || echo "WARNING: post-triage sync failed (non-fatal)"
-    fi
-else
-    echo "ERROR: claude exited with code $EXIT_CODE"
+if [[ $EXIT_CODE -ne 0 ]]; then
+    echo "ERROR: claude exited with code $EXIT_CODE — NOT advancing last_run"
     exit $EXIT_CODE
+fi
+
+# Guard against false success. claude -p exits 0 even when it did NO work —
+# e.g. it was blocked by a permission denial (call_tool_destructive not allowed)
+# or hit an internal error and just *described* the problem. Advancing last_run
+# in that case silently skips the whole window forever. Only advance when the
+# result JSON shows a clean run: not is_error AND no permission_denials.
+RUN_STATUS=$(printf '%s' "$CLAUDE_OUT" | python3 -c '
+import sys, json
+try:
+    line = [l for l in sys.stdin.read().splitlines() if l.strip()][-1]
+    d = json.loads(line)
+except Exception:
+    print("PARSE_FAIL"); sys.exit(0)
+if d.get("is_error"):
+    print("ERROR")
+elif (d.get("permission_denials") or []):
+    print("BLOCKED:%d" % len(d["permission_denials"]))
+else:
+    print("OK")
+' 2>/dev/null)
+
+if [[ "$RUN_STATUS" != "OK" ]]; then
+    echo "ERROR: triage did not complete cleanly (status=$RUN_STATUS) — NOT advancing last_run"
+    exit 1
+fi
+
+echo "$NOW" > "$LAST_RUN_FILE"
+echo "Triage complete. Updated last_run to $NOW"
+
+# Re-sync from Gmail so the local archive reflects label changes made by triage
+MSGVAULT_BIN="$(dirname "$0")/../msgvault"
+if [[ -x "$MSGVAULT_BIN" ]]; then
+    echo "Syncing local archive from Gmail..."
+    "$MSGVAULT_BIN" sync --home "$MSGVAULT_HOME" 2>&1 || echo "WARNING: post-triage sync failed (non-fatal)"
 fi
