@@ -12,10 +12,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/wesm/msgvault/internal/export"
-	"github.com/wesm/msgvault/internal/query"
-	"github.com/wesm/msgvault/internal/search"
-	"github.com/wesm/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/export"
+	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/store"
 )
 
 type syncRunner struct {
@@ -109,7 +109,7 @@ func (r *syncRunner) processRule(
 		if !ok {
 			return 0, fmt.Errorf("rule %q: msgvault account %q not found", rule.Name, rule.MsgvaultAccount)
 		}
-		q.AccountID = &accountID
+		q.AccountIDs = []int64{accountID}
 	}
 
 	var exported int
