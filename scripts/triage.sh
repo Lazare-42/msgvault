@@ -89,7 +89,7 @@ set +e
 CLAUDE_OUT=$(claude -p \
     --model sonnet \
     --max-turns 50 \
-    --allowedTools "mcp__mcpproxy__retrieve_tools,mcp__mcpproxy__call_tool_read,mcp__mcpproxy__call_tool_write" \
+    --allowedTools "mcp__mcpproxy__retrieve_tools,mcp__mcpproxy__call_tool_read,mcp__mcpproxy__call_tool_write,mcp__mcpproxy__read_cache" \
     --permission-mode dontAsk \
     --output-format json \
     --no-session-persistence \
