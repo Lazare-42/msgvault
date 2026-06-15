@@ -15,22 +15,30 @@ export MSGVAULT_HOME
 
 TRIAGE_DIR="$MSGVAULT_HOME/triage"
 LAST_RUN_FILE="$TRIAGE_DIR/last_run"
-MCP_CONFIG="$TRIAGE_DIR/mcp.json"
 RULES_FILE="$TRIAGE_DIR/rules.md"
 
-# Validate triage directory and config exist
+# msgvault is reached through the mcpproxy gateway already present in Claude
+# Code's managed MCP config (/etc/claude-code/managed-mcp.json). We do NOT pass
+# a per-run --mcp-config: Claude Code rejects dynamic --mcp-config whenever an
+# enterprise/managed config is present ("You cannot dynamically configure MCP
+# servers when an enterprise MCP config is present"). Map this run's archive to
+# its mcpproxy upstream server name.
+case "$MSGVAULT_HOME" in
+    *msgvault-work*) PROXY_SERVER="msgvault-work" ;;
+    *)               PROXY_SERVER="msgvault-personal" ;;
+esac
+
+# Validate triage directory and rules file exist
 if [[ ! -d "$TRIAGE_DIR" ]]; then
     echo "ERROR: triage directory not found: $TRIAGE_DIR"
     echo "Create it with: mkdir -p $TRIAGE_DIR && cp scripts/triage-rules.md $TRIAGE_DIR/rules.md"
     exit 1
 fi
 
-for f in "$MCP_CONFIG" "$RULES_FILE"; do
-    if [[ ! -f "$f" ]]; then
-        echo "ERROR: required file not found: $f"
-        exit 1
-    fi
-done
+if [[ ! -f "$RULES_FILE" ]]; then
+    echo "ERROR: required file not found: $RULES_FILE"
+    exit 1
+fi
 
 # Read last triage timestamp (default: 24 hours ago)
 if [[ -f "$LAST_RUN_FILE" ]]; then
@@ -45,14 +53,29 @@ NOW=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
 AFTER_DATE="${LAST_RUN%T*}"
 echo "Triage run: $LAST_RUN → $NOW (search after:$AFTER_DATE label:inbox)"
 echo "MSGVAULT_HOME: $MSGVAULT_HOME"
+echo "mcpproxy upstream: $PROXY_SERVER"
 
 PROMPT="Triage all unread/unprocessed INBOX messages since $AFTER_DATE.
 
+All msgvault tools are reached through the mcpproxy gateway. The msgvault
+instance for THIS run is the upstream server named \"$PROXY_SERVER\".
+
+Tool access (do this exactly):
+- FIRST call mcp__mcpproxy__retrieve_tools with query \"$PROXY_SERVER messages labels\"
+  to load the exact msgvault tool names and their input schemas for the
+  \"$PROXY_SERVER\" server.
+- Read operations (search_messages, get_message, list_messages, list_gmail_labels):
+  call mcp__mcpproxy__call_tool_read with name=\"$PROXY_SERVER:<tool>\" and the args
+  from that tool's schema.
+- Label changes (modify_labels): call mcp__mcpproxy__call_tool_write with
+  name=\"$PROXY_SERVER:modify_labels\". Always pass intent_reason and
+  intent_data_sensitivity=\"private\".
+
 Steps:
-1. Use search_messages to find messages still in INBOX (query: \"label:inbox after:$AFTER_DATE\"). Page through all results.
+1. search_messages to find messages still in INBOX (query: \"label:inbox after:$AFTER_DATE\"). Page through all results.
 2. For each message, check the deterministic rules first (see system prompt). If a rule matches, apply it immediately via modify_labels.
 3. For messages not caught by deterministic rules, read the subject + from + snippet and classify using the AI rules.
-4. Apply label changes via modify_labels (remove INBOX label to archive).
+4. Apply label changes via modify_labels (remove the INBOX label to archive).
 5. Output a JSON array summarizing all actions taken.
 
 Important:
@@ -65,9 +88,8 @@ echo "Running claude triage..."
 set +e
 claude -p \
     --model sonnet \
-    --max-turns 30 \
-    --mcp-config "$MCP_CONFIG" \
-    --allowedTools "mcp__msgvault__search_messages,mcp__msgvault__get_message,mcp__msgvault__list_messages,mcp__msgvault__list_gmail_labels,mcp__msgvault__modify_labels" \
+    --max-turns 50 \
+    --allowedTools "mcp__mcpproxy__retrieve_tools,mcp__mcpproxy__call_tool_read,mcp__mcpproxy__call_tool_write" \
     --permission-mode dontAsk \
     --output-format json \
     --no-session-persistence \
