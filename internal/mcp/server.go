@@ -280,7 +280,7 @@ func searchMessagesTool(vectorAvailable bool) mcp.Tool {
 			mcp.WithDescription("Search emails using Gmail-like query syntax. Supports from:, to:, subject:, label:, has:attachment, before:, after:, and free text. "+
 				"Paginate with offset/limit (default limit 20, max 50). Response: data, total, returned, offset, has_more. "+
 				"(This server is not configured for vector search; only keyword FTS is available.)"),
-			mcp.WithReadOnlyHintAnnotation(true),
+			mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 			mcp.WithString("query",
 				mcp.Required(),
 				mcp.Description("Gmail-style search query (e.g. 'from:alice subject:meeting after:2024-01-01')"),
@@ -297,7 +297,7 @@ func searchMessagesTool(vectorAvailable bool) mcp.Tool {
 			"total=-1 means the full match count is unknown — use has_more. "+
 			"Vector/hybrid ranking depth is capped by max_page_size_hybrid in config; beyond that use mode=fts. "+
 			"Vector search is configured: set mode=vector for pure semantic search or mode=hybrid to fuse BM25 and vector ranking via RRF. Vector/hybrid modes require free-text terms in the query; filter-only queries must use mode=fts."),
-		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithString("query",
 			mcp.Required(),
 			mcp.Description("Gmail-style search query (e.g. 'from:alice subject:meeting after:2024-01-01'); mode=vector|hybrid require at least one free-text term"),
@@ -323,7 +323,7 @@ func searchMessagesTool(vectorAvailable bool) mcp.Tool {
 func getMessageTool() mcp.Tool {
 	return mcp.NewTool(ToolGetMessage,
 		mcp.WithDescription("Get full message details including body text, recipients, labels, and attachments by message ID."),
-		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithNumber("id",
 			mcp.Required(),
 			mcp.Description("Message ID"),
@@ -334,7 +334,7 @@ func getMessageTool() mcp.Tool {
 func getAttachmentTool() mcp.Tool {
 	return mcp.NewTool(ToolGetAttachment,
 		mcp.WithDescription("Get attachment content by attachment ID. Returns metadata as text and the file content as an embedded resource blob. Use get_message first to find attachment IDs."),
-		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithNumber("attachment_id",
 			mcp.Required(),
 			mcp.Description("Attachment ID (from get_message response)"),
@@ -345,6 +345,7 @@ func getAttachmentTool() mcp.Tool {
 func exportAttachmentTool() mcp.Tool {
 	return mcp.NewTool(ToolExportAttachment,
 		mcp.WithDescription("Save an attachment to the local filesystem. Use this for file types that cannot be displayed inline (e.g. PDFs, documents). Returns the saved file path."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithNumber("attachment_id",
 			mcp.Required(),
 			mcp.Description("Attachment ID (from get_message response)"),
@@ -360,7 +361,7 @@ func listMessagesTool() mcp.Tool {
 		mcp.WithDescription("List messages with optional filters. Returns compact summaries sorted by date by default; set full=true for snippets, labels, and other extra fields. "+
 			"Paginate with offset/limit (default limit 20, max 50). Response: data, total, returned, offset, has_more. "+
 			"total=-1 because the full count is not computed; use has_more for paging."),
-		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
 		mcp.WithString("from",
 			mcp.Description("Filter by sender email address"),
@@ -387,14 +388,14 @@ func listMessagesTool() mcp.Tool {
 func getStatsTool() mcp.Tool {
 	return mcp.NewTool(ToolGetStats,
 		mcp.WithDescription("Get archive overview: total messages, size, attachment count, and accounts."),
-		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 	)
 }
 
 func aggregateTool() mcp.Tool {
 	return mcp.NewTool(ToolAggregate,
 		mcp.WithDescription("Get grouped statistics (e.g. top senders, domains, labels, or message volume over time)."),
-		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithString("group_by",
 			mcp.Required(),
 			mcp.Description("Dimension to group by"),
@@ -449,7 +450,7 @@ func stageDeletionTool() mcp.Tool {
 func findSimilarMessagesTool() mcp.Tool {
 	return mcp.NewTool(ToolFindSimilarMessages,
 		mcp.WithDescription("Find messages whose embeddings are closest to the given message. Requires vector search to be configured and an active index generation."),
-		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithNumber("message_id",
 			mcp.Required(),
 			mcp.Description("Seed message ID; its embedding is used as the query vector"),
@@ -467,7 +468,7 @@ func findSimilarMessagesTool() mcp.Tool {
 func listDraftsTool() mcp.Tool {
 	return mcp.NewTool(ToolListDrafts,
 		mcp.WithDescription("List email drafts from Gmail. Returns draft ID, subject, recipients, and body preview for each draft."),
-		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
 		mcp.WithString("query",
 			mcp.Description("Optional Gmail-style search query to filter drafts (e.g. 'subject:meeting')"),
@@ -479,7 +480,7 @@ func listDraftsTool() mcp.Tool {
 func getDraftTool() mcp.Tool {
 	return mcp.NewTool(ToolGetDraft,
 		mcp.WithDescription("Get full details of a single Gmail draft by draft ID, including body text, recipients, and subject."),
-		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
 		mcp.WithString("draft_id",
 			mcp.Required(),
@@ -491,6 +492,7 @@ func getDraftTool() mcp.Tool {
 func createDraftTool() mcp.Tool {
 	return mcp.NewTool(ToolCreateDraft,
 		mcp.WithDescription("Create a new email draft in Gmail. The draft is saved but NOT sent. Use send_draft to send it. For rich formatting (links, bold, etc.), set content_type to text/html and provide HTML body."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
 		mcp.WithString("to",
 			mcp.Description("Recipient email address(es), comma-separated"),
@@ -523,6 +525,7 @@ func createDraftTool() mcp.Tool {
 func updateDraftTool() mcp.Tool {
 	return mcp.NewTool(ToolUpdateDraft,
 		mcp.WithDescription("Update an existing Gmail draft. Replaces the entire draft content."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
 		mcp.WithString("draft_id",
 			mcp.Required(),
@@ -581,6 +584,7 @@ func sendDraftTool() mcp.Tool {
 func modifyLabelsTool() mcp.Tool {
 	return mcp.NewTool(ToolModifyLabels,
 		mcp.WithDescription("Add and/or remove Gmail labels on messages. Use this to label, archive (remove INBOX), mark read (remove UNREAD), star, or categorize messages. Provide Gmail message IDs (from search_messages source_message_id field). Use list_gmail_labels to find label IDs."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
 		mcp.WithString("message_ids",
 			mcp.Required(),
@@ -598,6 +602,7 @@ func modifyLabelsTool() mcp.Tool {
 func createLabelTool() mcp.Tool {
 	return mcp.NewTool(ToolCreateLabel,
 		mcp.WithDescription("Create a new Gmail label. Returns the label ID which can be used with modify_labels."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
 		mcp.WithString("name",
 			mcp.Required(),
@@ -620,7 +625,7 @@ func deleteLabelTool() mcp.Tool {
 func listGmailLabelsTool() mcp.Tool {
 	return mcp.NewTool(ToolListGmailLabels,
 		mcp.WithDescription("List all Gmail labels from the live account (not the archive). Returns label IDs and names for use with modify_labels."),
-		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
 	)
 }
