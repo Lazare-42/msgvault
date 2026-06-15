@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
-	mvconfig "github.com/wesm/msgvault/internal/config"
+	mvconfig "go.kenn.io/msgvault/internal/config"
 )
 
 const defaultPageSize = 100

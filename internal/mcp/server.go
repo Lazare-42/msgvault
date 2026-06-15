@@ -678,7 +678,7 @@ func agentReadToolPermission(name string) (agentgrant.Permission, bool) {
 func listDraftsTool() mcp.Tool {
 	return mcp.NewTool(ToolListDrafts,
 		mcp.WithDescription("List email drafts from Gmail. Returns draft ID, subject, recipients, and body preview for each draft."),
-		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
 		mcp.WithString("query",
 			mcp.Description("Optional Gmail-style search query to filter drafts (e.g. 'subject:meeting')"),
@@ -690,7 +690,7 @@ func listDraftsTool() mcp.Tool {
 func getDraftTool() mcp.Tool {
 	return mcp.NewTool(ToolGetDraft,
 		mcp.WithDescription("Get full details of a single Gmail draft by draft ID, including body text, recipients, and subject."),
-		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
 		mcp.WithString("draft_id",
 			mcp.Required(),
@@ -702,6 +702,7 @@ func getDraftTool() mcp.Tool {
 func createDraftTool() mcp.Tool {
 	return mcp.NewTool(ToolCreateDraft,
 		mcp.WithDescription("Create a new email draft in Gmail. The draft is saved but NOT sent. Use send_draft to send it. For rich formatting (links, bold, etc.), set content_type to text/html and provide HTML body."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
 		mcp.WithString("to",
 			mcp.Description("Recipient email address(es), comma-separated"),
@@ -734,6 +735,7 @@ func createDraftTool() mcp.Tool {
 func updateDraftTool() mcp.Tool {
 	return mcp.NewTool(ToolUpdateDraft,
 		mcp.WithDescription("Update an existing Gmail draft. Replaces the entire draft content."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
 		mcp.WithString("draft_id",
 			mcp.Required(),
@@ -792,6 +794,7 @@ func sendDraftTool() mcp.Tool {
 func modifyLabelsTool() mcp.Tool {
 	return mcp.NewTool(ToolModifyLabels,
 		mcp.WithDescription("Add and/or remove Gmail labels on messages. Use this to label, archive (remove INBOX), mark read (remove UNREAD), star, or categorize messages. Provide Gmail message IDs (from search_messages source_message_id field). Use list_gmail_labels to find label IDs."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
 		mcp.WithString("message_ids",
 			mcp.Required(),
@@ -809,6 +812,7 @@ func modifyLabelsTool() mcp.Tool {
 func createLabelTool() mcp.Tool {
 	return mcp.NewTool(ToolCreateLabel,
 		mcp.WithDescription("Create a new Gmail label. Returns the label ID which can be used with modify_labels."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
 		mcp.WithString("name",
 			mcp.Required(),
@@ -831,7 +835,7 @@ func deleteLabelTool() mcp.Tool {
 func listGmailLabelsTool() mcp.Tool {
 	return mcp.NewTool(ToolListGmailLabels,
 		mcp.WithDescription("List all Gmail labels from the live account (not the archive). Returns label IDs and names for use with modify_labels."),
-		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
 	)
 }
