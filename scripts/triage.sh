@@ -76,12 +76,18 @@ Steps:
 2. For each message, check the deterministic rules first (see system prompt). If a rule matches, apply it immediately via modify_labels.
 3. For messages not caught by deterministic rules, read the subject + from + snippet and classify using the AI rules.
 4. Apply label changes via modify_labels (remove the INBOX label to archive).
-5. Output a JSON array summarizing all actions taken.
+5. When done, output ONLY a short summary: total processed, number archived,
+   number kept in INBOX, and a per-rule/category count. Do NOT list individual
+   messages or emit a large JSON array — keep the final response under ~40 lines.
 
 Important:
 - Only process messages that are in INBOX (the query already filters for this).
 - When in doubt, keep the message in INBOX (conservative).
-- Process ALL matching messages, paging through results as needed."
+- Process ALL matching messages, paging through results as needed.
+- Archive in batches: pass many message IDs to a single modify_labels call
+  rather than one call per message.
+- Keep your own running tally; do NOT accumulate per-message detail in your
+  replies — your final response must stay compact regardless of volume."
 
 echo "Running claude triage..."
 
