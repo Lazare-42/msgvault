@@ -237,6 +237,23 @@ func TestGetMessage(t *testing.T) {
 	assert.Equal("Message body 1", msg.BodyText)
 }
 
+func TestGetMessageExposesRFC822MessageID(t *testing.T) {
+	require := requirepkg.New(t)
+	assert := assertpkg.New(t)
+	env := newTestEnv(t)
+
+	const wantID = "<AS4P191MB2254@AS4P191MB2254.EURP191.PROD.OUTLOOK.COM>"
+	_, err := env.DB.Exec(`UPDATE messages SET rfc822_message_id = ? WHERE id = 1`, wantID)
+	require.NoError(err, "set rfc822_message_id")
+
+	msg, err := env.Engine.GetMessage(env.Ctx, 1)
+	require.NoError(err, "GetMessage")
+	require.NotNil(msg, "expected message")
+	// This is the value composers pass as create_draft's in_reply_to to
+	// produce a true reply that threads across mail clients.
+	assert.Equal(wantID, msg.RFC822MessageID, "rfc822_message_id")
+}
+
 func TestGetMessageWithAttachments(t *testing.T) {
 	require := requirepkg.New(t)
 	assert := assertpkg.New(t)
