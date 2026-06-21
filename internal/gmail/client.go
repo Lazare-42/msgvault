@@ -774,6 +774,20 @@ func writeRecipientHeaders(buf *bytes.Buffer, d *DraftCompose) {
 	if d.Subject != "" {
 		fmt.Fprintf(buf, "Subject: %s\r\n", mimeEncodeHeader(d.Subject))
 	}
+	// Reply threading headers. In-Reply-To/References are RFC 5322
+	// Message-IDs and are ASCII by construction, so they are emitted
+	// verbatim (no encoded-word wrapping). References defaults to
+	// In-Reply-To when not supplied so the chain is never empty for a reply.
+	if d.InReplyTo != "" {
+		fmt.Fprintf(buf, "In-Reply-To: %s\r\n", d.InReplyTo)
+	}
+	references := d.References
+	if references == "" {
+		references = d.InReplyTo
+	}
+	if references != "" {
+		fmt.Fprintf(buf, "References: %s\r\n", references)
+	}
 }
 
 // writeBase64 writes data as base64, wrapped at 76 chars per RFC 2045.
