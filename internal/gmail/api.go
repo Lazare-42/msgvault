@@ -198,9 +198,20 @@ type DraftCompose struct {
 	Cc          []string
 	Bcc         []string
 	Subject     string
-	Body        string            // Email body (plain text or HTML)
-	ContentType string            // "text/plain" (default) or "text/html"
-	ThreadID    string            // Optional: set to reply within a thread
+	Body        string // Email body (plain text or HTML)
+	ContentType string // "text/plain" (default) or "text/html"
+	ThreadID    string // Optional: set to reply within a thread
+
+	// InReplyTo and References make the draft a true reply rather than a
+	// new message dropped into a thread. InReplyTo is the RFC 5322
+	// Message-ID of the message being replied to (with angle brackets,
+	// e.g. "<abc@mail.gmail.com>"). References is the full reference chain
+	// (space-separated Message-IDs); when empty it defaults to InReplyTo.
+	// Setting these lets non-Gmail clients (Outlook, etc.) nest the reply
+	// correctly, which ThreadID alone does not guarantee.
+	InReplyTo  string
+	References string
+
 	Attachments []DraftAttachment // Optional file attachments
 }
 
