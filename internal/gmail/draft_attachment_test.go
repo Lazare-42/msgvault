@@ -25,6 +25,53 @@ func TestBuildRFC822Message_NoAttachments_SinglePart(t *testing.T) {
 	}
 }
 
+func TestBuildRFC822Message_ReplyHeaders(t *testing.T) {
+	t.Run("in_reply_to defaults references", func(t *testing.T) {
+		d := &DraftCompose{
+			To:        []string{"a@example.com"},
+			Subject:   "RE: hi",
+			Body:      "hello",
+			InReplyTo: "<orig-123@mail.gmail.com>",
+		}
+		msg, err := mail.ReadMessage(strings.NewReader(string(buildRFC822Message(d))))
+		if err != nil {
+			t.Fatalf("parse message: %v", err)
+		}
+		if got := msg.Header.Get("In-Reply-To"); got != "<orig-123@mail.gmail.com>" {
+			t.Fatalf("In-Reply-To = %q", got)
+		}
+		// References defaults to In-Reply-To when not supplied.
+		if got := msg.Header.Get("References"); got != "<orig-123@mail.gmail.com>" {
+			t.Fatalf("References = %q (expected to default to In-Reply-To)", got)
+		}
+	})
+
+	t.Run("explicit references chain", func(t *testing.T) {
+		d := &DraftCompose{
+			To:         []string{"a@example.com"},
+			Subject:    "RE: hi",
+			Body:       "hello",
+			InReplyTo:  "<msg-2@x>",
+			References: "<msg-0@x> <msg-1@x> <msg-2@x>",
+		}
+		msg, err := mail.ReadMessage(strings.NewReader(string(buildRFC822Message(d))))
+		if err != nil {
+			t.Fatalf("parse message: %v", err)
+		}
+		if got := msg.Header.Get("References"); got != "<msg-0@x> <msg-1@x> <msg-2@x>" {
+			t.Fatalf("References = %q", got)
+		}
+	})
+
+	t.Run("no reply headers when not a reply", func(t *testing.T) {
+		d := &DraftCompose{To: []string{"a@example.com"}, Subject: "hi", Body: "hello"}
+		raw := string(buildRFC822Message(d))
+		if strings.Contains(raw, "In-Reply-To:") || strings.Contains(raw, "References:") {
+			t.Fatalf("unexpected reply headers in non-reply draft:\n%s", raw)
+		}
+	})
+}
+
 func TestBuildRFC822Message_WithAttachments_Multipart(t *testing.T) {
 	pdf := []byte("%PDF-1.4 fake cession bytes \x00\x01\x02")
 	d := &DraftCompose{

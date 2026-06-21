@@ -2823,6 +2823,12 @@ func (h *handlers) createDraft(ctx context.Context, req mcp.CallToolRequest) (*m
 	if v, _ := args["thread_id"].(string); v != "" {
 		compose.ThreadID = v
 	}
+	if v, _ := args["in_reply_to"].(string); v != "" {
+		compose.InReplyTo = v
+	}
+	if v, _ := args["references"].(string); v != "" {
+		compose.References = v
+	}
 
 	atts, err := h.resolveDraftAttachments(ctx, args)
 	if err != nil {
@@ -2890,6 +2896,12 @@ func (h *handlers) updateDraft(ctx context.Context, req mcp.CallToolRequest) (*m
 	}
 	if v, _ := args["thread_id"].(string); v != "" {
 		compose.ThreadID = v
+	}
+	if v, _ := args["in_reply_to"].(string); v != "" {
+		compose.InReplyTo = v
+	}
+	if v, _ := args["references"].(string); v != "" {
+		compose.References = v
 	}
 
 	atts, err := h.resolveDraftAttachments(ctx, args)
