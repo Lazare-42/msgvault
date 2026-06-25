@@ -252,8 +252,8 @@ func TestGetMessage(t *testing.T) {
 }
 
 func TestGetMessageExposesRFC822MessageID(t *testing.T) {
-	require := requirepkg.New(t)
-	assert := assertpkg.New(t)
+	require := require.New(t)
+	assert := assert.New(t)
 	env := newTestEnv(t)
 
 	const wantID = "<AS4P191MB2254@AS4P191MB2254.EURP191.PROD.OUTLOOK.COM>"
