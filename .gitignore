@@ -74,3 +74,6 @@ docs/screenshots/demo-data/
 integrations/*/outbox/
 integrations/*/state/
 integrations/*/lazare-local.*
+
+# personal financial/legal scratch documents (real PII) — NEVER commit
+PHildev/
