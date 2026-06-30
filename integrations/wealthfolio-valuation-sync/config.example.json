@@ -1,0 +1,14 @@
+{
+  "output_dir": "/data/lazrossi/msgvault-data/wealthfolio-valuations/outbox",
+  "lookback_days_on_first_run": 400,
+  "delivery": {
+    "rsync_target": "/data/lazrossi/wealthfolio-data/nav-inbox/",
+    "rsync_args": ["-a", "--mkpath"]
+  },
+  "rules": [
+    { "name": "neuflize-valuations",  "query": "from:fr.abnamro.com (relevé OR valorisation OR titres OR portefeuille OR \"avis\")" },
+    { "name": "sofra-valuations",     "query": "from:sofrapro.fr (valorisation OR valeur OR liquidative)" },
+    { "name": "dyptique-valuations",  "query": "from:dyptiquegestion.fr (valorisation OR relevé OR portefeuille OR reporting)" },
+    { "name": "hsbc-valuations",      "query": "from:hsbcprivatebank.com (\"état des biens\" OR valorisation OR relevé)" }
+  ]
+}
