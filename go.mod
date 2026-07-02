@@ -24,6 +24,7 @@ require (
 	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6
 	github.com/go-playground/validator/v10 v10.30.5
 	github.com/gofrs/flock v0.13.1
+	github.com/emersion/go-smtp v0.24.0
 	github.com/gogs/chardet v0.0.0-20211120154057-b7413eaefb8f
 	github.com/google/go-cmp v0.7.0
 	github.com/google/jsonschema-go v0.4.3
