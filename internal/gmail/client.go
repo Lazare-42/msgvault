@@ -749,136 +749,6 @@ func extractBody(p *gmailPayload) string {
 	return htmlFallback
 }
 
-// buildRFC822Message builds an RFC 822 message from DraftCompose fields. When
-// the draft has attachments it produces a multipart/mixed message; otherwise a
-// single-part message.
-func buildRFC822Message(d *DraftCompose) []byte {
-	if len(d.Attachments) == 0 {
-		return buildSimpleMessage(d)
-	}
-	return buildMultipartMessage(d)
-}
-
-// writeRecipientHeaders writes To/Cc/Bcc/Subject headers (and is shared by the
-// single-part and multipart builders).
-func writeRecipientHeaders(buf *bytes.Buffer, d *DraftCompose) {
-	if len(d.To) > 0 {
-		fmt.Fprintf(buf, "To: %s\r\n", strings.Join(d.To, ", "))
-	}
-	if len(d.Cc) > 0 {
-		fmt.Fprintf(buf, "Cc: %s\r\n", strings.Join(d.Cc, ", "))
-	}
-	if len(d.Bcc) > 0 {
-		fmt.Fprintf(buf, "Bcc: %s\r\n", strings.Join(d.Bcc, ", "))
-	}
-	if d.Subject != "" {
-		fmt.Fprintf(buf, "Subject: %s\r\n", mimeEncodeHeader(d.Subject))
-	}
-	// Reply threading headers. In-Reply-To/References are RFC 5322
-	// Message-IDs and are ASCII by construction, so they are emitted
-	// verbatim (no encoded-word wrapping). References defaults to
-	// In-Reply-To when not supplied so the chain is never empty for a reply.
-	if d.InReplyTo != "" {
-		fmt.Fprintf(buf, "In-Reply-To: %s\r\n", d.InReplyTo)
-	}
-	references := d.References
-	if references == "" {
-		references = d.InReplyTo
-	}
-	if references != "" {
-		fmt.Fprintf(buf, "References: %s\r\n", references)
-	}
-}
-
-// writeBase64 writes data as base64, wrapped at 76 chars per RFC 2045.
-func writeBase64(buf *bytes.Buffer, data []byte) {
-	encoded := base64.StdEncoding.EncodeToString(data)
-	for len(encoded) > 76 {
-		buf.WriteString(encoded[:76])
-		buf.WriteString("\r\n")
-		encoded = encoded[76:]
-	}
-	if len(encoded) > 0 {
-		buf.WriteString(encoded)
-		buf.WriteString("\r\n")
-	}
-}
-
-// bodyContentType returns the Content-Type header value for the body part.
-func bodyContentType(d *DraftCompose) string {
-	ct := d.ContentType
-	if ct == "" {
-		ct = "text/plain"
-	}
-	if ct == "text/plain" {
-		return ct + "; charset=utf-8; format=flowed"
-	}
-	return ct + "; charset=utf-8"
-}
-
-// buildSimpleMessage builds a single-part RFC 822 message.
-func buildSimpleMessage(d *DraftCompose) []byte {
-	var buf bytes.Buffer
-	writeRecipientHeaders(&buf, d)
-	buf.WriteString("MIME-Version: 1.0\r\n")
-	fmt.Fprintf(&buf, "Content-Type: %s\r\n", bodyContentType(d))
-	buf.WriteString("Content-Transfer-Encoding: base64\r\n")
-	buf.WriteString("\r\n")
-	// Base64-encode the body to safely transport any UTF-8 content.
-	writeBase64(&buf, []byte(d.Body))
-	return buf.Bytes()
-}
-
-// buildMultipartMessage builds a multipart/mixed message with a body part
-// followed by one part per attachment.
-func buildMultipartMessage(d *DraftCompose) []byte {
-	// A random token keeps the boundary from colliding with message content.
-	boundary := fmt.Sprintf("=_msgvault_%016x", rand.Int63())
-
-	var buf bytes.Buffer
-	writeRecipientHeaders(&buf, d)
-	buf.WriteString("MIME-Version: 1.0\r\n")
-	fmt.Fprintf(&buf, "Content-Type: multipart/mixed; boundary=%q\r\n", boundary)
-	buf.WriteString("\r\n")
-
-	// Body part.
-	fmt.Fprintf(&buf, "--%s\r\n", boundary)
-	fmt.Fprintf(&buf, "Content-Type: %s\r\n", bodyContentType(d))
-	buf.WriteString("Content-Transfer-Encoding: base64\r\n")
-	buf.WriteString("\r\n")
-	writeBase64(&buf, []byte(d.Body))
-
-	// Attachment parts.
-	for i := range d.Attachments {
-		a := &d.Attachments[i]
-		mt := a.ContentType
-		if mt == "" {
-			mt = "application/octet-stream"
-		}
-		fname := mimeEncodeHeader(a.Filename)
-		fmt.Fprintf(&buf, "--%s\r\n", boundary)
-		fmt.Fprintf(&buf, "Content-Type: %s; name=%q\r\n", mt, fname)
-		buf.WriteString("Content-Transfer-Encoding: base64\r\n")
-		fmt.Fprintf(&buf, "Content-Disposition: attachment; filename=%q\r\n", fname)
-		buf.WriteString("\r\n")
-		writeBase64(&buf, a.Content)
-	}
-
-	fmt.Fprintf(&buf, "--%s--\r\n", boundary)
-	return buf.Bytes()
-}
-
-// mimeEncodeHeader encodes a header value using RFC 2047 encoded-word
-// if it contains non-ASCII characters. ASCII-only values are returned as-is.
-func mimeEncodeHeader(s string) string {
-	for i := 0; i < len(s); i++ {
-		if s[i] > 127 {
-			return "=?utf-8?B?" + base64.StdEncoding.EncodeToString([]byte(s)) + "?="
-		}
-	}
-	return s
-}
-
 // ListDrafts returns drafts matching the optional query.
 func (c *Client) ListDrafts(ctx context.Context, query string, maxResults int) ([]*Draft, error) {
 	params := url.Values{}
@@ -943,7 +813,10 @@ func (c *Client) GetDraft(ctx context.Context, draftID string) (*Draft, error) {
 
 // CreateDraft creates a new draft.
 func (c *Client) CreateDraft(ctx context.Context, compose *DraftCompose) (*Draft, error) {
-	raw := buildRFC822Message(compose)
+	raw, err := BuildDraftMIME(compose)
+	if err != nil {
+		return nil, fmt.Errorf("build draft MIME: %w", err)
+	}
 	encoded := base64.URLEncoding.EncodeToString(raw)
 
 	body := struct {
@@ -978,7 +851,10 @@ func (c *Client) CreateDraft(ctx context.Context, compose *DraftCompose) (*Draft
 
 // UpdateDraft replaces the content of an existing draft.
 func (c *Client) UpdateDraft(ctx context.Context, draftID string, compose *DraftCompose) (*Draft, error) {
-	raw := buildRFC822Message(compose)
+	raw, err := BuildDraftMIME(compose)
+	if err != nil {
+		return nil, fmt.Errorf("build draft MIME: %w", err)
+	}
 	encoded := base64.URLEncoding.EncodeToString(raw)
 
 	body := struct {

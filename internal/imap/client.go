@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
 	"slices"
@@ -89,6 +90,7 @@ type Client struct {
 	trashMailbox        string               // cached trash mailbox name
 	junkMailbox         string               // cached junk/spam mailbox name
 	allMailFolder       string               // mailbox with \All attribute (empty if not detected)
+	draftsMailbox       string               // mailbox with \Drafts attribute (empty if not detected)
 	msgIDToLabels       map[string][]string  // RFC822 Message-ID → mailbox memberships
 	seenRFC822IDs       map[string]bool      // dedup overlapping mailbox copies
 	labelMapComplete    bool                 // latest listing collected every mailbox membership
@@ -277,7 +279,14 @@ func (c *Client) listMailboxesLocked() ([]string, error) {
 		return c.mailboxCache, nil
 	}
 
-	items, err := c.conn.List("", "*", nil).Collect()
+	listOpts := &imap.ListOptions{}
+	if c.conn.Caps().Has(imap.CapSpecialUse) {
+		listOpts.ReturnSpecialUse = true
+	}
+	items, err := c.conn.List("", "*", listOpts).Collect()
+	if err != nil && listOpts.ReturnSpecialUse {
+		items, err = c.conn.List("", "*", &imap.ListOptions{}).Collect()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("LIST: %w", err)
 	}
@@ -297,8 +306,19 @@ func (c *Client) listMailboxesLocked() ([]string, error) {
 		if c.junkMailbox == "" && hasAttr(item.Attrs, imap.MailboxAttrJunk) {
 			c.junkMailbox = item.Mailbox
 		}
+		if c.draftsMailbox == "" && hasAttr(item.Attrs, imap.MailboxAttrDrafts) {
+			c.draftsMailbox = item.Mailbox
+		}
 	}
 
+	c.applyMailboxNameFallbacks(names)
+	c.mailboxCache = names
+	return names, nil
+}
+
+// applyMailboxNameFallbacks detects common system folder names when SPECIAL-USE
+// attributes are absent.
+func (c *Client) applyMailboxNameFallbacks(names []string) {
 	// Fallback: look for common junk/spam folder names
 	if c.junkMailbox == "" {
 		for _, candidate := range []string{
@@ -332,8 +352,36 @@ func (c *Client) listMailboxesLocked() ([]string, error) {
 		}
 	}
 
-	c.mailboxCache = names
-	return names, nil
+	// Fallback: look for common drafts folder names
+	if c.draftsMailbox == "" {
+		for _, candidate := range []string{"Drafts", "Draft", "[Gmail]/Drafts"} {
+			for _, mb := range names {
+				if strings.EqualFold(mb, candidate) {
+					c.draftsMailbox = mb
+					break
+				}
+			}
+			if c.draftsMailbox != "" {
+				break
+			}
+		}
+	}
+}
+
+// draftsMailboxLocked returns the drafts mailbox, preferring RFC 6154 \Drafts.
+// Caller must hold mu.
+func (c *Client) draftsMailboxLocked() (string, error) {
+	if c.draftsMailbox != "" {
+		return c.draftsMailbox, nil
+	}
+	if _, err := c.listMailboxesLocked(); err != nil {
+		return "", err
+	}
+	if c.draftsMailbox != "" {
+		return c.draftsMailbox, nil
+	}
+	c.draftsMailbox = "Drafts"
+	return c.draftsMailbox, nil
 }
 
 // enumerateMailboxSearchCriteria always constrains the search with an
@@ -1122,7 +1170,7 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// Draft stubs — IMAP does not support Gmail draft operations.
+// Draft operations.
 
 func (c *Client) ListDrafts(_ context.Context, _ string, _ int) ([]*gmailapi.Draft, error) {
 	return nil, fmt.Errorf("IMAP does not support Gmail draft operations")
@@ -1132,8 +1180,74 @@ func (c *Client) GetDraft(_ context.Context, _ string) (*gmailapi.Draft, error) 
 	return nil, fmt.Errorf("IMAP does not support Gmail draft operations")
 }
 
-func (c *Client) CreateDraft(_ context.Context, _ *gmailapi.DraftCompose) (*gmailapi.Draft, error) {
-	return nil, fmt.Errorf("IMAP does not support Gmail draft operations")
+func (c *Client) CreateDraft(ctx context.Context, compose *gmailapi.DraftCompose) (*gmailapi.Draft, error) {
+	raw, err := gmailapi.BuildDraftMIME(compose)
+	if err != nil {
+		return nil, fmt.Errorf("build draft MIME: %w", err)
+	}
+
+	var draft *gmailapi.Draft
+	err = c.withConn(ctx, func(conn *imapclient.Client) error {
+		if !conn.Caps().Has(imap.CapUIDPlus) {
+			return errors.New("server does not support UIDPLUS; create draft requires APPENDUID")
+		}
+
+		mailbox, err := c.draftsMailboxLocked()
+		if err != nil {
+			return err
+		}
+
+		cmd := conn.Append(mailbox, int64(len(raw)), &imap.AppendOptions{
+			Flags: []imap.Flag{imap.FlagDraft},
+		})
+		n, err := cmd.Write(raw)
+		if err != nil {
+			_ = cmd.Close()
+			return fmt.Errorf("APPEND draft literal: %w", err)
+		}
+		if n != len(raw) {
+			_ = cmd.Close()
+			return io.ErrShortWrite
+		}
+		if err := cmd.Close(); err != nil {
+			return fmt.Errorf("APPEND draft literal: %w", err)
+		}
+		appendData, err := cmd.Wait()
+		if err != nil {
+			return fmt.Errorf("APPEND to %q: %w", mailbox, err)
+		}
+		if appendData == nil || appendData.UID == 0 {
+			return errors.New("server did not return APPENDUID; cannot identify created draft")
+		}
+
+		id := compositeID(mailbox, appendData.UID)
+		draft = &gmailapi.Draft{
+			ID: id,
+			Message: gmailapi.DraftMessage{
+				ID:       id,
+				ThreadID: id,
+				LabelIDs: []string{mailbox},
+				To:       slices.Clone(compose.To),
+				Cc:       slices.Clone(compose.Cc),
+				Bcc:      slices.Clone(compose.Bcc),
+				Subject:  compose.Subject,
+				Body:     compose.Body,
+				Date:     time.Now().UnixMilli(),
+			},
+		}
+
+		c.messageListCache = nil
+		c.msgIDToLabels = nil
+		c.seenRFC822IDs = nil
+		return nil
+	})
+	if errors.Is(err, io.ErrShortWrite) {
+		return nil, fmt.Errorf("APPEND draft literal: %w", err)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return draft, nil
 }
 
 func (c *Client) UpdateDraft(_ context.Context, _ string, _ *gmailapi.DraftCompose) (*gmailapi.Draft, error) {
