@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/export"
+	"go.kenn.io/msgvault/internal/googledocs"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/query/querytest"
 	"go.kenn.io/msgvault/internal/search"
@@ -78,6 +79,29 @@ func (m *mockWhatsAppClient) SendMessage(ctx context.Context, req whatsapplive.S
 }
 func (m *mockWhatsAppClient) SendReaction(ctx context.Context, req whatsapplive.SendReactionRequest) (whatsapplive.SendResult, error) {
 	return m.sendReaction(ctx, req)
+}
+
+type mockGoogleDocsClient struct {
+	listDocs    func(context.Context, string, string, int) ([]googledocs.File, error)
+	getDoc      func(context.Context, string, string, int) (*googledocs.Document, error)
+	appendText  func(context.Context, string, string, string) (*googledocs.AppendResult, error)
+	replaceText func(context.Context, string, string, string, string, bool) (*googledocs.ReplaceResult, error)
+}
+
+func (m *mockGoogleDocsClient) ListDocs(ctx context.Context, sourceName, query string, limit int) ([]googledocs.File, error) {
+	return m.listDocs(ctx, sourceName, query, limit)
+}
+
+func (m *mockGoogleDocsClient) GetDoc(ctx context.Context, sourceName, documentID string, maxChars int) (*googledocs.Document, error) {
+	return m.getDoc(ctx, sourceName, documentID, maxChars)
+}
+
+func (m *mockGoogleDocsClient) AppendText(ctx context.Context, sourceName, documentID, text string) (*googledocs.AppendResult, error) {
+	return m.appendText(ctx, sourceName, documentID, text)
+}
+
+func (m *mockGoogleDocsClient) ReplaceText(ctx context.Context, sourceName, documentID, find, replacement string, matchCase bool) (*googledocs.ReplaceResult, error) {
+	return m.replaceText(ctx, sourceName, documentID, find, replacement, matchCase)
 }
 
 // Response types for runTool generic calls.
@@ -326,6 +350,166 @@ func TestSendWhatsAppReactionAllowsEmptyEmojiToClear(t *testing.T) {
 	assert.Equal(t, "", gotReq.Emoji)
 	assert.Equal(t, "react-1", gotReq.LocalRequestID)
 	assert.Equal(t, int64(42), result.MessageID)
+}
+
+func TestGoogleDocsHandlers(t *testing.T) {
+	t.Run("list forwards filters", func(t *testing.T) {
+		assert := assert.New(t)
+		client := &mockGoogleDocsClient{
+			listDocs: func(_ context.Context, sourceName, query string, limit int) ([]googledocs.File, error) {
+				assert.Equal("work", sourceName, "sourceName")
+				assert.Equal("roadmap", query, "query")
+				assert.Equal(7, limit, "limit")
+				return []googledocs.File{{
+					Source:     "work",
+					DocumentID: "doc-1",
+					Name:       "Roadmap",
+				}}, nil
+			},
+		}
+		h := &handlers{
+			engine: &querytest.MockEngine{},
+			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
+				return client, nil
+			},
+		}
+
+		files := runTool[[]googledocs.File](t, ToolListGoogleDocs, h.listGoogleDocs, map[string]any{
+			"source": "work",
+			"query":  "roadmap",
+			"limit":  float64(7),
+		})
+		require.Len(t, files, 1, "files")
+		assert.Equal("doc-1", files[0].DocumentID, "document_id")
+	})
+
+	t.Run("get returns bounded text", func(t *testing.T) {
+		assert := assert.New(t)
+		client := &mockGoogleDocsClient{
+			getDoc: func(_ context.Context, sourceName, documentID string, maxChars int) (*googledocs.Document, error) {
+				assert.Equal("work", sourceName, "sourceName")
+				assert.Equal("doc-1", documentID, "documentID")
+				assert.Equal(50, maxChars, "maxChars")
+				return &googledocs.Document{
+					File:       googledocs.File{Source: "work", DocumentID: "doc-1", Name: "Notes"},
+					Text:       "body",
+					TextLength: 4,
+				}, nil
+			},
+		}
+		h := &handlers{
+			engine: &querytest.MockEngine{},
+			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
+				return client, nil
+			},
+		}
+
+		doc := runTool[googledocs.Document](t, ToolGetGoogleDoc, h.getGoogleDoc, map[string]any{
+			"source":      "work",
+			"document_id": "doc-1",
+			"max_chars":   float64(50),
+		})
+		assert.Equal("body", doc.Text, "text")
+	})
+
+	t.Run("search returns snippets", func(t *testing.T) {
+		client := &mockGoogleDocsClient{
+			listDocs: func(context.Context, string, string, int) ([]googledocs.File, error) {
+				return []googledocs.File{{
+					Source:     "work",
+					DocumentID: "doc-1",
+					Name:       "Strategy",
+				}}, nil
+			},
+			getDoc: func(_ context.Context, sourceName, documentID string, maxChars int) (*googledocs.Document, error) {
+				assert.Equal(t, "work", sourceName, "sourceName")
+				assert.Equal(t, "doc-1", documentID, "documentID")
+				assert.Equal(t, maxGoogleDocsMaxChars, maxChars, "maxChars")
+				return &googledocs.Document{
+					File:       googledocs.File{Source: "work", DocumentID: "doc-1", Name: "Strategy"},
+					Text:       "intro alpha beta target phrase gamma delta conclusion",
+					TextLength: 53,
+				}, nil
+			},
+		}
+		h := &handlers{
+			engine: &querytest.MockEngine{},
+			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
+				return client, nil
+			},
+		}
+
+		results := runTool[[]googleDocsSearchResult](t, ToolSearchGoogleDocs, h.searchGoogleDocs, map[string]any{
+			"query":         "target",
+			"snippet_chars": float64(20),
+		})
+		require.Len(t, results, 1, "results")
+		assert.Contains(t, results[0].Snippet, "target", "snippet")
+	})
+
+	t.Run("append forwards text unchanged", func(t *testing.T) {
+		assert := assert.New(t)
+		client := &mockGoogleDocsClient{
+			appendText: func(_ context.Context, sourceName, documentID, text string) (*googledocs.AppendResult, error) {
+				assert.Equal("work", sourceName, "sourceName")
+				assert.Equal("doc-1", documentID, "documentID")
+				assert.Equal("\nnew note", text, "text")
+				return &googledocs.AppendResult{
+					Source:        sourceName,
+					DocumentID:    documentID,
+					InsertedChars: 9,
+					Status:        "appended",
+				}, nil
+			},
+		}
+		h := &handlers{
+			engine: &querytest.MockEngine{},
+			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
+				return client, nil
+			},
+		}
+
+		result := runTool[googledocs.AppendResult](t, ToolAppendGoogleDocText, h.appendGoogleDocText, map[string]any{
+			"source":      "work",
+			"document_id": "doc-1",
+			"text":        "\nnew note",
+		})
+		assert.Equal("appended", result.Status, "status")
+	})
+
+	t.Run("replace accepts explicit empty replacement", func(t *testing.T) {
+		assert := assert.New(t)
+		client := &mockGoogleDocsClient{
+			replaceText: func(_ context.Context, sourceName, documentID, find, replacement string, matchCase bool) (*googledocs.ReplaceResult, error) {
+				assert.Equal("work", sourceName, "sourceName")
+				assert.Equal("doc-1", documentID, "documentID")
+				assert.Equal("remove me", find, "find")
+				assert.Equal("", replacement, "replacement")
+				assert.True(matchCase, "matchCase")
+				return &googledocs.ReplaceResult{
+					Source:             sourceName,
+					DocumentID:         documentID,
+					OccurrencesChanged: 2,
+					Status:             "replaced",
+				}, nil
+			},
+		}
+		h := &handlers{
+			engine: &querytest.MockEngine{},
+			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
+				return client, nil
+			},
+		}
+
+		result := runTool[googledocs.ReplaceResult](t, ToolReplaceGoogleDocText, h.replaceGoogleDocText, map[string]any{
+			"source":      "work",
+			"document_id": "doc-1",
+			"find":        "remove me",
+			"replacement": "",
+			"match_case":  true,
+		})
+		assert.Equal(int64(2), result.OccurrencesChanged, "occurrences_changed")
+	})
 }
 
 func TestSearchMetadata(t *testing.T) {

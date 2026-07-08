@@ -70,6 +70,7 @@ Example Claude Desktop config (with port-forward):
 			return err
 		}
 		opts.GmailFactory = buildGmailFactory(st)
+		opts.GoogleDocsFactory = buildGoogleDocsFactory()
 
 		// Graceful shutdown on SIGINT/SIGTERM
 		sigCh := make(chan os.Signal, 1)

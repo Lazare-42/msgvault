@@ -541,6 +541,40 @@ oauth_app = "personal"
 	require.Truef(src.Backend == "drive" && src.OwnerPhone == "+15550000001" && src.FolderID == "drive-folder-id" && src.GoogleAccount == "user@example.com" && src.StableAfter == "10m", "source mismatch: %#v", src)
 }
 
+func TestGoogleDocsSourcesConfig(t *testing.T) {
+	require := require.New(t)
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config.toml")
+	data := []byte(`
+[[google_docs.sources]]
+name = "docs"
+enabled = true
+folder_id = "drive-folder-id"
+google_account = "user@example.com"
+oauth_app = "personal"
+
+[[google_docs.sources]]
+name = "disabled"
+enabled = false
+folder_id = "disabled-folder-id"
+google_account = "user@example.com"
+`)
+	require.NoError(os.WriteFile(configPath, data, 0o600), "write config")
+	cfg, err := Load(configPath, "")
+	require.NoError(err, "Load")
+
+	src := cfg.GetGoogleDocsSource("DOCS")
+	require.NotNil(src, "GetGoogleDocsSource returned nil")
+	require.True(src.Enabled, "source should be enabled")
+	require.Equal("drive-folder-id", src.FolderID, "FolderID")
+	require.Equal("user@example.com", src.GoogleAccount, "GoogleAccount")
+	require.Equal("personal", src.OAuthApp, "OAuthApp")
+
+	enabled := cfg.EnabledGoogleDocsSources()
+	require.Len(enabled, 1, "EnabledGoogleDocsSources")
+	require.Equal("docs", enabled[0].Name, "enabled source name")
+}
+
 func TestSynctechSMSScheduledSources(t *testing.T) {
 	cfg := NewDefaultConfig()
 	cfg.SynctechSMS.Sources = []SynctechSMSSource{

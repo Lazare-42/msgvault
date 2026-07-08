@@ -14,6 +14,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"go.kenn.io/msgvault/internal/gmail"
+	"go.kenn.io/msgvault/internal/googledocs"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/hybrid"
@@ -27,6 +28,10 @@ type GmailClientFactory func(ctx context.Context, email string) (*gmail.Client, 
 
 // WhatsAppClientFactory creates a live WhatsApp client for an archive account.
 type WhatsAppClientFactory func(ctx context.Context, account string) (whatsapplive.Client, error)
+
+// GoogleDocsClientFactory creates an authenticated Google Docs client for
+// configured Drive folder sources.
+type GoogleDocsClientFactory func(ctx context.Context) (googledocs.Client, error)
 
 // Tool name constants.
 const (
@@ -57,6 +62,11 @@ const (
 	ToolWhatsAppStatus         = "whatsapp_status"
 	ToolSendWhatsAppMessage    = "send_whatsapp_message"
 	ToolSendWhatsAppReaction   = "send_whatsapp_reaction"
+	ToolListGoogleDocs         = "list_google_docs"
+	ToolSearchGoogleDocs       = "search_google_docs"
+	ToolGetGoogleDoc           = "get_google_doc"
+	ToolAppendGoogleDocText    = "append_google_doc_text"
+	ToolReplaceGoogleDocText   = "replace_google_doc_text"
 )
 
 // search_message_bodies/search_in_message mode values (wire format).
@@ -123,6 +133,8 @@ type ServeOptions struct {
 	GmailFactory GmailClientFactory
 	// WhatsAppFactory is optional. When non-nil, live WhatsApp tools are exposed.
 	WhatsAppFactory WhatsAppClientFactory
+	// GoogleDocsFactory is optional. When non-nil, Google Docs tools are exposed.
+	GoogleDocsFactory GoogleDocsClientFactory
 }
 
 // BuildMCPServer builds an MCP server with all tools registered from opts.
@@ -136,18 +148,19 @@ func BuildMCPServer(opts ServeOptions) *server.MCPServer {
 	)
 
 	h := &handlers{
-		engine:           opts.Engine,
-		attachmentsDir:   opts.AttachmentsDir,
-		attachmentReader: opts.AttachmentReader,
-		manifestSaver:    opts.ManifestSaver,
-		hybridSearcher:   opts.HybridSearcher,
-		similarSearcher:  opts.SimilarSearcher,
-		dataDir:          opts.DataDir,
-		hybridEngine:     opts.HybridEngine,
-		vectorCfg:        opts.VectorCfg,
-		backend:          opts.Backend,
-		gmailFactory:     opts.GmailFactory,
-		whatsAppFactory:  opts.WhatsAppFactory,
+		engine:            opts.Engine,
+		attachmentsDir:    opts.AttachmentsDir,
+		attachmentReader:  opts.AttachmentReader,
+		manifestSaver:     opts.ManifestSaver,
+		hybridSearcher:    opts.HybridSearcher,
+		similarSearcher:   opts.SimilarSearcher,
+		dataDir:           opts.DataDir,
+		hybridEngine:      opts.HybridEngine,
+		vectorCfg:         opts.VectorCfg,
+		backend:           opts.Backend,
+		gmailFactory:      opts.GmailFactory,
+		whatsAppFactory:   opts.WhatsAppFactory,
+		googleDocsFactory: opts.GoogleDocsFactory,
 	}
 
 	vectorAvailable := opts.HybridEngine != nil || opts.HybridSearcher != nil
@@ -190,6 +203,14 @@ func BuildMCPServer(opts ServeOptions) *server.MCPServer {
 		s.AddTool(whatsAppStatusTool(), h.whatsAppStatus)
 		s.AddTool(sendWhatsAppMessageTool(), h.sendWhatsAppMessage)
 		s.AddTool(sendWhatsAppReactionTool(), h.sendWhatsAppReaction)
+	}
+
+	if opts.GoogleDocsFactory != nil {
+		s.AddTool(listGoogleDocsTool(), h.listGoogleDocs)
+		s.AddTool(searchGoogleDocsTool(), h.searchGoogleDocs)
+		s.AddTool(getGoogleDocTool(), h.getGoogleDoc)
+		s.AddTool(appendGoogleDocTextTool(), h.appendGoogleDocText)
+		s.AddTool(replaceGoogleDocTextTool(), h.replaceGoogleDocText)
 	}
 
 	return s
@@ -905,6 +926,103 @@ func sendWhatsAppReactionTool() mcp.Tool {
 		),
 		mcp.WithString("local_request_id",
 			mcp.Description("Optional caller-provided idempotency/audit key"),
+		),
+	)
+}
+
+func listGoogleDocsTool() mcp.Tool {
+	return mcp.NewTool(ToolListGoogleDocs,
+		mcp.WithDescription("List Google Docs in a configured Drive folder. Optionally filters by Drive name/fullText query."),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(true), mcp.WithOpenWorldHintAnnotation(true),
+		mcp.WithString("source",
+			mcp.Description("Configured google_docs source name. Required when more than one source is configured."),
+		),
+		mcp.WithString("query",
+			mcp.Description("Optional Drive search query matched against document name or full text"),
+		),
+		withLimit("20"),
+	)
+}
+
+func searchGoogleDocsTool() mcp.Tool {
+	return mcp.NewTool(ToolSearchGoogleDocs,
+		mcp.WithDescription("Search Google Docs in a configured Drive folder and return matching document snippets for LLM context."),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(true), mcp.WithOpenWorldHintAnnotation(true),
+		mcp.WithString("source",
+			mcp.Description("Configured google_docs source name. Required when more than one source is configured."),
+		),
+		mcp.WithString("query",
+			mcp.Required(),
+			mcp.Description("Text to search for in document name or full text"),
+		),
+		mcp.WithNumber("snippet_chars",
+			mcp.Description("Maximum characters per snippet (default 1000, max 4000)"),
+		),
+		withLimit("10"),
+	)
+}
+
+func getGoogleDocTool() mcp.Tool {
+	return mcp.NewTool(ToolGetGoogleDoc,
+		mcp.WithDescription("Export a Google Doc from a configured Drive folder as plain text."),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(true), mcp.WithOpenWorldHintAnnotation(true),
+		mcp.WithString("source",
+			mcp.Description("Configured google_docs source name. Required when more than one source is configured."),
+		),
+		mcp.WithString("document_id",
+			mcp.Required(),
+			mcp.Description("Google Docs document ID"),
+		),
+		mcp.WithNumber("max_chars",
+			mcp.Description("Maximum document text characters to return (default 20000, max 100000)"),
+		),
+	)
+}
+
+func appendGoogleDocTextTool() mcp.Tool {
+	return mcp.NewTool(ToolAppendGoogleDocText,
+		mcp.WithDescription("Append plain text to a Google Doc in a configured Drive folder."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithIdempotentHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(true),
+		mcp.WithString("source",
+			mcp.Description("Configured google_docs source name. Required when more than one source is configured."),
+		),
+		mcp.WithString("document_id",
+			mcp.Required(),
+			mcp.Description("Google Docs document ID"),
+		),
+		mcp.WithString("text",
+			mcp.Required(),
+			mcp.Description("Plain text to append"),
+		),
+	)
+}
+
+func replaceGoogleDocTextTool() mcp.Tool {
+	return mcp.NewTool(ToolReplaceGoogleDocText,
+		mcp.WithDescription("Replace all matching text in a Google Doc in a configured Drive folder."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithIdempotentHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(true),
+		mcp.WithString("source",
+			mcp.Description("Configured google_docs source name. Required when more than one source is configured."),
+		),
+		mcp.WithString("document_id",
+			mcp.Required(),
+			mcp.Description("Google Docs document ID"),
+		),
+		mcp.WithString("find",
+			mcp.Required(),
+			mcp.Description("Substring to find"),
+		),
+		mcp.WithString("replacement",
+			mcp.Required(),
+			mcp.Description("Replacement text. Use an empty string to delete matched text."),
+		),
+		mcp.WithBoolean("match_case",
+			mcp.Description("Whether the search should be case sensitive (default false)"),
 		),
 	)
 }

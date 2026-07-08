@@ -20,6 +20,7 @@ import (
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/export"
 	"go.kenn.io/msgvault/internal/gmail"
+	"go.kenn.io/msgvault/internal/googledocs"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/store"
@@ -47,6 +48,15 @@ const (
 	maxBodyChars = 4000
 	// maxContextSnippets is the maximum number of match excerpts returned for a single message.
 	maxContextSnippets = 5
+
+	defaultGoogleDocsListLimit    = 20
+	defaultGoogleDocsSearchLimit  = 10
+	defaultGoogleDocsSnippetChars = 1000
+	defaultGoogleDocsMaxChars     = 20000
+	maxGoogleDocsListLimit        = 100
+	maxGoogleDocsSearchLimit      = 20
+	maxGoogleDocsSnippetChars     = 4000
+	maxGoogleDocsMaxChars         = 100000
 	// totalCountUnknown is returned when the backend cannot report a full match
 	// count (hybrid/vector ranking depth, or list_messages without a separate
 	// count query). Clients should use has_more for paging.
@@ -106,15 +116,16 @@ func listLimitArg(args map[string]any) int {
 }
 
 type handlers struct {
-	engine           query.Engine
-	attachmentsDir   string
-	attachmentReader AttachmentReader
-	manifestSaver    DeletionManifestSaver
-	hybridSearcher   HybridSearcher
-	similarSearcher  SimilarSearcher
-	dataDir          string
-	gmailFactory     GmailClientFactory
-	whatsAppFactory  WhatsAppClientFactory
+	engine            query.Engine
+	attachmentsDir    string
+	attachmentReader  AttachmentReader
+	manifestSaver     DeletionManifestSaver
+	hybridSearcher    HybridSearcher
+	similarSearcher   SimilarSearcher
+	dataDir           string
+	gmailFactory      GmailClientFactory
+	whatsAppFactory   WhatsAppClientFactory
+	googleDocsFactory GoogleDocsClientFactory
 
 	// Optional vector-search wiring. When hybridEngine is nil, the
 	// search_message_bodies handler rejects mode=vector and mode=hybrid with
@@ -2203,6 +2214,217 @@ func (h *handlers) sendWhatsAppReaction(ctx context.Context, req mcp.CallToolReq
 		return mcp.NewToolResultError(fmt.Sprintf("send whatsapp reaction: %v", err)), nil
 	}
 	return jsonResult(result)
+}
+
+// --- Google Docs handlers ---
+
+type googleDocsSearchResult struct {
+	googledocs.File
+	Snippet       string `json:"snippet"`
+	TextLength    int    `json:"text_length"`
+	TextTruncated bool   `json:"text_truncated"`
+}
+
+func (h *handlers) getGoogleDocsClient(ctx context.Context) (googledocs.Client, error) {
+	if h.googleDocsFactory == nil {
+		return nil, fmt.Errorf("Google Docs API not configured")
+	}
+	client, err := h.googleDocsFactory(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("open Google Docs client: %w", err)
+	}
+	return client, nil
+}
+
+func (h *handlers) listGoogleDocs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	client, err := h.getGoogleDocsClient(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	files, err := client.ListDocs(
+		ctx,
+		optionalStringArg(args, "source"),
+		optionalStringArg(args, "query"),
+		boundedIntArg(args, "limit", defaultGoogleDocsListLimit, maxGoogleDocsListLimit),
+	)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("list Google Docs: %v", err)), nil
+	}
+	return jsonResult(files)
+}
+
+func (h *handlers) searchGoogleDocs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	query, err := requiredTrimmedStringArg(args, "query")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	client, err := h.getGoogleDocsClient(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	limit := boundedIntArg(args, "limit", defaultGoogleDocsSearchLimit, maxGoogleDocsSearchLimit)
+	snippetChars := boundedIntArg(args, "snippet_chars", defaultGoogleDocsSnippetChars, maxGoogleDocsSnippetChars)
+	files, err := client.ListDocs(ctx, optionalStringArg(args, "source"), query, limit)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("search Google Docs: %v", err)), nil
+	}
+	results := make([]googleDocsSearchResult, 0, len(files))
+	for _, file := range files {
+		doc, err := client.GetDoc(ctx, file.Source, file.DocumentID, maxGoogleDocsMaxChars)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("get Google Doc %s: %v", file.DocumentID, err)), nil
+		}
+		results = append(results, googleDocsSearchResult{
+			File:          file,
+			Snippet:       googleDocsSnippet(doc.Text, query, snippetChars),
+			TextLength:    doc.TextLength,
+			TextTruncated: doc.TextTruncated,
+		})
+	}
+	return jsonResult(results)
+}
+
+func (h *handlers) getGoogleDoc(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	documentID, err := requiredTrimmedStringArg(args, "document_id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	client, err := h.getGoogleDocsClient(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	doc, err := client.GetDoc(
+		ctx,
+		optionalStringArg(args, "source"),
+		documentID,
+		boundedIntArg(args, "max_chars", defaultGoogleDocsMaxChars, maxGoogleDocsMaxChars),
+	)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("get Google Doc: %v", err)), nil
+	}
+	return jsonResult(doc)
+}
+
+func (h *handlers) appendGoogleDocText(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	documentID, err := requiredTrimmedStringArg(args, "document_id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	text, err := requiredStringArg(args, "text")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	client, err := h.getGoogleDocsClient(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	result, err := client.AppendText(ctx, optionalStringArg(args, "source"), documentID, text)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("append Google Doc text: %v", err)), nil
+	}
+	return jsonResult(result)
+}
+
+func (h *handlers) replaceGoogleDocText(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	documentID, err := requiredTrimmedStringArg(args, "document_id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	find, err := requiredStringArg(args, "find")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	replacement, err := requiredStringArgAllowEmpty(args, "replacement")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	matchCase, _ := args["match_case"].(bool)
+	client, err := h.getGoogleDocsClient(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	result, err := client.ReplaceText(ctx, optionalStringArg(args, "source"), documentID, find, replacement, matchCase)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("replace Google Doc text: %v", err)), nil
+	}
+	return jsonResult(result)
+}
+
+func optionalStringArg(args map[string]any, key string) string {
+	v, _ := args[key].(string)
+	return strings.TrimSpace(v)
+}
+
+func requiredTrimmedStringArg(args map[string]any, key string) (string, error) {
+	v, err := requiredStringArg(args, key)
+	if err != nil {
+		return "", err
+	}
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "", fmt.Errorf("%s parameter is required", key)
+	}
+	return v, nil
+}
+
+func requiredStringArg(args map[string]any, key string) (string, error) {
+	v, ok := args[key].(string)
+	if !ok || v == "" {
+		return "", fmt.Errorf("%s parameter is required", key)
+	}
+	return v, nil
+}
+
+func requiredStringArgAllowEmpty(args map[string]any, key string) (string, error) {
+	v, ok := args[key].(string)
+	if !ok {
+		return "", fmt.Errorf("%s parameter is required", key)
+	}
+	return v, nil
+}
+
+func boundedIntArg(args map[string]any, key string, def, maxValue int) int {
+	v := limitArg(args, key, def)
+	if v <= 0 {
+		return def
+	}
+	return min(v, maxValue)
+}
+
+func googleDocsSnippet(text, query string, maxChars int) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	maxChars = min(max(maxChars, 1), maxGoogleDocsSnippetChars)
+	runes := []rune(text)
+	if len(runes) <= maxChars {
+		return text
+	}
+	needle := strings.ToLower(strings.TrimSpace(query))
+	startRune := 0
+	if needle != "" {
+		if idx := strings.Index(strings.ToLower(text), needle); idx >= 0 {
+			startRune = utf8.RuneCountInString(text[:idx]) - maxChars/4
+			if startRune < 0 {
+				startRune = 0
+			}
+		}
+	}
+	endRune := min(len(runes), startRune+maxChars)
+	snippet := string(runes[startRune:endRune])
+	if startRune > 0 {
+		snippet = "..." + snippet
+	}
+	if endRune < len(runes) {
+		snippet += "..."
+	}
+	return snippet
 }
 
 // --- Draft handlers ---
