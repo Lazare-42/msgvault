@@ -85,8 +85,9 @@ var whatsappLiveMCPCmd = &cobra.Command{
 			return err
 		}
 		service, err := whatsapplive.NewService(whatsapplive.ServiceOptions{
-			Store:     st,
-			Transport: transport,
+			Store:        st,
+			Transport:    transport,
+			LoginContext: cmd.Context(),
 		})
 		if err != nil {
 			_ = transport.Close()
