@@ -17,17 +17,19 @@ import (
 const reactionTypeEmoji = "emoji"
 
 type Service struct {
-	store     *store.Store
-	transport Transport
-	account   string
-	now       func() time.Time
+	store        *store.Store
+	transport    Transport
+	account      string
+	loginContext context.Context
+	now          func() time.Time
 }
 
 type ServiceOptions struct {
-	Store     *store.Store
-	Transport Transport
-	Account   string
-	Now       func() time.Time
+	Store        *store.Store
+	Transport    Transport
+	Account      string
+	LoginContext context.Context
+	Now          func() time.Time
 }
 
 type QRPairingTransport interface {
@@ -46,11 +48,16 @@ func NewService(opts ServiceOptions) (*Service, error) {
 	if now == nil {
 		now = time.Now
 	}
+	loginContext := opts.LoginContext
+	if loginContext == nil {
+		loginContext = context.Background()
+	}
 	return &Service{
-		store:     opts.Store,
-		transport: opts.Transport,
-		account:   strings.TrimSpace(opts.Account),
-		now:       now,
+		store:        opts.Store,
+		transport:    opts.Transport,
+		account:      strings.TrimSpace(opts.Account),
+		loginContext: loginContext,
+		now:          now,
 	}, nil
 }
 
@@ -80,7 +87,9 @@ func (s *Service) StartLogin(ctx context.Context) (LoginState, error) {
 	}
 	if status.Paired {
 		if !status.Connected {
-			if err := s.Connect(ctx); err != nil {
+			connectCtx, cancel := context.WithTimeout(s.loginContext, 15*time.Second)
+			defer cancel()
+			if err := s.Connect(connectCtx); err != nil {
 				state, stateErr := s.LoginState(ctx)
 				if stateErr != nil {
 					return LoginState{Status: status}, err
@@ -95,7 +104,7 @@ func (s *Service) StartLogin(ctx context.Context) (LoginState, error) {
 	if !ok {
 		return LoginState{Status: status}, errors.New("whatsapp QR login is not supported by this transport")
 	}
-	if err := pairer.StartQRPairing(ctx); err != nil {
+	if err := pairer.StartQRPairing(s.loginContext); err != nil {
 		return LoginState{Status: status}, err
 	}
 	return s.LoginState(ctx)

@@ -12,14 +12,31 @@ import (
 )
 
 type mockTransport struct {
-	status       Status
-	sendMessage  func(context.Context, TransportSendMessageRequest) (TransportSendResult, error)
-	sendReaction func(context.Context, TransportSendReactionRequest) (TransportSendResult, error)
+	status         Status
+	connect        func(context.Context) error
+	startQRPairing func(context.Context) error
+	pairingState   QRPairingState
+	sendMessage    func(context.Context, TransportSendMessageRequest) (TransportSendResult, error)
+	sendReaction   func(context.Context, TransportSendReactionRequest) (TransportSendResult, error)
 }
 
 func (m *mockTransport) Status(context.Context) (Status, error) { return m.status, nil }
-func (m *mockTransport) Connect(context.Context) error          { return nil }
-func (m *mockTransport) Close() error                           { return nil }
+func (m *mockTransport) Connect(ctx context.Context) error {
+	if m.connect != nil {
+		return m.connect(ctx)
+	}
+	return nil
+}
+func (m *mockTransport) Close() error { return nil }
+func (m *mockTransport) StartQRPairing(ctx context.Context) error {
+	if m.startQRPairing != nil {
+		return m.startQRPairing(ctx)
+	}
+	return nil
+}
+func (m *mockTransport) PairingState(context.Context) (QRPairingState, error) {
+	return m.pairingState, nil
+}
 func (m *mockTransport) SendMessage(ctx context.Context, req TransportSendMessageRequest) (TransportSendResult, error) {
 	return m.sendMessage(ctx, req)
 }
@@ -208,4 +225,60 @@ func TestServiceArchiveInboundReactionClearsReaction(t *testing.T) {
 		WHERE message_id = ? AND participant_id = ? AND removed_at IS NULL
 	`), targetID, participantID).Scan(&activeCount))
 	assertpkg.Equal(t, 0, activeCount)
+}
+
+type serviceContextKey string
+
+func TestServiceStartLoginUsesLoginContextForQRPairing(t *testing.T) {
+	ctx := context.WithValue(context.Background(), serviceContextKey("scope"), "request")
+	loginCtx := context.WithValue(context.Background(), serviceContextKey("scope"), "daemon")
+	st := testutil.NewTestStore(t)
+	var gotScope any
+	transport := &mockTransport{
+		status: Status{},
+		startQRPairing: func(ctx context.Context) error {
+			gotScope = ctx.Value(serviceContextKey("scope"))
+			return nil
+		},
+		pairingState: QRPairingState{Active: true},
+	}
+	svc, err := NewService(ServiceOptions{
+		Store:        st,
+		Transport:    transport,
+		LoginContext: loginCtx,
+	})
+	requirepkg.NoError(t, err)
+
+	_, err = svc.StartLogin(ctx)
+	requirepkg.NoError(t, err)
+	assertpkg.Equal(t, "daemon", gotScope)
+}
+
+func TestServiceStartLoginUsesLoginContextForReconnect(t *testing.T) {
+	ctx := context.WithValue(context.Background(), serviceContextKey("scope"), "request")
+	loginCtx := context.WithValue(context.Background(), serviceContextKey("scope"), "daemon")
+	st := testutil.NewTestStore(t)
+	var gotScope any
+	transport := &mockTransport{
+		status: Status{
+			AccountJID: "15551234567@s.whatsapp.net",
+			Paired:     true,
+			Connected:  false,
+		},
+		connect: func(ctx context.Context) error {
+			gotScope = ctx.Value(serviceContextKey("scope"))
+			return nil
+		},
+		pairingState: QRPairingState{Paired: true},
+	}
+	svc, err := NewService(ServiceOptions{
+		Store:        st,
+		Transport:    transport,
+		LoginContext: loginCtx,
+	})
+	requirepkg.NoError(t, err)
+
+	_, err = svc.StartLogin(ctx)
+	requirepkg.NoError(t, err)
+	assertpkg.Equal(t, "daemon", gotScope)
 }
