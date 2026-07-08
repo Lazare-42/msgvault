@@ -22,6 +22,15 @@ type Status struct {
 	SessionPath string `json:"session_path,omitempty"`
 }
 
+type QRPairingState struct {
+	Active    bool      `json:"active"`
+	Code      string    `json:"code,omitempty"`
+	Event     string    `json:"event,omitempty"`
+	Error     string    `json:"error,omitempty"`
+	ExpiresAt time.Time `json:"expires_at,omitempty"`
+	Paired    bool      `json:"paired"`
+}
+
 type SendMessageRequest struct {
 	Account        string
 	ChatID         string

@@ -36,9 +36,11 @@ type WhatsmeowTransport struct {
 	sessionPath string
 	account     string
 
-	mu        sync.Mutex
-	handlerID uint32
-	inbound   func(context.Context, InboundMessage) error
+	mu            sync.Mutex
+	handlerID     uint32
+	inbound       func(context.Context, InboundMessage) error
+	pairingCancel context.CancelFunc
+	pairingState  QRPairingState
 }
 
 func NewWhatsmeowTransport(ctx context.Context, opts WhatsmeowOptions) (*WhatsmeowTransport, error) {
@@ -106,6 +108,10 @@ func (t *WhatsmeowTransport) Connect(ctx context.Context) error {
 
 func (t *WhatsmeowTransport) Close() error {
 	t.mu.Lock()
+	if t.pairingCancel != nil {
+		t.pairingCancel()
+		t.pairingCancel = nil
+	}
 	if t.handlerID != 0 {
 		t.client.RemoveEventHandler(t.handlerID)
 		t.handlerID = 0
@@ -118,6 +124,119 @@ func (t *WhatsmeowTransport) Close() error {
 		return t.container.Close()
 	}
 	return nil
+}
+
+func (t *WhatsmeowTransport) StartQRPairing(ctx context.Context) error {
+	status, err := t.Status(ctx)
+	if err != nil {
+		return err
+	}
+	if status.Paired {
+		t.setPairingState(QRPairingState{
+			Event:  whatsmeow.QRChannelSuccess.Event,
+			Paired: true,
+		})
+		return nil
+	}
+
+	t.mu.Lock()
+	if t.pairingState.Active {
+		t.mu.Unlock()
+		return nil
+	}
+	pairingCtx, cancel := context.WithCancel(ctx)
+	t.pairingCancel = cancel
+	t.pairingState = QRPairingState{
+		Active: true,
+		Event:  "starting",
+	}
+	t.mu.Unlock()
+
+	go t.runQRPairing(pairingCtx, ctx)
+	return nil
+}
+
+func (t *WhatsmeowTransport) PairingState(ctx context.Context) (QRPairingState, error) {
+	status, err := t.Status(ctx)
+	if err != nil {
+		return QRPairingState{}, err
+	}
+	t.mu.Lock()
+	state := t.pairingState
+	t.mu.Unlock()
+	state.Paired = state.Paired || status.Paired
+	if state.Paired {
+		state.Active = false
+		state.Code = ""
+		state.ExpiresAt = time.Time{}
+		if state.Event == "" {
+			state.Event = whatsmeow.QRChannelSuccess.Event
+		}
+	}
+	return state, nil
+}
+
+func (t *WhatsmeowTransport) runQRPairing(pairingCtx context.Context, handlerCtx context.Context) {
+	qrChan, err := t.client.GetQRChannel(pairingCtx)
+	if err != nil {
+		t.finishQRPairing(QRPairingState{Event: "error", Error: err.Error()})
+		return
+	}
+	t.registerEventHandler(handlerCtx)
+	if err := t.client.ConnectContext(pairingCtx); err != nil {
+		t.finishQRPairing(QRPairingState{Event: "error", Error: err.Error()})
+		return
+	}
+	for item := range qrChan {
+		switch item.Event {
+		case whatsmeow.QRChannelEventCode:
+			t.setPairingState(QRPairingState{
+				Active:    true,
+				Code:      item.Code,
+				Event:     item.Event,
+				ExpiresAt: time.Now().Add(item.Timeout),
+			})
+		case whatsmeow.QRChannelEventError:
+			errMsg := "unknown QR pairing error"
+			if item.Error != nil {
+				errMsg = item.Error.Error()
+			}
+			t.finishQRPairing(QRPairingState{Event: item.Event, Error: errMsg})
+			return
+		case whatsmeow.QRChannelSuccess.Event:
+			t.finishQRPairing(QRPairingState{Event: item.Event, Paired: true})
+			return
+		default:
+			t.finishQRPairing(QRPairingState{
+				Event: item.Event,
+				Error: fmt.Sprintf("whatsapp pairing ended: %s", item.Event),
+			})
+			return
+		}
+	}
+	t.finishQRPairing(QRPairingState{
+		Event: "closed",
+		Error: "whatsapp QR channel closed before pairing completed",
+	})
+}
+
+func (t *WhatsmeowTransport) setPairingState(state QRPairingState) {
+	t.mu.Lock()
+	t.pairingState = state
+	t.mu.Unlock()
+}
+
+func (t *WhatsmeowTransport) finishQRPairing(state QRPairingState) {
+	state.Active = false
+	state.Code = ""
+	state.ExpiresAt = time.Time{}
+	t.mu.Lock()
+	if t.pairingCancel != nil {
+		t.pairingCancel()
+		t.pairingCancel = nil
+	}
+	t.pairingState = state
+	t.mu.Unlock()
 }
 
 func (t *WhatsmeowTransport) SendMessage(ctx context.Context, req TransportSendMessageRequest) (TransportSendResult, error) {
