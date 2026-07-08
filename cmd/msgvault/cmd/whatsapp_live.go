@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html/template"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,6 +26,7 @@ var whatsappLinkPhone string
 var whatsappLiveMCPAddr string
 var whatsappLivePairingToken string
 var whatsappLiveHTTPBasePath string
+var whatsappLivePublicBaseURL string
 
 var whatsappLinkCmd = &cobra.Command{
 	Use:   "whatsapp-link",
@@ -129,6 +131,15 @@ var whatsappLiveMCPCmd = &cobra.Command{
 		if err != nil {
 			return usageErr(cmd, err)
 		}
+		publicBaseURL := whatsappLivePublicBaseURL
+		if publicBaseURL == "" {
+			publicBaseURL = os.Getenv("MSGVAULT_WHATSAPP_PUBLIC_BASE_URL")
+		}
+		publicBaseURL, err = normalizeHTTPPublicBaseURL(publicBaseURL)
+		if err != nil {
+			return usageErr(cmd, err)
+		}
+		opts.WhatsAppLoginURL = whatsappLoginPageURL(publicBaseURL, basePath)
 		return serveWhatsAppLiveHTTP(cmd.Context(), addr, service, transport, opts, pairingToken, basePath)
 	},
 }
@@ -149,6 +160,7 @@ func init() {
 	whatsappLiveMCPCmd.Flags().StringVar(&whatsappLiveMCPAddr, "addr", "127.0.0.1:8121", "Loopback address to listen on (host:port)")
 	whatsappLiveMCPCmd.Flags().StringVar(&whatsappLivePairingToken, "pairing-token", "", "Token required for WhatsApp QR pairing pages (or MSGVAULT_WHATSAPP_PAIRING_TOKEN)")
 	whatsappLiveMCPCmd.Flags().StringVar(&whatsappLiveHTTPBasePath, "http-base-path", "", "Public URL base path for QR pages, e.g. /personal (or MSGVAULT_WHATSAPP_HTTP_BASE_PATH)")
+	whatsappLiveMCPCmd.Flags().StringVar(&whatsappLivePublicBaseURL, "public-base-url", "", "Public base URL for QR pages, e.g. https://whats.lazare.ai/personal (or MSGVAULT_WHATSAPP_PUBLIC_BASE_URL)")
 }
 
 func serveWhatsAppLiveHTTP(ctx context.Context, addr string, service *whatsapplive.Service, transport *whatsapplive.WhatsmeowTransport, opts mcpserver.ServeOptions, pairingToken string, basePath string) error {
@@ -383,6 +395,37 @@ func normalizeHTTPBasePath(raw string) (string, error) {
 		return "", nil
 	}
 	return raw, nil
+}
+
+func normalizeHTTPPublicBaseURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", fmt.Errorf("public base URL must start with http:// or https://")
+	}
+	if parsed.Host == "" {
+		return "", fmt.Errorf("public base URL must include a host")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", fmt.Errorf("public base URL must not contain query or fragment")
+	}
+	return strings.TrimRight(parsed.String(), "/"), nil
+}
+
+func whatsappLoginPageURL(publicBaseURL string, basePath string) string {
+	if publicBaseURL != "" {
+		return publicBaseURL + "/qr"
+	}
+	if basePath != "" {
+		return basePath + "/qr"
+	}
+	return "/qr"
 }
 
 var whatsappPairingTemplate = template.Must(template.New("whatsapp-pairing").Parse(`<!doctype html>

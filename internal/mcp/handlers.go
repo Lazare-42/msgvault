@@ -17,6 +17,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/skip2/go-qrcode"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/export"
 	"go.kenn.io/msgvault/internal/gmail"
@@ -105,6 +106,7 @@ type handlers struct {
 	dataDir           string
 	gmailFactory      GmailClientFactory
 	whatsAppFactory   WhatsAppClientFactory
+	whatsAppLoginURL  string
 	googleDocsFactory GoogleDocsClientFactory
 
 	// Optional vector-search wiring. When hybridEngine is nil, the
@@ -1049,6 +1051,14 @@ func jsonResult(v any) (*mcp.CallToolResult, error) {
 	return mcp.NewToolResultText(string(data)), nil
 }
 
+func structuredJSONResult(v any) (*mcp.CallToolResult, error) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("marshal error: %v", err)), nil
+	}
+	return mcp.NewToolResultStructured(v, string(data)), nil
+}
+
 // maxStageDeletionResults limits how many messages can be staged in one call.
 const maxStageDeletionResults = 100000
 
@@ -1324,6 +1334,126 @@ func (h *handlers) whatsAppStatus(ctx context.Context, req mcp.CallToolRequest) 
 		return mcp.NewToolResultError(fmt.Sprintf("whatsapp status: %v", err)), nil
 	}
 	return jsonResult(status)
+}
+
+type whatsappLoginClient interface {
+	StartLogin(ctx context.Context) (whatsapplive.LoginState, error)
+	LoginState(ctx context.Context) (whatsapplive.LoginState, error)
+}
+
+type whatsAppLoginResponse struct {
+	whatsapplive.LoginState
+	QRCode         string `json:"qr_code,omitempty"`
+	QRPNGBase64    string `json:"qr_png_base64,omitempty"`
+	QRPageURL      string `json:"qr_page_url,omitempty"`
+	PollAfterSecs  int    `json:"poll_after_secs,omitempty"`
+	AlreadyPaired  bool   `json:"already_paired"`
+	NeedsPairing   bool   `json:"needs_pairing"`
+	NeedsReconnect bool   `json:"needs_reconnect"`
+}
+
+func (h *handlers) whatsAppStartLogin(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	loginClient, state, err := h.getWhatsAppLoginClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	state, err = loginClient.StartLogin(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("start whatsapp login: %v", err)), nil
+	}
+
+	waitMS := boundedIntArg(args, "wait_ms", 3000, 15000)
+	if waitMS > 0 {
+		state, err = waitForWhatsAppLoginCode(ctx, loginClient, state, time.Duration(waitMS)*time.Millisecond)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("wait for whatsapp login QR: %v", err)), nil
+		}
+	}
+	return structuredJSONResult(h.whatsAppLoginResponse(state, includeQRPNG(args)))
+}
+
+func (h *handlers) whatsAppLoginStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	loginClient, state, err := h.getWhatsAppLoginClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	state, err = loginClient.LoginState(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("whatsapp login status: %v", err)), nil
+	}
+	return structuredJSONResult(h.whatsAppLoginResponse(state, includeQRPNG(args)))
+}
+
+func (h *handlers) getWhatsAppLoginClient(ctx context.Context, args map[string]any) (whatsappLoginClient, whatsapplive.LoginState, error) {
+	client, _, err := h.getWhatsAppClient(ctx, args)
+	if err != nil {
+		return nil, whatsapplive.LoginState{}, err
+	}
+	loginClient, ok := client.(whatsappLoginClient)
+	if !ok {
+		return nil, whatsapplive.LoginState{}, fmt.Errorf("WhatsApp live client does not support MCP login")
+	}
+	state, err := loginClient.LoginState(ctx)
+	if err != nil {
+		return nil, whatsapplive.LoginState{}, err
+	}
+	return loginClient, state, nil
+}
+
+func waitForWhatsAppLoginCode(ctx context.Context, client whatsappLoginClient, state whatsapplive.LoginState, wait time.Duration) (whatsapplive.LoginState, error) {
+	if wait <= 0 || state.Status.Paired || state.Pairing.Code != "" || state.Pairing.Error != "" {
+		return state, nil
+	}
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return state, ctx.Err()
+		case <-deadline.C:
+			return state, nil
+		case <-ticker.C:
+			next, err := client.LoginState(ctx)
+			if err != nil {
+				return state, err
+			}
+			state = next
+			if state.Status.Paired || state.Pairing.Code != "" || state.Pairing.Error != "" || !state.Pairing.Active {
+				return state, nil
+			}
+		}
+	}
+}
+
+func (h *handlers) whatsAppLoginResponse(state whatsapplive.LoginState, includePNG bool) whatsAppLoginResponse {
+	resp := whatsAppLoginResponse{
+		LoginState:     state,
+		QRCode:         state.Pairing.Code,
+		QRPageURL:      h.whatsAppLoginURL,
+		PollAfterSecs:  5,
+		AlreadyPaired:  state.Status.Paired,
+		NeedsPairing:   !state.Status.Paired,
+		NeedsReconnect: state.Status.Paired && !state.Status.Connected,
+	}
+	if state.Status.Paired {
+		resp.PollAfterSecs = 0
+	}
+	if includePNG && state.Pairing.Code != "" && !state.Status.Paired {
+		if png, err := qrcode.Encode(state.Pairing.Code, qrcode.Medium, 320); err == nil {
+			resp.QRPNGBase64 = base64.StdEncoding.EncodeToString(png)
+		}
+	}
+	return resp
+}
+
+func includeQRPNG(args map[string]any) bool {
+	v, ok := args["include_qr_png"].(bool)
+	return !ok || v
 }
 
 func (h *handlers) sendWhatsAppMessage(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
