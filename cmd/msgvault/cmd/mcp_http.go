@@ -74,10 +74,11 @@ Example Claude Desktop config (with port-forward):
 
 		fmt.Fprintf(os.Stderr, "Starting MCP HTTP server on %s\n", mcpSSEAddr)
 		return mcpserver.ServeStreamableHTTP(ctx, mcpSSEAddr, mcpHTTPAPIKey, mcpserver.ServeOptions{
-			Engine:         env.Engine,
-			AttachmentsDir: cfg.AttachmentsDir(),
-			DataDir:        cfg.Data.DataDir,
-			GmailFactory:   env.GmailFactory,
+			Engine:            env.Engine,
+			AttachmentsDir:    cfg.AttachmentsDir(),
+			DataDir:           cfg.Data.DataDir,
+			GmailFactory:      env.GmailFactory,
+			GoogleDocsFactory: env.GoogleDocsFactory,
 		})
 	},
 }

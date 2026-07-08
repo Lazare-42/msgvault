@@ -11,10 +11,14 @@ import (
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/gmail"
+	"go.kenn.io/msgvault/internal/googledocs"
 	mcpserver "go.kenn.io/msgvault/internal/mcp"
 	"go.kenn.io/msgvault/internal/oauth"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/store"
+	"google.golang.org/api/docs/v1"
+	"google.golang.org/api/drive/v3"
+	"google.golang.org/api/option"
 )
 
 var mcpForceSQL bool
@@ -73,10 +77,11 @@ Add to Claude Desktop config:
 		}()
 
 		opts := mcpserver.ServeOptions{
-			Engine:         env.Engine,
-			AttachmentsDir: cfg.AttachmentsDir(),
-			DataDir:        cfg.Data.DataDir,
-			GmailFactory:   env.GmailFactory,
+			Engine:            env.Engine,
+			AttachmentsDir:    cfg.AttachmentsDir(),
+			DataDir:           cfg.Data.DataDir,
+			GmailFactory:      env.GmailFactory,
+			GoogleDocsFactory: env.GoogleDocsFactory,
 		}
 		if vf != nil {
 			opts.HybridEngine = vf.HybridEngine
@@ -107,10 +112,11 @@ func mcpShouldUseParquet(forceSQL bool, analyticsDir string) bool {
 
 // mcpEnv holds shared resources for MCP commands (stdio, HTTP, SSE).
 type mcpEnv struct {
-	Store        *store.Store
-	Engine       query.Engine
-	GmailFactory mcpserver.GmailClientFactory
-	duckEngine   *query.DuckDBEngine // non-nil when DuckDB is used
+	Store             *store.Store
+	Engine            query.Engine
+	GmailFactory      mcpserver.GmailClientFactory
+	GoogleDocsFactory mcpserver.GoogleDocsClientFactory
+	duckEngine        *query.DuckDBEngine // non-nil when DuckDB is used
 }
 
 // Close releases all resources held by the MCP environment.
@@ -183,6 +189,7 @@ func setupMCPEnv(forceSQL, noSQLiteScanner bool) (*mcpEnv, error) {
 	}
 
 	env.GmailFactory = buildGmailFactory(s)
+	env.GoogleDocsFactory = buildGoogleDocsFactory()
 	return env, nil
 }
 
@@ -234,6 +241,54 @@ func buildGmailFactory(s *store.Store) mcpserver.GmailClientFactory {
 		)
 
 		return client, nil
+	}
+}
+
+// buildGoogleDocsFactory returns a GoogleDocsClientFactory for configured
+// Drive folder sources. It returns nil when no Google Docs sources are enabled.
+func buildGoogleDocsFactory() mcpserver.GoogleDocsClientFactory {
+	sources := cfg.EnabledGoogleDocsSources()
+	if len(sources) == 0 {
+		return nil
+	}
+
+	return func(ctx context.Context) (googledocs.Client, error) {
+		services := make([]googledocs.SourceServices, 0, len(sources))
+		for _, src := range sources {
+			if err := googledocs.ValidateSource(src); err != nil {
+				return nil, err
+			}
+			clientSecrets, err := cfg.OAuth.ClientSecretsFor(src.OAuthApp)
+			if err != nil {
+				return nil, fmt.Errorf("OAuth for google-docs source %q: %w", src.Name, err)
+			}
+			mgr, err := newGoogleDocsDriveOAuthManager(clientSecrets)
+			if err != nil {
+				return nil, fmt.Errorf("create OAuth manager for google-docs source %q: %w", src.Name, err)
+			}
+			if !googleDocsDriveTokenReady(mgr, src.GoogleAccount) {
+				return nil, fmt.Errorf("no Google Docs OAuth token with Drive/Docs scopes for %s; run 'msgvault add-google-docs-drive %s --folder-id %s --google-account %s' on a machine with browser auth first",
+					src.GoogleAccount, src.Name, src.FolderID, src.GoogleAccount)
+			}
+			ts, err := mgr.TokenSource(ctx, src.GoogleAccount)
+			if err != nil {
+				return nil, fmt.Errorf("get token for google-docs source %q (%s): %w", src.Name, src.GoogleAccount, err)
+			}
+			driveService, err := drive.NewService(ctx, option.WithTokenSource(ts))
+			if err != nil {
+				return nil, fmt.Errorf("create Drive service for google-docs source %q: %w", src.Name, err)
+			}
+			docsService, err := docs.NewService(ctx, option.WithTokenSource(ts))
+			if err != nil {
+				return nil, fmt.Errorf("create Docs service for google-docs source %q: %w", src.Name, err)
+			}
+			services = append(services, googledocs.SourceServices{
+				Source: src,
+				Drive:  driveService,
+				Docs:   docsService,
+			})
+		}
+		return googledocs.NewClient(services)
 	}
 }
 

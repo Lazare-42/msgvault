@@ -84,6 +84,18 @@ type SynctechSMSSource struct {
 	OAuthApp           string `toml:"oauth_app"`
 }
 
+type GoogleDocsConfig struct {
+	Sources []GoogleDocsSource `toml:"sources"`
+}
+
+type GoogleDocsSource struct {
+	Name          string `toml:"name"`
+	Enabled       bool   `toml:"enabled"`
+	FolderID      string `toml:"folder_id"`
+	GoogleAccount string `toml:"google_account"`
+	OAuthApp      string `toml:"oauth_app"`
+}
+
 // RemoteConfig holds configuration for a remote msgvault server.
 // Used by export-token to remember the NAS/server destination.
 type RemoteConfig struct {
@@ -110,6 +122,7 @@ type Config struct {
 	Identity    IdentityConfig    `toml:"identity"`
 	Accounts    []AccountSchedule `toml:"accounts"`
 	SynctechSMS SynctechSMSConfig `toml:"synctech_sms"`
+	GoogleDocs  GoogleDocsConfig  `toml:"google_docs"`
 
 	// Computed paths (not from config file)
 	HomeDir    string `toml:"-"`
@@ -273,6 +286,7 @@ func NewDefaultConfig() *Config {
 		},
 		Accounts:    []AccountSchedule{},
 		SynctechSMS: SynctechSMSConfig{Sources: []SynctechSMSSource{}},
+		GoogleDocs:  GoogleDocsConfig{Sources: []GoogleDocsSource{}},
 	}
 	cfg.Vector.ApplyDefaults()
 	return cfg
@@ -574,6 +588,26 @@ func (c *Config) GetSynctechSMSSource(name string) *SynctechSMSSource {
 		}
 	}
 	return nil
+}
+
+func (c *Config) GetGoogleDocsSource(name string) *GoogleDocsSource {
+	for _, src := range c.GoogleDocs.Sources {
+		if strings.EqualFold(src.Name, name) {
+			cp := src
+			return &cp
+		}
+	}
+	return nil
+}
+
+func (c *Config) EnabledGoogleDocsSources() []GoogleDocsSource {
+	var out []GoogleDocsSource
+	for _, src := range c.GoogleDocs.Sources {
+		if src.Enabled {
+			out = append(out, src)
+		}
+	}
+	return out
 }
 
 func (c *Config) ScheduledSynctechSMSSources() []SynctechSMSSource {
