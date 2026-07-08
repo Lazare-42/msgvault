@@ -13,7 +13,7 @@ buildGoModule {
 
   src = gitignoreSource ../.;
 
-  vendorHash = "sha256-MTAlu3po4fYs50QY2J4AlWmkSMhclX2YbL+IMtqEANY=";
+  vendorHash = "sha256-QkYNdvNI7kR5JVhdBjnnOaRHcYV3uu7TNNahTgqil9o=";
   proxyVendor = true;
 
   subPackages = [ "cmd/msgvault" ];
@@ -23,7 +23,8 @@ buildGoModule {
   env.CGO_ENABLED = 1;
 
   # sqlite-vec-go-bindings does `#include "sqlite3.h"` but ships no sqlite
-  # source — provide the system header via buildInputs.
+  # source — provide the system header via buildInputs. flake.nix asserts a
+  # minimum SQLite version before passing this package in.
   buildInputs = [ sqlite ];
 
   tags = [

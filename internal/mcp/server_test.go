@@ -22,6 +22,7 @@ import (
 	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/hybrid"
+	whatsapplive "go.kenn.io/msgvault/internal/whatsapp/live"
 )
 
 // stubEmbedder is an EmbeddingClient placeholder for tests where the
@@ -35,6 +36,24 @@ func (stubEmbedder) Embed(_ context.Context, _ []string) ([][]float32, error) {
 
 // toolHandler is the function signature for MCP tool handler methods.
 type toolHandler func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error)
+
+type mockWhatsAppClient struct {
+	status       whatsapplive.Status
+	sendMessage  func(context.Context, whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error)
+	sendReaction func(context.Context, whatsapplive.SendReactionRequest) (whatsapplive.SendResult, error)
+}
+
+func (m *mockWhatsAppClient) Status(context.Context) (whatsapplive.Status, error) {
+	return m.status, nil
+}
+func (m *mockWhatsAppClient) Connect(context.Context) error { return nil }
+func (m *mockWhatsAppClient) Close() error                  { return nil }
+func (m *mockWhatsAppClient) SendMessage(ctx context.Context, req whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error) {
+	return m.sendMessage(ctx, req)
+}
+func (m *mockWhatsAppClient) SendReaction(ctx context.Context, req whatsapplive.SendReactionRequest) (whatsapplive.SendResult, error) {
+	return m.sendReaction(ctx, req)
+}
 
 // Response types for runTool generic calls.
 type statsResponse struct {
@@ -127,6 +146,111 @@ func runToolExpectError(t *testing.T, name string, fn toolHandler, args map[stri
 	r := callToolDirect(t, name, fn, args)
 	requirepkg.True(t, r.IsError, "expected error result")
 	return r
+}
+
+func TestWhatsAppStatusUsesWhatsAppAccountScope(t *testing.T) {
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 1, SourceType: "gmail", Identifier: "lazare@example.com"},
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var factoryAccount string
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			Account:    "15551234567@s.whatsapp.net",
+			AccountJID: "15551234567@s.whatsapp.net",
+			Paired:     true,
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			factoryAccount = account
+			return client, nil
+		},
+	}
+
+	status := runTool[whatsapplive.Status](t, ToolWhatsAppStatus, h.whatsAppStatus, map[string]any{})
+	assertpkg.Equal(t, "15551234567@s.whatsapp.net", factoryAccount)
+	assertpkg.True(t, status.Paired)
+	assertpkg.Equal(t, "15551234567@s.whatsapp.net", status.AccountJID)
+}
+
+func TestSendWhatsAppMessage(t *testing.T) {
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var gotReq whatsapplive.SendMessageRequest
+	client := &mockWhatsAppClient{
+		sendMessage: func(_ context.Context, req whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error) {
+			gotReq = req
+			return whatsapplive.SendResult{
+				LocalRequestID:  req.LocalRequestID,
+				OutboxID:        7,
+				MessageID:       8,
+				RemoteMessageID: "remote-1",
+				ChatJID:         req.ChatID,
+				Status:          "sent",
+			}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assertpkg.Equal(t, "15551234567@s.whatsapp.net", account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsapplive.SendResult](t, ToolSendWhatsAppMessage, h.sendWhatsAppMessage, map[string]any{
+		"chat_id":          "15557654321@s.whatsapp.net",
+		"body":             "hello",
+		"local_request_id": "req-1",
+	})
+	assertpkg.Equal(t, "15557654321@s.whatsapp.net", gotReq.ChatID)
+	assertpkg.Equal(t, "hello", gotReq.Body)
+	assertpkg.Equal(t, "req-1", gotReq.LocalRequestID)
+	assertpkg.Equal(t, int64(8), result.MessageID)
+	assertpkg.Equal(t, "remote-1", result.RemoteMessageID)
+}
+
+func TestSendWhatsAppReactionAllowsEmptyEmojiToClear(t *testing.T) {
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var gotReq whatsapplive.SendReactionRequest
+	client := &mockWhatsAppClient{
+		sendReaction: func(_ context.Context, req whatsapplive.SendReactionRequest) (whatsapplive.SendResult, error) {
+			gotReq = req
+			return whatsapplive.SendResult{
+				LocalRequestID: req.LocalRequestID,
+				MessageID:      req.MessageID,
+				Status:         "sent",
+			}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assertpkg.Equal(t, "15551234567@s.whatsapp.net", account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsapplive.SendResult](t, ToolSendWhatsAppReaction, h.sendWhatsAppReaction, map[string]any{
+		"message_id":       float64(42),
+		"emoji":            "",
+		"local_request_id": "react-1",
+	})
+	assertpkg.Equal(t, int64(42), gotReq.MessageID)
+	assertpkg.Equal(t, "", gotReq.Emoji)
+	assertpkg.Equal(t, "react-1", gotReq.LocalRequestID)
+	assertpkg.Equal(t, int64(42), result.MessageID)
 }
 
 func TestSearchMessages(t *testing.T) {

@@ -20,6 +20,10 @@
       system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+        minSQLiteVersion = "3.44.0";
+        sqliteForMsgvault =
+          assert pkgs.lib.versionAtLeast pkgs.sqlite.version minSQLiteVersion;
+          pkgs.sqlite;
 
         # Pin Go 1.26.4 until nixpkgs-unstable ships it.
         # Scoped to msgvault only — do NOT export via overlay, that would
@@ -37,6 +41,7 @@
         msgvault = pkgs.callPackage ./nix/package.nix {
           inherit buildGoModule;
           inherit (gitignore.lib) gitignoreSource;
+          sqlite = sqliteForMsgvault;
         };
       in
       {
@@ -55,6 +60,8 @@
             pkgs.golangci-lint
             pkgs.delve
             pkgs.gcc
+            pkgs.pkg-config
+            sqliteForMsgvault
             pkgs.prek
             pkgs.sqlite-interactive
           ];

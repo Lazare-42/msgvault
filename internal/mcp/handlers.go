@@ -21,8 +21,10 @@ import (
 	"go.kenn.io/msgvault/internal/gmail"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/hybrid"
+	whatsapplive "go.kenn.io/msgvault/internal/whatsapp/live"
 )
 
 const (
@@ -88,10 +90,11 @@ func listLimitArg(args map[string]any) int {
 }
 
 type handlers struct {
-	engine         query.Engine
-	attachmentsDir string
-	dataDir        string
-	gmailFactory   GmailClientFactory
+	engine          query.Engine
+	attachmentsDir  string
+	dataDir         string
+	gmailFactory    GmailClientFactory
+	whatsAppFactory WhatsAppClientFactory
 
 	// Optional vector-search wiring. When hybridEngine is nil, the
 	// search_messages handler rejects mode=vector and mode=hybrid with
@@ -1247,6 +1250,131 @@ func (h *handlers) searchByDomains(ctx context.Context, req mcp.CallToolRequest)
 	}
 
 	return jsonResult(results)
+}
+
+// --- WhatsApp handlers ---
+
+func (h *handlers) getWhatsAppClient(ctx context.Context, args map[string]any) (whatsapplive.Client, string, error) {
+	if h.whatsAppFactory == nil {
+		return nil, "", fmt.Errorf("WhatsApp live client not configured")
+	}
+
+	account, _ := args["account"].(string)
+	account = strings.TrimSpace(account)
+
+	accounts, err := h.engine.ListAccounts(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to list accounts: %w", err)
+	}
+	whatsAppAccounts := make([]query.AccountInfo, 0, len(accounts))
+	for _, acc := range accounts {
+		if acc.SourceType == store.WhatsAppSourceType {
+			whatsAppAccounts = append(whatsAppAccounts, acc)
+		}
+	}
+
+	if account == "" {
+		switch len(whatsAppAccounts) {
+		case 0:
+			// Allow the live client to report pairing status before the first
+			// archive source has been created.
+		case 1:
+			account = whatsAppAccounts[0].Identifier
+		default:
+			return nil, "", fmt.Errorf("multiple WhatsApp accounts configured, specify 'account' parameter")
+		}
+	} else if len(whatsAppAccounts) > 0 {
+		found := false
+		for _, acc := range whatsAppAccounts {
+			if acc.Identifier == account {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, "", fmt.Errorf("WhatsApp account not found: %s", account)
+		}
+	}
+
+	client, err := h.whatsAppFactory(ctx, account)
+	if err != nil {
+		return nil, "", fmt.Errorf("open WhatsApp client: %w", err)
+	}
+	return client, account, nil
+}
+
+func (h *handlers) whatsAppStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	client, _, err := h.getWhatsAppClient(ctx, req.GetArguments())
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	status, err := client.Status(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("whatsapp status: %v", err)), nil
+	}
+	return jsonResult(status)
+}
+
+func (h *handlers) sendWhatsAppMessage(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	client, account, err := h.getWhatsAppClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	chatID, _ := args["chat_id"].(string)
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return mcp.NewToolResultError("chat_id parameter is required"), nil
+	}
+	body, _ := args["body"].(string)
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return mcp.NewToolResultError("body parameter is required"), nil
+	}
+	localRequestID, _ := args["local_request_id"].(string)
+
+	result, err := client.SendMessage(ctx, whatsapplive.SendMessageRequest{
+		Account:        account,
+		ChatID:         chatID,
+		Body:           body,
+		LocalRequestID: strings.TrimSpace(localRequestID),
+	})
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("send whatsapp message: %v", err)), nil
+	}
+	return jsonResult(result)
+}
+
+func (h *handlers) sendWhatsAppReaction(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	client, account, err := h.getWhatsAppClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	messageID, err := getIDArg(args, "message_id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	emojiRaw, ok := args["emoji"]
+	if !ok {
+		return mcp.NewToolResultError("emoji parameter is required; use an empty string to clear"), nil
+	}
+	emoji, ok := emojiRaw.(string)
+	if !ok {
+		return mcp.NewToolResultError("emoji must be a string"), nil
+	}
+	localRequestID, _ := args["local_request_id"].(string)
+
+	result, err := client.SendReaction(ctx, whatsapplive.SendReactionRequest{
+		Account:        account,
+		MessageID:      messageID,
+		Emoji:          emoji,
+		LocalRequestID: strings.TrimSpace(localRequestID),
+	})
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("send whatsapp reaction: %v", err)), nil
+	}
+	return jsonResult(result)
 }
 
 // --- Draft handlers ---
