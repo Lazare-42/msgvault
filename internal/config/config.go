@@ -432,6 +432,18 @@ type SynctechSMSSource struct {
 	OAuthApp           string `toml:"oauth_app"`
 }
 
+type GoogleDocsConfig struct {
+	Sources []GoogleDocsSource `toml:"sources"`
+}
+
+type GoogleDocsSource struct {
+	Name          string `toml:"name"`
+	Enabled       bool   `toml:"enabled"`
+	FolderID      string `toml:"folder_id"`
+	GoogleAccount string `toml:"google_account"`
+	OAuthApp      string `toml:"oauth_app"`
+}
+
 // RemoteConfig holds configuration for a remote msgvault server.
 // Remote-capable commands use this destination unless --local is selected.
 type RemoteConfig struct {
@@ -601,6 +613,7 @@ type Config struct {
 	IMAP               IMAPConfig                      `toml:"imap"`
 	Gmail              GmailConfig                     `toml:"gmail"`
 	Telemetry          TelemetryConfig                 `toml:"telemetry"`
+	GoogleDocs GoogleDocsConfig `toml:"google_docs"`
 
 	// Computed paths (not from config file)
 	HomeDir            string `toml:"-"`
@@ -913,6 +926,7 @@ func NewDefaultConfig() *Config {
 		Slack:   SlackConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
 		Discord: DiscordConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
 		Teams:   TeamsConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
+		GoogleDocs:  GoogleDocsConfig{Sources: []GoogleDocsSource{}},
 	}
 	cfg.Attachments.Documents = documentindex.DefaultDocumentsConfig()
 	cfg.Vector.ApplyDefaults()
@@ -2488,6 +2502,26 @@ func (c *Config) GetSynctechSMSSource(name string) *SynctechSMSSource {
 		}
 	}
 	return nil
+}
+
+func (c *Config) GetGoogleDocsSource(name string) *GoogleDocsSource {
+	for _, src := range c.GoogleDocs.Sources {
+		if strings.EqualFold(src.Name, name) {
+			cp := src
+			return &cp
+		}
+	}
+	return nil
+}
+
+func (c *Config) EnabledGoogleDocsSources() []GoogleDocsSource {
+	var out []GoogleDocsSource
+	for _, src := range c.GoogleDocs.Sources {
+		if src.Enabled {
+			out = append(out, src)
+		}
+	}
+	return out
 }
 
 func (c *Config) ScheduledSynctechSMSSources() []SynctechSMSSource {
