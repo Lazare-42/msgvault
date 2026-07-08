@@ -1476,6 +1476,26 @@ CREATE TABLE IF NOT EXISTS reaction_source_events (
 );
 CREATE INDEX IF NOT EXISTS idx_reaction_source_events_reaction
     ON reaction_source_events(reaction_id);
+CREATE TABLE IF NOT EXISTS whatsapp_outbox (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    local_request_id TEXT NOT NULL UNIQUE,
+    source_id BIGINT NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    conversation_id BIGINT REFERENCES conversations(id) ON DELETE SET NULL,
+    message_id BIGINT REFERENCES messages(id) ON DELETE SET NULL,
+
+    kind TEXT NOT NULL,
+    chat_jid TEXT NOT NULL,
+    target_source_message_id TEXT,
+    body TEXT,
+    emoji TEXT,
+
+    status TEXT NOT NULL DEFAULT 'pending',
+    remote_message_id TEXT,
+    error_text TEXT,
+
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
 
 -- ============================================================================
 -- ATTACHMENTS
@@ -3925,6 +3945,10 @@ CREATE INDEX IF NOT EXISTS idx_message_recipients_message ON message_recipients(
 CREATE INDEX IF NOT EXISTS idx_message_recipients_participant ON message_recipients(participant_id, recipient_type);
 
 CREATE INDEX IF NOT EXISTS idx_reactions_message ON reactions(message_id);
+CREATE INDEX IF NOT EXISTS idx_whatsapp_outbox_source_status
+    ON whatsapp_outbox(source_id, status, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_whatsapp_outbox_remote_message
+    ON whatsapp_outbox(source_id, remote_message_id);
 
 CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_hash ON attachments(content_hash);

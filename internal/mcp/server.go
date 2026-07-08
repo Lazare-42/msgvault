@@ -28,12 +28,16 @@ import (
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/hybrid"
 	"go.kenn.io/msgvault/internal/vector/visual"
+	whatsapplive "go.kenn.io/msgvault/internal/whatsapp/live"
 )
 
 // GmailClientFactory creates authenticated Gmail API clients for a given
 // account email. Returns nil if Gmail draft operations are not available
 // (e.g., OAuth not configured). The caller is responsible for closing the client.
 type GmailClientFactory func(ctx context.Context, email string) (*gmail.Client, error)
+
+// WhatsAppClientFactory creates a live WhatsApp client for an archive account.
+type WhatsAppClientFactory func(ctx context.Context, account string) (whatsapplive.Client, error)
 
 // Tool name constants.
 const (
@@ -109,6 +113,9 @@ const (
 	ToolCreateLabel            = "create_label"
 	ToolDeleteLabel            = "delete_label"
 	ToolListGmailLabels        = "list_gmail_labels"
+	ToolWhatsAppStatus         = "whatsapp_status"
+	ToolSendWhatsAppMessage    = "send_whatsapp_message"
+	ToolSendWhatsAppReaction   = "send_whatsapp_reaction"
 )
 
 // search_message_bodies/search_in_message mode values (wire format).
@@ -214,6 +221,8 @@ type ServeOptions struct {
 	Drafts        DraftRunner
 	DraftCommands []string
 	GmailFactory GmailClientFactory
+	// WhatsAppFactory is optional. When non-nil, live WhatsApp tools are exposed.
+	WhatsAppFactory WhatsAppClientFactory
 }
 
 type HTTPOptions struct {
@@ -419,6 +428,7 @@ func newMCPServerWithPolicy(
 		contactRoutesBackend: opts.ContactRoutesBackend,
 		chatDiscoveryBackend: opts.ChatDiscoveryBackend,
 	gmailFactory: opts.GmailFactory,
+	whatsAppFactory: opts.WhatsAppFactory,
 	}
 
 	for _, definition := range operationCatalog(opts, h) {
@@ -474,6 +484,12 @@ func newMCPServerWithPolicy(
 		s.AddTool(createLabelTool(), h.createLabel)
 		s.AddTool(deleteLabelTool(), h.deleteLabel)
 		s.AddTool(listGmailLabelsTool(), h.listGmailLabels)
+	}
+
+	if opts.WhatsAppFactory != nil {
+		s.AddTool(whatsAppStatusTool(), h.whatsAppStatus)
+		s.AddTool(sendWhatsAppMessageTool(), h.sendWhatsAppMessage)
+		s.AddTool(sendWhatsAppReactionTool(), h.sendWhatsAppReaction)
 	}
 
 	return s
@@ -849,5 +865,54 @@ func listGmailLabelsTool() mcp.Tool {
 		mcp.WithDescription("List all Gmail labels from the live account (not the archive). Returns label IDs and names for use with modify_labels."),
 		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
+	)
+}
+
+func whatsAppStatusTool() mcp.Tool {
+	return mcp.NewTool(ToolWhatsAppStatus,
+		mcp.WithDescription("Get live WhatsApp connection and pairing status."),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(true), mcp.WithOpenWorldHintAnnotation(false),
+		withAccount(),
+	)
+}
+
+func sendWhatsAppMessageTool() mcp.Tool {
+	return mcp.NewTool(ToolSendWhatsAppMessage,
+		mcp.WithDescription("Send a WhatsApp message through the linked live account. Records an outbox row before sending and archives the sent message."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithIdempotentHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(true),
+		withAccount(),
+		mcp.WithString("chat_id",
+			mcp.Required(),
+			mcp.Description("WhatsApp chat JID, group JID, or international phone number"),
+		),
+		mcp.WithString("body",
+			mcp.Required(),
+			mcp.Description("Message body to send"),
+		),
+		mcp.WithString("local_request_id",
+			mcp.Description("Optional caller-provided idempotency/audit key"),
+		),
+	)
+}
+
+func sendWhatsAppReactionTool() mcp.Tool {
+	return mcp.NewTool(ToolSendWhatsAppReaction,
+		mcp.WithDescription("Set or clear a WhatsApp emoji reaction on an archived WhatsApp message. Use an empty emoji string to clear the active reaction."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithIdempotentHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(true),
+		withAccount(),
+		mcp.WithNumber("message_id",
+			mcp.Required(),
+			mcp.Description("Archived msgvault message ID to react to"),
+		),
+		mcp.WithString("emoji",
+			mcp.Required(),
+			mcp.Description("Emoji reaction; pass an empty string to clear"),
+		),
+		mcp.WithString("local_request_id",
+			mcp.Description("Optional caller-provided idempotency/audit key"),
+		),
 	)
 }

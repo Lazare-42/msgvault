@@ -1,0 +1,96 @@
+package live
+
+import (
+	"context"
+	"time"
+)
+
+type Client interface {
+	Status(ctx context.Context) (Status, error)
+	Connect(ctx context.Context) error
+	Close() error
+	SendMessage(ctx context.Context, req SendMessageRequest) (SendResult, error)
+	SendReaction(ctx context.Context, req SendReactionRequest) (SendResult, error)
+}
+
+type Status struct {
+	Account     string `json:"account,omitempty"`
+	AccountJID  string `json:"account_jid,omitempty"`
+	Connected   bool   `json:"connected"`
+	LoggedIn    bool   `json:"logged_in"`
+	Paired      bool   `json:"paired"`
+	SessionPath string `json:"session_path,omitempty"`
+}
+
+type SendMessageRequest struct {
+	Account        string
+	ChatID         string
+	Body           string
+	LocalRequestID string
+}
+
+type SendReactionRequest struct {
+	Account        string
+	MessageID      int64
+	Emoji          string
+	LocalRequestID string
+}
+
+type SendResult struct {
+	LocalRequestID  string `json:"local_request_id"`
+	OutboxID        int64  `json:"outbox_id,omitempty"`
+	MessageID       int64  `json:"message_id,omitempty"`
+	RemoteMessageID string `json:"remote_message_id,omitempty"`
+	ChatJID         string `json:"chat_jid,omitempty"`
+	Status          string `json:"status"`
+}
+
+type InboundMessage struct {
+	Account   string
+	ChatJID   string
+	SenderJID string
+	MessageID string
+	PushName  string
+	Text      string
+	Timestamp time.Time
+	IsFromMe  bool
+	IsGroup   bool
+	RawJSON   []byte
+	Reaction  *InboundReaction
+}
+
+type InboundReaction struct {
+	TargetChatJID   string
+	TargetMessageID string
+	TargetSenderJID string
+	Emoji           string
+	TargetFromMe    bool
+}
+
+type Transport interface {
+	Status(ctx context.Context) (Status, error)
+	Connect(ctx context.Context) error
+	Close() error
+	SendMessage(ctx context.Context, req TransportSendMessageRequest) (TransportSendResult, error)
+	SendReaction(ctx context.Context, req TransportSendReactionRequest) (TransportSendResult, error)
+}
+
+type TransportSendMessageRequest struct {
+	Account string
+	ChatID  string
+	Body    string
+}
+
+type TransportSendReactionRequest struct {
+	Account         string
+	ChatJID         string
+	SenderJID       string
+	RemoteMessageID string
+	Emoji           string
+}
+
+type TransportSendResult struct {
+	RemoteMessageID string
+	ChatJID         string
+	Timestamp       time.Time
+}

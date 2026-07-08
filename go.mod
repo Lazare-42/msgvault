@@ -198,3 +198,18 @@ require (
 	modernc.org/memory v1.12.1 // indirect
 	modernc.org/sqlite v1.60.1 // indirect
 )
+
+require (
+	github.com/jhillyerd/enmime v1.3.0
+	github.com/mark3labs/mcp-go v0.55.1
+	go.mau.fi/whatsmeow v0.0.0-20260630180629-b572e5bcb92b
+	github.com/beeper/argo-go v1.1.2 // indirect
+	github.com/coder/websocket v1.8.15 // indirect
+	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
+	github.com/elliotchance/orderedmap/v3 v3.1.0 // indirect
+	github.com/petermattis/goid v0.0.0-20260330135022-df67b199bc81 // indirect
+	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
+	github.com/santhosh-tekuri/jsonschema/v6 v6.0.2 // indirect
+	github.com/vektah/gqlparser/v2 v2.5.27 // indirect
+	go.mau.fi/libsignal v0.2.2 // indirect
+)
