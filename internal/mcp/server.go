@@ -60,6 +60,8 @@ const (
 	ToolDeleteLabel            = "delete_label"
 	ToolListGmailLabels        = "list_gmail_labels"
 	ToolWhatsAppStatus         = "whatsapp_status"
+	ToolWhatsAppStartLogin     = "whatsapp_start_login"
+	ToolWhatsAppLoginStatus    = "whatsapp_login_status"
 	ToolSendWhatsAppMessage    = "send_whatsapp_message"
 	ToolSendWhatsAppReaction   = "send_whatsapp_reaction"
 	ToolListGoogleDocs         = "list_google_docs"
@@ -133,6 +135,8 @@ type ServeOptions struct {
 	GmailFactory GmailClientFactory
 	// WhatsAppFactory is optional. When non-nil, live WhatsApp tools are exposed.
 	WhatsAppFactory WhatsAppClientFactory
+	// WhatsAppLoginURL is an optional browser URL for QR login/resync.
+	WhatsAppLoginURL string
 	// GoogleDocsFactory is optional. When non-nil, Google Docs tools are exposed.
 	GoogleDocsFactory GoogleDocsClientFactory
 }
@@ -160,6 +164,7 @@ func BuildMCPServer(opts ServeOptions) *server.MCPServer {
 		backend:           opts.Backend,
 		gmailFactory:      opts.GmailFactory,
 		whatsAppFactory:   opts.WhatsAppFactory,
+		whatsAppLoginURL:  strings.TrimSpace(opts.WhatsAppLoginURL),
 		googleDocsFactory: opts.GoogleDocsFactory,
 	}
 
@@ -201,6 +206,8 @@ func BuildMCPServer(opts ServeOptions) *server.MCPServer {
 
 	if opts.WhatsAppFactory != nil {
 		s.AddTool(whatsAppStatusTool(), h.whatsAppStatus)
+		s.AddTool(whatsAppStartLoginTool(), h.whatsAppStartLogin)
+		s.AddTool(whatsAppLoginStatusTool(), h.whatsAppLoginStatus)
 		s.AddTool(sendWhatsAppMessageTool(), h.sendWhatsAppMessage)
 		s.AddTool(sendWhatsAppReactionTool(), h.sendWhatsAppReaction)
 	}
@@ -887,6 +894,33 @@ func whatsAppStatusTool() mcp.Tool {
 		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithIdempotentHintAnnotation(true), mcp.WithOpenWorldHintAnnotation(false),
 		withAccount(),
+	)
+}
+
+func whatsAppStartLoginTool() mcp.Tool {
+	return mcp.NewTool(ToolWhatsAppStartLogin,
+		mcp.WithDescription("Start or resume WhatsApp QR login for the live account. Returns status, QR payload, optional PNG bytes, and the browser QR page URL when configured."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(true), mcp.WithOpenWorldHintAnnotation(true),
+		withAccount(),
+		mcp.WithNumber("wait_ms",
+			mcp.Description("Milliseconds to wait for a QR code after starting login (default 3000, max 15000)"),
+		),
+		mcp.WithBoolean("include_qr_png",
+			mcp.Description("Include base64 PNG QR image data when a QR code is available (default true)"),
+		),
+	)
+}
+
+func whatsAppLoginStatusTool() mcp.Tool {
+	return mcp.NewTool(ToolWhatsAppLoginStatus,
+		mcp.WithDescription("Poll WhatsApp QR login state for the live account. Returns the current QR payload, optional PNG bytes, and browser QR page URL when configured."),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(true), mcp.WithOpenWorldHintAnnotation(false),
+		withAccount(),
+		mcp.WithBoolean("include_qr_png",
+			mcp.Description("Include base64 PNG QR image data when a QR code is available (default true)"),
+		),
 	)
 }
 

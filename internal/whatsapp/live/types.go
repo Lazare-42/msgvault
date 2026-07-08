@@ -31,6 +31,11 @@ type QRPairingState struct {
 	Paired    bool      `json:"paired"`
 }
 
+type LoginState struct {
+	Status  Status         `json:"status"`
+	Pairing QRPairingState `json:"pairing"`
+}
+
 type SendMessageRequest struct {
 	Account        string
 	ChatID         string

@@ -70,3 +70,35 @@ func TestWhatsAppPairingPublicPath(t *testing.T) {
 	assertpkg.Equal(t, "/qr", (&whatsappPairingHandler{}).publicPath("/qr"))
 	assertpkg.Equal(t, "/work/qr", (&whatsappPairingHandler{basePath: "/work"}).publicPath("/qr"))
 }
+
+func TestNormalizeHTTPPublicBaseURL(t *testing.T) {
+	t.Run("empty", func(t *testing.T) {
+		got, err := normalizeHTTPPublicBaseURL("")
+		requirepkg.NoError(t, err)
+		assertpkg.Empty(t, got)
+	})
+
+	t.Run("trims_trailing_slash", func(t *testing.T) {
+		got, err := normalizeHTTPPublicBaseURL("https://whats.lazare.ai/work/")
+		requirepkg.NoError(t, err)
+		assertpkg.Equal(t, "https://whats.lazare.ai/work", got)
+	})
+
+	t.Run("requires_http_url", func(t *testing.T) {
+		_, err := normalizeHTTPPublicBaseURL("whats.lazare.ai/work")
+		requirepkg.Error(t, err)
+		assertpkg.ErrorContains(t, err, "http:// or https://")
+	})
+
+	t.Run("rejects_query", func(t *testing.T) {
+		_, err := normalizeHTTPPublicBaseURL("https://whats.lazare.ai/work?token=x")
+		requirepkg.Error(t, err)
+		assertpkg.ErrorContains(t, err, "query or fragment")
+	})
+}
+
+func TestWhatsAppLoginPageURL(t *testing.T) {
+	assertpkg.Equal(t, "https://whats.lazare.ai/work/qr", whatsappLoginPageURL("https://whats.lazare.ai/work", "/ignored"))
+	assertpkg.Equal(t, "/work/qr", whatsappLoginPageURL("", "/work"))
+	assertpkg.Equal(t, "/qr", whatsappLoginPageURL("", ""))
+}

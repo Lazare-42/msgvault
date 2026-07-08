@@ -65,6 +65,8 @@ type toolHandler func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult
 
 type mockWhatsAppClient struct {
 	status       whatsapplive.Status
+	loginState   whatsapplive.LoginState
+	startLogin   func(context.Context) (whatsapplive.LoginState, error)
 	sendMessage  func(context.Context, whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error)
 	sendReaction func(context.Context, whatsapplive.SendReactionRequest) (whatsapplive.SendResult, error)
 }
@@ -74,6 +76,15 @@ func (m *mockWhatsAppClient) Status(context.Context) (whatsapplive.Status, error
 }
 func (m *mockWhatsAppClient) Connect(context.Context) error { return nil }
 func (m *mockWhatsAppClient) Close() error                  { return nil }
+func (m *mockWhatsAppClient) StartLogin(ctx context.Context) (whatsapplive.LoginState, error) {
+	if m.startLogin != nil {
+		return m.startLogin(ctx)
+	}
+	return m.loginState, nil
+}
+func (m *mockWhatsAppClient) LoginState(context.Context) (whatsapplive.LoginState, error) {
+	return m.loginState, nil
+}
 func (m *mockWhatsAppClient) SendMessage(ctx context.Context, req whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error) {
 	return m.sendMessage(ctx, req)
 }
@@ -274,6 +285,62 @@ func TestWhatsAppStatusUsesWhatsAppAccountScope(t *testing.T) {
 	assert.Equal(t, "15551234567@s.whatsapp.net", factoryAccount)
 	assert.True(t, status.Paired)
 	assert.Equal(t, "15551234567@s.whatsapp.net", status.AccountJID)
+}
+
+func TestWhatsAppStartLoginReturnsQRPayload(t *testing.T) {
+	eng := &querytest.MockEngine{}
+	client := &mockWhatsAppClient{
+		loginState: whatsapplive.LoginState{
+			Status: whatsapplive.Status{Paired: false},
+			Pairing: whatsapplive.QRPairingState{
+				Active: true,
+				Code:   "test-qr-code",
+				Event:  "code",
+			},
+		},
+	}
+	h := &handlers{
+		engine:           eng,
+		whatsAppLoginURL: "https://whats.lazare.ai/work/qr",
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assertpkg.Empty(t, account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsAppLoginResponse](t, ToolWhatsAppStartLogin, h.whatsAppStartLogin, map[string]any{
+		"include_qr_png": false,
+		"wait_ms":        float64(0),
+	})
+	assertpkg.True(t, result.NeedsPairing)
+	assertpkg.Equal(t, "test-qr-code", result.QRCode)
+	assertpkg.Empty(t, result.QRPNGBase64)
+	assertpkg.Equal(t, "https://whats.lazare.ai/work/qr", result.QRPageURL)
+}
+
+func TestWhatsAppLoginStatusCanIncludeQRPNG(t *testing.T) {
+	eng := &querytest.MockEngine{}
+	client := &mockWhatsAppClient{
+		loginState: whatsapplive.LoginState{
+			Status: whatsapplive.Status{Paired: false},
+			Pairing: whatsapplive.QRPairingState{
+				Active: true,
+				Code:   "test-qr-code",
+				Event:  "code",
+			},
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assertpkg.Empty(t, account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsAppLoginResponse](t, ToolWhatsAppLoginStatus, h.whatsAppLoginStatus, map[string]any{})
+	assertpkg.Equal(t, "test-qr-code", result.QRCode)
+	assertpkg.NotEmpty(t, result.QRPNGBase64)
 }
 
 func TestSendWhatsAppMessage(t *testing.T) {
