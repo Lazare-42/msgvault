@@ -30,6 +30,11 @@ type ServiceOptions struct {
 	Now       func() time.Time
 }
 
+type QRPairingTransport interface {
+	StartQRPairing(ctx context.Context) error
+	PairingState(ctx context.Context) (QRPairingState, error)
+}
+
 func NewService(opts ServiceOptions) (*Service, error) {
 	if opts.Store == nil {
 		return nil, errors.New("store is required")
@@ -66,6 +71,53 @@ func (s *Service) Connect(ctx context.Context) error {
 
 func (s *Service) Close() error {
 	return s.transport.Close()
+}
+
+func (s *Service) StartLogin(ctx context.Context) (LoginState, error) {
+	status, err := s.Status(ctx)
+	if err != nil {
+		return LoginState{}, err
+	}
+	if status.Paired {
+		if !status.Connected {
+			if err := s.Connect(ctx); err != nil {
+				state, stateErr := s.LoginState(ctx)
+				if stateErr != nil {
+					return LoginState{Status: status}, err
+				}
+				return state, err
+			}
+		}
+		return s.LoginState(ctx)
+	}
+
+	pairer, ok := s.transport.(QRPairingTransport)
+	if !ok {
+		return LoginState{Status: status}, errors.New("whatsapp QR login is not supported by this transport")
+	}
+	if err := pairer.StartQRPairing(ctx); err != nil {
+		return LoginState{Status: status}, err
+	}
+	return s.LoginState(ctx)
+}
+
+func (s *Service) LoginState(ctx context.Context) (LoginState, error) {
+	status, err := s.Status(ctx)
+	if err != nil {
+		return LoginState{}, err
+	}
+	pairer, ok := s.transport.(QRPairingTransport)
+	if !ok {
+		return LoginState{Status: status}, nil
+	}
+	pairing, err := pairer.PairingState(ctx)
+	if err != nil {
+		return LoginState{Status: status}, err
+	}
+	return LoginState{
+		Status:  status,
+		Pairing: pairing,
+	}, nil
 }
 
 func (s *Service) SendMessage(ctx context.Context, req SendMessageRequest) (SendResult, error) {
