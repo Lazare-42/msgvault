@@ -106,6 +106,102 @@ func (t *WhatsmeowTransport) Connect(ctx context.Context) error {
 	return t.client.ConnectContext(ctx)
 }
 
+func (t *WhatsmeowTransport) Logout(ctx context.Context, req TransportLogoutRequest) (TransportLogoutResult, error) {
+	t.cancelPairing()
+	status, err := t.Status(ctx)
+	if err != nil {
+		return TransportLogoutResult{}, err
+	}
+	result := TransportLogoutResult{}
+	if !status.Paired {
+		if !req.ForceLocal {
+			return result, nil
+		}
+		result.ForcedLocalClear = true
+		if err := t.clearLocalSession(ctx); err != nil {
+			return result, fmt.Errorf("clear local session: %w", err)
+		}
+		result.LocalSessionCleared = true
+		return result, nil
+	}
+
+	if !status.Connected {
+		t.registerEventHandler(ctx)
+		if err := t.client.ConnectContext(ctx); err != nil {
+			return t.finishLogoutFailure(ctx, result, req, fmt.Errorf("connect before logout: %w", err))
+		}
+	}
+	if err := t.client.Logout(ctx); err != nil {
+		return t.finishLogoutFailure(ctx, result, req, fmt.Errorf("remote logout: %w", err))
+	}
+	result.RemoteLogout = true
+	result.LocalSessionCleared = true
+	if err := t.resetClient(ctx); err != nil {
+		return result, fmt.Errorf("reset whatsapp client after logout: %w", err)
+	}
+	return result, nil
+}
+
+func (t *WhatsmeowTransport) finishLogoutFailure(ctx context.Context, result TransportLogoutResult, req TransportLogoutRequest, logoutErr error) (TransportLogoutResult, error) {
+	if !req.ForceLocal {
+		return result, logoutErr
+	}
+	result.ForcedLocalClear = true
+	if err := t.clearLocalSession(ctx); err != nil {
+		return result, errors.Join(logoutErr, fmt.Errorf("clear local session: %w", err))
+	}
+	result.LocalSessionCleared = true
+	return result, nil
+}
+
+func (t *WhatsmeowTransport) clearLocalSession(ctx context.Context) error {
+	if t.client != nil {
+		t.client.Disconnect()
+		if t.client.Store != nil && t.client.Store.ID != nil {
+			if err := t.client.Store.Delete(ctx); err != nil {
+				return err
+			}
+		}
+	}
+	return t.resetClient(ctx)
+}
+
+func (t *WhatsmeowTransport) resetClient(ctx context.Context) error {
+	device, err := t.container.GetFirstDevice(ctx)
+	if err != nil {
+		return fmt.Errorf("get fresh whatsapp device: %w", err)
+	}
+	client := whatsmeow.NewClient(device, nil)
+	client.EnableAutoReconnect = true
+
+	t.mu.Lock()
+	oldClient := t.client
+	oldHandlerID := t.handlerID
+	if t.pairingCancel != nil {
+		t.pairingCancel()
+		t.pairingCancel = nil
+	}
+	t.client = client
+	t.handlerID = 0
+	t.pairingState = QRPairingState{}
+	t.mu.Unlock()
+
+	if oldClient != nil && oldHandlerID != 0 {
+		oldClient.RemoveEventHandler(oldHandlerID)
+	}
+	return nil
+}
+
+func (t *WhatsmeowTransport) cancelPairing() {
+	t.mu.Lock()
+	if t.pairingCancel != nil {
+		t.pairingCancel()
+		t.pairingCancel = nil
+	}
+	t.pairingState = QRPairingState{}
+	t.mu.Unlock()
+}
+
 func (t *WhatsmeowTransport) Close() error {
 	t.mu.Lock()
 	if t.pairingCancel != nil {

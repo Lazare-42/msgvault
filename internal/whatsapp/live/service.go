@@ -80,6 +80,31 @@ func (s *Service) Close() error {
 	return s.transport.Close()
 }
 
+func (s *Service) Logout(ctx context.Context, req LogoutRequest) (LogoutResult, error) {
+	before, err := s.Status(ctx)
+	if err != nil {
+		return LogoutResult{}, err
+	}
+	transportResult, err := s.transport.Logout(ctx, TransportLogoutRequest{
+		ForceLocal: req.ForceLocal,
+	})
+	after, statusErr := s.Status(ctx)
+	result := LogoutResult{
+		StatusBefore:        before,
+		StatusAfter:         after,
+		RemoteLogout:        transportResult.RemoteLogout,
+		LocalSessionCleared: transportResult.LocalSessionCleared,
+		ForcedLocalClear:    transportResult.ForcedLocalClear,
+	}
+	if err != nil {
+		return result, err
+	}
+	if statusErr != nil {
+		return result, statusErr
+	}
+	return result, nil
+}
+
 func (s *Service) StartLogin(ctx context.Context) (LoginState, error) {
 	status, err := s.Status(ctx)
 	if err != nil {
