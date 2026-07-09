@@ -62,6 +62,7 @@ const (
 	ToolWhatsAppStatus         = "whatsapp_status"
 	ToolWhatsAppStartLogin     = "whatsapp_start_login"
 	ToolWhatsAppLoginStatus    = "whatsapp_login_status"
+	ToolWhatsAppLogout         = "whatsapp_logout"
 	ToolSendWhatsAppMessage    = "send_whatsapp_message"
 	ToolSendWhatsAppReaction   = "send_whatsapp_reaction"
 	ToolListGoogleDocs         = "list_google_docs"
@@ -208,6 +209,7 @@ func BuildMCPServer(opts ServeOptions) *server.MCPServer {
 		s.AddTool(whatsAppStatusTool(), h.whatsAppStatus)
 		s.AddTool(whatsAppStartLoginTool(), h.whatsAppStartLogin)
 		s.AddTool(whatsAppLoginStatusTool(), h.whatsAppLoginStatus)
+		s.AddTool(whatsAppLogoutTool(), h.whatsAppLogout)
 		s.AddTool(sendWhatsAppMessageTool(), h.sendWhatsAppMessage)
 		s.AddTool(sendWhatsAppReactionTool(), h.sendWhatsAppReaction)
 	}
@@ -920,6 +922,22 @@ func whatsAppLoginStatusTool() mcp.Tool {
 		withAccount(),
 		mcp.WithBoolean("include_qr_png",
 			mcp.Description("Include base64 PNG QR image data when a QR code is available (default true)"),
+		),
+	)
+}
+
+func whatsAppLogoutTool() mcp.Tool {
+	return mcp.NewTool(ToolWhatsAppLogout,
+		mcp.WithDescription("Log out and unlink the live WhatsApp account, clearing local pairing state so it can be paired again. Destructive: requires confirm=true. By default, local session state is cleared even if the remote WhatsApp logout cannot complete."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithIdempotentHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(true),
+		withAccount(),
+		mcp.WithBoolean("confirm",
+			mcp.Required(),
+			mcp.Description("Must be true to confirm logging out and clearing local WhatsApp pairing state."),
+		),
+		mcp.WithBoolean("force_local",
+			mcp.Description("Clear local session state if the remote WhatsApp logout request fails (default true)."),
 		),
 	)
 }
