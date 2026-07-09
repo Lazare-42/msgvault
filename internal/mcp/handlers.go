@@ -1386,6 +1386,30 @@ func (h *handlers) whatsAppLoginStatus(ctx context.Context, req mcp.CallToolRequ
 	return structuredJSONResult(h.whatsAppLoginResponse(state, includeQRPNG(args)))
 }
 
+func (h *handlers) whatsAppLogout(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	confirm, _ := args["confirm"].(bool)
+	if !confirm {
+		return mcp.NewToolResultError("confirm=true is required to log out WhatsApp and clear local pairing state"), nil
+	}
+	forceLocal := true
+	if v, ok := args["force_local"].(bool); ok {
+		forceLocal = v
+	}
+	client, account, err := h.getWhatsAppClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	result, err := client.Logout(ctx, whatsapplive.LogoutRequest{
+		Account:    account,
+		ForceLocal: forceLocal,
+	})
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("whatsapp logout: %v", err)), nil
+	}
+	return structuredJSONResult(result)
+}
+
 func (h *handlers) getWhatsAppLoginClient(ctx context.Context, args map[string]any) (whatsappLoginClient, whatsapplive.LoginState, error) {
 	client, _, err := h.getWhatsAppClient(ctx, args)
 	if err != nil {

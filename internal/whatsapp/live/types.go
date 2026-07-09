@@ -9,6 +9,7 @@ type Client interface {
 	Status(ctx context.Context) (Status, error)
 	Connect(ctx context.Context) error
 	Close() error
+	Logout(ctx context.Context, req LogoutRequest) (LogoutResult, error)
 	SendMessage(ctx context.Context, req SendMessageRequest) (SendResult, error)
 	SendReaction(ctx context.Context, req SendReactionRequest) (SendResult, error)
 }
@@ -41,6 +42,19 @@ type SendMessageRequest struct {
 	ChatID         string
 	Body           string
 	LocalRequestID string
+}
+
+type LogoutRequest struct {
+	Account    string
+	ForceLocal bool
+}
+
+type LogoutResult struct {
+	StatusBefore        Status `json:"status_before"`
+	StatusAfter         Status `json:"status_after"`
+	RemoteLogout        bool   `json:"remote_logout"`
+	LocalSessionCleared bool   `json:"local_session_cleared"`
+	ForcedLocalClear    bool   `json:"forced_local_clear"`
 }
 
 type SendReactionRequest struct {
@@ -85,8 +99,19 @@ type Transport interface {
 	Status(ctx context.Context) (Status, error)
 	Connect(ctx context.Context) error
 	Close() error
+	Logout(ctx context.Context, req TransportLogoutRequest) (TransportLogoutResult, error)
 	SendMessage(ctx context.Context, req TransportSendMessageRequest) (TransportSendResult, error)
 	SendReaction(ctx context.Context, req TransportSendReactionRequest) (TransportSendResult, error)
+}
+
+type TransportLogoutRequest struct {
+	ForceLocal bool
+}
+
+type TransportLogoutResult struct {
+	RemoteLogout        bool
+	LocalSessionCleared bool
+	ForcedLocalClear    bool
 }
 
 type TransportSendMessageRequest struct {

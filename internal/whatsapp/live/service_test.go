@@ -14,6 +14,7 @@ import (
 type mockTransport struct {
 	status         Status
 	connect        func(context.Context) error
+	logout         func(context.Context, TransportLogoutRequest) (TransportLogoutResult, error)
 	startQRPairing func(context.Context) error
 	pairingState   QRPairingState
 	sendMessage    func(context.Context, TransportSendMessageRequest) (TransportSendResult, error)
@@ -28,6 +29,12 @@ func (m *mockTransport) Connect(ctx context.Context) error {
 	return nil
 }
 func (m *mockTransport) Close() error { return nil }
+func (m *mockTransport) Logout(ctx context.Context, req TransportLogoutRequest) (TransportLogoutResult, error) {
+	if m.logout != nil {
+		return m.logout(ctx, req)
+	}
+	return TransportLogoutResult{}, nil
+}
 func (m *mockTransport) StartQRPairing(ctx context.Context) error {
 	if m.startQRPairing != nil {
 		return m.startQRPairing(ctx)
@@ -225,6 +232,41 @@ func TestServiceArchiveInboundReactionClearsReaction(t *testing.T) {
 		WHERE message_id = ? AND participant_id = ? AND removed_at IS NULL
 	`), targetID, participantID).Scan(&activeCount))
 	assertpkg.Equal(t, 0, activeCount)
+}
+
+func TestServiceLogoutReturnsBeforeAndAfterStatus(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewTestStore(t)
+	var gotReq TransportLogoutRequest
+	transport := &mockTransport{
+		status: Status{
+			AccountJID: "15551234567@s.whatsapp.net",
+			Connected:  true,
+			LoggedIn:   true,
+			Paired:     true,
+		},
+	}
+	transport.logout = func(_ context.Context, req TransportLogoutRequest) (TransportLogoutResult, error) {
+		gotReq = req
+		transport.status = Status{}
+		return TransportLogoutResult{
+			RemoteLogout:        true,
+			LocalSessionCleared: true,
+		}, nil
+	}
+	svc, err := NewService(ServiceOptions{
+		Store:     st,
+		Transport: transport,
+	})
+	requirepkg.NoError(t, err)
+
+	result, err := svc.Logout(ctx, LogoutRequest{ForceLocal: true})
+	requirepkg.NoError(t, err)
+	assertpkg.True(t, gotReq.ForceLocal)
+	assertpkg.True(t, result.StatusBefore.Paired)
+	assertpkg.False(t, result.StatusAfter.Paired)
+	assertpkg.True(t, result.RemoteLogout)
+	assertpkg.True(t, result.LocalSessionCleared)
 }
 
 type serviceContextKey string

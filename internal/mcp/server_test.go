@@ -42,6 +42,7 @@ type mockWhatsAppClient struct {
 	status       whatsapplive.Status
 	loginState   whatsapplive.LoginState
 	startLogin   func(context.Context) (whatsapplive.LoginState, error)
+	logout       func(context.Context, whatsapplive.LogoutRequest) (whatsapplive.LogoutResult, error)
 	sendMessage  func(context.Context, whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error)
 	sendReaction func(context.Context, whatsapplive.SendReactionRequest) (whatsapplive.SendResult, error)
 }
@@ -59,6 +60,12 @@ func (m *mockWhatsAppClient) StartLogin(ctx context.Context) (whatsapplive.Login
 }
 func (m *mockWhatsAppClient) LoginState(context.Context) (whatsapplive.LoginState, error) {
 	return m.loginState, nil
+}
+func (m *mockWhatsAppClient) Logout(ctx context.Context, req whatsapplive.LogoutRequest) (whatsapplive.LogoutResult, error) {
+	if m.logout != nil {
+		return m.logout(ctx, req)
+	}
+	return whatsapplive.LogoutResult{}, nil
 }
 func (m *mockWhatsAppClient) SendMessage(ctx context.Context, req whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error) {
 	return m.sendMessage(ctx, req)
@@ -266,6 +273,68 @@ func TestWhatsAppLoginStatusCanIncludeQRPNG(t *testing.T) {
 	result := runTool[whatsAppLoginResponse](t, ToolWhatsAppLoginStatus, h.whatsAppLoginStatus, map[string]any{})
 	assertpkg.Equal(t, "test-qr-code", result.QRCode)
 	assertpkg.NotEmpty(t, result.QRPNGBase64)
+}
+
+func TestWhatsAppLogoutRequiresConfirm(t *testing.T) {
+	eng := &querytest.MockEngine{}
+	var called bool
+	client := &mockWhatsAppClient{
+		logout: func(context.Context, whatsapplive.LogoutRequest) (whatsapplive.LogoutResult, error) {
+			called = true
+			return whatsapplive.LogoutResult{}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assertpkg.Empty(t, account)
+			return client, nil
+		},
+	}
+
+	result := runToolExpectError(t, ToolWhatsAppLogout, h.whatsAppLogout, map[string]any{})
+	assertpkg.Contains(t, resultText(t, result), "confirm=true is required")
+	assertpkg.False(t, called)
+}
+
+func TestWhatsAppLogoutForwardsForceLocal(t *testing.T) {
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var gotReq whatsapplive.LogoutRequest
+	client := &mockWhatsAppClient{
+		logout: func(_ context.Context, req whatsapplive.LogoutRequest) (whatsapplive.LogoutResult, error) {
+			gotReq = req
+			return whatsapplive.LogoutResult{
+				StatusBefore: whatsapplive.Status{
+					AccountJID: "15551234567@s.whatsapp.net",
+					Paired:     true,
+					Connected:  true,
+				},
+				StatusAfter:         whatsapplive.Status{},
+				RemoteLogout:        true,
+				LocalSessionCleared: true,
+			}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assertpkg.Equal(t, "15551234567@s.whatsapp.net", account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsapplive.LogoutResult](t, ToolWhatsAppLogout, h.whatsAppLogout, map[string]any{
+		"confirm":     true,
+		"force_local": false,
+	})
+	assertpkg.Equal(t, "15551234567@s.whatsapp.net", gotReq.Account)
+	assertpkg.False(t, gotReq.ForceLocal)
+	assertpkg.True(t, result.RemoteLogout)
+	assertpkg.True(t, result.LocalSessionCleared)
 }
 
 func TestSendWhatsAppMessage(t *testing.T) {
