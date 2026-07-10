@@ -114,9 +114,7 @@ func (s *Service) StartLogin(ctx context.Context) (LoginState, error) {
 	if status.Paired {
 		if !status.IsReady() {
 			if !status.Connected {
-				connectCtx, cancel := context.WithTimeout(s.loginContext, 15*time.Second)
-				defer cancel()
-				if err := s.Connect(connectCtx); err != nil {
+				if err := s.Connect(s.loginContext); err != nil {
 					state, stateErr := s.LoginState(ctx)
 					if stateErr != nil {
 						return LoginState{Status: status}, err
