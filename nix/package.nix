@@ -32,6 +32,14 @@ buildGoModule {
     "sqlite_vec"
   ];
 
+  preBuild = ''
+    go mod download go.mau.fi/whatsmeow
+    gomodcache="$(go env GOMODCACHE)"
+    whatsmeow_mod="$gomodcache/go.mau.fi/whatsmeow@v0.0.0-20260630180629-b572e5bcb92b"
+    chmod -R u+w "$whatsmeow_mod"
+    patch -d "$whatsmeow_mod" -p1 < nix/patches/whatsmeow-clean-failed-pairing-state.patch
+  '';
+
   ldflags = [
     "-s"
     "-w"

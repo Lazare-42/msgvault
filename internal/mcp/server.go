@@ -892,7 +892,7 @@ func listGmailLabelsTool() mcp.Tool {
 
 func whatsAppStatusTool() mcp.Tool {
 	return mcp.NewTool(ToolWhatsAppStatus,
-		mcp.WithDescription("Get live WhatsApp connection and pairing status."),
+		mcp.WithDescription("Get live WhatsApp connection and pairing status. WhatsApp is usable only when ready=true, meaning paired, connected, and logged_in are all true."),
 		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithIdempotentHintAnnotation(true), mcp.WithOpenWorldHintAnnotation(false),
 		withAccount(),
@@ -901,7 +901,7 @@ func whatsAppStatusTool() mcp.Tool {
 
 func whatsAppStartLoginTool() mcp.Tool {
 	return mcp.NewTool(ToolWhatsAppStartLogin,
-		mcp.WithDescription("Start or resume WhatsApp QR login for the live account. Returns status, QR payload, optional PNG bytes, and the browser QR page URL when configured."),
+		mcp.WithDescription("Start or resume WhatsApp QR login for the live account. Returns status, ready, QR payload, optional PNG bytes, and the browser QR page URL when configured. Continue polling until ready=true before sending messages."),
 		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithIdempotentHintAnnotation(true), mcp.WithOpenWorldHintAnnotation(true),
 		withAccount(),
@@ -916,7 +916,7 @@ func whatsAppStartLoginTool() mcp.Tool {
 
 func whatsAppLoginStatusTool() mcp.Tool {
 	return mcp.NewTool(ToolWhatsAppLoginStatus,
-		mcp.WithDescription("Poll WhatsApp QR login state for the live account. Returns the current QR payload, optional PNG bytes, and browser QR page URL when configured."),
+		mcp.WithDescription("Poll WhatsApp QR login state for the live account. Returns ready, current QR payload, optional PNG bytes, and browser QR page URL when configured. Continue polling until ready=true before sending messages."),
 		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithIdempotentHintAnnotation(true), mcp.WithOpenWorldHintAnnotation(false),
 		withAccount(),
@@ -944,7 +944,7 @@ func whatsAppLogoutTool() mcp.Tool {
 
 func sendWhatsAppMessageTool() mcp.Tool {
 	return mcp.NewTool(ToolSendWhatsAppMessage,
-		mcp.WithDescription("Send a WhatsApp message through the linked live account. Records an outbox row before sending and archives the sent message."),
+		mcp.WithDescription("Send a WhatsApp message through the linked live account. Requires whatsapp_status ready=true. Records an outbox row before sending and archives the sent message."),
 		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(true),
 		mcp.WithIdempotentHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(true),
 		withAccount(),
@@ -964,7 +964,7 @@ func sendWhatsAppMessageTool() mcp.Tool {
 
 func sendWhatsAppReactionTool() mcp.Tool {
 	return mcp.NewTool(ToolSendWhatsAppReaction,
-		mcp.WithDescription("Set or clear a WhatsApp emoji reaction on an archived WhatsApp message. Use an empty emoji string to clear the active reaction."),
+		mcp.WithDescription("Set or clear a WhatsApp emoji reaction on an archived WhatsApp message. Requires whatsapp_status ready=true. Use an empty emoji string to clear the active reaction."),
 		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(true),
 		mcp.WithIdempotentHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(true),
 		withAccount(),

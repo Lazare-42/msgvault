@@ -278,6 +278,8 @@ func TestWhatsAppStatusUsesWhatsAppAccountScope(t *testing.T) {
 			Account:    "15551234567@s.whatsapp.net",
 			AccountJID: "15551234567@s.whatsapp.net",
 			Paired:     true,
+			Connected:  true,
+			LoggedIn:   true,
 		},
 	}
 	h := &handlers{
@@ -291,6 +293,7 @@ func TestWhatsAppStatusUsesWhatsAppAccountScope(t *testing.T) {
 	status := runTool[whatsapplive.Status](t, ToolWhatsAppStatus, h.whatsAppStatus, map[string]any{})
 	assert.Equal(t, "15551234567@s.whatsapp.net", factoryAccount)
 	assert.True(t, status.Paired)
+	assert.True(t, status.Ready)
 	assert.Equal(t, "15551234567@s.whatsapp.net", status.AccountJID)
 }
 
@@ -348,6 +351,40 @@ func TestWhatsAppLoginStatusCanIncludeQRPNG(t *testing.T) {
 	result := runTool[whatsAppLoginResponse](t, ToolWhatsAppLoginStatus, h.whatsAppLoginStatus, map[string]any{})
 	assert.Equal(t, "test-qr-code", result.QRCode)
 	assert.NotEmpty(t, result.QRPNGBase64)
+}
+
+func TestWhatsAppLoginStatusReportsPairedButNotReady(t *testing.T) {
+	eng := &querytest.MockEngine{}
+	client := &mockWhatsAppClient{
+		loginState: whatsapplive.LoginState{
+			Status: whatsapplive.Status{
+				AccountJID: "15551234567@s.whatsapp.net",
+				Paired:     true,
+				Connected:  true,
+				LoggedIn:   false,
+			},
+			Pairing: whatsapplive.QRPairingState{
+				Active: false,
+				Paired: true,
+			},
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assertpkg.Empty(t, account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsAppLoginResponse](t, ToolWhatsAppLoginStatus, h.whatsAppLoginStatus, map[string]any{})
+	assertpkg.True(t, result.AlreadyPaired)
+	assertpkg.False(t, result.NeedsPairing)
+	assertpkg.False(t, result.Ready)
+	assertpkg.False(t, result.Status.Ready)
+	assertpkg.True(t, result.NeedsReconnect)
+	assertpkg.True(t, result.NeedsAuth)
+	assertpkg.Equal(t, 5, result.PollAfterSecs)
 }
 
 func TestWhatsAppLogoutRequiresConfirm(t *testing.T) {
@@ -420,6 +457,11 @@ func TestSendWhatsAppMessage(t *testing.T) {
 	}
 	var gotReq whatsapplive.SendMessageRequest
 	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			Paired:    true,
+			Connected: true,
+			LoggedIn:  true,
+		},
 		sendMessage: func(_ context.Context, req whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error) {
 			gotReq = req
 			return whatsapplive.SendResult{
@@ -452,6 +494,41 @@ func TestSendWhatsAppMessage(t *testing.T) {
 	assert.Equal(t, "remote-1", result.RemoteMessageID)
 }
 
+func TestSendWhatsAppMessageRejectsNotReady(t *testing.T) {
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var called bool
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			AccountJID: "15551234567@s.whatsapp.net",
+			Paired:     true,
+			Connected:  true,
+			LoggedIn:   false,
+		},
+		sendMessage: func(context.Context, whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error) {
+			called = true
+			return whatsapplive.SendResult{}, errors.New("send should not be called")
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assertpkg.Equal(t, "15551234567@s.whatsapp.net", account)
+			return client, nil
+		},
+	}
+
+	result := runToolExpectError(t, ToolSendWhatsAppMessage, h.sendWhatsAppMessage, map[string]any{
+		"chat_id": "15557654321@s.whatsapp.net",
+		"body":    "hello",
+	})
+	assertpkg.Contains(t, resultText(t, result), "ready=true")
+	assertpkg.False(t, called)
+}
+
 func TestSendWhatsAppReactionAllowsEmptyEmojiToClear(t *testing.T) {
 	eng := &querytest.MockEngine{
 		Accounts: []query.AccountInfo{
@@ -460,6 +537,11 @@ func TestSendWhatsAppReactionAllowsEmptyEmojiToClear(t *testing.T) {
 	}
 	var gotReq whatsapplive.SendReactionRequest
 	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			Paired:    true,
+			Connected: true,
+			LoggedIn:  true,
+		},
 		sendReaction: func(_ context.Context, req whatsapplive.SendReactionRequest) (whatsapplive.SendResult, error) {
 			gotReq = req
 			return whatsapplive.SendResult{
