@@ -73,38 +73,52 @@ func SplitWhatsAppSourceMessageID(sourceMessageID string) (chatJID, messageID st
 }
 
 func (s *Store) InsertWhatsAppOutbox(ctx context.Context, in WhatsAppOutboxInsert) (int64, error) {
+	id, _, err := s.InsertWhatsAppOutboxIfAbsent(ctx, in)
+	return id, err
+}
+
+// InsertWhatsAppOutboxIfAbsent reserves a local request id exactly once.
+// created=false means caller must return existing outbox state, never resend.
+func (s *Store) InsertWhatsAppOutboxIfAbsent(ctx context.Context, in WhatsAppOutboxInsert) (id int64, created bool, err error) {
 	if in.LocalRequestID == "" {
-		return 0, errors.New("local_request_id is required")
+		return 0, false, errors.New("local_request_id is required")
 	}
 	if in.SourceID == 0 {
-		return 0, errors.New("source_id is required")
+		return 0, false, errors.New("source_id is required")
 	}
 	if in.Kind != WhatsAppOutboxMessage && in.Kind != WhatsAppOutboxReaction {
-		return 0, fmt.Errorf("invalid outbox kind %q", in.Kind)
+		return 0, false, fmt.Errorf("invalid outbox kind %q", in.Kind)
 	}
 	if in.ChatJID == "" {
-		return 0, errors.New("chat_jid is required")
+		return 0, false, errors.New("chat_jid is required")
 	}
 
-	var id int64
-	err := s.db.QueryRowContext(ctx, fmt.Sprintf(`
+	err = s.db.QueryRowContext(ctx, fmt.Sprintf(`
 		INSERT INTO whatsapp_outbox (
 			local_request_id, source_id, conversation_id, message_id,
 			kind, chat_jid, target_source_message_id, body, emoji,
 			status, created_at, updated_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, %s, %s)
-		ON CONFLICT(local_request_id) DO UPDATE
-		SET local_request_id = whatsapp_outbox.local_request_id
+		ON CONFLICT(local_request_id) DO NOTHING
 		RETURNING id
 	`, s.dialect.Now(), s.dialect.Now()),
 		in.LocalRequestID, in.SourceID, in.ConversationID, in.MessageID,
 		in.Kind, in.ChatJID, in.TargetSourceMessageID, in.Body, in.Emoji,
 		WhatsAppOutboxPending,
 	).Scan(&id)
-	if err != nil {
-		return 0, fmt.Errorf("insert whatsapp outbox: %w", err)
+	if err == nil {
+		return id, true, nil
 	}
-	return id, nil
+	if !errors.Is(err, sql.ErrNoRows) {
+		return 0, false, fmt.Errorf("insert whatsapp outbox: %w", err)
+	}
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM whatsapp_outbox WHERE local_request_id = ?`,
+		in.LocalRequestID,
+	).Scan(&id); err != nil {
+		return 0, false, fmt.Errorf("get existing whatsapp outbox: %w", err)
+	}
+	return id, false, nil
 }
 
 func (s *Store) MarkWhatsAppOutboxSending(ctx context.Context, id int64) error {

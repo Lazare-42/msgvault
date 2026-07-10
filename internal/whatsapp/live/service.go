@@ -229,7 +229,7 @@ func (s *Service) SendMessage(ctx context.Context, req SendMessageRequest) (Send
 		return SendResult{}, fmt.Errorf("ensure conversation: %w", err)
 	}
 
-	outboxID, err := s.store.InsertWhatsAppOutbox(ctx, store.WhatsAppOutboxInsert{
+	outboxID, created, err := s.store.InsertWhatsAppOutboxIfAbsent(ctx, store.WhatsAppOutboxInsert{
 		LocalRequestID: req.LocalRequestID,
 		SourceID:       source.ID,
 		ConversationID: sql.NullInt64{Int64: conversationID, Valid: true},
@@ -239,6 +239,9 @@ func (s *Service) SendMessage(ctx context.Context, req SendMessageRequest) (Send
 	})
 	if err != nil {
 		return SendResult{}, err
+	}
+	if !created {
+		return s.existingSendResult(ctx, outboxID, store.WhatsAppOutboxMessage, req.ChatID, req.Body)
 	}
 	result := SendResult{
 		LocalRequestID: req.LocalRequestID,
@@ -303,6 +306,42 @@ func (s *Service) SendMessage(ctx context.Context, req SendMessageRequest) (Send
 	return result, nil
 }
 
+func (s *Service) existingSendResult(
+	ctx context.Context,
+	outboxID int64,
+	kind string,
+	chatJID string,
+	payload string,
+) (SendResult, error) {
+	record, err := s.store.GetWhatsAppOutbox(ctx, outboxID)
+	if err != nil {
+		return SendResult{}, err
+	}
+	existingPayload := record.Body.String
+	if kind == store.WhatsAppOutboxReaction {
+		existingPayload = record.Emoji.String
+	}
+	if record.Kind != kind || record.ChatJID != chatJID || existingPayload != payload {
+		return SendResult{}, fmt.Errorf("local_request_id %q was already used for a different whatsapp operation", record.LocalRequestID)
+	}
+	result := SendResult{
+		LocalRequestID:  record.LocalRequestID,
+		OutboxID:        record.ID,
+		MessageID:       record.MessageID.Int64,
+		RemoteMessageID: record.RemoteMessageID.String,
+		ChatJID:         record.ChatJID,
+		Status:          record.Status,
+	}
+	if record.Status == store.WhatsAppOutboxFailed {
+		message := record.ErrorText.String
+		if message == "" {
+			message = "whatsapp send failed"
+		}
+		return result, errors.New(message)
+	}
+	return result, nil
+}
+
 func (s *Service) SendReaction(ctx context.Context, req SendReactionRequest) (SendResult, error) {
 	if req.MessageID == 0 {
 		return SendResult{}, errors.New("message_id is required")
@@ -330,7 +369,7 @@ func (s *Service) SendReaction(ctx context.Context, req SendReactionRequest) (Se
 		return SendResult{}, fmt.Errorf("message belongs to whatsapp account %q, not %q", source.Identifier, req.Account)
 	}
 
-	outboxID, err := s.store.InsertWhatsAppOutbox(ctx, store.WhatsAppOutboxInsert{
+	outboxID, created, err := s.store.InsertWhatsAppOutboxIfAbsent(ctx, store.WhatsAppOutboxInsert{
 		LocalRequestID:        req.LocalRequestID,
 		SourceID:              source.ID,
 		ConversationID:        sql.NullInt64{Int64: ref.ConversationID, Valid: true},
@@ -342,6 +381,9 @@ func (s *Service) SendReaction(ctx context.Context, req SendReactionRequest) (Se
 	})
 	if err != nil {
 		return SendResult{}, err
+	}
+	if !created {
+		return s.existingSendResult(ctx, outboxID, store.WhatsAppOutboxReaction, ref.ChatJID, req.Emoji)
 	}
 	result := SendResult{
 		LocalRequestID: req.LocalRequestID,
