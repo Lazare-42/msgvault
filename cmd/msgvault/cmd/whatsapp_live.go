@@ -192,7 +192,7 @@ func serveWhatsAppLiveHTTP(ctx context.Context, addr string, st *store.Store, se
 		pairingToken: strings.TrimSpace(pairingToken),
 		basePath:     basePath,
 	}
-	api := &whatsappLiveAPIHandler{store: st, token: apiToken}
+	api := &whatsappLiveAPIHandler{store: st, sender: service, token: apiToken}
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", mcpHandler)
 	mux.HandleFunc("/", pairing.redirectRoot)
@@ -201,6 +201,7 @@ func serveWhatsAppLiveHTTP(ctx context.Context, addr string, st *store.Store, se
 	mux.HandleFunc("/status.json", pairing.statusJSON)
 	mux.HandleFunc("/api/chats", api.listChats)
 	mux.HandleFunc("/api/messages", api.listMessages)
+	mux.HandleFunc("/api/send", api.sendMessage)
 
 	httpServer := &http.Server{
 		Addr:              addr,

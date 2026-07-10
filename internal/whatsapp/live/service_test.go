@@ -55,6 +55,7 @@ func TestServiceSendMessageArchivesAndOutbox(t *testing.T) {
 	ctx := context.Background()
 	st := testutil.NewTestStore(t)
 	sentAt := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
+	sendCalls := 0
 	transport := &mockTransport{
 		status: Status{
 			AccountJID: "15551234567@s.whatsapp.net",
@@ -63,6 +64,7 @@ func TestServiceSendMessageArchivesAndOutbox(t *testing.T) {
 			LoggedIn:   true,
 		},
 		sendMessage: func(_ context.Context, req TransportSendMessageRequest) (TransportSendResult, error) {
+			sendCalls++
 			assertpkg.Equal(t, "15557654321@s.whatsapp.net", req.ChatID)
 			assertpkg.Equal(t, "hello", req.Body)
 			return TransportSendResult{
@@ -88,6 +90,15 @@ func TestServiceSendMessageArchivesAndOutbox(t *testing.T) {
 	assertpkg.Equal(t, store.WhatsAppOutboxSent, result.Status)
 	assertpkg.Equal(t, "remote-1", result.RemoteMessageID)
 	assertpkg.NotZero(t, result.MessageID)
+
+	duplicate, err := svc.SendMessage(ctx, SendMessageRequest{
+		ChatID:         "15557654321@s.whatsapp.net",
+		Body:           "hello",
+		LocalRequestID: "req-1",
+	})
+	requirepkg.NoError(t, err)
+	assertpkg.Equal(t, result, duplicate)
+	assertpkg.Equal(t, 1, sendCalls)
 
 	outbox, err := st.GetWhatsAppOutbox(ctx, result.OutboxID)
 	requirepkg.NoError(t, err)

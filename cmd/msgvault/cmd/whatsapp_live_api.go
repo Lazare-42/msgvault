@@ -1,22 +1,30 @@
 package cmd
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"go.kenn.io/msgvault/internal/store"
+	whatsapplive "go.kenn.io/msgvault/internal/whatsapp/live"
 )
 
-// whatsappLiveAPIHandler exposes read-only backfill endpoints for local
-// consumers (chat bridge, agents). Disabled unless an API token is set;
-// callers authenticate with Authorization: Bearer <token>.
+type whatsappMessageSender interface {
+	SendMessage(ctx context.Context, req whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error)
+}
+
+// whatsappLiveAPIHandler exposes backfill and send endpoints for trusted local
+// consumers (chat bridge, agents). Disabled unless an API token is set; callers
+// authenticate with Authorization: Bearer <token>.
 type whatsappLiveAPIHandler struct {
-	store *store.Store
-	token string
+	store  *store.Store
+	sender whatsappMessageSender
+	token  string
 }
 
 type whatsappAPIChat struct {
@@ -53,12 +61,12 @@ func (h *whatsappLiveAPIHandler) authorized(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(got), []byte(h.token)) == 1
 }
 
-func (h *whatsappLiveAPIHandler) guard(w http.ResponseWriter, r *http.Request) bool {
+func (h *whatsappLiveAPIHandler) guard(w http.ResponseWriter, r *http.Request, method string) bool {
 	if h.token == "" {
 		http.Error(w, "whatsapp live API is disabled; set MSGVAULT_WHATSAPP_API_TOKEN", http.StatusNotFound)
 		return false
 	}
-	if r.Method != http.MethodGet {
+	if r.Method != method {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return false
 	}
@@ -70,7 +78,7 @@ func (h *whatsappLiveAPIHandler) guard(w http.ResponseWriter, r *http.Request) b
 }
 
 func (h *whatsappLiveAPIHandler) listChats(w http.ResponseWriter, r *http.Request) {
-	if !h.guard(w, r) {
+	if !h.guard(w, r, http.MethodGet) {
 		return
 	}
 	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
@@ -100,7 +108,7 @@ func (h *whatsappLiveAPIHandler) listChats(w http.ResponseWriter, r *http.Reques
 }
 
 func (h *whatsappLiveAPIHandler) listMessages(w http.ResponseWriter, r *http.Request) {
-	if !h.guard(w, r) {
+	if !h.guard(w, r, http.MethodGet) {
 		return
 	}
 	q := r.URL.Query()
@@ -138,6 +146,50 @@ func (h *whatsappLiveAPIHandler) listMessages(w http.ResponseWriter, r *http.Req
 		nextCursor = messages[len(messages)-1].ID
 	}
 	writeAPIJSON(w, map[string]any{"messages": out, "next_after_id": nextCursor})
+}
+
+type whatsappAPISendRequest struct {
+	Account        string `json:"account,omitempty"`
+	ChatID         string `json:"chat_id"`
+	Body           string `json:"body"`
+	LocalRequestID string `json:"local_request_id,omitempty"`
+}
+
+func (h *whatsappLiveAPIHandler) sendMessage(w http.ResponseWriter, r *http.Request) {
+	if !h.guard(w, r, http.MethodPost) {
+		return
+	}
+	if h.sender == nil {
+		http.Error(w, "whatsapp sender is unavailable", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req whatsappAPISendRequest
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024*1024))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("invalid JSON: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	result, err := h.sender.SendMessage(r.Context(), whatsapplive.SendMessageRequest{
+		Account:        req.Account,
+		ChatID:         req.ChatID,
+		Body:           req.Body,
+		LocalRequestID: req.LocalRequestID,
+	})
+	if err != nil {
+		status := http.StatusBadGateway
+		if strings.Contains(err.Error(), "is required") {
+			status = http.StatusBadRequest
+		} else if strings.Contains(err.Error(), "not ready") {
+			status = http.StatusServiceUnavailable
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+
+	writeAPIJSON(w, result)
 }
 
 func writeAPIJSON(w http.ResponseWriter, v any) {

@@ -20,7 +20,7 @@ func TestWhatsAppOutboxLifecycle(t *testing.T) {
 	convID, err := st.EnsureConversationWithType(source.ID, "15557654321@s.whatsapp.net", "direct_chat", "")
 	requirepkg.NoError(t, err)
 
-	id, err := st.InsertWhatsAppOutbox(ctx, store.WhatsAppOutboxInsert{
+	id, created, err := st.InsertWhatsAppOutboxIfAbsent(ctx, store.WhatsAppOutboxInsert{
 		LocalRequestID: "req-1",
 		SourceID:       source.ID,
 		ConversationID: sql.NullInt64{Int64: convID, Valid: true},
@@ -30,8 +30,9 @@ func TestWhatsAppOutboxLifecycle(t *testing.T) {
 	})
 	requirepkg.NoError(t, err)
 	requirepkg.NotZero(t, id)
+	assertpkg.True(t, created)
 
-	dupID, err := st.InsertWhatsAppOutbox(ctx, store.WhatsAppOutboxInsert{
+	dupID, dupCreated, err := st.InsertWhatsAppOutboxIfAbsent(ctx, store.WhatsAppOutboxInsert{
 		LocalRequestID: "req-1",
 		SourceID:       source.ID,
 		Kind:           store.WhatsAppOutboxMessage,
@@ -40,6 +41,7 @@ func TestWhatsAppOutboxLifecycle(t *testing.T) {
 	})
 	requirepkg.NoError(t, err)
 	assertpkg.Equal(t, id, dupID)
+	assertpkg.False(t, dupCreated)
 
 	requirepkg.NoError(t, st.MarkWhatsAppOutboxSending(ctx, id))
 	rec, err := st.GetWhatsAppOutbox(ctx, id)
