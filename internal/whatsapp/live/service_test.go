@@ -141,6 +141,42 @@ func TestServiceSendMessageRejectsNotReady(t *testing.T) {
 	assertpkg.False(t, called)
 }
 
+func TestServiceStartLoginKeepsReconnectContextAlive(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewTestStore(t)
+	loginCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var connectCtx context.Context
+	var transport *mockTransport
+	transport = &mockTransport{
+		status: Status{
+			AccountJID: "15551234567@s.whatsapp.net",
+			Paired:     true,
+			Connected:  false,
+			LoggedIn:   true,
+		},
+		connect: func(ctx context.Context) error {
+			connectCtx = ctx
+			transport.status.Connected = true
+			transport.status.LoggedIn = true
+			return nil
+		},
+	}
+	svc, err := NewService(ServiceOptions{
+		Store:        st,
+		Transport:    transport,
+		LoginContext: loginCtx,
+	})
+	requirepkg.NoError(t, err)
+
+	state, err := svc.StartLogin(ctx)
+	requirepkg.NoError(t, err)
+	requirepkg.NotNil(t, connectCtx)
+	assertpkg.True(t, state.Status.Ready)
+	assertpkg.NoError(t, connectCtx.Err())
+}
+
 func TestServiceSendReactionUpdatesLocalReaction(t *testing.T) {
 	ctx := context.Background()
 	st := testutil.NewTestStore(t)
