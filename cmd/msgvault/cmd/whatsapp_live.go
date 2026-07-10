@@ -219,14 +219,15 @@ type whatsappPairingHandler struct {
 }
 
 type whatsappPairingView struct {
-	Status      whatsapplive.Status
-	Pairing     whatsapplive.QRPairingState
-	Authorized  bool
-	TokenQuery  string
-	NeedsToken  bool
-	HasQRCode   bool
-	RefreshSecs int
-	BasePath    string
+	Status              whatsapplive.Status
+	Pairing             whatsapplive.QRPairingState
+	Authorized          bool
+	TokenQuery          string
+	NeedsToken          bool
+	HasQRCode           bool
+	NeedsAuthentication bool
+	RefreshSecs         int
+	BasePath            string
 }
 
 func (h *whatsappPairingHandler) redirectRoot(w http.ResponseWriter, r *http.Request) {
@@ -278,14 +279,15 @@ func (h *whatsappPairingHandler) qrPage(w http.ResponseWriter, r *http.Request) 
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = whatsappPairingTemplate.Execute(w, whatsappPairingView{
-		Status:      status,
-		Pairing:     pairing,
-		Authorized:  true,
-		TokenQuery:  tokenQuery,
-		NeedsToken:  h.pairingToken != "",
-		HasQRCode:   pairing.Code != "" && !pairing.Paired,
-		RefreshSecs: 5,
-		BasePath:    h.basePath,
+		Status:              status,
+		Pairing:             pairing,
+		Authorized:          true,
+		TokenQuery:          tokenQuery,
+		NeedsToken:          h.pairingToken != "",
+		HasQRCode:           pairing.Code != "" && !pairing.Paired,
+		NeedsAuthentication: status.Paired && !status.LoggedIn,
+		RefreshSecs:         5,
+		BasePath:            h.basePath,
 	})
 }
 
@@ -461,10 +463,18 @@ var whatsappPairingTemplate = template.Must(template.New("whatsapp-pairing").Par
   {{if not .Authorized}}
     <p class="err">Pairing token required.</p>
     <p>Open this page with <code>?token=...</code> or send <code>Authorization: Bearer ...</code>.</p>
+  {{else if .NeedsAuthentication}}
+    <p class="err">Pairing incomplete.</p>
+    <p>WhatsApp created a local device record, but the session is not authenticated yet.</p>
+    <p>Account: <code>{{.Status.AccountJID}}</code></p>
+    <p>Connected: <code>{{.Status.Connected}}</code></p>
+    <p>Logged in: <code>{{.Status.LoggedIn}}</code></p>
+    <p>Session: <code>{{.Status.SessionPath}}</code></p>
   {{else if .Status.Paired}}
     <p class="ok">Linked.</p>
     <p>Account: <code>{{.Status.AccountJID}}</code></p>
     <p>Connected: <code>{{.Status.Connected}}</code></p>
+    <p>Logged in: <code>{{.Status.LoggedIn}}</code></p>
   {{else}}
     {{if .HasQRCode}}
       <p>Scan this QR code in WhatsApp: Settings → Linked devices → Link a device.</p>

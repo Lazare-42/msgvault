@@ -19,6 +19,7 @@ import (
 	"go.mau.fi/whatsmeow/store/sqlstore"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 
@@ -28,6 +29,7 @@ import (
 type WhatsmeowOptions struct {
 	SessionPath string
 	Account     string
+	LogLevel    string
 }
 
 type WhatsmeowTransport struct {
@@ -35,6 +37,7 @@ type WhatsmeowTransport struct {
 	container   *sqlstore.Container
 	sessionPath string
 	account     string
+	log         waLog.Logger
 
 	mu            sync.Mutex
 	handlerID     uint32
@@ -56,7 +59,8 @@ func NewWhatsmeowTransport(ctx context.Context, opts WhatsmeowOptions) (*Whatsme
 		Path:     opts.SessionPath,
 		RawQuery: "_foreign_keys=on&_busy_timeout=30000",
 	}
-	container, err := sqlstore.New(ctx, "sqlite3", u.String(), nil)
+	log := newWhatsmeowLogger(opts.LogLevel)
+	container, err := sqlstore.New(ctx, "sqlite3", u.String(), log.Sub("SQLStore"))
 	if err != nil {
 		return nil, fmt.Errorf("open whatsapp session: %w", err)
 	}
@@ -65,14 +69,23 @@ func NewWhatsmeowTransport(ctx context.Context, opts WhatsmeowOptions) (*Whatsme
 		_ = container.Close()
 		return nil, fmt.Errorf("get whatsapp device: %w", err)
 	}
-	client := whatsmeow.NewClient(device, nil)
+	client := whatsmeow.NewClient(device, log)
 	client.EnableAutoReconnect = true
 	return &WhatsmeowTransport{
 		client:      client,
 		container:   container,
 		sessionPath: opts.SessionPath,
 		account:     strings.TrimSpace(opts.Account),
+		log:         log,
 	}, nil
+}
+
+func newWhatsmeowLogger(level string) waLog.Logger {
+	level = strings.TrimSpace(level)
+	if level == "" {
+		level = "INFO"
+	}
+	return waLog.Stdout("WhatsApp", level, false)
 }
 
 func (t *WhatsmeowTransport) SetInboundHandler(handler func(context.Context, InboundMessage) error) {
@@ -171,7 +184,7 @@ func (t *WhatsmeowTransport) resetClient(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("get fresh whatsapp device: %w", err)
 	}
-	client := whatsmeow.NewClient(device, nil)
+	client := whatsmeow.NewClient(device, t.log)
 	client.EnableAutoReconnect = true
 
 	t.mu.Lock()
@@ -429,6 +442,8 @@ func (t *WhatsmeowTransport) registerEventHandler(ctx context.Context) {
 		return
 	}
 	t.handlerID = t.client.AddEventHandler(func(evt any) {
+		t.logWhatsAppEvent(evt)
+
 		msg, ok := evt.(*events.Message)
 		if !ok {
 			return
@@ -447,6 +462,48 @@ func (t *WhatsmeowTransport) registerEventHandler(ctx context.Context) {
 			t.client.Log.Warnf("Failed to archive WhatsApp message %s: %v", msg.Info.ID, err)
 		}
 	})
+}
+
+func (t *WhatsmeowTransport) logWhatsAppEvent(evt any) {
+	if t.client == nil || t.client.Log == nil {
+		return
+	}
+	switch event := evt.(type) {
+	case *events.PairSuccess:
+		t.client.Log.Infof("WhatsApp pair success: jid=%s lid=%s platform=%s business_name=%q", event.ID, event.LID, event.Platform, event.BusinessName)
+	case *events.PairError:
+		t.client.Log.Errorf("WhatsApp pair error: jid=%s lid=%s platform=%s business_name=%q error=%v", event.ID, event.LID, event.Platform, event.BusinessName, event.Error)
+	case *events.PairPasskeyRequest:
+		t.client.Log.Infof("WhatsApp pair passkey requested")
+	case *events.PairPasskeyError:
+		t.client.Log.Errorf("WhatsApp pair passkey error: continuation=%t error=%v", event.Continuation, event.Error)
+	case *events.PairPasskeyConfirmation:
+		t.client.Log.Infof("WhatsApp pair passkey confirmation received: skip_handoff_ux=%t", event.SkipHandoffUX)
+	case *events.QRScannedWithoutMultidevice:
+		t.client.Log.Warnf("WhatsApp QR scanned without multidevice enabled")
+	case *events.Connected:
+		t.client.Log.Infof("WhatsApp connected and authenticated")
+	case *events.Disconnected:
+		t.client.Log.Warnf("WhatsApp disconnected")
+	case *events.LoggedOut:
+		t.client.Log.Warnf("WhatsApp logged out: on_connect=%t reason=%s", event.OnConnect, event.Reason.String())
+	case *events.StreamReplaced:
+		t.client.Log.Warnf("WhatsApp stream replaced by another client")
+	case *events.ClientOutdated:
+		t.client.Log.Errorf("WhatsApp client outdated")
+	case *events.ConnectFailure:
+		t.client.Log.Errorf("WhatsApp connect failure: reason=%s message=%q", event.Reason.String(), event.Message)
+	case *events.TemporaryBan:
+		t.client.Log.Errorf("WhatsApp temporary ban: %s", event.String())
+	case *events.CATRefreshError:
+		t.client.Log.Errorf("WhatsApp CAT refresh error: %v", event.Error)
+	case *events.StreamError:
+		t.client.Log.Errorf("WhatsApp stream error: code=%s", event.Code)
+	case *events.KeepAliveTimeout:
+		t.client.Log.Warnf("WhatsApp keepalive timeout: error_count=%d last_success=%s", event.ErrorCount, event.LastSuccess.Format(time.RFC3339))
+	case *events.KeepAliveRestored:
+		t.client.Log.Infof("WhatsApp keepalive restored")
+	}
 }
 
 func (t *WhatsmeowTransport) convertMessage(evt *events.Message) (InboundMessage, bool) {
