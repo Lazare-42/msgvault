@@ -1,0 +1,44 @@
+diff --git a/pair.go b/pair.go
+index 7c11f4a..53b6f87 100644
+--- a/pair.go
++++ b/pair.go
+@@ -216,14 +216,13 @@ func (cli *Client) handlePair(ctx context.Context, deviceIdentityBytes []byte, r
+ 	cli.StoreLIDPNMapping(ctx, lid, jid)
+ 	err = cli.Store.Identities.PutIdentity(ctx, mainDeviceLID.SignalAddress().String(), mainDeviceIdentity)
+ 	if err != nil {
+-		_ = cli.Store.Delete(ctx)
++		cli.deleteFailedPairingStore(ctx)
+ 		cli.sendPairError(ctx, reqID, 500, "internal-error")
+ 		return &PairDatabaseError{"failed to store main device identity", err}
+ 	}
+ 
+ 	// Expect a disconnect after this and don't dispatch the usual Disconnected event
+ 	cli.expectDisconnect()
+-	cli.paired.Store(true)
+ 
+ 	err = cli.sendNode(ctx, waBinary.Node{
+ 		Tag: "iq",
+@@ -244,12 +243,22 @@ func (cli *Client) handlePair(ctx context.Context, deviceIdentityBytes []byte, r
+ 		}},
+ 	})
+ 	if err != nil {
+-		_ = cli.Store.Delete(ctx)
++		cli.deleteFailedPairingStore(ctx)
+ 		return fmt.Errorf("failed to send pairing confirmation: %w", err)
+ 	}
++	cli.paired.Store(true)
+ 	return nil
+ }
+ 
++func (cli *Client) deleteFailedPairingStore(ctx context.Context) {
++	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
++	defer cancel()
++	if err := cli.Store.Delete(cleanupCtx); err != nil {
++		cli.Log.Warnf("Failed to delete local store after pairing failure: %v", err)
++	}
++	cli.paired.Store(false)
++}
++
+ func concatBytes(data ...[]byte) []byte {
+ 	length := 0
+ 	for _, item := range data {

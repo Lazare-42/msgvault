@@ -59,6 +59,8 @@ func TestServiceSendMessageArchivesAndOutbox(t *testing.T) {
 		status: Status{
 			AccountJID: "15551234567@s.whatsapp.net",
 			Paired:     true,
+			Connected:  true,
+			LoggedIn:   true,
 		},
 		sendMessage: func(_ context.Context, req TransportSendMessageRequest) (TransportSendResult, error) {
 			assertpkg.Equal(t, "15557654321@s.whatsapp.net", req.ChatID)
@@ -108,6 +110,37 @@ func TestServiceSendMessageArchivesAndOutbox(t *testing.T) {
 	assertpkg.True(t, ref.IsFromMe)
 }
 
+func TestServiceSendMessageRejectsNotReady(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewTestStore(t)
+	var called bool
+	transport := &mockTransport{
+		status: Status{
+			AccountJID: "15551234567@s.whatsapp.net",
+			Paired:     true,
+			Connected:  true,
+			LoggedIn:   false,
+		},
+		sendMessage: func(context.Context, TransportSendMessageRequest) (TransportSendResult, error) {
+			called = true
+			return TransportSendResult{}, nil
+		},
+	}
+	svc, err := NewService(ServiceOptions{
+		Store:     st,
+		Transport: transport,
+	})
+	requirepkg.NoError(t, err)
+
+	_, err = svc.SendMessage(ctx, SendMessageRequest{
+		ChatID: "15557654321@s.whatsapp.net",
+		Body:   "hello",
+	})
+	requirepkg.Error(t, err)
+	assertpkg.Contains(t, err.Error(), "ready=true")
+	assertpkg.False(t, called)
+}
+
 func TestServiceSendReactionUpdatesLocalReaction(t *testing.T) {
 	ctx := context.Background()
 	st := testutil.NewTestStore(t)
@@ -117,6 +150,8 @@ func TestServiceSendReactionUpdatesLocalReaction(t *testing.T) {
 		status: Status{
 			AccountJID: "15551234567@s.whatsapp.net",
 			Paired:     true,
+			Connected:  true,
+			LoggedIn:   true,
 		},
 		sendReaction: func(_ context.Context, req TransportSendReactionRequest) (TransportSendResult, error) {
 			reactionReq = req
@@ -307,11 +342,13 @@ func TestServiceStartLoginUsesLoginContextForReconnect(t *testing.T) {
 			Paired:     true,
 			Connected:  false,
 		},
-		connect: func(ctx context.Context) error {
-			gotScope = ctx.Value(serviceContextKey("scope"))
-			return nil
-		},
 		pairingState: QRPairingState{Paired: true},
+	}
+	transport.connect = func(ctx context.Context) error {
+		gotScope = ctx.Value(serviceContextKey("scope"))
+		transport.status.Connected = true
+		transport.status.LoggedIn = true
+		return nil
 	}
 	svc, err := NewService(ServiceOptions{
 		Store:        st,

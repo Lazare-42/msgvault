@@ -69,6 +69,7 @@ func (s *Service) Status(ctx context.Context) (Status, error) {
 	if status.Account == "" {
 		status.Account = s.account
 	}
+	status.ApplyDerived()
 	return status, nil
 }
 
@@ -111,16 +112,19 @@ func (s *Service) StartLogin(ctx context.Context) (LoginState, error) {
 		return LoginState{}, err
 	}
 	if status.Paired {
-		if !status.Connected {
-			connectCtx, cancel := context.WithTimeout(s.loginContext, 15*time.Second)
-			defer cancel()
-			if err := s.Connect(connectCtx); err != nil {
-				state, stateErr := s.LoginState(ctx)
-				if stateErr != nil {
-					return LoginState{Status: status}, err
+		if !status.IsReady() {
+			if !status.Connected {
+				connectCtx, cancel := context.WithTimeout(s.loginContext, 15*time.Second)
+				defer cancel()
+				if err := s.Connect(connectCtx); err != nil {
+					state, stateErr := s.LoginState(ctx)
+					if stateErr != nil {
+						return LoginState{Status: status}, err
+					}
+					return state, err
 				}
-				return state, err
 			}
+			return s.waitForReady(ctx, status, 15*time.Second)
 		}
 		return s.LoginState(ctx)
 	}
@@ -133,6 +137,33 @@ func (s *Service) StartLogin(ctx context.Context) (LoginState, error) {
 		return LoginState{Status: status}, err
 	}
 	return s.LoginState(ctx)
+}
+
+func (s *Service) waitForReady(ctx context.Context, fallback Status, wait time.Duration) (LoginState, error) {
+	if wait <= 0 || fallback.IsReady() {
+		return s.LoginState(ctx)
+	}
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return LoginState{Status: fallback}, ctx.Err()
+		case <-deadline.C:
+			return s.LoginState(ctx)
+		case <-ticker.C:
+			state, err := s.LoginState(ctx)
+			if err != nil {
+				return LoginState{Status: fallback}, err
+			}
+			if state.Status.IsReady() || !state.Status.Paired || state.Pairing.Error != "" {
+				return state, nil
+			}
+		}
+	}
 }
 
 func (s *Service) LoginState(ctx context.Context) (LoginState, error) {
@@ -154,6 +185,22 @@ func (s *Service) LoginState(ctx context.Context) (LoginState, error) {
 	}, nil
 }
 
+func (s *Service) requireReady(ctx context.Context) (Status, error) {
+	status, err := s.Status(ctx)
+	if err != nil {
+		return Status{}, err
+	}
+	if !status.IsReady() {
+		return status, fmt.Errorf(
+			"whatsapp is not ready: paired=%t connected=%t logged_in=%t; run whatsapp_start_login and wait for ready=true before sending",
+			status.Paired,
+			status.Connected,
+			status.LoggedIn,
+		)
+	}
+	return status, nil
+}
+
 func (s *Service) SendMessage(ctx context.Context, req SendMessageRequest) (SendResult, error) {
 	req.ChatID = strings.TrimSpace(req.ChatID)
 	req.Body = strings.TrimSpace(req.Body)
@@ -165,6 +212,9 @@ func (s *Service) SendMessage(ctx context.Context, req SendMessageRequest) (Send
 	}
 	if req.LocalRequestID == "" {
 		req.LocalRequestID = uuid.NewString()
+	}
+	if _, err := s.requireReady(ctx); err != nil {
+		return SendResult{}, err
 	}
 
 	source, err := s.sourceForAccount(ctx, req.Account)
@@ -245,9 +295,8 @@ func (s *Service) SendMessage(ctx context.Context, req SendMessageRequest) (Send
 		return result, err
 	}
 	result.Status = store.WhatsAppOutboxSent
-	result.MessageID = messageID
 	result.RemoteMessageID = remote.RemoteMessageID
-	result.ChatJID = remote.ChatJID
+	result.MessageID = messageID
 	return result, nil
 }
 
@@ -255,8 +304,12 @@ func (s *Service) SendReaction(ctx context.Context, req SendReactionRequest) (Se
 	if req.MessageID == 0 {
 		return SendResult{}, errors.New("message_id is required")
 	}
+	req.Emoji = strings.TrimSpace(req.Emoji)
 	if req.LocalRequestID == "" {
 		req.LocalRequestID = uuid.NewString()
+	}
+	if _, err := s.requireReady(ctx); err != nil {
+		return SendResult{}, err
 	}
 
 	ref, err := s.store.GetWhatsAppMessageRef(ctx, req.MessageID)

@@ -104,14 +104,16 @@ func (t *WhatsmeowTransport) Status(ctx context.Context) (Status, error) {
 	if account == "" {
 		account = accountJID
 	}
-	return Status{
+	status := Status{
 		Account:     account,
 		AccountJID:  accountJID,
 		Connected:   t.client != nil && t.client.IsConnected(),
 		LoggedIn:    t.client != nil && t.client.IsLoggedIn(),
 		Paired:      accountJID != "",
 		SessionPath: t.sessionPath,
-	}, nil
+	}
+	status.ApplyDerived()
+	return status, nil
 }
 
 func (t *WhatsmeowTransport) Connect(ctx context.Context) error {
