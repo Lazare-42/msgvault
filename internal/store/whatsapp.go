@@ -12,6 +12,7 @@ import (
 const (
 	WhatsAppSourceType     = "whatsapp"
 	WhatsAppMessageType    = "whatsapp"
+	WhatsAppIdentifierType = "whatsapp"
 	WhatsAppRawFormat      = "whatsapp_json"
 	WhatsAppOutboxMessage  = "message"
 	WhatsAppOutboxReaction = "reaction"

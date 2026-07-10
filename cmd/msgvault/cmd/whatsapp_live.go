@@ -19,6 +19,7 @@ import (
 	"github.com/spf13/cobra"
 	mcpserver "go.kenn.io/msgvault/internal/mcp"
 	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/store"
 	whatsapplive "go.kenn.io/msgvault/internal/whatsapp/live"
 )
 
@@ -84,11 +85,25 @@ var whatsappLiveMCPCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		service, err := whatsapplive.NewService(whatsapplive.ServiceOptions{
+		var notifier *whatsapplive.WebhookNotifier
+		if webhookURL := strings.TrimSpace(os.Getenv("MSGVAULT_WHATSAPP_INBOUND_WEBHOOK_URL")); webhookURL != "" {
+			notifier = whatsapplive.NewWebhookNotifier(whatsapplive.WebhookOptions{
+				URL:    webhookURL,
+				Secret: os.Getenv("MSGVAULT_WHATSAPP_INBOUND_WEBHOOK_SECRET"),
+				Logger: logger,
+			})
+			defer notifier.Close()
+			logger.Info("WhatsApp inbound webhook enabled", "url", webhookURL)
+		}
+		serviceOpts := whatsapplive.ServiceOptions{
 			Store:        st,
 			Transport:    transport,
 			LoginContext: cmd.Context(),
-		})
+		}
+		if notifier != nil {
+			serviceOpts.Notify = notifier.Notify
+		}
+		service, err := whatsapplive.NewService(serviceOpts)
 		if err != nil {
 			_ = transport.Close()
 			return err
@@ -141,7 +156,8 @@ var whatsappLiveMCPCmd = &cobra.Command{
 			return usageErr(cmd, err)
 		}
 		opts.WhatsAppLoginURL = whatsappLoginPageURL(publicBaseURL, basePath)
-		return serveWhatsAppLiveHTTP(cmd.Context(), addr, service, transport, opts, pairingToken, basePath)
+		apiToken := strings.TrimSpace(os.Getenv("MSGVAULT_WHATSAPP_API_TOKEN"))
+		return serveWhatsAppLiveHTTP(cmd.Context(), addr, st, service, transport, opts, pairingToken, basePath, apiToken)
 	},
 }
 
@@ -164,7 +180,7 @@ func init() {
 	whatsappLiveMCPCmd.Flags().StringVar(&whatsappLivePublicBaseURL, "public-base-url", "", "Public base URL for QR pages, e.g. https://whats.lazare.ai/personal (or MSGVAULT_WHATSAPP_PUBLIC_BASE_URL)")
 }
 
-func serveWhatsAppLiveHTTP(ctx context.Context, addr string, service *whatsapplive.Service, transport *whatsapplive.WhatsmeowTransport, opts mcpserver.ServeOptions, pairingToken string, basePath string) error {
+func serveWhatsAppLiveHTTP(ctx context.Context, addr string, st *store.Store, service *whatsapplive.Service, transport *whatsapplive.WhatsmeowTransport, opts mcpserver.ServeOptions, pairingToken string, basePath string, apiToken string) error {
 	mcpHandler := server.NewStreamableHTTPServer(
 		mcpserver.BuildMCPServer(opts),
 		server.WithHeartbeatInterval(30*time.Second),
@@ -176,12 +192,15 @@ func serveWhatsAppLiveHTTP(ctx context.Context, addr string, service *whatsappli
 		pairingToken: strings.TrimSpace(pairingToken),
 		basePath:     basePath,
 	}
+	api := &whatsappLiveAPIHandler{store: st, token: apiToken}
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", mcpHandler)
 	mux.HandleFunc("/", pairing.redirectRoot)
 	mux.HandleFunc("/qr", pairing.qrPage)
 	mux.HandleFunc("/qr.png", pairing.qrPNG)
 	mux.HandleFunc("/status.json", pairing.statusJSON)
+	mux.HandleFunc("/api/chats", api.listChats)
+	mux.HandleFunc("/api/messages", api.listMessages)
 
 	httpServer := &http.Server{
 		Addr:              addr,

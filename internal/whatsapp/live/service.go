@@ -22,6 +22,7 @@ type Service struct {
 	account      string
 	loginContext context.Context
 	now          func() time.Time
+	notify       func(context.Context, InboundEvent)
 }
 
 type ServiceOptions struct {
@@ -30,6 +31,9 @@ type ServiceOptions struct {
 	Account      string
 	LoginContext context.Context
 	Now          func() time.Time
+	// Notify, when set, is called after a message (inbound or outbound
+	// echo) has been archived. Reactions do not notify.
+	Notify func(context.Context, InboundEvent)
 }
 
 type QRPairingTransport interface {
@@ -58,6 +62,7 @@ func NewService(opts ServiceOptions) (*Service, error) {
 		account:      strings.TrimSpace(opts.Account),
 		loginContext: loginContext,
 		now:          now,
+		notify:       opts.Notify,
 	}, nil
 }
 
@@ -463,6 +468,23 @@ func (s *Service) ArchiveInbound(ctx context.Context, msg InboundMessage) (int64
 	}
 
 	_ = s.store.RecomputeConversationStats(source.ID)
+
+	if s.notify != nil {
+		s.notify(ctx, InboundEvent{
+			Account:         source.Identifier,
+			Source:          store.WhatsAppSourceType,
+			ChatJID:         msg.ChatJID,
+			SenderJID:       senderJID,
+			PushName:        msg.PushName,
+			MessageID:       msg.MessageID,
+			SourceMessageID: store.WhatsAppSourceMessageID(msg.ChatJID, msg.MessageID),
+			StoreMessageID:  messageID,
+			Body:            msg.Text,
+			Timestamp:       msg.Timestamp,
+			IsFromMe:        msg.IsFromMe,
+			IsGroup:         msg.IsGroup,
+		})
+	}
 	return messageID, nil
 }
 
