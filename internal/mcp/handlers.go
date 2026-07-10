@@ -1333,6 +1333,7 @@ func (h *handlers) whatsAppStatus(ctx context.Context, req mcp.CallToolRequest) 
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("whatsapp status: %v", err)), nil
 	}
+	status.ApplyDerived()
 	return jsonResult(status)
 }
 
@@ -1347,9 +1348,11 @@ type whatsAppLoginResponse struct {
 	QRPNGBase64    string `json:"qr_png_base64,omitempty"`
 	QRPageURL      string `json:"qr_page_url,omitempty"`
 	PollAfterSecs  int    `json:"poll_after_secs,omitempty"`
+	Ready          bool   `json:"ready"`
 	AlreadyPaired  bool   `json:"already_paired"`
 	NeedsPairing   bool   `json:"needs_pairing"`
 	NeedsReconnect bool   `json:"needs_reconnect"`
+	NeedsAuth      bool   `json:"needs_authentication"`
 }
 
 func (h *handlers) whatsAppStartLogin(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -1427,7 +1430,8 @@ func (h *handlers) getWhatsAppLoginClient(ctx context.Context, args map[string]a
 }
 
 func waitForWhatsAppLoginCode(ctx context.Context, client whatsappLoginClient, state whatsapplive.LoginState, wait time.Duration) (whatsapplive.LoginState, error) {
-	if wait <= 0 || state.Status.Paired || state.Pairing.Code != "" || state.Pairing.Error != "" {
+	state.Status.ApplyDerived()
+	if wait <= 0 || state.Status.IsReady() || state.Pairing.Code != "" || state.Pairing.Error != "" || (!state.Status.Paired && !state.Pairing.Active) {
 		return state, nil
 	}
 	deadline := time.NewTimer(wait)
@@ -1447,7 +1451,8 @@ func waitForWhatsAppLoginCode(ctx context.Context, client whatsappLoginClient, s
 				return state, err
 			}
 			state = next
-			if state.Status.Paired || state.Pairing.Code != "" || state.Pairing.Error != "" || !state.Pairing.Active {
+			state.Status.ApplyDerived()
+			if state.Status.IsReady() || state.Pairing.Code != "" || state.Pairing.Error != "" || (!state.Status.Paired && !state.Pairing.Active) {
 				return state, nil
 			}
 		}
@@ -1455,16 +1460,20 @@ func waitForWhatsAppLoginCode(ctx context.Context, client whatsappLoginClient, s
 }
 
 func (h *handlers) whatsAppLoginResponse(state whatsapplive.LoginState, includePNG bool) whatsAppLoginResponse {
+	state.Status.ApplyDerived()
+	ready := state.Status.IsReady()
 	resp := whatsAppLoginResponse{
 		LoginState:     state,
 		QRCode:         state.Pairing.Code,
 		QRPageURL:      h.whatsAppLoginURL,
 		PollAfterSecs:  5,
+		Ready:          ready,
 		AlreadyPaired:  state.Status.Paired,
 		NeedsPairing:   !state.Status.Paired,
-		NeedsReconnect: state.Status.Paired && !state.Status.Connected,
+		NeedsReconnect: state.Status.Paired && !ready,
+		NeedsAuth:      state.Status.Paired && !state.Status.LoggedIn,
 	}
-	if state.Status.Paired {
+	if ready {
 		resp.PollAfterSecs = 0
 	}
 	if includePNG && state.Pairing.Code != "" && !state.Status.Paired {
@@ -1478,6 +1487,23 @@ func (h *handlers) whatsAppLoginResponse(state whatsapplive.LoginState, includeP
 func includeQRPNG(args map[string]any) bool {
 	v, ok := args["include_qr_png"].(bool)
 	return !ok || v
+}
+
+func requireWhatsAppReady(ctx context.Context, client whatsapplive.Client) error {
+	status, err := client.Status(ctx)
+	if err != nil {
+		return fmt.Errorf("whatsapp status: %w", err)
+	}
+	status.ApplyDerived()
+	if !status.IsReady() {
+		return fmt.Errorf(
+			"whatsapp is not ready: paired=%t connected=%t logged_in=%t; run whatsapp_start_login and wait for ready=true before sending",
+			status.Paired,
+			status.Connected,
+			status.LoggedIn,
+		)
+	}
+	return nil
 }
 
 func (h *handlers) sendWhatsAppMessage(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -1497,6 +1523,9 @@ func (h *handlers) sendWhatsAppMessage(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError("body parameter is required"), nil
 	}
 	localRequestID, _ := args["local_request_id"].(string)
+	if err := requireWhatsAppReady(ctx, client); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 
 	result, err := client.SendMessage(ctx, whatsapplive.SendMessageRequest{
 		Account:        account,
@@ -1529,6 +1558,9 @@ func (h *handlers) sendWhatsAppReaction(ctx context.Context, req mcp.CallToolReq
 		return mcp.NewToolResultError("emoji must be a string"), nil
 	}
 	localRequestID, _ := args["local_request_id"].(string)
+	if err := requireWhatsAppReady(ctx, client); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
 
 	result, err := client.SendReaction(ctx, whatsapplive.SendReactionRequest{
 		Account:        account,

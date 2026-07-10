@@ -20,7 +20,16 @@ type Status struct {
 	Connected   bool   `json:"connected"`
 	LoggedIn    bool   `json:"logged_in"`
 	Paired      bool   `json:"paired"`
+	Ready       bool   `json:"ready"`
 	SessionPath string `json:"session_path,omitempty"`
+}
+
+func (s Status) IsReady() bool {
+	return s.Paired && s.Connected && s.LoggedIn
+}
+
+func (s *Status) ApplyDerived() {
+	s.Ready = s.IsReady()
 }
 
 type QRPairingState struct {
