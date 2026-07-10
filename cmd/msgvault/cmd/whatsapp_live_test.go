@@ -1,12 +1,14 @@
 package cmd
 
 import (
+	"bytes"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	assertpkg "github.com/stretchr/testify/assert"
 	requirepkg "github.com/stretchr/testify/require"
+	whatsapplive "go.kenn.io/msgvault/internal/whatsapp/live"
 )
 
 func TestWhatsAppPairingAuth(t *testing.T) {
@@ -101,4 +103,25 @@ func TestWhatsAppLoginPageURL(t *testing.T) {
 	assertpkg.Equal(t, "https://whats.lazare.ai/work/qr", whatsappLoginPageURL("https://whats.lazare.ai/work", "/ignored"))
 	assertpkg.Equal(t, "/work/qr", whatsappLoginPageURL("", "/work"))
 	assertpkg.Equal(t, "/qr", whatsappLoginPageURL("", ""))
+}
+
+func TestWhatsAppPairingTemplateShowsIncompletePairing(t *testing.T) {
+	var buf bytes.Buffer
+	err := whatsappPairingTemplate.Execute(&buf, whatsappPairingView{
+		Authorized:          true,
+		NeedsAuthentication: true,
+		Status: whatsapplive.Status{
+			AccountJID:  "15551234567@s.whatsapp.net",
+			Connected:   true,
+			LoggedIn:    false,
+			Paired:      true,
+			SessionPath: "/tmp/whatsapp-session.db",
+		},
+	})
+	requirepkg.NoError(t, err)
+
+	html := buf.String()
+	assertpkg.Contains(t, html, "Pairing incomplete.")
+	assertpkg.Contains(t, html, "Logged in: <code>false</code>")
+	assertpkg.NotContains(t, html, "Linked.")
 }
