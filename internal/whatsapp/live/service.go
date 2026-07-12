@@ -438,6 +438,48 @@ func (s *Service) SendReaction(ctx context.Context, req SendReactionRequest) (Se
 }
 
 func (s *Service) ArchiveInbound(ctx context.Context, msg InboundMessage) (int64, error) {
+	return s.archiveInbound(ctx, msg, true, true)
+}
+
+// ArchiveHistorySync stores a WhatsApp history-sync batch without emitting
+// live-message webhooks. Conversation stats are recomputed once per source
+// after the batch instead of once per message.
+func (s *Service) ArchiveHistorySync(ctx context.Context, messages []InboundMessage) error {
+	accounts := make(map[string]struct{})
+	failures := 0
+	var firstErr error
+	for _, msg := range messages {
+		accounts[msg.Account] = struct{}{}
+		if _, err := s.archiveInbound(ctx, msg, false, false); err != nil {
+			failures++
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	for account := range accounts {
+		source, err := s.sourceForAccount(ctx, account)
+		if err != nil {
+			failures++
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		if err := s.store.RecomputeConversationStats(source.ID); err != nil {
+			failures++
+			if firstErr == nil {
+				firstErr = err
+			}
+		}
+	}
+	if failures > 0 {
+		return fmt.Errorf("archive history sync: %d failures (first: %w)", failures, firstErr)
+	}
+	return nil
+}
+
+func (s *Service) archiveInbound(ctx context.Context, msg InboundMessage, recomputeStats, notify bool) (int64, error) {
 	if msg.ChatJID == "" {
 		return 0, errors.New("chat_jid is required")
 	}
@@ -456,7 +498,7 @@ func (s *Service) ArchiveInbound(ctx context.Context, msg InboundMessage) (int64
 	if msg.Timestamp.IsZero() {
 		msg.Timestamp = s.now()
 	}
-	conversationID, err := s.ensureConversation(source.ID, msg.ChatJID)
+	conversationID, err := s.ensureConversationWithTitle(source.ID, msg.ChatJID, msg.ChatTitle)
 	if err != nil {
 		return 0, fmt.Errorf("ensure conversation: %w", err)
 	}
@@ -509,9 +551,11 @@ func (s *Service) ArchiveInbound(ctx context.Context, msg InboundMessage) (int64
 		}
 	}
 
-	_ = s.store.RecomputeConversationStats(source.ID)
+	if recomputeStats {
+		_ = s.store.RecomputeConversationStats(source.ID)
+	}
 
-	if s.notify != nil {
+	if notify && s.notify != nil {
 		s.notify(ctx, InboundEvent{
 			Account:         source.Identifier,
 			Source:          store.WhatsAppSourceType,
@@ -596,11 +640,15 @@ func (s *Service) sourceForAccount(ctx context.Context, account string) (*store.
 }
 
 func (s *Service) ensureConversation(sourceID int64, chatJID string) (int64, error) {
+	return s.ensureConversationWithTitle(sourceID, chatJID, "")
+}
+
+func (s *Service) ensureConversationWithTitle(sourceID int64, chatJID, title string) (int64, error) {
 	conversationType := "direct_chat"
 	if isGroupJID(chatJID) {
 		conversationType = "group_chat"
 	}
-	return s.store.EnsureConversationWithType(sourceID, chatJID, conversationType, "")
+	return s.store.EnsureConversationWithType(sourceID, chatJID, conversationType, strings.TrimSpace(title))
 }
 
 func isGroupJID(jid string) bool {

@@ -42,6 +42,7 @@ type WhatsmeowTransport struct {
 	mu            sync.Mutex
 	handlerID     uint32
 	inbound       func(context.Context, InboundMessage) error
+	historySync   func(context.Context, []InboundMessage) error
 	pairingCancel context.CancelFunc
 	pairingState  QRPairingState
 }
@@ -92,6 +93,12 @@ func (t *WhatsmeowTransport) SetInboundHandler(handler func(context.Context, Inb
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.inbound = handler
+}
+
+func (t *WhatsmeowTransport) SetHistorySyncHandler(handler func(context.Context, []InboundMessage) error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.historySync = handler
 }
 
 func (t *WhatsmeowTransport) Status(ctx context.Context) (Status, error) {
@@ -446,24 +453,81 @@ func (t *WhatsmeowTransport) registerEventHandler(ctx context.Context) {
 	t.handlerID = t.client.AddEventHandler(func(evt any) {
 		t.logWhatsAppEvent(evt)
 
-		msg, ok := evt.(*events.Message)
-		if !ok {
-			return
-		}
-		inbound, ok := t.convertMessage(msg)
-		if !ok {
-			return
-		}
-		t.mu.Lock()
-		handler := t.inbound
-		t.mu.Unlock()
-		if handler == nil {
-			return
-		}
-		if err := handler(ctx, inbound); err != nil {
-			t.client.Log.Warnf("Failed to archive WhatsApp message %s: %v", msg.Info.ID, err)
+		switch event := evt.(type) {
+		case *events.Message:
+			if _, err := t.convertAndArchiveMessage(ctx, event, ""); err != nil {
+				t.client.Log.Warnf("Failed to archive WhatsApp message %s: %v", event.Info.ID, err)
+			}
+		case *events.HistorySync:
+			go t.archiveHistorySync(ctx, event)
 		}
 	})
+}
+
+func (t *WhatsmeowTransport) convertAndArchiveMessage(ctx context.Context, msg *events.Message, chatTitle string) (bool, error) {
+	inbound, ok := t.convertMessage(msg)
+	if !ok {
+		return false, nil
+	}
+	inbound.ChatTitle = strings.TrimSpace(chatTitle)
+	t.mu.Lock()
+	handler := t.inbound
+	t.mu.Unlock()
+	if handler == nil {
+		return false, nil
+	}
+	return true, handler(ctx, inbound)
+}
+
+func (t *WhatsmeowTransport) archiveHistorySync(ctx context.Context, event *events.HistorySync) {
+	if event == nil || event.Data == nil {
+		return
+	}
+	conversations := event.Data.GetConversations()
+	t.client.Log.Infof("WhatsApp history sync received: type=%s conversations=%d progress=%d", event.Data.GetSyncType().String(), len(conversations), event.Data.GetProgress())
+
+	messages := make([]InboundMessage, 0)
+	parseFailures := 0
+	for _, conversation := range conversations {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		chatJID, err := types.ParseJID(conversation.GetID())
+		if err != nil {
+			parseFailures++
+			continue
+		}
+		title := strings.TrimSpace(conversation.GetDisplayName())
+		if title == "" {
+			title = strings.TrimSpace(conversation.GetName())
+		}
+		for _, historyMessage := range conversation.GetMessages() {
+			parsed, err := t.client.ParseWebMessage(chatJID, historyMessage.GetMessage())
+			if err != nil {
+				parseFailures++
+				continue
+			}
+			inbound, ok := t.convertMessage(parsed)
+			if !ok {
+				continue
+			}
+			inbound.ChatTitle = title
+			messages = append(messages, inbound)
+		}
+	}
+
+	t.mu.Lock()
+	handler := t.historySync
+	t.mu.Unlock()
+	if handler == nil || len(messages) == 0 {
+		t.client.Log.Infof("WhatsApp history sync skipped: messages=%d parse_failures=%d handler=%t", len(messages), parseFailures, handler != nil)
+		return
+	}
+	if err := handler(ctx, messages); err != nil {
+		t.client.Log.Warnf("WhatsApp history sync archive completed with errors: messages=%d parse_failures=%d error=%v", len(messages), parseFailures, err)
+		return
+	}
+	t.client.Log.Infof("WhatsApp history sync archived: messages=%d parse_failures=%d", len(messages), parseFailures)
 }
 
 func (t *WhatsmeowTransport) logWhatsAppEvent(evt any) {

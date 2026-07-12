@@ -85,6 +85,7 @@ type SendResult struct {
 type InboundMessage struct {
 	Account   string
 	ChatJID   string
+	ChatTitle string
 	SenderJID string
 	MessageID string
 	PushName  string
