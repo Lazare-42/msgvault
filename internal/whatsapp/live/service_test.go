@@ -152,6 +152,61 @@ func TestServiceSendMessageRejectsNotReady(t *testing.T) {
 	assertpkg.False(t, called)
 }
 
+func TestServiceArchiveHistorySyncBatchesStatsAndSkipsNotifications(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewTestStore(t)
+	notifications := 0
+	transport := &mockTransport{
+		status: Status{AccountJID: "15551234567@s.whatsapp.net", Paired: true},
+	}
+	svc, err := NewService(ServiceOptions{
+		Store:     st,
+		Transport: transport,
+		Notify: func(context.Context, InboundEvent) {
+			notifications++
+		},
+	})
+	requirepkg.NoError(t, err)
+
+	messages := []InboundMessage{
+		{
+			Account:   "15551234567@s.whatsapp.net",
+			ChatJID:   "120363@g.us",
+			ChatTitle: "Beynac Team",
+			SenderJID: "15557654321@s.whatsapp.net",
+			MessageID: "history-1",
+			Text:      "first",
+			Timestamp: time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC),
+			IsGroup:   true,
+		},
+		{
+			Account:   "15551234567@s.whatsapp.net",
+			ChatJID:   "120363@g.us",
+			ChatTitle: "Beynac Team",
+			SenderJID: "15558765432@s.whatsapp.net",
+			MessageID: "history-2",
+			Text:      "second",
+			Timestamp: time.Date(2026, 7, 1, 11, 0, 0, 0, time.UTC),
+			IsGroup:   true,
+		},
+	}
+	requirepkg.NoError(t, svc.ArchiveHistorySync(ctx, messages))
+	requirepkg.NoError(t, svc.ArchiveHistorySync(ctx, messages), "history sync retry is idempotent")
+	assertpkg.Zero(t, notifications)
+
+	var title string
+	var messageCount int64
+	var preview string
+	requirepkg.NoError(t, st.DB().QueryRow(st.Rebind(`
+		SELECT title, message_count, last_message_preview
+		FROM conversations
+		WHERE source_conversation_id = ?
+	`), "120363@g.us").Scan(&title, &messageCount, &preview))
+	assertpkg.Equal(t, "Beynac Team", title)
+	assertpkg.Equal(t, int64(2), messageCount)
+	assertpkg.Equal(t, "second", preview)
+}
+
 func TestServiceStartLoginKeepsReconnectContextAlive(t *testing.T) {
 	ctx := context.Background()
 	st := testutil.NewTestStore(t)

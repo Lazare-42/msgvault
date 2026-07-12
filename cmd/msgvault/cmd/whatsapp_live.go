@@ -112,6 +112,7 @@ var whatsappLiveMCPCmd = &cobra.Command{
 			_, archiveErr := service.ArchiveInbound(ctx, msg)
 			return archiveErr
 		})
+		transport.SetHistorySyncHandler(service.ArchiveHistorySync)
 		defer func() { _ = service.Close() }()
 
 		initialStatus, err := service.Status(cmd.Context())
