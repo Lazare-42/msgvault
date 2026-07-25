@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -152,6 +153,14 @@ func (c *TestContext) AssertFailedCount(want int) {
 	failed, err := c.Mgr.ListFailed()
 	require.NoError(c.t, err, "ListFailed()")
 	assert.Len(c.t, failed, want, "ListFailed()")
+}
+
+// AssertCancelledCount verifies the number of cancelled manifests.
+func (c *TestContext) AssertCancelledCount(want int) {
+	c.t.Helper()
+	cancelled, err := c.Mgr.ListCancelled()
+	require.NoError(c.t, err, "ListCancelled()")
+	assert.Len(c.t, cancelled, want, "ListCancelled()")
 }
 
 // AssertManifestExecution verifies the persisted execution state of a manifest.
@@ -526,6 +535,220 @@ func TestExecutor_Execute_ResumeFromInProgress(t *testing.T) {
 	tc.AssertManifestExecution(manifest.ID, 5, 0)
 }
 
+// TestExecutor_Execute_RejectsMethodMismatchOnResume verifies that a manifest
+// claimed and checkpointed with one method cannot be resumed with another:
+// resuming a permanent-delete batch through the trash path (or the reverse)
+// must fail before any message is touched, leaving the manifest resumable.
+func TestExecutor_Execute_RejectsMethodMismatchOnResume(t *testing.T) {
+	require := require.New(t)
+	tc := NewTestContext(t)
+
+	manifest := NewManifest("method mismatch", msgIDs(5))
+	manifest.Status = StatusInProgress
+	manifest.Execution = &Execution{
+		StartedAt:          time.Now().Add(-time.Hour),
+		Method:             MethodDelete,
+		Succeeded:          2,
+		LastProcessedIndex: 2,
+	}
+	require.NoError(tc.Mgr.SaveManifest(manifest), "SaveManifest()")
+
+	err := tc.ExecuteWithOpts(manifest.ID, trashOpts(100))
+	require.ErrorContains(err, "cannot be resumed with method", "trash resume of a delete batch")
+	tc.AssertTrashCalls(0)
+	tc.AssertDeleteCalls(0)
+	tc.AssertInProgressCount(1)
+}
+
+// TestExecutor_ExecuteBatch_RejectsTrashResume verifies the reverse and more
+// dangerous direction: ExecuteBatch always deletes permanently, so resuming a
+// recoverable trash batch through it must be rejected rather than silently
+// switching the remaining messages to permanent deletion. The batch then
+// resumes cleanly through the trash path it was started with.
+func TestExecutor_ExecuteBatch_RejectsTrashResume(t *testing.T) {
+	require := require.New(t)
+	tc := NewTestContext(t)
+
+	manifest := NewManifest("trash resumed as batch", msgIDs(5))
+	manifest.Status = StatusInProgress
+	manifest.Execution = &Execution{
+		StartedAt:          time.Now().Add(-time.Hour),
+		Method:             MethodTrash,
+		Succeeded:          2,
+		LastProcessedIndex: 2,
+	}
+	require.NoError(tc.Mgr.SaveManifest(manifest), "SaveManifest()")
+
+	err := tc.ExecuteBatch(manifest.ID)
+	require.ErrorContains(err, "cannot be resumed with method", "batch resume of a trash batch")
+	tc.AssertBatchDeleteCalls(0)
+	tc.AssertDeleteCalls(0)
+	tc.AssertInProgressCount(1)
+
+	require.NoError(tc.ExecuteWithOpts(manifest.ID, trashOpts(100)), "trash resume after rejection")
+	tc.AssertTrashCalls(3)
+	tc.AssertManifestExecution(manifest.ID, 5, 0)
+}
+
+// TestExecutor_Execute_ResumeRetriesFailedIDs verifies that resuming a trash
+// manifest retries checkpointed transient failures before continuing from
+// LastProcessedIndex, mirroring ExecuteBatch — instead of skipping them and
+// finalizing as completed while the messages remain undeleted.
+func TestExecutor_Execute_ResumeRetriesFailedIDs(t *testing.T) {
+	tc := NewTestContext(t)
+
+	manifest := NewManifest("trash retry", msgIDs(5))
+	manifest.Status = StatusInProgress
+	manifest.Execution = &Execution{
+		StartedAt:          time.Now().Add(-time.Hour),
+		Method:             MethodTrash,
+		Succeeded:          2,
+		Failed:             1,
+		FailedIDs:          []string{"msg1"},
+		LastProcessedIndex: 3, // msg0..msg2 processed; msg1 failed transiently
+	}
+	require.NoError(t, tc.Mgr.SaveManifest(manifest), "SaveManifest()")
+
+	require.NoError(t, tc.ExecuteWithOpts(manifest.ID, trashOpts(100)), "Execute()")
+
+	// msg1 retried, then msg3 and msg4 continued.
+	tc.AssertTrashCalls(3)
+	tc.AssertManifestExecution(manifest.ID, 5, 0)
+	tc.AssertCompletedCount(1)
+}
+
+// TestExecutor_Execute_ResumeRetryStillFailing verifies that a checkpointed
+// failure that fails again on the resume retry stays recorded in FailedIDs
+// rather than being double-counted or dropped.
+func TestExecutor_Execute_ResumeRetryStillFailing(t *testing.T) {
+	tc := NewTestContext(t)
+	tc.SimulateTrashError("msg1")
+
+	manifest := NewManifest("trash retry still failing", msgIDs(5))
+	manifest.Status = StatusInProgress
+	manifest.Execution = &Execution{
+		StartedAt:          time.Now().Add(-time.Hour),
+		Method:             MethodTrash,
+		Succeeded:          2,
+		Failed:             1,
+		FailedIDs:          []string{"msg1"},
+		LastProcessedIndex: 3,
+	}
+	require.NoError(t, tc.Mgr.SaveManifest(manifest), "SaveManifest()")
+
+	require.NoError(t, tc.ExecuteWithOpts(manifest.ID, trashOpts(100)), "Execute()")
+
+	tc.AssertManifestExecution(manifest.ID, 4, 1, "msg1")
+	tc.AssertCompletedCount(1)
+}
+
+// TestExecutor_Finalize_TerminalFileCarriesFinalState verifies that the final
+// status and counters are durable BEFORE the manifest is moved into its
+// terminal directory, so the file that lands there already carries them
+// instead of depending on a post-rename save.
+//
+// The crash window is simulated by occupying the manifest's destination path
+// in completed/ with a directory, which fails the rename on every OS at
+// exactly the point a crash would interrupt it (unlike chmod, which does not
+// make a directory unwritable on Windows). The durable record must still hold
+// the final state: with the write ordered after the move, the interrupted
+// manifest would be left serialized as in_progress with no CompletedAt.
+func TestExecutor_Finalize_TerminalFileCarriesFinalState(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	tc := NewTestContext(t)
+
+	manifest := tc.CreateManifest("final state", msgIDs(3))
+	blocker := filepath.Join(tc.Mgr.CompletedDir(), manifest.ID+".json")
+	// Occupied only once execution is under way: a terminal file present
+	// beforehand is (correctly) refused by ClaimManifest as an already
+	// finished batch, which would never reach finalization.
+	tc.Exec.WithProgress(&onStartProgress{hook: func() {
+		require.NoError(os.Mkdir(blocker, 0o755), "occupy the terminal destination path")
+	}})
+
+	err := tc.ExecuteWithOpts(manifest.ID, trashOpts(100))
+	require.Error(err, "the interrupted move must surface")
+	require.NoError(os.Remove(blocker), "clear the blocking directory")
+
+	loaded, err := LoadManifest(filepath.Join(tc.Mgr.InProgressDir(), manifest.ID+".json"))
+	require.NoError(err, "load the durable record left by the interrupted finalize")
+	assert.Equal(StatusCompleted, loaded.Status, "final status persisted before the move")
+	require.NotNil(loaded.Execution, "execution state")
+	assert.Equal(3, loaded.Execution.Succeeded)
+	assert.Equal(3, loaded.Execution.LastProcessedIndex)
+	require.NotNil(loaded.Execution.CompletedAt, "CompletedAt persisted before the move")
+}
+
+// TestExecutor_Finalize_CompletedFileIsSelfConsistent verifies the ordinary
+// path: the file in completed/ carries its own final status and counters, so
+// readers never depend on the directory to correct a stale inline status.
+func TestExecutor_Finalize_CompletedFileIsSelfConsistent(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	tc := NewTestContext(t)
+
+	manifest := tc.CreateManifest("self consistent", msgIDs(3))
+	require.NoError(tc.ExecuteWithOpts(manifest.ID, trashOpts(100)), "Execute()")
+
+	loaded, err := LoadManifest(filepath.Join(tc.Mgr.CompletedDir(), manifest.ID+".json"))
+	require.NoError(err, "load completed manifest")
+	assert.Equal(StatusCompleted, loaded.Status)
+	require.NotNil(loaded.Execution)
+	assert.Equal(3, loaded.Execution.Succeeded)
+	assert.Equal(0, loaded.Execution.Failed)
+	require.NotNil(loaded.Execution.CompletedAt)
+
+	_, statErr := os.Stat(filepath.Join(tc.Mgr.InProgressDir(), manifest.ID+".json"))
+	assert.True(os.IsNotExist(statErr), "in_progress file removed by the finalize rename")
+}
+
+// onStartProgress runs a hook when execution starts — after the manifest is
+// claimed into in_progress/, before any message is deleted — so a test can
+// disturb the manifest's on-disk state mid-execution.
+type onStartProgress struct {
+	hook func()
+}
+
+func (p *onStartProgress) OnStart(total, alreadyProcessed int)         { p.hook() }
+func (p *onStartProgress) OnProgress(processed, succeeded, failed int) {}
+func (p *onStartProgress) OnComplete(succeeded, failed int)            {}
+
+// TestExecutor_Finalize_PropagatesPersistFailure verifies that a failure to
+// persist the final state is returned rather than logged and swallowed, so
+// the caller never reports success over a manifest whose durable record was
+// never updated.
+//
+// The write is failed by replacing the claimed in_progress file with a
+// directory once execution is under way, which defeats the atomic writer's
+// final rename on every OS (chmod does not make a directory unwritable on
+// Windows).
+func TestExecutor_Finalize_PropagatesPersistFailure(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	tc := NewTestContext(t)
+
+	manifest := tc.CreateManifest("persist failure", msgIDs(2))
+	inProgressPath := filepath.Join(tc.Mgr.InProgressDir(), manifest.ID+".json")
+	tc.Exec.WithProgress(&onStartProgress{hook: func() {
+		require.NoError(os.Remove(inProgressPath), "remove the claimed manifest file")
+		require.NoError(os.Mkdir(inProgressPath, 0o755), "occupy its path with a directory")
+	}})
+
+	err := tc.ExecuteWithOpts(manifest.ID, trashOpts(100))
+	require.Error(err, "a final-state write failure must surface")
+	assert.Contains(err.Error(), "persist final state")
+
+	// The manifest was not moved into a terminal directory, and no stray temp
+	// file was left behind by the failed atomic write.
+	tc.AssertCompletedCount(0)
+	tc.AssertFailedCount(0)
+	require.NoError(os.Remove(inProgressPath), "clear the blocking directory")
+	entries, err := os.ReadDir(tc.Mgr.InProgressDir())
+	require.NoError(err, "ReadDir in_progress")
+	assert.Empty(entries, "no leftover temp files from the failed write")
+}
+
 func TestExecutor_ExecuteBatch_Scenarios(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -673,15 +896,20 @@ func TestExecutor_ExecuteBatch_Scenarios(t *testing.T) {
 	}
 }
 
+// TestExecutor_ExecuteBatch_InvalidStatus verifies that a manifest already in
+// a terminal state cannot be executed again. A manifest whose file merely
+// lives in in_progress/ (e.g. moved there directly, without an inline status
+// update) is a valid claim target, not an invalid one — see
+// TestManager_ClaimManifest_ResumeIgnoresStaleInlineStatus — so this test
+// exercises the genuinely invalid case: completed.
 func TestExecutor_ExecuteBatch_InvalidStatus(t *testing.T) {
 	ctx := NewTestContext(t)
 	manifest := ctx.CreateManifest("wrong status", msgIDs(1))
 
-	// Move to in_progress
-	require.NoError(t, ctx.Mgr.MoveManifest(manifest.ID, StatusPending, StatusInProgress), "MoveManifest()")
+	require.NoError(t, ctx.ExecuteBatch(manifest.ID), "ExecuteBatch() first run")
 
 	err := ctx.ExecuteBatch(manifest.ID)
-	assert.Error(t, err, "ExecuteBatch() should error for non-pending manifest")
+	assert.Error(t, err, "ExecuteBatch() should error for a completed manifest")
 }
 
 func TestExecutor_ExecuteBatch_ContextCancelled(t *testing.T) {
@@ -960,6 +1188,184 @@ func TestExecutor_OnStartRetryDoesNotShow100Percent(t *testing.T) {
 
 	// Should show 7 (succeeded), not 10 (startIndex == total)
 	assert.Equal(t, 7, tc.Progress.startProcessed, "OnStart alreadyProcessed (succeeded, not startIndex)")
+}
+
+// TestExecutor_Execute_CooperativeCancel verifies that a cross-process cancel
+// (the daemon moving the manifest out of in_progress/ while the CLI executor
+// runs) stops the executor promptly: it does not delete every message, returns
+// ErrManifestCancelled, and leaves the manifest cancelled rather than resurrected
+// or completed.
+func TestExecutor_Execute_CooperativeCancel(t *testing.T) {
+	tc := NewTestContext(t)
+	manifest := tc.CreateManifest("coop cancel", msgIDs(10))
+
+	callCount := 0
+	tc.MockAPI.BeforeTrash = func(string) error {
+		callCount++
+		if callCount == 1 {
+			// Simulate the daemon cancelling the in-progress batch mid-run.
+			require.NoError(t, tc.Mgr.CancelManifest(manifest.ID), "daemon CancelManifest")
+		}
+		return nil
+	}
+
+	err := tc.Execute(manifest.ID)
+	require.ErrorIs(t, err, ErrManifestCancelled, "Execute() error")
+
+	assert.Less(t, len(tc.MockAPI.TrashCalls), 10, "stopped before deleting all messages")
+	tc.AssertNotCompleted()
+	tc.AssertInProgressCount(0)
+	tc.AssertCompletedCount(0)
+	tc.AssertFailedCount(0)
+	tc.AssertCancelledCount(1)
+}
+
+// TestExecutor_Execute_NoResurrectionOnFinalize cancels the manifest on the
+// final item so the per-item loop check does not fire; the move-first finalize
+// must still refuse to recreate the in_progress file or mark it completed.
+func TestExecutor_Execute_NoResurrectionOnFinalize(t *testing.T) {
+	tc := NewTestContext(t)
+	manifest := tc.CreateManifest("finalize cancel", msgIDs(1))
+
+	tc.MockAPI.BeforeTrash = func(string) error {
+		// Cancel during the only delete, after the loop's pre-delete check.
+		require.NoError(t, tc.Mgr.CancelManifest(manifest.ID), "daemon CancelManifest")
+		return nil
+	}
+
+	err := tc.Execute(manifest.ID)
+	require.ErrorIs(t, err, ErrManifestCancelled, "Execute() error")
+
+	tc.AssertNotCompleted()
+	tc.AssertInProgressCount(0)
+	tc.AssertCompletedCount(0)
+	tc.AssertCancelledCount(1)
+}
+
+// TestExecutor_Execute_CancelledBeforeClaim verifies that a manifest cancelled
+// while still pending cannot be executed: prepareExecution reports it as
+// ErrManifestCancelled and nothing is deleted or completed.
+func TestExecutor_Execute_CancelledBeforeClaim(t *testing.T) {
+	tc := NewTestContext(t)
+	manifest := tc.CreateManifest("cancel before claim", msgIDs(3))
+
+	require.NoError(t, tc.Mgr.CancelManifest(manifest.ID), "CancelManifest")
+
+	err := tc.Execute(manifest.ID)
+	require.ErrorIs(t, err, ErrManifestCancelled, "Execute() error")
+
+	tc.AssertTrashCalls(0)
+	tc.AssertNotCompleted()
+	tc.AssertCompletedCount(0)
+	tc.AssertInProgressCount(0)
+	tc.AssertCancelledCount(1)
+}
+
+// TestExecutor_ExecuteBatch_CooperativeCancel verifies the batch path honors a
+// cross-process cancel between batches without deleting every batch or
+// resurrecting the manifest.
+func TestExecutor_ExecuteBatch_CooperativeCancel(t *testing.T) {
+	tc := NewTestContext(t)
+	manifest := tc.CreateManifest("coop cancel batch", msgIDs(2500))
+
+	batchCount := 0
+	tc.MockAPI.BeforeBatchDelete = func([]string) error {
+		batchCount++
+		if batchCount == 1 {
+			require.NoError(t, tc.Mgr.CancelManifest(manifest.ID), "daemon CancelManifest")
+		}
+		return nil
+	}
+
+	err := tc.ExecuteBatch(manifest.ID)
+	require.ErrorIs(t, err, ErrManifestCancelled, "ExecuteBatch() error")
+
+	assert.Less(t, len(tc.MockAPI.BatchDeleteCalls), 3, "stopped before processing all batches")
+	tc.AssertNotCompleted()
+	tc.AssertInProgressCount(0)
+	tc.AssertCompletedCount(0)
+	tc.AssertCancelledCount(1)
+}
+
+// TestExecutor_SaveCheckpoint_DoesNotResurrectCancelledManifest drives the
+// exact checkpoint-write race: a manifest is claimed into in_progress/, then a
+// daemon cancel moves it to cancelled/ in the window where the executor's
+// cancellation stat would previously have already passed. The subsequent
+// checkpoint write must NOT recreate in_progress/<id>.json; the manifest must
+// remain only in cancelled/.
+func TestExecutor_SaveCheckpoint_DoesNotResurrectCancelledManifest(t *testing.T) {
+	tc := NewTestContext(t)
+	manifest := tc.CreateManifest("checkpoint race", msgIDs(10))
+
+	// Claim into in_progress/ as prepareExecution would.
+	require.NoError(t, tc.Mgr.MoveManifest(manifest.ID, StatusPending, StatusInProgress), "MoveManifest")
+	manifest.Status = StatusInProgress
+	manifest.Execution = &Execution{StartedAt: time.Now(), Method: MethodTrash}
+	path := tc.Mgr.InProgressDir() + "/" + manifest.ID + ".json"
+
+	// The daemon cancels right before the checkpoint write lands.
+	require.NoError(t, tc.Mgr.CancelManifest(manifest.ID), "daemon CancelManifest")
+
+	// Invoke the checkpoint write directly at the race boundary.
+	tc.Exec.saveCheckpoint(manifest, manifest.ID, 5, 5, 0, nil)
+
+	// The in_progress file must not be resurrected; the manifest lives only
+	// in cancelled/.
+	_, statErr := os.Stat(path)
+	assert.True(t, os.IsNotExist(statErr), "in_progress file must not be recreated by checkpoint")
+	tc.AssertInProgressCount(0)
+	tc.AssertCompletedCount(0)
+	tc.AssertCancelledCount(1)
+}
+
+// TestExecutor_Finalize_RefusesWhenDurablyCancelled verifies that finalize
+// refuses to complete a manifest whose cancelled/ marker is present, even if a
+// stray in_progress/<id>.json exists (simulating a resurrected file). This
+// guards against a double copy in cancelled/ and completed/.
+func TestExecutor_Finalize_RefusesWhenDurablyCancelled(t *testing.T) {
+	require := require.New(t)
+	tc := NewTestContext(t)
+	manifest := tc.CreateManifest("finalize durable cancel", msgIDs(3))
+
+	require.NoError(tc.Mgr.MoveManifest(manifest.ID, StatusPending, StatusInProgress), "MoveManifest")
+	manifest.Status = StatusInProgress
+	manifest.Execution = &Execution{StartedAt: time.Now(), Method: MethodTrash}
+
+	// Daemon cancels (durable marker in cancelled/).
+	require.NoError(tc.Mgr.CancelManifest(manifest.ID), "daemon CancelManifest")
+
+	// Simulate a resurrected in_progress file so MoveManifest alone would
+	// otherwise succeed and create a completed/ copy.
+	inProgressPath := tc.Mgr.InProgressDir() + "/" + manifest.ID + ".json"
+	require.NoError(manifest.Save(inProgressPath), "resurrect in_progress file")
+
+	err := tc.Exec.finalizeExecution(manifest.ID, manifest, 3, 0, nil, true)
+	require.ErrorIs(err, ErrManifestCancelled, "finalizeExecution error")
+
+	tc.AssertCompletedCount(0)
+	tc.AssertCancelledCount(1)
+}
+
+// TestExecutor_PrepareExecution_PersistsInProgressState verifies that
+// claiming a pending manifest through the executor's prepareExecution (backed
+// by Manager.ClaimManifest) writes Status=InProgress and a non-nil Execution
+// to in_progress/<id>.json on disk immediately — not just to the returned
+// in-memory manifest. A crash before the first checkpoint must never leave an
+// in_progress file that still says "pending".
+func TestExecutor_PrepareExecution_PersistsInProgressState(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	tc := NewTestContext(t)
+	manifest := tc.CreateManifest("prepare persists", msgIDs(3))
+
+	_, err := tc.Exec.prepareExecution(manifest.ID, MethodTrash)
+	require.NoError(err, "prepareExecution")
+
+	inProgressPath := tc.Mgr.InProgressDir() + "/" + manifest.ID + ".json"
+	loaded, err := LoadManifest(inProgressPath)
+	require.NoError(err, "reload in_progress manifest from disk")
+	assert.Equal(StatusInProgress, loaded.Status, "on-disk status must not still say pending")
+	require.NotNil(loaded.Execution, "on-disk Execution must be initialized")
 }
 
 // TestNullProgress_AllMethods exercises all NullProgress methods for coverage.

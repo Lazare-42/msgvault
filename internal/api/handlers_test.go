@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -29,16 +30,19 @@ import (
 	"go.kenn.io/kit/packstore"
 	"go.kenn.io/msgvault/internal/attachmentstore"
 	"go.kenn.io/msgvault/internal/cacheops"
+	"go.kenn.io/msgvault/internal/circleback"
 	"go.kenn.io/msgvault/internal/clirun"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/gcal"
+	"go.kenn.io/msgvault/internal/granola"
 	"go.kenn.io/msgvault/internal/opserr"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/query/querytest"
 	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/synctechsms"
 	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/testutil/storetest"
 	"go.kenn.io/msgvault/internal/vector"
@@ -526,6 +530,25 @@ func TestHandleCLICollectionMutations(t *testing.T) {
 
 	_, err = st.GetCollectionByName("Team")
 	require.ErrorIs(err, store.ErrCollectionNotFound, "collection deleted")
+}
+
+func TestDocsPageDisabledOpenAPISpecStillServed(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+	srv := NewServer(&config.Config{Server: config.ServerConfig{APIPort: 8080}}, st, nil, testLogger())
+
+	docs := httptest.NewRecorder()
+	srv.Router().ServeHTTP(docs, httptest.NewRequest(http.MethodGet, "/docs", nil))
+	assert.Equal(http.StatusNotFound, docs.Code, "docs status: %s", docs.Body.String())
+	assert.NotContains(docs.Body.String(), "unpkg.com", "docs response must not reference CDN scripts")
+
+	spec := httptest.NewRecorder()
+	srv.Router().ServeHTTP(spec, httptest.NewRequest(http.MethodGet, "/openapi.json", nil))
+	require.Equal(http.StatusOK, spec.Code, "openapi status: %s", spec.Body.String())
+	var doc map[string]any
+	require.NoError(json.NewDecoder(spec.Body).Decode(&doc), "decode openapi")
+	assert.Equal("3.1.0", doc["openapi"], "openapi version")
 }
 
 func TestOpenAPIExportsCLIIdentityContracts(t *testing.T) {
@@ -2991,6 +3014,7 @@ func TestHandleSourceStatus(t *testing.T) {
 	assert := assert.New(t)
 	st := testutil.NewTestStore(t)
 	sched := newMockScheduler()
+	sched.scheduled["alice@example.com"] = true
 	srv := NewServer(&config.Config{Server: config.ServerConfig{APIPort: 8080}}, st, sched, testLogger())
 
 	gmail, err := st.GetOrCreateSource("gmail", "alice@example.com")
@@ -3052,6 +3076,8 @@ func TestHandleSourceStatus(t *testing.T) {
 	require.NotNil(got.LastSyncAt, "LastSyncAt")
 	assert.NotEmpty(*got.LastSyncAt, "LastSyncAt")
 	assert.NotEmpty(got.UpdatedAt, "UpdatedAt")
+	assert.False(got.CanSync, "active source cannot start a conflicting sync")
+	assert.Equal("sync_already_running", got.SyncUnavailableReason)
 
 	require.NotNil(got.ActiveSync, "ActiveSync")
 	assert.Equal(runningID, got.ActiveSync.ID, "ActiveSync.ID")
@@ -3073,6 +3099,62 @@ func TestHandleSourceStatus(t *testing.T) {
 	assert.NotEmpty(got.LastSuccessfulSync.ItemErrors[0].CreatedAt, "LastSuccessfulSync.ItemErrors[0].CreatedAt")
 	require.NotNil(got.LastSuccessfulSync.CursorAfter, "LastSuccessfulSync.CursorAfter")
 	assert.Equal("history-2", *got.LastSuccessfulSync.CursorAfter, "LastSuccessfulSync.CursorAfter")
+}
+
+func TestHandleSourceStatusExposesServerAuthorizedSyncCapability(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	st := testutil.NewTestStore(t)
+	sched := newMockScheduler()
+	sched.scheduled["ready@example.com"] = true
+	sched.statuses = []AccountStatus{{
+		Email: "ready@example.com", Schedule: "0 */6 * * *",
+		NextRun: time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC), LastError: "previous timeout",
+	}}
+	_, err := st.GetOrCreateSource("gmail", "ready@example.com")
+	requirements.NoError(err)
+	srv := NewServer(&config.Config{Server: config.ServerConfig{APIPort: 8080}}, st, sched, testLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sources/status", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	requirements.Equal(http.StatusOK, w.Code, w.Body.String())
+	var response SourceStatusResponse
+	requirements.NoError(json.Unmarshal(w.Body.Bytes(), &response))
+	requirements.Len(response.Sources, 1)
+	assertions.True(response.Sources[0].CanSync)
+	assertions.Empty(response.Sources[0].SyncUnavailableReason)
+	assertions.True(response.Sources[0].Scheduled)
+	assertions.Equal("0 */6 * * *", response.Sources[0].Schedule)
+	requirements.NotNil(response.Sources[0].NextSyncAt)
+	assertions.Equal("2026-07-20T00:00:00Z", *response.Sources[0].NextSyncAt)
+	assertions.Equal("previous timeout", response.Sources[0].SchedulerLastError)
+}
+
+func TestHandleSourceStatusDisablesSyncWhileSchedulerReportsAccountRunning(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	st := testutil.NewTestStore(t)
+	sched := newMockScheduler()
+	sched.scheduled["running@example.com"] = true
+	sched.statuses = []AccountStatus{{
+		Email: "running@example.com", Running: true, Schedule: "0 */6 * * *",
+	}}
+	_, err := st.GetOrCreateSource("gmail", "running@example.com")
+	requirements.NoError(err)
+	srv := NewServer(&config.Config{Server: config.ServerConfig{APIPort: 8080}}, st, sched, testLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sources/status", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	requirements.Equal(http.StatusOK, w.Code, w.Body.String())
+	var response SourceStatusResponse
+	requirements.NoError(json.Unmarshal(w.Body.Bytes(), &response))
+	requirements.Len(response.Sources, 1)
+	assertions.False(response.Sources[0].CanSync)
+	assertions.Equal("sync_already_running", response.Sources[0].SyncUnavailableReason)
 }
 
 func TestHandleSourceStatusNoSyncRuns(t *testing.T) {
@@ -3097,6 +3179,283 @@ func TestHandleSourceStatusNoSyncRuns(t *testing.T) {
 	assert.Nil(resp.Sources[0].ActiveSync, "ActiveSync")
 	assert.Nil(resp.Sources[0].LatestSync, "LatestSync")
 	assert.Nil(resp.Sources[0].LastSuccessfulSync, "LastSuccessfulSync")
+	assert.False(resp.Sources[0].CanSync)
+	assert.Equal("scheduler_unavailable", resp.Sources[0].SyncUnavailableReason)
+}
+
+// TestHandleSourceStatusGenericJobScheduled is a regression test for a MEDIUM
+// finding: sourceStatus only consulted the account scheduler, so non-account
+// sources (synctech-sms, gcal, granola, circleback, beeper) always reported
+// scheduled=false / sync_not_configured even when a generic scheduler job
+// governed them. A granola source whose matching generic job is idle and
+// scheduled must report Scheduled=true, surface the job's schedule/next-run,
+// and set CanSync=true.
+func TestHandleSourceStatusGenericJobScheduled(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+	sched := newMockScheduler()
+	sched.jobStatuses = []JobStatus{{
+		Name:     "granola:acct-1",
+		Schedule: "0 */6 * * *",
+		NextRun:  time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC),
+	}}
+	source, err := st.GetOrCreateSource(granola.SourceType, "acct-1")
+	require.NoError(err, "GetOrCreateSource granola")
+	srv := NewServer(&config.Config{Server: config.ServerConfig{APIPort: 8080}}, st, sched, testLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sources/status", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	require.Equal(http.StatusOK, w.Code, w.Body.String())
+	var resp SourceStatusResponse
+	require.NoError(json.NewDecoder(w.Body).Decode(&resp), "decode response")
+	require.Len(resp.Sources, 1, "sources")
+
+	got := resp.Sources[0]
+	assert.Equal(source.ID, got.ID, "ID")
+	assert.True(got.Scheduled, "Scheduled")
+	assert.Equal("0 */6 * * *", got.Schedule, "Schedule")
+	require.NotNil(got.NextSyncAt, "NextSyncAt")
+	assert.Equal("2026-07-20T00:00:00Z", *got.NextSyncAt, "NextSyncAt")
+	assert.True(got.CanSync, "idle scheduled generic-job source can sync")
+	assert.Empty(got.SyncUnavailableReason, "SyncUnavailableReason")
+}
+
+// TestHandleSourceStatusGenericJobRunning covers the running branch of the
+// same generic-job path: a running matching job must report
+// sync_already_running and CanSync=false, exactly like a running account job.
+func TestHandleSourceStatusGenericJobRunning(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+	sched := newMockScheduler()
+	sched.jobStatuses = []JobStatus{{
+		Name:      "synctech-sms:+15551234567",
+		Schedule:  "*/30 * * * *",
+		Running:   true,
+		LastError: "previous timeout",
+	}}
+	_, err := st.GetOrCreateSource(synctechsms.SourceType, "+15551234567")
+	require.NoError(err, "GetOrCreateSource synctech-sms")
+	srv := NewServer(&config.Config{Server: config.ServerConfig{APIPort: 8080}}, st, sched, testLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sources/status", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	require.Equal(http.StatusOK, w.Code, w.Body.String())
+	var resp SourceStatusResponse
+	require.NoError(json.NewDecoder(w.Body).Decode(&resp), "decode response")
+	require.Len(resp.Sources, 1, "sources")
+
+	got := resp.Sources[0]
+	assert.True(got.Scheduled, "Scheduled")
+	assert.Equal("previous timeout", got.SchedulerLastError, "SchedulerLastError")
+	assert.False(got.CanSync, "a running generic job cannot start a conflicting sync")
+	assert.Equal("sync_already_running", got.SyncUnavailableReason)
+}
+
+// TestHandleSourceStatusGenericJobUnscheduled asserts an unscheduled
+// generic-job-type source (no matching job registered) still reports
+// sync_not_configured, rather than falling through to some other reason.
+func TestHandleSourceStatusGenericJobUnscheduled(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+	sched := newMockScheduler() // no jobStatuses configured
+	_, err := st.GetOrCreateSource(circleback.SourceType, "acct-2")
+	require.NoError(err, "GetOrCreateSource circleback")
+	srv := NewServer(&config.Config{Server: config.ServerConfig{APIPort: 8080}}, st, sched, testLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sources/status", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	require.Equal(http.StatusOK, w.Code, w.Body.String())
+	var resp SourceStatusResponse
+	require.NoError(json.NewDecoder(w.Body).Decode(&resp), "decode response")
+	require.Len(resp.Sources, 1, "sources")
+
+	got := resp.Sources[0]
+	assert.False(got.Scheduled, "Scheduled")
+	assert.False(got.CanSync, "CanSync")
+	assert.Equal("sync_not_configured", got.SyncUnavailableReason)
+}
+
+// TestHandleSourceStatusBeeperSharesSingleJob covers the beeper N:1 fan-in:
+// every beeper store source (one per beeper AccountID) is driven by the same
+// singleton "beeper" scheduler job, so two beeper sources must both surface
+// that one job's scheduled/running state.
+func TestHandleSourceStatusBeeperSharesSingleJob(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+	sched := newMockScheduler()
+	sched.jobStatuses = []JobStatus{{
+		Name:     BeeperJobName,
+		Schedule: "*/30 * * * *",
+	}}
+	_, err := st.GetOrCreateSource("beeper", "beeper-account-1")
+	require.NoError(err, "GetOrCreateSource beeper account 1")
+	_, err = st.GetOrCreateSource("beeper", "beeper-account-2")
+	require.NoError(err, "GetOrCreateSource beeper account 2")
+	srv := NewServer(&config.Config{Server: config.ServerConfig{APIPort: 8080}}, st, sched, testLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sources/status?source_type=beeper", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	require.Equal(http.StatusOK, w.Code, w.Body.String())
+	var resp SourceStatusResponse
+	require.NoError(json.NewDecoder(w.Body).Decode(&resp), "decode response")
+	require.Len(resp.Sources, 2, "sources")
+
+	for _, got := range resp.Sources {
+		assert.True(got.Scheduled, "Scheduled for %s", got.Identifier)
+		assert.Equal("*/30 * * * *", got.Schedule, "Schedule for %s", got.Identifier)
+		assert.True(got.CanSync, "CanSync for %s", got.Identifier)
+	}
+}
+
+// TestHandleTriggerSyncGenericSource is a regression test for a MEDIUM finding:
+// sourceStatus reports CanSync=true for generic (non-account) sources, but the
+// trigger endpoint only recognized account jobs, so "Sync Now" for a granola /
+// gcal / synctech / circleback / beeper source returned 404. The caller now
+// passes source_type explicitly, so the handler resolves the generic job name
+// authoritatively (no store scan) and starts it asynchronously via StartJob.
+func TestHandleTriggerSyncGenericSource(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	sched := newMockScheduler()
+	sched.scheduledJobs = map[string]bool{"granola:acct-1": true}
+	srv := NewServer(&config.Config{Server: config.ServerConfig{APIPort: 8080}}, nil, sched, testLogger())
+
+	resp := servePOSTTestRequest(srv, "/api/v1/sync/acct-1?source_type=granola")
+
+	require.Equal(http.StatusAccepted, resp.Code, resp.Body.String())
+	assert.Equal([]string{"granola:acct-1"}, sched.startedJobs, "started generic job")
+	assert.Empty(sched.triggeredJobs, "TriggerJob must not be used for the async trigger path")
+}
+
+// TestHandleTriggerSyncBeeperSource confirms a beeper source (one of many under
+// the singleton "beeper" job) starts that shared job.
+func TestHandleTriggerSyncBeeperSource(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	sched := newMockScheduler()
+	sched.scheduledJobs = map[string]bool{BeeperJobName: true}
+	srv := NewServer(&config.Config{Server: config.ServerConfig{APIPort: 8080}}, nil, sched, testLogger())
+
+	resp := servePOSTTestRequest(srv, "/api/v1/sync/beeper-account-1?source_type=beeper")
+
+	require.Equal(http.StatusAccepted, resp.Code, resp.Body.String())
+	assert.Equal([]string{BeeperJobName}, sched.startedJobs, "started beeper job")
+}
+
+// TestHandleTriggerSyncGenericSourceNotScheduled confirms a generic source
+// whose job is not scheduled still returns 404 and starts nothing.
+func TestHandleTriggerSyncGenericSourceNotScheduled(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	sched := newMockScheduler() // no scheduledJobs
+	srv := NewServer(&config.Config{Server: config.ServerConfig{APIPort: 8080}}, nil, sched, testLogger())
+
+	resp := servePOSTTestRequest(srv, "/api/v1/sync/acct-2?source_type=circleback")
+
+	require.Equal(http.StatusNotFound, resp.Code, resp.Body.String())
+	assert.Empty(sched.startedJobs, "no job started")
+}
+
+// TestHandleTriggerSyncGenericIdentifierCollidesWithScheduledAccount is a
+// regression test for the wrong-scheduler-resolution bug: a granola source
+// whose store identifier happens to equal a scheduled account email must
+// still trigger the GRANOLA job via source_type dispatch, never the account
+// scheduler's TriggerSync for that email.
+func TestHandleTriggerSyncGenericIdentifierCollidesWithScheduledAccount(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	const collidingIdentifier = "shared@example.com"
+	sched := newMockScheduler()
+	sched.scheduled[collidingIdentifier] = true // an account is also scheduled under this identifier
+	sched.scheduledJobs = map[string]bool{"granola:" + collidingIdentifier: true}
+	srv := NewServer(&config.Config{Server: config.ServerConfig{APIPort: 8080}}, nil, sched, testLogger())
+
+	resp := servePOSTTestRequest(srv, "/api/v1/sync/"+collidingIdentifier+"?source_type=granola")
+
+	require.Equal(http.StatusAccepted, resp.Code, resp.Body.String())
+	assert.Equal([]string{"granola:" + collidingIdentifier}, sched.startedJobs, "started the granola job")
+	assert.Empty(sched.triggeredJobs, "must not touch the account scheduler's TriggerJob path")
+}
+
+// TestHandleSourceStatusGenericIdentifierCollidesWithScheduledAccount is the
+// sourceStatus counterpart of the wrong-scheduler-resolution regression: a
+// granola source whose identifier equals a scheduled account email must
+// report the generic job's state, not the account scheduler's.
+func TestHandleSourceStatusGenericIdentifierCollidesWithScheduledAccount(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	const collidingIdentifier = "shared@example.com"
+	st := testutil.NewTestStore(t)
+	sched := newMockScheduler()
+	sched.scheduled[collidingIdentifier] = true
+	sched.statuses = []AccountStatus{{
+		Email:    collidingIdentifier,
+		Schedule: "0 3 * * *",
+		Running:  true,
+	}}
+	sched.jobStatuses = []JobStatus{{
+		Name:     "granola:" + collidingIdentifier,
+		Schedule: "*/15 * * * *",
+		Running:  false,
+	}}
+	_, err := st.GetOrCreateSource(granola.SourceType, collidingIdentifier)
+	require.NoError(err, "GetOrCreateSource granola")
+	srv := NewServer(&config.Config{Server: config.ServerConfig{APIPort: 8080}}, st, sched, testLogger())
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/sources/status?source_type=granola", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	require.Equal(http.StatusOK, w.Code, w.Body.String())
+	var resp SourceStatusResponse
+	require.NoError(json.NewDecoder(w.Body).Decode(&resp), "decode response")
+	require.Len(resp.Sources, 1, "sources")
+
+	got := resp.Sources[0]
+	assert.Equal("*/15 * * * *", got.Schedule, "must report the generic job's schedule")
+	assert.True(got.CanSync, "generic job is scheduled and not running")
+}
+
+// TestSchedulerJobNameForSource covers every generic-job source type plus an
+// account-scheduler type (gmail), which must report ok=false since it's
+// governed by the account scheduler, not a generic job.
+func TestSchedulerJobNameForSource(t *testing.T) {
+	assert := assert.New(t)
+
+	cases := []struct {
+		name       string
+		sourceType string
+		identifier string
+		wantName   string
+		wantOK     bool
+	}{
+		{"synctech-sms", synctechsms.SourceType, "+15551234567", "synctech-sms:+15551234567", true},
+		{"gcal", gcal.SourceType, "alice@example.com/primary", "gcal:alice@example.com", true},
+		{"gcal no calendar id", gcal.SourceType, "alice@example.com", "", false},
+		{"granola", granola.SourceType, "acct-1", "granola:acct-1", true},
+		{"circleback", circleback.SourceType, "acct-2", "circleback:acct-2", true},
+		{"beeper", "beeper", "beeper-account-1", "beeper", true},
+		{"account scheduler type", "gmail", "alice@example.com", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gotName, gotOK := SchedulerJobNameForSource(tc.sourceType, tc.identifier)
+			assert.Equal(tc.wantOK, gotOK, "ok")
+			assert.Equal(tc.wantName, gotName, "name")
+		})
+	}
 }
 
 func TestHandleGetMessage(t *testing.T) {
@@ -6148,6 +6507,30 @@ func rawMIMEWithInlineImage(cid, contentType string, body []byte) []byte {
 	return rawMIMEWithImagePart(cid, contentType, "inline", body)
 }
 
+type archiveRawMessageStore struct {
+	*mockStore
+
+	raw []byte
+}
+
+func (s *archiveRawMessageStore) GetArchivedMessageRaw(context.Context, int64) ([]byte, error) {
+	return append([]byte(nil), s.raw...), nil
+}
+
+func TestHandleMessageInlineUsesArchiveAwareRawAuthority(t *testing.T) {
+	raw := rawMIMEWithInlineImage("retained@example", "image/png", []byte("retained"))
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
+		Store:  &archiveRawMessageStore{mockStore: &mockStore{stats: &StoreStats{}}, raw: raw},
+		Engine: &querytest.MockEngine{}, Logger: testLogger(),
+	})
+	response := httptest.NewRecorder()
+	srv.Router().ServeHTTP(response, httptest.NewRequest(http.MethodGet, inlineURL(7, "retained@example"), nil))
+
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Equal(t, "retained", response.Body.String())
+}
+
 func TestHandleMessageInline_ImagePNG(t *testing.T) {
 	assert := assert.New(t)
 	imgData := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}
@@ -6322,6 +6705,191 @@ func TestHandleMessageInline_UnsupportedEngine(t *testing.T) {
 	}
 }
 
+// inlineImagePart describes one inline image for a multi-CID MIME fixture.
+type inlineImagePart struct {
+	cid         string
+	contentType string
+	body        []byte
+}
+
+// rawMIMEWithInlineImages builds a multipart/related message whose HTML body
+// references each part by cid and carries every part as an inline attachment.
+// This exercises the fan-out path where opening one message triggers many
+// per-cid requests.
+func rawMIMEWithInlineImages(parts []inlineImagePart) []byte {
+	boundary := "test-boundary-multi"
+	var b strings.Builder
+	b.WriteString("MIME-Version: 1.0\r\n")
+	b.WriteString("Content-Type: multipart/related; boundary=\"" + boundary + "\"\r\n")
+	b.WriteString("Subject: test\r\n\r\n")
+	b.WriteString("--" + boundary + "\r\n")
+	b.WriteString("Content-Type: text/html; charset=utf-8\r\n\r\n<html><body>")
+	for _, p := range parts {
+		b.WriteString("<img src=\"cid:" + p.cid + "\">")
+	}
+	b.WriteString("</body></html>\r\n")
+	for _, p := range parts {
+		b.WriteString("--" + boundary + "\r\n")
+		b.WriteString("Content-Type: " + p.contentType + "\r\n")
+		b.WriteString("Content-Disposition: inline\r\n")
+		b.WriteString("Content-ID: <" + p.cid + ">\r\n")
+		b.WriteString("Content-Transfer-Encoding: base64\r\n\r\n")
+		b.WriteString(base64.StdEncoding.EncodeToString(p.body))
+		b.WriteString("\r\n")
+	}
+	b.WriteString("--" + boundary + "--\r\n")
+	return []byte(b.String())
+}
+
+// countingRawEngine wraps a raw-MIME map and counts how many times the raw
+// bytes are loaded, which is a faithful proxy for how many times the handler
+// parses the message: the parse-once cache loads and parses together inside a
+// single singleflight call, so a load count of 1 proves a single parse.
+type countingRawEngine struct {
+	querytest.MockEngine
+
+	raw   []byte
+	loads atomic.Int64
+}
+
+func (e *countingRawEngine) GetMessageRaw(ctx context.Context, id int64) ([]byte, error) {
+	if e.GetMessageRawFunc != nil {
+		return e.GetMessageRawFunc(ctx, id)
+	}
+	e.loads.Add(1)
+	return append([]byte(nil), e.raw...), nil
+}
+
+func inlineImageFixture(n int) []inlineImagePart {
+	parts := make([]inlineImagePart, n)
+	for i := range parts {
+		parts[i] = inlineImagePart{
+			cid:         fmt.Sprintf("img%d@example", i),
+			contentType: "image/png",
+			body:        fmt.Appendf(nil, "PNG-DATA-%d", i),
+		}
+	}
+	return parts
+}
+
+// inlineTestMessageID is the message id every inline-handler test fixture is
+// stored under.
+const inlineTestMessageID int64 = 1
+
+func requestInline(t *testing.T, srv *Server, cid string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, inlineURL(inlineTestMessageID, cid), nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+	return w
+}
+
+// TestHandleMessageInline_ParseOnce verifies that fetching every distinct cid
+// of one message loads and parses the raw MIME exactly once while each cid still
+// returns its own bytes and content type.
+func TestHandleMessageInline_ParseOnce(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	parts := inlineImageFixture(8)
+	engine := &countingRawEngine{raw: rawMIMEWithInlineImages(parts)}
+	srv := newTestServerWithEngine(t, engine)
+
+	for _, p := range parts {
+		w := requestInline(t, srv, p.cid)
+		require.Equal(http.StatusOK, w.Code, "status for %s (body: %s)", p.cid, w.Body.String())
+		assert.Equal("image/png", w.Header().Get("Content-Type"), "content type for %s", p.cid)
+		assert.Equal(p.body, w.Body.Bytes(), "body for %s", p.cid)
+	}
+	assert.Equal(int64(1), engine.loads.Load(), "raw loads (parses) for 8 distinct cids")
+}
+
+// TestHandleMessageInline_ConcurrentSingleParse verifies that a burst of
+// concurrent first-fetches for the same message collapses to one parse via
+// singleflight, and every response is correct.
+func TestHandleMessageInline_ConcurrentSingleParse(t *testing.T) {
+	parts := inlineImageFixture(4)
+	engine := &countingRawEngine{raw: rawMIMEWithInlineImages(parts)}
+	// Block the first load until all goroutines are in flight so they contend
+	// on the same singleflight key rather than serializing behind a fast cache
+	// fill.
+	release := make(chan struct{})
+	var gate sync.Once
+	engine.GetMessageRawFunc = func(_ context.Context, _ int64) ([]byte, error) {
+		gate.Do(func() { <-release })
+		engine.loads.Add(1)
+		return append([]byte(nil), engine.raw...), nil
+	}
+	srv := newTestServerWithEngine(t, engine)
+
+	const n = 16
+	var wg sync.WaitGroup
+	codes := make([]int, n)
+	for i := range n {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			codes[idx] = requestInline(t, srv, parts[idx%len(parts)].cid).Code
+		}(i)
+	}
+	// Give goroutines a moment to enter singleflight, then release the load.
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	for i, code := range codes {
+		assert.Equal(t, http.StatusOK, code, "status for request %d", i)
+	}
+	assert.Equal(t, int64(1), engine.loads.Load(), "raw loads (parses) under concurrent fan-out")
+}
+
+// TestHandleMessageInline_RawTooLarge verifies that a raw message over the size
+// cap is rejected before parsing with 413.
+func TestHandleMessageInline_RawTooLarge(t *testing.T) {
+	oversized := bytes.Repeat([]byte("x"), maxInlineRawBytes+1)
+	engine := &querytest.MockEngine{RawMessages: map[int64][]byte{1: oversized}}
+	srv := newTestServerWithEngine(t, engine)
+
+	w := requestInline(t, srv, "any@cid")
+	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code, "status for oversized raw")
+}
+
+// TestHandleMessageInline_TooManyParts verifies that a message carrying more
+// than the distinct-part cap is denied wholesale.
+func TestHandleMessageInline_TooManyParts(t *testing.T) {
+	parts := inlineImageFixture(maxInlinePartsPerMessage + 1)
+	engine := &querytest.MockEngine{RawMessages: map[int64][]byte{1: rawMIMEWithInlineImages(parts)}}
+	srv := newTestServerWithEngine(t, engine)
+
+	w := requestInline(t, srv, parts[0].cid)
+	assert.Equal(t, http.StatusUnprocessableEntity, w.Code, "status for too many inline parts")
+}
+
+// TestHandleMessageInline_TwoCIDsHappyPath verifies the ordinary small-message
+// case: both cids serve their own bytes.
+func TestHandleMessageInline_TwoCIDsHappyPath(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	parts := []inlineImagePart{
+		{cid: "a@example", contentType: "image/png", body: []byte{0x89, 'P', 'N', 'G'}},
+		{cid: "b@example", contentType: "image/gif", body: []byte("GIF89a-data")},
+	}
+	engine := &querytest.MockEngine{RawMessages: map[int64][]byte{1: rawMIMEWithInlineImages(parts)}}
+	srv := newTestServerWithEngine(t, engine)
+
+	first := requestInline(t, srv, "a@example")
+	require.Equal(http.StatusOK, first.Code, "status for a@example (body: %s)", first.Body.String())
+	assert.Equal("image/png", first.Header().Get("Content-Type"), "content type a")
+	assert.Equal(parts[0].body, first.Body.Bytes(), "body a")
+
+	second := requestInline(t, srv, "b@example")
+	require.Equal(http.StatusOK, second.Code, "status for b@example (body: %s)", second.Body.String())
+	assert.Equal("image/gif", second.Header().Get("Content-Type"), "content type b")
+	assert.Equal(parts[1].body, second.Body.Bytes(), "body b")
+
+	unknown := requestInline(t, srv, "missing@example")
+	assert.Equal(http.StatusNotFound, unknown.Code, "status for unknown cid")
+}
+
 // TestHandleGetMessage_EngineUnsupportedFallsBackToStore verifies that when
 // the configured engine reports the operation is unsupported, the handler
 // falls through to the store path so engine-only errors don't break detail
@@ -6393,6 +6961,7 @@ func TestHandleGetAttachmentContent(t *testing.T) {
 	assert.Equal("application/pdf", w.Header().Get("Content-Type"), "Content-Type")
 	assert.Equal(`attachment; filename="report.pdf"`, w.Header().Get("Content-Disposition"), "Content-Disposition")
 	assert.Equal(strconv.Itoa(len(content)), w.Header().Get("Content-Length"), "Content-Length")
+	assert.Equal("no-store", w.Header().Get("Cache-Control"), "Cache-Control")
 	assert.Equal(content, w.Body.Bytes(), "body")
 }
 

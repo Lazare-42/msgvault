@@ -41,6 +41,7 @@ ROUTES = [
     "/usage/text-messages/",
     "/usage/tui/",
     "/usage/vector-search/",
+    "/web-ui/",
 ]
 
 REQUIRED_SITEMAP_URLS = [
@@ -73,6 +74,7 @@ REQUIRED_SITEMAP_URLS = [
     "https://msgvault.io/usage/text-messages/",
     "https://msgvault.io/usage/tui/",
     "https://msgvault.io/usage/vector-search/",
+    "https://msgvault.io/web-ui/",
 ]
 
 REQUIRED_METADATA = [
@@ -135,9 +137,36 @@ FORBIDDEN_PATTERNS = [
     "sl-markdown-content",
 ]
 
+# Local credential/secret artifacts that must never appear in the published site.
+# Keep in sync with credential_globs in docs/zensical-docs.sh. Patterns are matched
+# against the lowercased file name, so they must be written lowercase.
 FORBIDDEN_SITE_FILENAMES = [
     "client_secret*.json",
     "oauth_client*.json",
+    "credentials*.json",
+    "service_account*.json",
+    "service-account*.json",
+    "token.json",
+    "tokens.json",
+    "token-*.json",
+    "*.pem",
+    "*.key",
+    "*.crt",
+    "*.cer",
+    "*.der",
+    "*.p12",
+    "*.pfx",
+    "*.p8",
+    "*.jks",
+    "*.keystore",
+    "*.ppk",
+    "id_rsa*",
+    "id_dsa*",
+    "id_ecdsa*",
+    "id_ed25519*",
+    "*.tfstate",
+    "*.tfstate.backup",
+    "*.tfvars",
 ]
 
 ALLOWED_MISSING_LOCAL_PATHS = {
@@ -215,6 +244,7 @@ class LinkParser(html.parser.HTMLParser):
         super().__init__()
         self.ids: set[str] = set()
         self.links: list[str] = []
+        self.nav_links: list[str] = []
         self.assets: list[str] = []
         self.style_attrs: list[str] = []
         self.style_blocks: list[str] = []
@@ -233,6 +263,8 @@ class LinkParser(html.parser.HTMLParser):
         if tag == "a" and "href" in attr:
             self.links.append(attr["href"])
             classes = set(attr.get("class", "").split())
+            if "md-nav__link" in classes:
+                self.nav_links.append(attr["href"])
             if "md-nav__link" in classes and attr["href"].startswith("#"):
                 self._nav_label_href = attr["href"]
                 self._nav_label_text = []
@@ -366,9 +398,9 @@ def check_fragment_nav_labels(current: pathlib.Path, parser: LinkParser) -> None
                 )
 
 
-def check_public_site_file_inventory() -> None:
-    for path in SITE.rglob("*"):
-        rel = path.relative_to(SITE)
+def check_public_site_file_inventory(site: pathlib.Path = SITE) -> None:
+    for path in site.rglob("*"):
+        rel = path.relative_to(site)
         for part in rel.parts:
             if part.startswith("."):
                 fail(f"forbidden public site dotfile: {rel.as_posix()}")
@@ -423,6 +455,14 @@ def main() -> None:
             fail(f"forbidden generated marker found: {pattern}")
 
     parsed_by_file = {path.resolve(): parse_html(path) for path in html_files}
+    index_parser = parsed_by_file[(SITE / "index.html").resolve()]
+    web_ui_route = route_to_file("/web-ui/").resolve()
+    if not any(
+        (target_file(SITE / "index.html", href) or pathlib.Path()).resolve()
+        == web_ui_route
+        for href in index_parser.nav_links
+    ):
+        fail("Web UI is missing from the rendered primary navigation")
     for current, parser in parsed_by_file.items():
         for href in parser.links:
             parsed = urllib.parse.urlparse(href)

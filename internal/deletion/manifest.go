@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gofrs/flock"
 	"go.kenn.io/msgvault/internal/fileutil"
 )
 
@@ -287,8 +288,289 @@ func NewManager(baseDir string) (*Manager, error) {
 			return nil, fmt.Errorf("create dir for %s: %w", status, err)
 		}
 	}
+	if err := os.MkdirAll(m.locksDir(), 0700); err != nil {
+		return nil, fmt.Errorf("create deletion locks dir: %w", err)
+	}
 
 	return m, nil
+}
+
+// locksDir holds per-manifest lock files. It sits beside the status
+// directories (never inside one) so a manifest's lock path is stable across
+// the pending -> in_progress -> cancelled/completed renames: unlike the
+// manifest file, the lock is never moved, so checkpoint writes and cancels
+// keyed by ID always contend on the same file. It is not a persisted status
+// directory, so it is never listed or scanned as manifests.
+func (m *Manager) locksDir() string {
+	return filepath.Join(m.baseDir, "locks")
+}
+
+// manifestLockPath returns the stable per-manifest lock file path.
+func (m *Manager) manifestLockPath(id string) string {
+	return filepath.Join(m.locksDir(), id+".lock")
+}
+
+// acquireManifestLock takes the exclusive cross-process lock guarding a single
+// manifest's status transitions and checkpoint writes. The caller MUST release
+// it. Only one lock is ever held per manifest and it is always acquired then
+// released within a single method, so there is no lock ordering to deadlock on.
+func (m *Manager) acquireManifestLock(id string) (*flock.Flock, error) {
+	if err := ValidateManifestID(id); err != nil {
+		return nil, err
+	}
+	if err := os.MkdirAll(m.locksDir(), 0700); err != nil {
+		return nil, fmt.Errorf("create deletion locks dir: %w", err)
+	}
+	lock := flock.New(m.manifestLockPath(id), flock.SetPermissions(0600))
+	if err := lock.Lock(); err != nil {
+		return nil, fmt.Errorf("lock manifest %s: %w", id, err)
+	}
+	return lock, nil
+}
+
+// writeManifestAtomic serializes manifest and publishes it at path via a
+// temp-file + os.Rename, so a reader never observes an empty or partially
+// written file: the previous contents at path remain intact until the rename
+// atomically replaces them. The temp file is written in the destination
+// directory (same filesystem, required for an atomic rename) and removed on any
+// error so no ".tmp" file is left behind. Callers must hold the per-manifest
+// lock and verify the destination's presence under that lock; the rename then
+// replaces the existing file rather than resurrecting a moved one.
+func writeManifestAtomic(manifest *Manifest, path string) (retErr error) {
+	data, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".manifest-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp manifest: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		if retErr != nil {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temp manifest: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp manifest: %w", err)
+	}
+	if err := fileutil.SecureChmod(tmpPath, 0600); err != nil {
+		return fmt.Errorf("protect temp manifest: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("publish manifest: %w", err)
+	}
+	return nil
+}
+
+// WriteInProgressCheckpoint persists the manifest's current execution progress
+// to in_progress/<id>.json under the per-manifest lock. It serializes with
+// CancelManifest and FinalizeInProgress so a checkpoint can never race a cancel
+// rename: while the lock is held, cancel cannot move the file, so the atomic
+// temp+rename write below replaces the verified-present destination without
+// tearing it or resurrecting a moved record. If the manifest is no longer in
+// in_progress/ (a cancel already moved it), it returns ErrManifestCancelled and
+// writes nothing.
+func (m *Manager) WriteInProgressCheckpoint(manifest *Manifest, id string) error {
+	lock, err := m.acquireManifestLock(id)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lock.Unlock() }()
+
+	path := filepath.Join(m.dirForStatus(StatusInProgress), id+".json")
+	if _, err := os.Stat(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return ErrManifestCancelled
+		}
+		return fmt.Errorf("stat in-progress manifest %s: %w", id, err)
+	}
+	return writeManifestAtomic(manifest, path)
+}
+
+// FinalizeInProgress atomically claims in_progress/<id>.json into a terminal
+// status (completed or failed) under the per-manifest lock. Holding the lock
+// stops a concurrent cancel from interleaving between the cancellation check
+// and the rename, so exactly one of finalize and cancel wins. It returns
+// ErrManifestCancelled when a durable cancelled/ marker is present or the
+// in_progress file has already been moved away. After the rename it also
+// removes any stale pending/<id>.json left by a crash in
+// claimPendingManifest's publish/remove window, so the terminal record is the
+// manifest's only file and a later ClaimManifest cannot re-execute it.
+func (m *Manager) FinalizeInProgress(id string, target Status) error {
+	if err := ValidateManifestID(id); err != nil {
+		return err
+	}
+	switch target {
+	case StatusCompleted, StatusFailed:
+		// allowed terminal states
+	default:
+		return fmt.Errorf("cannot finalize to status %s", target)
+	}
+	lock, err := m.acquireManifestLock(id)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lock.Unlock() }()
+
+	if _, err := os.Stat(filepath.Join(m.dirForStatus(StatusCancelled), id+".json")); err == nil {
+		return ErrManifestCancelled
+	}
+	fromPath := filepath.Join(m.dirForStatus(StatusInProgress), id+".json")
+	toPath := filepath.Join(m.dirForStatus(target), id+".json")
+	if err := os.Rename(fromPath, toPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return ErrManifestCancelled
+		}
+		return fmt.Errorf("finalize manifest %s: %w", id, err)
+	}
+	pendingPath := filepath.Join(m.dirForStatus(StatusPending), id+".json")
+	if err := os.Remove(pendingPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("WARNING: finalized manifest %s but could not remove stale pending copy: %v",
+			id, err)
+	}
+	return nil
+}
+
+// ClaimManifest atomically transitions a pending manifest into in_progress/
+// (or resumes one already there) for execution, holding the per-manifest
+// lock for the entire operation. This replaces the old "load manifest, check
+// its inline Status, MoveManifest, mutate the returned struct in memory"
+// sequence, which had two gaps: the unlocked MoveManifest rename could
+// interleave with a concurrent cancelManifestLocked, and the initialized
+// in_progress state (Status=InProgress + Execution) existed only in memory
+// until the first checkpoint — a crash before that checkpoint left
+// in_progress/<id>.json still serialized with "status": "pending", pointing
+// a resume at a pending/ file that no longer exists.
+//
+// The manifest's directory location is authoritative here, exactly as in
+// FinalizeInProgress and GetManifestWithStatus, not its serialized Status
+// field (which can be stale after a crash):
+//
+//   - in_progress/<id>.json present: this is a resume. Its Execution is left
+//     untouched if already set (it records real checkpoint progress —
+//     LastProcessedIndex, Succeeded, Failed); it is only initialized when nil.
+//   - completed/ or failed/<id>.json present: the manifest already reached a
+//     terminal state and must never be re-executed. This is checked BEFORE
+//     pending/ because a crash in claimPendingManifest's publish/remove
+//     window leaves a stale pending copy that survives finalization if the
+//     process also crashes before FinalizeInProgress's cleanup; honoring it
+//     would repeat an already-completed deletion. The stale copy is removed
+//     here (best-effort) and a "cannot execute" error is returned.
+//   - pending/<id>.json present (and no in_progress or terminal file): this
+//     is a fresh claim. The manifest is fully initialized in memory (Status +
+//     Execution) and that initialized state is published to
+//     in_progress/<id>.json via the same atomic temp+rename writeManifestAtomic
+//     uses for checkpoints BEFORE pending/<id>.json is removed. A crash
+//     between the write and the removal leaves an authoritative, fully
+//     initialized in_progress file plus a stale pending file: a later
+//     ClaimManifest or resume reads in_progress first and never revisits
+//     pending/, and FinalizeInProgress removes the stale copy on completion.
+//   - none present: a durable cancelled/ marker (checked first, like
+//     FinalizeInProgress) yields ErrManifestCancelled; otherwise the manifest
+//     does not exist.
+//
+// Holding the lock for the whole check-then-act sequence serializes claims
+// against cancelManifestLocked: either the claim completes first (the file is
+// in in_progress/ when cancel runs, so cancel moves it to cancelled/) or the
+// cancel wins first (claim observes the cancelled/ marker and returns
+// ErrManifestCancelled). Only one manifest's lock is ever held at a time, so
+// there is no lock-ordering cycle to deadlock on.
+func (m *Manager) ClaimManifest(id string, method Method) (*Manifest, error) {
+	if err := ValidateManifestID(id); err != nil {
+		return nil, err
+	}
+	lock, err := m.acquireManifestLock(id)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = lock.Unlock() }()
+
+	cancelledPath := filepath.Join(m.dirForStatus(StatusCancelled), id+".json")
+	if _, err := os.Stat(cancelledPath); err == nil {
+		return nil, ErrManifestCancelled
+	}
+
+	inProgressPath := filepath.Join(m.dirForStatus(StatusInProgress), id+".json")
+	manifest, err := LoadManifest(inProgressPath)
+	switch {
+	case err == nil:
+		return m.resumeClaimedManifest(manifest, inProgressPath, method)
+	case !errors.Is(err, os.ErrNotExist):
+		return nil, fmt.Errorf("load in-progress manifest %s: %w", id, err)
+	}
+
+	pendingPath := filepath.Join(m.dirForStatus(StatusPending), id+".json")
+	for _, status := range []Status{StatusCompleted, StatusFailed} {
+		if _, err := os.Stat(filepath.Join(m.dirForStatus(status), id+".json")); err != nil {
+			continue
+		}
+		if err := os.Remove(pendingPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			log.Printf("WARNING: manifest %s is %s but stale pending copy could not be removed: %v",
+				id, status, err)
+		}
+		return nil, fmt.Errorf("manifest %s is %s, cannot execute", id, status)
+	}
+
+	manifest, err = LoadManifest(pendingPath)
+	switch {
+	case err == nil:
+		return m.claimPendingManifest(manifest, pendingPath, inProgressPath, method)
+	case !errors.Is(err, os.ErrNotExist):
+		return nil, fmt.Errorf("load pending manifest %s: %w", id, err)
+	}
+
+	return nil, fmt.Errorf("manifest %s not found", id)
+}
+
+// resumeClaimedManifest handles the ClaimManifest resume branch: the manifest
+// is already in in_progress/. An existing Execution is left untouched so
+// checkpoint progress is never lost; it is only initialized when nil, e.g. a
+// manifest whose file was moved into in_progress/ without ever going through
+// ClaimManifest (the exact crash-before-checkpoint scenario this fix closes).
+// The inline Status field is corrected to InProgress and, if either it or a
+// freshly-initialized Execution changed, republished so the on-disk record
+// matches what is returned in memory.
+func (m *Manager) resumeClaimedManifest(manifest *Manifest, inProgressPath string, method Method) (*Manifest, error) {
+	needsWrite := manifest.Status != StatusInProgress
+	if manifest.Execution == nil {
+		manifest.Execution = &Execution{StartedAt: time.Now(), Method: method}
+		needsWrite = true
+	}
+	manifest.Status = StatusInProgress
+	if needsWrite {
+		if err := writeManifestAtomic(manifest, inProgressPath); err != nil {
+			return nil, fmt.Errorf("persist resumed execution for %s: %w", manifest.ID, err)
+		}
+	}
+	return manifest, nil
+}
+
+// claimPendingManifest handles the ClaimManifest fresh-claim branch: the
+// manifest is initialized and published to in_progress/<id>.json before
+// pending/<id>.json is removed, so a crash between the two leaves the
+// authoritative initialized in_progress file in place and only a stale
+// pending file behind. The stale copy is inert: a later claim/resume never
+// looks at pending/ once in_progress/ has a file, FinalizeInProgress removes
+// it when the execution reaches a terminal status, and ClaimManifest refuses
+// (and removes) a pending copy shadowed by a terminal record.
+func (m *Manager) claimPendingManifest(
+	manifest *Manifest, pendingPath, inProgressPath string, method Method,
+) (*Manifest, error) {
+	manifest.Status = StatusInProgress
+	manifest.Execution = &Execution{StartedAt: time.Now(), Method: method}
+	if err := writeManifestAtomic(manifest, inProgressPath); err != nil {
+		return nil, fmt.Errorf("claim manifest %s into in_progress: %w", manifest.ID, err)
+	}
+	if err := os.Remove(pendingPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("WARNING: claimed manifest %s but could not remove stale pending file: %v",
+			manifest.ID, err)
+	}
+	return manifest, nil
 }
 
 // dirForStatus returns the directory path for a given status.
@@ -306,6 +588,46 @@ func (m *Manager) PendingDir() string { return m.dirForStatus(StatusPending) }
 
 // InProgressDir returns the path to the in_progress directory.
 func (m *Manager) InProgressDir() string { return m.dirForStatus(StatusInProgress) }
+
+// InProgressManifestExists reports whether the manifest's file is still present
+// in the in_progress/ directory.
+//
+// Deletions execute in a separate CLI process while the daemon serves cancel
+// requests; the two coordinate only through manifest files on disk. A cancel
+// moves in_progress/<id>.json to cancelled/<id>.json, so its absence here is
+// the executor's cross-process signal that the deletion was cancelled and must
+// stop without recreating the file. Any stat error (including permission
+// errors) is treated as "gone" so the executor errs toward stopping rather
+// than continuing to delete.
+func (m *Manager) InProgressManifestExists(id string) bool {
+	if err := ValidateManifestID(id); err != nil {
+		return false
+	}
+	path := filepath.Join(m.dirForStatus(StatusInProgress), id+".json")
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// ManifestCancelled reports whether the manifest has a file in the cancelled/
+// directory.
+//
+// A daemon cancel moves in_progress/<id>.json to cancelled/<id>.json and leaves
+// it there (CancelManifest re-saves the inline status in place at the cancelled
+// path). This makes cancelled/<id>.json a durable cancellation marker that a
+// resurrecting checkpoint write cannot erase: even if a stale in-place write had
+// somehow recreated in_progress/<id>.json, the cancelled/ copy remains. The
+// executor treats this as authoritative cancellation in addition to the absence
+// of the in_progress/ file. Any stat error (including permission errors) is
+// treated as "not cancelled" here; the in_progress-absence check is the primary
+// stop signal and this is the durable belt-and-suspenders marker.
+func (m *Manager) ManifestCancelled(id string) bool {
+	if err := ValidateManifestID(id); err != nil {
+		return false
+	}
+	path := filepath.Join(m.dirForStatus(StatusCancelled), id+".json")
+	_, err := os.Stat(path)
+	return err == nil
+}
 
 // CompletedDir returns the path to the completed directory.
 func (m *Manager) CompletedDir() string { return m.dirForStatus(StatusCompleted) }
@@ -396,6 +718,16 @@ func (m *Manager) listManifests(status Status) ([]*Manifest, error) {
 	return manifests, nil
 }
 
+// manifestLookupOrder is the directory search order for by-ID lookups.
+// in_progress/ is checked before pending/ because a crash in
+// claimPendingManifest's publish/remove window can leave a stale pending copy
+// alongside the authoritative initialized in_progress record; the in_progress
+// copy carries the real execution state (method, checkpoint progress) and
+// must win so callers plan against it rather than the stale copy.
+var manifestLookupOrder = []Status{
+	StatusInProgress, StatusPending, StatusCompleted, StatusFailed, StatusCancelled,
+}
+
 // GetManifest loads a manifest by ID from any status directory.
 func (m *Manager) GetManifest(id string) (*Manifest, string, error) {
 	if strings.TrimSpace(id) == "" {
@@ -405,7 +737,7 @@ func (m *Manager) GetManifest(id string) (*Manifest, string, error) {
 		return nil, "", err
 	}
 	filename := id + ".json"
-	for _, status := range persistedStatuses {
+	for _, status := range manifestLookupOrder {
 		dir := m.dirForStatus(status)
 		path := filepath.Join(dir, filename)
 		if manifest, err := LoadManifest(path); err == nil {
@@ -427,7 +759,7 @@ func (m *Manager) GetManifestWithStatus(id string) (*Manifest, Status, error) {
 		return nil, "", err
 	}
 	filename := id + ".json"
-	for _, status := range persistedStatuses {
+	for _, status := range manifestLookupOrder {
 		path := filepath.Join(m.dirForStatus(status), filename)
 		manifest, err := LoadManifest(path)
 		if err != nil {
@@ -507,13 +839,42 @@ func (m *Manager) CancelManifest(id string) error {
 	if err := ValidateManifestID(id); err != nil {
 		return err
 	}
-	for _, fromStatus := range []Status{StatusPending, StatusInProgress} {
+	lock, err := m.acquireManifestLock(id)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = lock.Unlock() }()
+	return m.cancelManifestLocked(id)
+}
+
+// cancelManifestLocked performs the cancel rename and inline-status rewrite
+// while the caller holds the per-manifest lock. Serializing with
+// WriteInProgressCheckpoint and FinalizeInProgress through that lock guarantees
+// the rename cannot interleave a checkpoint's atomic write, so cancelled/<id>.json
+// always ends up as a fully valid manifest and in_progress/<id>.json is never
+// left torn or resurrected.
+//
+// in_progress/ is checked before pending/: a crash in claimPendingManifest's
+// publish/remove window leaves a stale pending copy alongside the
+// authoritative initialized in_progress file (see ClaimManifest). Cancelling
+// the in_progress record and removing the stale copy keeps the manifest a
+// single on-disk file — cancelling the pending copy instead would orphan the
+// in_progress file, so lookups would keep reporting the batch as in progress.
+func (m *Manager) cancelManifestLocked(id string) error {
+	for _, fromStatus := range []Status{StatusInProgress, StatusPending} {
 		fromPath := filepath.Join(m.dirForStatus(fromStatus), id+".json")
 		if _, err := os.Stat(fromPath); os.IsNotExist(err) {
 			continue
 		}
 		if err := m.MoveManifest(id, fromStatus, StatusCancelled); err != nil {
 			return fmt.Errorf("move manifest %s to cancelled: %w", id, err)
+		}
+		if fromStatus == StatusInProgress {
+			pendingPath := filepath.Join(m.dirForStatus(StatusPending), id+".json")
+			if err := os.Remove(pendingPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				log.Printf("WARNING: cancelled manifest %s but could not remove stale pending copy: %v",
+					id, err)
+			}
 		}
 		toPath := filepath.Join(m.dirForStatus(StatusCancelled), id+".json")
 		manifest, err := LoadManifest(toPath)

@@ -96,5 +96,6 @@ fi
   cd docs
   uv run --frozen bash ./zensical-docs.sh build
   uv run --frozen python scripts/check_built_site.py
+  uv run --frozen python scripts/selftest_check_built_site.py
   uv run --frozen python scripts/check_vercel_redirects.py
 )

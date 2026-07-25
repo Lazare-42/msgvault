@@ -178,11 +178,17 @@ func testLogger() *slog.Logger {
 
 // mockScheduler implements SyncScheduler for tests.
 type mockScheduler struct {
-	scheduled  map[string]bool
-	running    bool
-	statuses   []AccountStatus
-	triggerFn  func(email string) error
-	addedAccts []string // emails added via AddAccount
+	scheduled     map[string]bool
+	running       bool
+	statuses      []AccountStatus
+	jobStatuses   []JobStatus     // generic (non-account) job statuses, see JobStatus()
+	scheduledJobs map[string]bool // generic job names recognized by IsJobScheduled
+	triggeredJobs []string        // generic job names passed to TriggerJob
+	triggerJobFn  func(name string) error
+	startedJobs   []string // generic job names passed to StartJob
+	startJobFn    func(name string) error
+	triggerFn     func(email string) error
+	addedAccts    []string // emails added via AddAccount
 }
 
 func newMockScheduler() *mockScheduler {
@@ -215,6 +221,30 @@ func (m *mockScheduler) Status() []AccountStatus {
 
 func (m *mockScheduler) IsRunning() bool {
 	return m.running
+}
+
+func (m *mockScheduler) JobStatus() []JobStatus {
+	return m.jobStatuses
+}
+
+func (m *mockScheduler) IsJobScheduled(name string) bool {
+	return m.scheduledJobs[name]
+}
+
+func (m *mockScheduler) TriggerJob(name string) error {
+	m.triggeredJobs = append(m.triggeredJobs, name)
+	if m.triggerJobFn != nil {
+		return m.triggerJobFn(name)
+	}
+	return nil
+}
+
+func (m *mockScheduler) StartJob(name string) error {
+	m.startedJobs = append(m.startedJobs, name)
+	if m.startJobFn != nil {
+		return m.startJobFn(name)
+	}
+	return nil
 }
 
 // mockStore implements MessageStore for tests.
@@ -250,13 +280,16 @@ type mockStore struct {
 	// Call counts so tests can assert that bulk hydration paths use
 	// GetMessagesSummariesByIDs (one round-trip) instead of looping
 	// GetMessage (per-hit N+1).
-	getMessageCalls          atomic.Int32
-	getSummariesByIDsCalls   atomic.Int32
-	getSummariesByIDsLastIDs []int64
-	searchMessagesCalls      atomic.Int32
-	searchMessagesQueryCalls atomic.Int32
-	searchMessagesQueryLast  *search.Query
-	needsFTSBackfillCalls    atomic.Int32
+	getMessageCalls                atomic.Int32
+	getSummariesByIDsCalls         atomic.Int32
+	getSummariesByIDsLastIDs       []int64
+	searchMessagesCalls            atomic.Int32
+	searchMessagesQueryCalls       atomic.Int32
+	searchMessagesQueryLast        *search.Query
+	searchMessagesQueryFunc        func(*search.Query, int, int) ([]APIMessage, int64, error)
+	searchMessagesQueryLimits      []int
+	searchMessagesQueryTransferred int
+	needsFTSBackfillCalls          atomic.Int32
 
 	sourcesByLookup    map[string][]*store.Source
 	sourcesByLookupErr error
@@ -339,6 +372,7 @@ func (m *mockStore) SearchMessagesQueryContext(ctx context.Context, q *search.Qu
 
 func (m *mockStore) SearchMessagesQuery(q *search.Query, offset, limit int) ([]APIMessage, int64, error) {
 	m.searchMessagesQueryCalls.Add(1)
+	m.searchMessagesQueryLimits = append(m.searchMessagesQueryLimits, limit)
 	if q != nil {
 		cp := *q
 		cp.AccountIDs = append([]int64(nil), q.AccountIDs...)
@@ -347,6 +381,12 @@ func (m *mockStore) SearchMessagesQuery(q *search.Query, offset, limit int) ([]A
 	} else {
 		m.searchMessagesQueryLast = nil
 	}
+	if m.searchMessagesQueryFunc != nil {
+		messages, total, err := m.searchMessagesQueryFunc(q, offset, limit)
+		m.searchMessagesQueryTransferred += len(messages)
+		return messages, total, err
+	}
+	m.searchMessagesQueryTransferred += len(m.messages)
 	return m.messages, m.total, nil
 }
 
