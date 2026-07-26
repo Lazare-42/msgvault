@@ -1,0 +1,26 @@
+name: Docker
+
+# The PR dispatcher always calls the main-pinned workflow. That workflow
+# independently routes same-repository Linux jobs to the managed public fleet
+# and fork jobs to GitHub-hosted runners.
+on:
+  pull_request:
+    paths:
+      - 'Dockerfile'
+      - '.dockerignore'
+      - '.github/workflows/docker.yml'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Makefile'
+      - 'api/openapi.yaml'
+      - 'pkg/client/openapi.yaml'
+      - 'scripts/generate-web-client.mjs'
+      - 'web/**'
+      - 'internal/web/**'
+      - '**/*.go'
+      - '.github/workflows/docker-pr.yml'
+permissions: read-all
+
+jobs:
+  run:
+    uses: kenn-io/msgvault/.github/workflows/docker.yml@main
