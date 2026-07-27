@@ -4,14 +4,23 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
 	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
+	"go.kenn.io/msgvault/internal/apiprotocol"
 	apiclient "go.kenn.io/msgvault/pkg/client"
 	"go.kenn.io/msgvault/pkg/client/generated"
+)
+
+type RequestMode uint8
+
+const (
+	RequestModeBounded RequestMode = iota
+	RequestModeCLI
 )
 
 // Config holds configuration for creating a daemon HTTP client.
@@ -21,6 +30,8 @@ type Config struct {
 	AllowInsecure bool
 	Timeout       time.Duration
 	HTTPClient    *http.Client
+	Context       context.Context
+	RequestMode   RequestMode
 }
 
 // Client provides HTTP access to a local or configured remote msgvault daemon.
@@ -30,6 +41,8 @@ type Client struct {
 	httpClient  *http.Client
 	typedClient *apiclient.Client
 	busyNotify  func(message string)
+	rootContext context.Context
+	requestMode RequestMode
 }
 
 // SetBusyNotifier registers a callback invoked when the daemon reports that
@@ -99,8 +112,14 @@ func New(cfg Config) (*Client, error) {
 	}
 
 	timeout := cfg.Timeout
-	if timeout == 0 {
+	if cfg.RequestMode == RequestModeCLI {
+		timeout = 0
+	} else if timeout == 0 {
 		timeout = 30 * time.Second
+	}
+	rootContext := cfg.Context
+	if rootContext == nil {
+		rootContext = context.Background()
 	}
 
 	httpClient := &http.Client{}
@@ -111,9 +130,11 @@ func New(cfg Config) (*Client, error) {
 	httpClient.Timeout = timeout
 
 	c := &Client{
-		baseURL:    strings.TrimSuffix(cfg.URL, "/"),
-		apiKey:     cfg.APIKey,
-		httpClient: httpClient,
+		baseURL:     strings.TrimSuffix(cfg.URL, "/"),
+		apiKey:      cfg.APIKey,
+		httpClient:  httpClient,
+		rootContext: rootContext,
+		requestMode: cfg.RequestMode,
 	}
 	if _, err := c.GeneratedClient(); err != nil {
 		return nil, err
@@ -142,6 +163,13 @@ func (c *Client) Timeout() time.Duration {
 	return c.httpClient.Timeout
 }
 
+func (c *Client) requestContext() context.Context {
+	if c == nil || c.rootContext == nil {
+		return context.Background()
+	}
+	return c.rootContext
+}
+
 // GeneratedClient returns the typed OpenAPI client used for daemon requests.
 func (c *Client) GeneratedClient() (*apiclient.Client, error) {
 	if c.typedClient != nil {
@@ -149,8 +177,11 @@ func (c *Client) GeneratedClient() (*apiclient.Client, error) {
 	}
 	apiClient, err := apiclient.New(
 		c.baseURL,
-		runtime.WithHTTPClient(httpDoer{client: c.httpClient}),
-		runtime.WithRequestEditorFn(requestEditor(c.apiKey)),
+		runtime.WithHTTPClient(httpDoer{
+			client:      c.httpClient,
+			rootContext: c.requestContext(),
+		}),
+		runtime.WithRequestEditorFn(requestEditor(c.apiKey, c.requestMode)),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create generated API client: %w", err)
@@ -210,7 +241,7 @@ func (c *Client) doGeneratedRequestWithHTTPClient(
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
-	resp, err := httpClient.Do(req)
+	resp, err := doRequestWithRootContext(c.requestContext(), httpClient, req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
@@ -227,7 +258,8 @@ func httpClientWithoutTimeout(client *http.Client) *http.Client {
 }
 
 type httpDoer struct {
-	client *http.Client
+	client      *http.Client
+	rootContext context.Context
 }
 
 func (d httpDoer) Do(ctx context.Context, req *http.Request) (*http.Response, error) {
@@ -238,15 +270,69 @@ func (d httpDoer) Do(ctx context.Context, req *http.Request) (*http.Response, er
 	if ctx != nil {
 		req = req.WithContext(ctx)
 	}
+	return doRequestWithRootContext(d.rootContext, client, req)
+}
+
+func doRequestWithRootContext(
+	rootContext context.Context,
+	client *http.Client,
+	req *http.Request,
+) (*http.Response, error) {
+	requestContext := req.Context()
+	switch {
+	case rootContext == nil || rootContext.Done() == nil:
+		// The per-call context remains the only cancellation source.
+	case requestContext.Done() == nil:
+		req = req.WithContext(rootContext)
+	default:
+		mergedContext, cancel := context.WithCancelCause(requestContext)
+		stopRootCancellation := context.AfterFunc(rootContext, func() {
+			cancel(context.Cause(rootContext))
+		})
+		req = req.WithContext(mergedContext)
+
+		// #nosec G704 -- daemonclient intentionally sends requests to the
+		// caller-resolved msgvault daemon URL after New validates the scheme.
+		resp, err := client.Do(req)
+		if err != nil {
+			stopRootCancellation()
+			cancel(nil)
+			return nil, err
+		}
+		resp.Body = &cancelOnCloseBody{
+			ReadCloser:           resp.Body,
+			stopRootCancellation: stopRootCancellation,
+			cancel:               cancel,
+		}
+		return resp, nil
+	}
+
 	// #nosec G704 -- daemonclient intentionally sends requests to the
 	// caller-resolved msgvault daemon URL after New validates the scheme.
 	return client.Do(req)
 }
 
-func requestEditor(apiKey string) apiclient.RequestEditorFn {
+type cancelOnCloseBody struct {
+	io.ReadCloser
+
+	stopRootCancellation func() bool
+	cancel               context.CancelCauseFunc
+}
+
+func (b *cancelOnCloseBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.stopRootCancellation()
+	b.cancel(nil)
+	return err
+}
+
+func requestEditor(apiKey string, mode RequestMode) apiclient.RequestEditorFn {
 	return func(_ context.Context, req *http.Request) error {
 		if apiKey != "" {
 			req.Header.Set("X-Api-Key", apiKey)
+		}
+		if mode == RequestModeCLI {
+			req.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
 		}
 		req.Header.Set("Accept", "application/json")
 		return nil

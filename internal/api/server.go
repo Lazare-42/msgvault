@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.kenn.io/msgvault/internal/apiprotocol"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/scheduler"
@@ -168,6 +169,10 @@ type Server struct {
 	scheduler      SyncScheduler
 	logger         *slog.Logger
 	requestTimeout time.Duration
+	// readTimeout is the ordinary connection read ceiling used by http.Server.
+	// Tests shrink it to exercise protective slow-body handling without waiting
+	// for the production timeout.
+	readTimeout time.Duration
 	// queryTimeout caps POST /api/v1/query. Defaults to QueryEndpointTimeout;
 	// tests override it to exercise the timeout path without a real slow query.
 	queryTimeout time.Duration
@@ -285,6 +290,7 @@ type SQLQueryRunner func(ctx context.Context, sql string) (*query.QueryResult, e
 
 const (
 	DaemonLongRequestTimeout = 30 * time.Minute
+	daemonReadTimeout        = 15 * time.Second
 	// QueryEndpointTimeout is the hard ceiling for POST /api/v1/query. The raw
 	// SQL endpoint is the F2 runaway culprit: a single bad SELECT over the full
 	// archive pegged every core for minutes. 120s is generous for legitimate
@@ -390,6 +396,7 @@ func NewServerWithOptions(opts ServerOptions) *Server {
 		scheduler:            opts.Scheduler,
 		logger:               opts.Logger,
 		requestTimeout:       timeout,
+		readTimeout:          daemonReadTimeout,
 		queryTimeout:         QueryEndpointTimeout,
 		inProgressThreshold:  inProgressLogThreshold,
 		inProgressInterval:   inProgressLogInterval,
@@ -556,7 +563,7 @@ func (s *Server) StartOnListener(ln net.Listener) error {
 	s.server = &http.Server{
 		Addr:         ln.Addr().String(),
 		Handler:      s.router,
-		ReadTimeout:  15 * time.Second,
+		ReadTimeout:  s.readTimeout,
 		WriteTimeout: writeTimeout,
 		IdleTimeout:  120 * time.Second,
 	}
@@ -585,24 +592,94 @@ func (s *Server) Router() http.Handler {
 	return s.router
 }
 
+func (s *Server) requestUsesCLITimeoutPolicy(r *http.Request) bool {
+	if r.Header.Get(apiprotocol.ClientClassHeader) != apiprotocol.ClientClassCLI {
+		return false
+	}
+	return s.requestAuthentication(r).trustedForCLIDuration
+}
+
+func serveWithoutRequestDeadlines(
+	w http.ResponseWriter,
+	r *http.Request,
+	next http.Handler,
+) {
+	controller := http.NewResponseController(w)
+	_ = controller.SetReadDeadline(time.Time{})
+	_ = controller.SetWriteDeadline(time.Time{})
+	next.ServeHTTP(w, r)
+}
+
+func serveWithoutWriteDeadline(
+	w http.ResponseWriter,
+	r *http.Request,
+	next http.Handler,
+) {
+	controller := http.NewResponseController(w)
+	_ = controller.SetWriteDeadline(time.Time{})
+	next.ServeHTTP(w, r)
+}
+
+func serveWithProtectiveRequestDeadline(
+	w http.ResponseWriter,
+	r *http.Request,
+	next http.Handler,
+) {
+	ctx, cancel := context.WithTimeout(r.Context(), DaemonLongRequestTimeout)
+	defer cancel()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		controller := http.NewResponseController(w)
+		_ = controller.SetReadDeadline(deadline)
+	}
+	next.ServeHTTP(w, r.WithContext(ctx))
+}
+
 func (s *Server) timeoutMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.requestUsesCLITimeoutPolicy(r) {
+			if cliRequestNeedsProtectiveCeiling(r) {
+				serveWithProtectiveRequestDeadline(w, r, next)
+				return
+			}
+			serveWithoutRequestDeadlines(w, r, next)
+			return
+		}
+
 		timeout, bounded := s.requestTimeoutForPath(r.URL.Path)
 		if !bounded {
-			// Long-running request (multi-hour sync, import, embeddings
-			// build): the server's absolute WriteTimeout would sever the
-			// response at the 30-minute mark regardless of activity, so
-			// clear the connection's write deadline for this request. A
-			// disconnected client still ends the work via r.Context()
-			// cancellation. Best-effort: test recorders lack deadlines.
-			_ = http.NewResponseController(w).SetWriteDeadline(time.Time{})
-			next.ServeHTTP(w, r)
+			serveWithoutWriteDeadline(w, r, next)
 			return
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), timeout)
 		defer cancel()
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
+}
+
+// cliRequestNeedsProtectiveCeiling identifies marked CLI routes whose
+// production work still includes a filesystem, planner, or synchronous cache
+// phase that cannot be interrupted at every point. They get the generous
+// daemon ceiling until end-to-end cancellation is proven for the whole route.
+func cliRequestNeedsProtectiveCeiling(r *http.Request) bool {
+	switch r.Method + " " + r.URL.Path {
+	case "GET /api/v1/cli/cache-stats",
+		"POST /api/v1/cli/build-cache",
+		"POST /api/v1/cli/add-calendar/plan",
+		"POST /api/v1/cli/delete-staged/plan",
+		"POST /api/v1/cli/deletion-manifests",
+		"POST /api/v1/cli/embeddings/plan",
+		"GET /api/v1/cli/message",
+		"GET /api/v1/cli/message/raw",
+		"GET /api/v1/cli/attachment",
+		"GET /api/v1/cli/search",
+		"POST /api/v1/cli/deduplicate/plan",
+		"POST /api/v1/cli/identities",
+		"DELETE /api/v1/cli/identities":
+		return true
+	default:
+		return false
+	}
 }
 
 // requestTimeoutForPath returns the context deadline to impose on a request

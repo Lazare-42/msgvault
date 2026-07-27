@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/msgvault/internal/apiprotocol"
 	"go.kenn.io/msgvault/pkg/client/generated"
 )
 
@@ -62,6 +64,45 @@ func TestNewDefaultTimeout(t *testing.T) {
 	c, err := New(Config{URL: "https://nas:8080", APIKey: "key"})
 	require.NoError(t, err, "New")
 	assert.Equal(t, 30*time.Second, c.Timeout(), "timeout")
+}
+
+func TestNewCLIModeDisablesWholeRequestTimeoutAndPreservesTransport(t *testing.T) {
+	assert := assert.New(t)
+	transport := &http.Transport{
+		DialContext:         (&net.Dialer{Timeout: 7 * time.Second}).DialContext,
+		TLSHandshakeTimeout: 11 * time.Second,
+	}
+	base := &http.Client{Transport: transport, Timeout: 45 * time.Second}
+
+	c, err := New(Config{
+		URL:         "https://nas.example:8443",
+		HTTPClient:  base,
+		RequestMode: RequestModeCLI,
+	})
+	require.NoError(t, err, "New")
+
+	assert.Zero(c.Timeout(), "CLI operations are governed by their context")
+	assert.Same(transport, c.httpClient.Transport, "transport-level bounds are retained")
+	assert.Equal(11*time.Second, transport.TLSHandshakeTimeout)
+	assert.Equal(45*time.Second, base.Timeout, "caller-owned client is not mutated")
+}
+
+func TestCLIModeGeneratedRequestCarriesClassAndAPIKey(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, apiprotocol.ClientClassCLI, r.Header.Get(apiprotocol.ClientClassHeader))
+		assert.Equal(t, "secret-key", r.Header.Get("X-Api-Key"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"columns":["n"],"rows":[[1]],"row_count":1}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	c, err := New(Config{
+		URL: srv.URL, APIKey: "secret-key", AllowInsecure: true,
+		RequestMode: RequestModeCLI,
+	})
+	require.NoError(t, err, "New")
+	_, err = c.RunSQLQuery(context.Background(), "SELECT 1")
+	require.NoError(t, err, "RunSQLQuery")
 }
 
 func TestGeneratedClientUsesTransportAndAuth(t *testing.T) {
@@ -290,11 +331,145 @@ func TestRebuildCLIFTSRetriesWhileOperationInProgress(t *testing.T) {
 	assert.Equal(int64(3), hits.Load(), "two busy responses then success")
 }
 
+func TestGeneratedNonStreamingBusyRetryReturnsRootContextCancellation(t *testing.T) {
+	require := require.New(t)
+	oldDelay := operationBusyRetryDelay
+	operationBusyRetryDelay = time.Second
+	t.Cleanup(func() { operationBusyRetryDelay = oldDelay })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/stats", r.URL.Path, "path")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, err := w.Write([]byte(
+			`{"error":"operation_in_progress","message":"a scheduled sync has been running for 5m"}`,
+		))
+		assert.NoError(t, err, "write busy response")
+	}))
+	t.Cleanup(srv.Close)
+
+	rootCtx, cancel := context.WithCancel(context.Background())
+	c, err := New(Config{
+		URL:           srv.URL,
+		APIKey:        "key",
+		AllowInsecure: true,
+		Context:       rootCtx,
+	})
+	require.NoError(err, "New")
+
+	waiting := make(chan struct{})
+	c.SetBusyNotifier(func(string) { close(waiting) })
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.GetStats()
+		done <- err
+	}()
+
+	select {
+	case <-waiting:
+	case <-time.After(time.Second):
+		require.FailNow("generated response did not enter busy retry wait")
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		require.ErrorIs(err, context.Canceled)
+	case <-time.After(time.Second):
+		require.FailNow("generated response did not return after root context cancellation")
+	}
+}
+
+func TestRawAndStreamingRequestsUseClientRootContext(t *testing.T) {
+	tests := []struct {
+		name    string
+		request func(*Client) (*http.Response, error)
+	}{
+		{
+			name: "raw",
+			request: func(c *Client) (*http.Response, error) {
+				return c.DoGeneratedRequestWithContext(
+					context.Background(),
+					http.MethodGet,
+					"/api/v1/stats",
+					&generated.RunCLIRequestOptions{},
+				)
+			},
+		},
+		{
+			name: "streaming",
+			request: func(c *Client) (*http.Response, error) {
+				return c.DoGeneratedStreamingRequestWithContext(
+					context.Background(),
+					http.MethodPost,
+					"/api/v1/cli/run",
+					&generated.RunCLIRequestOptions{},
+				)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			requestStarted := make(chan struct{})
+			release := make(chan struct{})
+			srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+				close(requestStarted)
+				<-release
+			}))
+			t.Cleanup(srv.Close)
+			t.Cleanup(func() {
+				select {
+				case <-release:
+				default:
+					close(release)
+				}
+			})
+
+			rootCtx, cancelRoot := context.WithCancel(context.Background())
+			t.Cleanup(cancelRoot)
+			c, err := New(Config{
+				URL:           srv.URL,
+				AllowInsecure: true,
+				HTTPClient:    srv.Client(),
+				Context:       rootCtx,
+				RequestMode:   RequestModeCLI,
+			})
+			require.NoError(err, "New")
+
+			done := make(chan error, 1)
+			go func() {
+				resp, err := tt.request(c)
+				if resp != nil {
+					_ = resp.Body.Close()
+				}
+				done <- err
+			}()
+
+			select {
+			case <-requestStarted:
+			case <-time.After(time.Second):
+				require.FailNow("request did not start")
+			}
+			cancelRoot()
+
+			select {
+			case err = <-done:
+			case <-time.After(time.Second):
+				close(release)
+				err = <-done
+			}
+			require.ErrorIs(err, context.Canceled)
+		})
+	}
+}
+
 func TestRunCLICommandStopsRetryingWhenContextCancelled(t *testing.T) {
 	require := require.New(t)
 
 	oldDelay := operationBusyRetryDelay
-	operationBusyRetryDelay = 50 * time.Millisecond
+	operationBusyRetryDelay = time.Second
 	t.Cleanup(func() { operationBusyRetryDelay = oldDelay })
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -308,10 +483,24 @@ func TestRunCLICommandStopsRetryingWhenContextCancelled(t *testing.T) {
 	require.NoError(err, "New")
 
 	ctx, cancel := context.WithCancel(context.Background())
+	waiting := make(chan struct{})
+	c.SetBusyNotifier(func(string) { close(waiting) })
+	done := make(chan error, 1)
 	go func() {
-		time.Sleep(10 * time.Millisecond)
-		cancel()
+		done <- c.RunCLICommand(ctx, CLIRunRequest{Args: []string{"sync"}}, nil)
 	}()
-	err = c.RunCLICommand(ctx, CLIRunRequest{Args: []string{"sync"}}, nil)
-	require.Error(err, "cancelled retry loop returns an error")
+
+	select {
+	case <-waiting:
+	case <-time.After(time.Second):
+		require.FailNow("streaming request did not enter busy retry wait")
+	}
+	cancel()
+
+	select {
+	case err = <-done:
+		require.ErrorIs(err, context.Canceled)
+	case <-time.After(time.Second):
+		require.FailNow("streaming busy retry did not return after context cancellation")
+	}
 }

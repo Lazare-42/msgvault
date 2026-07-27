@@ -475,7 +475,7 @@ func runBackupCreateLocal(cmd *cobra.Command) error {
 	}
 	defer func() { _ = blobs.Close() }()
 
-	freezer, closeFreezer, err := newBackupFreezer()
+	freezer, closeFreezer, err := newBackupFreezer(cmd.Context())
 	if err != nil {
 		return err
 	}
@@ -533,13 +533,16 @@ func runBackupCreateLocal(cmd *cobra.Command) error {
 // freezeViaDaemon coordinator over it. backup create must never scan a
 // live-daemon-owned SQLite file unfrozen, so a daemon that cannot be
 // resolved here is a hard failure rather than a silent unfrozen fallback.
-func newBackupFreezer() (backup.FreezeCoordinator, func(), error) {
+func newBackupFreezer(ctx context.Context) (backup.FreezeCoordinator, func(), error) {
 	rt := findDaemonRuntime(cfg.Data.DataDir)
 	if rt == nil {
 		return nil, func() {}, errors.New(
 			"backup create: no running msgvault daemon found; refusing to back up an unfrozen archive")
 	}
-	client, err := daemonclient.New(daemonclient.Config{
+	// Begin and End deliberately use separate per-call contexts. Keep command
+	// values on the client root without letting command cancellation poison the
+	// cleanup request that releases an already-open freeze window.
+	client, err := newDaemonCLIClient(context.WithoutCancel(ctx), daemonclient.Config{
 		URL:           urlFromDaemonRuntime(rt),
 		APIKey:        cfg.Server.APIKey,
 		AllowInsecure: true,

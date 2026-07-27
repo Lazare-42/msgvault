@@ -107,7 +107,7 @@ type Dialect interface {
 	// means the index is visibly behind (a backfill is certainly needed);
 	// false is not authoritative — on SQLite the MAX(rowid)-vs-MAX(id)
 	// comparison misses interior holes that only the full anti-join finds.
-	FTSNeedsBackfillQuick(db *sql.DB) bool
+	FTSNeedsBackfillQuick(ctx context.Context, db *sql.DB) bool
 
 	// FTSClearSQL returns the SQL to clear all FTS data before a full backfill.
 	FTSClearSQL() string
@@ -129,7 +129,7 @@ type Dialect interface {
 	// PG path includes a full-table tsvector clear (same cost as FTSClearSQL)
 	// plus a GIN rebuild over a populated table, both of which can exceed the
 	// pool-wide 30s timeout on a large archive (finding S1).
-	FTSRebuildSchema(q querier) error
+	FTSRebuildSchema(ctx context.Context, q contextQuerier) error
 
 	// EnsureFTSIndex idempotently creates any FTS index that must be created
 	// AFTER LegacyColumnMigrations have added the FTS column. SQLite is a
@@ -168,11 +168,11 @@ type Dialect interface {
 	// already present in schema.sql / schema_pg.sql.
 	LegacyColumnMigrations() []ColumnMigration
 
-	// DatabaseSize returns the on-disk or logical size of the database in
-	// bytes. For SQLite: file size at dbPath. For PostgreSQL: queries
-	// pg_database_size(). Returns 0 if the size cannot be determined;
-	// an error only for genuine failures (not missing files).
-	DatabaseSize(db *sql.DB, dbPath string) (int64, error)
+	// DatabaseSize returns the logical allocated size of the database in
+	// bytes. SQLite multiplies the main database's page_count by page_size
+	// (excluding WAL/SHM sidecar overhead); PostgreSQL queries
+	// pg_database_size(). In-memory SQLite databases report 0.
+	DatabaseSize(ctx context.Context, db *sql.DB, dbPath string) (int64, error)
 
 	// Connection lifecycle
 

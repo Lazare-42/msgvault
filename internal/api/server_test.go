@@ -1,11 +1,14 @@
 package api
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -18,12 +21,15 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/kit/daemon"
+	"go.kenn.io/msgvault/internal/apiprotocol"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/store"
 )
+
+const cliTimeoutTestAPIKey = "cli-timeout-test-key"
 
 // syncBuffer is a concurrency-safe buffer for capturing slog output written
 // from the logger goroutine while the test goroutine reads it.
@@ -274,8 +280,12 @@ type mockStore struct {
 
 	// Error injection for the context-aware read paths, used to verify
 	// handlers map context deadline/cancellation to a structured 503.
-	statsErr     error
-	summariesErr error
+	statsErr              error
+	getStatsFunc          func()
+	getStatsContextFunc   func(context.Context) error
+	getScopedStatsFunc    func([]int64)
+	getScopedStatsCtxFunc func(context.Context, []int64) error
+	summariesErr          error
 
 	// Call counts so tests can assert that bulk hydration paths use
 	// GetMessagesSummariesByIDs (one round-trip) instead of looping
@@ -297,6 +307,10 @@ type mockStore struct {
 }
 
 func (m *mockStore) GetStats() (*StoreStats, error) {
+	if m.getStatsFunc != nil {
+		m.getStatsFunc()
+		return &StoreStats{}, nil
+	}
 	if m.stats == nil {
 		return &StoreStats{}, nil
 	}
@@ -335,7 +349,10 @@ func (m *mockStore) GetMessagesSummariesByIDs(ids []int64) ([]APIMessage, error)
 
 // The Context variants make mockStore satisfy CtxMessageStore, so handler
 // tests exercise the same context-aware read path used in production.
-func (m *mockStore) GetStatsContext(_ context.Context) (*StoreStats, error) {
+func (m *mockStore) GetStatsContext(ctx context.Context) (*StoreStats, error) {
+	if m.getStatsContextFunc != nil {
+		return nil, m.getStatsContextFunc(ctx)
+	}
 	if m.statsErr != nil {
 		return nil, m.statsErr
 	}
@@ -390,11 +407,25 @@ func (m *mockStore) SearchMessagesQuery(q *search.Query, offset, limit int) ([]A
 	return m.messages, m.total, nil
 }
 
-func (m *mockStore) GetStatsForScope([]int64) (*store.Stats, error) {
+func (m *mockStore) GetStatsForScope(sourceIDs []int64) (*store.Stats, error) {
+	if m.getScopedStatsFunc != nil {
+		m.getScopedStatsFunc(sourceIDs)
+		return &store.Stats{}, nil
+	}
 	if m.stats == nil {
 		return &store.Stats{}, nil
 	}
 	return m.stats, nil
+}
+
+func (m *mockStore) GetStatsForScopeContext(
+	ctx context.Context,
+	sourceIDs []int64,
+) (*store.Stats, error) {
+	if m.getScopedStatsCtxFunc != nil {
+		return nil, m.getScopedStatsCtxFunc(ctx, sourceIDs)
+	}
+	return m.GetStatsForScope(sourceIDs)
 }
 
 func (m *mockStore) GetSourcesByIdentifierOrDisplayName(input string) ([]*store.Source, error) {
@@ -976,22 +1007,26 @@ func TestCORSDisabledByDefault(t *testing.T) {
 		"expected no CORS header when no origins configured")
 }
 
-// deadlineClearingRecorder records SetWriteDeadline calls so tests can verify
-// the timeout middleware clears the absolute write deadline for long requests.
+// deadlineClearingRecorder records deadline calls so tests can verify the
+// timeout middleware clears absolute connection deadlines for long requests.
 type deadlineClearingRecorder struct {
 	*httptest.ResponseRecorder
 
-	deadlines []time.Time
+	readDeadlines  []time.Time
+	writeDeadlines []time.Time
 }
 
-func (w *deadlineClearingRecorder) SetWriteDeadline(t time.Time) error {
-	w.deadlines = append(w.deadlines, t)
+func (w *deadlineClearingRecorder) SetReadDeadline(deadline time.Time) error {
+	w.readDeadlines = append(w.readDeadlines, deadline)
 	return nil
 }
 
-func TestTimeoutMiddlewareClearsWriteDeadlineForLongRequests(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
+func (w *deadlineClearingRecorder) SetWriteDeadline(deadline time.Time) error {
+	w.writeDeadlines = append(w.writeDeadlines, deadline)
+	return nil
+}
+
+func TestTimeoutMiddlewareDeadlinePolicy(t *testing.T) {
 	srv := NewServerWithOptions(ServerOptions{
 		Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
 		Logger: testLogger(),
@@ -1001,12 +1036,382 @@ func TestTimeoutMiddlewareClearsWriteDeadlineForLongRequests(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	}))
 
-	long := &deadlineClearingRecorder{ResponseRecorder: httptest.NewRecorder()}
-	handler.ServeHTTP(long, httptest.NewRequest(http.MethodPost, "/api/v1/cli/sync-full", nil))
-	require.Len(long.deadlines, 1, "long request clears the write deadline")
-	assert.True(long.deadlines[0].IsZero(), "deadline cleared, not extended")
+	longPath := httptest.NewRequest(http.MethodPost, "/api/v1/cli/sync-full", nil)
+	marked := httptest.NewRequest(http.MethodGet, "/api/v1/cli/stats", nil)
+	marked.RemoteAddr = "127.0.0.1:4242"
+	marked.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
+	markedDeleteDeduped := httptest.NewRequest(
+		http.MethodPost,
+		"/api/v1/cli/delete-deduped",
+		nil,
+	)
+	markedDeleteDeduped.RemoteAddr = "127.0.0.1:4242"
+	markedDeleteDeduped.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
+	bounded := httptest.NewRequest(http.MethodGet, "/api/v1/cli/stats", nil)
 
-	bounded := &deadlineClearingRecorder{ResponseRecorder: httptest.NewRecorder()}
-	handler.ServeHTTP(bounded, httptest.NewRequest(http.MethodGet, "/api/v1/cli/stats", nil))
-	assert.Empty(bounded.deadlines, "bounded request keeps the server write deadline")
+	tests := []struct {
+		name           string
+		request        *http.Request
+		wantReadClear  bool
+		wantWriteClear bool
+	}{
+		{name: "unmarked long path", request: longPath, wantWriteClear: true},
+		{name: "marked request", request: marked, wantReadClear: true, wantWriteClear: true},
+		{
+			name:           "marked atomic dedup deletion",
+			request:        markedDeleteDeduped,
+			wantReadClear:  true,
+			wantWriteClear: true,
+		},
+		{name: "bounded request", request: bounded},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			recorder := &deadlineClearingRecorder{ResponseRecorder: httptest.NewRecorder()}
+			handler.ServeHTTP(recorder, tt.request)
+			if tt.wantReadClear {
+				require.Len(recorder.readDeadlines, 1, "read deadline changes")
+				assert.True(recorder.readDeadlines[0].IsZero(), "read deadline cleared, not extended")
+			} else {
+				assert.Empty(recorder.readDeadlines, "request keeps the server read deadline")
+			}
+			if tt.wantWriteClear {
+				require.Len(recorder.writeDeadlines, 1, "write deadline changes")
+				assert.True(recorder.writeDeadlines[0].IsZero(), "write deadline cleared, not extended")
+			} else {
+				assert.Empty(recorder.writeDeadlines, "request keeps the server write deadline")
+			}
+		})
+	}
+}
+
+func TestCLIRequestDurationPolicy(t *testing.T) {
+	tests := []struct {
+		name        string
+		apiKey      string
+		bindAddr    string
+		allowUnsafe bool
+		configure   func(*Server, *http.Request)
+		wantTimeout bool
+	}{
+		{
+			name: "keyless loopback CLI",
+			configure: func(_ *Server, req *http.Request) {
+				req.RemoteAddr = "127.0.0.1:4242"
+				req.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
+			},
+		},
+		{
+			name:        "keyless remote CLI remains bounded",
+			bindAddr:    "0.0.0.0",
+			allowUnsafe: true,
+			wantTimeout: true,
+			configure: func(srv *Server, req *http.Request) {
+				req.RemoteAddr = "198.51.100.23:4242"
+				req.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
+				assert.True(t, srv.apiRequestAuthorized(req), "allow-insecure keyless remote request stays authorized")
+			},
+		},
+		{
+			name:        "forwarded loopback cannot spoof keyless remote CLI",
+			bindAddr:    "0.0.0.0",
+			allowUnsafe: true,
+			wantTimeout: true,
+			configure: func(srv *Server, req *http.Request) {
+				req.RemoteAddr = "198.51.100.23:4242"
+				req.Header.Set("Forwarded", "for=127.0.0.1")
+				req.Header.Set("X-Forwarded-For", "127.0.0.1")
+				req.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
+				assert.True(t, srv.apiRequestAuthorized(req), "allow-insecure keyless remote request stays authorized")
+			},
+		},
+		{
+			name:   "API key CLI",
+			apiKey: cliTimeoutTestAPIKey,
+			configure: func(_ *Server, req *http.Request) {
+				req.RemoteAddr = "198.51.100.23:4242"
+				req.Header.Set("X-Api-Key", cliTimeoutTestAPIKey)
+				req.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
+			},
+		},
+		{
+			name:        "unmarked API request",
+			wantTimeout: true,
+		},
+		{
+			name:        "browser session cannot opt in",
+			apiKey:      cliTimeoutTestAPIKey,
+			wantTimeout: true,
+			configure: func(srv *Server, req *http.Request) {
+				id, _, err := srv.sessions.create()
+				require.NoError(t, err, "create session")
+				req.AddCookie(&http.Cookie{
+					Name:     sessionCookieName,
+					Value:    id,
+					Secure:   true,
+					HttpOnly: true,
+					SameSite: http.SameSiteStrictMode,
+				})
+				req.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := NewServerWithOptions(ServerOptions{
+				Config: &config.Config{Server: config.ServerConfig{
+					APIPort:       8080,
+					APIKey:        tt.apiKey,
+					BindAddr:      tt.bindAddr,
+					AllowInsecure: tt.allowUnsafe,
+				}},
+				Logger:         testLogger(),
+				RequestTimeout: 5 * time.Millisecond,
+			})
+			t.Cleanup(func() {
+				require.NoError(t, srv.Shutdown(context.Background()))
+			})
+
+			handlerResult := make(chan error, 1)
+			handler := srv.timeoutMiddleware(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				select {
+				case <-time.After(40 * time.Millisecond):
+					handlerResult <- nil
+				case <-r.Context().Done():
+					handlerResult <- r.Context().Err()
+				}
+			}))
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/cli/stats", nil)
+			if tt.configure != nil {
+				tt.configure(srv, req)
+			}
+
+			handler.ServeHTTP(httptest.NewRecorder(), req)
+			err := <-handlerResult
+			if tt.wantTimeout {
+				assert.ErrorIs(t, err, context.DeadlineExceeded)
+			} else {
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestTimeoutMiddlewareMarkedRequestPreservesCallerCancellation(t *testing.T) {
+	require := require.New(t)
+	srv := NewServerWithOptions(ServerOptions{
+		Config:         &config.Config{Server: config.ServerConfig{APIPort: 8080}},
+		Logger:         testLogger(),
+		RequestTimeout: 5 * time.Millisecond,
+	})
+
+	started := make(chan struct{})
+	handlerResult := make(chan error, 1)
+	handler := srv.timeoutMiddleware(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+		handlerResult <- r.Context().Err()
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/cli/stats", nil).WithContext(ctx)
+	req.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
+	requestDone := make(chan struct{})
+	go func() {
+		handler.ServeHTTP(httptest.NewRecorder(), req)
+		close(requestDone)
+	}()
+
+	require.Eventually(func() bool {
+		select {
+		case <-started:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, time.Millisecond, "handler starts")
+	cancel()
+
+	select {
+	case err := <-handlerResult:
+		require.ErrorIs(err, context.Canceled)
+	case <-time.After(time.Second):
+		require.FailNow("handler did not observe caller cancellation")
+	}
+	select {
+	case <-requestDone:
+	case <-time.After(time.Second):
+		require.FailNow("marked request did not return after caller cancellation")
+	}
+}
+
+func TestMarkedCLIProtectiveCeilingInventory(t *testing.T) {
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Server: config.ServerConfig{
+			APIPort: 8080,
+			APIKey:  cliTimeoutTestAPIKey,
+		}},
+		Logger: testLogger(),
+	})
+
+	protectiveRoutes := []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodGet, path: "/api/v1/cli/cache-stats"},
+		{method: http.MethodPost, path: "/api/v1/cli/build-cache"},
+		{method: http.MethodPost, path: "/api/v1/cli/add-calendar/plan"},
+		{method: http.MethodPost, path: "/api/v1/cli/delete-staged/plan"},
+		{method: http.MethodPost, path: "/api/v1/cli/deletion-manifests"},
+		{method: http.MethodPost, path: "/api/v1/cli/embeddings/plan"},
+		{method: http.MethodGet, path: "/api/v1/cli/message"},
+		{method: http.MethodGet, path: "/api/v1/cli/message/raw"},
+		{method: http.MethodGet, path: "/api/v1/cli/attachment"},
+		{method: http.MethodGet, path: "/api/v1/cli/search"},
+		{method: http.MethodPost, path: "/api/v1/cli/deduplicate/plan"},
+		{method: http.MethodPost, path: "/api/v1/cli/identities"},
+		{method: http.MethodDelete, path: "/api/v1/cli/identities"},
+	}
+
+	for _, route := range protectiveRoutes {
+		name := route.method + " " + route.path
+		t.Run(name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			var deadline time.Time
+			var hasDeadline bool
+			handler := srv.timeoutMiddleware(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				deadline, hasDeadline = r.Context().Deadline()
+			}))
+			req := httptest.NewRequest(route.method, route.path, nil)
+			req.Header.Set("X-Api-Key", cliTimeoutTestAPIKey)
+			req.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
+			recorder := &deadlineClearingRecorder{ResponseRecorder: httptest.NewRecorder()}
+
+			started := time.Now()
+			handler.ServeHTTP(recorder, req)
+
+			require.True(hasDeadline, "protective route receives a context deadline")
+			remaining := time.Until(deadline)
+			assert.Greater(remaining, DaemonLongRequestTimeout-time.Second)
+			assert.LessOrEqual(remaining, DaemonLongRequestTimeout)
+			assert.False(deadline.Before(started), "protective deadline is in the future")
+			require.Len(recorder.readDeadlines, 1, "protective route extends the server read deadline")
+			readRemaining := time.Until(recorder.readDeadlines[0])
+			assert.Greater(readRemaining, DaemonLongRequestTimeout-time.Second)
+			assert.LessOrEqual(readRemaining, DaemonLongRequestTimeout)
+			assert.Empty(recorder.writeDeadlines, "protective route keeps the server write deadline")
+		})
+	}
+}
+
+func TestMarkedCLIProtectiveRouteCanReadBodyPastOrdinaryServerTimeout(t *testing.T) {
+	const ordinaryReadTimeout = 100 * time.Millisecond
+
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Server: config.ServerConfig{
+			APIPort: 8080,
+			APIKey:  cliTimeoutTestAPIKey,
+		}},
+		Logger: testLogger(),
+	})
+	srv.readTimeout = ordinaryReadTimeout
+	handlerEntered := make(chan struct{}, 1)
+	srv.router = srv.timeoutMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlerEntered <- struct{}{}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusRequestTimeout)
+			return
+		}
+		if string(body) != "ab" {
+			http.Error(w, "unexpected body", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err, "listen")
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- srv.StartOnListener(listener)
+	}()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		require.NoError(t, srv.Shutdown(ctx), "shutdown")
+		require.ErrorIs(t, <-serveErr, http.ErrServerClosed, "serve result")
+	})
+
+	slowBodyStatus := func(t *testing.T, path string, marked bool) (int, error) {
+		t.Helper()
+		conn, err := net.Dial("tcp", listener.Addr().String())
+		require.NoError(t, err, "dial server")
+		defer func() { _ = conn.Close() }()
+		require.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)), "bound test connection")
+
+		marker := ""
+		if marked {
+			marker = fmt.Sprintf("%s: %s\r\n",
+				apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
+		}
+		_, err = fmt.Fprintf(conn,
+			"POST %s HTTP/1.1\r\n"+
+				"Host: %s\r\n"+
+				"X-Api-Key: %s\r\n"+
+				"%s"+
+				"Content-Length: 2\r\n\r\n"+
+				"a",
+			path,
+			listener.Addr().String(),
+			cliTimeoutTestAPIKey,
+			marker,
+		)
+		require.NoError(t, err, "write headers and first body byte")
+
+		select {
+		case <-handlerEntered:
+		case <-time.After(2 * time.Second):
+			require.FailNow(t, "inner handler did not start")
+		}
+		time.Sleep(2 * ordinaryReadTimeout)
+		if marked {
+			_, err = conn.Write([]byte("b"))
+			require.NoError(t, err, "write delayed body byte")
+		} else {
+			// The server may close the connection as soon as the ordinary
+			// read deadline expires, so a late control write can return
+			// EPIPE/closed socket before the 408 response is read.
+			_, _ = conn.Write([]byte("b"))
+		}
+
+		resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodPost})
+		if err != nil {
+			return 0, err
+		}
+		defer func() { _ = resp.Body.Close() }()
+		return resp.StatusCode, nil
+	}
+
+	t.Run("protective route extends read deadline", func(t *testing.T) {
+		status, err := slowBodyStatus(t, "/api/v1/cli/build-cache", true)
+		require.NoError(t, err, "read marked response")
+		assert.Equal(t, http.StatusNoContent, status)
+	})
+	t.Run("unmarked route keeps ordinary read deadline", func(t *testing.T) {
+		status, err := slowBodyStatus(t, "/api/v1/cli/stats", false)
+		if err != nil {
+			// net/http may write a 408 before closing the connection, or the
+			// platform may abort the connection as soon as the read deadline
+			// expires. Either outcome proves the delayed body was bounded.
+			var netErr *net.OpError
+			require.ErrorAs(t, err, &netErr, "read deadline closes the connection")
+			return
+		}
+		assert.Equal(t, http.StatusRequestTimeout, status)
+	})
 }

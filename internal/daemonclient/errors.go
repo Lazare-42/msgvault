@@ -2,7 +2,6 @@ package daemonclient
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -160,11 +159,12 @@ func generatedResponse[R any](
 		if checkErr == nil {
 			return resp, nil
 		}
-		// context.Background keeps waiting uncancellable here; the request
-		// itself carries the caller's context, so cancellation surfaces as a
-		// non-busy error on the next attempt.
-		if waiter.wait(context.Background(), checkErr) {
+		waitCtx := c.requestContext()
+		if waiter.wait(waitCtx, checkErr) {
 			continue
+		}
+		if err := waitCtx.Err(); err != nil {
+			return zero, err
 		}
 		return zero, checkErr
 	}

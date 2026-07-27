@@ -380,17 +380,54 @@ func (s *Store) DB() *sql.DB {
 // to dst using VACUUM INTO. PostgreSQL deployments should be backed up with
 // pg_dump, pg_basebackup, or replication tooling outside msgvault.
 func (s *Store) BackupDatabase(dst string) error {
+	return s.BackupDatabaseContext(context.Background(), dst)
+}
+
+// BackupDatabaseContext is the request-aware form of BackupDatabase.
+func (s *Store) BackupDatabaseContext(ctx context.Context, dst string) (returnErr error) {
 	if s.IsPostgreSQL() {
 		return errors.New("backup-before-dedup is SQLite-only (uses VACUUM INTO); " +
 			"snapshot the PostgreSQL database with pg_dump out-of-band, " +
 			"then rerun with --no-backup",
 		)
 	}
-	if _, err := os.Stat(dst); err == nil {
+	if _, err := os.Lstat(dst); err == nil {
 		return fmt.Errorf("backup target already exists: %s", dst)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect backup target %s: %w", dst, err)
 	}
-	if _, err := s.DB().Exec("VACUUM INTO ?", dst); err != nil {
-		return fmt.Errorf("vacuum into %s: %w", dst, err)
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	tempDir, err := os.MkdirTemp(
+		filepath.Dir(dst),
+		"."+filepath.Base(dst)+".tmp-*",
+	)
+	if err != nil {
+		return fmt.Errorf("create temporary backup directory for %s: %w", dst, err)
+	}
+	defer func() {
+		if err := os.RemoveAll(tempDir); err != nil {
+			cleanupErr := fmt.Errorf("remove temporary backup directory %s: %w", tempDir, err)
+			returnErr = errors.Join(returnErr, cleanupErr)
+		}
+	}()
+
+	tempPath := filepath.Join(tempDir, "backup.db")
+	if _, err := s.DB().ExecContext(ctx, "VACUUM INTO ?", tempPath); err != nil {
+		return fmt.Errorf("vacuum into temporary backup for %s: %w", dst, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, err := os.Lstat(dst); err == nil {
+		return fmt.Errorf("backup target already exists: %s", dst)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("inspect backup target %s: %w", dst, err)
+	}
+	if err := os.Rename(tempPath, dst); err != nil {
+		return fmt.Errorf("publish backup %s: %w", dst, err)
 	}
 	return nil
 }
@@ -451,9 +488,16 @@ func (s *Store) WithExclusiveLock(ctx context.Context, fn func() error) error {
 // receives *loggedTx so every statement inside the transaction goes through
 // the dialect's Rebind automatically.
 func (s *Store) withTx(fn func(tx *loggedTx) error) error {
+	return s.withTxContext(context.Background(), fn)
+}
+
+// withTxContext is the request-aware form of withTx. Cancelling ctx aborts
+// connection acquisition and every context-aware statement in the
+// transaction.
+func (s *Store) withTxContext(ctx context.Context, fn func(tx *loggedTx) error) error {
 	start := time.Now()
 	slog.Debug("sql tx begin")
-	tx, err := s.db.Begin()
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		slog.Warn("sql tx begin failed", "error", err.Error())
 		return fmt.Errorf("begin tx: %w", err)
@@ -1028,10 +1072,16 @@ func (s *Store) NeedsFTSBackfill() bool {
 // true means a backfill is certainly needed; false may miss interior index
 // holes (SQLite) that only the full probe finds.
 func (s *Store) NeedsFTSBackfillQuick() bool {
+	return s.NeedsFTSBackfillQuickContext(context.Background())
+}
+
+// NeedsFTSBackfillQuickContext is the request-aware form of
+// NeedsFTSBackfillQuick.
+func (s *Store) NeedsFTSBackfillQuickContext(ctx context.Context) bool {
 	if !s.fts5Available {
 		return false
 	}
-	return s.dialect.FTSNeedsBackfillQuick(s.db.DB)
+	return s.dialect.FTSNeedsBackfillQuick(ctx, s.db.DB)
 }
 
 // Stats holds database statistics.
@@ -1211,9 +1261,12 @@ func (s *Store) GetStatsForScopeContext(ctx context.Context, sourceIDs []int64) 
 		}
 	}
 
-	// DatabaseSize: file size for SQLite, pg_database_size() for PostgreSQL.
-	if size, err := s.dialect.DatabaseSize(s.db.DB, s.dbPath); err == nil {
+	// DatabaseSize: logical main-database page allocation for SQLite,
+	// pg_database_size() for PostgreSQL.
+	if size, err := s.dialect.DatabaseSize(ctx, s.db.DB, s.dbPath); err == nil {
 		stats.DatabaseSize = size
+	} else if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
 	}
 
 	return stats, nil

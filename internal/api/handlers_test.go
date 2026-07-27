@@ -28,6 +28,7 @@ import (
 	"go.kenn.io/kit/daemon"
 	"go.kenn.io/kit/pack"
 	"go.kenn.io/kit/packstore"
+	"go.kenn.io/msgvault/internal/apiprotocol"
 	"go.kenn.io/msgvault/internal/attachmentstore"
 	"go.kenn.io/msgvault/internal/cacheops"
 	"go.kenn.io/msgvault/internal/circleback"
@@ -247,6 +248,109 @@ func TestHandleCLIStatsAccountLookupErrorReturnsInternal(t *testing.T) {
 	require.NoError(json.NewDecoder(w.Body).Decode(&resp), "decode error response")
 	assert.Equal("internal_error", resp.Error, "error code")
 	assert.Equal("Failed to resolve CLI scope", resp.Message, "error message")
+}
+
+func TestMarkedCLIGlobalStatsCancellationInterruptsStore(t *testing.T) {
+	testMarkedCLIStatsCancellationInterruptsStore(t, "/api/v1/cli/stats", false)
+}
+
+func TestMarkedCLIScopedStatsCancellationInterruptsStore(t *testing.T) {
+	testMarkedCLIStatsCancellationInterruptsStore(
+		t,
+		"/api/v1/cli/stats?collection=Important",
+		true,
+	)
+}
+
+func testMarkedCLIStatsCancellationInterruptsStore(t *testing.T, target string, scoped bool) {
+	t.Helper()
+
+	callStarted := make(chan struct{})
+	callReturned := make(chan struct{})
+	releaseLegacyCall := make(chan struct{})
+	handlerDone := make(chan struct{})
+
+	legacyCall := func() {
+		close(callStarted)
+		<-releaseLegacyCall
+		close(callReturned)
+	}
+	contextCall := func(ctx context.Context) error {
+		close(callStarted)
+		<-ctx.Done()
+		close(callReturned)
+		return ctx.Err()
+	}
+
+	st := &mockStore{
+		collections: map[string]*store.CollectionWithSources{
+			"Important": {
+				Collection: store.Collection{Name: "Important"},
+				SourceIDs:  []int64{7},
+			},
+		},
+	}
+	if scoped {
+		st.getScopedStatsFunc = func([]int64) {
+			legacyCall()
+		}
+		st.getScopedStatsCtxFunc = func(ctx context.Context, _ []int64) error {
+			return contextCall(ctx)
+		}
+	} else {
+		st.getStatsFunc = legacyCall
+		st.getStatsContextFunc = contextCall
+	}
+
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Server: config.ServerConfig{
+			APIPort: 8080,
+			APIKey:  cliTimeoutTestAPIKey,
+		}},
+		Store:  st,
+		Logger: testLogger(),
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest(http.MethodGet, target, nil).WithContext(ctx)
+	req.Header.Set("X-Api-Key", cliTimeoutTestAPIKey)
+	req.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
+	resp := httptest.NewRecorder()
+	go func() {
+		srv.Router().ServeHTTP(resp, req)
+		close(handlerDone)
+	}()
+	t.Cleanup(func() {
+		close(releaseLegacyCall)
+		select {
+		case <-handlerDone:
+		case <-time.After(time.Second):
+			assert.Fail(t, "CLI stats handler did not finish during cleanup")
+		}
+	})
+
+	select {
+	case <-callStarted:
+	case <-time.After(time.Second):
+		require.FailNow(t, "CLI stats store call did not start")
+	}
+	cancel()
+
+	select {
+	case <-callReturned:
+	case <-time.After(time.Second):
+		require.FailNow(t, "CLI stats store call continued after marked request cancellation")
+	}
+	select {
+	case <-handlerDone:
+	case <-time.After(time.Second):
+		require.FailNow(t, "CLI stats handler did not return after store cancellation")
+	}
+
+	require.Equal(t, http.StatusServiceUnavailable, resp.Code, "status (body: %s)", resp.Body.String())
+	var errResp ErrorResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&errResp), "decode error response")
+	assert.Equal(t, "query_canceled", errResp.Error, "error code")
 }
 
 func TestHandleCLICreateDeletionManifest(t *testing.T) {
@@ -1045,6 +1149,85 @@ func TestHandleQueryEnforcesQueryTimeout(t *testing.T) {
 
 	require.Equal(http.StatusServiceUnavailable, resp.Code, "body: %s", resp.Body.String())
 	assert.Contains(resp.Body.String(), "query_timeout")
+}
+
+func TestMarkedCLIQueryCancellationInterruptsDuckDB(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	engine, err := query.NewDuckDBEngine("", "", nil)
+	require.NoError(err, "NewDuckDBEngine")
+	t.Cleanup(func() { _ = engine.Close() })
+
+	queryStarted := make(chan struct{})
+	queryReturned := make(chan struct{})
+	queryErr := make(chan error, 1)
+	queryHasDeadline := make(chan bool, 1)
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Server: config.ServerConfig{
+			APIPort: 8080,
+			APIKey:  cliTimeoutTestAPIKey,
+		}},
+		Logger: testLogger(),
+		SQLQueryRunner: func(ctx context.Context, sql string) (*query.QueryResult, error) {
+			_, hasDeadline := ctx.Deadline()
+			queryHasDeadline <- hasDeadline
+			close(queryStarted)
+			result, err := engine.QuerySQL(ctx, sql)
+			queryErr <- err
+			close(queryReturned)
+			return result, err
+		},
+	})
+	srv.queryTimeout = 20 * time.Millisecond
+	httpServer := httptest.NewServer(srv.Router())
+	t.Cleanup(httpServer.Close)
+
+	const slowSQL = `SELECT COUNT(*) FROM range(1000000) a, range(1000000) b
+		WHERE (a.range * b.range) % 7 = 0`
+	body := strings.NewReader(`{"sql":` + strconv.Quote(slowSQL) + `}`)
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, httpServer.URL+queryEndpointPath, body)
+	require.NoError(err, "NewRequestWithContext")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Api-Key", cliTimeoutTestAPIKey)
+	req.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
+
+	requestDone := make(chan error, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(req)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+		requestDone <- err
+	}()
+
+	require.Eventually(func() bool {
+		select {
+		case <-queryStarted:
+			return true
+		default:
+			return false
+		}
+	}, 2*time.Second, 10*time.Millisecond, "DuckDB query starts")
+	assert.False(<-queryHasDeadline, "marked query context must not have a server deadline")
+	assert.Never(func() bool {
+		select {
+		case <-queryReturned:
+			return true
+		default:
+			return false
+		}
+	}, 60*time.Millisecond, 5*time.Millisecond,
+		"marked query survives the 20ms ordinary query ceiling")
+
+	cancel()
+	select {
+	case <-queryReturned:
+		require.Error(<-queryErr, "DuckDB returns cancellation")
+	case <-time.After(5 * time.Second):
+		require.FailNow("DuckDB continued after marked HTTP cancellation")
+	}
+	require.Error(<-requestDone, "client observes cancellation")
 }
 
 func TestHandleCLIRunRejectsDisallowedEnv(t *testing.T) {

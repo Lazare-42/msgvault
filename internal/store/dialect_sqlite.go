@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"unicode"
 
@@ -200,15 +199,15 @@ func (d *SQLiteDialect) FTSNeedsBackfill(db *sql.DB) bool {
 // lookups, instant at any archive size. It catches the dominant staleness
 // (tail of the messages table not yet indexed: fresh import, interrupted
 // backfill) but misses interior holes; FTSNeedsBackfill stays authoritative.
-func (d *SQLiteDialect) FTSNeedsBackfillQuick(db *sql.DB) bool {
+func (d *SQLiteDialect) FTSNeedsBackfillQuick(ctx context.Context, db *sql.DB) bool {
 	var msgMax int64
-	if err := db.QueryRowContext(context.Background(),
+	if err := db.QueryRowContext(ctx,
 		"SELECT COALESCE(MAX(id), 0) FROM messages",
 	).Scan(&msgMax); err != nil || msgMax == 0 {
 		return false
 	}
 	var ftsMax int64
-	if err := db.QueryRowContext(context.Background(),
+	if err := db.QueryRowContext(ctx,
 		"SELECT COALESCE(MAX(rowid), 0) FROM messages_fts",
 	).Scan(&ftsMax); err != nil {
 		return false
@@ -235,15 +234,15 @@ func (d *SQLiteDialect) SchemaFTS() string {
 // transaction (finding S1). SQLite DDL is transactional, so DROP/CREATE of
 // the virtual table run fine inside the tx runMaintenance opens; SQLite has
 // no statement_timeout, so the hatch is a plain transaction here.
-func (d *SQLiteDialect) FTSRebuildSchema(q querier) error {
-	if _, err := q.Exec("DROP TABLE IF EXISTS messages_fts"); err != nil {
+func (d *SQLiteDialect) FTSRebuildSchema(ctx context.Context, q contextQuerier) error {
+	if _, err := q.ExecContext(ctx, "DROP TABLE IF EXISTS messages_fts"); err != nil {
 		return fmt.Errorf("drop messages_fts: %w", err)
 	}
 	schema, err := schemaFS.ReadFile("schema_sqlite.sql")
 	if err != nil {
 		return fmt.Errorf("read schema_sqlite.sql: %w", err)
 	}
-	if _, err := q.Exec(string(schema)); err != nil {
+	if _, err := q.ExecContext(ctx, string(schema)); err != nil {
 		if d.IsNoSuchModuleError(err) {
 			return errors.New("cannot rebuild FTS: this msgvault binary was built without " +
 				"FTS5 support (rebuild with `-tags fts5`)",
@@ -300,17 +299,31 @@ func (d *SQLiteDialect) LegacyColumnMigrations() []ColumnMigration {
 	}
 }
 
-// DatabaseSize returns the on-disk size of the SQLite database file.
-// Returns (0, nil) for in-memory databases or when the file cannot be stat'd.
-func (d *SQLiteDialect) DatabaseSize(_ *sql.DB, dbPath string) (int64, error) {
+// DatabaseSize returns SQLite's logical main-database allocation:
+// PRAGMA page_count multiplied by PRAGMA page_size. The query sees committed
+// pages that still reside in WAL, while deliberately excluding WAL framing and
+// SHM sidecar overhead. In-memory databases retain the historical 0 result.
+func (d *SQLiteDialect) DatabaseSize(
+	ctx context.Context,
+	db *sql.DB,
+	dbPath string,
+) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if dbPath == "" || dbPath == ":memory:" || strings.Contains(dbPath, ":memory:") {
 		return 0, nil
 	}
-	info, err := os.Stat(dbPath)
-	if err != nil {
-		return 0, nil //nolint:nilerr // missing/unstattable db file reports 0 size, not an error
+
+	var pageCount int64
+	if err := db.QueryRowContext(ctx, "PRAGMA page_count").Scan(&pageCount); err != nil {
+		return 0, fmt.Errorf("query SQLite page count: %w", err)
 	}
-	return info.Size(), nil
+	var pageSize int64
+	if err := db.QueryRowContext(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
+		return 0, fmt.Errorf("query SQLite page size: %w", err)
+	}
+	return pageCount * pageSize, nil
 }
 
 // InitConn is a no-op for SQLite — PRAGMAs are set via DSN parameters.

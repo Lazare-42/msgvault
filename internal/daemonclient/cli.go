@@ -514,7 +514,7 @@ func (c *Client) CreateCLIDeletionManifest(
 
 // SaveManifest adapts Client to deletion manifest saver interfaces.
 func (c *Client) SaveManifest(manifest *deletion.Manifest) error {
-	_, err := c.CreateCLIDeletionManifest(context.Background(), manifest)
+	_, err := c.CreateCLIDeletionManifest(c.requestContext(), manifest)
 	return err
 }
 
@@ -558,6 +558,9 @@ func (c *Client) openCLIStream(
 		_ = resp.Body.Close()
 		if waiter.wait(ctx, err) {
 			continue
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
 		}
 		return nil, err
 	}

@@ -11,13 +11,14 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/kit/daemon"
-	"go.kenn.io/msgvault/internal/api"
+	"go.kenn.io/msgvault/internal/apiprotocol"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonclient"
 )
@@ -42,19 +43,94 @@ func TestOpenHTTPStoreUsesConfiguredRemoteWithoutDaemonAutostart(t *testing.T) {
 	assert.Equal(t, "http://daemonclient.example:8080", info.URL)
 }
 
-func TestOpenHTTPStoreUsesLongTimeoutForConfiguredRemote(t *testing.T) {
+func TestOpenHTTPStoreUsesCLIModeForConfiguredRemote(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	var marker atomic.Value
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal("/health", r.URL.Path)
+		assert.Equal("remote-daemon-secret", r.Header.Get("X-Api-Key"))
+		marker.Store(r.Header.Get(apiprotocol.ClientClassHeader))
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write([]byte(`{"status":"ok"}`))
+		assert.NoError(err, "write health response")
+	}))
+	t.Cleanup(srv.Close)
+
 	withStoreResolverConfig(t, &config.Config{
 		Remote: config.RemoteConfig{
-			URL:           "http://daemonclient.example:8080",
+			URL:           srv.URL,
+			APIKey:        "remote-daemon-secret",
 			AllowInsecure: true,
 		},
 	})
 
 	st, _, err := OpenHTTPStore(context.Background())
-	require.NoError(t, err, "OpenHTTPStore")
+	require.NoError(err, "OpenHTTPStore")
 	t.Cleanup(func() { _ = st.Close() })
 
-	assert.Equal(t, api.DaemonLongRequestTimeout, remoteStoreTimeoutForTest(t, st))
+	assert.Zero(st.Timeout(), "configured remote operations use caller duration")
+	_, err = st.GetHealth(context.Background())
+	require.NoError(err, "GetHealth")
+	assert.Equal(apiprotocol.ClientClassCLI, marker.Load())
+}
+
+func TestOpenHTTPStoreRootContextCancelsLocalDaemonRequest(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	var marker atomic.Value
+	requestCanceled := make(chan struct{})
+	mux := http.NewServeMux()
+	mux.Handle("/api/ping", daemon.NewPingHandler(daemon.PingHandlerOptions{
+		Service: daemonService,
+		Version: Version,
+	}))
+	mux.HandleFunc("/api/v1/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write([]byte(`{"status":"ok"}`))
+		assert.NoError(err, "write health response")
+	})
+	mux.HandleFunc("/api/v1/stats", func(_ http.ResponseWriter, r *http.Request) {
+		marker.Store(r.Header.Get(apiprotocol.ClientClassHeader))
+		<-r.Context().Done()
+		close(requestCanceled)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	dataDir := t.TempDir()
+	withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	rt := daemonRuntimeForHTTPServer(t, srv, daemonAPIKeyFingerprint(""))
+	_, err := daemonRuntimeStore(dataDir).Write(rt.Record)
+	require.NoError(err, "write daemon runtime")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	st, _, err := OpenHTTPStore(ctx)
+	require.NoError(err, "OpenHTTPStore")
+	t.Cleanup(func() { _ = st.Close() })
+	assert.Zero(st.Timeout(), "local daemon operations use caller duration")
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := st.GetStats()
+		done <- err
+	}()
+	require.Eventually(func() bool {
+		return marker.Load() != nil
+	}, 2*time.Second, 10*time.Millisecond, "stats request starts")
+	cancel()
+
+	require.Eventually(func() bool {
+		select {
+		case <-requestCanceled:
+			return true
+		default:
+			return false
+		}
+	}, 2*time.Second, 10*time.Millisecond, "root cancellation reaches stats request")
+	assert.Equal(apiprotocol.ClientClassCLI, marker.Load())
+	require.Error(<-done, "canceled stats request")
 }
 
 func TestOpenHTTPStoreStartsLocalDaemonWhenNoRemoteConfigured(t *testing.T) {
@@ -243,12 +319,16 @@ func TestOpenHTTPStoreUsesServerAPIKeyForLocalDaemon(t *testing.T) {
 		Service: daemonService,
 		Version: Version,
 	}))
-	mux.HandleFunc("/api/v1/stats", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		gotAPIKey = r.Header.Get("X-Api-Key")
 		if gotAPIKey != localCfg.Server.APIKey {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+	mux.HandleFunc("/api/v1/stats", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"total_messages":7}`))
 	})
@@ -308,7 +388,7 @@ func TestOpenHTTPStoreRejectsLocalDaemonWithStaleServerAPIKey(t *testing.T) {
 		Service: daemonService,
 		Version: Version,
 	}))
-	mux.HandleFunc("/api/v1/stats", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		statsCalled = true
 		assert.Equal(localCfg.Server.APIKey, r.Header.Get("X-Api-Key"), "auth probe uses current server api key")
 		w.Header().Set("Content-Type", "application/json")
@@ -363,10 +443,10 @@ func TestOpenHTTPStoreRejectsLocalDaemonWithChangedServerAPIKeyFingerprint(t *te
 		Service: daemonService,
 		Version: Version,
 	}))
-	mux.HandleFunc("/api/v1/stats", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/api/v1/health", func(w http.ResponseWriter, _ *http.Request) {
 		statsCalled = true
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"total_messages":7}`))
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
@@ -415,7 +495,7 @@ func TestOpenHTTPStoreRejectsLegacyLocalDaemonAfterServerAPIKeyRemoved(t *testin
 		Service: daemonService,
 		Version: Version,
 	}))
-	mux.HandleFunc("/api/v1/stats", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/health", func(w http.ResponseWriter, r *http.Request) {
 		statsCalled = true
 		assert.Empty(r.Header.Get("X-Api-Key"), "removed api key should probe without credentials")
 		w.Header().Set("Content-Type", "application/json")
@@ -454,6 +534,82 @@ func TestOpenHTTPStoreRejectsLegacyLocalDaemonAfterServerAPIKeyRemoved(t *testin
 	assert.True(statsCalled, "missing auth metadata should be verified with a live probe")
 }
 
+func TestProbeLocalDaemonAuthDoesNotWaitForStats(t *testing.T) {
+	var statsCalled atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/health", func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "secret", r.Header.Get("X-Api-Key"))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+	mux.HandleFunc("/api/v1/stats", func(w http.ResponseWriter, _ *http.Request) {
+		statsCalled.Store(true)
+		time.Sleep(3 * localDaemonAuthProbeTimeout)
+		w.WriteHeader(http.StatusOK)
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	rt := daemonRuntimeForHTTPServer(t, server, daemonAPIKeyFingerprint("secret"))
+	c := lifecycleTestConfig(t.TempDir())
+	c.Server.APIKey = "secret"
+
+	start := time.Now()
+	require.NoError(t, probeLocalDaemonAuth(context.Background(), rt, c))
+	assert.Less(t, time.Since(start), localDaemonAuthProbeTimeout)
+	assert.False(t, statsCalled.Load(), "auth probe never performs archive statistics")
+}
+
+func TestProbeLocalDaemonAuthRespectsParentDeadline(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/v1/health", func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-time.After(3 * localDaemonAuthProbeTimeout):
+		}
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	rt := daemonRuntimeForHTTPServer(t, server, daemonAPIKeyFingerprint("secret"))
+	c := lifecycleTestConfig(t.TempDir())
+	c.Server.APIKey = "secret"
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	t.Cleanup(cancel)
+
+	err := probeLocalDaemonAuth(ctx, rt, c)
+	require.Error(t, err)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Contains(t, err.Error(), "probe local daemon authentication")
+}
+
+func daemonRuntimeForHTTPServer(t *testing.T, server *httptest.Server, authFingerprint string) *DaemonRuntime {
+	t.Helper()
+	host, portText, err := net.SplitHostPort(server.Listener.Addr().String())
+	require.NoError(t, err, "split listener address")
+	port, err := strconv.Atoi(portText)
+	require.NoError(t, err, "parse listener port")
+
+	return &DaemonRuntime{
+		Record: daemon.RuntimeRecord{
+			PID:     os.Getpid(),
+			Network: daemon.NetworkTCP,
+			Address: net.JoinHostPort(host, portText),
+			Service: daemonService,
+			Version: Version,
+			Metadata: map[string]string{
+				runtimeHost:            host,
+				runtimePort:            portText,
+				runtimeAPIVersion:      strconv.Itoa(daemonAPIVersion),
+				runtimeAuthFingerprint: authFingerprint,
+			},
+		},
+		Host: host,
+		Port: port,
+		API:  daemonAPIVersion,
+	}
+}
+
 func TestOpenHTTPStoreHonorsNeverAutoRestartPolicy(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(
@@ -473,6 +629,10 @@ func TestOpenHTTPStoreHonorsNeverAutoRestartPolicy(t *testing.T) {
 	mux.HandleFunc("/api/v1/stats", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"total_messages":9}`))
+	})
+	mux.HandleFunc("/api/v1/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
@@ -685,12 +845,6 @@ func withStoreResolverConfig(t *testing.T, c *config.Config) {
 		cfg = oldCfg
 		useLocal = oldUseLocal
 	})
-}
-
-func remoteStoreTimeoutForTest(t *testing.T, st *daemonclient.Client) time.Duration {
-	t.Helper()
-	require.NotNil(t, st, "daemon client")
-	return st.Timeout()
 }
 
 func captureStderrDuring(t *testing.T, fn func()) string {
