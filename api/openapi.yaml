@@ -1136,6 +1136,15 @@ components:
         - has_after
         - total
       type: object
+    CreatePersonRequest:
+      additionalProperties: false
+      properties:
+        participant_id:
+          format: int64
+          type: integer
+      required:
+        - participant_id
+      type: object
     CreateRequest:
       additionalProperties: false
       properties:
@@ -2823,6 +2832,16 @@ components:
       required:
         - busy
       type: object
+    PatchPersonRequest:
+      additionalProperties: false
+      properties:
+        display_name:
+          type:
+            - string
+            - "null"
+      required:
+        - display_name
+      type: object
     PatchSavedViewRequest:
       additionalProperties: false
       properties:
@@ -2835,6 +2854,40 @@ components:
         schema_version:
           format: int64
           type: integer
+      type: object
+    Person:
+      additionalProperties: true
+      properties:
+        created_at:
+          format: date-time
+          type: string
+        display_name:
+          type: string
+        id:
+          format: int64
+          type: integer
+        participant_ids:
+          items:
+            format: int64
+            type: integer
+          type:
+            - array
+            - "null"
+        revision:
+          format: int64
+          type: integer
+        updated_at:
+          format: date-time
+          type: string
+        vcard_uid:
+          type: string
+      required:
+        - id
+        - vcard_uid
+        - revision
+        - participant_ids
+        - created_at
+        - updated_at
       type: object
     PersonCluster:
       additionalProperties: true
@@ -2912,6 +2965,21 @@ components:
         - provenance
         - participant_id
       type: object
+    PersonProfile:
+      additionalProperties: true
+      properties:
+        display_name:
+          type: string
+        id:
+          format: int64
+          type: integer
+        revision:
+          format: int64
+          type: integer
+      required:
+        - id
+        - revision
+      type: object
     PersonSearchHTTPResponse:
       additionalProperties: true
       properties:
@@ -2972,6 +3040,8 @@ components:
           type: string
         partial_label:
           type: boolean
+        profile:
+          $ref: "#/components/schemas/PersonProfile"
         source_counts:
           items:
             $ref: "#/components/schemas/SourceCount"
@@ -2989,6 +3059,18 @@ components:
         - first_at
         - last_at
         - cache_revision
+      type: object
+    PersonsResponse:
+      additionalProperties: true
+      properties:
+        persons:
+          items:
+            $ref: "#/components/schemas/Person"
+          type:
+            - array
+            - "null"
+      required:
+        - persons
       type: object
     PingInfo:
       additionalProperties: true
@@ -4463,7 +4545,7 @@ components:
       type: apiKey
 info:
   title: msgvault API
-  version: 1.31.0
+  version: 1.32.0
 openapi: 3.1.0
 paths:
   /api/ping:
@@ -7990,6 +8072,277 @@ paths:
       summary: Get one person's canonical activity timeline
       tags:
         - Exploration
+  /api/v1/persons:
+    get:
+      description: "Durable persons are curated profiles; /api/v1/people exposes derived analytics groupings. The listing is deliberately unpaginated: persons exist only through explicit promotion, so the set stays small."
+      operationId: listPersons
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonsResponse"
+          description: OK
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: List durable person profiles
+      tags:
+        - API
+    post:
+      description: Returns 201 when a new person is created, or 200 when the cluster is already represented by a person (idempotent re-promotion, which also binds any unbound cluster members).
+      operationId: createPerson
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreatePersonRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Person"
+          description: OK
+          headers:
+            ETag:
+              description: Strong person profile revision tag for optimistic concurrency
+              schema:
+                type: string
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Person"
+          description: Created
+          headers:
+            ETag:
+              description: Strong person profile revision tag for optimistic concurrency
+              schema:
+                type: string
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Promote a participant cluster to a durable person
+      tags:
+        - API
+  /api/v1/persons/{id}:
+    delete:
+      description: "Deletion is permanent: the person's participant bindings are removed and its vCard UID is retired forever. Re-promoting the same cluster afterwards creates a new person with a new UID."
+      operationId: deletePerson
+      parameters:
+        - description: Durable person ID
+          in: path
+          name: id
+          required: true
+          schema:
+            format: int64
+            type: integer
+        - description: Strong ETag returned by the latest person profile read. Must be the exact single tag from that read; the RFC 7232 forms `*` and comma-separated tag lists are not supported.
+          in: header
+          name: If-Match
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: No Content
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "428":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Delete a durable person profile
+      tags:
+        - API
+    get:
+      operationId: getPersonProfile
+      parameters:
+        - description: Durable person ID
+          in: path
+          name: id
+          required: true
+          schema:
+            format: int64
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Person"
+          description: OK
+          headers:
+            ETag:
+              description: Strong person profile revision tag for optimistic concurrency
+              schema:
+                type: string
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Get a durable person profile
+      tags:
+        - API
+    patch:
+      operationId: patchPerson
+      parameters:
+        - description: Durable person ID
+          in: path
+          name: id
+          required: true
+          schema:
+            format: int64
+            type: integer
+        - description: Strong ETag returned by the latest person profile read. Must be the exact single tag from that read; the RFC 7232 forms `*` and comma-separated tag lists are not supported.
+          in: header
+          name: If-Match
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PatchPersonRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Person"
+          description: OK
+          headers:
+            ETag:
+              description: Strong person profile revision tag for optimistic concurrency
+              schema:
+                type: string
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "428":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Update a durable person's display name
+      tags:
+        - API
   /api/v1/query:
     post:
       operationId: runQuery

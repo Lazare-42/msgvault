@@ -147,7 +147,12 @@ import (
 // (any rank), and total_count reports the matched-row count (0 or 1). Clients
 // use it to hydrate a selected group without paging the ranked listing.
 // Additive (minor bump): omitting the field preserves the ranked listing.
-const APISchemaVersion = "1.31.0"
+// 1.32.0 adds durable person profiles: promote an observed participant
+// cluster (201 on creation, 200 on idempotent re-promotion), list/get stable
+// profiles, update the display-name override and delete a profile with
+// revision-tag optimistic concurrency, and surface the covering profile on
+// the /people/{id} analytical detail.
+const APISchemaVersion = "1.32.0"
 
 // OpenAPIDocument builds the API schema from the same Huma route registration
 // used by the daemon. It binds no socket and needs no database.
@@ -435,6 +440,17 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 				if schema.Properties[property] != nil {
 					schema.Properties[property].Nullable = true
 				}
+			}
+		}
+	}
+	if patch := schemas["PatchPersonRequest"]; patch != nil {
+		if displayName := patch.Properties["display_name"]; displayName != nil {
+			if displayName.Extensions == nil {
+				displayName.Extensions = map[string]any{}
+			}
+			displayName.Extensions["x-omitempty"] = false
+			displayName.Extensions["x-oapi-codegen-extra-tags"] = map[string]any{
+				"validate": "omitempty",
 			}
 		}
 	}

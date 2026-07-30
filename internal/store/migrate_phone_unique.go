@@ -136,6 +136,14 @@ func (s *Store) dedupeParticipantsByPhone(ctx context.Context, tx *loggedTx) err
 // domain, display_name) from the loser, then deletes loser from
 // participants.
 func (s *Store) mergeParticipant(ctx context.Context, tx *loggedTx, winner, loser int64) error {
+	// This tx bumps the identity revision in step (6), so the
+	// identity-mutation row lock must come before the table writes below —
+	// BeginExclusive takes that row first and then LOCK TABLE, and the
+	// reverse order here could deadlock against a serialized source removal
+	// on the one-shot first open of a legacy database.
+	if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
+		return err
+	}
 	// (1) message_recipients UNIQUE(message_id, participant_id, recipient_type)
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM message_recipients
@@ -232,6 +240,8 @@ func (s *Store) mergeParticipant(ctx context.Context, tx *loggedTx, winner, lose
 
 	// (6) Repoint (and, if needed, restructure) any link edges referencing
 	// loser before the delete below drops them via ON DELETE CASCADE.
+	// This one-shot legacy migration runs during schema setup before person
+	// profiles can be created, so there are no person bindings to re-point.
 	if err := s.rewriteLinksForMerge(tx, loser, winner); err != nil {
 		return fmt.Errorf("rewrite participant links (loser=%d, winner=%d): %w", loser, winner, err)
 	}

@@ -2097,6 +2097,38 @@ func (s *Store) MergeParticipants(oldID, newID int64) error {
 		return nil
 	}
 	return s.withTx(func(tx *loggedTx) error {
+		// Serialize the curated binding check with promotion and link/unlink
+		// mutations before this transaction repoints any archive references.
+		if err := s.lockIdentityMutationTx(tx); err != nil {
+			return err
+		}
+		if err := s.verifyParticipantsExistTx(tx, oldID, newID); err != nil {
+			return err
+		}
+		edges, err := s.loadLinkEdgesTx(tx)
+		if err != nil {
+			return err
+		}
+		personID, unionMembers, err := s.personForClusterUnionTx(
+			context.Background(), tx, oldID, newID, edges,
+		)
+		if err != nil {
+			return err
+		}
+		if personID != 0 {
+			changed, err := s.mergePersonBindingsTx(
+				context.Background(), tx, personID, oldID, unionMembers)
+			if err != nil {
+				return err
+			}
+			if changed {
+				if err := s.bumpPersonRevisionsTx(
+					context.Background(), tx, personID); err != nil {
+					return err
+				}
+			}
+		}
+
 		// The merge must not lose contact metadata: fill gaps on the survivor
 		// from the absorbed row, carrying the email's analytics domain with it.
 		// Email and phone are UNIQUE, so the absorbed row must release each
@@ -2175,7 +2207,7 @@ func (s *Store) MergeParticipants(oldID, newID int64) error {
 		if err := s.bumpAccountIdentityRevision(tx); err != nil {
 			return err
 		}
-		_, err := tx.Exec(`DELETE FROM participants WHERE id = ?`, oldID)
+		_, err = tx.Exec(`DELETE FROM participants WHERE id = ?`, oldID)
 		return err
 	})
 }
@@ -2218,16 +2250,25 @@ func (s *Store) SetParticipantIdentifier(participantID int64, identifierType, id
 		return errors.New("identifier type and value are required")
 	}
 	return s.withTx(func(tx *loggedTx) error {
-		var existingID int64
-		err := tx.QueryRow(`
-			SELECT participant_id FROM participant_identifiers
-			WHERE identifier_type = ? AND identifier_value = ?
-		`, identifierType, identifierValue).Scan(&existingID)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return fmt.Errorf("lookup participant identifier: %w", err)
+		// Fast path first, read-only: importer re-runs hit the no-op case
+		// constantly, and it must not take any write lock.
+		noop, err := participantIdentifierIsNoopTx(tx, participantID, identifierType, identifierValue)
+		if err != nil || noop {
+			return err
 		}
-		if err == nil && existingID == participantID {
-			return nil
+		// The write path may bump the identity revision below (owner
+		// evidence), so the identity-mutation row lock must come BEFORE the
+		// participant_identifiers write: BeginExclusive takes that row and
+		// then LOCK TABLE participant_identifiers, and the reverse order
+		// here would deadlock against a serialized source removal. Re-check
+		// the no-op case under the lock: a concurrent call may have set the
+		// same mapping while we waited.
+		if err := s.lockIdentityMutationTx(tx); err != nil {
+			return err
+		}
+		noop, err = participantIdentifierIsNoopTx(tx, participantID, identifierType, identifierValue)
+		if err != nil || noop {
+			return err
 		}
 		if _, err := tx.Exec(`
 			INSERT INTO participant_identifiers (participant_id, identifier_type, identifier_value, is_primary)
@@ -2257,6 +2298,22 @@ func (s *Store) SetParticipantIdentifier(participantID int64, identifierType, id
 		}
 		return s.bumpAccountIdentityRevision(tx)
 	})
+}
+
+// participantIdentifierIsNoopTx reports whether (identifierType,
+// identifierValue) already points at participantID, without taking any lock.
+func participantIdentifierIsNoopTx(
+	tx *loggedTx, participantID int64, identifierType, identifierValue string,
+) (bool, error) {
+	var existingID int64
+	err := tx.QueryRow(`
+		SELECT participant_id FROM participant_identifiers
+		WHERE identifier_type = ? AND identifier_value = ?
+	`, identifierType, identifierValue).Scan(&existingID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("lookup participant identifier: %w", err)
+	}
+	return err == nil && existingID == participantID, nil
 }
 
 func (s *Store) EnsureParticipantByIdentifier(identifierType, identifierValue, displayName string) (int64, error) {
