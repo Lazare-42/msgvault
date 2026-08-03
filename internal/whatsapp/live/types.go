@@ -51,6 +51,10 @@ type SendMessageRequest struct {
 	ChatID         string
 	Body           string
 	LocalRequestID string
+	// Mentions is a list of full JID strings (e.g. "178357123686403@lid" or
+	// "33612345678@s.whatsapp.net") to @mention. The Body must contain a
+	// matching "@<user>" token per JID for WhatsApp to render the name + ping.
+	Mentions []string
 }
 
 type LogoutRequest struct {
@@ -125,9 +129,10 @@ type TransportLogoutResult struct {
 }
 
 type TransportSendMessageRequest struct {
-	Account string
-	ChatID  string
-	Body    string
+	Account  string
+	ChatID   string
+	Body     string
+	Mentions []string // full JID strings to @mention (see SendMessageRequest)
 }
 
 type TransportSendReactionRequest struct {

@@ -256,9 +256,10 @@ func (s *Service) SendMessage(ctx context.Context, req SendMessageRequest) (Send
 	result.Status = store.WhatsAppOutboxSending
 
 	remote, err := s.transport.SendMessage(ctx, TransportSendMessageRequest{
-		Account: source.Identifier,
-		ChatID:  req.ChatID,
-		Body:    req.Body,
+		Account:  source.Identifier,
+		ChatID:   req.ChatID,
+		Body:     req.Body,
+		Mentions: req.Mentions,
 	})
 	if err != nil {
 		_ = s.store.MarkWhatsAppOutboxFailed(ctx, outboxID, err)
