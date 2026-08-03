@@ -362,9 +362,23 @@ func (t *WhatsmeowTransport) SendMessage(ctx context.Context, req TransportSendM
 	if err != nil {
 		return TransportSendResult{}, err
 	}
-	resp, err := t.client.SendMessage(ctx, chat, &waE2E.Message{
-		Conversation: proto.String(req.Body),
-	})
+	var msg *waE2E.Message
+	if len(req.Mentions) > 0 {
+		// @mentions require an ExtendedTextMessage carrying the mentioned JIDs.
+		// WhatsApp then renders each "@<user>" token in Text as the contact's
+		// name and pings them (group participants resolve via pushname/LID).
+		msg = &waE2E.Message{
+			ExtendedTextMessage: &waE2E.ExtendedTextMessage{
+				Text: proto.String(req.Body),
+				ContextInfo: &waE2E.ContextInfo{
+					MentionedJID: req.Mentions,
+				},
+			},
+		}
+	} else {
+		msg = &waE2E.Message{Conversation: proto.String(req.Body)}
+	}
+	resp, err := t.client.SendMessage(ctx, chat, msg)
 	if err != nil {
 		return TransportSendResult{}, err
 	}

@@ -2351,6 +2351,16 @@ func (h *handlers) sendWhatsAppMessage(ctx context.Context, req mcp.CallToolRequ
 		return mcp.NewToolResultError("body parameter is required"), nil
 	}
 	localRequestID, _ := args["local_request_id"].(string)
+	var mentions []string
+	if raw, ok := args["mentions"].([]any); ok {
+		for _, m := range raw {
+			if s, ok := m.(string); ok {
+				if s = strings.TrimSpace(s); s != "" {
+					mentions = append(mentions, s)
+				}
+			}
+		}
+	}
 	if err := requireWhatsAppReady(ctx, client); err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
 	}
@@ -2360,6 +2370,7 @@ func (h *handlers) sendWhatsAppMessage(ctx context.Context, req mcp.CallToolRequ
 		ChatID:         chatID,
 		Body:           body,
 		LocalRequestID: strings.TrimSpace(localRequestID),
+		Mentions:       mentions,
 	})
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("send whatsapp message: %v", err)), nil

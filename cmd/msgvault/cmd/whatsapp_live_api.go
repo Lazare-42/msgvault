@@ -149,10 +149,11 @@ func (h *whatsappLiveAPIHandler) listMessages(w http.ResponseWriter, r *http.Req
 }
 
 type whatsappAPISendRequest struct {
-	Account        string `json:"account,omitempty"`
-	ChatID         string `json:"chat_id"`
-	Body           string `json:"body"`
-	LocalRequestID string `json:"local_request_id,omitempty"`
+	Account        string   `json:"account,omitempty"`
+	ChatID         string   `json:"chat_id"`
+	Body           string   `json:"body"`
+	LocalRequestID string   `json:"local_request_id,omitempty"`
+	Mentions       []string `json:"mentions,omitempty"`
 }
 
 func (h *whatsappLiveAPIHandler) sendMessage(w http.ResponseWriter, r *http.Request) {
@@ -177,6 +178,7 @@ func (h *whatsappLiveAPIHandler) sendMessage(w http.ResponseWriter, r *http.Requ
 		ChatID:         req.ChatID,
 		Body:           req.Body,
 		LocalRequestID: req.LocalRequestID,
+		Mentions:       req.Mentions,
 	})
 	if err != nil {
 		status := http.StatusBadGateway
