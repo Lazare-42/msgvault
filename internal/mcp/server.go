@@ -303,7 +303,6 @@ func newMCPHTTPServer(opts ServeOptions, addr, apiKey string) *http.Server {
 	return stdlibServer
 }
 
-
 func bearerAuthHandler(apiKey string, next http.Handler) http.Handler {
 	if apiKey == "" {
 		return next

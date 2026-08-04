@@ -372,19 +372,19 @@ func TestWhatsAppLoginStatusReportsPairedButNotReady(t *testing.T) {
 	h := &handlers{
 		engine: eng,
 		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
-			assertpkg.Empty(t, account)
+			assert.Empty(t, account)
 			return client, nil
 		},
 	}
 
 	result := runTool[whatsAppLoginResponse](t, ToolWhatsAppLoginStatus, h.whatsAppLoginStatus, map[string]any{})
-	assertpkg.True(t, result.AlreadyPaired)
-	assertpkg.False(t, result.NeedsPairing)
-	assertpkg.False(t, result.Ready)
-	assertpkg.False(t, result.Status.Ready)
-	assertpkg.True(t, result.NeedsReconnect)
-	assertpkg.True(t, result.NeedsAuth)
-	assertpkg.Equal(t, 5, result.PollAfterSecs)
+	assert.True(t, result.AlreadyPaired)
+	assert.False(t, result.NeedsPairing)
+	assert.False(t, result.Ready)
+	assert.False(t, result.Status.Ready)
+	assert.True(t, result.NeedsReconnect)
+	assert.True(t, result.NeedsAuth)
+	assert.Equal(t, 5, result.PollAfterSecs)
 }
 
 func TestWhatsAppLogoutRequiresConfirm(t *testing.T) {
@@ -516,7 +516,7 @@ func TestSendWhatsAppMessageRejectsNotReady(t *testing.T) {
 	h := &handlers{
 		engine: eng,
 		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
-			assertpkg.Equal(t, "15551234567@s.whatsapp.net", account)
+			assert.Equal(t, "15551234567@s.whatsapp.net", account)
 			return client, nil
 		},
 	}
@@ -525,8 +525,8 @@ func TestSendWhatsAppMessageRejectsNotReady(t *testing.T) {
 		"chat_id": "15557654321@s.whatsapp.net",
 		"body":    "hello",
 	})
-	assertpkg.Contains(t, resultText(t, result), "ready=true")
-	assertpkg.False(t, called)
+	assert.Contains(t, resultText(t, result), "ready=true")
+	assert.False(t, called)
 }
 
 func TestSendWhatsAppReactionAllowsEmptyEmojiToClear(t *testing.T) {
