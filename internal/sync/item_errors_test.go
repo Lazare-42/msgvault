@@ -55,6 +55,46 @@ func (c *legacyRawBatchClient) Close() error {
 	return nil
 }
 
+func (c *legacyRawBatchClient) ListDrafts(context.Context, string, int) ([]*gmail.Draft, error) {
+	return nil, nil
+}
+
+func (c *legacyRawBatchClient) GetDraft(context.Context, string) (*gmail.Draft, error) {
+	return nil, nil
+}
+
+func (c *legacyRawBatchClient) CreateDraft(context.Context, *gmail.DraftCompose) (*gmail.Draft, error) {
+	return nil, nil
+}
+
+func (c *legacyRawBatchClient) UpdateDraft(context.Context, string, *gmail.DraftCompose) (*gmail.Draft, error) {
+	return nil, nil
+}
+
+func (c *legacyRawBatchClient) DeleteDraft(context.Context, string) error {
+	return nil
+}
+
+func (c *legacyRawBatchClient) SendDraft(context.Context, string) (*gmail.SentMessage, error) {
+	return nil, nil
+}
+
+func (c *legacyRawBatchClient) ModifyMessageLabels(context.Context, string, []string, []string) error {
+	return nil
+}
+
+func (c *legacyRawBatchClient) BatchModifyLabels(context.Context, []string, []string, []string) error {
+	return nil
+}
+
+func (c *legacyRawBatchClient) CreateLabel(context.Context, string) (*gmail.Label, error) {
+	return nil, nil
+}
+
+func (c *legacyRawBatchClient) DeleteLabel(context.Context, string) error {
+	return nil
+}
+
 var _ gmail.API = (*legacyRawBatchClient)(nil)
 
 type diagnosticRawBatchClient struct {
