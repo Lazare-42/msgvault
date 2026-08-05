@@ -16,10 +16,12 @@ import (
 // last_modified backfill alone is a full messages-table scan — seconds of
 // startup on a large archive).
 const (
-	migrationAttachmentsContentHashUnique = "attachments_content_hash_unique_index"
-	migrationMessagesLastModifiedBackfill = "messages_last_modified_backfill"
-	migrationMessageAttributionProvenance = "message_attribution_provenance_v2"
-	migrationArchiveIdentity              = "archive_identity_v1"
+	migrationAttachmentsContentHashUnique     = "attachments_content_hash_unique_index"
+	migrationMessagesLastModifiedBackfill     = "messages_last_modified_backfill"
+	migrationMessageAttributionProvenance     = "message_attribution_provenance_v2"
+	migrationArchiveIdentity                  = "archive_identity_v1"
+	migrationMessagesContentChangedAtBackfill = "messages_content_changed_at_backfill"
+	migrationMessageWatermarkTriggers         = "message_watermark_triggers_v1"
 )
 
 func backfillLegacyMessageAttributionProvenance(
@@ -149,7 +151,8 @@ func backfillLegacyCalendarAttribution(
 			return fmt.Errorf("close legacy calendar attribution: %w", err)
 		}
 
-		if err := execInChunks(
+		if err := execInChunksContext(
+			ctx,
 			tx,
 			messageIDs,
 			nil,

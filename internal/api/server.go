@@ -107,6 +107,51 @@ func (s *Server) getMessagesSummariesByIDs(ctx context.Context, ids []int64) ([]
 	return s.store.GetMessagesSummariesByIDs(ids)
 }
 
+// ChangedMessageLister is an optional extension of MessageStore for stores that
+// can serve the content-change feed. Optional rather than part of MessageStore
+// because the feed needs the content_changed_at triggers and a commit-bound
+// reading, which only a store sitting on the migrated schema has: anything else
+// implementing MessageStore — the package's own test doubles today — leaves the
+// method off and the route answers 503 feature_unavailable rather than inventing
+// a watermark.
+type ChangedMessageLister interface {
+	ListChangedMessages(
+		ctx context.Context, since store.ChangedMessagesCursor, limit int,
+	) (store.ChangedMessagePage, error)
+}
+
+// The store implementation must satisfy the optional interface. This guards the
+// store side of the contract only: the daemon passes cmd.storeAPIAdapter, not
+// *store.Store, so the assertion that actually protects the production route is
+// the one beside that adapter in cmd/msgvault/cmd/serve.go, which is a non-test
+// file and so fails the build rather than a test run. An end-to-end test drives
+// the route through the adapter in cmd/msgvault/cmd/changes_api_e2e_test.go.
+var _ ChangedMessageLister = (*store.Store)(nil)
+
+// ArchiveIdentifier is an optional extension of MessageStore for stores that
+// can report the durable identity of the archive behind them.
+//
+// Separate from ChangedMessageLister, and asserted separately, because the two
+// are different capabilities: listing changed rows needs the migrated schema,
+// while identifying the archive needs archive_metadata. The change feed happens
+// to need both — its cursor carries an archive-local message id, so a cursor is
+// only meaningful in the archive that issued it and has to name it — but
+// widening ChangedMessageLister to carry the lookup would make every future
+// implementer of the feed also implement identity, and would put the answer to
+// "which archive is this" behind the feed.
+//
+// The same 503 feature_unavailable as ChangedMessageLister: a store that cannot
+// say which archive it is cannot issue a cursor anyone can safely resume from,
+// and an unbound cursor is the failure the binding exists to prevent.
+type ArchiveIdentifier interface {
+	ArchiveUIDContext(ctx context.Context) (string, error)
+}
+
+// The store implementation must satisfy the optional interface. As with
+// ChangedMessageLister, the assertion that protects the production route is the
+// one beside cmd.storeAPIAdapter in cmd/msgvault/cmd/serve.go.
+var _ ArchiveIdentifier = (*store.Store)(nil)
+
 // SourceStatusStore defines the source/sync read operations used by the
 // source status endpoint.
 type SourceStatusStore interface {
@@ -189,6 +234,7 @@ type Server struct {
 	router              http.Handler
 	server              *http.Server
 	rateLimiter         *RateLimiter
+	changesRateLimiter  *RateLimiter
 	idleTracker         *IdleTracker
 	operationGate       OperationGate
 	// ftsIndexComplete memoizes that the FTS index is fully populated so
@@ -207,6 +253,11 @@ type Server struct {
 	// can report it. See ensureCLISearchIndexAsync.
 	ftsEnsureRunning atomic.Bool
 	ftsIndexState    atomic.Value
+	// changesStallLoggedAt throttles the WARN handleMessageChanges emits when
+	// the content-change feed is held back by a long-lived write transaction.
+	// Unix nanoseconds of the last such line, so a consumer polling once a
+	// second cannot turn one stuck connection into a log flood.
+	changesStallLoggedAt atomic.Int64
 	// ftsRebuildGen is a seqlock-style generation for index rebuilds:
 	// handleCLIRebuildFTS bumps it to odd on entry and back to even on
 	// return. The ensure worker's completeness probe runs outside the
@@ -437,6 +488,13 @@ func NewServerWithOptions(opts ServerOptions) *Server {
 
 // setupRouter configures the Huma API router and standard HTTP middleware.
 func (s *Server) setupRouter() http.Handler {
+	// Most trusted local traffic bypasses the general limiter, but the change
+	// feed takes SQLite's writer lock and therefore has its own non-bypassable
+	// budget.
+	s.rateLimiter = NewRateLimiter(10, 20)
+	s.changesRateLimiter = NewRateLimiter(
+		changeFeedRequestsPerSecond, changeFeedRequestBurst)
+
 	mux := http.NewServeMux()
 	api := s.setupHumaAPI(mux)
 	apiV1 := s.setupAPIV1Group(api)
@@ -467,9 +525,6 @@ func (s *Server) setupRouter() http.Handler {
 		s.logger.Warn("cors_origins contains \"*\": wildcard matches never receive " +
 			"Access-Control-Allow-Credentials; list exact origins in cors_origins to allow credentialed CORS")
 	}
-
-	// Rate limiting (10 req/sec with burst of 20)
-	s.rateLimiter = NewRateLimiter(10, 20)
 
 	// Request security classification and CSRF checks sit inside rate limiting
 	// but outside the operation gate, so rejected browser mutations never wait
@@ -576,6 +631,9 @@ func (s *Server) StartOnListener(ln net.Listener) error {
 func (s *Server) Shutdown(ctx context.Context) error {
 	if s.rateLimiter != nil {
 		s.rateLimiter.Close()
+	}
+	if s.changesRateLimiter != nil {
+		s.changesRateLimiter.Close()
 	}
 	if s.sessions != nil {
 		s.sessions.Close()
