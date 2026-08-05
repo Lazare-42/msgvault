@@ -305,19 +305,9 @@ func buildAPIClient(ctx context.Context, src *store.Source, getOAuthMgr func(str
 
 		switch imapCfg.EffectiveAuthMethod() {
 		case imaplib.AuthXOAuth2:
-			if cfg.Microsoft.ClientID == "" {
-				return nil, errors.New("microsoft OAuth not configured — add a [microsoft] section with client_id to config.toml")
-			}
-			msMgr := microsoft.NewManager(
-				cfg.Microsoft.ClientID,
-				cfg.Microsoft.EffectiveTenantID(),
-				cfg.Microsoft.EffectiveRedirectURI(),
-				cfg.TokensDir(),
-				logger,
-			)
-			tokenFn, err := msMgr.TokenSource(ctx, imapCfg.Username)
+			tokenFn, err := microsoftIMAPTokenSource(ctx, imapCfg)
 			if err != nil {
-				return nil, fmt.Errorf("load Microsoft token: %w (run 'add-o365' first)", err)
+				return nil, err
 			}
 			opts = append(opts, imaplib.WithTokenSource(tokenFn))
 			return imaplib.NewClient(imapCfg, "", opts...), nil
