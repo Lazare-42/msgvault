@@ -850,7 +850,10 @@ func modifyLabelsTool() mcp.Tool {
 			mcp.Description("Comma-separated Gmail message IDs (the source_message_id from search results, NOT the archive numeric ID)"),
 		),
 		mcp.WithString("add_labels",
-			mcp.Description("Comma-separated label IDs to add (e.g. 'STARRED,Label_123')"),
+			mcp.Description("Comma-separated label IDs to add (e.g. 'STARRED,Label_123'). "+
+				"For IMAP/Microsoft 365 accounts, use 'folder:<name>' to MOVE the message into a "+
+				"mailbox (created on demand), e.g. 'folder:Recruiting' — supported IMAP labels are "+
+				"UNREAD, STARRED, INBOX, and folder:<name>."),
 		),
 		mcp.WithString("remove_labels",
 			mcp.Description("Comma-separated label IDs to remove (e.g. 'INBOX,UNREAD'). Remove INBOX to archive."),
