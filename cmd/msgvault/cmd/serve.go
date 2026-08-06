@@ -170,7 +170,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("claim daemon ownership: %w", err)
 	}
+	heartbeatCtx, stopHeartbeat := context.WithCancel(cmd.Context())
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		runtimeRecordHeartbeat(heartbeatCtx, ownership, daemonRuntimeHeartbeatInterval)
+	}()
 	defer func() {
+		stopHeartbeat()
+		<-heartbeatDone
 		if err := ownership.Close(); err != nil {
 			logger.Warn("release daemon ownership failed", "error", err)
 		}
