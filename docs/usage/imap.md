@@ -117,3 +117,20 @@ without folder flags scans the complete account again.
 
 Folder filtering works the same whether the CLI uses a local daemon or a
 configured remote msgvault server.
+
+## Filing Messages Into Folders
+
+IMAP has no multi-label model: a message lives in exactly one mailbox, so
+"labeling" over IMAP is a MOVE. The `modify_labels` MCP tool accepts these
+labels for IMAP and Microsoft 365 accounts:
+
+- `UNREAD` — add to mark unread, remove to mark read (`\Seen`).
+- `STARRED` — add/remove the `\Flagged` flag (a "pin").
+- `INBOX` — add to move back to INBOX, remove to archive.
+- `folder:<name>` — add to MOVE the message into the named mailbox, e.g.
+  `folder:Recruiting`. The mailbox is created on demand if it does not exist.
+
+A `folder:` move is mutually exclusive with an INBOX add/remove in the same
+call, but a flag (e.g. `STARRED`) can be applied alongside it. Removing a
+`folder:` label is not supported — move to a different folder instead. The
+`create_label` tool pre-provisions an empty mailbox without moving anything.

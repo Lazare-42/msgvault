@@ -1706,8 +1706,30 @@ func (c *Client) ModifyMessageLabels(ctx context.Context, messageID string, addL
 			}
 			c.clearMessageCaches()
 		}
+		if ops.destFolder != "" && !strings.EqualFold(mailbox, ops.destFolder) {
+			if err := ensureMailbox(conn, ops.destFolder); err != nil {
+				return err
+			}
+			if _, err := conn.Move(uidSet, ops.destFolder).Wait(); err != nil {
+				return fmt.Errorf("MOVE to %q: %w", ops.destFolder, err)
+			}
+			c.clearMessageCaches()
+		}
 		return nil
 	})
+}
+
+// ensureMailbox creates the named mailbox if it does not already exist. An
+// ALREADYEXISTS response is treated as success so folder moves are idempotent.
+func ensureMailbox(conn *imapclient.Client, name string) error {
+	if err := conn.Create(name, nil).Wait(); err != nil {
+		var imapErr *imap.Error
+		if errors.As(err, &imapErr) && imapErr.Code == imap.ResponseCodeAlreadyExists {
+			return nil
+		}
+		return fmt.Errorf("CREATE mailbox %q: %w", name, err)
+	}
+	return nil
 }
 
 func (c *Client) BatchModifyLabels(ctx context.Context, messageIDs, addLabelIDs, removeLabelIDs []string) error {
@@ -1719,8 +1741,23 @@ func (c *Client) BatchModifyLabels(ctx context.Context, messageIDs, addLabelIDs,
 	return nil
 }
 
-func (c *Client) CreateLabel(_ context.Context, _ string) (*gmailapi.Label, error) {
-	return nil, errors.New("IMAP does not support arbitrary Gmail labels; supported system labels are UNREAD, STARRED, and INBOX")
+// CreateLabel creates an IMAP mailbox (folder) with the given name. Unlike
+// Gmail labels, IMAP folders are the unit a message is filed into; creating one
+// lets a caller pre-provision a destination before moving messages into it with
+// a "folder:<name>" modify-labels operation. Creating an existing mailbox is a
+// no-op. The returned label uses the mailbox name as both ID and name.
+func (c *Client) CreateLabel(ctx context.Context, name string) (*gmailapi.Label, error) {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" {
+		return nil, errors.New("mailbox name is required")
+	}
+	if err := c.withConn(ctx, func(conn *imapclient.Client) error {
+		return ensureMailbox(conn, trimmed)
+	}); err != nil {
+		return nil, err
+	}
+	c.clearMessageCaches()
+	return &gmailapi.Label{ID: trimmed, Name: trimmed}, nil
 }
 
 func (c *Client) DeleteLabel(_ context.Context, _ string) error {
@@ -1732,11 +1769,46 @@ type imapLabelOps struct {
 	removeFlags []imap.Flag
 	moveToInbox bool
 	archive     bool
+	// destFolder, when non-empty, is an arbitrary mailbox the message should
+	// be MOVEd into (e.g. an HR "Recruiting" folder). Set via a
+	// "folder:<name>" add-label. Mutually exclusive with moveToInbox/archive.
+	destFolder string
+}
+
+// imapFolderLabelPrefix marks an add-label as an arbitrary destination mailbox
+// rather than a Gmail system label. IMAP has no multi-label model, so filing a
+// message into a folder is a MOVE: add-label "folder:Recruiting" relocates the
+// message to the "Recruiting" mailbox (created on demand).
+const imapFolderLabelPrefix = "folder:"
+
+// imapFolderLabel reports whether label is a "folder:<name>" destination and,
+// if so, returns the trimmed folder name. The name is NOT upper-cased —
+// mailbox names are case-sensitive on most servers.
+func imapFolderLabel(label string) (string, bool) {
+	trimmed := strings.TrimSpace(label)
+	if len(trimmed) < len(imapFolderLabelPrefix) ||
+		!strings.EqualFold(trimmed[:len(imapFolderLabelPrefix)], imapFolderLabelPrefix) {
+		return "", false
+	}
+	return strings.TrimSpace(trimmed[len(imapFolderLabelPrefix):]), true
 }
 
 func parseIMAPLabelOps(addLabelIDs, removeLabelIDs []string) (imapLabelOps, error) {
 	var ops imapLabelOps
 	for _, label := range addLabelIDs {
+		if folder, ok := imapFolderLabel(label); ok {
+			if folder == "" {
+				return ops, fmt.Errorf("IMAP folder label %q has an empty destination", label)
+			}
+			if ops.destFolder != "" {
+				if !strings.EqualFold(ops.destFolder, folder) {
+					return ops, fmt.Errorf("cannot move a message to two folders (%q and %q)", ops.destFolder, folder)
+				}
+				continue // same destination repeated; keep the first spelling
+			}
+			ops.destFolder = folder
+			continue
+		}
 		switch normalizeGmailLabel(label) {
 		case "":
 			continue
@@ -1751,6 +1823,10 @@ func parseIMAPLabelOps(addLabelIDs, removeLabelIDs []string) (imapLabelOps, erro
 		}
 	}
 	for _, label := range removeLabelIDs {
+		if _, ok := imapFolderLabel(label); ok {
+			return ops, fmt.Errorf(
+				"removing a folder label (%q) is not supported over IMAP; move to another folder instead", label)
+		}
 		switch normalizeGmailLabel(label) {
 		case "":
 			continue
@@ -1764,8 +1840,21 @@ func parseIMAPLabelOps(addLabelIDs, removeLabelIDs []string) (imapLabelOps, erro
 			return ops, unsupportedIMAPLabel(label)
 		}
 	}
-	if ops.moveToInbox && ops.archive {
-		return ops, errors.New("cannot add and remove INBOX in the same IMAP label operation")
+	// INBOX-add, INBOX-remove (archive), and folder moves are all MOVEs to
+	// different destinations; at most one may apply per operation.
+	moveTargets := 0
+	if ops.moveToInbox {
+		moveTargets++
+	}
+	if ops.archive {
+		moveTargets++
+	}
+	if ops.destFolder != "" {
+		moveTargets++
+	}
+	if moveTargets > 1 {
+		return ops, errors.New(
+			"conflicting IMAP moves: combine at most one of INBOX add, INBOX remove (archive), or a folder move")
 	}
 	return ops, nil
 }
@@ -1775,7 +1864,9 @@ func normalizeGmailLabel(label string) string {
 }
 
 func unsupportedIMAPLabel(label string) error {
-	return fmt.Errorf("IMAP label operation %q is unsupported; supported system labels are UNREAD, STARRED, and INBOX", label)
+	return fmt.Errorf(
+		"IMAP label operation %q is unsupported; use system labels UNREAD, STARRED, INBOX, "+
+			"or \"folder:<name>\" to move into a mailbox", label)
 }
 
 func appendFlag(flags []imap.Flag, flag imap.Flag) []imap.Flag {
