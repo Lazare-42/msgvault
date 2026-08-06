@@ -1,11 +1,15 @@
 package imap
 
 import (
+	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"maps"
+	"net"
 	"slices"
 	"strconv"
 	"strings"
@@ -14,11 +18,15 @@ import (
 
 	imap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
+	smtp "github.com/emersion/go-smtp"
 	gmailapi "go.kenn.io/msgvault/internal/gmail"
+	msgmime "go.kenn.io/msgvault/internal/mime"
 )
 
 // Option is a functional option for Client.
 type Option func(*Client)
+
+type smtpSendFunc func(ctx context.Context, from string, to []string, raw []byte) error
 
 // WithLogger sets the logger.
 func WithLogger(logger *slog.Logger) Option {
@@ -29,6 +37,11 @@ func WithLogger(logger *slog.Logger) Option {
 // for XOAUTH2 SASL authentication. Required when Config.AuthMethod is AuthXOAuth2.
 func WithTokenSource(fn func(ctx context.Context) (string, error)) Option {
 	return func(c *Client) { c.tokenSource = fn }
+}
+
+// WithSMTPAddr overrides the SMTP submission address used by SendDraft.
+func WithSMTPAddr(addr string) Option {
+	return func(c *Client) { c.smtpAddr = addr }
 }
 
 // WithDateFilter restricts IMAP SEARCH to messages within the given date range.
@@ -89,11 +102,16 @@ type Client struct {
 	trashMailbox        string               // cached trash mailbox name
 	junkMailbox         string               // cached junk/spam mailbox name
 	allMailFolder       string               // mailbox with \All attribute (empty if not detected)
+	archiveMailbox      string               // mailbox with \Archive attribute (empty if not detected)
+	draftsMailbox       string               // mailbox with \Drafts attribute (empty if not detected)
+	sentMailbox         string               // mailbox with \Sent attribute (empty if not detected)
 	msgIDToLabels       map[string][]string  // RFC822 Message-ID → mailbox memberships
 	seenRFC822IDs       map[string]bool      // dedup overlapping mailbox copies
 	labelMapComplete    bool                 // latest listing collected every mailbox membership
 	since               time.Time            // IMAP SINCE date filter (zero = no filter)
 	before              time.Time            // IMAP BEFORE date filter (zero = no filter)
+	smtpAddr            string               // SMTP submission addr host:port, optional
+	smtpSend            smtpSendFunc         // test hook; nil uses real SMTP
 
 	// folderFilter overrides which mailboxes are included in the sync.
 	// Zero-valued (empty include and exclude) means "all mailboxes".
@@ -277,7 +295,14 @@ func (c *Client) listMailboxesLocked() ([]string, error) {
 		return c.mailboxCache, nil
 	}
 
-	items, err := c.conn.List("", "*", nil).Collect()
+	listOpts := &imap.ListOptions{}
+	if c.conn.Caps().Has(imap.CapSpecialUse) {
+		listOpts.ReturnSpecialUse = true
+	}
+	items, err := c.conn.List("", "*", listOpts).Collect()
+	if err != nil && listOpts.ReturnSpecialUse {
+		items, err = c.conn.List("", "*", &imap.ListOptions{}).Collect()
+	}
 	if err != nil {
 		return nil, fmt.Errorf("LIST: %w", err)
 	}
@@ -294,11 +319,28 @@ func (c *Client) listMailboxesLocked() ([]string, error) {
 		if c.allMailFolder == "" && hasAttr(item.Attrs, imap.MailboxAttrAll) {
 			c.allMailFolder = item.Mailbox
 		}
+		if c.archiveMailbox == "" && hasAttr(item.Attrs, imap.MailboxAttrArchive) {
+			c.archiveMailbox = item.Mailbox
+		}
 		if c.junkMailbox == "" && hasAttr(item.Attrs, imap.MailboxAttrJunk) {
 			c.junkMailbox = item.Mailbox
 		}
+		if c.draftsMailbox == "" && hasAttr(item.Attrs, imap.MailboxAttrDrafts) {
+			c.draftsMailbox = item.Mailbox
+		}
+		if c.sentMailbox == "" && hasAttr(item.Attrs, imap.MailboxAttrSent) {
+			c.sentMailbox = item.Mailbox
+		}
 	}
 
+	c.applyMailboxNameFallbacks(names)
+	c.mailboxCache = names
+	return names, nil
+}
+
+// applyMailboxNameFallbacks detects common system folder names when SPECIAL-USE
+// attributes are absent.
+func (c *Client) applyMailboxNameFallbacks(names []string) {
 	// Fallback: look for common junk/spam folder names
 	if c.junkMailbox == "" {
 		for _, candidate := range []string{
@@ -332,8 +374,66 @@ func (c *Client) listMailboxesLocked() ([]string, error) {
 		}
 	}
 
-	c.mailboxCache = names
-	return names, nil
+	// Fallback: look for common drafts folder names
+	if c.draftsMailbox == "" {
+		for _, candidate := range []string{"Drafts", "Draft", "[Gmail]/Drafts"} {
+			for _, mb := range names {
+				if strings.EqualFold(mb, candidate) {
+					c.draftsMailbox = mb
+					break
+				}
+			}
+			if c.draftsMailbox != "" {
+				break
+			}
+		}
+	}
+
+	// Fallback: look for common archive folder names
+	if c.archiveMailbox == "" {
+		for _, candidate := range []string{"Archive", "Archives", "[Gmail]/All Mail"} {
+			for _, mb := range names {
+				if strings.EqualFold(mb, candidate) {
+					c.archiveMailbox = mb
+					break
+				}
+			}
+			if c.archiveMailbox != "" {
+				break
+			}
+		}
+	}
+
+	// Fallback: look for common sent folder names
+	if c.sentMailbox == "" {
+		for _, candidate := range []string{"Sent Items", "Sent", "Sent Messages", "[Gmail]/Sent Mail"} {
+			for _, mb := range names {
+				if strings.EqualFold(mb, candidate) {
+					c.sentMailbox = mb
+					break
+				}
+			}
+			if c.sentMailbox != "" {
+				break
+			}
+		}
+	}
+}
+
+// draftsMailboxLocked returns the drafts mailbox, preferring RFC 6154 \Drafts.
+// Caller must hold mu.
+func (c *Client) draftsMailboxLocked() (string, error) {
+	if c.draftsMailbox != "" {
+		return c.draftsMailbox, nil
+	}
+	if _, err := c.listMailboxesLocked(); err != nil {
+		return "", err
+	}
+	if c.draftsMailbox != "" {
+		return c.draftsMailbox, nil
+	}
+	c.draftsMailbox = "Drafts"
+	return c.draftsMailbox, nil
 }
 
 // enumerateMailboxSearchCriteria always constrains the search with an
@@ -380,6 +480,38 @@ func addMessageIDsFromHeaderFetchResults(dst map[string]bool, msgs []*imapclient
 			dst[msgID] = true
 		}
 	}
+}
+
+// sentMailboxLocked returns the sent mailbox, preferring RFC 6154 \Sent.
+// Caller must hold mu.
+func (c *Client) sentMailboxLocked() (string, error) {
+	if c.sentMailbox != "" {
+		return c.sentMailbox, nil
+	}
+	if _, err := c.listMailboxesLocked(); err != nil {
+		return "", err
+	}
+	if c.sentMailbox != "" {
+		return c.sentMailbox, nil
+	}
+	c.sentMailbox = "Sent Items"
+	return c.sentMailbox, nil
+}
+
+// archiveMailboxLocked returns the archive mailbox, preferring RFC 6154
+// \Archive. Caller must hold mu.
+func (c *Client) archiveMailboxLocked() (string, error) {
+	if c.archiveMailbox != "" {
+		return c.archiveMailbox, nil
+	}
+	if _, err := c.listMailboxesLocked(); err != nil {
+		return "", err
+	}
+	if c.archiveMailbox != "" {
+		return c.archiveMailbox, nil
+	}
+	c.archiveMailbox = "Archive"
+	return c.archiveMailbox, nil
 }
 
 // enumerateMailbox lists UIDs in a single mailbox. A non-zero minUID
@@ -1073,28 +1205,33 @@ func (c *Client) DeleteMessage(ctx context.Context, messageID string) error {
 		return err
 	}
 	return c.withConn(ctx, func(conn *imapclient.Client) error {
-		if !conn.Caps().Has(imap.CapUIDPlus) {
-			return errors.New("server does not support UIDPLUS; " +
-				"permanent delete requires UID EXPUNGE " +
-				"(use trash instead)")
-		}
-		if err := c.selectMailbox(mailbox); err != nil {
-			return err
-		}
-		var uidSet imap.UIDSet
-		uidSet.AddNum(uid)
-		if err := conn.Store(uidSet, &imap.StoreFlags{
-			Op:     imap.StoreFlagsAdd,
-			Silent: true,
-			Flags:  []imap.Flag{imap.FlagDeleted},
-		}, nil).Close(); err != nil {
-			return fmt.Errorf("UID STORE \\Deleted: %w", err)
-		}
-		if err := conn.UIDExpunge(uidSet).Close(); err != nil {
-			return fmt.Errorf("UID EXPUNGE: %w", err)
-		}
-		return nil
+		return c.deleteUIDLocked(conn, mailbox, uid)
 	})
+}
+
+// deleteUIDLocked permanently deletes one UID. Caller must hold mu.
+func (c *Client) deleteUIDLocked(conn *imapclient.Client, mailbox string, uid imap.UID) error {
+	if !conn.Caps().Has(imap.CapUIDPlus) {
+		return errors.New("server does not support UIDPLUS; " +
+			"permanent delete requires UID EXPUNGE " +
+			"(use trash instead)")
+	}
+	if err := c.selectMailbox(mailbox); err != nil {
+		return err
+	}
+	var uidSet imap.UIDSet
+	uidSet.AddNum(uid)
+	if err := conn.Store(uidSet, &imap.StoreFlags{
+		Op:     imap.StoreFlagsAdd,
+		Silent: true,
+		Flags:  []imap.Flag{imap.FlagDeleted},
+	}, nil).Close(); err != nil {
+		return fmt.Errorf("UID STORE \\Deleted: %w", err)
+	}
+	if err := conn.UIDExpunge(uidSet).Close(); err != nil {
+		return fmt.Errorf("UID EXPUNGE: %w", err)
+	}
+	return nil
 }
 
 // BatchDeleteMessages always returns an error to signal that IMAP
@@ -1120,4 +1257,536 @@ func (c *Client) Close() error {
 		return fmt.Errorf("IMAP logout: %w", err)
 	}
 	return nil
+}
+
+// Draft operations.
+
+func (c *Client) ListDrafts(ctx context.Context, query string, maxResults int) ([]*gmailapi.Draft, error) {
+	ids, err := c.listDraftIDs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	raws, err := c.GetMessagesRawBatch(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+
+	drafts := make([]*gmailapi.Draft, 0, len(raws))
+	for _, raw := range raws {
+		if raw == nil || len(raw.Raw) == 0 {
+			continue
+		}
+		draft, err := draftFromRaw(raw)
+		if err != nil {
+			return nil, err
+		}
+		if !draftMatchesQuery(draft, query) {
+			continue
+		}
+		drafts = append(drafts, draft)
+		if maxResults > 0 && len(drafts) >= maxResults {
+			break
+		}
+	}
+	return drafts, nil
+}
+
+func (c *Client) listDraftIDs(ctx context.Context) ([]string, error) {
+	var ids []string
+	err := c.withConn(ctx, func(conn *imapclient.Client) error {
+		mailbox, err := c.draftsMailboxLocked()
+		if err != nil {
+			return err
+		}
+		if err := c.selectMailbox(mailbox); err != nil {
+			return err
+		}
+		searchData, err := conn.UIDSearch(&imap.SearchCriteria{}, nil).Wait()
+		if err != nil {
+			return fmt.Errorf("UID SEARCH drafts in %q: %w", mailbox, err)
+		}
+		uidSet, ok := searchData.All.(imap.UIDSet)
+		if !ok {
+			return nil
+		}
+		uids, _ := uidSet.Nums()
+		slices.Reverse(uids)
+		ids = make([]string, 0, len(uids))
+		for _, uid := range uids {
+			ids = append(ids, compositeID(mailbox, uid))
+		}
+		return nil
+	})
+	return ids, err
+}
+
+func (c *Client) GetDraft(ctx context.Context, draftID string) (*gmailapi.Draft, error) {
+	raw, err := c.GetMessageRaw(ctx, draftID)
+	if err != nil {
+		return nil, err
+	}
+	return draftFromRaw(raw)
+}
+
+func (c *Client) CreateDraft(ctx context.Context, compose *gmailapi.DraftCompose) (*gmailapi.Draft, error) {
+	raw, err := gmailapi.BuildDraftMIME(compose)
+	if err != nil {
+		return nil, fmt.Errorf("build draft MIME: %w", err)
+	}
+
+	var draft *gmailapi.Draft
+	err = c.withConn(ctx, func(conn *imapclient.Client) error {
+		if !conn.Caps().Has(imap.CapUIDPlus) {
+			return errors.New("server does not support UIDPLUS; create draft requires APPENDUID")
+		}
+
+		mailbox, err := c.draftsMailboxLocked()
+		if err != nil {
+			return err
+		}
+
+		id, err := c.appendMessageLocked(conn, mailbox, raw, []imap.Flag{imap.FlagDraft})
+		if err != nil {
+			return err
+		}
+
+		draft = &gmailapi.Draft{
+			ID: id,
+			Message: gmailapi.DraftMessage{
+				ID:       id,
+				ThreadID: id,
+				LabelIDs: []string{mailbox},
+				To:       slices.Clone(compose.To),
+				Cc:       slices.Clone(compose.Cc),
+				Bcc:      slices.Clone(compose.Bcc),
+				Subject:  compose.Subject,
+				Body:     compose.Body,
+				Date:     time.Now().UnixMilli(),
+			},
+		}
+
+		c.messageListCache = nil
+		c.msgIDToLabels = nil
+		c.seenRFC822IDs = nil
+		return nil
+	})
+	if errors.Is(err, io.ErrShortWrite) {
+		return nil, fmt.Errorf("APPEND draft literal: %w", err)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return draft, nil
+}
+
+// appendMessageLocked appends raw RFC 822 bytes and returns mailbox|UID.
+// Caller must hold mu.
+func (c *Client) appendMessageLocked(
+	conn *imapclient.Client,
+	mailbox string,
+	raw []byte,
+	flags []imap.Flag,
+) (string, error) {
+	if !conn.Caps().Has(imap.CapUIDPlus) {
+		return "", errors.New("server does not support UIDPLUS; append requires APPENDUID")
+	}
+	cmd := conn.Append(mailbox, int64(len(raw)), &imap.AppendOptions{
+		Flags: flags,
+	})
+	n, err := cmd.Write(raw)
+	if err != nil {
+		_ = cmd.Close()
+		return "", fmt.Errorf("APPEND literal to %q: %w", mailbox, err)
+	}
+	if n != len(raw) {
+		_ = cmd.Close()
+		return "", fmt.Errorf("APPEND literal to %q: %w", mailbox, io.ErrShortWrite)
+	}
+	if err := cmd.Close(); err != nil {
+		return "", fmt.Errorf("APPEND literal to %q: %w", mailbox, err)
+	}
+	appendData, err := cmd.Wait()
+	if err != nil {
+		return "", fmt.Errorf("APPEND to %q: %w", mailbox, err)
+	}
+	if appendData == nil || appendData.UID == 0 {
+		return "", errors.New("server did not return APPENDUID; cannot identify appended message")
+	}
+	return compositeID(mailbox, appendData.UID), nil
+}
+
+func (c *Client) UpdateDraft(ctx context.Context, draftID string, compose *gmailapi.DraftCompose) (*gmailapi.Draft, error) {
+	draft, err := c.CreateDraft(ctx, compose)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.DeleteDraft(ctx, draftID); err != nil {
+		return nil, fmt.Errorf("delete old draft %q after append: %w", draftID, err)
+	}
+	return draft, nil
+}
+
+func (c *Client) DeleteDraft(ctx context.Context, draftID string) error {
+	mailbox, uid, err := parseCompositeID(draftID)
+	if err != nil {
+		return err
+	}
+	return c.withConn(ctx, func(conn *imapclient.Client) error {
+		draftsMailbox, err := c.draftsMailboxLocked()
+		if err != nil {
+			return err
+		}
+		if !strings.EqualFold(mailbox, draftsMailbox) {
+			return fmt.Errorf("message %q is in mailbox %q, not drafts mailbox %q", draftID, mailbox, draftsMailbox)
+		}
+		if err := c.deleteUIDLocked(conn, mailbox, uid); err != nil {
+			return err
+		}
+		c.messageListCache = nil
+		c.msgIDToLabels = nil
+		c.seenRFC822IDs = nil
+		return nil
+	})
+}
+
+func (c *Client) SendDraft(ctx context.Context, draftID string) (*gmailapi.SentMessage, error) {
+	raw, err := c.GetMessageRaw(ctx, draftID)
+	if err != nil {
+		return nil, err
+	}
+	draft, err := draftFromRaw(raw)
+	if err != nil {
+		return nil, err
+	}
+	recipients := draftRecipients(draft)
+	if len(recipients) == 0 {
+		return nil, errors.New("draft has no To/Cc/Bcc recipients")
+	}
+	from := c.config.Username
+	if err := c.sendSMTP(ctx, from, recipients, raw.Raw); err != nil {
+		return nil, err
+	}
+
+	draftMailbox, draftUID, err := parseCompositeID(draftID)
+	if err != nil {
+		return nil, err
+	}
+
+	var sent *gmailapi.SentMessage
+	err = c.withConn(ctx, func(conn *imapclient.Client) error {
+		draftsMailbox, err := c.draftsMailboxLocked()
+		if err != nil {
+			return err
+		}
+		if !strings.EqualFold(draftMailbox, draftsMailbox) {
+			return fmt.Errorf("message %q is in mailbox %q, not drafts mailbox %q", draftID, draftMailbox, draftsMailbox)
+		}
+		sentMailbox, err := c.sentMailboxLocked()
+		if err != nil {
+			return err
+		}
+		sentID, err := c.appendMessageLocked(conn, sentMailbox, raw.Raw, []imap.Flag{imap.FlagSeen})
+		if err != nil {
+			return fmt.Errorf("SMTP send succeeded but append to sent mailbox failed: %w", err)
+		}
+		if err := c.deleteUIDLocked(conn, draftMailbox, draftUID); err != nil {
+			return fmt.Errorf("SMTP send and sent append succeeded but delete draft failed: %w", err)
+		}
+		sent = &gmailapi.SentMessage{
+			ID:       sentID,
+			ThreadID: sentID,
+			LabelIDs: []string{sentMailbox},
+		}
+		c.messageListCache = nil
+		c.msgIDToLabels = nil
+		c.seenRFC822IDs = nil
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return sent, nil
+}
+
+func draftRecipients(draft *gmailapi.Draft) []string {
+	seen := make(map[string]bool)
+	var out []string
+	for _, addr := range append(append(slices.Clone(draft.Message.To), draft.Message.Cc...), draft.Message.Bcc...) {
+		key := strings.ToLower(addr)
+		if addr == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, addr)
+	}
+	return out
+}
+
+func (c *Client) sendSMTP(ctx context.Context, from string, to []string, raw []byte) error {
+	if c.smtpSend != nil {
+		return c.smtpSend(ctx, from, to, raw)
+	}
+	if c.tokenSource == nil {
+		return errors.New("SMTP send requires XOAUTH2 token source")
+	}
+	token, err := c.tokenSource(ctx)
+	if err != nil {
+		return fmt.Errorf("get SMTP XOAUTH2 token: %w", err)
+	}
+
+	addr := c.smtpSubmissionAddr()
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("parse SMTP address %q: %w", addr, err)
+	}
+	client, err := smtp.DialStartTLS(addr, &tls.Config{
+		ServerName: host,
+		MinVersion: tls.VersionTLS12,
+	})
+	if err != nil {
+		return fmt.Errorf("connect SMTP %s STARTTLS: %w", addr, err)
+	}
+	defer client.Close()
+
+	if !client.SupportsAuth("XOAUTH2") {
+		return errors.New("SMTP server does not advertise XOAUTH2")
+	}
+	if err := client.Auth(NewXOAuth2Client(c.config.Username, token)); err != nil {
+		return fmt.Errorf("SMTP XOAUTH2 authenticate: %w (ensure SMTP AUTH is enabled for the mailbox/tenant and the account was re-authorized with SMTP.Send)", err)
+	}
+	if err := client.SendMail(from, to, bytes.NewReader(raw)); err != nil {
+		return fmt.Errorf("SMTP send mail: %w", err)
+	}
+	if err := client.Quit(); err != nil {
+		return fmt.Errorf("SMTP quit: %w", err)
+	}
+	return nil
+}
+
+func (c *Client) smtpSubmissionAddr() string {
+	if c.smtpAddr != "" {
+		return c.smtpAddr
+	}
+	host := normalizeHost(c.config.Host)
+	lowerHost := strings.ToLower(host)
+	if strings.Contains(lowerHost, "office365") || strings.Contains(lowerHost, "outlook.office") {
+		return net.JoinHostPort("smtp.office365.com", "587")
+	}
+	if strings.HasPrefix(lowerHost, "imap.") {
+		return net.JoinHostPort("smtp."+host[5:], "587")
+	}
+	return net.JoinHostPort("smtp."+host, "587")
+}
+
+func draftFromRaw(raw *gmailapi.RawMessage) (*gmailapi.Draft, error) {
+	if raw == nil {
+		return nil, errors.New("draft raw message is nil")
+	}
+	parsed, err := msgmime.Parse(raw.Raw)
+	if err != nil {
+		return nil, fmt.Errorf("parse draft MIME %q: %w", raw.ID, err)
+	}
+	body := parsed.BodyText
+	if body == "" {
+		body = parsed.BodyHTML
+	}
+	date := raw.InternalDate
+	if date == 0 && !parsed.Date.IsZero() {
+		date = parsed.Date.UnixMilli()
+	}
+	return &gmailapi.Draft{
+		ID: raw.ID,
+		Message: gmailapi.DraftMessage{
+			ID:       raw.ID,
+			ThreadID: raw.ThreadID,
+			LabelIDs: slices.Clone(raw.LabelIDs),
+			Snippet:  snippet(body),
+			From:     firstAddress(parsed.From),
+			To:       addressList(parsed.To),
+			Cc:       addressList(parsed.Cc),
+			Bcc:      addressList(parsed.Bcc),
+			Subject:  parsed.Subject,
+			Body:     body,
+			Date:     date,
+		},
+	}, nil
+}
+
+func addressList(addrs []msgmime.Address) []string {
+	out := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		if addr.Email != "" {
+			out = append(out, addr.Email)
+		}
+	}
+	return out
+}
+
+func firstAddress(addrs []msgmime.Address) string {
+	if len(addrs) == 0 {
+		return ""
+	}
+	if addrs[0].Name == "" {
+		return addrs[0].Email
+	}
+	return fmt.Sprintf("%s <%s>", addrs[0].Name, addrs[0].Email)
+}
+
+func snippet(body string) string {
+	fields := strings.Fields(body)
+	s := strings.Join(fields, " ")
+	runes := []rune(s)
+	if len(runes) > 160 {
+		return string(runes[:160])
+	}
+	return s
+}
+
+func draftMatchesQuery(draft *gmailapi.Draft, query string) bool {
+	query = strings.TrimSpace(strings.ToLower(query))
+	if query == "" {
+		return true
+	}
+	msg := draft.Message
+	haystack := strings.ToLower(strings.Join(append(
+		[]string{msg.From, msg.Subject, msg.Body},
+		append(append(slices.Clone(msg.To), msg.Cc...), msg.Bcc...)...,
+	), "\n"))
+	return strings.Contains(haystack, query)
+}
+
+// Label operations.
+
+func (c *Client) ModifyMessageLabels(ctx context.Context, messageID string, addLabelIDs, removeLabelIDs []string) error {
+	mailbox, uid, err := parseCompositeID(messageID)
+	if err != nil {
+		return err
+	}
+	ops, err := parseIMAPLabelOps(addLabelIDs, removeLabelIDs)
+	if err != nil {
+		return err
+	}
+	return c.withConn(ctx, func(conn *imapclient.Client) error {
+		if err := c.selectMailbox(mailbox); err != nil {
+			return err
+		}
+		var uidSet imap.UIDSet
+		uidSet.AddNum(uid)
+		if len(ops.addFlags) > 0 {
+			if err := conn.Store(uidSet, &imap.StoreFlags{
+				Op:     imap.StoreFlagsAdd,
+				Silent: true,
+				Flags:  ops.addFlags,
+			}, nil).Close(); err != nil {
+				return fmt.Errorf("UID STORE add flags: %w", err)
+			}
+		}
+		if len(ops.removeFlags) > 0 {
+			if err := conn.Store(uidSet, &imap.StoreFlags{
+				Op:     imap.StoreFlagsDel,
+				Silent: true,
+				Flags:  ops.removeFlags,
+			}, nil).Close(); err != nil {
+				return fmt.Errorf("UID STORE remove flags: %w", err)
+			}
+		}
+		if ops.moveToInbox && !strings.EqualFold(mailbox, "INBOX") {
+			if _, err := conn.Move(uidSet, "INBOX").Wait(); err != nil {
+				return fmt.Errorf("MOVE to INBOX: %w", err)
+			}
+			c.clearMessageCaches()
+		}
+		if ops.archive && strings.EqualFold(mailbox, "INBOX") {
+			archiveMailbox, err := c.archiveMailboxLocked()
+			if err != nil {
+				return err
+			}
+			if _, err := conn.Move(uidSet, archiveMailbox).Wait(); err != nil {
+				return fmt.Errorf("MOVE to %q: %w", archiveMailbox, err)
+			}
+			c.clearMessageCaches()
+		}
+		return nil
+	})
+}
+
+func (c *Client) BatchModifyLabels(ctx context.Context, messageIDs, addLabelIDs, removeLabelIDs []string) error {
+	for _, id := range messageIDs {
+		if err := c.ModifyMessageLabels(ctx, id, addLabelIDs, removeLabelIDs); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *Client) CreateLabel(_ context.Context, _ string) (*gmailapi.Label, error) {
+	return nil, errors.New("IMAP does not support arbitrary Gmail labels; supported system labels are UNREAD, STARRED, and INBOX")
+}
+
+func (c *Client) DeleteLabel(_ context.Context, _ string) error {
+	return errors.New("IMAP does not support deleting arbitrary Gmail labels")
+}
+
+type imapLabelOps struct {
+	addFlags    []imap.Flag
+	removeFlags []imap.Flag
+	moveToInbox bool
+	archive     bool
+}
+
+func parseIMAPLabelOps(addLabelIDs, removeLabelIDs []string) (imapLabelOps, error) {
+	var ops imapLabelOps
+	for _, label := range addLabelIDs {
+		switch normalizeGmailLabel(label) {
+		case "":
+			continue
+		case "UNREAD":
+			ops.removeFlags = appendFlag(ops.removeFlags, imap.FlagSeen)
+		case "STARRED":
+			ops.addFlags = appendFlag(ops.addFlags, imap.FlagFlagged)
+		case "INBOX":
+			ops.moveToInbox = true
+		default:
+			return ops, unsupportedIMAPLabel(label)
+		}
+	}
+	for _, label := range removeLabelIDs {
+		switch normalizeGmailLabel(label) {
+		case "":
+			continue
+		case "UNREAD":
+			ops.addFlags = appendFlag(ops.addFlags, imap.FlagSeen)
+		case "STARRED":
+			ops.removeFlags = appendFlag(ops.removeFlags, imap.FlagFlagged)
+		case "INBOX":
+			ops.archive = true
+		default:
+			return ops, unsupportedIMAPLabel(label)
+		}
+	}
+	if ops.moveToInbox && ops.archive {
+		return ops, errors.New("cannot add and remove INBOX in the same IMAP label operation")
+	}
+	return ops, nil
+}
+
+func normalizeGmailLabel(label string) string {
+	return strings.ToUpper(strings.TrimSpace(label))
+}
+
+func unsupportedIMAPLabel(label string) error {
+	return fmt.Errorf("IMAP label operation %q is unsupported; supported system labels are UNREAD, STARRED, and INBOX", label)
+}
+
+func appendFlag(flags []imap.Flag, flag imap.Flag) []imap.Flag {
+	if slices.Contains(flags, flag) {
+		return flags
+	}
+	return append(flags, flag)
+}
+
+func (c *Client) clearMessageCaches() {
+	c.messageListCache = nil
+	c.msgIDToLabels = nil
+	c.seenRFC822IDs = nil
 }

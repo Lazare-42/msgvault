@@ -11,19 +11,25 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/skip2/go-qrcode"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/export"
+	"go.kenn.io/msgvault/internal/gmail"
+	"go.kenn.io/msgvault/internal/googledocs"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/chunkmatch"
 	"go.kenn.io/msgvault/internal/vector/embed"
 	"go.kenn.io/msgvault/internal/vector/hybrid"
+	whatsapplive "go.kenn.io/msgvault/internal/whatsapp/live"
 )
 
 const (
@@ -43,6 +49,15 @@ const (
 	maxBodyChars = 4000
 	// maxContextSnippets is the maximum number of match excerpts returned for a single message.
 	maxContextSnippets = 5
+
+	defaultGoogleDocsListLimit    = 20
+	defaultGoogleDocsSearchLimit  = 10
+	defaultGoogleDocsSnippetChars = 1000
+	defaultGoogleDocsMaxChars     = 20000
+	maxGoogleDocsListLimit        = 100
+	maxGoogleDocsSearchLimit      = 20
+	maxGoogleDocsSnippetChars     = 4000
+	maxGoogleDocsMaxChars         = 100000
 	// totalCountUnknown is returned when the backend cannot report a full match
 	// count (hybrid/vector ranking depth, or list_messages without a separate
 	// count query). Clients should use has_more for paging.
@@ -102,13 +117,17 @@ func listLimitArg(args map[string]any) int {
 }
 
 type handlers struct {
-	engine           query.Engine
-	attachmentsDir   string
-	attachmentReader AttachmentReader
-	manifestSaver    DeletionManifestSaver
-	hybridSearcher   HybridSearcher
-	similarSearcher  SimilarSearcher
-	dataDir          string
+	engine            query.Engine
+	attachmentsDir    string
+	attachmentReader  AttachmentReader
+	manifestSaver     DeletionManifestSaver
+	hybridSearcher    HybridSearcher
+	similarSearcher   SimilarSearcher
+	dataDir           string
+	gmailFactory      GmailClientFactory
+	whatsAppFactory   WhatsAppClientFactory
+	whatsAppLoginURL  string
+	googleDocsFactory GoogleDocsClientFactory
 
 	// Optional vector-search wiring. When hybridEngine is nil, the
 	// search_message_bodies handler rejects mode=vector and mode=hybrid with
@@ -231,6 +250,36 @@ func translateVectorErr(err error) *mcp.CallToolResult {
 	return nil
 }
 
+type messageSummaryCompact struct {
+	ID                   int64     `json:"id"`
+	SourceMessageID      string    `json:"source_message_id"`
+	ConversationID       int64     `json:"conversation_id"`
+	SourceConversationID string    `json:"source_conversation_id"`
+	Subject              string    `json:"subject"`
+	FromEmail            string    `json:"from_email"`
+	FromName             string    `json:"from_name"`
+	SentAt               time.Time `json:"sent_at"`
+	HasAttachments       bool      `json:"has_attachments"`
+}
+
+func compactMessageSummaries(results []query.MessageSummary) []messageSummaryCompact {
+	out := make([]messageSummaryCompact, len(results))
+	for i, msg := range results {
+		out[i] = messageSummaryCompact{
+			ID:                   msg.ID,
+			SourceMessageID:      msg.SourceMessageID,
+			ConversationID:       msg.ConversationID,
+			SourceConversationID: msg.SourceConversationID,
+			Subject:              msg.Subject,
+			FromEmail:            msg.FromEmail,
+			FromName:             msg.FromName,
+			SentAt:               msg.SentAt,
+			HasAttachments:       msg.HasAttachments,
+		}
+	}
+	return out
+}
+
 // getAccountID looks up a source ID by email address.
 // Returns nil if account is empty (no filter), or an error if not found.
 func (h *handlers) getAccountID(ctx context.Context, account string) (*int64, error) {
@@ -339,6 +388,55 @@ type searchMessageItem struct {
 	Matches          []messageMatch        `json:"matches,omitempty"`
 	MatchesTruncated bool                  `json:"matches_truncated,omitempty"`
 	Score            *hybridScoreBreakdown `json:"score,omitempty"`
+}
+
+// maxDraftAttachmentsSize caps the combined raw size of attachments on a single
+// draft. Gmail rejects messages over ~25MB; base64 inflates content by ~33%, so
+// the raw total must stay below that ceiling.
+const maxDraftAttachmentsSize = 18 * 1024 * 1024
+
+// resolveDraftAttachments loads the attachments named by the comma-separated
+// "attachment_ids" argument from the archive into draft attachments. Returns
+// (nil, nil) when no attachment_ids are provided.
+func (h *handlers) resolveDraftAttachments(ctx context.Context, args map[string]any) ([]gmail.DraftAttachment, error) {
+	raw, _ := args["attachment_ids"].(string)
+	ids := splitCSV(raw)
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	if h.attachmentsDir == "" {
+		return nil, fmt.Errorf("attachments directory not configured")
+	}
+
+	var atts []gmail.DraftAttachment
+	var total int64
+	for _, s := range ids {
+		id, err := strconv.ParseInt(s, 10, 64)
+		if err != nil || id < 1 {
+			return nil, fmt.Errorf("invalid attachment_id %q: must be a positive integer", s)
+		}
+		att, err := h.engine.GetAttachment(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("get attachment %d: %v", id, err)
+		}
+		if att == nil {
+			return nil, fmt.Errorf("attachment %d not found", id)
+		}
+		data, err := h.readAttachmentFile(att.ContentHash)
+		if err != nil {
+			return nil, fmt.Errorf("attachment %d: %v", id, err)
+		}
+		total += int64(len(data))
+		if total > maxDraftAttachmentsSize {
+			return nil, fmt.Errorf("total attachment size exceeds %d bytes", maxDraftAttachmentsSize)
+		}
+		atts = append(atts, gmail.DraftAttachment{
+			Filename:    att.Filename,
+			ContentType: att.MimeType,
+			Content:     data,
+		})
+	}
+	return atts, nil
 }
 
 // searchMessages preserves the legacy combined search tool while clients
@@ -1644,7 +1742,13 @@ func (h *handlers) listMessages(ctx context.Context, req mcp.CallToolRequest) (*
 		results = results[:pageLimit]
 	}
 
-	return jsonResult(newPaginatedResponseNoTotal(results, offset, hasMore))
+	if full, _ := args["full"].(bool); full {
+		return jsonResult(newPaginatedResponseNoTotal(results, offset, hasMore))
+	}
+
+	// Compact summaries are the default for MCP to keep common mailbox lookups
+	// cheap in both tokens and latency.
+	return jsonResult(newPaginatedResponseNoTotal(compactMessageSummaries(results), offset, hasMore))
 }
 
 // getStatsResponse is the JSON body returned by the get_stats MCP tool.
@@ -1765,6 +1869,14 @@ func jsonResult(v any) (*mcp.CallToolResult, error) {
 		return mcp.NewToolResultError(fmt.Sprintf("marshal error: %v", err)), nil
 	}
 	return mcp.NewToolResultText(string(data)), nil
+}
+
+func structuredJSONResult(v any) (*mcp.CallToolResult, error) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("marshal error: %v", err)), nil
+	}
+	return mcp.NewToolResultStructured(v, string(data)), nil
 }
 
 // maxStageDeletionResults limits how many messages can be staged in one call.
@@ -1987,4 +2099,948 @@ func (h *handlers) searchByDomains(ctx context.Context, req mcp.CallToolRequest)
 	}
 
 	return jsonResult(results)
+}
+
+// --- WhatsApp handlers ---
+
+func (h *handlers) getWhatsAppClient(ctx context.Context, args map[string]any) (whatsapplive.Client, string, error) {
+	if h.whatsAppFactory == nil {
+		return nil, "", fmt.Errorf("WhatsApp live client not configured")
+	}
+
+	account, _ := args["account"].(string)
+	account = strings.TrimSpace(account)
+
+	accounts, err := h.engine.ListAccounts(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to list accounts: %w", err)
+	}
+	whatsAppAccounts := make([]query.AccountInfo, 0, len(accounts))
+	for _, acc := range accounts {
+		if acc.SourceType == store.WhatsAppSourceType {
+			whatsAppAccounts = append(whatsAppAccounts, acc)
+		}
+	}
+
+	if account == "" {
+		switch len(whatsAppAccounts) {
+		case 0:
+			// Allow the live client to report pairing status before the first
+			// archive source has been created.
+		case 1:
+			account = whatsAppAccounts[0].Identifier
+		default:
+			return nil, "", fmt.Errorf("multiple WhatsApp accounts configured, specify 'account' parameter")
+		}
+	} else if len(whatsAppAccounts) > 0 {
+		found := false
+		for _, acc := range whatsAppAccounts {
+			if acc.Identifier == account {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return nil, "", fmt.Errorf("WhatsApp account not found: %s", account)
+		}
+	}
+
+	client, err := h.whatsAppFactory(ctx, account)
+	if err != nil {
+		return nil, "", fmt.Errorf("open WhatsApp client: %w", err)
+	}
+	return client, account, nil
+}
+
+func (h *handlers) whatsAppStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	client, _, err := h.getWhatsAppClient(ctx, req.GetArguments())
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	status, err := client.Status(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("whatsapp status: %v", err)), nil
+	}
+	status.ApplyDerived()
+	return jsonResult(status)
+}
+
+type whatsappLoginClient interface {
+	StartLogin(ctx context.Context) (whatsapplive.LoginState, error)
+	LoginState(ctx context.Context) (whatsapplive.LoginState, error)
+}
+
+type whatsAppLoginResponse struct {
+	whatsapplive.LoginState
+	QRCode         string `json:"qr_code,omitempty"`
+	QRPNGBase64    string `json:"qr_png_base64,omitempty"`
+	QRPageURL      string `json:"qr_page_url,omitempty"`
+	PollAfterSecs  int    `json:"poll_after_secs,omitempty"`
+	Ready          bool   `json:"ready"`
+	AlreadyPaired  bool   `json:"already_paired"`
+	NeedsPairing   bool   `json:"needs_pairing"`
+	NeedsReconnect bool   `json:"needs_reconnect"`
+	NeedsAuth      bool   `json:"needs_authentication"`
+}
+
+func (h *handlers) whatsAppStartLogin(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	loginClient, state, err := h.getWhatsAppLoginClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	state, err = loginClient.StartLogin(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("start whatsapp login: %v", err)), nil
+	}
+
+	waitMS := boundedIntArg(args, "wait_ms", 3000, 15000)
+	if waitMS > 0 {
+		state, err = waitForWhatsAppLoginCode(ctx, loginClient, state, time.Duration(waitMS)*time.Millisecond)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("wait for whatsapp login QR: %v", err)), nil
+		}
+	}
+	return structuredJSONResult(h.whatsAppLoginResponse(state, includeQRPNG(args)))
+}
+
+func (h *handlers) whatsAppLoginStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	loginClient, state, err := h.getWhatsAppLoginClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	state, err = loginClient.LoginState(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("whatsapp login status: %v", err)), nil
+	}
+	return structuredJSONResult(h.whatsAppLoginResponse(state, includeQRPNG(args)))
+}
+
+func (h *handlers) whatsAppLogout(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	confirm, _ := args["confirm"].(bool)
+	if !confirm {
+		return mcp.NewToolResultError("confirm=true is required to log out WhatsApp and clear local pairing state"), nil
+	}
+	forceLocal := true
+	if v, ok := args["force_local"].(bool); ok {
+		forceLocal = v
+	}
+	client, account, err := h.getWhatsAppClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	result, err := client.Logout(ctx, whatsapplive.LogoutRequest{
+		Account:    account,
+		ForceLocal: forceLocal,
+	})
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("whatsapp logout: %v", err)), nil
+	}
+	return structuredJSONResult(result)
+}
+
+func (h *handlers) getWhatsAppLoginClient(ctx context.Context, args map[string]any) (whatsappLoginClient, whatsapplive.LoginState, error) {
+	client, _, err := h.getWhatsAppClient(ctx, args)
+	if err != nil {
+		return nil, whatsapplive.LoginState{}, err
+	}
+	loginClient, ok := client.(whatsappLoginClient)
+	if !ok {
+		return nil, whatsapplive.LoginState{}, fmt.Errorf("WhatsApp live client does not support MCP login")
+	}
+	state, err := loginClient.LoginState(ctx)
+	if err != nil {
+		return nil, whatsapplive.LoginState{}, err
+	}
+	return loginClient, state, nil
+}
+
+func waitForWhatsAppLoginCode(ctx context.Context, client whatsappLoginClient, state whatsapplive.LoginState, wait time.Duration) (whatsapplive.LoginState, error) {
+	state.Status.ApplyDerived()
+	if wait <= 0 || state.Status.IsReady() || state.Pairing.Code != "" || state.Pairing.Error != "" || (!state.Status.Paired && !state.Pairing.Active) {
+		return state, nil
+	}
+	deadline := time.NewTimer(wait)
+	defer deadline.Stop()
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return state, ctx.Err()
+		case <-deadline.C:
+			return state, nil
+		case <-ticker.C:
+			next, err := client.LoginState(ctx)
+			if err != nil {
+				return state, err
+			}
+			state = next
+			state.Status.ApplyDerived()
+			if state.Status.IsReady() || state.Pairing.Code != "" || state.Pairing.Error != "" || (!state.Status.Paired && !state.Pairing.Active) {
+				return state, nil
+			}
+		}
+	}
+}
+
+func (h *handlers) whatsAppLoginResponse(state whatsapplive.LoginState, includePNG bool) whatsAppLoginResponse {
+	state.Status.ApplyDerived()
+	ready := state.Status.IsReady()
+	resp := whatsAppLoginResponse{
+		LoginState:     state,
+		QRCode:         state.Pairing.Code,
+		QRPageURL:      h.whatsAppLoginURL,
+		PollAfterSecs:  5,
+		Ready:          ready,
+		AlreadyPaired:  state.Status.Paired,
+		NeedsPairing:   !state.Status.Paired,
+		NeedsReconnect: state.Status.Paired && !ready,
+		NeedsAuth:      state.Status.Paired && !state.Status.LoggedIn,
+	}
+	if ready {
+		resp.PollAfterSecs = 0
+	}
+	if includePNG && state.Pairing.Code != "" && !state.Status.Paired {
+		if png, err := qrcode.Encode(state.Pairing.Code, qrcode.Medium, 320); err == nil {
+			resp.QRPNGBase64 = base64.StdEncoding.EncodeToString(png)
+		}
+	}
+	return resp
+}
+
+func includeQRPNG(args map[string]any) bool {
+	v, ok := args["include_qr_png"].(bool)
+	return !ok || v
+}
+
+func requireWhatsAppReady(ctx context.Context, client whatsapplive.Client) error {
+	status, err := client.Status(ctx)
+	if err != nil {
+		return fmt.Errorf("whatsapp status: %w", err)
+	}
+	status.ApplyDerived()
+	if !status.IsReady() {
+		return fmt.Errorf(
+			"whatsapp is not ready: paired=%t connected=%t logged_in=%t; run whatsapp_start_login and wait for ready=true before sending",
+			status.Paired,
+			status.Connected,
+			status.LoggedIn,
+		)
+	}
+	return nil
+}
+
+func (h *handlers) sendWhatsAppMessage(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	client, account, err := h.getWhatsAppClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	chatID, _ := args["chat_id"].(string)
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return mcp.NewToolResultError("chat_id parameter is required"), nil
+	}
+	body, _ := args["body"].(string)
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return mcp.NewToolResultError("body parameter is required"), nil
+	}
+	localRequestID, _ := args["local_request_id"].(string)
+	var mentions []string
+	if raw, ok := args["mentions"].([]any); ok {
+		for _, m := range raw {
+			if s, ok := m.(string); ok {
+				if s = strings.TrimSpace(s); s != "" {
+					mentions = append(mentions, s)
+				}
+			}
+		}
+	}
+	if err := requireWhatsAppReady(ctx, client); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	result, err := client.SendMessage(ctx, whatsapplive.SendMessageRequest{
+		Account:        account,
+		ChatID:         chatID,
+		Body:           body,
+		LocalRequestID: strings.TrimSpace(localRequestID),
+		Mentions:       mentions,
+	})
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("send whatsapp message: %v", err)), nil
+	}
+	return jsonResult(result)
+}
+
+func (h *handlers) sendWhatsAppReaction(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	client, account, err := h.getWhatsAppClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	messageID, err := getIDArg(args, "message_id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	emojiRaw, ok := args["emoji"]
+	if !ok {
+		return mcp.NewToolResultError("emoji parameter is required; use an empty string to clear"), nil
+	}
+	emoji, ok := emojiRaw.(string)
+	if !ok {
+		return mcp.NewToolResultError("emoji must be a string"), nil
+	}
+	localRequestID, _ := args["local_request_id"].(string)
+	if err := requireWhatsAppReady(ctx, client); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	result, err := client.SendReaction(ctx, whatsapplive.SendReactionRequest{
+		Account:        account,
+		MessageID:      messageID,
+		Emoji:          emoji,
+		LocalRequestID: strings.TrimSpace(localRequestID),
+	})
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("send whatsapp reaction: %v", err)), nil
+	}
+	return jsonResult(result)
+}
+
+// --- Google Docs handlers ---
+
+type googleDocsSearchResult struct {
+	googledocs.File
+	Snippet       string `json:"snippet"`
+	TextLength    int    `json:"text_length"`
+	TextTruncated bool   `json:"text_truncated"`
+}
+
+func (h *handlers) getGoogleDocsClient(ctx context.Context) (googledocs.Client, error) {
+	if h.googleDocsFactory == nil {
+		return nil, fmt.Errorf("Google Docs API not configured")
+	}
+	client, err := h.googleDocsFactory(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("open Google Docs client: %w", err)
+	}
+	return client, nil
+}
+
+func (h *handlers) listGoogleDocs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	client, err := h.getGoogleDocsClient(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	files, err := client.ListDocs(
+		ctx,
+		optionalStringArg(args, "source"),
+		optionalStringArg(args, "query"),
+		boundedIntArg(args, "limit", defaultGoogleDocsListLimit, maxGoogleDocsListLimit),
+	)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("list Google Docs: %v", err)), nil
+	}
+	return jsonResult(files)
+}
+
+func (h *handlers) searchGoogleDocs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	query, err := requiredTrimmedStringArg(args, "query")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	client, err := h.getGoogleDocsClient(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	limit := boundedIntArg(args, "limit", defaultGoogleDocsSearchLimit, maxGoogleDocsSearchLimit)
+	snippetChars := boundedIntArg(args, "snippet_chars", defaultGoogleDocsSnippetChars, maxGoogleDocsSnippetChars)
+	files, err := client.ListDocs(ctx, optionalStringArg(args, "source"), query, limit)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("search Google Docs: %v", err)), nil
+	}
+	results := make([]googleDocsSearchResult, 0, len(files))
+	for _, file := range files {
+		doc, err := client.GetDoc(ctx, file.Source, file.DocumentID, maxGoogleDocsMaxChars)
+		if err != nil {
+			return mcp.NewToolResultError(fmt.Sprintf("get Google Doc %s: %v", file.DocumentID, err)), nil
+		}
+		results = append(results, googleDocsSearchResult{
+			File:          file,
+			Snippet:       googleDocsSnippet(doc.Text, query, snippetChars),
+			TextLength:    doc.TextLength,
+			TextTruncated: doc.TextTruncated,
+		})
+	}
+	return jsonResult(results)
+}
+
+func (h *handlers) getGoogleDoc(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	documentID, err := requiredTrimmedStringArg(args, "document_id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	client, err := h.getGoogleDocsClient(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	doc, err := client.GetDoc(
+		ctx,
+		optionalStringArg(args, "source"),
+		documentID,
+		boundedIntArg(args, "max_chars", defaultGoogleDocsMaxChars, maxGoogleDocsMaxChars),
+	)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("get Google Doc: %v", err)), nil
+	}
+	return jsonResult(doc)
+}
+
+func (h *handlers) appendGoogleDocText(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	documentID, err := requiredTrimmedStringArg(args, "document_id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	text, err := requiredStringArg(args, "text")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	client, err := h.getGoogleDocsClient(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	result, err := client.AppendText(ctx, optionalStringArg(args, "source"), documentID, text)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("append Google Doc text: %v", err)), nil
+	}
+	return jsonResult(result)
+}
+
+func (h *handlers) replaceGoogleDocText(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	documentID, err := requiredTrimmedStringArg(args, "document_id")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	find, err := requiredStringArg(args, "find")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	replacement, err := requiredStringArgAllowEmpty(args, "replacement")
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	matchCase, _ := args["match_case"].(bool)
+	client, err := h.getGoogleDocsClient(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	result, err := client.ReplaceText(ctx, optionalStringArg(args, "source"), documentID, find, replacement, matchCase)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("replace Google Doc text: %v", err)), nil
+	}
+	return jsonResult(result)
+}
+
+func optionalStringArg(args map[string]any, key string) string {
+	v, _ := args[key].(string)
+	return strings.TrimSpace(v)
+}
+
+func requiredTrimmedStringArg(args map[string]any, key string) (string, error) {
+	v, err := requiredStringArg(args, key)
+	if err != nil {
+		return "", err
+	}
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return "", fmt.Errorf("%s parameter is required", key)
+	}
+	return v, nil
+}
+
+func requiredStringArg(args map[string]any, key string) (string, error) {
+	v, ok := args[key].(string)
+	if !ok || v == "" {
+		return "", fmt.Errorf("%s parameter is required", key)
+	}
+	return v, nil
+}
+
+func requiredStringArgAllowEmpty(args map[string]any, key string) (string, error) {
+	v, ok := args[key].(string)
+	if !ok {
+		return "", fmt.Errorf("%s parameter is required", key)
+	}
+	return v, nil
+}
+
+func boundedIntArg(args map[string]any, key string, def, maxValue int) int {
+	v := limitArg(args, key, def)
+	if v <= 0 {
+		return def
+	}
+	return min(v, maxValue)
+}
+
+func googleDocsSnippet(text, query string, maxChars int) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	maxChars = min(max(maxChars, 1), maxGoogleDocsSnippetChars)
+	runes := []rune(text)
+	if len(runes) <= maxChars {
+		return text
+	}
+	needle := strings.ToLower(strings.TrimSpace(query))
+	startRune := 0
+	if needle != "" {
+		if idx := strings.Index(strings.ToLower(text), needle); idx >= 0 {
+			startRune = utf8.RuneCountInString(text[:idx]) - maxChars/4
+			if startRune < 0 {
+				startRune = 0
+			}
+		}
+	}
+	endRune := min(len(runes), startRune+maxChars)
+	snippet := string(runes[startRune:endRune])
+	if startRune > 0 {
+		snippet = "..." + snippet
+	}
+	if endRune < len(runes) {
+		snippet += "..."
+	}
+	return snippet
+}
+
+// --- Draft handlers ---
+
+// getGmailClient resolves the account email and returns an authenticated Gmail client.
+// The caller must close the returned client.
+func (h *handlers) getGmailClient(ctx context.Context, args map[string]any) (*gmail.Client, string, error) {
+	if h.gmailFactory == nil {
+		return nil, "", fmt.Errorf("Gmail API not configured (OAuth credentials needed)")
+	}
+
+	account, _ := args["account"].(string)
+	if account == "" {
+		// If no account specified, try to use the first/only account
+		accounts, err := h.engine.ListAccounts(ctx)
+		if err != nil {
+			return nil, "", fmt.Errorf("failed to list accounts: %w", err)
+		}
+		if len(accounts) == 0 {
+			return nil, "", fmt.Errorf("no accounts configured")
+		}
+		if len(accounts) > 1 {
+			return nil, "", fmt.Errorf("multiple accounts configured, specify 'account' parameter (use get_stats to list accounts)")
+		}
+		account = accounts[0].Identifier
+	}
+
+	client, err := h.gmailFactory(ctx, account)
+	if err != nil {
+		return nil, "", fmt.Errorf("authenticate %s: %w", account, err)
+	}
+
+	return client, account, nil
+}
+
+func (h *handlers) listDrafts(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	client, _, err := h.getGmailClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	defer client.Close()
+
+	queryStr, _ := args["query"].(string)
+	limit := limitArg(args, "limit", 20)
+
+	drafts, err := client.ListDrafts(ctx, queryStr, limit)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("list drafts: %v", err)), nil
+	}
+
+	// Return a compact summary
+	type draftSummary struct {
+		DraftID string   `json:"draft_id"`
+		Subject string   `json:"subject"`
+		To      []string `json:"to,omitempty"`
+		Snippet string   `json:"snippet"`
+		BodyLen int      `json:"body_length"`
+	}
+
+	summaries := make([]draftSummary, len(drafts))
+	for i, d := range drafts {
+		summaries[i] = draftSummary{
+			DraftID: d.ID,
+			Subject: d.Message.Subject,
+			To:      d.Message.To,
+			Snippet: d.Message.Snippet,
+			BodyLen: len(d.Message.Body),
+		}
+	}
+
+	return jsonResult(summaries)
+}
+
+func (h *handlers) getDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	client, _, err := h.getGmailClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	defer client.Close()
+
+	draftID, _ := args["draft_id"].(string)
+	if draftID == "" {
+		return mcp.NewToolResultError("draft_id parameter is required"), nil
+	}
+
+	draft, err := client.GetDraft(ctx, draftID)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("get draft: %v", err)), nil
+	}
+
+	return jsonResult(draft)
+}
+
+func (h *handlers) createDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	client, _, err := h.getGmailClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	defer client.Close()
+
+	body, _ := args["body"].(string)
+	if body == "" {
+		return mcp.NewToolResultError("body parameter is required"), nil
+	}
+
+	compose := &gmail.DraftCompose{
+		Body: body,
+	}
+
+	if v, _ := args["to"].(string); v != "" {
+		compose.To = splitCSV(v)
+	}
+	if v, _ := args["cc"].(string); v != "" {
+		compose.Cc = splitCSV(v)
+	}
+	if v, _ := args["bcc"].(string); v != "" {
+		compose.Bcc = splitCSV(v)
+	}
+	if v, _ := args["subject"].(string); v != "" {
+		compose.Subject = v
+	}
+	if v, _ := args["content_type"].(string); v != "" {
+		compose.ContentType = v
+	}
+	if v, _ := args["thread_id"].(string); v != "" {
+		compose.ThreadID = v
+	}
+	if v, _ := args["in_reply_to"].(string); v != "" {
+		compose.InReplyTo = v
+	}
+	if v, _ := args["references"].(string); v != "" {
+		compose.References = v
+	}
+
+	atts, err := h.resolveDraftAttachments(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	compose.Attachments = atts
+
+	draft, err := client.CreateDraft(ctx, compose)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("create draft: %v", err)), nil
+	}
+
+	resp := struct {
+		DraftID     string `json:"draft_id"`
+		Subject     string `json:"subject"`
+		Attachments int    `json:"attachments"`
+		NextStep    string `json:"next_step"`
+	}{
+		DraftID:     draft.ID,
+		Subject:     draft.Message.Subject,
+		Attachments: len(atts),
+		NextStep:    "Use send_draft to send, update_draft to modify, or delete_draft to discard",
+	}
+
+	return jsonResult(resp)
+}
+
+func (h *handlers) updateDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	client, _, err := h.getGmailClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	defer client.Close()
+
+	draftID, _ := args["draft_id"].(string)
+	if draftID == "" {
+		return mcp.NewToolResultError("draft_id parameter is required"), nil
+	}
+
+	body, _ := args["body"].(string)
+	if body == "" {
+		return mcp.NewToolResultError("body parameter is required"), nil
+	}
+
+	compose := &gmail.DraftCompose{
+		Body: body,
+	}
+
+	if v, _ := args["to"].(string); v != "" {
+		compose.To = splitCSV(v)
+	}
+	if v, _ := args["cc"].(string); v != "" {
+		compose.Cc = splitCSV(v)
+	}
+	if v, _ := args["bcc"].(string); v != "" {
+		compose.Bcc = splitCSV(v)
+	}
+	if v, _ := args["subject"].(string); v != "" {
+		compose.Subject = v
+	}
+	if v, _ := args["content_type"].(string); v != "" {
+		compose.ContentType = v
+	}
+	if v, _ := args["thread_id"].(string); v != "" {
+		compose.ThreadID = v
+	}
+	if v, _ := args["in_reply_to"].(string); v != "" {
+		compose.InReplyTo = v
+	}
+	if v, _ := args["references"].(string); v != "" {
+		compose.References = v
+	}
+
+	atts, err := h.resolveDraftAttachments(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	compose.Attachments = atts
+
+	draft, err := client.UpdateDraft(ctx, draftID, compose)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("update draft: %v", err)), nil
+	}
+
+	return jsonResult(struct {
+		DraftID string `json:"draft_id"`
+		Subject string `json:"subject"`
+		Status  string `json:"status"`
+	}{
+		DraftID: draft.ID,
+		Subject: draft.Message.Subject,
+		Status:  "updated",
+	})
+}
+
+func (h *handlers) deleteDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	client, _, err := h.getGmailClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	defer client.Close()
+
+	draftID, _ := args["draft_id"].(string)
+	if draftID == "" {
+		return mcp.NewToolResultError("draft_id parameter is required"), nil
+	}
+
+	if err := client.DeleteDraft(ctx, draftID); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("delete draft: %v", err)), nil
+	}
+
+	return jsonResult(struct {
+		DraftID string `json:"draft_id"`
+		Status  string `json:"status"`
+	}{
+		DraftID: draftID,
+		Status:  "deleted",
+	})
+}
+
+func (h *handlers) sendDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	client, _, err := h.getGmailClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	defer client.Close()
+
+	draftID, _ := args["draft_id"].(string)
+	if draftID == "" {
+		return mcp.NewToolResultError("draft_id parameter is required"), nil
+	}
+
+	sent, err := client.SendDraft(ctx, draftID)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("send draft: %v", err)), nil
+	}
+
+	return jsonResult(struct {
+		MessageID string   `json:"message_id"`
+		ThreadID  string   `json:"thread_id"`
+		LabelIDs  []string `json:"label_ids"`
+		Status    string   `json:"status"`
+	}{
+		MessageID: sent.ID,
+		ThreadID:  sent.ThreadID,
+		LabelIDs:  sent.LabelIDs,
+		Status:    "sent",
+	})
+}
+
+// --- Label handlers ---
+
+func (h *handlers) modifyLabels(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	client, _, err := h.getGmailClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	defer client.Close()
+
+	messageIDsStr, _ := args["message_ids"].(string)
+	if messageIDsStr == "" {
+		return mcp.NewToolResultError("message_ids parameter is required"), nil
+	}
+
+	addLabelsStr, _ := args["add_labels"].(string)
+	removeLabelsStr, _ := args["remove_labels"].(string)
+
+	if addLabelsStr == "" && removeLabelsStr == "" {
+		return mcp.NewToolResultError("at least one of add_labels or remove_labels is required"), nil
+	}
+
+	messageIDs := splitCSV(messageIDsStr)
+	addLabelIDs := splitCSV(addLabelsStr)
+	removeLabelIDs := splitCSV(removeLabelsStr)
+
+	if len(messageIDs) > 1 {
+		err = client.BatchModifyLabels(ctx, messageIDs, addLabelIDs, removeLabelIDs)
+	} else {
+		err = client.ModifyMessageLabels(ctx, messageIDs[0], addLabelIDs, removeLabelIDs)
+	}
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("modify labels: %v", err)), nil
+	}
+
+	return jsonResult(struct {
+		MessageCount int      `json:"message_count"`
+		Added        []string `json:"added_labels,omitempty"`
+		Removed      []string `json:"removed_labels,omitempty"`
+		Status       string   `json:"status"`
+	}{
+		MessageCount: len(messageIDs),
+		Added:        addLabelIDs,
+		Removed:      removeLabelIDs,
+		Status:       "modified",
+	})
+}
+
+func (h *handlers) createLabel(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	client, _, err := h.getGmailClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	defer client.Close()
+
+	name, _ := args["name"].(string)
+	if name == "" {
+		return mcp.NewToolResultError("name parameter is required"), nil
+	}
+
+	label, err := client.CreateLabel(ctx, name)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("create label: %v", err)), nil
+	}
+
+	return jsonResult(label)
+}
+
+func (h *handlers) deleteLabel(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	client, _, err := h.getGmailClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	defer client.Close()
+
+	labelID, _ := args["label_id"].(string)
+	if labelID == "" {
+		return mcp.NewToolResultError("label_id parameter is required"), nil
+	}
+
+	if err := client.DeleteLabel(ctx, labelID); err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("delete label: %v", err)), nil
+	}
+
+	return jsonResult(struct {
+		LabelID string `json:"label_id"`
+		Status  string `json:"status"`
+	}{
+		LabelID: labelID,
+		Status:  "deleted",
+	})
+}
+
+func (h *handlers) listGmailLabels(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+
+	client, _, err := h.getGmailClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	defer client.Close()
+
+	labels, err := client.ListLabels(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("list labels: %v", err)), nil
+	}
+
+	return jsonResult(labels)
+}
+
+// splitCSV splits a comma-separated string into trimmed parts.
+func splitCSV(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
 }

@@ -113,8 +113,10 @@ func TestIsPersonalMicrosoftAccount(t *testing.T) {
 func TestScopesForEmail(t *testing.T) {
 	orgScopes := scopesForEmail("user@company.com")
 	assert.Equal(t, ScopeIMAPOrg, orgScopes[0], "org scope")
+	assert.Equal(t, ScopeSMTPOrg, orgScopes[1], "org SMTP scope")
 	personalScopes := scopesForEmail("user@hotmail.com")
 	assert.Equal(t, ScopeIMAPPersonal, personalScopes[0], "personal scope")
+	assert.Equal(t, ScopeSMTPPersonal, personalScopes[1], "personal SMTP scope")
 }
 
 func TestSanitizeEmail(t *testing.T) {
@@ -362,9 +364,11 @@ func TestAuthorize_ScopeCorrection(t *testing.T) {
 		case 1:
 			// First call: should have org scope (domain-based guess).
 			assert.Equal(ScopeIMAPOrg, scopes[0], "first call scope")
+			assert.Equal(ScopeSMTPOrg, scopes[1], "first call SMTP scope")
 		case 2:
 			// Second call: should have personal scope (corrected via tid).
 			assert.Equal(ScopeIMAPPersonal, scopes[0], "second call scope")
+			assert.Equal(ScopeSMTPPersonal, scopes[1], "second call SMTP scope")
 		}
 		tok := (&oauth2.Token{
 			AccessToken:  "access-token",
@@ -383,6 +387,7 @@ func TestAuthorize_ScopeCorrection(t *testing.T) {
 	require.NoError(err)
 	require.NotEmpty(tf.Scopes, "saved scopes should not be empty")
 	assert.Equal(ScopeIMAPPersonal, tf.Scopes[0], "saved scopes[0]")
+	assert.Contains(tf.Scopes, ScopeSMTPPersonal, "saved scopes include SMTP")
 }
 
 func TestAuthorize_NoScopeCorrection(t *testing.T) {
@@ -406,6 +411,7 @@ func TestAuthorize_NoScopeCorrection(t *testing.T) {
 		callCount++
 		// Should already have personal scope.
 		assert.Equal(ScopeIMAPPersonal, scopes[0], "initial scope")
+		assert.Equal(ScopeSMTPPersonal, scopes[1], "initial SMTP scope")
 		idToken := makeIDToken(t, map[string]any{
 			"email": "user@outlook.com",
 			"tid":   consumerTID,
@@ -427,6 +433,7 @@ func TestAuthorize_NoScopeCorrection(t *testing.T) {
 	require.NoError(err)
 	require.NotEmpty(tf.Scopes, "saved scopes should not be empty")
 	assert.Equal(ScopeIMAPPersonal, tf.Scopes[0], "saved scopes[0]")
+	assert.Contains(tf.Scopes, ScopeSMTPPersonal, "saved scopes include SMTP")
 }
 
 func TestAuthorize_PersistsTenantID(t *testing.T) {
@@ -496,7 +503,7 @@ func TestTokenSource_CorrectScopeSucceeds(t *testing.T) {
 		RefreshToken: "refresh-token",
 		TokenType:    "Bearer",
 	}
-	require.NoError(t, m.saveToken("user@outlook.com", token, []string{ScopeIMAPPersonal, "offline_access"}, MicrosoftConsumerTenantID))
+	require.NoError(t, m.saveToken("user@outlook.com", token, []string{ScopeIMAPPersonal, ScopeSMTPPersonal, "offline_access"}, MicrosoftConsumerTenantID))
 
 	ts, err := m.TokenSource(t.Context(), "user@outlook.com")
 	require.NoError(t, err)
@@ -551,7 +558,7 @@ func TestTokenSource_PersistedTenantOverridesManager(t *testing.T) {
 		RefreshToken: "refresh-token",
 		TokenType:    "Bearer",
 	}
-	require.NoError(t, m.saveToken("user@company.com", token, []string{ScopeIMAPOrg, "offline_access"}, "my-org-tenant"))
+	require.NoError(t, m.saveToken("user@company.com", token, []string{ScopeIMAPOrg, ScopeSMTPOrg, "offline_access"}, "my-org-tenant"))
 
 	// TokenSource should succeed and use "my-org-tenant", not "common".
 	ts, err := m.TokenSource(t.Context(), "user@company.com")
@@ -573,7 +580,7 @@ func TestTokenSource_ConcurrentAccess(t *testing.T) {
 		RefreshToken: "refresh-token",
 		TokenType:    "Bearer",
 	}
-	require.NoError(t, m.saveToken("user@outlook.com", token, []string{ScopeIMAPPersonal, "offline_access"}, MicrosoftConsumerTenantID))
+	require.NoError(t, m.saveToken("user@outlook.com", token, []string{ScopeIMAPPersonal, ScopeSMTPPersonal, "offline_access"}, MicrosoftConsumerTenantID))
 
 	fn, err := m.TokenSource(t.Context(), "user@outlook.com")
 	require.NoError(t, err)
@@ -768,7 +775,7 @@ func TestTokenSource_RespectsCallCtxCancellation(t *testing.T) {
 		RefreshToken: "refresh-token",
 		TokenType:    "Bearer",
 	}
-	require.NoError(t, m.saveToken("user@outlook.com", token, []string{ScopeIMAPPersonal, "offline_access"}, MicrosoftConsumerTenantID))
+	require.NoError(t, m.saveToken("user@outlook.com", token, []string{ScopeIMAPPersonal, ScopeSMTPPersonal, "offline_access"}, MicrosoftConsumerTenantID))
 
 	fn, err := m.TokenSource(t.Context(), "user@outlook.com")
 	require.NoError(t, err)
@@ -864,7 +871,7 @@ func TestTokenSource_PreMigrationTokenGetsTenantBinding(t *testing.T) {
 		RefreshToken: "refresh-token",
 		TokenType:    "Bearer",
 	}
-	require.NoError(t, m.saveToken("user@company.com", token, []string{ScopeIMAPOrg, "offline_access"}, ""))
+	require.NoError(t, m.saveToken("user@company.com", token, []string{ScopeIMAPOrg, ScopeSMTPOrg, "offline_access"}, ""))
 
 	// TokenSource should succeed: the tenant gets bound internally.
 	// If scope validation kicked in and found a mismatch it would error.

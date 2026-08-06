@@ -22,6 +22,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/export"
+	"go.kenn.io/msgvault/internal/googledocs"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/query/querytest"
 	"go.kenn.io/msgvault/internal/search"
@@ -29,6 +30,7 @@ import (
 	"go.kenn.io/msgvault/internal/testutil/storetest"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/hybrid"
+	whatsapplive "go.kenn.io/msgvault/internal/whatsapp/live"
 )
 
 // stubEmbedder is an EmbeddingClient placeholder for tests where the
@@ -60,6 +62,65 @@ func (f similarSearcherFunc) FindSimilar(ctx context.Context, req SimilarSearchR
 
 // toolHandler is the function signature for MCP tool handler methods.
 type toolHandler func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error)
+
+type mockWhatsAppClient struct {
+	status       whatsapplive.Status
+	loginState   whatsapplive.LoginState
+	startLogin   func(context.Context) (whatsapplive.LoginState, error)
+	logout       func(context.Context, whatsapplive.LogoutRequest) (whatsapplive.LogoutResult, error)
+	sendMessage  func(context.Context, whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error)
+	sendReaction func(context.Context, whatsapplive.SendReactionRequest) (whatsapplive.SendResult, error)
+}
+
+func (m *mockWhatsAppClient) Status(context.Context) (whatsapplive.Status, error) {
+	return m.status, nil
+}
+func (m *mockWhatsAppClient) Connect(context.Context) error { return nil }
+func (m *mockWhatsAppClient) Close() error                  { return nil }
+func (m *mockWhatsAppClient) StartLogin(ctx context.Context) (whatsapplive.LoginState, error) {
+	if m.startLogin != nil {
+		return m.startLogin(ctx)
+	}
+	return m.loginState, nil
+}
+func (m *mockWhatsAppClient) LoginState(context.Context) (whatsapplive.LoginState, error) {
+	return m.loginState, nil
+}
+func (m *mockWhatsAppClient) Logout(ctx context.Context, req whatsapplive.LogoutRequest) (whatsapplive.LogoutResult, error) {
+	if m.logout != nil {
+		return m.logout(ctx, req)
+	}
+	return whatsapplive.LogoutResult{}, nil
+}
+func (m *mockWhatsAppClient) SendMessage(ctx context.Context, req whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error) {
+	return m.sendMessage(ctx, req)
+}
+func (m *mockWhatsAppClient) SendReaction(ctx context.Context, req whatsapplive.SendReactionRequest) (whatsapplive.SendResult, error) {
+	return m.sendReaction(ctx, req)
+}
+
+type mockGoogleDocsClient struct {
+	listDocs    func(context.Context, string, string, int) ([]googledocs.File, error)
+	getDoc      func(context.Context, string, string, int) (*googledocs.Document, error)
+	appendText  func(context.Context, string, string, string) (*googledocs.AppendResult, error)
+	replaceText func(context.Context, string, string, string, string, bool) (*googledocs.ReplaceResult, error)
+}
+
+func (m *mockGoogleDocsClient) ListDocs(ctx context.Context, sourceName, query string, limit int) ([]googledocs.File, error) {
+	return m.listDocs(ctx, sourceName, query, limit)
+}
+
+func (m *mockGoogleDocsClient) GetDoc(ctx context.Context, sourceName, documentID string, maxChars int) (*googledocs.Document, error) {
+	return m.getDoc(ctx, sourceName, documentID, maxChars)
+}
+
+func (m *mockGoogleDocsClient) AppendText(ctx context.Context, sourceName, documentID, text string) (*googledocs.AppendResult, error) {
+	return m.appendText(ctx, sourceName, documentID, text)
+}
+
+func (m *mockGoogleDocsClient) ReplaceText(ctx context.Context, sourceName, documentID, find, replacement string, matchCase bool) (*googledocs.ReplaceResult, error) {
+	return m.replaceText(ctx, sourceName, documentID, find, replacement, matchCase)
+}
 
 // Response types for runTool generic calls.
 type statsResponse struct {
@@ -129,6 +190,28 @@ type paginatedListMessages struct {
 	HasMore  bool                   `json:"has_more"`
 }
 
+type compactMessageSummary struct {
+	ID                   int64  `json:"id"`
+	SourceMessageID      string `json:"source_message_id"`
+	ConversationID       int64  `json:"conversation_id"`
+	SourceConversationID string `json:"source_conversation_id"`
+	Subject              string `json:"subject"`
+	FromEmail            string `json:"from_email"`
+	FromName             string `json:"from_name"`
+	SentAt               string `json:"sent_at"`
+	HasAttachments       bool   `json:"has_attachments"`
+}
+
+// paginatedCompactMessages is the default (compact) search/list response:
+// a paginated envelope whose Data is the compact summary projection.
+type paginatedCompactMessages struct {
+	Data     []compactMessageSummary `json:"data"`
+	Total    int64                   `json:"total"`
+	Returned int                     `json:"returned"`
+	Offset   int                     `json:"offset"`
+	HasMore  bool                    `json:"has_more"`
+}
+
 // newTestHandlers creates a handlers instance with the given mock engine.
 func newTestHandlers(eng query.Engine) *handlers {
 	return &handlers{engine: eng}
@@ -182,6 +265,471 @@ func runToolExpectError(t *testing.T, name string, fn toolHandler, args map[stri
 	return r
 }
 
+func TestWhatsAppStatusUsesWhatsAppAccountScope(t *testing.T) {
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 1, SourceType: "gmail", Identifier: "lazare@example.com"},
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var factoryAccount string
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			Account:    "15551234567@s.whatsapp.net",
+			AccountJID: "15551234567@s.whatsapp.net",
+			Paired:     true,
+			Connected:  true,
+			LoggedIn:   true,
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			factoryAccount = account
+			return client, nil
+		},
+	}
+
+	status := runTool[whatsapplive.Status](t, ToolWhatsAppStatus, h.whatsAppStatus, map[string]any{})
+	assert.Equal(t, "15551234567@s.whatsapp.net", factoryAccount)
+	assert.True(t, status.Paired)
+	assert.True(t, status.Ready)
+	assert.Equal(t, "15551234567@s.whatsapp.net", status.AccountJID)
+}
+
+func TestWhatsAppStartLoginReturnsQRPayload(t *testing.T) {
+	eng := &querytest.MockEngine{}
+	client := &mockWhatsAppClient{
+		loginState: whatsapplive.LoginState{
+			Status: whatsapplive.Status{Paired: false},
+			Pairing: whatsapplive.QRPairingState{
+				Active: true,
+				Code:   "test-qr-code",
+				Event:  "code",
+			},
+		},
+	}
+	h := &handlers{
+		engine:           eng,
+		whatsAppLoginURL: "https://whats.lazare.ai/work/qr",
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Empty(t, account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsAppLoginResponse](t, ToolWhatsAppStartLogin, h.whatsAppStartLogin, map[string]any{
+		"include_qr_png": false,
+		"wait_ms":        float64(0),
+	})
+	assert.True(t, result.NeedsPairing)
+	assert.Equal(t, "test-qr-code", result.QRCode)
+	assert.Empty(t, result.QRPNGBase64)
+	assert.Equal(t, "https://whats.lazare.ai/work/qr", result.QRPageURL)
+}
+
+func TestWhatsAppLoginStatusCanIncludeQRPNG(t *testing.T) {
+	eng := &querytest.MockEngine{}
+	client := &mockWhatsAppClient{
+		loginState: whatsapplive.LoginState{
+			Status: whatsapplive.Status{Paired: false},
+			Pairing: whatsapplive.QRPairingState{
+				Active: true,
+				Code:   "test-qr-code",
+				Event:  "code",
+			},
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Empty(t, account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsAppLoginResponse](t, ToolWhatsAppLoginStatus, h.whatsAppLoginStatus, map[string]any{})
+	assert.Equal(t, "test-qr-code", result.QRCode)
+	assert.NotEmpty(t, result.QRPNGBase64)
+}
+
+func TestWhatsAppLoginStatusReportsPairedButNotReady(t *testing.T) {
+	eng := &querytest.MockEngine{}
+	client := &mockWhatsAppClient{
+		loginState: whatsapplive.LoginState{
+			Status: whatsapplive.Status{
+				AccountJID: "15551234567@s.whatsapp.net",
+				Paired:     true,
+				Connected:  true,
+				LoggedIn:   false,
+			},
+			Pairing: whatsapplive.QRPairingState{
+				Active: false,
+				Paired: true,
+			},
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Empty(t, account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsAppLoginResponse](t, ToolWhatsAppLoginStatus, h.whatsAppLoginStatus, map[string]any{})
+	assert.True(t, result.AlreadyPaired)
+	assert.False(t, result.NeedsPairing)
+	assert.False(t, result.Ready)
+	assert.False(t, result.Status.Ready)
+	assert.True(t, result.NeedsReconnect)
+	assert.True(t, result.NeedsAuth)
+	assert.Equal(t, 5, result.PollAfterSecs)
+}
+
+func TestWhatsAppLogoutRequiresConfirm(t *testing.T) {
+	eng := &querytest.MockEngine{}
+	var called bool
+	client := &mockWhatsAppClient{
+		logout: func(context.Context, whatsapplive.LogoutRequest) (whatsapplive.LogoutResult, error) {
+			called = true
+			return whatsapplive.LogoutResult{}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Empty(t, account)
+			return client, nil
+		},
+	}
+
+	result := runToolExpectError(t, ToolWhatsAppLogout, h.whatsAppLogout, map[string]any{})
+	assert.Contains(t, resultText(t, result), "confirm=true is required")
+	assert.False(t, called)
+}
+
+func TestWhatsAppLogoutForwardsForceLocal(t *testing.T) {
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var gotReq whatsapplive.LogoutRequest
+	client := &mockWhatsAppClient{
+		logout: func(_ context.Context, req whatsapplive.LogoutRequest) (whatsapplive.LogoutResult, error) {
+			gotReq = req
+			return whatsapplive.LogoutResult{
+				StatusBefore: whatsapplive.Status{
+					AccountJID: "15551234567@s.whatsapp.net",
+					Paired:     true,
+					Connected:  true,
+				},
+				StatusAfter:         whatsapplive.Status{},
+				RemoteLogout:        true,
+				LocalSessionCleared: true,
+			}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Equal(t, "15551234567@s.whatsapp.net", account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsapplive.LogoutResult](t, ToolWhatsAppLogout, h.whatsAppLogout, map[string]any{
+		"confirm":     true,
+		"force_local": false,
+	})
+	assert.Equal(t, "15551234567@s.whatsapp.net", gotReq.Account)
+	assert.False(t, gotReq.ForceLocal)
+	assert.True(t, result.RemoteLogout)
+	assert.True(t, result.LocalSessionCleared)
+}
+
+func TestSendWhatsAppMessage(t *testing.T) {
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var gotReq whatsapplive.SendMessageRequest
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			Paired:    true,
+			Connected: true,
+			LoggedIn:  true,
+		},
+		sendMessage: func(_ context.Context, req whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error) {
+			gotReq = req
+			return whatsapplive.SendResult{
+				LocalRequestID:  req.LocalRequestID,
+				OutboxID:        7,
+				MessageID:       8,
+				RemoteMessageID: "remote-1",
+				ChatJID:         req.ChatID,
+				Status:          "sent",
+			}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Equal(t, "15551234567@s.whatsapp.net", account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsapplive.SendResult](t, ToolSendWhatsAppMessage, h.sendWhatsAppMessage, map[string]any{
+		"chat_id":          "15557654321@s.whatsapp.net",
+		"body":             "hello",
+		"local_request_id": "req-1",
+	})
+	assert.Equal(t, "15557654321@s.whatsapp.net", gotReq.ChatID)
+	assert.Equal(t, "hello", gotReq.Body)
+	assert.Equal(t, "req-1", gotReq.LocalRequestID)
+	assert.Equal(t, int64(8), result.MessageID)
+	assert.Equal(t, "remote-1", result.RemoteMessageID)
+}
+
+func TestSendWhatsAppMessageRejectsNotReady(t *testing.T) {
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var called bool
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			AccountJID: "15551234567@s.whatsapp.net",
+			Paired:     true,
+			Connected:  true,
+			LoggedIn:   false,
+		},
+		sendMessage: func(context.Context, whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error) {
+			called = true
+			return whatsapplive.SendResult{}, errors.New("send should not be called")
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Equal(t, "15551234567@s.whatsapp.net", account)
+			return client, nil
+		},
+	}
+
+	result := runToolExpectError(t, ToolSendWhatsAppMessage, h.sendWhatsAppMessage, map[string]any{
+		"chat_id": "15557654321@s.whatsapp.net",
+		"body":    "hello",
+	})
+	assert.Contains(t, resultText(t, result), "ready=true")
+	assert.False(t, called)
+}
+
+func TestSendWhatsAppReactionAllowsEmptyEmojiToClear(t *testing.T) {
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var gotReq whatsapplive.SendReactionRequest
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			Paired:    true,
+			Connected: true,
+			LoggedIn:  true,
+		},
+		sendReaction: func(_ context.Context, req whatsapplive.SendReactionRequest) (whatsapplive.SendResult, error) {
+			gotReq = req
+			return whatsapplive.SendResult{
+				LocalRequestID: req.LocalRequestID,
+				MessageID:      req.MessageID,
+				Status:         "sent",
+			}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Equal(t, "15551234567@s.whatsapp.net", account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsapplive.SendResult](t, ToolSendWhatsAppReaction, h.sendWhatsAppReaction, map[string]any{
+		"message_id":       float64(42),
+		"emoji":            "",
+		"local_request_id": "react-1",
+	})
+	assert.Equal(t, int64(42), gotReq.MessageID)
+	assert.Equal(t, "", gotReq.Emoji)
+	assert.Equal(t, "react-1", gotReq.LocalRequestID)
+	assert.Equal(t, int64(42), result.MessageID)
+}
+
+func TestGoogleDocsHandlers(t *testing.T) {
+	t.Run("list forwards filters", func(t *testing.T) {
+		assert := assert.New(t)
+		client := &mockGoogleDocsClient{
+			listDocs: func(_ context.Context, sourceName, query string, limit int) ([]googledocs.File, error) {
+				assert.Equal("work", sourceName, "sourceName")
+				assert.Equal("roadmap", query, "query")
+				assert.Equal(7, limit, "limit")
+				return []googledocs.File{{
+					Source:     "work",
+					DocumentID: "doc-1",
+					Name:       "Roadmap",
+				}}, nil
+			},
+		}
+		h := &handlers{
+			engine: &querytest.MockEngine{},
+			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
+				return client, nil
+			},
+		}
+
+		files := runTool[[]googledocs.File](t, ToolListGoogleDocs, h.listGoogleDocs, map[string]any{
+			"source": "work",
+			"query":  "roadmap",
+			"limit":  float64(7),
+		})
+		require.Len(t, files, 1, "files")
+		assert.Equal("doc-1", files[0].DocumentID, "document_id")
+	})
+
+	t.Run("get returns bounded text", func(t *testing.T) {
+		assert := assert.New(t)
+		client := &mockGoogleDocsClient{
+			getDoc: func(_ context.Context, sourceName, documentID string, maxChars int) (*googledocs.Document, error) {
+				assert.Equal("work", sourceName, "sourceName")
+				assert.Equal("doc-1", documentID, "documentID")
+				assert.Equal(50, maxChars, "maxChars")
+				return &googledocs.Document{
+					File:       googledocs.File{Source: "work", DocumentID: "doc-1", Name: "Notes"},
+					Text:       "body",
+					TextLength: 4,
+				}, nil
+			},
+		}
+		h := &handlers{
+			engine: &querytest.MockEngine{},
+			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
+				return client, nil
+			},
+		}
+
+		doc := runTool[googledocs.Document](t, ToolGetGoogleDoc, h.getGoogleDoc, map[string]any{
+			"source":      "work",
+			"document_id": "doc-1",
+			"max_chars":   float64(50),
+		})
+		assert.Equal("body", doc.Text, "text")
+	})
+
+	t.Run("search returns snippets", func(t *testing.T) {
+		client := &mockGoogleDocsClient{
+			listDocs: func(context.Context, string, string, int) ([]googledocs.File, error) {
+				return []googledocs.File{{
+					Source:     "work",
+					DocumentID: "doc-1",
+					Name:       "Strategy",
+				}}, nil
+			},
+			getDoc: func(_ context.Context, sourceName, documentID string, maxChars int) (*googledocs.Document, error) {
+				assert.Equal(t, "work", sourceName, "sourceName")
+				assert.Equal(t, "doc-1", documentID, "documentID")
+				assert.Equal(t, maxGoogleDocsMaxChars, maxChars, "maxChars")
+				return &googledocs.Document{
+					File:       googledocs.File{Source: "work", DocumentID: "doc-1", Name: "Strategy"},
+					Text:       "intro alpha beta target phrase gamma delta conclusion",
+					TextLength: 53,
+				}, nil
+			},
+		}
+		h := &handlers{
+			engine: &querytest.MockEngine{},
+			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
+				return client, nil
+			},
+		}
+
+		results := runTool[[]googleDocsSearchResult](t, ToolSearchGoogleDocs, h.searchGoogleDocs, map[string]any{
+			"query":         "target",
+			"snippet_chars": float64(20),
+		})
+		require.Len(t, results, 1, "results")
+		assert.Contains(t, results[0].Snippet, "target", "snippet")
+	})
+
+	t.Run("append forwards text unchanged", func(t *testing.T) {
+		assert := assert.New(t)
+		client := &mockGoogleDocsClient{
+			appendText: func(_ context.Context, sourceName, documentID, text string) (*googledocs.AppendResult, error) {
+				assert.Equal("work", sourceName, "sourceName")
+				assert.Equal("doc-1", documentID, "documentID")
+				assert.Equal("\nnew note", text, "text")
+				return &googledocs.AppendResult{
+					Source:        sourceName,
+					DocumentID:    documentID,
+					InsertedChars: 9,
+					Status:        "appended",
+				}, nil
+			},
+		}
+		h := &handlers{
+			engine: &querytest.MockEngine{},
+			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
+				return client, nil
+			},
+		}
+
+		result := runTool[googledocs.AppendResult](t, ToolAppendGoogleDocText, h.appendGoogleDocText, map[string]any{
+			"source":      "work",
+			"document_id": "doc-1",
+			"text":        "\nnew note",
+		})
+		assert.Equal("appended", result.Status, "status")
+	})
+
+	t.Run("replace accepts explicit empty replacement", func(t *testing.T) {
+		assert := assert.New(t)
+		client := &mockGoogleDocsClient{
+			replaceText: func(_ context.Context, sourceName, documentID, find, replacement string, matchCase bool) (*googledocs.ReplaceResult, error) {
+				assert.Equal("work", sourceName, "sourceName")
+				assert.Equal("doc-1", documentID, "documentID")
+				assert.Equal("remove me", find, "find")
+				assert.Equal("", replacement, "replacement")
+				assert.True(matchCase, "matchCase")
+				return &googledocs.ReplaceResult{
+					Source:             sourceName,
+					DocumentID:         documentID,
+					OccurrencesChanged: 2,
+					Status:             "replaced",
+				}, nil
+			},
+		}
+		h := &handlers{
+			engine: &querytest.MockEngine{},
+			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
+				return client, nil
+			},
+		}
+
+		result := runTool[googledocs.ReplaceResult](t, ToolReplaceGoogleDocText, h.replaceGoogleDocText, map[string]any{
+			"source":      "work",
+			"document_id": "doc-1",
+			"find":        "remove me",
+			"replacement": "",
+			"match_case":  true,
+		})
+		assert.Equal(int64(2), result.OccurrencesChanged, "occurrences_changed")
+	})
+}
+
 func TestSearchMetadata(t *testing.T) {
 	eng := &querytest.MockEngine{
 		SearchFastResults: []query.MessageSummary{
@@ -202,6 +750,13 @@ func TestSearchMetadata(t *testing.T) {
 		assert.Equal("thread-abc", resp.Data[0].SourceConversationID, "SourceConversationID")
 		assert.Equal(int64(99), resp.Data[0].ConversationID, "conversation_id")
 		assert.Equal(int64(1), resp.Total, "total")
+	})
+
+	t.Run("full results when requested", func(t *testing.T) {
+		resp := runTool[paginatedSearchMessages](t, "search_messages", h.searchMessages, map[string]any{"query": "from:alice", "full": true})
+		if len(resp.Data) != 1 || resp.Data[0].Subject != "Hello" {
+			t.Fatalf("unexpected result: %v", resp.Data)
+		}
 	})
 
 	t.Run("missing query", func(t *testing.T) {
@@ -2071,6 +2626,16 @@ func TestListMessages(t *testing.T) {
 		require.Len(t, resp.Data, 1, "data")
 		assert.Equal(t, "thread-list", resp.Data[0].SourceConversationID, "SourceConversationID")
 		assert.False(t, resp.HasMore, "has_more")
+	})
+
+	t.Run("full results when requested", func(t *testing.T) {
+		resp := runTool[paginatedListMessages](t, "list_messages", h.listMessages, map[string]any{
+			"from": "alice@example.com",
+			"full": true,
+		})
+		if len(resp.Data) != 1 || resp.Data[0].SourceConversationID != "thread-list" {
+			t.Fatalf("unexpected result: %v", resp.Data)
+		}
 	})
 
 	errorCases := []struct {

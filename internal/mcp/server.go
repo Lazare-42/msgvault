@@ -13,10 +13,25 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"go.kenn.io/msgvault/internal/gmail"
+	"go.kenn.io/msgvault/internal/googledocs"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/hybrid"
+	whatsapplive "go.kenn.io/msgvault/internal/whatsapp/live"
 )
+
+// GmailClientFactory creates authenticated Gmail API clients for a given
+// account email. Returns nil if Gmail draft operations are not available
+// (e.g., OAuth not configured). The caller is responsible for closing the client.
+type GmailClientFactory func(ctx context.Context, email string) (*gmail.Client, error)
+
+// WhatsAppClientFactory creates a live WhatsApp client for an archive account.
+type WhatsAppClientFactory func(ctx context.Context, account string) (whatsapplive.Client, error)
+
+// GoogleDocsClientFactory creates an authenticated Google Docs client for
+// configured Drive folder sources.
+type GoogleDocsClientFactory func(ctx context.Context) (googledocs.Client, error)
 
 // Tool name constants.
 const (
@@ -34,6 +49,27 @@ const (
 	ToolSearchByDomains        = "search_by_domains"
 	ToolFindSimilarMessages    = "find_similar_messages"
 	ToolSearchInMessage        = "search_in_message"
+	ToolListDrafts             = "list_drafts"
+	ToolGetDraft               = "get_draft"
+	ToolCreateDraft            = "create_draft"
+	ToolUpdateDraft            = "update_draft"
+	ToolDeleteDraft            = "delete_draft"
+	ToolSendDraft              = "send_draft"
+	ToolModifyLabels           = "modify_labels"
+	ToolCreateLabel            = "create_label"
+	ToolDeleteLabel            = "delete_label"
+	ToolListGmailLabels        = "list_gmail_labels"
+	ToolWhatsAppStatus         = "whatsapp_status"
+	ToolWhatsAppStartLogin     = "whatsapp_start_login"
+	ToolWhatsAppLoginStatus    = "whatsapp_login_status"
+	ToolWhatsAppLogout         = "whatsapp_logout"
+	ToolSendWhatsAppMessage    = "send_whatsapp_message"
+	ToolSendWhatsAppReaction   = "send_whatsapp_reaction"
+	ToolListGoogleDocs         = "list_google_docs"
+	ToolSearchGoogleDocs       = "search_google_docs"
+	ToolGetGoogleDoc           = "get_google_doc"
+	ToolAppendGoogleDocText    = "append_google_doc_text"
+	ToolReplaceGoogleDocText   = "replace_google_doc_text"
 )
 
 // search_message_bodies/search_in_message mode values (wire format).
@@ -92,20 +128,24 @@ type ServeOptions struct {
 	// vector/hybrid searches with a vector_not_enabled error.
 	HybridEngine *hybrid.Engine
 	// VectorCfg should already have ApplyDefaults() called on it.
-	// The handler reads Search.MaxPageSizeHybridClamp() at request
-	// time; a positive value clamps the per-request limit, and zero
-	// disables clamping (the user can set
-	// `max_page_size_hybrid = 0` in TOML to disable; ApplyDefaults
-	// only fills in 50 when the field was omitted).
 	VectorCfg vector.Config
 	// Backend is optional. When nil, find_similar_messages rejects all
 	// calls with a vector_not_enabled error.
 	Backend vector.Backend
+	// GmailFactory is optional. When non-nil, draft management tools are exposed.
+	GmailFactory GmailClientFactory
+	// WhatsAppFactory is optional. When non-nil, live WhatsApp tools are exposed.
+	WhatsAppFactory WhatsAppClientFactory
+	// WhatsAppLoginURL is an optional browser URL for QR login/resync.
+	WhatsAppLoginURL string
+	// GoogleDocsFactory is optional. When non-nil, Google Docs tools are exposed.
+	GoogleDocsFactory GoogleDocsClientFactory
 }
 
-// newMCPServer builds an MCP server with all tools registered from opts.
-// Shared by ServeWithOptions (stdio) and ServeHTTPWithOptions (HTTP).
-func newMCPServer(opts ServeOptions) *server.MCPServer {
+// BuildMCPServer builds an MCP server with all tools registered from opts.
+// Shared by ServeWithOptions (stdio), ServeHTTPWithOptions (HTTP), and the
+// SSE transport. Callers choose the transport.
+func BuildMCPServer(opts ServeOptions) *server.MCPServer {
 	s := server.NewMCPServer(
 		"msgvault",
 		"1.0.0",
@@ -113,16 +153,20 @@ func newMCPServer(opts ServeOptions) *server.MCPServer {
 	)
 
 	h := &handlers{
-		engine:           opts.Engine,
-		attachmentsDir:   opts.AttachmentsDir,
-		attachmentReader: opts.AttachmentReader,
-		manifestSaver:    opts.ManifestSaver,
-		hybridSearcher:   opts.HybridSearcher,
-		similarSearcher:  opts.SimilarSearcher,
-		dataDir:          opts.DataDir,
-		hybridEngine:     opts.HybridEngine,
-		vectorCfg:        opts.VectorCfg,
-		backend:          opts.Backend,
+		engine:            opts.Engine,
+		attachmentsDir:    opts.AttachmentsDir,
+		attachmentReader:  opts.AttachmentReader,
+		manifestSaver:     opts.ManifestSaver,
+		hybridSearcher:    opts.HybridSearcher,
+		similarSearcher:   opts.SimilarSearcher,
+		dataDir:           opts.DataDir,
+		hybridEngine:      opts.HybridEngine,
+		vectorCfg:         opts.VectorCfg,
+		backend:           opts.Backend,
+		gmailFactory:      opts.GmailFactory,
+		whatsAppFactory:   opts.WhatsAppFactory,
+		whatsAppLoginURL:  strings.TrimSpace(opts.WhatsAppLoginURL),
+		googleDocsFactory: opts.GoogleDocsFactory,
 	}
 
 	vectorAvailable := opts.HybridEngine != nil || opts.HybridSearcher != nil
@@ -148,6 +192,36 @@ func newMCPServer(opts ServeOptions) *server.MCPServer {
 		s.AddTool(findSimilarMessagesTool(), h.findSimilarMessages)
 	}
 
+	if opts.GmailFactory != nil {
+		s.AddTool(listDraftsTool(), h.listDrafts)
+		s.AddTool(getDraftTool(), h.getDraft)
+		s.AddTool(createDraftTool(), h.createDraft)
+		s.AddTool(updateDraftTool(), h.updateDraft)
+		s.AddTool(deleteDraftTool(), h.deleteDraft)
+		s.AddTool(sendDraftTool(), h.sendDraft)
+		s.AddTool(modifyLabelsTool(), h.modifyLabels)
+		s.AddTool(createLabelTool(), h.createLabel)
+		s.AddTool(deleteLabelTool(), h.deleteLabel)
+		s.AddTool(listGmailLabelsTool(), h.listGmailLabels)
+	}
+
+	if opts.WhatsAppFactory != nil {
+		s.AddTool(whatsAppStatusTool(), h.whatsAppStatus)
+		s.AddTool(whatsAppStartLoginTool(), h.whatsAppStartLogin)
+		s.AddTool(whatsAppLoginStatusTool(), h.whatsAppLoginStatus)
+		s.AddTool(whatsAppLogoutTool(), h.whatsAppLogout)
+		s.AddTool(sendWhatsAppMessageTool(), h.sendWhatsAppMessage)
+		s.AddTool(sendWhatsAppReactionTool(), h.sendWhatsAppReaction)
+	}
+
+	if opts.GoogleDocsFactory != nil {
+		s.AddTool(listGoogleDocsTool(), h.listGoogleDocs)
+		s.AddTool(searchGoogleDocsTool(), h.searchGoogleDocs)
+		s.AddTool(getGoogleDocTool(), h.getGoogleDoc)
+		s.AddTool(appendGoogleDocTextTool(), h.appendGoogleDocText)
+		s.AddTool(replaceGoogleDocTextTool(), h.replaceGoogleDocText)
+	}
+
 	return s
 }
 
@@ -158,18 +232,19 @@ func newMCPServer(opts ServeOptions) *server.MCPServer {
 // Serve is a thin wrapper around ServeWithOptions that leaves the vector
 // fields empty; callers that want vector/hybrid search should use
 // ServeWithOptions directly.
-func Serve(ctx context.Context, engine query.Engine, attachmentsDir, dataDir string) error {
+func Serve(ctx context.Context, engine query.Engine, attachmentsDir, dataDir string, gmailFactory GmailClientFactory) error {
 	return ServeWithOptions(ctx, ServeOptions{
 		Engine:         engine,
 		AttachmentsDir: attachmentsDir,
 		DataDir:        dataDir,
+		GmailFactory:   gmailFactory,
 	})
 }
 
 // ServeWithOptions creates an MCP server from opts and serves over stdio.
 // It blocks until stdin is closed or the context is cancelled.
 func ServeWithOptions(ctx context.Context, opts ServeOptions) error {
-	s := newMCPServer(opts)
+	s := BuildMCPServer(opts)
 	stdio := server.NewStdioServer(s)
 	if err := stdio.Listen(ctx, os.Stdin, os.Stdout); err != nil {
 		return fmt.Errorf("serve MCP over stdio: %w", err)
@@ -219,7 +294,7 @@ func newMCPHTTPServer(opts ServeOptions, addr, apiKey string) *http.Server {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	httpServer := server.NewStreamableHTTPServer(
-		newMCPServer(opts),
+		BuildMCPServer(opts),
 		server.WithStreamableHTTPServer(stdlibServer),
 	)
 	mux := http.NewServeMux()
@@ -279,12 +354,15 @@ func searchMetadataTool() mcp.Tool {
 	return mcp.NewTool(ToolSearchMetadata,
 		mcp.WithDescription(searchIntro+searchMetadataPaginationDoc+
 			"For body keywords use search_message_bodies; for vector/hybrid search use semantic_search_messages."),
-		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithString("query",
 			mcp.Required(),
 			mcp.Description(queryDesc),
 		),
 		withAccount(),
+		mcp.WithBoolean("full",
+			mcp.Description("Return full message summaries instead of compact results (default false)"),
+		),
 		withLimit("20"),
 		withOffset(),
 	)
@@ -425,7 +503,7 @@ func getMessageTool() mcp.Tool {
 			"To read sequentially: call again with offset += body_returned. "+
 			"To jump to a known match location: use center_at=<byte offset> to center the window on that location. "+
 			"Note: snippet is pre-stored source metadata (may be empty for non-Gmail sources)."),
-		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithNumber("id",
 			mcp.Required(),
 			mcp.Description("Message ID"),
@@ -452,7 +530,7 @@ func getMessageTool() mcp.Tool {
 func getAttachmentTool() mcp.Tool {
 	return mcp.NewTool(ToolGetAttachment,
 		mcp.WithDescription("Get attachment content by attachment ID. Returns metadata as text and the file content as an embedded resource blob. Use get_message first to find attachment IDs."),
-		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithNumber("attachment_id",
 			mcp.Required(),
 			mcp.Description("Attachment ID (from get_message response)"),
@@ -463,6 +541,7 @@ func getAttachmentTool() mcp.Tool {
 func exportAttachmentTool() mcp.Tool {
 	return mcp.NewTool(ToolExportAttachment,
 		mcp.WithDescription("Save an attachment to the local filesystem. Use this for file types that cannot be displayed inline (e.g. PDFs, documents). Returns the saved file path."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithNumber("attachment_id",
 			mcp.Required(),
 			mcp.Description("Attachment ID (from get_message response)"),
@@ -517,11 +596,12 @@ func searchInMessageTool(vectorInMessageAvailable bool) mcp.Tool {
 func listMessagesTool() mcp.Tool {
 	return mcp.NewTool(ToolListMessages,
 		mcp.WithDescription("List messages with optional filters, newest-first. "+
+			"Returns compact summaries by default; set full=true for snippets, labels, and other extra fields. "+
 			"Pass conversation_id to enumerate a thread's messages, then call get_message(id) per message to read bodies — "+
 			"there is deliberately no bulk body fetch, to avoid loading huge threads into the context window. "+
 			"Paginate with offset/limit (default limit 20, max 50). Response: data, total, returned, offset, has_more. "+
 			"total=-1 because the full count is not computed; use has_more for paging."),
-		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
 		mcp.WithString("from",
 			mcp.Description("Filter by sender email address"),
@@ -540,6 +620,9 @@ func listMessagesTool() mcp.Tool {
 		mcp.WithNumber("conversation_id",
 			mcp.Description("Filter by conversation/thread ID"),
 		),
+		mcp.WithBoolean("full",
+			mcp.Description("Return full message summaries instead of compact results (default false)"),
+		),
 		withLimit("20"),
 		withOffset(),
 	)
@@ -548,7 +631,7 @@ func listMessagesTool() mcp.Tool {
 func getStatsTool() mcp.Tool {
 	return mcp.NewTool(ToolGetStats,
 		mcp.WithDescription("Get archive overview: total messages, size, attachment count, and accounts."),
-		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 	)
 }
 
@@ -556,7 +639,7 @@ func aggregateTool() mcp.Tool {
 	return mcp.NewTool(ToolAggregate,
 		mcp.WithDescription("Get grouped statistics (top senders, recipients, domains, labels, or message volume by calendar year). "+
 			"Returns a JSON array of objects with fields Key, Count, TotalSize, AttachmentSize, AttachmentCount, and TotalUnique."),
-		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithString("group_by",
 			mcp.Required(),
 			mcp.Description("Dimension to group by. When 'time', buckets are by calendar year only (Key is a year string like \"2024\")."),
@@ -611,7 +694,7 @@ func stageDeletionTool() mcp.Tool {
 func findSimilarMessagesTool() mcp.Tool {
 	return mcp.NewTool(ToolFindSimilarMessages,
 		mcp.WithDescription("Find messages whose embeddings are closest to the given message. Requires vector search to be configured and an active index generation."),
-		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithNumber("message_id",
 			mcp.Required(),
 			mcp.Description("Seed message ID; its embedding is used as the query vector"),
@@ -625,6 +708,376 @@ func findSimilarMessagesTool() mcp.Tool {
 		withBefore(),
 		mcp.WithBoolean("has_attachment",
 			mcp.Description("Only messages with attachments"),
+		),
+	)
+}
+
+func listDraftsTool() mcp.Tool {
+	return mcp.NewTool(ToolListDrafts,
+		mcp.WithDescription("List email drafts from Gmail. Returns draft ID, subject, recipients, and body preview for each draft."),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
+		withAccount(),
+		mcp.WithString("query",
+			mcp.Description("Optional Gmail-style search query to filter drafts (e.g. 'subject:meeting')"),
+		),
+		withLimit("20"),
+	)
+}
+
+func getDraftTool() mcp.Tool {
+	return mcp.NewTool(ToolGetDraft,
+		mcp.WithDescription("Get full details of a single Gmail draft by draft ID, including body text, recipients, and subject."),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
+		withAccount(),
+		mcp.WithString("draft_id",
+			mcp.Required(),
+			mcp.Description("Draft ID (from list_drafts response)"),
+		),
+	)
+}
+
+func createDraftTool() mcp.Tool {
+	return mcp.NewTool(ToolCreateDraft,
+		mcp.WithDescription("Create a new email draft in Gmail. The draft is saved but NOT sent. Use send_draft to send it. For rich formatting (links, bold, etc.), set content_type to text/html and provide HTML body. To reply to an existing message, set thread_id AND in_reply_to (the original Message-ID) so the draft threads as a true reply in every mail client, not just Gmail."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
+		withAccount(),
+		mcp.WithString("to",
+			mcp.Description("Recipient email address(es), comma-separated"),
+		),
+		mcp.WithString("cc",
+			mcp.Description("CC recipients, comma-separated"),
+		),
+		mcp.WithString("bcc",
+			mcp.Description("BCC recipients, comma-separated"),
+		),
+		mcp.WithString("subject",
+			mcp.Description("Email subject line"),
+		),
+		mcp.WithString("body",
+			mcp.Required(),
+			mcp.Description("Email body content. Plain text by default, or HTML when content_type is text/html"),
+		),
+		mcp.WithString("content_type",
+			mcp.Description("Body content type: 'text/plain' (default) or 'text/html' for rich formatting with links, bold, etc."),
+		),
+		mcp.WithString("thread_id",
+			mcp.Description("Thread ID to create a reply draft within an existing thread"),
+		),
+		mcp.WithString("in_reply_to",
+			mcp.Description("RFC 5322 Message-ID of the message being replied to, including angle brackets (e.g. '<abc@mail.gmail.com>'). Sets the In-Reply-To header so the draft is a true reply that nests correctly in any mail client (not just Gmail). Get this from the message's raw headers."),
+		),
+		mcp.WithString("references",
+			mcp.Description("Space-separated Message-ID reference chain for the reply (the original References header plus the message being replied to). Defaults to in_reply_to when omitted."),
+		),
+		mcp.WithString("attachment_ids",
+			mcp.Description("Attachment IDs to attach, comma-separated (from get_message). Attaches the archived file directly — no need to export first."),
+		),
+	)
+}
+
+func updateDraftTool() mcp.Tool {
+	return mcp.NewTool(ToolUpdateDraft,
+		mcp.WithDescription("Update an existing Gmail draft. Replaces the entire draft content."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
+		withAccount(),
+		mcp.WithString("draft_id",
+			mcp.Required(),
+			mcp.Description("Draft ID to update (from list_drafts response)"),
+		),
+		mcp.WithString("to",
+			mcp.Description("Recipient email address(es), comma-separated"),
+		),
+		mcp.WithString("cc",
+			mcp.Description("CC recipients, comma-separated"),
+		),
+		mcp.WithString("bcc",
+			mcp.Description("BCC recipients, comma-separated"),
+		),
+		mcp.WithString("subject",
+			mcp.Description("Email subject line"),
+		),
+		mcp.WithString("body",
+			mcp.Required(),
+			mcp.Description("Email body content. Plain text by default, or HTML when content_type is text/html"),
+		),
+		mcp.WithString("content_type",
+			mcp.Description("Body content type: 'text/plain' (default) or 'text/html' for rich formatting with links, bold, etc."),
+		),
+		mcp.WithString("thread_id",
+			mcp.Description("Thread ID for reply drafts"),
+		),
+		mcp.WithString("in_reply_to",
+			mcp.Description("RFC 5322 Message-ID of the message being replied to, including angle brackets. Sets the In-Reply-To header for true reply threading across mail clients."),
+		),
+		mcp.WithString("references",
+			mcp.Description("Space-separated Message-ID reference chain. Defaults to in_reply_to when omitted."),
+		),
+		mcp.WithString("attachment_ids",
+			mcp.Description("Attachment IDs to attach, comma-separated (from get_message). Replaces any existing attachments."),
+		),
+	)
+}
+
+func deleteDraftTool() mcp.Tool {
+	return mcp.NewTool(ToolDeleteDraft,
+		mcp.WithDescription("Permanently delete a Gmail draft."),
+		withAccount(),
+		mcp.WithString("draft_id",
+			mcp.Required(),
+			mcp.Description("Draft ID to delete"),
+		),
+	)
+}
+
+func sendDraftTool() mcp.Tool {
+	return mcp.NewTool(ToolSendDraft,
+		mcp.WithDescription("Send an existing Gmail draft. The draft is removed and a sent message is created. This action cannot be undone."),
+		withAccount(),
+		mcp.WithString("draft_id",
+			mcp.Required(),
+			mcp.Description("Draft ID to send"),
+		),
+	)
+}
+
+func modifyLabelsTool() mcp.Tool {
+	return mcp.NewTool(ToolModifyLabels,
+		mcp.WithDescription("Add and/or remove Gmail labels on messages. Use this to label, archive (remove INBOX), mark read (remove UNREAD), star, or categorize messages. Provide Gmail message IDs (from search_messages source_message_id field). Use list_gmail_labels to find label IDs."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
+		withAccount(),
+		mcp.WithString("message_ids",
+			mcp.Required(),
+			mcp.Description("Comma-separated Gmail message IDs (the source_message_id from search results, NOT the archive numeric ID)"),
+		),
+		mcp.WithString("add_labels",
+			mcp.Description("Comma-separated label IDs to add (e.g. 'STARRED,Label_123')"),
+		),
+		mcp.WithString("remove_labels",
+			mcp.Description("Comma-separated label IDs to remove (e.g. 'INBOX,UNREAD'). Remove INBOX to archive."),
+		),
+	)
+}
+
+func createLabelTool() mcp.Tool {
+	return mcp.NewTool(ToolCreateLabel,
+		mcp.WithDescription("Create a new Gmail label. Returns the label ID which can be used with modify_labels."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
+		withAccount(),
+		mcp.WithString("name",
+			mcp.Required(),
+			mcp.Description("Label name. Use '/' for nesting (e.g. 'Projects/Acme')"),
+		),
+	)
+}
+
+func deleteLabelTool() mcp.Tool {
+	return mcp.NewTool(ToolDeleteLabel,
+		mcp.WithDescription("Permanently delete a Gmail label by ID. Messages with this label are NOT deleted; the label is simply removed from them. Only user-created labels can be deleted (not system labels like INBOX, SENT, etc.). Use list_gmail_labels to find label IDs."),
+		withAccount(),
+		mcp.WithString("label_id",
+			mcp.Required(),
+			mcp.Description("Label ID to delete (e.g. 'Label_11'). Use list_gmail_labels to find IDs."),
+		),
+	)
+}
+
+func listGmailLabelsTool() mcp.Tool {
+	return mcp.NewTool(ToolListGmailLabels,
+		mcp.WithDescription("List all Gmail labels from the live account (not the archive). Returns label IDs and names for use with modify_labels."),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
+		withAccount(),
+	)
+}
+
+func whatsAppStatusTool() mcp.Tool {
+	return mcp.NewTool(ToolWhatsAppStatus,
+		mcp.WithDescription("Get live WhatsApp connection and pairing status. WhatsApp is usable only when ready=true, meaning paired, connected, and logged_in are all true."),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(true), mcp.WithOpenWorldHintAnnotation(false),
+		withAccount(),
+	)
+}
+
+func whatsAppStartLoginTool() mcp.Tool {
+	return mcp.NewTool(ToolWhatsAppStartLogin,
+		mcp.WithDescription("Start or resume WhatsApp QR login for the live account. Returns status, ready, QR payload, optional PNG bytes, and the browser QR page URL when configured. Continue polling until ready=true before sending messages."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(true), mcp.WithOpenWorldHintAnnotation(true),
+		withAccount(),
+		mcp.WithNumber("wait_ms",
+			mcp.Description("Milliseconds to wait for a QR code after starting login (default 3000, max 15000)"),
+		),
+		mcp.WithBoolean("include_qr_png",
+			mcp.Description("Include base64 PNG QR image data when a QR code is available (default true)"),
+		),
+	)
+}
+
+func whatsAppLoginStatusTool() mcp.Tool {
+	return mcp.NewTool(ToolWhatsAppLoginStatus,
+		mcp.WithDescription("Poll WhatsApp QR login state for the live account. Returns ready, current QR payload, optional PNG bytes, and browser QR page URL when configured. Continue polling until ready=true before sending messages."),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(true), mcp.WithOpenWorldHintAnnotation(false),
+		withAccount(),
+		mcp.WithBoolean("include_qr_png",
+			mcp.Description("Include base64 PNG QR image data when a QR code is available (default true)"),
+		),
+	)
+}
+
+func whatsAppLogoutTool() mcp.Tool {
+	return mcp.NewTool(ToolWhatsAppLogout,
+		mcp.WithDescription("Log out and unlink the live WhatsApp account, clearing local pairing state so it can be paired again. Destructive: requires confirm=true. By default, local session state is cleared even if the remote WhatsApp logout cannot complete."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithIdempotentHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(true),
+		withAccount(),
+		mcp.WithBoolean("confirm",
+			mcp.Required(),
+			mcp.Description("Must be true to confirm logging out and clearing local WhatsApp pairing state."),
+		),
+		mcp.WithBoolean("force_local",
+			mcp.Description("Clear local session state if the remote WhatsApp logout request fails (default true)."),
+		),
+	)
+}
+
+func sendWhatsAppMessageTool() mcp.Tool {
+	return mcp.NewTool(ToolSendWhatsAppMessage,
+		mcp.WithDescription("Send a WhatsApp message through the linked live account. Requires whatsapp_status ready=true. Records an outbox row before sending and archives the sent message."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithIdempotentHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(true),
+		withAccount(),
+		mcp.WithString("chat_id",
+			mcp.Required(),
+			mcp.Description("WhatsApp chat JID, group JID, or international phone number"),
+		),
+		mcp.WithString("body",
+			mcp.Required(),
+			mcp.Description("Message body to send"),
+		),
+		mcp.WithArray("mentions",
+			mcp.Description("Optional @mentions: full JID strings (e.g. \"178357123686403@lid\" or \"33612345678@s.whatsapp.net\"). The body must contain a matching \"@<user>\" token per JID (the digits before @), which WhatsApp renders as the contact's name and pings. Mainly for group messages."),
+			mcp.Items(map[string]any{"type": "string"}),
+		),
+		mcp.WithString("local_request_id",
+			mcp.Description("Optional caller-provided idempotency/audit key"),
+		),
+	)
+}
+
+func sendWhatsAppReactionTool() mcp.Tool {
+	return mcp.NewTool(ToolSendWhatsAppReaction,
+		mcp.WithDescription("Set or clear a WhatsApp emoji reaction on an archived WhatsApp message. Requires whatsapp_status ready=true. Use an empty emoji string to clear the active reaction."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithIdempotentHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(true),
+		withAccount(),
+		mcp.WithNumber("message_id",
+			mcp.Required(),
+			mcp.Description("Archived msgvault message ID to react to"),
+		),
+		mcp.WithString("emoji",
+			mcp.Required(),
+			mcp.Description("Emoji reaction; pass an empty string to clear"),
+		),
+		mcp.WithString("local_request_id",
+			mcp.Description("Optional caller-provided idempotency/audit key"),
+		),
+	)
+}
+
+func listGoogleDocsTool() mcp.Tool {
+	return mcp.NewTool(ToolListGoogleDocs,
+		mcp.WithDescription("List Google Docs in a configured Drive folder. Optionally filters by Drive name/fullText query."),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(true), mcp.WithOpenWorldHintAnnotation(true),
+		mcp.WithString("source",
+			mcp.Description("Configured google_docs source name. Required when more than one source is configured."),
+		),
+		mcp.WithString("query",
+			mcp.Description("Optional Drive search query matched against document name or full text"),
+		),
+		withLimit("20"),
+	)
+}
+
+func searchGoogleDocsTool() mcp.Tool {
+	return mcp.NewTool(ToolSearchGoogleDocs,
+		mcp.WithDescription("Search Google Docs in a configured Drive folder and return matching document snippets for LLM context."),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(true), mcp.WithOpenWorldHintAnnotation(true),
+		mcp.WithString("source",
+			mcp.Description("Configured google_docs source name. Required when more than one source is configured."),
+		),
+		mcp.WithString("query",
+			mcp.Required(),
+			mcp.Description("Text to search for in document name or full text"),
+		),
+		mcp.WithNumber("snippet_chars",
+			mcp.Description("Maximum characters per snippet (default 1000, max 4000)"),
+		),
+		withLimit("10"),
+	)
+}
+
+func getGoogleDocTool() mcp.Tool {
+	return mcp.NewTool(ToolGetGoogleDoc,
+		mcp.WithDescription("Export a Google Doc from a configured Drive folder as plain text."),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(true), mcp.WithOpenWorldHintAnnotation(true),
+		mcp.WithString("source",
+			mcp.Description("Configured google_docs source name. Required when more than one source is configured."),
+		),
+		mcp.WithString("document_id",
+			mcp.Required(),
+			mcp.Description("Google Docs document ID"),
+		),
+		mcp.WithNumber("max_chars",
+			mcp.Description("Maximum document text characters to return (default 20000, max 100000)"),
+		),
+	)
+}
+
+func appendGoogleDocTextTool() mcp.Tool {
+	return mcp.NewTool(ToolAppendGoogleDocText,
+		mcp.WithDescription("Append plain text to a Google Doc in a configured Drive folder."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithIdempotentHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(true),
+		mcp.WithString("source",
+			mcp.Description("Configured google_docs source name. Required when more than one source is configured."),
+		),
+		mcp.WithString("document_id",
+			mcp.Required(),
+			mcp.Description("Google Docs document ID"),
+		),
+		mcp.WithString("text",
+			mcp.Required(),
+			mcp.Description("Plain text to append"),
+		),
+	)
+}
+
+func replaceGoogleDocTextTool() mcp.Tool {
+	return mcp.NewTool(ToolReplaceGoogleDocText,
+		mcp.WithDescription("Replace all matching text in a Google Doc in a configured Drive folder."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithIdempotentHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(true),
+		mcp.WithString("source",
+			mcp.Description("Configured google_docs source name. Required when more than one source is configured."),
+		),
+		mcp.WithString("document_id",
+			mcp.Required(),
+			mcp.Description("Google Docs document ID"),
+		),
+		mcp.WithString("find",
+			mcp.Required(),
+			mcp.Description("Substring to find"),
+		),
+		mcp.WithString("replacement",
+			mcp.Required(),
+			mcp.Description("Replacement text. Use an empty string to delete matched text."),
+		),
+		mcp.WithBoolean("match_case",
+			mcp.Description("Whether the search should be case sensitive (default false)"),
 		),
 	)
 }

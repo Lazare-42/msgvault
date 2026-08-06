@@ -600,5 +600,430 @@ func (c *Client) BatchDeleteMessages(ctx context.Context, messageIDs []string) e
 	return err
 }
 
+// --- Draft operations ---
+
+// Gmail API JSON types for drafts.
+
+type gmailDraftMessage struct {
+	ID           string        `json:"id"`
+	ThreadID     string        `json:"threadId"`
+	LabelIDs     []string      `json:"labelIds"`
+	Snippet      string        `json:"snippet"`
+	InternalDate string        `json:"internalDate"`
+	Payload      *gmailPayload `json:"payload"`
+}
+
+type gmailPayload struct {
+	Headers []gmailHeader  `json:"headers"`
+	Parts   []gmailPayload `json:"parts"`
+	Body    *gmailBody     `json:"body"`
+}
+
+type gmailHeader struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+type gmailBody struct {
+	Size int    `json:"size"`
+	Data string `json:"data"` // base64url encoded
+}
+
+type gmailDraft struct {
+	ID      string            `json:"id"`
+	Message gmailDraftMessage `json:"message"`
+}
+
+type listDraftsResponse struct {
+	Drafts        []gmailDraft `json:"drafts"`
+	NextPageToken string       `json:"nextPageToken"`
+}
+
+// parseDraft converts a Gmail API draft response to our domain type.
+func parseDraft(d gmailDraft) *Draft {
+	msg := d.Message
+	dm := DraftMessage{
+		ID:       msg.ID,
+		ThreadID: msg.ThreadID,
+		LabelIDs: msg.LabelIDs,
+		Snippet:  msg.Snippet,
+	}
+
+	if msg.InternalDate != "" {
+		dm.Date, _ = strconv.ParseInt(msg.InternalDate, 10, 64)
+	}
+
+	if msg.Payload != nil {
+		for _, h := range msg.Payload.Headers {
+			switch strings.ToLower(h.Name) {
+			case "from":
+				dm.From = h.Value
+			case "to":
+				dm.To = splitAddresses(h.Value)
+			case "cc":
+				dm.Cc = splitAddresses(h.Value)
+			case "bcc":
+				dm.Bcc = splitAddresses(h.Value)
+			case "subject":
+				dm.Subject = h.Value
+			}
+		}
+
+		dm.Body = extractBody(msg.Payload)
+	}
+
+	return &Draft{ID: d.ID, Message: dm}
+}
+
+// splitAddresses splits a comma-separated list of email addresses.
+func splitAddresses(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// extractBody extracts the text/plain body from a message payload.
+// Falls back to text/html if no plain text part exists.
+func extractBody(p *gmailPayload) string {
+	if p == nil {
+		return ""
+	}
+
+	// Check this part directly
+	if p.Body != nil && p.Body.Data != "" {
+		// Determine content type from headers if available
+		contentType := ""
+		for _, h := range p.Headers {
+			if strings.ToLower(h.Name) == "content-type" {
+				contentType = strings.ToLower(h.Value)
+				break
+			}
+		}
+		if strings.Contains(contentType, "text/plain") || contentType == "" {
+			decoded, err := decodeBase64URL(p.Body.Data)
+			if err == nil {
+				return string(decoded)
+			}
+		}
+	}
+
+	// Search parts recursively — prefer text/plain
+	var htmlFallback string
+	for i := range p.Parts {
+		part := &p.Parts[i]
+		contentType := ""
+		for _, h := range part.Headers {
+			if strings.ToLower(h.Name) == "content-type" {
+				contentType = strings.ToLower(h.Value)
+				break
+			}
+		}
+		if part.Body != nil && part.Body.Data != "" {
+			decoded, err := decodeBase64URL(part.Body.Data)
+			if err == nil {
+				if strings.Contains(contentType, "text/plain") {
+					return string(decoded)
+				}
+				if strings.Contains(contentType, "text/html") && htmlFallback == "" {
+					htmlFallback = string(decoded)
+				}
+			}
+		}
+		// Recurse into nested parts
+		if len(part.Parts) > 0 {
+			if body := extractBody(part); body != "" {
+				return body
+			}
+		}
+	}
+
+	return htmlFallback
+}
+
+// ListDrafts returns drafts matching the optional query.
+func (c *Client) ListDrafts(ctx context.Context, query string, maxResults int) ([]*Draft, error) {
+	params := url.Values{}
+	if maxResults > 0 {
+		params.Set("maxResults", strconv.Itoa(maxResults))
+	} else {
+		params.Set("maxResults", "20")
+	}
+	if query != "" {
+		params.Set("q", query)
+	}
+	// Request full message metadata so we can parse headers
+	params.Set("includeSpamTrash", "false")
+
+	path := fmt.Sprintf("/users/%s/drafts?%s", c.userID, params.Encode())
+	data, err := c.request(ctx, OpDraftsList, "GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp listDraftsResponse
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("parse drafts list: %w", err)
+	}
+
+	// The list endpoint returns minimal data. Fetch each draft for full content.
+	drafts := make([]*Draft, 0, len(resp.Drafts))
+	for _, d := range resp.Drafts {
+		full, err := c.GetDraft(ctx, d.ID)
+		if err != nil {
+			// Skip drafts that fail to fetch (may have been deleted)
+			var nfe *NotFoundError
+			if errors.As(err, &nfe) {
+				continue
+			}
+			return nil, fmt.Errorf("get draft %s: %w", d.ID, err)
+		}
+		drafts = append(drafts, full)
+	}
+
+	return drafts, nil
+}
+
+// GetDraft returns a single draft by ID with full message content.
+func (c *Client) GetDraft(ctx context.Context, draftID string) (*Draft, error) {
+	params := url.Values{}
+	params.Set("format", "full")
+
+	path := fmt.Sprintf("/users/%s/drafts/%s?%s", c.userID, draftID, params.Encode())
+	data, err := c.request(ctx, OpDraftsGet, "GET", path, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	var d gmailDraft
+	if err := json.Unmarshal(data, &d); err != nil {
+		return nil, fmt.Errorf("parse draft: %w", err)
+	}
+
+	return parseDraft(d), nil
+}
+
+// CreateDraft creates a new draft.
+func (c *Client) CreateDraft(ctx context.Context, compose *DraftCompose) (*Draft, error) {
+	raw, err := BuildDraftMIME(compose)
+	if err != nil {
+		return nil, fmt.Errorf("build draft MIME: %w", err)
+	}
+	encoded := base64.URLEncoding.EncodeToString(raw)
+
+	body := struct {
+		Message struct {
+			Raw      string `json:"raw"`
+			ThreadID string `json:"threadId,omitempty"`
+		} `json:"message"`
+	}{}
+	body.Message.Raw = encoded
+	if compose.ThreadID != "" {
+		body.Message.ThreadID = compose.ThreadID
+	}
+
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal draft: %w", err)
+	}
+
+	path := fmt.Sprintf("/users/%s/drafts", c.userID)
+	data, err := c.request(ctx, OpDraftsCreate, "POST", path, bodyBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	var d gmailDraft
+	if err := json.Unmarshal(data, &d); err != nil {
+		return nil, fmt.Errorf("parse created draft: %w", err)
+	}
+
+	return parseDraft(d), nil
+}
+
+// UpdateDraft replaces the content of an existing draft.
+func (c *Client) UpdateDraft(ctx context.Context, draftID string, compose *DraftCompose) (*Draft, error) {
+	raw, err := BuildDraftMIME(compose)
+	if err != nil {
+		return nil, fmt.Errorf("build draft MIME: %w", err)
+	}
+	encoded := base64.URLEncoding.EncodeToString(raw)
+
+	body := struct {
+		Message struct {
+			Raw      string `json:"raw"`
+			ThreadID string `json:"threadId,omitempty"`
+		} `json:"message"`
+	}{}
+	body.Message.Raw = encoded
+	if compose.ThreadID != "" {
+		body.Message.ThreadID = compose.ThreadID
+	}
+
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal draft: %w", err)
+	}
+
+	path := fmt.Sprintf("/users/%s/drafts/%s", c.userID, draftID)
+	data, err := c.request(ctx, OpDraftsUpdate, "PUT", path, bodyBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	var d gmailDraft
+	if err := json.Unmarshal(data, &d); err != nil {
+		return nil, fmt.Errorf("parse updated draft: %w", err)
+	}
+
+	return parseDraft(d), nil
+}
+
+// DeleteDraft permanently deletes a draft.
+func (c *Client) DeleteDraft(ctx context.Context, draftID string) error {
+	path := fmt.Sprintf("/users/%s/drafts/%s", c.userID, draftID)
+	_, err := c.request(ctx, OpDraftsDelete, "DELETE", path, nil)
+	return err
+}
+
+// SendDraft sends a draft. The draft is removed from drafts afterward.
+func (c *Client) SendDraft(ctx context.Context, draftID string) (*SentMessage, error) {
+	body := struct {
+		ID string `json:"id"`
+	}{ID: draftID}
+
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal send request: %w", err)
+	}
+
+	path := fmt.Sprintf("/users/%s/drafts/send", c.userID)
+	data, err := c.request(ctx, OpDraftsSend, "POST", path, bodyBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp struct {
+		ID       string   `json:"id"`
+		ThreadID string   `json:"threadId"`
+		LabelIDs []string `json:"labelIds"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("parse send response: %w", err)
+	}
+
+	return &SentMessage{
+		ID:       resp.ID,
+		ThreadID: resp.ThreadID,
+		LabelIDs: resp.LabelIDs,
+	}, nil
+}
+
+// --- Label operations ---
+
+// ModifyMessageLabels adds and/or removes labels on a single message.
+func (c *Client) ModifyMessageLabels(ctx context.Context, messageID string, addLabelIDs, removeLabelIDs []string) error {
+	body := struct {
+		AddLabelIDs    []string `json:"addLabelIds,omitempty"`
+		RemoveLabelIDs []string `json:"removeLabelIds,omitempty"`
+	}{
+		AddLabelIDs:    addLabelIDs,
+		RemoveLabelIDs: removeLabelIDs,
+	}
+
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshal modify: %w", err)
+	}
+
+	path := fmt.Sprintf("/users/%s/messages/%s/modify", c.userID, messageID)
+	_, err = c.request(ctx, OpModifyLabels, "POST", path, bodyBytes)
+	return err
+}
+
+// BatchModifyLabels adds and/or removes labels on multiple messages (max 1000).
+func (c *Client) BatchModifyLabels(ctx context.Context, messageIDs, addLabelIDs, removeLabelIDs []string) error {
+	if len(messageIDs) == 0 {
+		return nil
+	}
+	if len(messageIDs) > 1000 {
+		return fmt.Errorf("batch modify limited to 1000 messages, got %d", len(messageIDs))
+	}
+
+	body := struct {
+		IDs            []string `json:"ids"`
+		AddLabelIDs    []string `json:"addLabelIds,omitempty"`
+		RemoveLabelIDs []string `json:"removeLabelIds,omitempty"`
+	}{
+		IDs:            messageIDs,
+		AddLabelIDs:    addLabelIDs,
+		RemoveLabelIDs: removeLabelIDs,
+	}
+
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return fmt.Errorf("marshal batch modify: %w", err)
+	}
+
+	path := fmt.Sprintf("/users/%s/messages/batchModify", c.userID)
+	_, err = c.request(ctx, OpBatchModifyLabels, "POST", path, bodyBytes)
+	return err
+}
+
+// CreateLabel creates a new user label.
+func (c *Client) CreateLabel(ctx context.Context, name string) (*Label, error) {
+	body := struct {
+		Name                  string `json:"name"`
+		MessageListVisibility string `json:"messageListVisibility"`
+		LabelListVisibility   string `json:"labelListVisibility"`
+	}{
+		Name:                  name,
+		MessageListVisibility: "show",
+		LabelListVisibility:   "labelShow",
+	}
+
+	bodyBytes, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal label: %w", err)
+	}
+
+	path := fmt.Sprintf("/users/%s/labels", c.userID)
+	data, err := c.request(ctx, OpCreateLabel, "POST", path, bodyBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp gmailLabel
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return nil, fmt.Errorf("parse label: %w", err)
+	}
+
+	return &Label{
+		ID:                    resp.ID,
+		Name:                  resp.Name,
+		Type:                  resp.Type,
+		MessagesTotal:         resp.MessagesTotal,
+		MessagesUnread:        resp.MessagesUnread,
+		MessageListVisibility: resp.MessageListVisibility,
+		LabelListVisibility:   resp.LabelListVisibility,
+	}, nil
+}
+
+// DeleteLabel permanently deletes a user label by ID.
+// Messages with this label are not deleted; the label is simply removed from them.
+func (c *Client) DeleteLabel(ctx context.Context, labelID string) error {
+	path := fmt.Sprintf("/users/%s/labels/%s", c.userID, labelID)
+	_, err := c.request(ctx, OpDeleteLabel, "DELETE", path, nil)
+	return err
+}
+
 // Ensure Client implements API interface.
 var _ API = (*Client)(nil)

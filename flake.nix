@@ -10,6 +10,7 @@
 
   outputs =
     {
+      self,
       nixpkgs,
       flake-utils,
       gitignore,
@@ -19,6 +20,10 @@
       system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
+        minSQLiteVersion = "3.44.0";
+        sqliteForMsgvault =
+          assert pkgs.lib.versionAtLeast pkgs.sqlite.version minSQLiteVersion;
+          pkgs.sqlite;
 
         # Pin Go 1.26.5 until nixpkgs-unstable ships it.
         # Scoped to msgvault only — do NOT export via overlay, that would
@@ -36,6 +41,7 @@
         msgvault = pkgs.callPackage ./nix/package.nix {
           inherit buildGoModule;
           inherit (gitignore.lib) gitignoreSource;
+          sqlite = sqliteForMsgvault;
         };
       in
       {
@@ -54,6 +60,8 @@
             pkgs.golangci-lint
             pkgs.delve
             pkgs.gcc
+            pkgs.pkg-config
+            sqliteForMsgvault
             pkgs.prek
             pkgs.sqlite-interactive
           ];
@@ -61,5 +69,13 @@
 
         formatter = pkgs.nixfmt-rfc-style;
       }
-    );
+    )
+    // {
+      # Expose the package as an overlay for nixos-config wiring. This uses
+      # the per-system package built above (which scopes the Go pin to
+      # msgvault), so it does not leak goPinned into the consumer's closure.
+      overlays.default = final: _prev: {
+        msgvault = self.packages.${final.system}.default;
+      };
+    };
 }

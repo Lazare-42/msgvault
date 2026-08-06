@@ -40,6 +40,10 @@ const (
 	// ScopeIMAPPersonal is the IMAP scope for personal Microsoft accounts
 	// (hotmail.com, outlook.com, live.com, etc.).
 	ScopeIMAPPersonal = "https://outlook.office.com/IMAP.AccessAsUser.All"
+	// ScopeSMTPOrg is the SMTP AUTH scope for organizational (O365) accounts.
+	ScopeSMTPOrg = "https://outlook.office365.com/SMTP.Send"
+	// ScopeSMTPPersonal is the SMTP AUTH scope for personal Microsoft accounts.
+	ScopeSMTPPersonal = "https://outlook.office.com/SMTP.Send"
 
 	// MicrosoftConsumerTenantID is the fixed tenant ID for all personal
 	// Microsoft accounts (outlook.com, hotmail.com, live.com, etc.).
@@ -57,10 +61,12 @@ const (
 // Personal Microsoft accounts use a different IMAP resource than org accounts.
 func scopesForEmail(email string) []string {
 	imapScope := ScopeIMAPOrg
+	smtpScope := ScopeSMTPOrg
 	if isPersonalMicrosoftAccount(email) {
 		imapScope = ScopeIMAPPersonal
+		smtpScope = ScopeSMTPPersonal
 	}
-	return []string{imapScope, scopeOfflineAccess, "openid", scopeEmail}
+	return []string{imapScope, smtpScope, scopeOfflineAccess, "openid", scopeEmail}
 }
 
 // isPersonalMicrosoftAccount returns true for common consumer Microsoft domains.
@@ -97,6 +103,22 @@ func imapScopeForTenant(tid string) string {
 		return ScopeIMAPPersonal
 	}
 	return ScopeIMAPOrg
+}
+
+func smtpScopeForTenant(tid string) string {
+	if strings.EqualFold(tid, MicrosoftConsumerTenantID) {
+		return ScopeSMTPPersonal
+	}
+	return ScopeSMTPOrg
+}
+
+func containsScope(scopes []string, want string) bool {
+	for _, scope := range scopes {
+		if strings.EqualFold(scope, want) {
+			return true
+		}
+	}
+	return false
 }
 
 type TokenMismatchError struct {
@@ -178,7 +200,7 @@ func (m *Manager) Authorize(ctx context.Context, email string) error {
 				"from", scopes[0],
 				"to", correctIMAPScope,
 			)
-			scopes = []string{correctIMAPScope, scopeOfflineAccess, "openid", scopeEmail}
+			scopes = []string{correctIMAPScope, smtpScopeForTenant(claims.TenantID), scopeOfflineAccess, "openid", scopeEmail}
 			token, nonce, err = flow(ctx, email, scopes)
 			if err != nil {
 				return fmt.Errorf("re-authorize with correct IMAP scope: %w", err)
@@ -254,6 +276,18 @@ func (m *Manager) TokenSource(ctx context.Context, email string) (func(context.C
 			)
 			return nil, fmt.Errorf(
 				"token for %s has stale IMAP scope — run 'msgvault add-o365 %s' to re-authorize",
+				email, email,
+			)
+		}
+		correctSMTPScope := smtpScopeForTenant(tf.TenantID)
+		if !containsScope(tf.Scopes, correctSMTPScope) {
+			m.logger.Debug("stale Microsoft SMTP scope detected",
+				logKeyEmail, email,
+				"expected_scope", correctSMTPScope,
+				"tenant_id", tf.TenantID,
+			)
+			return nil, fmt.Errorf(
+				"token for %s is missing SMTP.Send scope — run 'msgvault add-o365 %s' to re-authorize",
 				email, email,
 			)
 		}

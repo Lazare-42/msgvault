@@ -51,19 +51,24 @@ type MessageSummary struct {
 
 // MessageDetail represents a full message with body and attachments.
 type MessageDetail struct {
-	ID                   int64      `json:"id"`
-	SourceID             int64      `json:"source_id,omitempty"`
-	SourceMessageID      string     `json:"source_message_id"`
-	ConversationID       int64      `json:"conversation_id"`
-	SourceConversationID string     `json:"source_conversation_id"` // Gmail Thread ID
-	Subject              string     `json:"subject"`
-	MessageType          string     `json:"message_type,omitempty"`
-	Snippet              string     `json:"snippet"`
-	SentAt               time.Time  `json:"sent_at"`
-	ReceivedAt           *time.Time `json:"received_at,omitempty"`
-	DeletedAt            *time.Time `json:"deleted_at,omitempty"` // When message was deleted from source (nil if not deleted)
-	SizeEstimate         int64      `json:"size_estimate"`
-	HasAttachments       bool       `json:"has_attachments"`
+	ID                   int64  `json:"id"`
+	SourceID             int64  `json:"source_id,omitempty"`
+	SourceMessageID      string `json:"source_message_id"`
+	ConversationID       int64  `json:"conversation_id"`
+	SourceConversationID string `json:"source_conversation_id"` // Gmail Thread ID
+	// RFC822MessageID is the RFC 5322 Message-ID header (e.g.
+	// "<abc@mail.gmail.com>"). Pass it as create_draft's in_reply_to to
+	// compose a true reply that threads correctly in every mail client.
+	// Empty for messages whose source did not record a Message-ID.
+	RFC822MessageID string     `json:"rfc822_message_id,omitempty"`
+	Subject         string     `json:"subject"`
+	MessageType     string     `json:"message_type,omitempty"`
+	Snippet         string     `json:"snippet"`
+	SentAt          time.Time  `json:"sent_at"`
+	ReceivedAt      *time.Time `json:"received_at,omitempty"`
+	DeletedAt       *time.Time `json:"deleted_at,omitempty"` // When message was deleted from source (nil if not deleted)
+	SizeEstimate    int64      `json:"size_estimate"`
+	HasAttachments  bool       `json:"has_attachments"`
 
 	// Participants
 	From []Address `json:"from"`
