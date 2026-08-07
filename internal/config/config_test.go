@@ -1051,15 +1051,26 @@ mcp_enabled = true
 }
 
 func TestNewDefaultConfig(t *testing.T) {
+	assert := assert.New(t)
 	// Use a temp directory as MSGVAULT_HOME
 	tmpDir := t.TempDir()
 	t.Setenv("MSGVAULT_HOME", tmpDir)
 
 	cfg := NewDefaultConfig()
 
-	assert.Equal(t, tmpDir, cfg.HomeDir)
-	assert.Equal(t, tmpDir, cfg.Data.DataDir)
-	assert.Equal(t, 5, cfg.Sync.RateLimitQPS)
+	assert.Equal(tmpDir, cfg.HomeDir)
+	assert.Equal(tmpDir, cfg.Data.DataDir)
+	assert.False(cfg.Data.LooseAttachments)
+	assert.Equal(5, cfg.Sync.RateLimitQPS)
+}
+
+func TestDataLooseAttachmentsConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(path, []byte("[data]\nloose_attachments = true\n"), 0o600))
+
+	cfg, err := Load(path, "")
+	require.NoError(t, err)
+	assert.True(t, cfg.Data.LooseAttachments)
 }
 
 func TestSaveAndLoad_RoundTrip(t *testing.T) {
