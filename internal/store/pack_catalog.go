@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -14,11 +16,18 @@ import (
 // engine. It contains conversions only; SQL and transaction authority remain
 // on Store.
 type PackCatalog struct {
-	store *Store
+	store          *Store
+	attachmentsDir string
 }
 
 // NewPackCatalog constructs a Kit catalog adapter over st.
 func NewPackCatalog(st *Store) *PackCatalog { return &PackCatalog{store: st} }
+
+// NewMaintenancePackCatalog constructs a catalog that can resolve missing
+// logical sizes from msgvault's canonical loose attachment tree.
+func NewMaintenancePackCatalog(st *Store, attachmentsDir string) *PackCatalog {
+	return &PackCatalog{store: st, attachmentsDir: attachmentsDir}
+}
 
 var _ packstore.Catalog = (*PackCatalog)(nil)
 
@@ -86,8 +95,23 @@ func (c *PackCatalog) ListUnpacked(ctx context.Context) ([]packstore.Candidate, 
 				"original_hash", blob.Hash, "error", err)
 			continue
 		}
+		size := blob.Size
+		if size < 0 && c.attachmentsDir != "" {
+			paths := append([]string(nil), blob.Paths...)
+			paths = append(paths, filepath.Join(hash.String()[:2], hash.String()))
+			for _, candidatePath := range paths {
+				path := filepath.FromSlash(candidatePath)
+				if !filepath.IsAbs(path) {
+					path = filepath.Join(c.attachmentsDir, path)
+				}
+				if info, statErr := os.Lstat(filepath.Clean(path)); statErr == nil && info.Mode().IsRegular() {
+					size = info.Size()
+					break
+				}
+			}
+		}
 		result = append(result, packstore.Candidate{Hash: hash,
-			OriginalHashes: blob.OriginalHashes, Paths: blob.Paths, Size: blob.Size})
+			OriginalHashes: blob.OriginalHashes, Paths: blob.Paths, Size: size})
 	}
 	return result, nil
 }
