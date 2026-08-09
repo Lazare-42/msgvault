@@ -104,8 +104,11 @@ const (
 // HTTPStoreInfo carries the selected daemon endpoint alongside the client.
 // Commands use it for user-facing endpoint labels and local-daemon cwd policy.
 type HTTPStoreInfo struct {
-	Kind HTTPStoreKind
-	URL  string
+	Kind                     HTTPStoreKind
+	URL                      string
+	StartedLocalDaemon       bool
+	DaemonLogPath            string
+	StartupCacheBuildOutcome startupCacheBuildOutcome
 }
 
 // IsRemoteMode returns true when CLI requests should target the configured
@@ -126,6 +129,13 @@ func IsRemoteMode() bool {
 // daemon is discovered or started so SQLite remains owned by one long-lived
 // process.
 func OpenHTTPStore(ctx context.Context) (*daemonclient.Client, HTTPStoreInfo, error) {
+	return openHTTPStoreWithStartupCacheIntent(ctx, startupCacheBuildIntentNone)
+}
+
+func openHTTPStoreWithStartupCacheIntent(
+	ctx context.Context,
+	intent startupCacheBuildIntent,
+) (*daemonclient.Client, HTTPStoreInfo, error) {
 	if cfg == nil {
 		return nil, HTTPStoreInfo{}, errors.New("nil config")
 	}
@@ -140,7 +150,7 @@ func OpenHTTPStore(ctx context.Context) (*daemonclient.Client, HTTPStoreInfo, er
 		}, nil
 	}
 
-	rt, err := ensureLocalDaemonRuntime(ctx, cfg)
+	rt, startup, err := ensureLocalDaemonRuntimeWithStartupCacheIntent(ctx, cfg, intent)
 	if err != nil {
 		return nil, HTTPStoreInfo{}, err
 	}
@@ -155,8 +165,11 @@ func OpenHTTPStore(ctx context.Context) (*daemonclient.Client, HTTPStoreInfo, er
 	}
 	st.SetBusyNotifier(reportDaemonBusyWait)
 	return st, HTTPStoreInfo{
-		Kind: HTTPStoreLocalDaemon,
-		URL:  url,
+		Kind:                     HTTPStoreLocalDaemon,
+		URL:                      url,
+		StartedLocalDaemon:       startup.Started,
+		DaemonLogPath:            startup.LogPath,
+		StartupCacheBuildOutcome: startup.Outcome,
 	}, nil
 }
 
@@ -185,26 +198,36 @@ func openRemoteStore(ctx context.Context) (*daemonclient.Client, error) {
 	return st, nil
 }
 
-func ensureLocalDaemonRuntime(ctx context.Context, c *config.Config) (*DaemonRuntime, error) {
+type localDaemonStartupInfo struct {
+	Started bool
+	LogPath string
+	Outcome startupCacheBuildOutcome
+}
+
+func ensureLocalDaemonRuntimeWithStartupCacheIntent(
+	ctx context.Context,
+	c *config.Config,
+	intent startupCacheBuildIntent,
+) (*DaemonRuntime, localDaemonStartupInfo, error) {
 	if c == nil {
-		return nil, errors.New("nil config")
+		return nil, localDaemonStartupInfo{}, errors.New("nil config")
 	}
 	if err := os.MkdirAll(c.Data.DataDir, 0o700); err != nil {
-		return nil, fmt.Errorf("create data directory: %w", err)
+		return nil, localDaemonStartupInfo{}, fmt.Errorf("create data directory: %w", err)
 	}
 	if rt := findDaemonRuntime(c.Data.DataDir); rt != nil &&
 		!shouldUpgradeDaemonRuntimeWithPolicy(rt, Version, c.Server.DaemonAutoRestart) {
 		if err := probeLocalDaemonAuth(ctx, rt, c); err != nil {
-			return nil, err
+			return nil, localDaemonStartupInfo{}, err
 		}
-		return rt, nil
+		return rt, localDaemonStartupInfo{}, nil
 	}
 
 	// No usable daemon was found. If a direct CLI writer owns the archive,
 	// fail fast with a clear message instead of spawning a daemon that cannot
 	// claim the held write-owner lock.
 	if err := daemonAutostartPreflight(c); err != nil {
-		return nil, err
+		return nil, localDaemonStartupInfo{}, err
 	}
 
 	launchLock, ok := acquireBackgroundLaunchLock(c.Data.DataDir)
@@ -218,7 +241,7 @@ func ensureLocalDaemonRuntime(ctx context.Context, c *config.Config) (*DaemonRun
 		inProgress, err := daemonStartInProgress(ctx, c.Data.DataDir)
 		if err != nil {
 			_ = launchLock.Unlock()
-			return nil, err
+			return nil, localDaemonStartupInfo{}, err
 		}
 		if inProgress {
 			_ = launchLock.Unlock()
@@ -233,52 +256,100 @@ func ensureLocalDaemonRuntime(ctx context.Context, c *config.Config) (*DaemonRun
 			ctx, c.Data.DataDir, c.Server.DaemonAutoRestart, localDaemonAutoStartReadyTimeout,
 		)
 		if err != nil {
-			return nil, err
+			return nil, localDaemonStartupInfo{}, err
 		}
 		if rt != nil {
 			if err := probeLocalDaemonAuth(ctx, rt, c); err != nil {
-				return nil, err
+				return nil, localDaemonStartupInfo{}, err
 			}
-			return rt, nil
+			return rt, localDaemonStartupInfo{}, nil
 		}
 		if acquiredLock != nil {
 			launchLock = acquiredLock
 		} else {
-			return nil, errors.New("msgvault daemon start is already in progress")
+			return nil, localDaemonStartupInfo{},
+				errors.New("msgvault daemon start is already in progress")
 		}
 	}
 	defer func() { _ = launchLock.Unlock() }()
 
 	prep, err := prepareBackgroundDaemonStart(c, "run `msgvault daemon stop` or retry with --local")
 	if err != nil {
-		return nil, err
+		return nil, localDaemonStartupInfo{}, err
 	}
 	if rt := prep.Reusable; rt != nil {
 		if err := probeLocalDaemonAuth(ctx, rt, c); err != nil {
-			return nil, err
+			return nil, localDaemonStartupInfo{}, err
 		}
-		return rt, nil
+		return rt, localDaemonStartupInfo{}, nil
 	}
 
-	proc, err := startServeBackgroundProcessForRun(c, backgroundServeStartOptions{})
+	startedAt := time.Now()
+	proc, err := startServeBackgroundProcessForRun(c, backgroundServeStartOptions{
+		CacheBuildIntent: intent,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("start background daemon: %w", err)
+		return nil, localDaemonStartupInfo{}, fmt.Errorf("start background daemon: %w", err)
 	}
+	defer func() { _ = proc.releaseProcessTree() }()
 	stopProgress := reportLocalDaemonStartup(ctx, proc)
-	defer stopProgress()
+	defer func() { stopProgress() }()
 	rt, ready, err := waitForBackgroundServeReadyForRun(
 		ctx, c.Data.DataDir, proc.Wait, localDaemonAutoStartReadyTimeout,
 	)
 	if err != nil {
-		return nil, backgroundServeStartupError(err, proc)
+		startupErr := backgroundServeStartupError(err, proc)
+		if intent != startupCacheBuildIntentNone && ctx.Err() != nil {
+			stopErr := stopBackgroundServeStartupForRun(proc)
+			if stopErr != nil {
+				startupErr = errors.Join(startupErr,
+					fmt.Errorf("stop canceled daemon startup: %w", stopErr))
+			}
+		}
+		return nil, localDaemonStartupInfo{}, startupErr
 	}
 	if !ready {
-		return nil, fmt.Errorf(
+		return nil, localDaemonStartupInfo{}, fmt.Errorf(
 			"msgvault daemon did not become ready within %s (pid %d)\nLogs: %s",
 			localDaemonAutoStartReadyTimeout, proc.PID, proc.LogPath,
 		)
 	}
-	return rt, nil
+	if intent != startupCacheBuildIntentNone {
+		rt = refreshDaemonRuntimeRecord(c.Data.DataDir, rt)
+	}
+	stopProgress()
+	stopProgress = func() {}
+	if intent != startupCacheBuildIntentNone {
+		_, _ = fmt.Fprintf(os.Stderr, "Daemon ready after %s.\n",
+			time.Since(startedAt).Round(time.Second))
+	}
+	return rt, localDaemonStartupInfo{
+		Started: true,
+		LogPath: proc.LogPath,
+		Outcome: startupCacheBuildOutcomeFromRuntime(rt),
+	}, nil
+}
+
+// refreshDaemonRuntimeRecord reloads the exact process record after readiness.
+// A readiness probe can read the record before startup metadata is published,
+// then block on the reserved listener until the API server starts. In that
+// race, the endpoint is ready but the probe's record snapshot is stale.
+func refreshDaemonRuntimeRecord(dataDir string, rt *DaemonRuntime) *DaemonRuntime {
+	if rt == nil {
+		return nil
+	}
+	records, err := daemonRuntimeStore(dataDir).List()
+	if err != nil {
+		return rt
+	}
+	for _, rec := range records {
+		if rec.PID == rt.Record.PID {
+			fresh := *rt
+			fresh.Record = rec
+			return &fresh
+		}
+	}
+	return rt
 }
 
 func backgroundServeStartupError(err error, proc *backgroundServeProcess) error {
@@ -318,7 +389,7 @@ func reportLocalDaemonStartup(ctx context.Context, proc *backgroundServeProcess)
 		timer := time.NewTimer(localDaemonStartupProgressDelay)
 		defer timer.Stop()
 		started := time.Now()
-		lastLine := ""
+		state := daemonStartupProgressState{}
 		announced := false
 		for {
 			select {
@@ -339,19 +410,14 @@ func reportLocalDaemonStartup(ctx context.Context, proc *backgroundServeProcess)
 			}
 
 			elapsed := time.Since(started).Round(time.Second)
-			line := latestDaemonLogLine(proc.LogPath)
-			switch {
-			case line != "" && line != lastLine:
-				_, _ = fmt.Fprintf(os.Stderr, "Daemon startup (%s): %s\n", elapsed, humanizeDaemonLogLine(line))
-				lastLine = line
-			case proc.LogPath != "":
+			message := state.Next(latestDaemonLogLine(proc.LogPath))
+			if message == "still waiting" && proc.LogPath != "" {
 				_, _ = fmt.Fprintf(os.Stderr,
 					"Daemon startup (%s): still waiting. Logs: %s\n",
 					elapsed, proc.LogPath)
-			default:
+			} else {
 				_, _ = fmt.Fprintf(os.Stderr,
-					"Daemon startup (%s): still waiting.\n",
-					elapsed)
+					"Daemon startup (%s): %s\n", elapsed, message)
 			}
 			timer.Reset(localDaemonStartupProgressInterval)
 		}
@@ -382,10 +448,36 @@ func compactDuration(d time.Duration) string {
 var daemonStartupStepLabels = map[string]string{
 	"open_archive_database": "opening the archive database",
 	"init_archive_schema":   "checking the database schema",
+	"build_analytics_cache": "building the analytics cache",
 	"init_analytics_engine": "starting the analytics engine",
 	"init_vector_backend":   "initializing vector search",
 	"skip_vector_backend":   "vector search disabled",
 	"start_api_server":      "starting the API server",
+}
+
+type daemonStartupProgressState struct {
+	lastLine   string
+	activeStep string
+}
+
+func (s *daemonStartupProgressState) Next(line string) string {
+	if line == s.lastLine {
+		if s.activeStep != "" {
+			return "still " + s.activeStep
+		}
+		return "still waiting"
+	}
+	s.lastLine = line
+	fields, ok := parseLogfmt(strings.TrimSpace(line))
+	if ok && fields["step"] != "" {
+		switch fields["msg"] {
+		case "daemon startup step":
+			s.activeStep = daemonStartupStepLabel(fields["step"])
+		case "daemon startup step complete", "daemon startup step failed":
+			s.activeStep = ""
+		}
+	}
+	return humanizeDaemonLogLine(line)
 }
 
 func daemonStartupStepLabel(step string) string {
@@ -446,10 +538,22 @@ func summarizeDaemonLogLine(line string) string {
 	// bind, enabled), which are detail — never a reason to fall back
 	// to the raw line, so they skip the unknown-key guard below.
 	case msg == "daemon startup step" && step != "":
-		sb.WriteString(daemonStartupStepLabel(step))
+		label := daemonStartupStepLabel(step)
+		sb.WriteString(label)
+		if step == "build_analytics_cache" && fields["reason"] != "" {
+			sb.WriteString(" (")
+			if fields["full_rebuild"] == "true" {
+				sb.WriteString("full rebuild: ")
+			}
+			sb.WriteString(fields["reason"])
+			sb.WriteString(")")
+		}
 	case msg == "daemon startup step complete" && step != "":
 		sb.WriteString(daemonStartupStepLabel(step))
 		sb.WriteString(" (done)")
+	case msg == "daemon startup step failed" && step != "":
+		sb.WriteString(daemonStartupStepLabel(step))
+		sb.WriteString(" (failed)")
 	// SQL logger records carry the full statement in stmt — schema
 	// migrations dump multiple kilobytes of SQL into a single line.
 	// Summarize to the duration; the statement stays in serve.log.

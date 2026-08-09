@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -1183,6 +1184,104 @@ func TestRunServeStartNotReadyPointsAtStatusForAutoPort(t *testing.T) {
 			"Logs: /tmp/msgvault-serve.log\n",
 		stdout.String())
 	assert.Empty(t, stderr.String())
+}
+
+func TestStopBackgroundServeStartupTerminatesProcess(t *testing.T) {
+	cmd := helperProcessCommand(context.Background(), "block")
+	require.NoError(t, cmd.Start(), "start blocking helper")
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+	proc := &backgroundServeProcess{
+		PID:     cmd.Process.Pid,
+		Process: cmd.Process,
+		Wait:    waitCh,
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+
+	err := stopBackgroundServeStartup(proc, 2*time.Second)
+
+	require.NoError(t, err)
+}
+
+type recordingBackgroundProcessTree struct {
+	terminateCalls atomic.Int32
+	closeCalls     atomic.Int32
+	terminate      func() error
+}
+
+func (t *recordingBackgroundProcessTree) Attach(*os.Process) error {
+	return nil
+}
+
+func (t *recordingBackgroundProcessTree) Terminate() error {
+	t.terminateCalls.Add(1)
+	return t.terminate()
+}
+
+func (t *recordingBackgroundProcessTree) Close() error {
+	t.closeCalls.Add(1)
+	return nil
+}
+
+func TestStartServeBackgroundProcessTransfersProcessTreeOwnership(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+	t.Setenv("GO_HELPER_MODE", "block")
+	tree := &recordingBackgroundProcessTree{terminate: func() error { return nil }}
+	oldCommand := newServeBackgroundCommandForRun
+	oldConfigure := configureServeBackgroundCommandForRun
+	newServeBackgroundCommandForRun = func(string, ...string) *exec.Cmd {
+		return helperProcessCommand(context.Background(), "block")
+	}
+	configureServeBackgroundCommandForRun = func(*exec.Cmd) (backgroundServeCommandConfig, error) {
+		return backgroundServeCommandConfig{ProcessTree: tree}, nil
+	}
+	t.Cleanup(func() {
+		newServeBackgroundCommandForRun = oldCommand
+		configureServeBackgroundCommandForRun = oldConfigure
+	})
+
+	proc, err := startServeBackgroundProcess(
+		lifecycleTestConfig(t.TempDir()),
+		backgroundServeStartOptions{ExecutablePath: os.Args[0]},
+	)
+	require.NoError(err)
+	t.Cleanup(func() {
+		_ = proc.Process.Kill()
+		select {
+		case <-proc.Wait:
+		case <-time.After(2 * time.Second):
+		}
+		_ = proc.releaseProcessTree()
+	})
+
+	assert.Zero(tree.closeCalls.Load(), "successful startup must transfer process-tree ownership")
+	require.NoError(proc.releaseProcessTree())
+	assert.Equal(int32(1), tree.closeCalls.Load(), "owner releases process-tree handle")
+}
+
+func TestStopBackgroundServeStartupTerminatesProcessTree(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	cmd := helperProcessCommand(context.Background(), "block")
+	require.NoError(cmd.Start(), "start blocking helper")
+	waitCh := make(chan error, 1)
+	go func() { waitCh <- cmd.Wait() }()
+	tree := &recordingBackgroundProcessTree{terminate: cmd.Process.Kill}
+	proc := &backgroundServeProcess{
+		PID:         cmd.Process.Pid,
+		Process:     cmd.Process,
+		ProcessTree: tree,
+		Wait:        waitCh,
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+
+	require.NoError(stopBackgroundServeStartup(proc, 2*time.Second))
+	assert.Equal(int32(1), tree.terminateCalls.Load(), "terminate process tree")
+	assert.Equal(int32(1), tree.closeCalls.Load(), "close process tree handle")
 }
 
 func TestServeStopGraceTimeoutCoversDaemonShutdownBudget(t *testing.T) {

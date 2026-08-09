@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/csv"
@@ -308,11 +309,33 @@ func requestedBuildCacheMode(full, auto, derived bool) (buildCacheMode, error) {
 }
 
 func runBuildCacheHTTP(cmd *cobra.Command, fullRebuild bool) error {
-	st, _, err := OpenHTTPStore(cmd.Context())
+	intent := startupCacheBuildIntentDefault
+	if fullRebuild {
+		intent = startupCacheBuildIntentFull
+	}
+	st, info, err := openHTTPStoreWithStartupCacheIntent(cmd.Context(), intent)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = st.Close() }()
+	if info.StartedLocalDaemon {
+		switch info.StartupCacheBuildOutcome {
+		case startupCacheBuildOutcomeFulfilled:
+			_, writeErr := fmt.Fprintln(cmd.OutOrStdout(),
+				"Cache build complete. The daemon is running and using the analytics cache.")
+			if writeErr != nil {
+				return fmt.Errorf("write build-cache completion: %w", writeErr)
+			}
+			return nil
+		case startupCacheBuildOutcomeFailed:
+			return fmt.Errorf(
+				"analytics cache build failed during daemon startup; "+
+					"the daemon is running with live SQL\nLogs: %s",
+				info.DaemonLogPath,
+			)
+		case startupCacheBuildOutcomeNone, startupCacheBuildOutcomeUnconsumed:
+		}
+	}
 
 	return st.BuildCLICache(cmd.Context(), fullRebuild, func(stream, data string) error {
 		switch stream {
@@ -1925,10 +1948,23 @@ func buildCacheSubprocessMode(ctx context.Context, mode buildCacheMode) error {
 	if err != nil {
 		return err
 	}
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("build-cache subprocess: %w; output: %s",
-			err, strings.TrimSpace(string(out)))
+	return runBuildCacheSubprocessCommand(cmd, os.Stderr)
+}
+
+func runBuildCacheSubprocessCommand(cmd *exec.Cmd, stderrWriter io.Writer) error {
+	if stderrWriter == nil {
+		stderrWriter = io.Discard
+	}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = io.MultiWriter(stderrWriter, &stderr)
+	if err := cmd.Run(); err != nil {
+		output := strings.TrimSpace(strings.Join([]string{stdout.String(), stderr.String()}, "\n"))
+		if output != "" {
+			return fmt.Errorf("build-cache subprocess: %w; output: %s", err, output)
+		}
+		return fmt.Errorf("build-cache subprocess: %w", err)
 	}
 	return nil
 }

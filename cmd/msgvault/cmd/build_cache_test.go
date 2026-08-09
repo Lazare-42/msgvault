@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +24,22 @@ import (
 	"go.kenn.io/msgvault/internal/identityindex"
 	"go.kenn.io/msgvault/internal/query"
 )
+
+func TestDaemonBuildCacheChildUsesQuietConsolePolicy(t *testing.T) {
+	t.Setenv(daemonCLISubprocessEnv, "")
+	t.Setenv(buildCacheDaemonSubprocessEnv, strconv.Itoa(os.Getppid()))
+	assert.True(t, isDaemonConsoleSubprocess())
+}
+
+func TestRunBuildCacheSubprocessCommandStreamsStderrOnSuccess(t *testing.T) {
+	cmd := helperProcessCommand(context.Background(), "stdout-stderr-ok")
+	var stderr bytes.Buffer
+
+	err := runBuildCacheSubprocessCommand(cmd, &stderr)
+
+	require.NoError(t, err)
+	assert.Equal(t, "cache build warning\n", stderr.String())
+}
 
 // setupTestSQLite creates a test SQLite database with realistic email data.
 func setupTestSQLite(t *testing.T) string {
