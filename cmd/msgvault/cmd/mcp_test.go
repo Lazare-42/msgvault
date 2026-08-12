@@ -54,17 +54,25 @@ func TestMCPCommandUsesDaemonInsteadOfOpeningLocalDatabase(t *testing.T) {
 
 func TestMCPCommandForwardsServerAPIKeyToHTTPTransport(t *testing.T) {
 	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "/api/v1/stats", r.URL.Path)
 		assert.Equal(t, "daemon-key", r.Header.Get("X-Api-Key"))
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{
-			"total_messages": 0,
-			"total_threads": 0,
-			"total_accounts": 0,
-			"total_labels": 0,
-			"total_attachments": 0,
-			"database_size_bytes": 0
-		}`))
+		switch r.URL.Path {
+		case "/api/v1/stats":
+			_, _ = w.Write([]byte(`{
+				"total_messages": 0,
+				"total_threads": 0,
+				"total_accounts": 0,
+				"total_labels": 0,
+				"total_attachments": 0,
+				"database_size_bytes": 0
+			}`))
+		case "/api/v1/cli/accounts":
+			// Queried by buildGmailFactory to detect IMAP accounts.
+			_, _ = w.Write([]byte(`{"accounts": []}`))
+		default:
+			assert.Fail(t, "unexpected daemon path", r.URL.Path)
+			http.NotFound(w, r)
+		}
 	}))
 	t.Cleanup(daemon.Close)
 
