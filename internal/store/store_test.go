@@ -579,6 +579,63 @@ func TestStore_MessageLabels(t *testing.T) {
 	assert.Equal(t, labels["SENT"], labelID, "label_id (SENT)")
 }
 
+func TestStore_RemoveStaleFlagLabels(t *testing.T) {
+	f := storetest.New(t)
+
+	msgID := f.CreateMessage("msg-1")
+
+	systemLabels := f.EnsureLabels(map[string]string{
+		"INBOX":    "INBOX",
+		"UNREAD":   "UNREAD",
+		"STARRED":  "STARRED",
+		"ANSWERED": "ANSWERED",
+	}, "system")
+	userLabels := f.EnsureLabels(map[string]string{
+		"Archive": "Archive",
+	}, "user")
+	keywordLabels := f.EnsureLabels(map[string]string{
+		"Traite": "Traite",
+	}, store.LabelTypeKeyword)
+
+	err := f.Store.ReplaceMessageLabels(msgID, []int64{
+		systemLabels["INBOX"],
+		systemLabels["UNREAD"],
+		systemLabels["STARRED"],
+		userLabels["Archive"],
+		keywordLabels["Traite"],
+	})
+	require.NoError(t, err, "ReplaceMessageLabels()")
+
+	// The message was read and its category removed; the star remains.
+	keep := []int64{
+		systemLabels["INBOX"],
+		userLabels["Archive"],
+		systemLabels["STARRED"],
+	}
+	changed, err := f.Store.RemoveStaleFlagLabels(msgID, f.Source.ID, keep)
+	require.NoError(t, err, "RemoveStaleFlagLabels()")
+	assert.True(t, changed, "stale UNREAD and Traite should be removed")
+
+	f.AssertLabelCount(msgID, 3)
+	f.AssertMessageHasLabel(msgID, systemLabels["INBOX"])
+	f.AssertMessageHasLabel(msgID, userLabels["Archive"])
+	f.AssertMessageHasLabel(msgID, systemLabels["STARRED"])
+
+	// Idempotent: nothing left to remove.
+	changed, err = f.Store.RemoveStaleFlagLabels(msgID, f.Source.ID, keep)
+	require.NoError(t, err, "RemoveStaleFlagLabels() second call")
+	assert.False(t, changed, "no stale flag labels remain")
+
+	// An empty keep set clears all flag-derived labels but preserves
+	// mailbox and user labels.
+	changed, err = f.Store.RemoveStaleFlagLabels(msgID, f.Source.ID, nil)
+	require.NoError(t, err, "RemoveStaleFlagLabels() empty keep")
+	assert.True(t, changed, "STARRED should be removed")
+	f.AssertLabelCount(msgID, 2)
+	f.AssertMessageHasLabel(msgID, systemLabels["INBOX"])
+	f.AssertMessageHasLabel(msgID, userLabels["Archive"])
+}
+
 func TestStore_MessageRecipients(t *testing.T) {
 	f := storetest.New(t)
 
@@ -1444,25 +1501,30 @@ func TestStore_ReconcileMessageLabelsReportsChanges(t *testing.T) {
 	require.NoError(f.Store.ReplaceMessageLabels(
 		messageID, []int64{labels["INBOX"]}))
 
-	changed, err := f.Store.ReconcileMessageLabels(
+	changed, extra, err := f.Store.ReconcileMessageLabels(
 		messageID, []int64{labels["INBOX"]}, false)
 	require.NoError(err)
 	assert.False(changed)
+	assert.Empty(extra, "existing labels all desired: nothing extra")
 
-	changed, err = f.Store.ReconcileMessageLabels(
+	changed, extra, err = f.Store.ReconcileMessageLabels(
 		messageID, []int64{labels["STARRED"]}, false)
 	require.NoError(err)
 	assert.True(changed)
+	assert.Equal([]int64{labels["INBOX"]}, extra,
+		"merge mode reports existing labels beyond the desired set")
 
-	changed, err = f.Store.ReconcileMessageLabels(
+	changed, extra, err = f.Store.ReconcileMessageLabels(
 		messageID, []int64{labels["INBOX"], labels["STARRED"]}, true)
 	require.NoError(err)
 	assert.False(changed)
+	assert.Nil(extra, "replace mode never reports extra labels")
 
-	changed, err = f.Store.ReconcileMessageLabels(
+	changed, extra, err = f.Store.ReconcileMessageLabels(
 		messageID, []int64{labels["SENT"]}, true)
 	require.NoError(err)
 	assert.True(changed)
+	assert.Nil(extra, "replace mode never reports extra labels")
 	f.AssertLabelCount(messageID, 1)
 	f.AssertMessageHasLabel(messageID, labels["SENT"])
 }

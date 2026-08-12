@@ -109,6 +109,26 @@ func AppendIMAPMessageWithoutMessageID(
 	require.NoError(t, err)
 }
 
+// AppendIMAPMessageWithFlags appends one synthetic RFC822 message with the
+// supplied IMAP flags to a mailbox of an in-memory IMAP test user.
+func AppendIMAPMessageWithFlags(
+	t *testing.T,
+	user *imapmemserver.User,
+	mailbox string,
+	flags []imap.Flag,
+) {
+	t.Helper()
+	body := []byte(
+		"From: alice@example.com\r\nTo: bob@example.com\r\n\r\nbody\r\n",
+	)
+	_, err := user.Append(
+		mailbox,
+		imapLiteral{bytes.NewReader(body)},
+		&imap.AppendOptions{Flags: flags},
+	)
+	require.NoError(t, err)
+}
+
 // AppendIMAPMessageWithMessageID appends one synthetic RFC822 message with
 // the supplied Message-ID to a mailbox of an in-memory IMAP test user.
 func AppendIMAPMessageWithMessageID(

@@ -50,10 +50,20 @@ func markRawBatchError(results []gmailapi.RawMessageBatchResult, items []batchFe
 func rawBatchFetchOptions() *imap.FetchOptions {
 	return &imap.FetchOptions{
 		UID:          true,
+		Flags:        true, // per-message flags become archive labels (UNREAD, STARRED, ...)
 		InternalDate: true,
 		RFC822Size:   true,
 		BodySection:  []*imap.FetchItemBodySection{{Peek: true}}, // BODY.PEEK[] to avoid marking \Seen
 	}
+}
+
+// labelRescanFetchOptions extends the Message-ID-only fetch with FLAGS so
+// labels-only rescans of known messages can refresh flag-derived labels
+// (read state, star, keywords) without downloading bodies.
+func labelRescanFetchOptions() *imap.FetchOptions {
+	opts := messageIDHeaderFetchOptions()
+	opts.Flags = true
+	return opts
 }
 
 func rawMIMEMessageID(rawMIME []byte) string {
@@ -138,12 +148,17 @@ func (c *Client) applyFetchResults(
 		// listing. The map keys on RFC822 Message-ID and maps to the other
 		// mailbox names the message appears in. Skip the current mailbox to
 		// avoid duplicates that would violate the message_labels primary key.
-		labels := c.labelsForMessage(mailbox, rfc822MessageID)
+		// Per-message flags (read state, star, keywords) are appended as
+		// additional labels.
+		flagLabels := labelsForFlags(msgBuf.Flags)
+		labels := mergeFlagLabels(
+			c.labelsForMessage(mailbox, rfc822MessageID), flagLabels)
 
 		results[idx].Message = &gmailapi.RawMessage{
 			ID:           msgID,
 			ThreadID:     msgID,
 			LabelIDs:     labels,
+			FlagLabels:   flagLabels,
 			InternalDate: msgBuf.InternalDate.UnixMilli(),
 			SizeEstimate: msgBuf.RFC822Size,
 			Raw:          rawMIME,
@@ -372,7 +387,10 @@ func (c *Client) applyLabelFetchResults(
 			continue
 		}
 		rfc822MessageID := rawMIMEMessageID(msgBuf.BodySection[0].Bytes)
-		results[idx].LabelIDs = c.labelsForMessage(mailbox, rfc822MessageID)
+		flagLabels := labelsForFlags(msgBuf.Flags)
+		results[idx].LabelIDs = mergeFlagLabels(
+			c.labelsForMessage(mailbox, rfc822MessageID), flagLabels)
+		results[idx].FlagLabels = flagLabels
 		results[idx].RFC822MessageID = rfc822MessageID
 		results[idx].Err = nil
 	}
@@ -474,7 +492,7 @@ func (c *Client) GetMessageLabelsBatch(ctx context.Context, messageIDs []string)
 		return nil, err
 	}
 
-	fetchOpts := messageIDHeaderFetchOptions()
+	fetchOpts := labelRescanFetchOptions()
 	for _, mailbox := range batchMailboxOrder(byMailbox, c.allMailFolder) {
 		if ctx.Err() != nil {
 			return results, ctx.Err()

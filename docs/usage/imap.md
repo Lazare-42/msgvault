@@ -118,6 +118,28 @@ without folder flags scans the complete account again.
 Folder filtering works the same whether the CLI uses a local daemon or a
 configured remote msgvault server.
 
+## Flag-Derived Labels
+
+Besides folder names, msgvault stores each message's IMAP flags as searchable
+labels:
+
+- `UNREAD` — the message has no `\Seen` flag.
+- `STARRED` — the message carries the `\Flagged` flag.
+- `ANSWERED` — the message carries the `\Answered` flag (you replied to it).
+- Custom IMAP keywords appear verbatim as labels. Outlook categories arrive
+  this way: a category named `Traite` becomes a `Traite` label. Some servers
+  store keywords lowercased, so the label may appear as `traite`.
+
+Internal client bookkeeping is not turned into labels: system flags such as
+`\Draft` and `\Deleted`, `$`-prefixed keywords such as `$Forwarded`, and bare
+spam-training keywords such as `NonJunk` are skipped.
+
+Flag labels track the server on every sync, including folder-filtered ones.
+Reading a message removes its `UNREAD` label on the next sync, replying adds
+`ANSWERED`, and removing a category drops the matching keyword label. This
+makes searches such as "in INBOX, not replied, without the Traite category"
+possible from the TUI or query interface.
+
 ## Filing Messages Into Folders
 
 IMAP has no multi-label model: a message lives in exactly one mailbox, so

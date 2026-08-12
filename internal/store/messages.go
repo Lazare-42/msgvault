@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -561,7 +562,7 @@ func (s *Store) updateMessageOnDedup(
 			}
 		}
 
-		labelsChanged, err := s.reconcileMessageLabelsTx(
+		labelsChanged, _, err := s.reconcileMessageLabelsTx(
 			tx, messageID, labelIDs, replaceLabels)
 		if err != nil {
 			return err
@@ -1548,6 +1549,18 @@ type LabelInfo struct {
 	Type string // "system" or "user"
 }
 
+// LabelTypeKeyword is the label_type for labels derived from custom IMAP
+// keywords (e.g. an Outlook category stored as keyword "Traite"). Keyword
+// labels track per-message flag state and may be removed from a message by
+// RemoveStaleFlagLabels when the keyword disappears at the source.
+const LabelTypeKeyword = "keyword"
+
+// flagDerivedLabelNames are the well-known labels derived from per-message
+// IMAP flags (\Seen absence, \Flagged, \Answered). Together with
+// keyword-typed labels they form the label set whose membership must track
+// the source's current flag state on every rescan.
+var flagDerivedLabelNames = []string{"UNREAD", "STARRED", "ANSWERED"}
+
 // IsSystemLabel returns true if the given Gmail label ID represents a system label.
 func IsSystemLabel(sourceLabelID string) bool {
 	switch sourceLabelID {
@@ -1630,31 +1643,34 @@ func (s *Store) ReplaceMessageLabels(messageID int64, labelIDs []int64) error {
 }
 
 // ReconcileMessageLabels replaces or merges labels and reports whether the
-// persisted label set changed.
+// persisted label set changed. In merge mode it also returns the label IDs
+// already on the message that are absent from labelIDs — reusing the
+// existing-label read so callers (e.g. flag-label pruning on filtered IMAP
+// rescans) can skip a per-message DELETE when nothing can be stale. In
+// replace mode extra is nil: replacement already removed those rows.
 func (s *Store) ReconcileMessageLabels(
 	messageID int64, labelIDs []int64, replace bool,
-) (bool, error) {
-	var changed bool
-	err := s.withTx(func(tx *loggedTx) error {
-		var err error
-		changed, err = s.reconcileMessageLabelsTx(
+) (changed bool, extra []int64, err error) {
+	err = s.withTx(func(tx *loggedTx) error {
+		var txErr error
+		changed, extra, txErr = s.reconcileMessageLabelsTx(
 			tx, messageID, labelIDs, replace)
-		return err
+		return txErr
 	})
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
-	return changed, nil
+	return changed, extra, nil
 }
 
 func (s *Store) reconcileMessageLabelsTx(
 	tx *loggedTx, messageID int64, labelIDs []int64, replace bool,
-) (bool, error) {
+) (bool, []int64, error) {
 	rows, err := tx.Query(`
 		SELECT label_id FROM message_labels WHERE message_id = ?
 	`, messageID)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 
 	existing := make(map[int64]struct{})
@@ -1662,16 +1678,16 @@ func (s *Store) reconcileMessageLabelsTx(
 		var labelID int64
 		if err := rows.Scan(&labelID); err != nil {
 			_ = rows.Close()
-			return false, err
+			return false, nil, err
 		}
 		existing[labelID] = struct{}{}
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		return false, err
+		return false, nil, err
 	}
 	if err := rows.Close(); err != nil {
-		return false, err
+		return false, nil, err
 	}
 
 	desired := make(map[int64]struct{}, len(labelIDs))
@@ -1690,13 +1706,21 @@ func (s *Store) reconcileMessageLabelsTx(
 			}
 		}
 		if !changed {
-			return false, nil
+			return false, nil, nil
 		}
 		if err := replaceMessageLabelsTx(tx, messageID, labelIDs); err != nil {
-			return false, err
+			return false, nil, err
 		}
-		return true, nil
+		return true, nil, nil
 	}
+
+	var extra []int64
+	for labelID := range existing {
+		if _, ok := desired[labelID]; !ok {
+			extra = append(extra, labelID)
+		}
+	}
+	slices.Sort(extra)
 
 	missing := make([]int64, 0, len(desired))
 	for labelID := range desired {
@@ -1705,12 +1729,12 @@ func (s *Store) reconcileMessageLabelsTx(
 		}
 	}
 	if len(missing) == 0 {
-		return false, nil
+		return false, extra, nil
 	}
 	if err := s.addMessageLabelsTx(tx, messageID, missing); err != nil {
-		return false, err
+		return false, nil, err
 	}
-	return true, nil
+	return true, extra, nil
 }
 
 func replaceMessageLabelsTx(tx querier, messageID int64, labelIDs []int64) error {
@@ -1774,6 +1798,52 @@ func (s *Store) addMessageLabelsTx(
 // Uses INSERT OR IGNORE — safe to call multiple times.
 func (s *Store) LinkMessageLabel(messageID, labelID int64) error {
 	return s.AddMessageLabels(messageID, []int64{labelID})
+}
+
+// RemoveStaleFlagLabels removes flag-derived labels (UNREAD/STARRED/ANSWERED
+// and keyword-typed labels of the message's source) that are absent from
+// keepLabelIDs, reporting whether any were removed. Mailbox and user labels
+// are untouched, so partial-snapshot syncs can keep merging mailbox
+// memberships while flag labels still replace-track the source's current
+// per-message flag state.
+func (s *Store) RemoveStaleFlagLabels(
+	messageID, sourceID int64, keepLabelIDs []int64,
+) (bool, error) {
+	namePlaceholders := make([]string, len(flagDerivedLabelNames))
+	args := []any{messageID, sourceID}
+	for i, name := range flagDerivedLabelNames {
+		namePlaceholders[i] = "?"
+		args = append(args, name)
+	}
+	query := fmt.Sprintf(`
+		DELETE FROM message_labels
+		WHERE message_id = ?
+		AND label_id IN (
+			SELECT id FROM labels
+			WHERE source_id = ?
+			AND (name IN (%s) OR label_type = ?)
+		)`, strings.Join(namePlaceholders, ", "))
+	args = append(args, LabelTypeKeyword)
+
+	if len(keepLabelIDs) > 0 {
+		placeholders := make([]string, len(keepLabelIDs))
+		for i, id := range keepLabelIDs {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		query += fmt.Sprintf(
+			" AND label_id NOT IN (%s)", strings.Join(placeholders, ", "))
+	}
+
+	res, err := s.db.Exec(s.dialect.Rebind(query), args...)
+	if err != nil {
+		return false, fmt.Errorf("remove stale flag labels: %w", err)
+	}
+	removed, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("remove stale flag labels: %w", err)
+	}
+	return removed > 0, nil
 }
 
 // RemoveMessageLabels removes specific labels from a message.
