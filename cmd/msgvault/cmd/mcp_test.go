@@ -76,6 +76,7 @@ func TestMCPCommandForwardsHTTPPolicy(t *testing.T) {
 			http.Error(w, `{"error":"visual_search_not_ready"}`, http.StatusServiceUnavailable)
 			return
 		}
+		if r.URL.Path == "/api/v1/cli/accounts" { _, _ = w.Write([]byte(`{"accounts": []}`)); return }
 		http.NotFound(w, r)
 	}))
 	t.Cleanup(daemon.Close)
