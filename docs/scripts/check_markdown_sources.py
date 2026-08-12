@@ -69,6 +69,7 @@ PUBLIC_MARKDOWN = {
     "usage/slack.md",
     "usage/teams.md",
     "usage/text-messages.md",
+    "usage/triage.md",
     "usage/tui.md",
     "usage/vector-search.md",
     "web-ui.md",
