@@ -32,10 +32,13 @@ import (
 	whatsapplive "go.kenn.io/msgvault/internal/whatsapp/live"
 )
 
-// GmailClientFactory creates authenticated Gmail API clients for a given
-// account email. Returns nil if Gmail draft operations are not available
-// (e.g., OAuth not configured). The caller is responsible for closing the client.
-type GmailClientFactory func(ctx context.Context, email string) (*gmail.Client, error)
+// GmailClientFactory creates authenticated mail API clients for a given
+// account email. The returned client is a gmail.API implementation — the
+// Gmail OAuth client for Gmail accounts, or the IMAP client (which also
+// satisfies gmail.API, including drafts and label/folder operations) for
+// IMAP-backed accounts such as Microsoft 365. The caller is responsible
+// for closing the client.
+type GmailClientFactory func(ctx context.Context, email string) (gmail.API, error)
 
 // WhatsAppClientFactory creates a live WhatsApp client for an archive account.
 type WhatsAppClientFactory func(ctx context.Context, account string) (whatsapplive.Client, error)
