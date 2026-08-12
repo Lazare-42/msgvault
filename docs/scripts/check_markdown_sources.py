@@ -52,6 +52,7 @@ PUBLIC_MARKDOWN = {
     "usage/querying.md",
     "usage/searching.md",
     "usage/text-messages.md",
+    "usage/triage.md",
     "usage/tui.md",
     "usage/vector-search.md",
 }
