@@ -151,8 +151,32 @@ labels for IMAP and Microsoft 365 accounts:
 - `INBOX` — add to move back to INBOX, remove to archive.
 - `folder:<name>` — add to MOVE the message into the named mailbox, e.g.
   `folder:Recruiting`. The mailbox is created on demand if it does not exist.
+- `keyword:<name>` — add/remove an IMAP keyword (custom flag) on the message,
+  e.g. `keyword:Traite`. Exchange and Microsoft 365 surface keywords as
+  Outlook categories; servers may canonicalize the keyword's case. Keywords
+  combine freely with other flags and with a folder/INBOX move in one call.
 
 A `folder:` move is mutually exclusive with an INBOX add/remove in the same
 call, but a flag (e.g. `STARRED`) can be applied alongside it. Removing a
 `folder:` label is not supported — move to a different folder instead. The
 `create_label` tool pre-provisions an empty mailbox without moving anything.
+
+## Applying Labels From the CLI
+
+The same label operations are available without MCP through the
+`modify-labels` command:
+
+```bash
+msgvault modify-labels --account user@example.com --ids 12,34 \
+  --add "keyword:Handled" --remove UNREAD
+```
+
+`--ids` takes archive message IDs (the numeric IDs shown by the TUI and
+query interface, resolved through the msgvault daemon); `--source-ids`
+takes the mail server's own message IDs and passes them through as-is.
+At least one of `--ids`/`--source-ids` and at least one of
+`--add`/`--remove` is required. Writes are applied in chunks and require
+an IMAP-backed account; `--dry-run` previews the operation for any
+account type. The command prints a single JSON report on stdout
+(`{"modified": [...], "errors": N, "dry_run": ...}`) with progress on
+stderr.
