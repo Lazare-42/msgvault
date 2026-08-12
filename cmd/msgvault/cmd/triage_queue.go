@@ -96,6 +96,7 @@ type triageReport struct {
 	Moved                []int64              `json:"moved"`
 	MoveErrors           int                  `json:"move_errors"`
 	SkippedTreated       int                  `json:"skipped_treated"`
+	SkippedByID          int                  `json:"skipped_by_id"`
 	SkippedAlreadyQueued int                  `json:"skipped_already_queued"`
 	Replied              []triageRepliedEntry `json:"replied"`
 	DryRun               bool                 `json:"dry_run"`
@@ -174,6 +175,7 @@ func runTriageQueue(cmd *cobra.Command, _ []string) error {
 		Scanned:              len(msgs),
 		Moved:                []int64{},
 		SkippedTreated:       res.SkippedTreated,
+		SkippedByID:          res.SkippedByID,
 		SkippedAlreadyQueued: res.SkippedAlreadyQueued,
 		Replied:              []triageRepliedEntry{},
 		DryRun:               triageDryRun,
@@ -312,22 +314,58 @@ func lookupTriageMoveSource(account daemonclient.CLIAccount) (*store.Source, err
 	}
 	defer func() { _ = s.Close() }()
 
-	sources, err := s.GetSourcesByIdentifier(account.Email)
+	return lookupTriageMoveSourceIn(s, account)
+}
+
+// lookupTriageMoveSourceIn is the store-injectable core of
+// lookupTriageMoveSource. IMAP source identifiers are
+// imaps://user@host:port URLs with the account email stored in
+// display_name, so the lookup must match either column — the same
+// resolver sync/sync-full use.
+func lookupTriageMoveSourceIn(s *store.Store, account daemonclient.CLIAccount) (*store.Source, error) {
+	sources, err := s.GetSourcesByIdentifierOrDisplayName(account.Email)
 	if err != nil {
 		return nil, fmt.Errorf("look up source for %s: %w", account.Email, err)
 	}
+	return pickTriageMoveSource(sources, account)
+}
+
+// pickTriageMoveSource selects, among the local rows matching the
+// account email by identifier or display name, the one backing the
+// daemon account (same source type). Exactly one row must match.
+func pickTriageMoveSource(sources []*store.Source, account daemonclient.CLIAccount) (*store.Source, error) {
+	var matches []*store.Source
 	for _, src := range sources {
 		if src.SourceType == account.Type {
-			return src, nil
+			matches = append(matches, src)
 		}
 	}
-	return nil, fmt.Errorf("no local %s source found for %s", account.Type, account.Email)
+	switch len(matches) {
+	case 0:
+		return nil, fmt.Errorf("no local %s source found for %s", account.Type, account.Email)
+	case 1:
+		return matches[0], nil
+	default:
+		names := make([]string, 0, len(matches))
+		for _, src := range matches {
+			names = append(names, src.Identifier)
+		}
+		sort.Strings(names)
+		return nil, fmt.Errorf(
+			"multiple local %s sources match %s (%s); remove or rename the duplicate before moving",
+			account.Type, account.Email, strings.Join(names, ", "))
+	}
 }
 
 // listTriageCandidates pages through the daemon's filtered message list
 // for the label pool below the cutoff. The engine already applies the
 // Before filter; the SentAt guard is defensive so classification can
 // never move a message at or past the cutoff boundary.
+//
+// Offset paging over a live archive can skip or duplicate a message
+// when the daemon ingests new mail mid-scan. That is acceptable here:
+// runs are idempotent (already-queued messages are excluded) and the
+// next run picks up anything a shifted page missed.
 func listTriageCandidates(
 	ctx context.Context,
 	engine *daemonclient.Engine,
@@ -507,9 +545,9 @@ func init() {
 	triageQueueCmd.Flags().StringVar(&triageLabel, "label", "INBOX",
 		"Label/folder pool to scan")
 	triageQueueCmd.Flags().StringVar(&triageBefore, triageFlagBefore, "",
-		"Staleness cutoff date (YYYY-MM-DD); mutually exclusive with --older-than-workdays")
+		"Staleness cutoff date (YYYY-MM-DD, interpreted as UTC midnight); mutually exclusive with --older-than-workdays")
 	triageQueueCmd.Flags().IntVar(&triageOlderWorkdays, triageFlagOlderWorkdays, 0,
-		"Messages are stale once N full working days (Mon-Fri) have passed; mutually exclusive with --before")
+		"Messages are stale once N full working days (Mon-Fri, midnight boundaries in local time) have passed; mutually exclusive with --before")
 	triageQueueCmd.Flags().StringArrayVar(&triageNotLabels, "not-label", nil,
 		"Treated label to skip (repeatable, case-insensitive exact match)")
 	triageQueueCmd.Flags().StringVar(&triageMoveTo, "move-to", "",

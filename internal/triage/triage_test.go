@@ -21,6 +21,7 @@ func TestClassify(t *testing.T) {
 		wantMoveIDs              []int64
 		wantRepliedIDs           []int64
 		wantSkippedTreated       int
+		wantSkippedByID          int
 		wantSkippedAlreadyQueued int
 	}{
 		{
@@ -113,19 +114,22 @@ func TestClassify(t *testing.T) {
 			wantSkippedTreated: 1,
 		},
 		{
-			name: "skip ids counted as treated",
+			name: "skip ids counted separately from treated labels",
 			msgs: []query.MessageSummary{
 				msg(1, "INBOX"),
 				msg(2, "INBOX"),
 				msg(3, "INBOX", "ANSWERED"),
+				msg(4, "INBOX", "done"),
 			},
 			opts: Options{
 				QueueFolder:   "Queue",
+				TreatedLabels: []string{"done"},
 				ReportReplied: true,
 				SkipIDs:       map[int64]bool{1: true, 3: true},
 			},
 			wantMoveIDs:        []int64{2},
-			wantSkippedTreated: 2,
+			wantSkippedTreated: 1,
+			wantSkippedByID:    2,
 		},
 		{
 			name: "empty input",
@@ -149,6 +153,7 @@ func TestClassify(t *testing.T) {
 			assert.Equal(t, tt.wantMoveIDs, nilIfEmpty(moveIDs))
 			assert.Equal(t, tt.wantRepliedIDs, nilIfEmpty(repliedIDs))
 			assert.Equal(t, tt.wantSkippedTreated, res.SkippedTreated)
+			assert.Equal(t, tt.wantSkippedByID, res.SkippedByID)
 			assert.Equal(t, tt.wantSkippedAlreadyQueued, res.SkippedAlreadyQueued)
 		})
 	}

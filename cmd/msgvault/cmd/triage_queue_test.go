@@ -6,6 +6,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/daemonclient"
+	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
 func TestParseTriageSkipIDs(t *testing.T) {
@@ -33,6 +35,78 @@ func TestParseTriageSkipIDs(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := parseTriageSkipIDs(tt.raw)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestLookupTriageMoveSourceInResolvesIMAPByDisplayName guards the
+// lookup against IMAP's identifier scheme: the sources row stores
+// imaps://user@host:port as identifier and the bare email only in
+// display_name, so a lookup keyed on the email must match display_name
+// too or every IMAP move fails with "no local imap source found".
+func TestLookupTriageMoveSourceInResolvesIMAPByDisplayName(t *testing.T) {
+	s := testutil.NewTestStore(t)
+
+	src, err := s.GetOrCreateSource(sourceTypeIMAP, "imaps://alice@example.com@mail.example.com:993")
+	require.NoError(t, err)
+	require.NoError(t, s.UpdateSourceDisplayName(src.ID, "alice@example.com"))
+
+	account := daemonclient.CLIAccount{
+		ID:    src.ID,
+		Email: "alice@example.com",
+		Type:  sourceTypeIMAP,
+	}
+
+	got, err := lookupTriageMoveSourceIn(s, account)
+	require.NoError(t, err)
+	assert.Equal(t, src.ID, got.ID)
+	assert.Equal(t, "imaps://alice@example.com@mail.example.com:993", got.Identifier)
+	assert.Equal(t, sourceTypeIMAP, got.SourceType)
+}
+
+func TestPickTriageMoveSource(t *testing.T) {
+	imapSrc := &store.Source{ID: 1, SourceType: sourceTypeIMAP, Identifier: "imaps://alice@example.com@mail.example.com:993"}
+	mboxSrc := &store.Source{ID: 2, SourceType: sourceTypeMbox, Identifier: "alice@example.com"}
+	otherIMAP := &store.Source{ID: 3, SourceType: sourceTypeIMAP, Identifier: "imaps://alice@example.com@backup.example.com:993"}
+	account := daemonclient.CLIAccount{ID: 1, Email: "alice@example.com", Type: sourceTypeIMAP}
+
+	tests := []struct {
+		name    string
+		sources []*store.Source
+		want    *store.Source
+		wantErr string
+	}{
+		{
+			name:    "picks the row matching the account source type",
+			sources: []*store.Source{mboxSrc, imapSrc},
+			want:    imapSrc,
+		},
+		{
+			name:    "no row of the right type",
+			sources: []*store.Source{mboxSrc},
+			wantErr: "no local imap source found",
+		},
+		{
+			name:    "empty input",
+			wantErr: "no local imap source found",
+		},
+		{
+			name:    "ambiguous rows rejected",
+			sources: []*store.Source{imapSrc, otherIMAP},
+			wantErr: "multiple local imap sources match",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := pickTriageMoveSource(tt.sources, account)
 			if tt.wantErr != "" {
 				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.wantErr)
