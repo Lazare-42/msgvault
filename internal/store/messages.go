@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -561,7 +562,7 @@ func (s *Store) updateMessageOnDedup(
 			}
 		}
 
-		labelsChanged, err := s.reconcileMessageLabelsTx(
+		labelsChanged, _, err := s.reconcileMessageLabelsTx(
 			tx, messageID, labelIDs, replaceLabels)
 		if err != nil {
 			return err
@@ -1642,31 +1643,34 @@ func (s *Store) ReplaceMessageLabels(messageID int64, labelIDs []int64) error {
 }
 
 // ReconcileMessageLabels replaces or merges labels and reports whether the
-// persisted label set changed.
+// persisted label set changed. In merge mode it also returns the label IDs
+// already on the message that are absent from labelIDs — reusing the
+// existing-label read so callers (e.g. flag-label pruning on filtered IMAP
+// rescans) can skip a per-message DELETE when nothing can be stale. In
+// replace mode extra is nil: replacement already removed those rows.
 func (s *Store) ReconcileMessageLabels(
 	messageID int64, labelIDs []int64, replace bool,
-) (bool, error) {
-	var changed bool
-	err := s.withTx(func(tx *loggedTx) error {
-		var err error
-		changed, err = s.reconcileMessageLabelsTx(
+) (changed bool, extra []int64, err error) {
+	err = s.withTx(func(tx *loggedTx) error {
+		var txErr error
+		changed, extra, txErr = s.reconcileMessageLabelsTx(
 			tx, messageID, labelIDs, replace)
-		return err
+		return txErr
 	})
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
-	return changed, nil
+	return changed, extra, nil
 }
 
 func (s *Store) reconcileMessageLabelsTx(
 	tx *loggedTx, messageID int64, labelIDs []int64, replace bool,
-) (bool, error) {
+) (bool, []int64, error) {
 	rows, err := tx.Query(`
 		SELECT label_id FROM message_labels WHERE message_id = ?
 	`, messageID)
 	if err != nil {
-		return false, err
+		return false, nil, err
 	}
 
 	existing := make(map[int64]struct{})
@@ -1674,16 +1678,16 @@ func (s *Store) reconcileMessageLabelsTx(
 		var labelID int64
 		if err := rows.Scan(&labelID); err != nil {
 			_ = rows.Close()
-			return false, err
+			return false, nil, err
 		}
 		existing[labelID] = struct{}{}
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		return false, err
+		return false, nil, err
 	}
 	if err := rows.Close(); err != nil {
-		return false, err
+		return false, nil, err
 	}
 
 	desired := make(map[int64]struct{}, len(labelIDs))
@@ -1702,13 +1706,21 @@ func (s *Store) reconcileMessageLabelsTx(
 			}
 		}
 		if !changed {
-			return false, nil
+			return false, nil, nil
 		}
 		if err := replaceMessageLabelsTx(tx, messageID, labelIDs); err != nil {
-			return false, err
+			return false, nil, err
 		}
-		return true, nil
+		return true, nil, nil
 	}
+
+	var extra []int64
+	for labelID := range existing {
+		if _, ok := desired[labelID]; !ok {
+			extra = append(extra, labelID)
+		}
+	}
+	slices.Sort(extra)
 
 	missing := make([]int64, 0, len(desired))
 	for labelID := range desired {
@@ -1717,12 +1729,12 @@ func (s *Store) reconcileMessageLabelsTx(
 		}
 	}
 	if len(missing) == 0 {
-		return false, nil
+		return false, extra, nil
 	}
 	if err := s.addMessageLabelsTx(tx, messageID, missing); err != nil {
-		return false, err
+		return false, nil, err
 	}
-	return true, nil
+	return true, extra, nil
 }
 
 func replaceMessageLabelsTx(tx querier, messageID int64, labelIDs []int64) error {
@@ -1797,18 +1809,20 @@ func (s *Store) LinkMessageLabel(messageID, labelID int64) error {
 func (s *Store) RemoveStaleFlagLabels(
 	messageID, sourceID int64, keepLabelIDs []int64,
 ) (bool, error) {
-	query := `
+	namePlaceholders := make([]string, len(flagDerivedLabelNames))
+	args := []any{messageID, sourceID}
+	for i, name := range flagDerivedLabelNames {
+		namePlaceholders[i] = "?"
+		args = append(args, name)
+	}
+	query := fmt.Sprintf(`
 		DELETE FROM message_labels
 		WHERE message_id = ?
 		AND label_id IN (
 			SELECT id FROM labels
 			WHERE source_id = ?
-			AND (name IN (?, ?, ?) OR label_type = ?)
-		)`
-	args := []any{messageID, sourceID}
-	for _, name := range flagDerivedLabelNames {
-		args = append(args, name)
-	}
+			AND (name IN (%s) OR label_type = ?)
+		)`, strings.Join(namePlaceholders, ", "))
 	args = append(args, LabelTypeKeyword)
 
 	if len(keepLabelIDs) > 0 {

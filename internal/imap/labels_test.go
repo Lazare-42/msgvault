@@ -145,6 +145,16 @@ func TestLabelsForFlags(t *testing.T) {
 			want:  []string{"STARRED", "ANSWERED"},
 		},
 		{
+			name:  "bare spam-training keywords are skipped",
+			flags: []imap.Flag{imap.FlagSeen, "NonJunk", "Junk", "NotJunk"},
+			want:  []string{},
+		},
+		{
+			name:  "spam-training keywords are skipped case-insensitively",
+			flags: []imap.Flag{imap.FlagSeen, "nonjunk", "JUNK", "notjunk", "Traite"},
+			want:  []string{"Traite"},
+		},
+		{
 			name:  "duplicate flags map to one label",
 			flags: []imap.Flag{"Traite", "Traite", imap.FlagFlagged, "STARRED"},
 			want:  []string{"Traite", "STARRED", "UNREAD"},

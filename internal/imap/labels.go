@@ -67,6 +67,15 @@ const (
 	flagLabelAnswered = "ANSWERED"
 )
 
+// ignoredKeywords are bare client-noise keywords — spam-training state that
+// Mozilla-family clients set without a $ prefix — that would pollute the
+// archive's labels. Matched case-insensitively like all flag atoms.
+var ignoredKeywords = map[string]bool{
+	"junk":    true,
+	"nonjunk": true,
+	"notjunk": true,
+}
+
 // labelsForFlags maps per-message IMAP flags to archive labels:
 //
 //   - absence of \Seen        → UNREAD
@@ -74,9 +83,10 @@ const (
 //   - \Answered               → ANSWERED
 //   - custom keywords         → verbatim (e.g. Outlook category "Traite")
 //
-// Other system flags (\Draft, \Deleted, \Recent, ...) and $-prefixed
-// system keywords ($Forwarded, $MDNSent, ...) are skipped. Flag atoms are
-// case-insensitive per RFC 3501, so system flags match in any case.
+// Other system flags (\Draft, \Deleted, \Recent, ...), $-prefixed system
+// keywords ($Forwarded, $MDNSent, ...), and bare spam-training keywords
+// (Junk, NonJunk, NotJunk) are skipped. Flag atoms are case-insensitive
+// per RFC 3501, so system flags match in any case.
 func labelsForFlags(flags []imap.Flag) []string {
 	labels := make([]string, 0, len(flags)+1)
 	added := make(map[string]bool, len(flags)+1)
@@ -99,6 +109,8 @@ func labelsForFlags(flags []imap.Flag) []string {
 			add(flagLabelAnswered)
 		case strings.HasPrefix(name, `\`), strings.HasPrefix(name, "$"):
 			// Other system flags and $-prefixed system keywords.
+		case ignoredKeywords[strings.ToLower(name)]:
+			// Bare client-noise keywords (spam-training state).
 		default:
 			add(name)
 		}

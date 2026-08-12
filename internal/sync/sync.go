@@ -530,7 +530,7 @@ func (s *Syncer) processBatch(ctx context.Context, syncID, sourceID int64, listR
 			}
 
 			if alreadyExists {
-				changed, err := s.store.ReconcileMessageLabels(
+				changed, _, err := s.store.ReconcileMessageLabels(
 					existing.ID,
 					labelIDsFor(raw.LabelIDs, labelMap),
 					false,
@@ -1078,6 +1078,11 @@ func (s *Syncer) resolveLabelIDs(
 			if !slices.Contains(flagLabels, label) {
 				continue
 			}
+			// Known limitation: labels are unique on (source_id, name),
+			// so a keyword sharing its name with a mailbox merges into
+			// that mailbox's existing row. If that row keeps
+			// label_type='user', keyword stale-removal will not prune
+			// it. Accepted trade-off for such degenerate collisions.
 			var err error
 			id, err = s.store.EnsureLabel(
 				sourceID, label, label, flagLabelType(label))
@@ -1173,7 +1178,7 @@ func (s *Syncer) ingestMessage(
 				}
 			}
 			if !conclusive {
-				changed, err := s.store.ReconcileMessageLabels(
+				changed, _, err := s.store.ReconcileMessageLabels(
 					existingID, labelIDs, false)
 				return dedupMutationResultWithSentinel(
 					changed,
@@ -1184,7 +1189,7 @@ func (s *Syncer) ingestMessage(
 			}
 			complete := s.labelsSnapshotComplete()
 			if matches {
-				changed, err := s.store.ReconcileMessageLabels(
+				changed, _, err := s.store.ReconcileMessageLabels(
 					existingID, labelIDs, complete)
 				if err != nil {
 					return false, fmt.Errorf(
@@ -1273,12 +1278,17 @@ func (s *Syncer) reconcileValidatedMessageLabels(
 	labelIDs []int64,
 	snapshotComplete bool,
 ) (bool, error) {
-	changed, err := s.store.ReconcileMessageLabels(
+	changed, extraLabelIDs, err := s.store.ReconcileMessageLabels(
 		existingID, labelIDs, snapshotComplete)
 	if err != nil {
 		return false, err
 	}
-	if !snapshotComplete {
+	// Only labels the message already has beyond the desired set can be
+	// stale; ReconcileMessageLabels reports them from its own read of
+	// message_labels, so the common no-change rescan skips the pruning
+	// DELETE entirely. The DELETE itself narrows to flag-derived labels
+	// (well-known names or keyword-typed), leaving mailbox labels merged.
+	if !snapshotComplete && len(extraLabelIDs) > 0 {
 		removed, err := s.store.RemoveStaleFlagLabels(
 			existingID, sourceID, labelIDs)
 		if err != nil {

@@ -1501,25 +1501,30 @@ func TestStore_ReconcileMessageLabelsReportsChanges(t *testing.T) {
 	require.NoError(f.Store.ReplaceMessageLabels(
 		messageID, []int64{labels["INBOX"]}))
 
-	changed, err := f.Store.ReconcileMessageLabels(
+	changed, extra, err := f.Store.ReconcileMessageLabels(
 		messageID, []int64{labels["INBOX"]}, false)
 	require.NoError(err)
 	assert.False(changed)
+	assert.Empty(extra, "existing labels all desired: nothing extra")
 
-	changed, err = f.Store.ReconcileMessageLabels(
+	changed, extra, err = f.Store.ReconcileMessageLabels(
 		messageID, []int64{labels["STARRED"]}, false)
 	require.NoError(err)
 	assert.True(changed)
+	assert.Equal([]int64{labels["INBOX"]}, extra,
+		"merge mode reports existing labels beyond the desired set")
 
-	changed, err = f.Store.ReconcileMessageLabels(
+	changed, extra, err = f.Store.ReconcileMessageLabels(
 		messageID, []int64{labels["INBOX"], labels["STARRED"]}, true)
 	require.NoError(err)
 	assert.False(changed)
+	assert.Nil(extra, "replace mode never reports extra labels")
 
-	changed, err = f.Store.ReconcileMessageLabels(
+	changed, extra, err = f.Store.ReconcileMessageLabels(
 		messageID, []int64{labels["SENT"]}, true)
 	require.NoError(err)
 	assert.True(changed)
+	assert.Nil(extra, "replace mode never reports extra labels")
 	f.AssertLabelCount(messageID, 1)
 	f.AssertMessageHasLabel(messageID, labels["SENT"])
 }
