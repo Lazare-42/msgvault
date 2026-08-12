@@ -249,6 +249,26 @@ func TestParseIMAPLabelOpsKeyword(t *testing.T) {
 			wantAdd:    []goimap.Flag{"Handled", goimap.FlagFlagged},
 			wantFolder: "Archive",
 		},
+		{
+			name:    "keyword with inner space is rejected",
+			add:     []string{"keyword:My Tag"},
+			wantErr: "not allowed in a flag atom",
+		},
+		{
+			name:    "keyword with parenthesis is rejected",
+			add:     []string{"keyword:Tag(1)"},
+			wantErr: "not allowed in a flag atom",
+		},
+		{
+			name:    "keyword with asterisk is rejected",
+			add:     []string{"keyword:Tag*"},
+			wantErr: "not allowed in a flag atom",
+		},
+		{
+			name:    "keyword with atom-special on remove is rejected",
+			remove:  []string{`keyword:Tag"quote`},
+			wantErr: "not allowed in a flag atom",
+		},
 	}
 
 	for _, tt := range tests {
