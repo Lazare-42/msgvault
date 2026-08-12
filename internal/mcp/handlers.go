@@ -2626,11 +2626,12 @@ func googleDocsSnippet(text, query string, maxChars int) string {
 
 // --- Draft handlers ---
 
-// getGmailClient resolves the account email and returns an authenticated Gmail client.
+// getGmailClient resolves the account email and returns an authenticated mail
+// API client (Gmail OAuth or IMAP, depending on the account's source type).
 // The caller must close the returned client.
-func (h *handlers) getGmailClient(ctx context.Context, args map[string]any) (*gmail.Client, string, error) {
+func (h *handlers) getGmailClient(ctx context.Context, args map[string]any) (gmail.API, string, error) {
 	if h.gmailFactory == nil {
-		return nil, "", fmt.Errorf("Gmail API not configured (OAuth credentials needed)")
+		return nil, "", fmt.Errorf("live mail API not configured (Gmail OAuth credentials or an IMAP account needed)")
 	}
 
 	account, _ := args["account"].(string)

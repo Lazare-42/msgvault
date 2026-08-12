@@ -53,10 +53,6 @@ Add to Claude Desktop config:
 		}
 		defer func() { _ = st.Close() }()
 
-		// Set up Gmail client factory for draft operations.
-		// If OAuth is not configured, draft tools are simply not exposed.
-		gmailFactory := buildGmailFactory(st)
-
 		// Derive from cmd.Context() so signal handling installed by
 		// the cobra root command (SIGINT/SIGTERM → ctx.Done()) reaches
 		// the MCP transport and can trigger ServeHTTPWithOptions's
@@ -68,7 +64,10 @@ Add to Claude Desktop config:
 		if err != nil {
 			return err
 		}
-		opts.GmailFactory = gmailFactory
+		// Set up the live mail client factory for draft/label operations.
+		// If neither Gmail OAuth nor an IMAP account is available, the
+		// write tools are simply not exposed.
+		opts.GmailFactory = buildGmailFactory(ctx, st)
 		opts.GoogleDocsFactory = buildGoogleDocsFactory()
 
 		if mcpHTTPAddr != "" {
@@ -213,66 +212,95 @@ func (s daemonMCPSimilarSearcher) FindSimilar(
 }
 
 // buildGmailFactory returns a GmailClientFactory that creates authenticated
-// Gmail clients using OAuth tokens. Returns nil if OAuth is not configured.
+// live mail clients for the MCP draft/label write tools. Gmail accounts use
+// Google OAuth tokens; IMAP accounts (including Microsoft 365 delegated and
+// app-only sources) build an IMAP/SMTP client from the source's sync_config.
+// Returns nil — disabling the write tools — only when Google OAuth is not
+// configured AND no IMAP account exists in the archive.
 //
 // The stdio/HTTP mcp command talks to the daemon over a *daemonclient.Client
-// rather than a direct *store.Store, so account/OAuth-app lookups are resolved
-// through the daemon's CLI accounts API. OAuth tokens themselves live locally
-// (cfg.TokensDir()) and are read directly.
-func buildGmailFactory(st *daemonclient.Client) mcpserver.GmailClientFactory {
-	// Check if OAuth secrets are available
-	secretsPath, err := cfg.OAuth.ClientSecretsFor("")
-	if err != nil {
-		// OAuth not configured — draft tools will be disabled
-		fmt.Fprintf(os.Stderr, "Note: OAuth not configured, draft tools disabled\n")
+// rather than a direct *store.Store, so account/OAuth-app/sync_config lookups
+// are resolved through the daemon's CLI accounts API. Credentials themselves
+// (OAuth tokens, IMAP passwords, Microsoft refresh tokens or certificates)
+// live locally (cfg.TokensDir() or configured paths) and are read directly.
+func buildGmailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.GmailClientFactory {
+	secretsPath, secretsErr := cfg.OAuth.ClientSecretsFor("")
+	oauthConfigured := secretsErr == nil
+
+	hasIMAP := false
+	if accounts, err := st.GetCLIAccounts(ctx); err == nil {
+		for _, a := range accounts {
+			if a.Type == sourceTypeIMAP {
+				hasIMAP = true
+				break
+			}
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "Note: could not list accounts to detect IMAP sources: %v\n", err)
+	}
+
+	if !oauthConfigured && !hasIMAP {
+		// Neither auth path is available — write tools will be disabled.
+		fmt.Fprintf(os.Stderr, "Note: OAuth not configured and no IMAP accounts, draft tools disabled\n")
 		return nil
 	}
 
-	return func(ctx context.Context, email string) (*gmail.Client, error) {
-		// Look up the account's OAuth app binding via the daemon.
+	return func(ctx context.Context, email string) (gmail.API, error) {
+		// Look up the account's source type and OAuth app binding via the daemon.
 		accounts, err := st.GetCLIAccounts(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("lookup account %s: %w", email, err)
 		}
-		var appName string
-		found := false
-		for _, a := range accounts {
-			if a.Email == email {
-				appName = a.OAuthApp
-				found = true
+		var account *daemonclient.CLIAccount
+		for i := range accounts {
+			if accounts[i].Email == email {
+				account = &accounts[i]
 				break
 			}
 		}
-		if !found {
+		if account == nil {
 			return nil, fmt.Errorf("account %s not found in database", email)
 		}
 
-		// Resolve the correct OAuth app for this account
-		appSecrets := secretsPath
-		if appName != "" {
-			appSecrets, err = cfg.OAuth.ClientSecretsFor(appName)
-			if err != nil {
-				return nil, fmt.Errorf("OAuth app %q: %w", appName, err)
+		switch account.Type {
+		case sourceTypeIMAP:
+			return buildIMAPAPIClient(ctx, account.Email, account.SyncConfig)
+
+		case sourceTypeGmail, "":
+			if !oauthConfigured {
+				return nil, fmt.Errorf("Gmail OAuth not configured for %s: %v", email, secretsErr)
 			}
+
+			// Resolve the correct OAuth app for this account
+			appSecrets := secretsPath
+			if account.OAuthApp != "" {
+				appSecrets, err = cfg.OAuth.ClientSecretsFor(account.OAuthApp)
+				if err != nil {
+					return nil, fmt.Errorf("OAuth app %q: %w", account.OAuthApp, err)
+				}
+			}
+
+			oauthMgr, err := oauth.NewManager(appSecrets, cfg.TokensDir(), logger)
+			if err != nil {
+				return nil, fmt.Errorf("create OAuth manager: %w", err)
+			}
+
+			tokenSource, err := oauthMgr.TokenSource(ctx, email)
+			if err != nil {
+				return nil, fmt.Errorf("get token for %s: %w (run 'msgvault add-account %s' first)", email, err, email)
+			}
+
+			rateLimiter := gmail.NewRateLimiter(float64(cfg.Sync.RateLimitQPS))
+			client := gmail.NewClient(tokenSource,
+				gmail.WithLogger(logger),
+				gmail.WithRateLimiter(rateLimiter),
+			)
+
+			return client, nil
+
+		default:
+			return nil, fmt.Errorf("account %s has source type %q, which does not support draft/label operations", email, account.Type)
 		}
-
-		oauthMgr, err := oauth.NewManager(appSecrets, cfg.TokensDir(), logger)
-		if err != nil {
-			return nil, fmt.Errorf("create OAuth manager: %w", err)
-		}
-
-		tokenSource, err := oauthMgr.TokenSource(ctx, email)
-		if err != nil {
-			return nil, fmt.Errorf("get token for %s: %w (run 'msgvault add-account %s' first)", email, err, email)
-		}
-
-		rateLimiter := gmail.NewRateLimiter(float64(cfg.Sync.RateLimitQPS))
-		client := gmail.NewClient(tokenSource,
-			gmail.WithLogger(logger),
-			gmail.WithRateLimiter(rateLimiter),
-		)
-
-		return client, nil
 	}
 }
 
