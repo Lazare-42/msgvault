@@ -725,6 +725,11 @@ type cliAccountResponse struct {
 	MessageCount       int64      `json:"message_count"`
 	SourceDeletedCount int64      `json:"source_deleted_count"`
 	LastSync           *time.Time `json:"last_sync"`
+	// SyncConfig is the source's sync_config JSON, exposed only for IMAP
+	// sources so the MCP command can build live IMAP/SMTP clients for
+	// draft and label operations. It contains connection parameters
+	// (host, port, username, auth method), never credentials.
+	SyncConfig string `json:"sync_config,omitempty"`
 }
 
 type cliMessageResponse struct {
@@ -1921,6 +1926,12 @@ func (s *Server) handleCLIAccounts(w http.ResponseWriter, r *http.Request) {
 		if src.LastSyncAt.Valid {
 			lastSync := src.LastSyncAt.Time.UTC()
 			account.LastSync = &lastSync
+		}
+		// Only IMAP configs are exposed: the MCP factory needs the
+		// connection parameters to build a live client. Other source
+		// types keep their sync_config private to the daemon.
+		if src.SourceType == "imap" && src.SyncConfig.Valid {
+			account.SyncConfig = src.SyncConfig.String
 		}
 		accounts = append(accounts, account)
 	}

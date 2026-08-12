@@ -2662,6 +2662,51 @@ func TestHandleCLIAccountsReturnsOAuthApp(t *testing.T) {
 	assert.Empty(byEmail["default@example.com"], "default account oauth_app empty")
 }
 
+func TestHandleCLIAccountsExposesIMAPSyncConfigOnly(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
+		Store:  st,
+		Logger: testLogger(),
+	})
+
+	imapSrc, err := st.GetOrCreateSource("imap", "shared@example.com")
+	require.NoError(err, "GetOrCreateSource imap")
+	imapConfig := `{"host":"imap.example.com","port":993,"tls":true,"username":"shared@example.com","auth_method":"xoauth2","ms_app_only":true}`
+	require.NoError(st.UpdateSourceSyncConfig(imapSrc.ID, imapConfig), "UpdateSourceSyncConfig imap")
+
+	gmailSrc, err := st.GetOrCreateSource("gmail", "alice@example.com")
+	require.NoError(err, "GetOrCreateSource gmail")
+	require.NoError(
+		st.UpdateSourceSyncConfig(gmailSrc.ID, `{"private":"stays-private"}`),
+		"UpdateSourceSyncConfig gmail",
+	)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/cli/accounts", nil)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	assert.Equal(http.StatusOK, w.Code, "status: %s", w.Body.String())
+
+	var resp struct {
+		Accounts []struct {
+			Email      string `json:"email"`
+			Type       string `json:"type"`
+			SyncConfig string `json:"sync_config"`
+		} `json:"accounts"`
+	}
+	require.NoError(json.NewDecoder(w.Body).Decode(&resp), "decode response")
+
+	byEmail := map[string]string{}
+	for _, a := range resp.Accounts {
+		byEmail[a.Email] = a.SyncConfig
+	}
+	assert.Equal(imapConfig, byEmail["shared@example.com"], "IMAP sync_config exposed")
+	assert.Empty(byEmail["alice@example.com"], "non-IMAP sync_config stays private")
+}
+
 func TestHandleCLIUpdateAccountDisplayName(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)

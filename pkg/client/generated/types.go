@@ -517,6 +517,7 @@ type CliAccountResponse struct {
 	MessageCount       int64      `json:"message_count"`
 	OauthApp           *string    `json:"oauth_app,omitempty"`
 	SourceDeletedCount int64      `json:"source_deleted_count"`
+	SyncConfig         *string    `json:"sync_config,omitempty"`
 	Type               string     `json:"type" validate:"required"`
 }
 

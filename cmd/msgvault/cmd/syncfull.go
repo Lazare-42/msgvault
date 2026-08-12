@@ -272,16 +272,7 @@ func buildAPIClient(ctx context.Context, src *store.Source, getOAuthMgr func(str
 		), nil
 
 	case sourceTypeIMAP:
-		if !src.SyncConfig.Valid || src.SyncConfig.String == "" {
-			return nil, fmt.Errorf("IMAP source %s has no config (run 'add-imap' first)", src.Identifier)
-		}
-		imapCfg, err := imaplib.ConfigFromJSON(src.SyncConfig.String)
-		if err != nil {
-			return nil, fmt.Errorf("parse IMAP config: %w", err)
-		}
-
 		var opts []imaplib.Option
-		opts = append(opts, imaplib.WithLogger(logger))
 		opts = append(opts, imapOpts...)
 
 		var since, before time.Time
@@ -303,24 +294,48 @@ func buildAPIClient(ctx context.Context, src *store.Source, getOAuthMgr func(str
 			opts = append(opts, imaplib.WithDateFilter(since, before))
 		}
 
-		switch imapCfg.EffectiveAuthMethod() {
-		case imaplib.AuthXOAuth2:
-			tokenFn, err := microsoftIMAPTokenSource(ctx, imapCfg)
-			if err != nil {
-				return nil, err
-			}
-			opts = append(opts, imaplib.WithTokenSource(tokenFn))
-			return imaplib.NewClient(imapCfg, "", opts...), nil
-		default:
-			password, err := imaplib.LoadCredentials(cfg.TokensDir(), src.Identifier)
-			if err != nil {
-				return nil, fmt.Errorf("load IMAP credentials: %w (run 'add-imap' first)", err)
-			}
-			return imaplib.NewClient(imapCfg, password, opts...), nil
+		syncConfig := ""
+		if src.SyncConfig.Valid {
+			syncConfig = src.SyncConfig.String
 		}
+		return buildIMAPAPIClient(ctx, src.Identifier, syncConfig, opts...)
 
 	default:
 		return nil, fmt.Errorf("unsupported source type %q", src.SourceType)
+	}
+}
+
+// buildIMAPAPIClient constructs an IMAP-backed gmail.API client from a
+// source's sync_config JSON. Shared by the sync path (buildAPIClient) and
+// the MCP factory (buildGmailFactory), which resolves accounts through the
+// daemon rather than a local *store.Source. Handles both auth models:
+// XOAUTH2 (Microsoft 365 delegated or app-only certificate flow) and
+// password (stored credentials in the tokens dir).
+func buildIMAPAPIClient(ctx context.Context, identifier, syncConfigJSON string, imapOpts ...imaplib.Option) (gmail.API, error) {
+	if syncConfigJSON == "" {
+		return nil, fmt.Errorf("IMAP source %s has no config (run 'add-imap' first)", identifier)
+	}
+	imapCfg, err := imaplib.ConfigFromJSON(syncConfigJSON)
+	if err != nil {
+		return nil, fmt.Errorf("parse IMAP config: %w", err)
+	}
+
+	opts := append([]imaplib.Option{imaplib.WithLogger(logger)}, imapOpts...)
+
+	switch imapCfg.EffectiveAuthMethod() {
+	case imaplib.AuthXOAuth2:
+		tokenFn, err := microsoftIMAPTokenSource(ctx, imapCfg)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, imaplib.WithTokenSource(tokenFn))
+		return imaplib.NewClient(imapCfg, "", opts...), nil
+	default:
+		password, err := imaplib.LoadCredentials(cfg.TokensDir(), identifier)
+		if err != nil {
+			return nil, fmt.Errorf("load IMAP credentials: %w (run 'add-imap' first)", err)
+		}
+		return imaplib.NewClient(imapCfg, password, opts...), nil
 	}
 }
 

@@ -417,6 +417,7 @@ func cliAccountsFromGenerated(resp *generated.ListCLIAccountsResponse) []CLIAcco
 			MessageCount:       account.MessageCount,
 			SourceDeletedCount: account.SourceDeletedCount,
 			LastSync:           account.LastSync,
+			SyncConfig:         stringValue(account.SyncConfig),
 		}
 	}
 	return out
