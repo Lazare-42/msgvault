@@ -879,6 +879,11 @@ type cliAccountResponse struct {
 	HistoryOnly        bool                   `json:"history_only"`
 	ReanchorRequired   bool                   `json:"reanchor_required"`
 	MergedIntoSourceID int64                  `json:"merged_into_source_id"`
+	// SyncConfig is the source's sync_config JSON, exposed only for IMAP
+	// sources so the MCP command can build live IMAP/SMTP clients for
+	// draft and label operations. It contains connection parameters
+	// (host, port, username, auth method), never credentials.
+	SyncConfig string `json:"sync_config,omitempty"`
 }
 
 type cliMessageResponse struct {
@@ -2833,7 +2838,9 @@ func (s *Server) handleCLIAccounts(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to list accounts")
 			return
 		}
-		accounts = append(accounts, newCLIAccountResponse(src, count, sourceDeleted))
+		account := newCLIAccountResponse(src, count, sourceDeleted)
+		if src.SourceType == "imap" && src.SyncConfig.Valid { account.SyncConfig = src.SyncConfig.String }
+		accounts = append(accounts, account)
 	}
 
 	if lister, ok := s.store.(virtualAccountLister); ok {

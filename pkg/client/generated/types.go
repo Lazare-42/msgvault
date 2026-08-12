@@ -2212,6 +2212,7 @@ func (c ChoiceDescriptor) Validate() error {
 }
 
 type CliAccountResponse struct {
+ SyncConfig *string `json:"sync_config,omitempty"`
 	Alias              *string          `json:"alias" validate:"required"`
 	DisplayName        string           `json:"display_name" validate:"required"`
 	Email              string           `json:"email" validate:"required"`

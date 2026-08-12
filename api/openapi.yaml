@@ -2383,6 +2383,8 @@ components:
         source_deleted_count:
           format: int64
           type: integer
+        sync_config:
+          type: string
         type:
           type: string
         virtual_accounts:
