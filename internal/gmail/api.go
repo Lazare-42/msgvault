@@ -203,6 +203,7 @@ type RawMessage struct {
 	ID           string
 	ThreadID     string
 	LabelIDs     []string
+	FlagLabels   []string // labels derived from per-message flags (IMAP); subset of LabelIDs
 	Snippet      string
 	HistoryID    uint64
 	InternalDate int64 // Unix milliseconds
@@ -230,6 +231,7 @@ var ErrMessageGone = errors.New("message no longer present in the mailbox")
 type MessageLabelsBatchResult struct {
 	ID              string
 	LabelIDs        []string
+	FlagLabels      []string // labels derived from per-message flags (IMAP); subset of LabelIDs
 	RFC822MessageID string
 	Err             error
 }

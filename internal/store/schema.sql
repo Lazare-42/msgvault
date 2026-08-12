@@ -1667,7 +1667,7 @@ CREATE TABLE IF NOT EXISTS labels (
 
     source_label_id TEXT,           -- Gmail label ID
     name TEXT NOT NULL,
-    label_type TEXT,                -- 'system', 'user', 'auto'
+    label_type TEXT,                -- 'system', 'user', 'auto', 'keyword'
     system_role TEXT,               -- trusted canonical role (for example, 'sent')
     color TEXT,
 
