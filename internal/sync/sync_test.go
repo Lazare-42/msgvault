@@ -2969,6 +2969,7 @@ func (a *labelMetadataSnapshotAPI) GetMessageLabelsBatch(_ context.Context, mess
 			continue
 		}
 		results[i].LabelIDs = append([]string(nil), msg.LabelIDs...)
+		results[i].FlagLabels = append([]string(nil), msg.FlagLabels...)
 	}
 	return results, nil
 }
@@ -3058,6 +3059,56 @@ func TestIMAPFilteredRescanExactIDMergesNewLabels(t *testing.T) {
 	assert.Equal(t, [][2]string{{sourceMessageID, ""}}, filteredAPI.seedCalls)
 	assertMessageHasLabel(t, env.Store, sourceMessageID, "[Gmail]/All Mail")
 	assertMessageHasLabel(t, env.Store, sourceMessageID, "Archive")
+}
+
+func TestIMAPFilteredRescanReplacesStaleFlagLabels(t *testing.T) {
+	env := newTestEnv(t)
+	opts := DefaultOptions()
+	opts.SourceType = sourceTypeIMAP
+	env.Syncer = New(env.Mock, env.Store, opts)
+	env.Mock.Labels = []*gmail.Label{
+		{ID: "INBOX", Name: "INBOX", Type: labelTypeSystem},
+		{ID: "Archive", Name: "Archive", Type: "user"},
+	}
+
+	const sourceMessageID = "INBOX|7"
+	msg := testemail.NewMessage().
+		Subject("Flag label rescan").
+		Header("Message-ID", "<flag-label-rescan@example.com>").
+		Body("Flag-derived labels must track the source on every sync.").
+		Bytes()
+
+	env.Mock.Profile.MessagesTotal = 1
+	env.Mock.AddMessage(sourceMessageID, msg,
+		[]string{"INBOX", "Archive", "UNREAD", "Traite"})
+	env.Mock.Messages[sourceMessageID].FlagLabels = []string{"UNREAD", "Traite"}
+	summary := runFullSync(t, env)
+	assertSummary(t, summary, WantSummary{Added: new(int64(1))})
+	assertMessageHasLabel(t, env.Store, sourceMessageID, "UNREAD")
+	assertMessageHasLabel(t, env.Store, sourceMessageID, "Traite")
+
+	// The message is read and replied at the source, and its category is
+	// removed. The Archive mailbox falls outside the filtered view.
+	env.Mock.Messages[sourceMessageID].LabelIDs = []string{"INBOX", "ANSWERED"}
+	env.Mock.Messages[sourceMessageID].FlagLabels = []string{"ANSWERED"}
+	filteredAPI := &labelMetadataSnapshotAPI{
+		MockAPI:  env.Mock,
+		filtered: true,
+	}
+	env.Syncer = New(filteredAPI, env.Store, opts)
+
+	summary = runFullSync(t, env)
+	assertSummary(t, summary, WantSummary{
+		Added:   new(int64(0)),
+		Updated: new(int64(1)),
+	})
+	// Mailbox labels keep merge semantics under a partial snapshot...
+	assertMessageHasLabel(t, env.Store, sourceMessageID, "INBOX")
+	assertMessageHasLabel(t, env.Store, sourceMessageID, "Archive")
+	// ...but flag-derived labels replace-track the fetched message.
+	assertMessageHasLabel(t, env.Store, sourceMessageID, "ANSWERED")
+	assertMessageNotHasLabel(t, env.Store, sourceMessageID, "UNREAD")
+	assertMessageNotHasLabel(t, env.Store, sourceMessageID, "Traite")
 }
 
 func TestIMAPCompleteRescanReplacesExactIDLabels(t *testing.T) {

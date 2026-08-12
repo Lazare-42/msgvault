@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -294,7 +295,15 @@ func (s *Syncer) processBatch(ctx context.Context, syncID, sourceID int64, listR
 			}
 
 			existing := existingMap[sourceMessageID]
-			labelIDs := labelIDsFor(labelResult.LabelIDs, labelMap)
+			labelIDs, err := s.resolveLabelIDs(
+				sourceID, labelResult.LabelIDs, labelResult.FlagLabels, labelMap)
+			if err != nil {
+				s.logger.Warn("failed to resolve message labels",
+					"id", sourceMessageID, "error", err)
+				s.recordSyncItem(syncID, sourceMessageID, syncItemPhaseIngest, store.SyncRunItemStatusError, syncItemKindIngestError, err)
+				checkpoint.ErrorsCount++
+				continue
+			}
 			if s.opts.SourceType == sourceTypeIMAP {
 				matcher, ok := s.client.(fetchedSourceMessageMatcher)
 				if !ok {
@@ -369,6 +378,7 @@ func (s *Syncer) processBatch(ctx context.Context, syncID, sourceID int64, listR
 
 			changed, err := s.reconcileValidatedMessageLabels(
 				existing.ID,
+				sourceID,
 				sourceMessageID,
 				labelResult.RFC822MessageID,
 				labelIDs,
@@ -469,6 +479,7 @@ func (s *Syncer) processBatch(ctx context.Context, syncID, sourceID int64, listR
 				if bytes.Equal(archivedRaw, raw.Raw) {
 					changed, err := s.reconcileValidatedMessageLabels(
 						existing.ID,
+						sourceID,
 						sourceMessageID,
 						pendingRefresh.rfc822MessageID,
 						pendingRefresh.labelIDs,
@@ -796,6 +807,7 @@ type messageData struct {
 	cc             []mime.Address
 	bcc            []mime.Address
 	gmailLabelIDs  []string
+	flagLabels     []string // flag-derived subset of gmailLabelIDs (IMAP)
 	attachments    []mime.Attachment
 	participantMap map[string]int64
 }
@@ -947,6 +959,7 @@ func (s *Syncer) parseToModel(sourceID int64, raw *gmail.RawMessage, threadID st
 		cc:             parsed.Cc,
 		bcc:            parsed.Bcc,
 		gmailLabelIDs:  raw.LabelIDs,
+		flagLabels:     raw.FlagLabels,
 		attachments:    parsed.Attachments,
 		participantMap: participantMap,
 	}, nil
@@ -957,12 +970,11 @@ func (s *Syncer) parseToModel(sourceID int64, raw *gmail.RawMessage, threadID st
 // here: persisted rows leave embed_gen NULL (column default) and the
 // scan-and-fill worker discovers them later.
 func (s *Syncer) persistMessage(data *messageData, labelMap map[string]int64) (int64, error) {
-	// Map Gmail label IDs to internal IDs
-	var labelIDs []int64
-	for _, gmailLabelID := range data.gmailLabelIDs {
-		if internalID, ok := labelMap[gmailLabelID]; ok {
-			labelIDs = append(labelIDs, internalID)
-		}
+	// Map source label IDs to internal IDs
+	labelIDs, err := s.resolveLabelIDs(
+		data.message.SourceID, data.gmailLabelIDs, data.flagLabels, labelMap)
+	if err != nil {
+		return 0, err
 	}
 
 	// Build recipient sets
@@ -1050,6 +1062,47 @@ var errDuplicateRFC822 = errors.New("duplicate RFC822 Message-ID")
 var errDeferredIMAPIdentity = errors.New(
 	"deferred IMAP source identity validation")
 
+// resolveLabelIDs maps source label IDs to internal label IDs. Labels absent
+// from labelMap are dropped — except flag-derived labels: per-message IMAP
+// flags and keywords are not part of the mailbox listing that seeds labelMap,
+// so they are created on demand and cached back into labelMap.
+func (s *Syncer) resolveLabelIDs(
+	sourceID int64,
+	sourceLabelIDs, flagLabels []string,
+	labelMap map[string]int64,
+) ([]int64, error) {
+	labelIDs := make([]int64, 0, len(sourceLabelIDs))
+	for _, label := range sourceLabelIDs {
+		id, ok := labelMap[label]
+		if !ok {
+			if !slices.Contains(flagLabels, label) {
+				continue
+			}
+			var err error
+			id, err = s.store.EnsureLabel(
+				sourceID, label, label, flagLabelType(label))
+			if err != nil {
+				return nil, fmt.Errorf(
+					"ensure flag label %q: %w", label, err)
+			}
+			labelMap[label] = id
+		}
+		labelIDs = append(labelIDs, id)
+	}
+	return labelIDs, nil
+}
+
+// flagLabelType classifies a flag-derived label: the well-known flag labels
+// are system labels; anything else is a custom IMAP keyword.
+func flagLabelType(name string) string {
+	switch name {
+	case "UNREAD", "STARRED", "ANSWERED":
+		return labelTypeSystem
+	default:
+		return store.LabelTypeKeyword
+	}
+}
+
 func labelIDsFor(sourceLabelIDs []string, labelMap map[string]int64) []int64 {
 	labelIDs := make([]int64, 0, len(sourceLabelIDs))
 	for _, label := range sourceLabelIDs {
@@ -1090,7 +1143,11 @@ func (s *Syncer) ingestMessage(
 			return false, fmt.Errorf("check rfc822 dedup: %w", err)
 		}
 		if existingID > 0 {
-			labelIDs := labelIDsFor(data.gmailLabelIDs, labelMap)
+			labelIDs, err := s.resolveLabelIDs(
+				sourceID, data.gmailLabelIDs, data.flagLabels, labelMap)
+			if err != nil {
+				return false, fmt.Errorf("resolve dedup labels: %w", err)
+			}
 			matcher, ok := s.client.(sourceMessageMatcher)
 			if !ok {
 				return false, errors.New(
@@ -1202,8 +1259,15 @@ func (s *Syncer) preserveReusedIMAPSource(
 	return nil
 }
 
+// reconcileValidatedMessageLabels refreshes the labels of an already-archived
+// message. Complete snapshots replace the whole label set. Partial snapshots
+// (folder- or date-filtered syncs) only merge mailbox labels — but flag-derived
+// labels (UNREAD, STARRED, ANSWERED, custom keywords) always describe the
+// fetched message itself, so stale ones are removed even when merging;
+// otherwise a message read at the source would keep its UNREAD label forever.
 func (s *Syncer) reconcileValidatedMessageLabels(
 	existingID int64,
+	sourceID int64,
 	sourceMessageID string,
 	rfc822MessageID string,
 	labelIDs []int64,
@@ -1213,6 +1277,14 @@ func (s *Syncer) reconcileValidatedMessageLabels(
 		existingID, labelIDs, snapshotComplete)
 	if err != nil {
 		return false, err
+	}
+	if !snapshotComplete {
+		removed, err := s.store.RemoveStaleFlagLabels(
+			existingID, sourceID, labelIDs)
+		if err != nil {
+			return false, err
+		}
+		changed = changed || removed
 	}
 	if seeder, ok := s.client.(validatedMessageDedupSeeder); ok {
 		if err := seeder.SeedValidatedMessageDedup(

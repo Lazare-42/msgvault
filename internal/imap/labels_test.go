@@ -99,3 +99,95 @@ func TestClassifyLabelType(t *testing.T) {
 		})
 	}
 }
+
+func TestLabelsForFlags(t *testing.T) {
+	tests := []struct {
+		name  string
+		flags []imap.Flag
+		want  []string
+	}{
+		{
+			name:  "no flags means unread",
+			flags: nil,
+			want:  []string{"UNREAD"},
+		},
+		{
+			name:  "seen message has no flag labels",
+			flags: []imap.Flag{imap.FlagSeen},
+			want:  []string{},
+		},
+		{
+			name:  "flagged becomes starred",
+			flags: []imap.Flag{imap.FlagSeen, imap.FlagFlagged},
+			want:  []string{"STARRED"},
+		},
+		{
+			name:  "answered plus custom keyword",
+			flags: []imap.Flag{imap.FlagAnswered, "Traite"},
+			want:  []string{"ANSWERED", "Traite", "UNREAD"},
+		},
+		{
+			name: "system flags and dollar keywords are skipped",
+			flags: []imap.Flag{
+				imap.FlagSeen,
+				imap.FlagDraft,
+				imap.FlagDeleted,
+				`\Recent`,
+				imap.FlagForwarded,
+				imap.FlagMDNSent,
+				"$Junk",
+			},
+			want: []string{},
+		},
+		{
+			name:  "system flag atoms match case-insensitively",
+			flags: []imap.Flag{`\seen`, `\FLAGGED`, `\answered`},
+			want:  []string{"STARRED", "ANSWERED"},
+		},
+		{
+			name:  "duplicate flags map to one label",
+			flags: []imap.Flag{"Traite", "Traite", imap.FlagFlagged, "STARRED"},
+			want:  []string{"Traite", "STARRED", "UNREAD"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, labelsForFlags(tt.flags))
+		})
+	}
+}
+
+func TestMergeFlagLabels(t *testing.T) {
+	tests := []struct {
+		name       string
+		labels     []string
+		flagLabels []string
+		want       []string
+	}{
+		{
+			name:       "appends missing flag labels",
+			labels:     []string{"INBOX"},
+			flagLabels: []string{"UNREAD", "STARRED"},
+			want:       []string{"INBOX", "UNREAD", "STARRED"},
+		},
+		{
+			name:       "skips duplicates",
+			labels:     []string{"INBOX", "Traite"},
+			flagLabels: []string{"Traite", "UNREAD"},
+			want:       []string{"INBOX", "Traite", "UNREAD"},
+		},
+		{
+			name:       "no flag labels keeps mailbox labels",
+			labels:     []string{"INBOX"},
+			flagLabels: nil,
+			want:       []string{"INBOX"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, mergeFlagLabels(tt.labels, tt.flagLabels))
+		})
+	}
+}

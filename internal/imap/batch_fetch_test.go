@@ -106,11 +106,110 @@ func TestGetMessageLabelsBatchPreservesPerMessageMissingUID(t *testing.T) {
 	require.NoError(err)
 	require.Len(results, 2)
 	assert.Equal("INBOX|1", results[0].ID)
-	assert.Equal([]string{"INBOX"}, results[0].LabelIDs)
+	assert.Equal([]string{"INBOX", "UNREAD"}, results[0].LabelIDs)
+	assert.Equal([]string{"UNREAD"}, results[0].FlagLabels)
 	require.NoError(results[0].Err)
 	assert.Equal("INBOX|99", results[1].ID)
 	assert.Nil(results[1].LabelIDs)
 	require.ErrorIs(results[1].Err, errIMAPFetchResultMissing)
+}
+
+// storeIMAPFlags mutates a message's flags on the in-memory server through a
+// separate IMAP connection, simulating flag changes made by another client
+// (reading a message, replying, adding an Outlook category keyword).
+func storeIMAPFlags(
+	t *testing.T,
+	addr, mailbox string,
+	uid imapapi.UID,
+	op imapapi.StoreFlagsOp,
+	flags []imapapi.Flag,
+) {
+	t.Helper()
+	conn, err := imapclient.DialInsecure(addr, nil)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	require.NoError(t, conn.Login(
+		testutil.IMAPTestUsername, testutil.IMAPTestPassword).Wait())
+	_, err = conn.Select(mailbox, nil).Wait()
+	require.NoError(t, err)
+	require.NoError(t, conn.Store(imapapi.UIDSetNum(uid), &imapapi.StoreFlags{
+		Op:     op,
+		Silent: true,
+		Flags:  flags,
+	}, nil).Close())
+	require.NoError(t, conn.Logout().Wait())
+}
+
+func TestGetMessagesRawBatchMapsFlagsToLabels(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	addr, user := testutil.StartIMAPMemServer(t, map[string]int{"INBOX": 0})
+	// Custom keywords pass through verbatim as returned by the server. Flag
+	// atoms are case-insensitive and the in-memory server canonicalizes them
+	// to lowercase, so the keyword "Traite" comes back as "traite".
+	testutil.AppendIMAPMessageWithFlags(t, user, "INBOX",
+		[]imapapi.Flag{imapapi.FlagAnswered, "traite"})
+	client := newTestClient(t, addr)
+
+	results, err := client.GetMessagesRawBatchWithErrors(
+		context.Background(), []string{"INBOX|1"})
+
+	require.NoError(err)
+	require.Len(results, 1)
+	require.NoError(results[0].Err)
+	require.NotNil(results[0].Message)
+	assert.ElementsMatch(
+		[]string{"INBOX", "ANSWERED", "traite", "UNREAD"},
+		results[0].Message.LabelIDs,
+	)
+	assert.ElementsMatch(
+		[]string{"ANSWERED", "traite", "UNREAD"},
+		results[0].Message.FlagLabels,
+	)
+}
+
+func TestGetMessageLabelsBatchRefreshesFlagLabels(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	addr, _ := testutil.StartIMAPMemServer(t, map[string]int{"INBOX": 1})
+	client := newTestClient(t, addr)
+
+	results, err := client.GetMessageLabelsBatch(
+		context.Background(), []string{"INBOX|1"})
+	require.NoError(err)
+	require.Len(results, 1)
+	require.NoError(results[0].Err)
+	assert.ElementsMatch([]string{"INBOX", "UNREAD"}, results[0].LabelIDs)
+	assert.Equal([]string{"UNREAD"}, results[0].FlagLabels)
+
+	// The message is read, starred, and categorised by another client. The
+	// in-memory server canonicalizes keyword atoms to lowercase.
+	storeIMAPFlags(t, addr, "INBOX", 1, imapapi.StoreFlagsAdd,
+		[]imapapi.Flag{imapapi.FlagSeen, imapapi.FlagFlagged, "traite"})
+
+	results, err = client.GetMessageLabelsBatch(
+		context.Background(), []string{"INBOX|1"})
+	require.NoError(err)
+	require.Len(results, 1)
+	require.NoError(results[0].Err)
+	assert.ElementsMatch(
+		[]string{"INBOX", "STARRED", "traite"}, results[0].LabelIDs)
+	assert.ElementsMatch(
+		[]string{"STARRED", "traite"}, results[0].FlagLabels)
+	assert.NotContains(results[0].LabelIDs, "UNREAD",
+		"a read message must not keep the UNREAD flag label")
+
+	// The star and category are removed again.
+	storeIMAPFlags(t, addr, "INBOX", 1, imapapi.StoreFlagsDel,
+		[]imapapi.Flag{imapapi.FlagFlagged, "traite"})
+
+	results, err = client.GetMessageLabelsBatch(
+		context.Background(), []string{"INBOX|1"})
+	require.NoError(err)
+	require.Len(results, 1)
+	require.NoError(results[0].Err)
+	assert.Equal([]string{"INBOX"}, results[0].LabelIDs)
+	assert.Empty(results[0].FlagLabels)
 }
 
 func TestLabelOnlyRescanDefersAllMailDedupUntilValidated(t *testing.T) {
@@ -144,7 +243,7 @@ func TestLabelOnlyRescanDefersAllMailDedupUntilValidated(t *testing.T) {
 	require.Len(labelResults, 1)
 	require.NoError(labelResults[0].Err)
 	assert.ElementsMatch(
-		[]string{"All Mail", "Archive"},
+		[]string{"All Mail", "Archive", "UNREAD"},
 		labelResults[0].LabelIDs,
 	)
 	assert.Equal(messageID, labelResults[0].RFC822MessageID)
@@ -323,7 +422,8 @@ func TestApplyLabelFetchResultsMarksOnlyMissingUID(t *testing.T) {
 	var c Client
 	c.applyLabelFetchResults(results, uidToIdx, "Archive", chunk, msgs)
 
-	assert.Equal([]string{"Archive"}, results[0].LabelIDs)
+	assert.Equal([]string{"Archive", "UNREAD"}, results[0].LabelIDs)
+	assert.Equal([]string{"UNREAD"}, results[0].FlagLabels)
 	require.NoError(results[0].Err)
 	assert.Nil(results[1].LabelIDs)
 	require.ErrorIs(results[1].Err, errIMAPFetchResultMissing)
@@ -455,7 +555,7 @@ func TestApplyFetchResultsMergesLabelsUsingRawMessageIDWithoutEnvelope(t *testin
 	c.applyFetchResults(results, uidToIdx, "Archive", chunk, msgs)
 
 	require.NotNil(results[0].Message)
-	assert.Equal([]string{"Archive", "Projects"}, results[0].Message.LabelIDs)
+	assert.Equal([]string{"Archive", "Projects", "UNREAD"}, results[0].Message.LabelIDs)
 	assert.Equal(raw, results[0].Message.Raw)
 	require.NoError(results[0].Err)
 }
@@ -479,7 +579,7 @@ func TestApplyFetchResultsMergesLabelsWhenRawMessageIDHasRecoverableMIMEError(t 
 	c.applyFetchResults(results, uidToIdx, "Archive", chunk, msgs)
 
 	require.NotNil(results[0].Message)
-	assert.Equal([]string{"Archive", "Projects"}, results[0].Message.LabelIDs)
+	assert.Equal([]string{"Archive", "Projects", "UNREAD"}, results[0].Message.LabelIDs)
 	assert.Equal(raw, results[0].Message.Raw)
 	require.NoError(results[0].Err)
 }
@@ -522,7 +622,7 @@ func TestApplyFetchResultsImportsWhenRawMessageIDMissingOrInvalid(t *testing.T) 
 
 			require.NotNil(results[0].Message)
 			assert.Equal("Archive|10", results[0].Message.ID)
-			assert.Equal([]string{"Archive"}, results[0].Message.LabelIDs)
+			assert.Equal([]string{"Archive", "UNREAD"}, results[0].Message.LabelIDs)
 			assert.Equal(tt.raw, results[0].Message.Raw)
 			require.NoError(results[0].Err)
 			assert.Equal(map[string]bool{"existing": true}, c.seenRFC822IDs)

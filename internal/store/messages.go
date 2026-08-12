@@ -1548,6 +1548,18 @@ type LabelInfo struct {
 	Type string // "system" or "user"
 }
 
+// LabelTypeKeyword is the label_type for labels derived from custom IMAP
+// keywords (e.g. an Outlook category stored as keyword "Traite"). Keyword
+// labels track per-message flag state and may be removed from a message by
+// RemoveStaleFlagLabels when the keyword disappears at the source.
+const LabelTypeKeyword = "keyword"
+
+// flagDerivedLabelNames are the well-known labels derived from per-message
+// IMAP flags (\Seen absence, \Flagged, \Answered). Together with
+// keyword-typed labels they form the label set whose membership must track
+// the source's current flag state on every rescan.
+var flagDerivedLabelNames = []string{"UNREAD", "STARRED", "ANSWERED"}
+
 // IsSystemLabel returns true if the given Gmail label ID represents a system label.
 func IsSystemLabel(sourceLabelID string) bool {
 	switch sourceLabelID {
@@ -1774,6 +1786,50 @@ func (s *Store) addMessageLabelsTx(
 // Uses INSERT OR IGNORE — safe to call multiple times.
 func (s *Store) LinkMessageLabel(messageID, labelID int64) error {
 	return s.AddMessageLabels(messageID, []int64{labelID})
+}
+
+// RemoveStaleFlagLabels removes flag-derived labels (UNREAD/STARRED/ANSWERED
+// and keyword-typed labels of the message's source) that are absent from
+// keepLabelIDs, reporting whether any were removed. Mailbox and user labels
+// are untouched, so partial-snapshot syncs can keep merging mailbox
+// memberships while flag labels still replace-track the source's current
+// per-message flag state.
+func (s *Store) RemoveStaleFlagLabels(
+	messageID, sourceID int64, keepLabelIDs []int64,
+) (bool, error) {
+	query := `
+		DELETE FROM message_labels
+		WHERE message_id = ?
+		AND label_id IN (
+			SELECT id FROM labels
+			WHERE source_id = ?
+			AND (name IN (?, ?, ?) OR label_type = ?)
+		)`
+	args := []any{messageID, sourceID}
+	for _, name := range flagDerivedLabelNames {
+		args = append(args, name)
+	}
+	args = append(args, LabelTypeKeyword)
+
+	if len(keepLabelIDs) > 0 {
+		placeholders := make([]string, len(keepLabelIDs))
+		for i, id := range keepLabelIDs {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		query += fmt.Sprintf(
+			" AND label_id NOT IN (%s)", strings.Join(placeholders, ", "))
+	}
+
+	res, err := s.db.Exec(s.dialect.Rebind(query), args...)
+	if err != nil {
+		return false, fmt.Errorf("remove stale flag labels: %w", err)
+	}
+	removed, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("remove stale flag labels: %w", err)
+	}
+	return removed > 0, nil
 }
 
 // RemoveMessageLabels removes specific labels from a message.
