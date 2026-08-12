@@ -33,10 +33,12 @@ IMAP or Microsoft 365); `--dry-run` works for any source type.
 Exactly one of the two cutoff flags is required:
 
 - `--before YYYY-MM-DD` — absolute date; messages sent before it are stale.
+  The date is interpreted as **UTC midnight**.
 - `--older-than-workdays N` — messages are stale once `N` full working days
   (Monday-Friday) have passed; weekends do not count. Run on a Monday with
   `--older-than-workdays 2`, Friday mail is not yet stale (only one full
-  working day has passed) but Wednesday mail is.
+  working day has passed) but Wednesday mail is. Day boundaries are
+  **midnight in the local timezone** of the machine running the command.
 
 ## What gets skipped
 
@@ -50,6 +52,7 @@ Exactly one of the two cutoff flags is required:
   are never re-moved; the destination is always auto-excluded.
 - **Skip IDs** — `--skip-ids 12,57` excludes specific archive message IDs,
   typically ones a previous `--report-replied` review judged as treated.
+  These are counted separately in the report as `skipped_by_id`.
 
 ## Replied messages
 
@@ -74,6 +77,7 @@ Progress goes to stderr; stdout carries a single JSON object:
   "moved": [101, 102],
   "move_errors": 0,
   "skipped_treated": 7,
+  "skipped_by_id": 2,
   "skipped_already_queued": 3,
   "replied": [
     {

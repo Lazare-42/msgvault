@@ -35,7 +35,7 @@ type Options struct {
 
 	// SkipIDs holds archive message IDs judged treated externally
 	// (e.g. by a caller reviewing a prior replied report). They are
-	// counted as treated.
+	// counted separately as SkippedByID.
 	SkipIDs map[int64]bool
 }
 
@@ -46,9 +46,10 @@ type Result struct {
 	// Replied lists ANSWERED messages withheld from moving for the
 	// caller to report (only populated when Options.ReportReplied).
 	Replied []query.MessageSummary
-	// SkippedTreated counts messages excluded by a treated label or by
-	// Options.SkipIDs.
+	// SkippedTreated counts messages excluded by a treated label.
 	SkippedTreated int
+	// SkippedByID counts messages excluded by Options.SkipIDs.
+	SkippedByID int
 	// SkippedAlreadyQueued counts messages already carrying the queue
 	// folder label.
 	SkippedAlreadyQueued int
@@ -66,7 +67,7 @@ func Classify(msgs []query.MessageSummary, opts Options) Result {
 		case hasAnyLabel(msg.Labels, opts.TreatedLabels):
 			res.SkippedTreated++
 		case opts.SkipIDs[msg.ID]:
-			res.SkippedTreated++
+			res.SkippedByID++
 		case opts.ReportReplied && hasLabel(msg.Labels, RepliedLabel):
 			res.Replied = append(res.Replied, msg)
 		default:
