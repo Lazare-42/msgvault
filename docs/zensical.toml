@@ -37,6 +37,7 @@ nav = [
     {"Analytics & Stats" = "usage/analytics.md"},
     {"SQL Queries" = "usage/querying.md"},
     {"Deleting Email" = "usage/deletion.md"},
+    {"Triage Queue" = "usage/triage.md"},
     {"Accounts & Collections" = "usage/multi-account.md"},
     {"Deduplication" = "usage/deduplication.md"},
     {"Backup" = "usage/backup.md"},
