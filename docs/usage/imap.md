@@ -155,6 +155,8 @@ labels for IMAP and Microsoft 365 accounts:
   e.g. `keyword:Traite`. Exchange and Microsoft 365 surface keywords as
   Outlook categories; servers may canonicalize the keyword's case. Keywords
   combine freely with other flags and with a folder/INBOX move in one call.
+  The name must be a single IMAP flag atom: accented/UTF-8 letters are fine,
+  but spaces and the special characters `( ) { } % * " \ ]` are rejected.
 
 A `folder:` move is mutually exclusive with an INBOX add/remove in the same
 call, but a flag (e.g. `STARRED`) can be applied alongside it. Removing a

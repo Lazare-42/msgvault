@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	imap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
@@ -1797,11 +1798,29 @@ const imapKeywordLabelPrefix = "keyword:"
 
 // imapKeywordLabel reports whether label is a "keyword:<name>" custom flag
 // and, if so, returns the trimmed keyword name. The name is passed through
-// as-is (no case-folding, no atom sanitizing): go-imap transmits arbitrary
-// keyword atoms, and Exchange maps keywords to Outlook categories — including
-// UTF-8 names — though servers may canonicalize case when storing them.
+// without case-folding or rewriting (validateIMAPKeywordName only rejects
+// characters that cannot form a single flag atom): go-imap transmits
+// arbitrary keyword atoms, and Exchange maps keywords to Outlook categories
+// — including UTF-8 names — though servers may canonicalize case when
+// storing them.
 func imapKeywordLabel(label string) (string, bool) {
 	return imapPrefixedLabel(label, imapKeywordLabelPrefix)
+}
+
+// validateIMAPKeywordName rejects keyword names that cannot travel as a
+// single IMAP flag atom: whitespace would split the STORE argument into
+// multiple bogus keywords, and atom-special or control characters corrupt
+// the command or draw a server BAD. Non-ASCII letters (e.g. accented UTF-8
+// names) remain allowed and pass through untouched — Exchange accepts them;
+// whether one matches an existing category is a runtime concern, not a
+// parse-time one.
+func validateIMAPKeywordName(keyword string) error {
+	for _, r := range keyword {
+		if unicode.IsSpace(r) || unicode.IsControl(r) || strings.ContainsRune(`(){}%*"\]`, r) {
+			return fmt.Errorf("IMAP keyword name %q contains characters not allowed in a flag atom", keyword)
+		}
+	}
+	return nil
 }
 
 // imapPrefixedLabel matches label against a case-insensitive "<prefix>" marker
@@ -1835,6 +1854,9 @@ func parseIMAPLabelOps(addLabelIDs, removeLabelIDs []string) (imapLabelOps, erro
 			if keyword == "" {
 				return ops, fmt.Errorf("IMAP keyword label %q has an empty keyword name", label)
 			}
+			if err := validateIMAPKeywordName(keyword); err != nil {
+				return ops, err
+			}
 			ops.addFlags = appendFlag(ops.addFlags, imap.Flag(keyword))
 			continue
 		}
@@ -1859,6 +1881,9 @@ func parseIMAPLabelOps(addLabelIDs, removeLabelIDs []string) (imapLabelOps, erro
 		if keyword, ok := imapKeywordLabel(label); ok {
 			if keyword == "" {
 				return ops, fmt.Errorf("IMAP keyword label %q has an empty keyword name", label)
+			}
+			if err := validateIMAPKeywordName(keyword); err != nil {
+				return ops, err
 			}
 			ops.removeFlags = appendFlag(ops.removeFlags, imap.Flag(keyword))
 			continue

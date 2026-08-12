@@ -860,8 +860,8 @@ func modifyLabelsTool() mcp.Tool {
 				"For IMAP/Microsoft 365 accounts, use 'folder:<name>' to MOVE the message into a "+
 				"mailbox (created on demand), e.g. 'folder:Recruiting', and 'keyword:<name>' to set "+
 				"an IMAP keyword flag (on Exchange/O365 this sets an Outlook category), e.g. "+
-				"'keyword:Handled' — supported IMAP labels are UNREAD, STARRED, INBOX, "+
-				"folder:<name>, and keyword:<name>."),
+				"'keyword:Handled' (no spaces or IMAP atom-special characters in the name) — "+
+				"supported IMAP labels are UNREAD, STARRED, INBOX, folder:<name>, and keyword:<name>."),
 		),
 		mcp.WithString("remove_labels",
 			mcp.Description("Comma-separated label IDs to remove (e.g. 'INBOX,UNREAD'). Remove INBOX to archive. "+
