@@ -5,10 +5,19 @@
   fetchFromGitHub,
   gitignoreSource,
   nodejs,
+  runCommand,
   sqlite,
 }:
 let
   version = "0.19.3";
+
+  kitUiSrc = fetchFromGitHub {
+    owner = "kenn-io";
+    repo = "kit-ui";
+    rev = "1e9dc7d45525a471040b72b894432c4956542c38";
+    hash = "sha256-XV7CuqMC+jlhaWQyXzcDukqnF73Lycy2Kueb7rMhxz8=";
+  };
+
 in
 buildGoModule {
   pname = "msgvault";
@@ -19,19 +28,39 @@ buildGoModule {
   vendorHash = "sha256-jnmrZBb8rZChl/UvwMeMDjcIBj6Oyi7lmk9+jg8NnjY=";
   proxyVendor = true;
 
-  bunDeps = bun2nix.fetchBunDeps {
-    bunNix = ../web/bun.nix;
-    overrides = {
-      "@kenn-io/kit-ui@github:kenn-io/kit-ui#1e9dc7d" =
-        _:
-        fetchFromGitHub {
-          owner = "kenn-io";
-          repo = "kit-ui";
-          rev = "1e9dc7d45525a471040b72b894432c4956542c38";
-          hash = "sha256-XV7CuqMC+jlhaWQyXzcDukqnF73Lycy2Kueb7rMhxz8=";
+  # bun2nix cannot express `github:` dependencies: the generated bun.nix names
+  # the package npm-style, so its cache entry never matches the
+  # `@GH@<owner>-<repo>-<committish>@@@1` folder bun looks up
+  # (PackageManagerDirectories cached_github_folder_name). On sandboxed
+  # builders bun then tries to download the tarball and fails with
+  # FailedToOpenSocket. Add the exact entry bun expects, including the
+  # `.bun-tag` marker bun writes when it extracts a GitHub tarball itself.
+  #
+  # The entry must be a plain directory of regular files (or one top-level
+  # symlink). Merging it via symlinkJoin/lndir turns every file into a
+  # symlink, and bun's copyfile backend then silently installs an empty
+  # package.
+  bunDeps =
+    let
+      base = bun2nix.fetchBunDeps {
+        bunNix = ../web/bun.nix;
+        overrides = {
+          # Replace the generated (invalid npm-registry) fetch for the
+          # github: dependency so it is never attempted; the usable cache
+          # entry is added below.
+          "@kenn-io/kit-ui@github:kenn-io/kit-ui#1e9dc7d" = _: kitUiSrc;
         };
-    };
-  };
+      };
+    in
+    runCommand "msgvault-bun-deps" { } ''
+      mkdir -p "$out/share/bun-cache"
+      cp -R ${base}/share/bun-cache/. "$out/share/bun-cache/"
+      chmod -R u+w "$out/share/bun-cache"
+      dest="$out/share/bun-cache/@GH@kenn-io-kit-ui-1e9dc7d@@@1"
+      cp -R ${kitUiSrc} "$dest"
+      chmod -R u+w "$dest"
+      printf 'kenn-io-kit-ui-1e9dc7d' > "$dest/.bun-tag"
+    '';
   bunRoot = "web";
   bunInstallFlags = [
     "--linker=hoisted"
