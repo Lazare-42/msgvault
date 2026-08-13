@@ -1,8 +1,8 @@
 package cmd
 
 import (
+	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/vector"
-	"go.kenn.io/msgvault/internal/vector/embed"
 	"go.kenn.io/msgvault/internal/vector/hybrid"
 )
 
@@ -18,7 +18,8 @@ import (
 type vectorFeatures struct {
 	Backend      vector.Backend
 	HybridEngine *hybrid.Engine
-	Worker       *embed.Worker
+	Runner       scheduler.EmbedRunner
+	Convergence  scheduler.ConvergenceChecker
 	Cfg          vector.Config
 	// Close releases the backend's resources: on SQLite it closes the
 	// vectors.db handle (so WAL checkpoints complete); on PostgreSQL it is
