@@ -795,6 +795,54 @@ func TestBuildCacheAutoReevaluatesUnderLock(t *testing.T) {
 	assert.False(explicit.Skipped, "explicit --full-rebuild must stay unconditional")
 }
 
+func TestBuildCacheScheduledReevaluatesIntervalUnderLock(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	tmpDir := setupTestSQLite(t)
+	dbPath := filepath.Join(tmpDir, "test.db")
+	analyticsDir := filepath.Join(tmpDir, "analytics")
+
+	first, err := buildCache(dbPath, analyticsDir, true)
+	requirements.NoError(err)
+	requirements.False(first.Skipped)
+	state, err := query.ReadCacheSyncState(analyticsDir)
+	requirements.NoError(err)
+
+	db, err := sql.Open("sqlite3", dbPath)
+	requirements.NoError(err)
+	_, err = db.Exec(`
+		INSERT INTO messages (
+			id, source_id, source_message_id, sent_at, subject, snippet
+		) VALUES (6, 1, 'msg6', ?, 'New subject', 'New snippet')
+	`, state.PublishedAt.Add(time.Minute))
+	requirements.NoError(err)
+	requirements.NoError(db.Close())
+
+	result, err := buildCacheScheduled(
+		dbPath,
+		analyticsDir,
+		6*time.Hour,
+		func() time.Time { return state.PublishedAt.Add(time.Hour) },
+	)
+	requirements.NoError(err)
+	assertions.True(result.Skipped,
+		"a scheduled waiter must recheck the interval after acquiring the build lock")
+
+	after, err := query.ReadCacheSyncState(analyticsDir)
+	requirements.NoError(err)
+	assertions.Equal(state.PublishedAt, after.PublishedAt)
+
+	result, err = buildCacheScheduled(
+		dbPath,
+		analyticsDir,
+		6*time.Hour,
+		func() time.Time { return state.PublishedAt.Add(7 * time.Hour) },
+	)
+	requirements.NoError(err)
+	assertions.False(result.Skipped,
+		"the lock-held recheck must build after the interval elapses")
+}
+
 // TestBuildCache_WaitsForCrossProcessBuildLock verifies buildCache blocks on
 // the inter-process build lock: buildCacheMu only serializes one process,
 // while daemon-owned CLI children rebuild the cache in their own processes.
@@ -2783,6 +2831,7 @@ func TestCacheNeedsBuild(t *testing.T) {
 		name       string
 		setup      func(t *testing.T, dbPath, analyticsDir string)
 		wantBuild  bool
+		wantUsable bool
 		wantReason string
 	}{
 		{
@@ -2794,7 +2843,8 @@ func TestCacheNeedsBuild(t *testing.T) {
 				writeSyncState(t, analyticsDir, 0)
 				createFakeParquet(t, analyticsDir)
 			},
-			wantBuild: false,
+			wantBuild:  false,
+			wantUsable: true,
 		},
 		{
 			name: "NoStateFile_NoParquet_NeedsBuild",
@@ -2829,6 +2879,7 @@ func TestCacheNeedsBuild(t *testing.T) {
 				createFakeParquet(t, analyticsDir)
 			},
 			wantBuild:  true,
+			wantUsable: true,
 			wantReason: "5 new messages",
 		},
 		{
@@ -2844,7 +2895,8 @@ func TestCacheNeedsBuild(t *testing.T) {
 				writeSyncState(t, analyticsDir, 10)
 				createFakeParquet(t, analyticsDir)
 			},
-			wantBuild: false,
+			wantBuild:  false,
+			wantUsable: true,
 		},
 		{
 			name: "HasState_EmptyParquetDir_NeedsBuild",
@@ -2875,7 +2927,8 @@ func TestCacheNeedsBuild(t *testing.T) {
 				writeSyncState(t, analyticsDir, 0)
 				createFakeParquet(t, analyticsDir)
 			},
-			wantBuild: false,
+			wantBuild:  false,
+			wantUsable: true,
 		},
 		{
 			name: "CalendarOnly_NoMessagesParquet_NoRebuild",
@@ -2892,7 +2945,8 @@ func TestCacheNeedsBuild(t *testing.T) {
 				writeSyncState(t, analyticsDir, 10)
 				createFakeParquet(t, analyticsDir)
 			},
-			wantBuild: false,
+			wantBuild:  false,
+			wantUsable: true,
 		},
 		{
 			name: "SourceDeletedAndDedupHiddenSinceBuild_NeedsBuild",
@@ -2914,6 +2968,7 @@ func TestCacheNeedsBuild(t *testing.T) {
 				createFakeParquet(t, analyticsDir)
 			},
 			wantBuild:  true,
+			wantUsable: true,
 			wantReason: "1 deletions",
 		},
 		{
@@ -2975,6 +3030,8 @@ func TestCacheNeedsBuild(t *testing.T) {
 
 			got := cacheNeedsBuild(dbPath, analyticsDir)
 			assert.Equal(t, tt.wantBuild, got.NeedsBuild, "cacheNeedsBuild() build (reason: %q)", got.Reason)
+			assert.Equal(t, tt.wantUsable, got.HasUsablePublication,
+				"cacheNeedsBuild() usable publication (reason: %q)", got.Reason)
 			if tt.wantReason != "" {
 				assert.Equal(t, tt.wantReason, got.Reason, "cacheNeedsBuild() reason")
 			}
@@ -2996,6 +3053,7 @@ func TestCacheNeedsBuild_DriftedPublicationForcesFullRebuild(t *testing.T) {
 	got := cacheNeedsBuild(dbPath, analyticsDir)
 	assert.True(got.NeedsBuild)
 	assert.True(got.FullRebuild)
+	assert.False(got.HasUsablePublication)
 	assert.Contains(got.Reason, "drift")
 }
 
