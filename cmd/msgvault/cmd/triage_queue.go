@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -14,7 +13,6 @@ import (
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/gmail"
 	"go.kenn.io/msgvault/internal/query"
-	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/triage"
 )
 
@@ -33,9 +31,6 @@ var (
 const (
 	triageFlagBefore        = "before"
 	triageFlagOlderWorkdays = "older-than-workdays"
-	// triageMoveChunkSize bounds each BatchModifyLabels call so one bad
-	// message cannot fail an arbitrarily large move.
-	triageMoveChunkSize = 40
 	// triagePageSize is the archive scan page size (kept under the API
 	// server's page cap so a short page reliably means "last page").
 	triagePageSize = 200
@@ -128,7 +123,7 @@ func runTriageQueue(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("list accounts: %w", err)
 	}
-	account, err := resolveTriageAccount(accounts, triageAccount)
+	account, err := resolveSyncableAccount(accounts, triageAccount)
 	if err != nil {
 		return err
 	}
@@ -138,7 +133,7 @@ func runTriageQueue(cmd *cobra.Command, _ []string) error {
 	// the mail server and skip this entirely.
 	var apiClient gmail.API
 	if !triageDryRun {
-		src, err := lookupTriageMoveSource(account)
+		src, err := lookupAccountWriteSource(account)
 		if err != nil {
 			return err
 		}
@@ -244,117 +239,6 @@ func parseTriageSkipIDs(raw string) (map[int64]bool, error) {
 		ids[id] = true
 	}
 	return ids, nil
-}
-
-// resolveTriageAccount picks the target account among the daemon's
-// syncable (gmail/imap) accounts: an explicit identifier must match
-// exactly one account by email or display name (case-insensitive);
-// with no identifier the single syncable account is used.
-func resolveTriageAccount(accounts []daemonclient.CLIAccount, input string) (daemonclient.CLIAccount, error) {
-	var syncable []daemonclient.CLIAccount
-	for _, a := range accounts {
-		if a.Type == sourceTypeGmail || a.Type == sourceTypeIMAP {
-			syncable = append(syncable, a)
-		}
-	}
-
-	if input == "" {
-		switch len(syncable) {
-		case 0:
-			return daemonclient.CLIAccount{}, errors.New(
-				"no syncable (gmail/imap) accounts configured - run 'add-imap' or 'add-account' first")
-		case 1:
-			return syncable[0], nil
-		default:
-			return daemonclient.CLIAccount{}, fmt.Errorf(
-				"multiple syncable accounts configured (%s) - use --account to pick one",
-				strings.Join(triageAccountNames(syncable), ", "))
-		}
-	}
-
-	var matches []daemonclient.CLIAccount
-	for _, a := range syncable {
-		if strings.EqualFold(a.Email, input) ||
-			(a.DisplayName != "" && strings.EqualFold(a.DisplayName, input)) {
-			matches = append(matches, a)
-		}
-	}
-	switch len(matches) {
-	case 0:
-		return daemonclient.CLIAccount{}, fmt.Errorf(
-			"no syncable account found for %q (try 'msgvault list-accounts')", input)
-	case 1:
-		return matches[0], nil
-	default:
-		return daemonclient.CLIAccount{}, fmt.Errorf(
-			"ambiguous account %q matches multiple sources: %s",
-			input, strings.Join(triageAccountNames(matches), ", "))
-	}
-}
-
-func triageAccountNames(accounts []daemonclient.CLIAccount) []string {
-	names := make([]string, 0, len(accounts))
-	for _, a := range accounts {
-		names = append(names, fmt.Sprintf("%s (%s)", a.Email, a.Type))
-	}
-	sort.Strings(names)
-	return names
-}
-
-// lookupTriageMoveSource resolves the local store.Source row backing the
-// daemon account, which carries the sync_config/credentials needed to
-// build a live mail client. The archive is opened read-only, so this is
-// safe alongside the running daemon; in remote daemon mode the local
-// archive does not exist and moves are unavailable.
-func lookupTriageMoveSource(account daemonclient.CLIAccount) (*store.Source, error) {
-	s, err := store.OpenReadOnly(cfg.DatabaseDSN())
-	if err != nil {
-		return nil, fmt.Errorf(
-			"open local archive to load source credentials (moves require running where the account was added): %w", err)
-	}
-	defer func() { _ = s.Close() }()
-
-	return lookupTriageMoveSourceIn(s, account)
-}
-
-// lookupTriageMoveSourceIn is the store-injectable core of
-// lookupTriageMoveSource. IMAP source identifiers are
-// imaps://user@host:port URLs with the account email stored in
-// display_name, so the lookup must match either column — the same
-// resolver sync/sync-full use.
-func lookupTriageMoveSourceIn(s *store.Store, account daemonclient.CLIAccount) (*store.Source, error) {
-	sources, err := s.GetSourcesByIdentifierOrDisplayName(account.Email)
-	if err != nil {
-		return nil, fmt.Errorf("look up source for %s: %w", account.Email, err)
-	}
-	return pickTriageMoveSource(sources, account)
-}
-
-// pickTriageMoveSource selects, among the local rows matching the
-// account email by identifier or display name, the one backing the
-// daemon account (same source type). Exactly one row must match.
-func pickTriageMoveSource(sources []*store.Source, account daemonclient.CLIAccount) (*store.Source, error) {
-	var matches []*store.Source
-	for _, src := range sources {
-		if src.SourceType == account.Type {
-			matches = append(matches, src)
-		}
-	}
-	switch len(matches) {
-	case 0:
-		return nil, fmt.Errorf("no local %s source found for %s", account.Type, account.Email)
-	case 1:
-		return matches[0], nil
-	default:
-		names := make([]string, 0, len(matches))
-		for _, src := range matches {
-			names = append(names, src.Identifier)
-		}
-		sort.Strings(names)
-		return nil, fmt.Errorf(
-			"multiple local %s sources match %s (%s); remove or rename the duplicate before moving",
-			account.Type, account.Email, strings.Join(names, ", "))
-	}
 }
 
 // listTriageCandidates pages through the daemon's filtered message list
@@ -512,29 +396,13 @@ func executeTriageMoves(
 	folder string,
 ) (moved []int64, moveErrors int) {
 	moved = []int64{}
-	addLabels := []string{"folder:" + folder}
-	for start := 0; start < len(msgs); start += triageMoveChunkSize {
-		end := min(start+triageMoveChunkSize, len(msgs))
-		chunk := msgs[start:end]
-		ids := make([]string, 0, len(chunk))
-		for _, m := range chunk {
-			ids = append(ids, m.SourceMessageID)
-		}
-		if err := client.BatchModifyLabels(ctx, ids, addLabels, nil); err != nil {
-			moveErrors += len(chunk)
-			fmt.Fprintf(os.Stderr, "Warning: move chunk of %d message(s) failed: %v\n", len(chunk), err)
-			if ctx.Err() != nil {
-				// The remaining chunks would fail the same way; count
-				// them as errors and stop.
-				moveErrors += len(msgs) - end
-				return moved, moveErrors
-			}
-			continue
-		}
-		for _, m := range chunk {
-			moved = append(moved, m.ID)
-		}
-		fmt.Fprintf(os.Stderr, "Moved %d/%d message(s)...\n", len(moved), len(msgs))
+	ids := make([]string, 0, len(msgs))
+	for _, m := range msgs {
+		ids = append(ids, m.SourceMessageID)
+	}
+	okIdx, moveErrors := batchModifyLabelsChunked(ctx, client, ids, []string{"folder:" + folder}, nil, "Moved")
+	for _, i := range okIdx {
+		moved = append(moved, msgs[i].ID)
 	}
 	return moved, moveErrors
 }

@@ -858,11 +858,14 @@ func modifyLabelsTool() mcp.Tool {
 		mcp.WithString("add_labels",
 			mcp.Description("Comma-separated label IDs to add (e.g. 'STARRED,Label_123'). "+
 				"For IMAP/Microsoft 365 accounts, use 'folder:<name>' to MOVE the message into a "+
-				"mailbox (created on demand), e.g. 'folder:Recruiting' — supported IMAP labels are "+
-				"UNREAD, STARRED, INBOX, and folder:<name>."),
+				"mailbox (created on demand), e.g. 'folder:Recruiting', and 'keyword:<name>' to set "+
+				"an IMAP keyword flag (on Exchange/O365 this sets an Outlook category), e.g. "+
+				"'keyword:Handled' (no spaces or IMAP atom-special characters in the name) — "+
+				"supported IMAP labels are UNREAD, STARRED, INBOX, folder:<name>, and keyword:<name>."),
 		),
 		mcp.WithString("remove_labels",
-			mcp.Description("Comma-separated label IDs to remove (e.g. 'INBOX,UNREAD'). Remove INBOX to archive."),
+			mcp.Description("Comma-separated label IDs to remove (e.g. 'INBOX,UNREAD'). Remove INBOX to archive. "+
+				"For IMAP accounts, 'keyword:<name>' clears the keyword flag/category."),
 		),
 	)
 }

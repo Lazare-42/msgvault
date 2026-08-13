@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	imap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
@@ -1785,12 +1786,52 @@ const imapFolderLabelPrefix = "folder:"
 // if so, returns the trimmed folder name. The name is NOT upper-cased —
 // mailbox names are case-sensitive on most servers.
 func imapFolderLabel(label string) (string, bool) {
+	return imapPrefixedLabel(label, imapFolderLabelPrefix)
+}
+
+// imapKeywordLabelPrefix marks a label as an arbitrary IMAP keyword (custom
+// flag) set on the message with STORE, rather than a Gmail system label or a
+// folder move. Unlike folder moves, keywords are per-message flags, so they
+// compose freely with other flag ops and with a folder/INBOX move in the same
+// operation, and they can be removed again.
+const imapKeywordLabelPrefix = "keyword:"
+
+// imapKeywordLabel reports whether label is a "keyword:<name>" custom flag
+// and, if so, returns the trimmed keyword name. The name is passed through
+// without case-folding or rewriting (validateIMAPKeywordName only rejects
+// characters that cannot form a single flag atom): go-imap transmits
+// arbitrary keyword atoms, and Exchange maps keywords to Outlook categories
+// — including UTF-8 names — though servers may canonicalize case when
+// storing them.
+func imapKeywordLabel(label string) (string, bool) {
+	return imapPrefixedLabel(label, imapKeywordLabelPrefix)
+}
+
+// validateIMAPKeywordName rejects keyword names that cannot travel as a
+// single IMAP flag atom: whitespace would split the STORE argument into
+// multiple bogus keywords, and atom-special or control characters corrupt
+// the command or draw a server BAD. Non-ASCII letters (e.g. accented UTF-8
+// names) remain allowed and pass through untouched — Exchange accepts them;
+// whether one matches an existing category is a runtime concern, not a
+// parse-time one.
+func validateIMAPKeywordName(keyword string) error {
+	for _, r := range keyword {
+		if unicode.IsSpace(r) || unicode.IsControl(r) || strings.ContainsRune(`(){}%*"\]`, r) {
+			return fmt.Errorf("IMAP keyword name %q contains characters not allowed in a flag atom", keyword)
+		}
+	}
+	return nil
+}
+
+// imapPrefixedLabel matches label against a case-insensitive "<prefix>" marker
+// and returns the whitespace-trimmed, case-preserved remainder.
+func imapPrefixedLabel(label, prefix string) (string, bool) {
 	trimmed := strings.TrimSpace(label)
-	if len(trimmed) < len(imapFolderLabelPrefix) ||
-		!strings.EqualFold(trimmed[:len(imapFolderLabelPrefix)], imapFolderLabelPrefix) {
+	if len(trimmed) < len(prefix) ||
+		!strings.EqualFold(trimmed[:len(prefix)], prefix) {
 		return "", false
 	}
-	return strings.TrimSpace(trimmed[len(imapFolderLabelPrefix):]), true
+	return strings.TrimSpace(trimmed[len(prefix):]), true
 }
 
 func parseIMAPLabelOps(addLabelIDs, removeLabelIDs []string) (imapLabelOps, error) {
@@ -1807,6 +1848,16 @@ func parseIMAPLabelOps(addLabelIDs, removeLabelIDs []string) (imapLabelOps, erro
 				continue // same destination repeated; keep the first spelling
 			}
 			ops.destFolder = folder
+			continue
+		}
+		if keyword, ok := imapKeywordLabel(label); ok {
+			if keyword == "" {
+				return ops, fmt.Errorf("IMAP keyword label %q has an empty keyword name", label)
+			}
+			if err := validateIMAPKeywordName(keyword); err != nil {
+				return ops, err
+			}
+			ops.addFlags = appendFlag(ops.addFlags, imap.Flag(keyword))
 			continue
 		}
 		switch normalizeGmailLabel(label) {
@@ -1826,6 +1877,16 @@ func parseIMAPLabelOps(addLabelIDs, removeLabelIDs []string) (imapLabelOps, erro
 		if _, ok := imapFolderLabel(label); ok {
 			return ops, fmt.Errorf(
 				"removing a folder label (%q) is not supported over IMAP; move to another folder instead", label)
+		}
+		if keyword, ok := imapKeywordLabel(label); ok {
+			if keyword == "" {
+				return ops, fmt.Errorf("IMAP keyword label %q has an empty keyword name", label)
+			}
+			if err := validateIMAPKeywordName(keyword); err != nil {
+				return ops, err
+			}
+			ops.removeFlags = appendFlag(ops.removeFlags, imap.Flag(keyword))
+			continue
 		}
 		switch normalizeGmailLabel(label) {
 		case "":
@@ -1866,7 +1927,7 @@ func normalizeGmailLabel(label string) string {
 func unsupportedIMAPLabel(label string) error {
 	return fmt.Errorf(
 		"IMAP label operation %q is unsupported; use system labels UNREAD, STARRED, INBOX, "+
-			"or \"folder:<name>\" to move into a mailbox", label)
+			"\"folder:<name>\" to move into a mailbox, or \"keyword:<name>\" to set a custom flag", label)
 }
 
 func appendFlag(flags []imap.Flag, flag imap.Flag) []imap.Flag {
