@@ -65,6 +65,18 @@ CREATE TABLE IF NOT EXISTS embedding_changes (
 CREATE INDEX IF NOT EXISTS idx_embedding_changes_message_id
     ON embedding_changes(message_id);
 
+-- Records importer-owned service registrations without exposing provenance as
+-- a user-facing alias or overloading catalog metadata. User edits remove these
+-- markers, which makes an explicitly configured service authoritative again.
+-- This table ships with its first writer; existing unmarked services remain
+-- user-owned because their provenance cannot be inferred safely.
+CREATE TABLE IF NOT EXISTS communication_service_discoveries (
+    service_id      INTEGER NOT NULL REFERENCES communication_services(id) ON DELETE CASCADE,
+    provider        TEXT NOT NULL,
+    discovery_kind  TEXT NOT NULL,
+    PRIMARY KEY (service_id, provider, discovery_kind)
+);
+
 -- ============================================================================
 -- SOURCES & IDENTITY
 -- ============================================================================
@@ -711,6 +723,10 @@ CREATE INDEX IF NOT EXISTS idx_account_identities_address
 CREATE TABLE IF NOT EXISTS participant_links (
     participant_a INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
     participant_b INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+    -- Non-NULL only when an identity-match candidate inserted this exact edge.
+    -- User-created links remain NULL; system-match rejection removes only an
+    -- edge owned by that system decision.
+    identity_match_candidate_id INTEGER,
     created_at    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (participant_a, participant_b),
     CHECK (participant_a < participant_b)
@@ -1434,6 +1450,7 @@ CREATE TABLE IF NOT EXISTS identity_match_candidates (
     pre_conflict_state TEXT CHECK (
         pre_conflict_state IN ('candidate', 'accepted', 'rejected')
     ),
+    application_pending BOOLEAN NOT NULL DEFAULT TRUE,
     decided_by TEXT,
     decided_at DATETIME,
     notes TEXT,
@@ -1451,6 +1468,33 @@ CREATE INDEX IF NOT EXISTS idx_identity_match_candidates_value
     ON identity_match_candidates(basis, normalized_value)
     WHERE normalized_value IS NOT NULL;
 
+-- A participant merge can collapse duplicate candidates while an accepted
+-- application is waiting for the identity lock. Record the exact survivor,
+-- or a confirmed endpoint collapse, so that waiter can finish safely.
+CREATE TABLE IF NOT EXISTS identity_match_candidate_redirects (
+    retired_candidate_id INTEGER PRIMARY KEY,
+    surviving_candidate_id INTEGER REFERENCES identity_match_candidates(id) ON DELETE CASCADE,
+    endpoints_collapsed BOOLEAN NOT NULL DEFAULT FALSE,
+    CHECK ((endpoints_collapsed = TRUE AND surviving_candidate_id IS NULL) OR
+           (endpoints_collapsed = FALSE AND surviving_candidate_id IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_identity_match_candidate_redirects_survivor
+    ON identity_match_candidate_redirects(surviving_candidate_id)
+    WHERE surviving_candidate_id IS NOT NULL;
+
+-- Generated identity candidates may be supported by observations from more
+-- than one archive source. Keeping the support rows separate from the
+-- candidate's display source lets source removal recompute stale suggestions
+-- without deleting explicit user decisions.
+CREATE TABLE IF NOT EXISTS identity_match_candidate_sources (
+    candidate_id INTEGER NOT NULL REFERENCES identity_match_candidates(id) ON DELETE CASCADE,
+    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    is_conservative BOOLEAN NOT NULL DEFAULT FALSE,
+    PRIMARY KEY (candidate_id, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_identity_match_candidate_sources_source
+    ON identity_match_candidate_sources(source_id, candidate_id);
+
 CREATE TABLE IF NOT EXISTS identity_match_evidence (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     candidate_id INTEGER NOT NULL REFERENCES identity_match_candidates(id) ON DELETE CASCADE,
@@ -1462,6 +1506,15 @@ CREATE TABLE IF NOT EXISTS identity_match_evidence (
 );
 CREATE INDEX IF NOT EXISTS idx_identity_match_evidence_candidate
     ON identity_match_evidence(candidate_id, id);
+
+CREATE TABLE IF NOT EXISTS identity_match_evidence_sources (
+    evidence_id INTEGER NOT NULL REFERENCES identity_match_evidence(id) ON DELETE CASCADE,
+    source_id INTEGER NOT NULL REFERENCES sources(id) ON DELETE CASCADE,
+    is_conservative BOOLEAN NOT NULL DEFAULT FALSE,
+    PRIMARY KEY (evidence_id, source_id)
+);
+CREATE INDEX IF NOT EXISTS idx_identity_match_evidence_sources_source
+    ON identity_match_evidence_sources(source_id, evidence_id);
 
 -- ============================================================================
 -- APPLIED MIGRATIONS
