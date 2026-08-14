@@ -222,6 +222,8 @@ func (s *Server) registerHumaRoutes(api huma.API, apiV1 huma.API) {
 	s.registerExploreRoutes(apiV1)
 	s.registerFilesRoutes(apiV1)
 	s.registerPersonProfileRoutes(apiV1)
+	s.registerOrganizationRoutes(apiV1)
+	s.registerEmploymentRoutes(apiV1)
 	s.registerPersonProfileValueRoutes(apiV1)
 	s.registerCommunicationServiceRoutes(apiV1)
 	s.registerAttributeDefinitionRoutes(apiV1)
@@ -890,7 +892,7 @@ func pathIntegerParam(doc string) *huma.Param {
 
 func pathNamedIntegerParam(name, doc string) *huma.Param {
 	p := param(name, "path", huma.TypeInteger, doc, true)
-	p.Schema.Format = "int64"
+	p.Schema.Format = formatInt64
 	return p
 }
 
@@ -900,13 +902,13 @@ func queryStringParam(name, doc string, required bool) *huma.Param {
 
 func queryIntegerParam(name, doc string) *huma.Param {
 	p := param(name, "query", huma.TypeInteger, doc, false)
-	p.Schema.Format = "int64"
+	p.Schema.Format = formatInt64
 	return p
 }
 
 func queryIntegerArrayParam(name, doc string) *huma.Param {
 	p := param(name, "query", huma.TypeArray, doc, false)
-	p.Schema.Items = &huma.Schema{Type: huma.TypeInteger, Format: "int64"}
+	p.Schema.Items = &huma.Schema{Type: huma.TypeInteger, Format: formatInt64}
 	return p
 }
 

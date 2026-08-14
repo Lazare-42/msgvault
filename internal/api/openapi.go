@@ -188,7 +188,9 @@ import (
 // one canonical edge with endpoint-aware presentation, optimistic PATCH and
 // delete operations, and unresolved RELATED review listing. Additive (minor
 // bump): existing endpoints and response fields are unchanged.
-const APISchemaVersion = "1.39.0"
+// 1.40.0 adds organization profiles, employment history, and their typed
+// attribute, projection, and lifecycle routes.
+const APISchemaVersion = "1.40.0"
 
 // OpenAPIDocument builds the API schema from the same Huma route registration
 // used by the daemon. It binds no socket and needs no database.
@@ -390,7 +392,7 @@ func hardenSettingsSchemas(doc *huma.OpenAPI) {
 		value.AdditionalProperties = nil
 		value.OneOf = []*huma.Schema{
 			settingsValueArm("string", &huma.Schema{Type: huma.TypeString}),
-			settingsValueArm("integer", &huma.Schema{Type: huma.TypeInteger, Format: "int64"}),
+			settingsValueArm("integer", &huma.Schema{Type: huma.TypeInteger, Format: formatInt64}),
 			settingsValueArm("number", &huma.Schema{Type: huma.TypeNumber, Format: "double"}),
 			settingsValueArm("boolean", &huma.Schema{Type: huma.TypeBoolean}),
 			settingsValueArm("strings", &huma.Schema{
