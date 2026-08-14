@@ -1,12 +1,6 @@
 module go.kenn.io/msgvault
 
-go 1.26.5
-
-// Pinned past 1.26.5 for the stdlib fixes govulncheck enforces in CI
-// (GO-2026-6218 net/url, GO-2026-6091 html/template, and siblings). The
-// `go` directive stays at 1.26.5 so the Nix build, whose nixpkgs Go is
-// 1.26.5, keeps building; setup-go prefers this toolchain directive.
-toolchain go1.26.6
+go 1.26.6
 
 require (
 	charm.land/bubbles/v2 v2.1.1
@@ -29,6 +23,7 @@ require (
 	github.com/gogs/chardet v0.0.0-20211120154057-b7413eaefb8f
 	github.com/google/go-cmp v0.7.0
 	github.com/google/jsonschema-go v0.4.3
+	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/jhillyerd/enmime v1.3.0
 	github.com/mattn/go-isatty v0.0.22
@@ -102,7 +97,6 @@ require (
 	github.com/godzie44/go-uring v0.0.0-20220926161041-69611e8b13d5 // indirect
 	github.com/google/flatbuffers v25.12.19+incompatible // indirect
 	github.com/google/s2a-go v0.1.9 // indirect
-	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.17 // indirect
 	github.com/googleapis/gax-go/v2 v2.22.0 // indirect
 	github.com/gorilla/css v1.0.1 // indirect
