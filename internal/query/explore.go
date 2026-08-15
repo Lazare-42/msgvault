@@ -71,7 +71,8 @@ func (e *DuckDBEngine) Explore(ctx context.Context, request ExploreRequest) (*Ex
 	countArgs := append(append([]any{}, conditionArgs...), candidateRankArgs...)
 	args := append(append([]any{}, countArgs...), limit, request.Page.Offset)
 	var queryText string
-	if !e.exploreFastPathDisabled && !exploreConditionsTouchParticipantLists(request) {
+	fastPath := !e.exploreFastPathDisabled && !exploreConditionsTouchParticipantLists(request)
+	if fastPath {
 		queryText = buildExploreFastListingSQL(conditions, candidateRankExpression,
 			e.parquetPath(datasetParticipantClusters), e.parquetPath(datasetOwnerParticipants))
 		args = append(args, conditionArgs...) // membership rescan
@@ -136,7 +137,11 @@ func (e *DuckDBEngine) Explore(ctx context.Context, request ExploreRequest) (*Ex
 		return nil, fmt.Errorf("iterate analytical entries: %w", err)
 	}
 	if len(response.Rows) == 0 && request.Page.Offset > 0 {
-		if err := e.db.QueryRowContext(ctx, buildExploreCountSQL(conditions, candidateRankExpression), countArgs...).Scan(&response.TotalCount); err != nil {
+		countSQL := buildExploreCountSQL(conditions, candidateRankExpression)
+		if fastPath {
+			countSQL = buildExploreFastCountSQL(conditions, candidateRankExpression)
+		}
+		if err := e.db.QueryRowContext(ctx, countSQL, countArgs...).Scan(&response.TotalCount); err != nil {
 			return nil, fmt.Errorf("count analytical entries beyond page: %w", err)
 		}
 	}
@@ -591,6 +596,13 @@ func buildExploreCountSQL(conditions, candidateRankExpression string) string {
 SELECT COUNT(*) FROM logical_entries`
 }
 
+func buildExploreFastCountSQL(conditions, candidateRankExpression string) string {
+	return buildExploreNarrowFilteredClassifiedCTE(conditions, candidateRankExpression) +
+		exploreLogicalEntriesCTE(false) + `
+)
+SELECT COUNT(*) FROM logical_entries`
+}
+
 // exploreConditionsTouchParticipantLists reports whether buildExploreConditions
 // renders predicates over the per-message participant list columns for this
 // request. Those predicates force analytical_entries to assemble participant
@@ -630,7 +642,7 @@ func exploreConditionsTouchParticipantLists(request ExploreRequest) bool {
 // Output columns, ordering, and pagination are identical to buildExploreSQL;
 // TestExploreListingFastPathMatchesLegacy pins the equivalence.
 func buildExploreFastListingSQL(conditions, candidateRankExpression, clustersGlob, ownersGlob string) string {
-	return buildExploreFilteredClassifiedCTE(conditions, candidateRankExpression) +
+	return buildExploreNarrowFilteredClassifiedCTE(conditions, candidateRankExpression) +
 		exploreLogicalEntriesCTE(false) + fmt.Sprintf(`
 ), page AS (
     SELECT * FROM logical_entries
@@ -638,7 +650,7 @@ func buildExploreFastListingSQL(conditions, candidateRankExpression, clustersGlo
     LIMIT ? OFFSET ?
 ), membership AS (
     SELECT source_id, conversation_id, message_id
-    FROM analytical_entries
+    FROM entry_core AS analytical_entries
     WHERE (%s) AND (%s)
 ), page_messages AS (
     SELECT p.entry_key, p.anchor_message_id AS message_id
@@ -672,7 +684,7 @@ func buildExploreFastListingSQL(conditions, candidateRankExpression, clustersGlo
     FROM (
         SELECT source_id, conversation_id,
             %s AS is_chat
-        FROM analytical_entries
+        FROM entry_core AS analytical_entries
         WHERE %s
     )
 ), clusters AS (
@@ -780,6 +792,22 @@ WITH filtered AS (
         ` + sqlIsChatPredicate("message_type", "conversation_type") + ` AS is_chat,
         ` + identityindex.EntryKindSQL("message_type") + ` AS entry_kind
     FROM filtered
+)`
+}
+
+// buildExploreNarrowFilteredClassifiedCTE is the listing-only counterpart to
+// buildExploreFilteredClassifiedCTE. It shadows the wide convenience-view name
+// while evaluating conditions so identity predicates keep their established
+// qualification without forcing participant-list aggregation.
+func buildExploreNarrowFilteredClassifiedCTE(conditions, candidateRankExpression string) string {
+	return "WITH " + buildNarrowAnalyticalEntriesCTE("entry_core") + `,
+filtered AS (
+	SELECT * FROM entry_core AS analytical_entries WHERE ` + conditions + `
+), classified AS (
+	SELECT *, ` + candidateRankExpression + ` AS candidate_rank,
+		` + sqlIsChatPredicate("message_type", "conversation_type") + ` AS is_chat,
+		` + identityindex.EntryKindSQL("message_type") + ` AS entry_kind
+	FROM filtered
 )`
 }
 
