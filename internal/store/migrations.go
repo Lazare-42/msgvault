@@ -16,14 +16,25 @@ import (
 // last_modified backfill alone is a full messages-table scan — seconds of
 // startup on a large archive).
 const (
-	migrationAttachmentsContentHashUnique     = "attachments_content_hash_unique_index"
-	migrationMessagesLastModifiedBackfill     = "messages_last_modified_backfill"
-	migrationMessageAttributionProvenance     = "message_attribution_provenance_v2"
+	migrationAttachmentsContentHashUnique = "attachments_content_hash_unique_index"
+	migrationMessagesLastModifiedBackfill = "messages_last_modified_backfill"
+	// v3: messageIdentityAttributionMatch became envelope-authoritative and
+	// gated email identifier matches on the sender lacking a primary email.
+	// Archives that ran v2 reconciled under the old predicate, so the rename
+	// re-runs reconciliation (and the cache-revision bump) once more.
+	migrationMessageAttributionProvenance     = "message_attribution_provenance_v3"
 	migrationArchiveIdentity                  = "archive_identity_v1"
 	migrationMessagesContentChangedAtBackfill = "messages_content_changed_at_backfill"
 	migrationMessageWatermarkTriggers         = "message_watermark_triggers_v1"
 	migrationEmbeddingChangeJournalTriggers   = "embedding_change_journal_triggers_v7"
 	migrationIdentityMatchSourceSupport       = "identity_match_source_support_v1"
+	// v3: the SQLite conversation trigger narrowed from a blanket
+	// AFTER UPDATE to conversation_type changes only; archives that
+	// installed the blanket trigger need the repair to re-run.
+	// v4: the messages trigger narrowed on both backends to
+	// MessagesActivityColumns with a value-change guard, so embedding and
+	// FTS bookkeeping sweeps no longer requeue the archive.
+	migrationActivityProjectionTriggers = "activity_projection_triggers_v4"
 )
 
 // backfillLegacyIdentityMatchSourceSupport gives pre-support-table generated

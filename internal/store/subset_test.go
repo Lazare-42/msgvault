@@ -243,11 +243,16 @@ func TestCopySubset_UpgradedMessageColumnOrder(t *testing.T) {
 
 	st, err := Open(srcDB)
 	require.NoError(err, "open source for upgrade")
+	// A pre-attribution archive also predates the activity queue trigger, which
+	// names source_is_from_me and would otherwise block the DROP COLUMN; the
+	// upgrade below reinstalls it through its own migration.
 	_, err = st.DB().Exec(`
+		DROP TRIGGER trg_activity_queue_messages_update;
 		ALTER TABLE messages DROP COLUMN identity_is_from_me;
 		ALTER TABLE messages DROP COLUMN source_is_from_me;
 		DELETE FROM applied_migrations
-		WHERE name = 'message_attribution_provenance_v2';
+		WHERE name IN ('message_attribution_provenance_v3',
+		               'activity_projection_triggers_v4');
 	`)
 	require.NoError(err, "simulate pre-attribution schema")
 	require.NoError(st.InitSchema(), "upgrade source schema")
@@ -1953,8 +1958,10 @@ func TestCopySubset_ControlCharInPath(t *testing.T) {
 // update messages, which resolves to main.messages, so the rename back — ALTER
 // TABLE ... RENAME TO messages — fails its schema reparse with "error in
 // trigger trg_message_bodies_last_modified_upd: no such table: main.messages".
-// Neither attribution column is indexed or named by any trigger or view, so
-// ALTER TABLE ... DROP COLUMN works directly.
+// Neither attribution column is indexed, and the only trigger naming one
+// (trg_activity_queue_messages_update, on source_is_from_me) postdates such
+// archives, so it is dropped first and ALTER TABLE ... DROP COLUMN works
+// directly.
 func TestCopySubset_LegacySourceMissingAttributionColumns(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -1965,6 +1972,9 @@ func TestCopySubset_LegacySourceMissingAttributionColumns(t *testing.T) {
 
 	db, err := sql.Open("sqlite3", srcDB+"?_foreign_keys=OFF")
 	require.NoError(err, "open source db")
+
+	_, err = db.Exec(`DROP TRIGGER trg_activity_queue_messages_update`)
+	require.NoError(err, "drop the activity trigger that names source_is_from_me")
 
 	for _, col := range []string{"source_is_from_me", "identity_is_from_me"} {
 		_, err = db.Exec(
@@ -2501,8 +2511,10 @@ func TestCopySubset_UpgradedAuxiliaryColumnOrder(t *testing.T) {
 
 	// Rebuild each table into the shape the legacy ADD COLUMN migrations
 	// produce: the late-added columns re-appended at the end, in migration
-	// order. Indexes on the dropped columns go first — SQLite refuses to
-	// drop an indexed column.
+	// order. Indexes and triggers on the dropped columns go first — SQLite
+	// refuses to drop a column referenced by either — and the activity
+	// trigger is recreated afterwards with its schema.sql definition, since
+	// a real upgraded archive carries it.
 	for _, stmt := range []string{
 		`ALTER TABLE labels DROP COLUMN system_role`,
 		`ALTER TABLE labels ADD COLUMN system_role TEXT`,
@@ -2517,10 +2529,22 @@ func TestCopySubset_UpgradedAuxiliaryColumnOrder(t *testing.T) {
 
 		`DROP INDEX IF EXISTS idx_conversations_type`,
 		`DROP TRIGGER IF EXISTS trg_embedding_changes_conversation_title`,
+		`DROP TRIGGER IF EXISTS trg_activity_queue_conversation_type_update`,
 		`ALTER TABLE conversations DROP COLUMN conversation_type`,
 		`ALTER TABLE conversations DROP COLUMN title`,
 		`ALTER TABLE conversations ADD COLUMN title TEXT`,
 		`ALTER TABLE conversations ADD COLUMN conversation_type TEXT NOT NULL DEFAULT 'email_thread'`,
+		`CREATE TRIGGER trg_activity_queue_conversation_type_update
+		 AFTER UPDATE OF conversation_type ON conversations FOR EACH ROW
+		 WHEN OLD.conversation_type IS NOT NEW.conversation_type
+		 BEGIN
+		     INSERT INTO activity_projection_queue (message_id, revision, queued_at)
+		     SELECT id, 1, CURRENT_TIMESTAMP
+		     FROM messages WHERE conversation_id = NEW.id
+		     ON CONFLICT(message_id) DO UPDATE SET
+		         revision = activity_projection_queue.revision + 1,
+		         queued_at = CURRENT_TIMESTAMP;
+		 END`,
 	} {
 		_, err = db.Exec(stmt)
 		require.NoError(err, "rebuild upgraded order: %s", stmt)
