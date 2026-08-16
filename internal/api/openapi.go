@@ -195,7 +195,10 @@ import (
 // meeting-import routes keep their current contracts.
 // 1.42.0 adds the dated activity and daily-note route families. Existing
 // profile, meeting, media, and other API contracts remain unchanged.
-const APISchemaVersion = "1.42.0"
+// 1.43.0 adds structured analytical-cache readiness responses, including the
+// transient building state, to cache-dependent coverage and detail routes.
+// Additive (minor bump): existing success responses remain unchanged.
+const APISchemaVersion = "1.43.0"
 
 // OpenAPIDocument builds the API schema from the same Huma route registration
 // used by the daemon. It binds no socket and needs no database.
@@ -584,6 +587,16 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 			}
 		}
 	}
+	if unavailable := schemas["ExploreCacheUnavailableResponse"]; unavailable != nil {
+		if recoveryAction := unavailable.Properties["recovery_action"]; recoveryAction != nil {
+			if recoveryAction.Extensions == nil {
+				recoveryAction.Extensions = map[string]any{}
+			}
+			recoveryAction.Extensions["x-oapi-codegen-extra-tags"] = map[string]any{
+				"validate": "omitempty",
+			}
+		}
+	}
 	setEnumNames := func(schema *huma.Schema, enumNames []any) {
 		if schema == nil {
 			return
@@ -620,7 +633,7 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 			},
 		},
 		"ExploreCacheUnavailableResponse": {
-			"readiness": {"ExploreCacheUnavailableResponseReadinessAbsent", "ExploreCacheUnavailableResponseReadinessInterrupted", "ExploreCacheUnavailableResponseReadinessStaleSchema", "ExploreCacheUnavailableResponseReadinessDrifted"},
+			"readiness": {"ExploreCacheUnavailableResponseReadinessAbsent", "ExploreCacheUnavailableResponseReadinessBuilding", "ExploreCacheUnavailableResponseReadinessInterrupted", "ExploreCacheUnavailableResponseReadinessStaleSchema", "ExploreCacheUnavailableResponseReadinessDrifted"},
 		},
 		"ExploreFilter": {
 			"dimension": {"ExploreFilterDimensionSource", "ExploreFilterDimensionParticipant", "ExploreFilterDimensionDomain", "ExploreFilterDimensionMessageType", "ExploreFilterDimensionAfter", "ExploreFilterDimensionBefore", "ExploreFilterDimensionDeletion", "ExploreFilterDimensionIdentity"},

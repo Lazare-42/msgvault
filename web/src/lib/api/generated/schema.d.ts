@@ -3647,7 +3647,7 @@ export interface components {
             error: string;
             message: string;
             /** @enum {string} */
-            readiness: "absent" | "interrupted" | "stale_schema" | "drifted";
+            readiness: "absent" | "building" | "interrupted" | "stale_schema" | "drifted";
             recovery_action: string;
         } & {
             [key: string]: unknown;
@@ -9281,6 +9281,15 @@ export interface operations {
                     "application/json": components["schemas"]["DomainSummary"];
                 };
             };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExploreCacheUnavailableResponse"] | components["schemas"]["ErrorResponse"];
+                };
+            };
             /** @description Error */
             default: {
                 headers: {
@@ -12370,6 +12379,15 @@ export interface operations {
                     "application/json": components["schemas"]["PersonSummary"];
                 };
             };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExploreCacheUnavailableResponse"] | components["schemas"]["ErrorResponse"];
+                };
+            };
             /** @description Error */
             default: {
                 headers: {
@@ -15046,13 +15064,13 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
-            /** @description Error */
+            /** @description Service Unavailable */
             503: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ErrorResponse"];
+                    "application/json": components["schemas"]["ExploreCacheUnavailableResponse"] | components["schemas"]["ErrorResponse"];
                 };
             };
             /** @description Error */

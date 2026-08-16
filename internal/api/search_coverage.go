@@ -55,6 +55,7 @@ func (s *Server) registerSearchCoverageRoute(api huma.API) {
 	op.RequestBody = jsonRequestBodyFor[SearchCoverageRequest](api)
 	op.Responses = jsonResponsesFor[SearchCoverageResponse](api)
 	addErrorResponses(api, op.Responses, http.StatusBadRequest, http.StatusServiceUnavailable)
+	op.Responses[httpStatusKey(http.StatusServiceUnavailable)] = exploreUnavailableResponseFor(api)
 	registerRawHumaRoute(api, op, s.handleSearchCoverage)
 }
 
@@ -78,7 +79,7 @@ func (s *Server) handleSearchCoverage(w http.ResponseWriter, r *http.Request) {
 	ctx = semanticCoverageContext(ctx, cfg.Embed.Scope.BuildScope())
 	explorer, ok := s.queryEngineForContext(r.Context()).(query.Explorer)
 	if !ok {
-		writeExploreUnavailable(w, query.CacheAbsent)
+		s.writeExploreUnavailable(r.Context(), w, query.CacheAbsent)
 		return
 	}
 	response := SearchCoverageResponse{
@@ -109,7 +110,7 @@ func (s *Server) handleSearchCoverage(w http.ResponseWriter, r *http.Request) {
 		Explore: query.ExploreRequest{Context: ctx}, IncludedKeys: []string{},
 	})
 	if err != nil {
-		s.writeExploreError(w, err)
+		s.writeExploreError(r.Context(), w, err)
 		return
 	}
 	contextHash := searchCoverageContextHash(ctx)
@@ -141,7 +142,7 @@ func (s *Server) handleSearchCoverage(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, response)
 			return
 		}
-		s.writeExploreError(w, err)
+		s.writeExploreError(r.Context(), w, err)
 		return
 	}
 	currentStatus, _, current, _ := resolveSearchCoverageGeneration(
