@@ -95,6 +95,16 @@ type mediaDownloader interface {
 	Download(ctx context.Context, msg whatsmeow.DownloadableMessage) ([]byte, error)
 }
 
+// peerMessageSender is the subset of *whatsmeow.Client used to send a
+// protocol-level message to the user's own other devices/primary phone (see
+// RequestHistorySync). It exists so tests can supply a fake without a live,
+// authenticated whatsmeow session — SendPeerMessage requires a real
+// noise-protocol connection that unit tests cannot stand up, the same reason
+// mediaDownloader exists for Download.
+type peerMessageSender interface {
+	SendPeerMessage(ctx context.Context, message *waE2E.Message) (whatsmeow.SendResponse, error)
+}
+
 type WhatsmeowOptions struct {
 	SessionPath string
 	Account     string
@@ -108,6 +118,7 @@ type WhatsmeowTransport struct {
 	account     string
 	log         waLog.Logger
 	downloader  mediaDownloader
+	peerSender  peerMessageSender
 
 	mu            sync.Mutex
 	handlerID     uint32
@@ -159,6 +170,7 @@ func NewWhatsmeowTransport(ctx context.Context, opts WhatsmeowOptions) (*Whatsme
 		account:       strings.TrimSpace(opts.Account),
 		log:           log,
 		downloader:    client,
+		peerSender:    client,
 		messageEvents: make(chan *events.Message, messageQueueCapacity),
 		bgCtx:         bgCtx,
 		bgCancel:      bgCancel,
@@ -291,6 +303,7 @@ func (t *WhatsmeowTransport) resetClient(ctx context.Context) error {
 	}
 	t.client = client
 	t.downloader = client
+	t.peerSender = client
 	t.handlerID = 0
 	t.pairingState = QRPairingState{}
 	t.mu.Unlock()
@@ -498,6 +511,58 @@ func (t *WhatsmeowTransport) SendReaction(ctx context.Context, req TransportSend
 		ChatJID:         chat.ToNonAD().String(),
 		Timestamp:       resp.Timestamp,
 	}, nil
+}
+
+// RequestHistorySync asks WhatsApp's own on-demand history-sync mechanism
+// (whatsmeow's Client.BuildHistorySyncRequest) for more messages older than
+// req.AnchorMessageID in one chat. The built protocol message is sent via
+// SendPeerMessage — a peer/protocol message to the user's own other devices
+// (in particular the primary phone), not a normal chat message — which is
+// what BuildHistorySyncRequest's own doc comment specifies. The response, if
+// any, arrives later and asynchronously as a normal *events.HistorySync
+// (type ON_DEMAND) through the existing history-sync notification path
+// (registerEventHandler's *events.HistorySync case, unchanged), so a nil
+// error here only means the request was sent, not that WhatsApp will honor
+// it.
+func (t *WhatsmeowTransport) RequestHistorySync(ctx context.Context, req TransportRequestHistorySyncRequest) error {
+	chat, err := ParseChatJID(req.ChatJID)
+	if err != nil {
+		return err
+	}
+	if req.AnchorMessageID == "" {
+		return errors.New("anchor message id is required")
+	}
+	count := req.Count
+	if count <= 0 {
+		count = DefaultHistorySyncRequestCount
+	}
+	if count > MaxHistorySyncRequestCount {
+		count = MaxHistorySyncRequestCount
+	}
+
+	anchor := &types.MessageInfo{
+		MessageSource: types.MessageSource{
+			Chat:     chat,
+			IsFromMe: req.AnchorIsFromMe,
+		},
+		ID:        types.MessageID(req.AnchorMessageID),
+		Timestamp: req.AnchorTimestamp,
+	}
+	msg := t.client.BuildHistorySyncRequest(anchor, count)
+
+	// Snapshot peerSender under the same mutex resetClient uses to install a
+	// fresh one — same race resetClient documents for downloader in
+	// downloadMediaAttachment.
+	t.mu.Lock()
+	sender := t.peerSender
+	t.mu.Unlock()
+	if sender == nil {
+		return errors.New("no whatsapp client available to request history sync")
+	}
+	if _, err := sender.SendPeerMessage(ctx, msg); err != nil {
+		return fmt.Errorf("send history sync request: %w", err)
+	}
+	return nil
 }
 
 func (t *WhatsmeowTransport) LinkQR(ctx context.Context, w io.Writer) error {

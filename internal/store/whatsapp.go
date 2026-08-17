@@ -212,6 +212,53 @@ func (s *Store) GetWhatsAppMessageIDBySource(ctx context.Context, sourceID int64
 	return id, nil
 }
 
+// WhatsAppOldestMessageAnchor is the earliest archived message msgvault has
+// for a WhatsApp chat, used as the "last known message" anchor for an
+// on-demand history-sync request (see live.Service.RequestHistorySync):
+// WhatsApp is asked for messages strictly older than this one.
+type WhatsAppOldestMessageAnchor struct {
+	SourceMessageID string
+	IsFromMe        bool
+	SentAt          time.Time
+}
+
+// GetOldestWhatsAppMessage returns the earliest archived message (by
+// sent_at, then id) for the given WhatsApp chat within sourceID, or nil if no
+// message has been archived for that chat yet. A single ORDER BY ... LIMIT 1
+// lookup — no message_bodies join (see CLAUDE.md SQL guidelines); only
+// source_message_id/is_from_me/sent_at are needed to build a history-sync
+// anchor.
+func (s *Store) GetOldestWhatsAppMessage(ctx context.Context, sourceID int64, chatJID string) (*WhatsAppOldestMessageAnchor, error) {
+	if sourceID == 0 {
+		return nil, errors.New("source_id is required")
+	}
+	if chatJID == "" {
+		return nil, errors.New("chat_jid is required")
+	}
+	row := s.db.QueryRowContext(ctx, `
+		SELECT m.source_message_id, m.is_from_me, m.sent_at
+		FROM messages m
+		JOIN conversations c ON c.id = m.conversation_id
+		WHERE m.source_id = ?
+		  AND m.message_type = ?
+		  AND c.source_conversation_id = ?
+		  AND m.deleted_at IS NULL
+		  AND m.sent_at IS NOT NULL
+		ORDER BY m.sent_at ASC, m.id ASC
+		LIMIT 1
+	`, sourceID, WhatsAppMessageType, chatJID)
+	var anchor WhatsAppOldestMessageAnchor
+	var sentAt sql.NullTime
+	if err := row.Scan(&anchor.SourceMessageID, &anchor.IsFromMe, &sentAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("get oldest whatsapp message: %w", err)
+	}
+	anchor.SentAt = sentAt.Time
+	return &anchor, nil
+}
+
 // SetReaction replaces the active reaction from participantID on messageID.
 // Empty reactionValue clears the active reaction without inserting a new one.
 func (s *Store) SetReaction(messageID, participantID int64, reactionType, reactionValue string, at time.Time) error {

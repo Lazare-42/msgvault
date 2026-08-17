@@ -12,7 +12,19 @@ type Client interface {
 	Logout(ctx context.Context, req LogoutRequest) (LogoutResult, error)
 	SendMessage(ctx context.Context, req SendMessageRequest) (SendResult, error)
 	SendReaction(ctx context.Context, req SendReactionRequest) (SendResult, error)
+	RequestHistorySync(ctx context.Context, req RequestHistorySyncRequest) (RequestHistorySyncResult, error)
 }
+
+// DefaultHistorySyncRequestCount is WhatsApp's own documented recommendation
+// (see whatsmeow's Client.BuildHistorySyncRequest) for how many messages to
+// request per on-demand history-sync call.
+const DefaultHistorySyncRequestCount = 50
+
+// MaxHistorySyncRequestCount caps how many messages a single on-demand
+// history-sync request can ask for. WhatsApp's protocol does not document a
+// hard maximum; this only guards against one call asking for an unreasonably
+// large batch — the documented recommendation is DefaultHistorySyncRequestCount.
+const MaxHistorySyncRequestCount = 100
 
 type Status struct {
 	Account     string `json:"account,omitempty"`
@@ -84,6 +96,35 @@ type SendResult struct {
 	RemoteMessageID string `json:"remote_message_id,omitempty"`
 	ChatJID         string `json:"chat_jid,omitempty"`
 	Status          string `json:"status"`
+}
+
+// RequestHistorySyncRequest asks WhatsApp's own on-demand history-sync
+// mechanism (whatsmeow's BuildHistorySyncRequest, sent as a peer/protocol
+// message to the primary device) for more messages older than the oldest
+// message msgvault has already archived for ChatID. This is best-effort and
+// asynchronous: WhatsApp's servers/primary device decide whether to honor
+// it, and — when they do — the response arrives later as a normal
+// *events.HistorySync (archived by the existing history-sync handler), not
+// as a direct reply to this call. There is no guarantee the requested
+// messages still exist on WhatsApp's side.
+type RequestHistorySyncRequest struct {
+	Account string
+	ChatID  string
+	// Count is how many messages to request. Defaults to
+	// DefaultHistorySyncRequestCount and is capped at
+	// MaxHistorySyncRequestCount.
+	Count int
+}
+
+// RequestHistorySyncResult describes what was requested, not what came back
+// — see RequestHistorySyncRequest's doc comment on the asynchronous,
+// best-effort nature of this operation.
+type RequestHistorySyncResult struct {
+	ChatJID         string    `json:"chat_jid"`
+	AnchorMessageID string    `json:"anchor_message_id"`
+	AnchorTimestamp time.Time `json:"anchor_timestamp"`
+	AnchorIsFromMe  bool      `json:"anchor_is_from_me"`
+	RequestedCount  int       `json:"requested_count"`
 }
 
 type InboundMessage struct {
@@ -169,4 +210,16 @@ type TransportSendResult struct {
 	RemoteMessageID string
 	ChatJID         string
 	Timestamp       time.Time
+}
+
+// TransportRequestHistorySyncRequest carries an already-resolved anchor
+// message (the caller — Service.RequestHistorySync — is responsible for
+// finding it) down to the transport, which builds and sends the actual
+// whatsmeow on-demand history-sync protocol message.
+type TransportRequestHistorySyncRequest struct {
+	ChatJID         string
+	AnchorMessageID string
+	AnchorTimestamp time.Time
+	AnchorIsFromMe  bool
+	Count           int
 }
