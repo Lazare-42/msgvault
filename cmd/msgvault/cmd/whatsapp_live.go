@@ -100,6 +100,7 @@ var whatsappLiveMCPCmd = &cobra.Command{
 			Transport:      transport,
 			LoginContext:   cmd.Context(),
 			AttachmentsDir: cfg.AttachmentsDir(),
+			Logger:         logger,
 		}
 		if notifier != nil {
 			serviceOpts.Notify = notifier.Notify

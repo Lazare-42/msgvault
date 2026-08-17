@@ -468,13 +468,14 @@ func TestServiceStartLoginUsesLoginContextForReconnect(t *testing.T) {
 }
 
 // attachmentRow is a minimal snapshot of one `attachments` row, read via raw
-// SQL because the plain UpsertAttachment path this package uses (mirroring
-// Gmail/IMAP sync) has no dedicated typed accessor.
+// SQL because the AttachmentRef/Replace* path this package uses (mirroring
+// Discord/Slack/Beeper) has no dedicated single-row typed accessor.
 type attachmentRow struct {
 	filename    string
 	mimeType    string
 	storagePath string
 	contentHash string
+	mediaType   string
 	size        int64
 }
 
@@ -482,10 +483,10 @@ func queryWhatsAppAttachment(t *testing.T, st *store.Store, messageID int64) (at
 	t.Helper()
 	var row attachmentRow
 	err := st.DB().QueryRow(st.Rebind(`
-		SELECT filename, mime_type, storage_path, COALESCE(content_hash, ''), size
+		SELECT filename, mime_type, storage_path, COALESCE(content_hash, ''), COALESCE(media_type, ''), size
 		FROM attachments
 		WHERE message_id = ?
-	`), messageID).Scan(&row.filename, &row.mimeType, &row.storagePath, &row.contentHash, &row.size)
+	`), messageID).Scan(&row.filename, &row.mimeType, &row.storagePath, &row.contentHash, &row.mediaType, &row.size)
 	if err != nil {
 		return attachmentRow{}, false
 	}
@@ -535,6 +536,7 @@ func TestServiceArchiveInboundStoresDownloadedAttachment(t *testing.T) {
 	requirepkg.True(t, ok, "attachment row must exist for downloaded media")
 	assertpkg.Equal(t, "RIB.pdf", row.filename)
 	assertpkg.Equal(t, "application/pdf", row.mimeType)
+	assertpkg.Equal(t, "document", row.mediaType)
 	assertpkg.Equal(t, int64(len(content)), row.size)
 	assertpkg.NotEmpty(t, row.contentHash)
 
@@ -547,9 +549,15 @@ func TestServiceArchiveInboundStoresDownloadedAttachment(t *testing.T) {
 	hasAttachments, count := queryMessageAttachmentStats(t, st, messageID)
 	assertpkg.True(t, hasAttachments)
 	assertpkg.Equal(t, int64(1), count)
+
+	var sizeEstimate int64
+	requirepkg.NoError(t, st.DB().QueryRow(st.Rebind(`
+		SELECT size_estimate FROM messages WHERE id = ?
+	`), messageID).Scan(&sizeEstimate))
+	assertpkg.Equal(t, int64(len(content)), sizeEstimate, "size_estimate must include downloaded attachment bytes")
 }
 
-func TestServiceArchiveInboundDownloadFailureArchivesMessageWithoutAttachmentRow(t *testing.T) {
+func TestServiceArchiveInboundDownloadFailureLeavesPendingMarkerRow(t *testing.T) {
 	tests := []struct {
 		name              string
 		configureAttchDir bool
@@ -585,6 +593,7 @@ func TestServiceArchiveInboundDownloadFailureArchivesMessageWithoutAttachmentRow
 			if tt.configureAttchDir {
 				dir = t.TempDir()
 			}
+			var gotEvent InboundEvent
 			transport := &mockTransport{
 				status: Status{AccountJID: "15551234567@s.whatsapp.net", Paired: true},
 			}
@@ -592,6 +601,7 @@ func TestServiceArchiveInboundDownloadFailureArchivesMessageWithoutAttachmentRow
 				Store:          st,
 				Transport:      transport,
 				AttachmentsDir: dir,
+				Notify:         func(_ context.Context, e InboundEvent) { gotEvent = e },
 			})
 			requirepkg.NoError(t, err)
 
@@ -606,14 +616,110 @@ func TestServiceArchiveInboundDownloadFailureArchivesMessageWithoutAttachmentRow
 			requirepkg.NoError(t, err, "a failed/unstorable download must not drop the message")
 			requirepkg.NotZero(t, messageID)
 
-			_, ok := queryWhatsAppAttachment(t, st, messageID)
-			assertpkg.False(t, ok, "no attachments row for bytes that were never durably stored")
+			// A failed download must not leave the message looking
+			// attachment-free: a marker row records that real media was sent
+			// even though its bytes were never durably stored.
+			row, ok := queryWhatsAppAttachment(t, st, messageID)
+			requirepkg.True(t, ok, "a marker row must exist so the failure is visible/queryable")
+			assertpkg.Equal(t, "RIB.pdf", row.filename)
+			assertpkg.Empty(t, row.contentHash, "no content hash: bytes were never durably stored")
+			assertpkg.Contains(t, row.storagePath, "whatsapp:pending:")
 
 			hasAttachments, count := queryMessageAttachmentStats(t, st, messageID)
-			assertpkg.False(t, hasAttachments)
-			assertpkg.Zero(t, count)
+			assertpkg.True(t, hasAttachments, "message must not look attachment-free")
+			assertpkg.Equal(t, int64(1), count)
+
+			// size_estimate mirrors Gmail/IMAP's "size of the fetched
+			// message": it reflects bytes actually downloaded (Data), not
+			// whether local CAS storage was configured/succeeded.
+			var sizeEstimate int64
+			requirepkg.NoError(t, st.DB().QueryRow(st.Rebind(`
+				SELECT size_estimate FROM messages WHERE id = ?
+			`), messageID).Scan(&sizeEstimate))
+			assertpkg.Equal(t, int64(len(tt.attachment.Data)), sizeEstimate)
+
+			assertpkg.False(t, gotEvent.HasAttachment, "webhook must not point consumers at bytes that were never stored")
+			assertpkg.Empty(t, gotEvent.AttachmentMediaType)
+			assertpkg.Empty(t, gotEvent.AttachmentFilename)
 		})
 	}
+}
+
+func TestServiceArchiveInboundAttachmentStoreFailureDoesNotFailMessage(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewTestStore(t)
+	// A regular file where a directory is expected forces
+	// export.StoreAttachmentFile to fail with a genuine store-layer error
+	// (mirroring a real misconfigured or unwritable AttachmentsDir), rather
+	// than a stubbed one.
+	badDir := filepath.Join(t.TempDir(), "not-a-dir")
+	requirepkg.NoError(t, os.WriteFile(badDir, []byte("x"), 0o600))
+
+	notifications := 0
+	transport := &mockTransport{status: Status{AccountJID: "15551234567@s.whatsapp.net", Paired: true}}
+	svc, err := NewService(ServiceOptions{
+		Store:          st,
+		Transport:      transport,
+		AttachmentsDir: badDir,
+		Notify:         func(context.Context, InboundEvent) { notifications++ },
+	})
+	requirepkg.NoError(t, err)
+
+	messageID, err := svc.ArchiveInbound(ctx, InboundMessage{
+		Account:   "15551234567@s.whatsapp.net",
+		ChatJID:   "15557654321@s.whatsapp.net",
+		SenderJID: "15557654321@s.whatsapp.net",
+		MessageID: "media-store-fail",
+		Timestamp: time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC),
+		Attachment: &InboundAttachment{
+			Filename:  "RIB.pdf",
+			MimeType:  "application/pdf",
+			MediaType: "document",
+			Data:      []byte("bank details"),
+		},
+	})
+	requirepkg.NoError(t, err, "an attachment store failure must not fail an already-committed message")
+	requirepkg.NotZero(t, messageID)
+	assertpkg.Equal(t, 1, notifications, "recomputeStats/notify must still run despite the attachment failure")
+
+	var count int
+	requirepkg.NoError(t, st.DB().QueryRow(st.Rebind(`SELECT COUNT(*) FROM messages WHERE id = ?`), messageID).Scan(&count))
+	assertpkg.Equal(t, 1, count, "the message itself must still be committed")
+}
+
+func TestServiceArchiveInboundNotifiesAttachmentMetadataOnSuccess(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewTestStore(t)
+	var gotEvent InboundEvent
+	transport := &mockTransport{status: Status{AccountJID: "15551234567@s.whatsapp.net", Paired: true}}
+	svc, err := NewService(ServiceOptions{
+		Store:          st,
+		Transport:      transport,
+		AttachmentsDir: t.TempDir(),
+		Notify:         func(_ context.Context, e InboundEvent) { gotEvent = e },
+	})
+	requirepkg.NoError(t, err)
+
+	messageID, err := svc.ArchiveInbound(ctx, InboundMessage{
+		Account:   "15551234567@s.whatsapp.net",
+		ChatJID:   "15557654321@s.whatsapp.net",
+		SenderJID: "15557654321@s.whatsapp.net",
+		MessageID: "media-notify",
+		Timestamp: time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC),
+		Attachment: &InboundAttachment{
+			Filename:  "RIB.pdf",
+			MimeType:  "application/pdf",
+			MediaType: "document",
+			Data:      []byte("bank details"),
+		},
+	})
+	requirepkg.NoError(t, err)
+	requirepkg.NotZero(t, messageID)
+
+	assertpkg.True(t, gotEvent.HasAttachment)
+	assertpkg.Equal(t, "document", gotEvent.AttachmentMediaType)
+	assertpkg.Equal(t, "RIB.pdf", gotEvent.AttachmentFilename)
+	assertpkg.Equal(t, messageID, gotEvent.StoreMessageID)
 }
 
 func TestServiceArchiveInboundCaptionlessAttachmentMessageIsRetrievable(t *testing.T) {

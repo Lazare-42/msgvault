@@ -29,6 +29,19 @@ type InboundEvent struct {
 	Timestamp       time.Time `json:"timestamp"`
 	IsFromMe        bool      `json:"is_from_me"`
 	IsGroup         bool      `json:"is_group"`
+	// HasAttachment, AttachmentMediaType, and AttachmentFilename describe a
+	// media payload (image/video/document/audio/sticker) that was
+	// successfully downloaded and durably stored for this message — a
+	// message with a captionless attachment archives with an empty Body, so
+	// without these a webhook consumer would see what looks like an empty
+	// event even though real media was archived. A message whose attachment
+	// failed to download still archives (see storeInboundAttachment) but is
+	// not reported here as having one: a consumer that fetches media for
+	// every HasAttachment=true event must not be pointed at bytes that were
+	// never actually stored.
+	HasAttachment       bool   `json:"has_attachment"`
+	AttachmentMediaType string `json:"attachment_media_type,omitempty"`
+	AttachmentFilename  string `json:"attachment_filename,omitempty"`
 }
 
 // WebhookNotifier delivers InboundEvents to a local HTTP consumer with an
