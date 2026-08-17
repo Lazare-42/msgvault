@@ -2,6 +2,7 @@ package live
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,13 +16,14 @@ import (
 )
 
 type mockTransport struct {
-	status         Status
-	connect        func(context.Context) error
-	logout         func(context.Context, TransportLogoutRequest) (TransportLogoutResult, error)
-	startQRPairing func(context.Context) error
-	pairingState   QRPairingState
-	sendMessage    func(context.Context, TransportSendMessageRequest) (TransportSendResult, error)
-	sendReaction   func(context.Context, TransportSendReactionRequest) (TransportSendResult, error)
+	status             Status
+	connect            func(context.Context) error
+	logout             func(context.Context, TransportLogoutRequest) (TransportLogoutResult, error)
+	startQRPairing     func(context.Context) error
+	pairingState       QRPairingState
+	sendMessage        func(context.Context, TransportSendMessageRequest) (TransportSendResult, error)
+	sendReaction       func(context.Context, TransportSendReactionRequest) (TransportSendResult, error)
+	requestHistorySync func(context.Context, TransportRequestHistorySyncRequest) error
 }
 
 func (m *mockTransport) Status(context.Context) (Status, error) { return m.status, nil }
@@ -52,6 +54,39 @@ func (m *mockTransport) SendMessage(ctx context.Context, req TransportSendMessag
 }
 func (m *mockTransport) SendReaction(ctx context.Context, req TransportSendReactionRequest) (TransportSendResult, error) {
 	return m.sendReaction(ctx, req)
+}
+
+// RequestHistorySync makes mockTransport satisfy the optional
+// HistorySyncTransport interface. Tests that don't care about this path
+// leave requestHistorySync nil and get a no-op success; tests exercising
+// Service.RequestHistorySync set it to capture/assert the built request. See
+// minimalTransport below for a transport that deliberately does NOT
+// implement HistorySyncTransport.
+func (m *mockTransport) RequestHistorySync(ctx context.Context, req TransportRequestHistorySyncRequest) error {
+	if m.requestHistorySync != nil {
+		return m.requestHistorySync(ctx, req)
+	}
+	return nil
+}
+
+// minimalTransport implements only the core Transport interface (no
+// HistorySyncTransport), used to verify Service.RequestHistorySync's error
+// when the configured transport doesn't support history-sync requests.
+type minimalTransport struct {
+	status Status
+}
+
+func (m *minimalTransport) Status(context.Context) (Status, error) { return m.status, nil }
+func (m *minimalTransport) Connect(context.Context) error          { return nil }
+func (m *minimalTransport) Close() error                           { return nil }
+func (m *minimalTransport) Logout(context.Context, TransportLogoutRequest) (TransportLogoutResult, error) {
+	return TransportLogoutResult{}, nil
+}
+func (m *minimalTransport) SendMessage(context.Context, TransportSendMessageRequest) (TransportSendResult, error) {
+	return TransportSendResult{}, nil
+}
+func (m *minimalTransport) SendReaction(context.Context, TransportSendReactionRequest) (TransportSendResult, error) {
+	return TransportSendResult{}, nil
 }
 
 func TestServiceSendMessageArchivesAndOutbox(t *testing.T) {
@@ -153,6 +188,165 @@ func TestServiceSendMessageRejectsNotReady(t *testing.T) {
 	requirepkg.Error(t, err)
 	assertpkg.Contains(t, err.Error(), "ready=true")
 	assertpkg.False(t, called)
+}
+
+// newHistorySyncTestService sets up a store with one archived WhatsApp
+// message (usable as a RequestHistorySync anchor) for chatJID, and a Service
+// wired to a ready mockTransport. Individual tests override transport.status
+// or transport.requestHistorySync as needed.
+func newHistorySyncTestService(t *testing.T) (svc *Service, st *store.Store, chatJID string, transport *mockTransport) {
+	t.Helper()
+	st = testutil.NewTestStore(t)
+	source, err := st.GetOrCreateSource(store.WhatsAppSourceType, "15551234567@s.whatsapp.net")
+	requirepkg.NoError(t, err)
+	chatJID = "15557654321@s.whatsapp.net"
+	convID, err := st.EnsureConversationWithType(source.ID, chatJID, "direct_chat", "")
+	requirepkg.NoError(t, err)
+	_, err = st.UpsertMessage(&store.Message{
+		SourceID:        source.ID,
+		ConversationID:  convID,
+		SourceMessageID: store.WhatsAppSourceMessageID(chatJID, "anchor-msg"),
+		MessageType:     store.WhatsAppMessageType,
+		SentAt:          sql.NullTime{Time: time.Date(2022, 1, 1, 0, 0, 0, 0, time.UTC), Valid: true},
+		IsFromMe:        true,
+	})
+	requirepkg.NoError(t, err)
+
+	transport = &mockTransport{
+		status: Status{AccountJID: "15551234567@s.whatsapp.net", Paired: true, Connected: true, LoggedIn: true},
+	}
+	svc, err = NewService(ServiceOptions{Store: st, Transport: transport})
+	requirepkg.NoError(t, err)
+	return svc, st, chatJID, transport
+}
+
+// TestServiceRequestHistorySyncUsesOldestArchivedMessageAsAnchor asserts the
+// anchor is the OLDEST archived message for the chat (not, say, the most
+// recently inserted one), since WhatsApp's on-demand history-sync returns
+// messages strictly before the given anchor.
+func TestServiceRequestHistorySyncUsesOldestArchivedMessageAsAnchor(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewTestStore(t)
+	source, err := st.GetOrCreateSource(store.WhatsAppSourceType, "15551234567@s.whatsapp.net")
+	requirepkg.NoError(t, err)
+	chatJID := "15557654321@s.whatsapp.net"
+	convID, err := st.EnsureConversationWithType(source.ID, chatJID, "direct_chat", "")
+	requirepkg.NoError(t, err)
+
+	older := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	newer := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+	_, err = st.UpsertMessage(&store.Message{
+		SourceID:        source.ID,
+		ConversationID:  convID,
+		SourceMessageID: store.WhatsAppSourceMessageID(chatJID, "newer-msg"),
+		MessageType:     store.WhatsAppMessageType,
+		SentAt:          sql.NullTime{Time: newer, Valid: true},
+		IsFromMe:        false,
+	})
+	requirepkg.NoError(t, err)
+	_, err = st.UpsertMessage(&store.Message{
+		SourceID:        source.ID,
+		ConversationID:  convID,
+		SourceMessageID: store.WhatsAppSourceMessageID(chatJID, "older-msg"),
+		MessageType:     store.WhatsAppMessageType,
+		SentAt:          sql.NullTime{Time: older, Valid: true},
+		IsFromMe:        true,
+	})
+	requirepkg.NoError(t, err)
+
+	var captured TransportRequestHistorySyncRequest
+	transport := &mockTransport{
+		status: Status{AccountJID: "15551234567@s.whatsapp.net", Paired: true, Connected: true, LoggedIn: true},
+		requestHistorySync: func(_ context.Context, req TransportRequestHistorySyncRequest) error {
+			captured = req
+			return nil
+		},
+	}
+	svc, err := NewService(ServiceOptions{Store: st, Transport: transport})
+	requirepkg.NoError(t, err)
+
+	result, err := svc.RequestHistorySync(ctx, RequestHistorySyncRequest{ChatID: chatJID})
+	requirepkg.NoError(t, err)
+
+	assertpkg.Equal(t, chatJID, captured.ChatJID)
+	assertpkg.Equal(t, "older-msg", captured.AnchorMessageID)
+	assertpkg.True(t, captured.AnchorIsFromMe)
+	assertpkg.True(t, older.Equal(captured.AnchorTimestamp))
+	assertpkg.Equal(t, DefaultHistorySyncRequestCount, captured.Count)
+
+	assertpkg.Equal(t, chatJID, result.ChatJID)
+	assertpkg.Equal(t, "older-msg", result.AnchorMessageID)
+	assertpkg.Equal(t, DefaultHistorySyncRequestCount, result.RequestedCount)
+}
+
+func TestServiceRequestHistorySyncClampsAndDefaultsCount(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{"zero defaults", 0, DefaultHistorySyncRequestCount},
+		{"negative defaults", -5, DefaultHistorySyncRequestCount},
+		{"within range kept", 30, 30},
+		{"over max clamped", 500, MaxHistorySyncRequestCount},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, _, chatJID, _ := newHistorySyncTestService(t)
+			result, err := svc.RequestHistorySync(context.Background(), RequestHistorySyncRequest{
+				ChatID: chatJID,
+				Count:  tt.in,
+			})
+			requirepkg.NoError(t, err)
+			assertpkg.Equal(t, tt.want, result.RequestedCount)
+		})
+	}
+}
+
+func TestServiceRequestHistorySyncRejectsNotReady(t *testing.T) {
+	svc, _, chatJID, transport := newHistorySyncTestService(t)
+	transport.status.LoggedIn = false
+	var called bool
+	transport.requestHistorySync = func(context.Context, TransportRequestHistorySyncRequest) error {
+		called = true
+		return nil
+	}
+
+	_, err := svc.RequestHistorySync(context.Background(), RequestHistorySyncRequest{ChatID: chatJID})
+	requirepkg.Error(t, err)
+	assertpkg.Contains(t, err.Error(), "ready=true")
+	assertpkg.False(t, called)
+}
+
+func TestServiceRequestHistorySyncRequiresArchivedAnchor(t *testing.T) {
+	svc, _, _, _ := newHistorySyncTestService(t)
+
+	_, err := svc.RequestHistorySync(context.Background(), RequestHistorySyncRequest{ChatID: "15559999999@s.whatsapp.net"})
+	requirepkg.Error(t, err)
+	assertpkg.Contains(t, err.Error(), "no archived whatsapp messages found")
+}
+
+func TestServiceRequestHistorySyncRequiresTransportSupport(t *testing.T) {
+	st := testutil.NewTestStore(t)
+	transport := &minimalTransport{
+		status: Status{AccountJID: "15551234567@s.whatsapp.net", Paired: true, Connected: true, LoggedIn: true},
+	}
+	svc, err := NewService(ServiceOptions{Store: st, Transport: transport})
+	requirepkg.NoError(t, err)
+
+	_, err = svc.RequestHistorySync(context.Background(), RequestHistorySyncRequest{ChatID: "15557654321@s.whatsapp.net"})
+	requirepkg.Error(t, err)
+	assertpkg.Contains(t, err.Error(), "not supported by this transport")
+}
+
+func TestServiceRequestHistorySyncPropagatesTransportError(t *testing.T) {
+	svc, _, chatJID, transport := newHistorySyncTestService(t)
+	transport.requestHistorySync = func(context.Context, TransportRequestHistorySyncRequest) error {
+		return assertpkg.AnError
+	}
+
+	_, err := svc.RequestHistorySync(context.Background(), RequestHistorySyncRequest{ChatID: chatJID})
+	requirepkg.Error(t, err)
 }
 
 func TestServiceArchiveHistorySyncBatchesStatsAndSkipsNotifications(t *testing.T) {

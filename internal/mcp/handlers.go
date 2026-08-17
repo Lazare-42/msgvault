@@ -2413,6 +2413,42 @@ func (h *handlers) sendWhatsAppReaction(ctx context.Context, req mcp.CallToolReq
 	return jsonResult(result)
 }
 
+func (h *handlers) whatsAppRequestHistorySync(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := req.GetArguments()
+	client, account, err := h.getWhatsAppClient(ctx, args)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+	chatID, _ := args["chat_id"].(string)
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return mcp.NewToolResultError("chat_id parameter is required"), nil
+	}
+	count := boundedIntArg(args, "count", whatsapplive.DefaultHistorySyncRequestCount, whatsapplive.MaxHistorySyncRequestCount)
+	if err := requireWhatsAppReady(ctx, client); err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	result, err := client.RequestHistorySync(ctx, whatsapplive.RequestHistorySyncRequest{
+		Account: account,
+		ChatID:  chatID,
+		Count:   count,
+	})
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("request whatsapp history sync: %v", err)), nil
+	}
+	return structuredJSONResult(struct {
+		whatsapplive.RequestHistorySyncResult
+		Message string `json:"message"`
+	}{
+		RequestHistorySyncResult: result,
+		Message: "History sync requested. This is best-effort and asynchronous: WhatsApp decides " +
+			"whether to honor it, and if it does, matching older messages are archived automatically " +
+			"over the following seconds to minutes as they arrive — there is no synchronous confirmation. " +
+			"Check back later with list_messages or search_messages.",
+	})
+}
+
 // --- Google Docs handlers ---
 
 type googleDocsSearchResult struct {

@@ -64,12 +64,13 @@ func (f similarSearcherFunc) FindSimilar(ctx context.Context, req SimilarSearchR
 type toolHandler func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error)
 
 type mockWhatsAppClient struct {
-	status       whatsapplive.Status
-	loginState   whatsapplive.LoginState
-	startLogin   func(context.Context) (whatsapplive.LoginState, error)
-	logout       func(context.Context, whatsapplive.LogoutRequest) (whatsapplive.LogoutResult, error)
-	sendMessage  func(context.Context, whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error)
-	sendReaction func(context.Context, whatsapplive.SendReactionRequest) (whatsapplive.SendResult, error)
+	status             whatsapplive.Status
+	loginState         whatsapplive.LoginState
+	startLogin         func(context.Context) (whatsapplive.LoginState, error)
+	logout             func(context.Context, whatsapplive.LogoutRequest) (whatsapplive.LogoutResult, error)
+	sendMessage        func(context.Context, whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error)
+	sendReaction       func(context.Context, whatsapplive.SendReactionRequest) (whatsapplive.SendResult, error)
+	requestHistorySync func(context.Context, whatsapplive.RequestHistorySyncRequest) (whatsapplive.RequestHistorySyncResult, error)
 }
 
 func (m *mockWhatsAppClient) Status(context.Context) (whatsapplive.Status, error) {
@@ -97,6 +98,9 @@ func (m *mockWhatsAppClient) SendMessage(ctx context.Context, req whatsapplive.S
 }
 func (m *mockWhatsAppClient) SendReaction(ctx context.Context, req whatsapplive.SendReactionRequest) (whatsapplive.SendResult, error) {
 	return m.sendReaction(ctx, req)
+}
+func (m *mockWhatsAppClient) RequestHistorySync(ctx context.Context, req whatsapplive.RequestHistorySyncRequest) (whatsapplive.RequestHistorySyncResult, error) {
+	return m.requestHistorySync(ctx, req)
 }
 
 type mockGoogleDocsClient struct {
@@ -527,6 +531,131 @@ func TestSendWhatsAppMessageRejectsNotReady(t *testing.T) {
 	})
 	assert.Contains(t, resultText(t, result), "ready=true")
 	assert.False(t, called)
+}
+
+func TestWhatsAppRequestHistorySync(t *testing.T) {
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var gotReq whatsapplive.RequestHistorySyncRequest
+	anchorTime := time.Date(2022, 1, 1, 0, 0, 0, 0, time.UTC)
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			Paired:    true,
+			Connected: true,
+			LoggedIn:  true,
+		},
+		requestHistorySync: func(_ context.Context, req whatsapplive.RequestHistorySyncRequest) (whatsapplive.RequestHistorySyncResult, error) {
+			gotReq = req
+			return whatsapplive.RequestHistorySyncResult{
+				ChatJID:         req.ChatID,
+				AnchorMessageID: "anchor-msg",
+				AnchorTimestamp: anchorTime,
+				AnchorIsFromMe:  true,
+				RequestedCount:  req.Count,
+			}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Equal(t, "15551234567@s.whatsapp.net", account)
+			return client, nil
+		},
+	}
+
+	result := runTool[struct {
+		whatsapplive.RequestHistorySyncResult
+		Message string `json:"message"`
+	}](t, ToolWhatsAppRequestHistorySync, h.whatsAppRequestHistorySync, map[string]any{
+		"chat_id": "15557654321@s.whatsapp.net",
+		"count":   float64(30),
+	})
+	assert.Equal(t, "15557654321@s.whatsapp.net", gotReq.ChatID)
+	assert.Equal(t, 30, gotReq.Count)
+	assert.Equal(t, "anchor-msg", result.AnchorMessageID)
+	assert.Equal(t, 30, result.RequestedCount)
+	assert.NotEmpty(t, result.Message)
+}
+
+func TestWhatsAppRequestHistorySyncDefaultsCount(t *testing.T) {
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var gotReq whatsapplive.RequestHistorySyncRequest
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{Paired: true, Connected: true, LoggedIn: true},
+		requestHistorySync: func(_ context.Context, req whatsapplive.RequestHistorySyncRequest) (whatsapplive.RequestHistorySyncResult, error) {
+			gotReq = req
+			return whatsapplive.RequestHistorySyncResult{RequestedCount: req.Count}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			return client, nil
+		},
+	}
+
+	runTool[struct {
+		whatsapplive.RequestHistorySyncResult
+		Message string `json:"message"`
+	}](t, ToolWhatsAppRequestHistorySync, h.whatsAppRequestHistorySync, map[string]any{
+		"chat_id": "15557654321@s.whatsapp.net",
+	})
+	assert.Equal(t, whatsapplive.DefaultHistorySyncRequestCount, gotReq.Count)
+}
+
+func TestWhatsAppRequestHistorySyncRejectsNotReady(t *testing.T) {
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var called bool
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			AccountJID: "15551234567@s.whatsapp.net",
+			Paired:     true,
+			Connected:  true,
+			LoggedIn:   false,
+		},
+		requestHistorySync: func(context.Context, whatsapplive.RequestHistorySyncRequest) (whatsapplive.RequestHistorySyncResult, error) {
+			called = true
+			return whatsapplive.RequestHistorySyncResult{}, errors.New("request should not be called")
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			return client, nil
+		},
+	}
+
+	result := runToolExpectError(t, ToolWhatsAppRequestHistorySync, h.whatsAppRequestHistorySync, map[string]any{
+		"chat_id": "15557654321@s.whatsapp.net",
+	})
+	assert.Contains(t, resultText(t, result), "ready=true")
+	assert.False(t, called)
+}
+
+func TestWhatsAppRequestHistorySyncRequiresChatID(t *testing.T) {
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{Paired: true, Connected: true, LoggedIn: true},
+	}
+	h := &handlers{
+		engine: &querytest.MockEngine{},
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			return client, nil
+		},
+	}
+
+	result := runToolExpectError(t, ToolWhatsAppRequestHistorySync, h.whatsAppRequestHistorySync, map[string]any{})
+	assert.Contains(t, resultText(t, result), "chat_id")
 }
 
 func TestSendWhatsAppReactionAllowsEmptyEmojiToClear(t *testing.T) {

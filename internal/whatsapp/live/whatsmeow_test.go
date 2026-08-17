@@ -418,11 +418,12 @@ func TestConvertMessageBareLocationPinIsArchived(t *testing.T) {
 
 // TestNewWhatsmeowTransportAndResetClientKeepDownloaderInSync exercises the
 // real NewWhatsmeowTransport/resetClient path (not a bare struct literal) so
-// a regression that drops resetClient's `t.downloader = client` resync (see
-// downloadMediaAttachment, which reads t.downloader under t.mu specifically
-// because of that race) would fail this test. Both calls are fully local
-// (sqlite session store + in-memory client construction), so no live
-// connection or pairing is needed.
+// a regression that drops resetClient's `t.downloader = client` (or
+// `t.peerSender = client`) resync — see downloadMediaAttachment and
+// RequestHistorySync, which both read their client-scoped field under t.mu
+// specifically because of that race — would fail this test. Both calls are
+// fully local (sqlite session store + in-memory client construction), so no
+// live connection or pairing is needed.
 func TestNewWhatsmeowTransportAndResetClientKeepDownloaderInSync(t *testing.T) {
 	dir := t.TempDir()
 	transport, err := NewWhatsmeowTransport(context.Background(), WhatsmeowOptions{
@@ -434,6 +435,8 @@ func TestNewWhatsmeowTransportAndResetClientKeepDownloaderInSync(t *testing.T) {
 
 	require.NotNil(t, transport.downloader)
 	assert.Same(t, transport.client, transport.downloader.(*whatsmeow.Client))
+	require.NotNil(t, transport.peerSender)
+	assert.Same(t, transport.client, transport.peerSender.(*whatsmeow.Client))
 
 	oldClient := transport.client
 	require.NoError(t, transport.resetClient(context.Background()))
@@ -441,6 +444,131 @@ func TestNewWhatsmeowTransportAndResetClientKeepDownloaderInSync(t *testing.T) {
 	require.NotNil(t, transport.downloader)
 	assert.Same(t, transport.client, transport.downloader.(*whatsmeow.Client),
 		"downloader must be resynced to the new client after resetClient")
+	require.NotNil(t, transport.peerSender)
+	assert.Same(t, transport.client, transport.peerSender.(*whatsmeow.Client),
+		"peerSender must be resynced to the new client after resetClient")
+}
+
+// fakePeerMessageSender captures the *waE2E.Message passed to SendPeerMessage
+// so RequestHistorySync tests can assert on whatsmeow's own
+// BuildHistorySyncRequest output without a live, authenticated session (see
+// peerMessageSender's doc comment).
+type fakePeerMessageSender struct {
+	sent *waE2E.Message
+	err  error
+}
+
+func (f *fakePeerMessageSender) SendPeerMessage(_ context.Context, message *waE2E.Message) (whatsmeow.SendResponse, error) {
+	f.sent = message
+	if f.err != nil {
+		return whatsmeow.SendResponse{}, f.err
+	}
+	return whatsmeow.SendResponse{ID: "peer-resp-1"}, nil
+}
+
+// newRequestHistorySyncTestTransport builds a real *WhatsmeowTransport (so
+// BuildHistorySyncRequest runs as a genuine *whatsmeow.Client method, the
+// same production code path used live) with peerSender swapped for a fake,
+// since SendPeerMessage itself requires a live, authenticated connection.
+func newRequestHistorySyncTestTransport(t *testing.T) (*WhatsmeowTransport, *fakePeerMessageSender) {
+	t.Helper()
+	dir := t.TempDir()
+	transport, err := NewWhatsmeowTransport(context.Background(), WhatsmeowOptions{
+		SessionPath: filepath.Join(dir, "session.db"),
+		Account:     "15551234567@s.whatsapp.net",
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = transport.Close() })
+	sender := &fakePeerMessageSender{}
+	transport.peerSender = sender
+	return transport, sender
+}
+
+func TestRequestHistorySyncBuildsAndSendsOnDemandRequest(t *testing.T) {
+	transport, sender := newRequestHistorySyncTestTransport(t)
+	anchorTime := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+
+	err := transport.RequestHistorySync(context.Background(), TransportRequestHistorySyncRequest{
+		ChatJID:         "120363@g.us",
+		AnchorMessageID: "ANCHOR123",
+		AnchorTimestamp: anchorTime,
+		AnchorIsFromMe:  true,
+		Count:           25,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, sender.sent)
+
+	req := sender.sent.GetProtocolMessage().GetPeerDataOperationRequestMessage().GetHistorySyncOnDemandRequest()
+	require.NotNil(t, req)
+	assert.Equal(t, waE2E.PeerDataOperationRequestType_HISTORY_SYNC_ON_DEMAND,
+		sender.sent.GetProtocolMessage().GetPeerDataOperationRequestMessage().GetPeerDataOperationRequestType())
+	assert.Equal(t, "120363@g.us", req.GetChatJID())
+	assert.Equal(t, "ANCHOR123", req.GetOldestMsgID())
+	assert.True(t, req.GetOldestMsgFromMe())
+	assert.EqualValues(t, 25, req.GetOnDemandMsgCount())
+	// The field is named "...TimestampMS" but whatsmeow's own doc comment on
+	// BuildHistorySyncRequest notes it actually holds seconds.
+	assert.Equal(t, anchorTime.Unix(), req.GetOldestMsgTimestampMS())
+}
+
+func TestRequestHistorySyncDefaultsAndClampsCount(t *testing.T) {
+	tests := []struct {
+		name string
+		in   int
+		want int32
+	}{
+		{"zero defaults", 0, DefaultHistorySyncRequestCount},
+		{"negative defaults", -1, DefaultHistorySyncRequestCount},
+		{"within range kept", 30, 30},
+		{"over max clamped", 500, MaxHistorySyncRequestCount},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			transport, sender := newRequestHistorySyncTestTransport(t)
+			err := transport.RequestHistorySync(context.Background(), TransportRequestHistorySyncRequest{
+				ChatJID:         "120363@g.us",
+				AnchorMessageID: "anchor",
+				AnchorTimestamp: time.Now(),
+				Count:           tt.in,
+			})
+			require.NoError(t, err)
+			req := sender.sent.GetProtocolMessage().GetPeerDataOperationRequestMessage().GetHistorySyncOnDemandRequest()
+			require.NotNil(t, req)
+			assert.Equal(t, tt.want, req.GetOnDemandMsgCount())
+		})
+	}
+}
+
+func TestRequestHistorySyncRequiresAnchorMessageID(t *testing.T) {
+	transport, sender := newRequestHistorySyncTestTransport(t)
+	err := transport.RequestHistorySync(context.Background(), TransportRequestHistorySyncRequest{
+		ChatJID: "120363@g.us",
+	})
+	require.Error(t, err)
+	assert.Nil(t, sender.sent, "must not send when the anchor is missing")
+}
+
+func TestRequestHistorySyncRejectsInvalidChatJID(t *testing.T) {
+	transport, sender := newRequestHistorySyncTestTransport(t)
+	err := transport.RequestHistorySync(context.Background(), TransportRequestHistorySyncRequest{
+		ChatJID:         "",
+		AnchorMessageID: "anchor",
+	})
+	require.Error(t, err)
+	assert.Nil(t, sender.sent)
+}
+
+func TestRequestHistorySyncPropagatesSendError(t *testing.T) {
+	transport, sender := newRequestHistorySyncTestTransport(t)
+	sender.err = errors.New("boom")
+
+	err := transport.RequestHistorySync(context.Background(), TransportRequestHistorySyncRequest{
+		ChatJID:         "120363@g.us",
+		AnchorMessageID: "anchor",
+		AnchorTimestamp: time.Now(),
+	})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "boom")
 }
 
 func TestMediaDownloadTimeoutScalesWithDeclaredSize(t *testing.T) {

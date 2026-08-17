@@ -109,6 +109,53 @@ func TestSetReactionReplaceAndClear(t *testing.T) {
 	assertpkg.Equal(t, 0, activeCount)
 }
 
+func TestGetOldestWhatsAppMessage(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewTestStore(t)
+	source, err := st.GetOrCreateSource(store.WhatsAppSourceType, "15551234567@s.whatsapp.net")
+	requirepkg.NoError(t, err)
+	chatJID := "15557654321@s.whatsapp.net"
+	convID, err := st.EnsureConversationWithType(source.ID, chatJID, "direct_chat", "")
+	requirepkg.NoError(t, err)
+
+	anchor, err := st.GetOldestWhatsAppMessage(ctx, source.ID, chatJID)
+	requirepkg.NoError(t, err)
+	assertpkg.Nil(t, anchor, "no archived messages yet should report no anchor, not an error")
+
+	older := time.Unix(100, 0)
+	newer := time.Unix(200, 0)
+	_, err = st.UpsertMessage(&store.Message{
+		SourceID:        source.ID,
+		ConversationID:  convID,
+		SourceMessageID: store.WhatsAppSourceMessageID(chatJID, "newer-msg"),
+		MessageType:     store.WhatsAppMessageType,
+		SentAt:          sql.NullTime{Time: newer, Valid: true},
+		IsFromMe:        false,
+	})
+	requirepkg.NoError(t, err)
+	_, err = st.UpsertMessage(&store.Message{
+		SourceID:        source.ID,
+		ConversationID:  convID,
+		SourceMessageID: store.WhatsAppSourceMessageID(chatJID, "older-msg"),
+		MessageType:     store.WhatsAppMessageType,
+		SentAt:          sql.NullTime{Time: older, Valid: true},
+		IsFromMe:        true,
+	})
+	requirepkg.NoError(t, err)
+
+	anchor, err = st.GetOldestWhatsAppMessage(ctx, source.ID, chatJID)
+	requirepkg.NoError(t, err)
+	requirepkg.NotNil(t, anchor)
+	assertpkg.Equal(t, store.WhatsAppSourceMessageID(chatJID, "older-msg"), anchor.SourceMessageID)
+	assertpkg.True(t, anchor.IsFromMe)
+	assertpkg.True(t, older.Equal(anchor.SentAt))
+
+	// A different chat within the same source must not see this chat's anchor.
+	otherAnchor, err := st.GetOldestWhatsAppMessage(ctx, source.ID, "15550000000@s.whatsapp.net")
+	requirepkg.NoError(t, err)
+	assertpkg.Nil(t, otherAnchor)
+}
+
 func TestGetWhatsAppMessageRef(t *testing.T) {
 	ctx := context.Background()
 	st := testutil.NewTestStore(t)

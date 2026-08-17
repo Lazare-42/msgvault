@@ -38,41 +38,42 @@ type GoogleDocsClientFactory func(ctx context.Context) (googledocs.Client, error
 
 // Tool name constants.
 const (
-	ToolSearchMessages         = "search_messages"
-	ToolSearchMetadata         = "search_metadata"
-	ToolSearchMessageBodies    = "search_message_bodies"
-	ToolSemanticSearchMessages = "semantic_search_messages"
-	ToolGetMessage             = "get_message"
-	ToolGetAttachment          = "get_attachment"
-	ToolExportAttachment       = "export_attachment"
-	ToolListMessages           = "list_messages"
-	ToolGetStats               = "get_stats"
-	ToolAggregate              = "aggregate"
-	ToolStageDeletion          = "stage_deletion"
-	ToolSearchByDomains        = "search_by_domains"
-	ToolFindSimilarMessages    = "find_similar_messages"
-	ToolSearchInMessage        = "search_in_message"
-	ToolListDrafts             = "list_drafts"
-	ToolGetDraft               = "get_draft"
-	ToolCreateDraft            = "create_draft"
-	ToolUpdateDraft            = "update_draft"
-	ToolDeleteDraft            = "delete_draft"
-	ToolSendDraft              = "send_draft"
-	ToolModifyLabels           = "modify_labels"
-	ToolCreateLabel            = "create_label"
-	ToolDeleteLabel            = "delete_label"
-	ToolListGmailLabels        = "list_gmail_labels"
-	ToolWhatsAppStatus         = "whatsapp_status"
-	ToolWhatsAppStartLogin     = "whatsapp_start_login"
-	ToolWhatsAppLoginStatus    = "whatsapp_login_status"
-	ToolWhatsAppLogout         = "whatsapp_logout"
-	ToolSendWhatsAppMessage    = "send_whatsapp_message"
-	ToolSendWhatsAppReaction   = "send_whatsapp_reaction"
-	ToolListGoogleDocs         = "list_google_docs"
-	ToolSearchGoogleDocs       = "search_google_docs"
-	ToolGetGoogleDoc           = "get_google_doc"
-	ToolAppendGoogleDocText    = "append_google_doc_text"
-	ToolReplaceGoogleDocText   = "replace_google_doc_text"
+	ToolSearchMessages             = "search_messages"
+	ToolSearchMetadata             = "search_metadata"
+	ToolSearchMessageBodies        = "search_message_bodies"
+	ToolSemanticSearchMessages     = "semantic_search_messages"
+	ToolGetMessage                 = "get_message"
+	ToolGetAttachment              = "get_attachment"
+	ToolExportAttachment           = "export_attachment"
+	ToolListMessages               = "list_messages"
+	ToolGetStats                   = "get_stats"
+	ToolAggregate                  = "aggregate"
+	ToolStageDeletion              = "stage_deletion"
+	ToolSearchByDomains            = "search_by_domains"
+	ToolFindSimilarMessages        = "find_similar_messages"
+	ToolSearchInMessage            = "search_in_message"
+	ToolListDrafts                 = "list_drafts"
+	ToolGetDraft                   = "get_draft"
+	ToolCreateDraft                = "create_draft"
+	ToolUpdateDraft                = "update_draft"
+	ToolDeleteDraft                = "delete_draft"
+	ToolSendDraft                  = "send_draft"
+	ToolModifyLabels               = "modify_labels"
+	ToolCreateLabel                = "create_label"
+	ToolDeleteLabel                = "delete_label"
+	ToolListGmailLabels            = "list_gmail_labels"
+	ToolWhatsAppStatus             = "whatsapp_status"
+	ToolWhatsAppStartLogin         = "whatsapp_start_login"
+	ToolWhatsAppLoginStatus        = "whatsapp_login_status"
+	ToolWhatsAppLogout             = "whatsapp_logout"
+	ToolSendWhatsAppMessage        = "send_whatsapp_message"
+	ToolSendWhatsAppReaction       = "send_whatsapp_reaction"
+	ToolWhatsAppRequestHistorySync = "whatsapp_request_history_sync"
+	ToolListGoogleDocs             = "list_google_docs"
+	ToolSearchGoogleDocs           = "search_google_docs"
+	ToolGetGoogleDoc               = "get_google_doc"
+	ToolAppendGoogleDocText        = "append_google_doc_text"
+	ToolReplaceGoogleDocText       = "replace_google_doc_text"
 )
 
 // search_message_bodies/search_in_message mode values (wire format).
@@ -218,6 +219,7 @@ func BuildMCPServer(opts ServeOptions) *server.MCPServer {
 		s.AddTool(whatsAppLogoutTool(), h.whatsAppLogout)
 		s.AddTool(sendWhatsAppMessageTool(), h.sendWhatsAppMessage)
 		s.AddTool(sendWhatsAppReactionTool(), h.sendWhatsAppReaction)
+		s.AddTool(whatsAppRequestHistorySyncTool(), h.whatsAppRequestHistorySync)
 	}
 
 	if opts.GoogleDocsFactory != nil {
@@ -993,6 +995,24 @@ func sendWhatsAppReactionTool() mcp.Tool {
 		),
 		mcp.WithString("local_request_id",
 			mcp.Description("Optional caller-provided idempotency/audit key"),
+		),
+	)
+}
+
+func whatsAppRequestHistorySyncTool() mcp.Tool {
+	return mcp.NewTool(ToolWhatsAppRequestHistorySync,
+		mcp.WithDescription("Ask WhatsApp for more history in one chat, older than the oldest message msgvault has already archived for it. Requires whatsapp_status ready=true and at least one already-archived message in the chat to anchor the request. "+
+			"This is best-effort and asynchronous: it sends WhatsApp's own on-demand history-sync request to your primary device, but whether any older messages actually come back depends on WhatsApp's own server-side/device retention, which is not documented and not guaranteed for old content. "+
+			"A successful call only means the request was sent, not that new messages will arrive — there is no synchronous confirmation. If WhatsApp honors the request, matching messages are archived automatically over the following seconds to minutes; check back with list_messages or search_messages rather than expecting an immediate result."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(true),
+		withAccount(),
+		mcp.WithString("chat_id",
+			mcp.Required(),
+			mcp.Description("WhatsApp chat JID to request more history for (must already have at least one archived message)"),
+		),
+		mcp.WithNumber("count",
+			mcp.Description("How many older messages to request (default 50, the value WhatsApp itself recommends; capped at 100)"),
 		),
 	)
 }
