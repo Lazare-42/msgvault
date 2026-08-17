@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	stdmime "mime"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -13,6 +15,8 @@ import (
 	"sync"
 	"time"
 	"unicode"
+
+	"golang.org/x/sync/errgroup"
 
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -26,6 +30,71 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+// maxMediaDownloadBytes caps a single media download by its declared size,
+// mirroring the cap convention Beeper/Slack use (100 MiB). whatsmeow's
+// Download API fully buffers the decrypted payload in memory with no
+// streaming or size-limited variant, so oversized media is rejected before
+// the network call rather than truncated during it.
+const maxMediaDownloadBytes = int64(100 << 20)
+
+// historySyncDownloadConcurrency bounds how many history-sync messages within
+// one conversation are converted (including any media download, up to
+// mediaDownloadTimeout each) concurrently. A serial loop over a large backlog
+// of media messages could take hours (200 items at up to 60s each observed in
+// practice); a small worker pool keeps the wall-clock time bounded without
+// downloading everything in the conversation at once.
+const historySyncDownloadConcurrency = 8
+
+// messageQueueCapacity bounds how many inbound live messages can be waiting
+// for processMessageQueue before registerEventHandler's *events.Message case
+// falls back to archiving synchronously (see registerEventHandler).
+const messageQueueCapacity = 256
+
+// mediaDownloadTimeout bounds a single media download attempt, scaled by the
+// declared payload size so large-but-legitimate files are not starved by a
+// flat deadline. internal/slack/media.go's mediaTimeout fixed the identical
+// mistake for Slack: a flat timeout permanently stalls anything that cannot
+// finish within it, and every retry (or, here, every history-sync item) hits
+// the same wall. The bound scales at a ~128 KiB/s floor rate with a 10-minute
+// minimum (matching Slack's), so any download making modest progress
+// completes, while remaining finite — WhatsApp CDN URLs and media keys
+// expire, and an unattended session must never hang forever on a stalled
+// read.
+func mediaDownloadTimeout(declaredSize int64) time.Duration {
+	const floor = 10 * time.Minute
+	if declaredSize <= 0 {
+		return floor
+	}
+	scaled := time.Duration(declaredSize/(128<<10)) * time.Second
+	if scaled < floor {
+		return floor
+	}
+	return scaled
+}
+
+// fileLengthInt64 safely narrows a WhatsApp-declared FileLength (uint64) to
+// int64. A value large enough to overflow int64 is only possible from
+// corrupt or adversarial input (no real attachment is exabytes); such a value
+// is treated as size-unknown (0) rather than silently wrapping negative. A
+// negative size would otherwise let downloadMediaAttachment's size-cap check
+// (declaredSize > maxMediaDownloadBytes is always false for a negative
+// number) be bypassed entirely, and — on a failed download, where nothing
+// later overwrites the metadata-derived size with the real byte count — would
+// persist as a nonsensical negative attachment size.
+func fileLengthInt64(v uint64) int64 {
+	if v > math.MaxInt64 {
+		return 0
+	}
+	return int64(v)
+}
+
+// mediaDownloader is the subset of *whatsmeow.Client used to fetch the bytes
+// referenced by a downloadable media message. It exists so tests can supply a
+// fake without standing up a real whatsmeow client/session.
+type mediaDownloader interface {
+	Download(ctx context.Context, msg whatsmeow.DownloadableMessage) ([]byte, error)
+}
+
 type WhatsmeowOptions struct {
 	SessionPath string
 	Account     string
@@ -38,6 +107,7 @@ type WhatsmeowTransport struct {
 	sessionPath string
 	account     string
 	log         waLog.Logger
+	downloader  mediaDownloader
 
 	mu            sync.Mutex
 	handlerID     uint32
@@ -45,6 +115,15 @@ type WhatsmeowTransport struct {
 	historySync   func(context.Context, []InboundMessage) error
 	pairingCancel context.CancelFunc
 	pairingState  QRPairingState
+
+	// messageEvents/bgCtx/bgCancel back the single-worker queue
+	// processMessageQueue drains (see registerEventHandler): started once in
+	// NewWhatsmeowTransport and tied to the transport's own lifetime (not to
+	// any particular Connect/reconnect call), so it survives resetClient and
+	// keeps message archiving order intact across a logout/re-pair.
+	messageEvents chan *events.Message
+	bgCtx         context.Context
+	bgCancel      context.CancelFunc
 }
 
 func NewWhatsmeowTransport(ctx context.Context, opts WhatsmeowOptions) (*WhatsmeowTransport, error) {
@@ -72,13 +151,20 @@ func NewWhatsmeowTransport(ctx context.Context, opts WhatsmeowOptions) (*Whatsme
 	}
 	client := whatsmeow.NewClient(device, log)
 	client.EnableAutoReconnect = true
-	return &WhatsmeowTransport{
-		client:      client,
-		container:   container,
-		sessionPath: opts.SessionPath,
-		account:     strings.TrimSpace(opts.Account),
-		log:         log,
-	}, nil
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	t := &WhatsmeowTransport{
+		client:        client,
+		container:     container,
+		sessionPath:   opts.SessionPath,
+		account:       strings.TrimSpace(opts.Account),
+		log:           log,
+		downloader:    client,
+		messageEvents: make(chan *events.Message, messageQueueCapacity),
+		bgCtx:         bgCtx,
+		bgCancel:      bgCancel,
+	}
+	go t.processMessageQueue()
+	return t, nil
 }
 
 func newWhatsmeowLogger(level string) waLog.Logger {
@@ -204,6 +290,7 @@ func (t *WhatsmeowTransport) resetClient(ctx context.Context) error {
 		t.pairingCancel = nil
 	}
 	t.client = client
+	t.downloader = client
 	t.handlerID = 0
 	t.pairingState = QRPairingState{}
 	t.mu.Unlock()
@@ -225,6 +312,9 @@ func (t *WhatsmeowTransport) cancelPairing() {
 }
 
 func (t *WhatsmeowTransport) Close() error {
+	if t.bgCancel != nil {
+		t.bgCancel()
+	}
 	t.mu.Lock()
 	if t.pairingCancel != nil {
 		t.pairingCancel()
@@ -469,8 +559,22 @@ func (t *WhatsmeowTransport) registerEventHandler(ctx context.Context) {
 
 		switch event := evt.(type) {
 		case *events.Message:
-			if _, err := t.convertAndArchiveMessage(ctx, event, ""); err != nil {
-				t.client.Log.Warnf("Failed to archive WhatsApp message %s: %v", event.Info.ID, err)
+			// convertAndArchiveMessage can block on a media download (up to
+			// mediaDownloadTimeout) and on store I/O; whatsmeow's own
+			// event-dispatch goroutine must return quickly or it stalls every
+			// other live event for this account (handlerQueueLoop blocks the
+			// next event until this call returns). Hand off to
+			// processMessageQueue's single worker, which preserves the
+			// arrival order this closure observes. Fall back to synchronous
+			// processing (with the same stall risk) only if that queue is
+			// completely backed up, so a message is never dropped.
+			select {
+			case t.messageEvents <- event:
+			default:
+				t.client.Log.Warnf("WhatsApp message queue full; archiving %s synchronously", event.Info.ID)
+				if _, err := t.convertAndArchiveMessage(ctx, event, ""); err != nil {
+					t.client.Log.Warnf("Failed to archive WhatsApp message %s: %v", event.Info.ID, err)
+				}
 			}
 		case *events.HistorySync:
 			go t.archiveHistorySync(ctx, event)
@@ -478,8 +582,32 @@ func (t *WhatsmeowTransport) registerEventHandler(ctx context.Context) {
 	})
 }
 
+// processMessageQueue drains queued *events.Message values strictly in
+// delivery order on a single dedicated goroutine (started once in
+// NewWhatsmeowTransport), off whatsmeow's own event-dispatch goroutine — see
+// registerEventHandler. Using one worker rather than one goroutine per
+// message keeps ordering intact: conversation stats are recomputed from
+// whatever is durably in the store at read time (order-independent), but a
+// reaction that lands before its target message exists is silently dropped
+// (see archiveReaction), so preserving arrival order here is what makes that
+// dependency reliable.
+func (t *WhatsmeowTransport) processMessageQueue() {
+	for {
+		select {
+		case <-t.bgCtx.Done():
+			return
+		case event := <-t.messageEvents:
+			if _, err := t.convertAndArchiveMessage(t.bgCtx, event, ""); err != nil {
+				if t.log != nil {
+					t.log.Warnf("Failed to archive WhatsApp message %s: %v", event.Info.ID, err)
+				}
+			}
+		}
+	}
+}
+
 func (t *WhatsmeowTransport) convertAndArchiveMessage(ctx context.Context, msg *events.Message, chatTitle string) (bool, error) {
-	inbound, ok := t.convertMessage(msg)
+	inbound, ok := t.convertMessage(ctx, msg)
 	if !ok {
 		return false, nil
 	}
@@ -493,6 +621,28 @@ func (t *WhatsmeowTransport) convertAndArchiveMessage(ctx context.Context, msg *
 	return true, handler(ctx, inbound)
 }
 
+// convertedHistoryMessage is one history-sync message's conversion outcome,
+// written by exactly one archiveHistorySync worker goroutine at its own
+// index — concurrent writes to distinct slice indices are safe without
+// further synchronization.
+type convertedHistoryMessage struct {
+	inbound     InboundMessage
+	ok          bool
+	parseFailed bool
+}
+
+// archiveHistorySync converts and persists one history-sync batch.
+// Conversions within a conversation run on a bounded worker pool
+// (historySyncDownloadConcurrency) since each one may include a media
+// download of up to mediaDownloadTimeout; a fully serial loop over a large
+// backlog could otherwise take hours. Each conversation's batch is persisted
+// (via t.historySync) as soon as it is converted, rather than accumulating
+// every conversation in memory for a single write at the end, so a
+// cancellation or crash partway through a large sync keeps everything
+// archived up to the last completed conversation instead of losing the whole
+// run. ctx is checked both per-conversation and inside each per-message
+// worker so cancellation stops promptly instead of only between
+// conversations.
 func (t *WhatsmeowTransport) archiveHistorySync(ctx context.Context, event *events.HistorySync) {
 	if event == nil || event.Data == nil {
 		return
@@ -500,48 +650,88 @@ func (t *WhatsmeowTransport) archiveHistorySync(ctx context.Context, event *even
 	conversations := event.Data.GetConversations()
 	t.client.Log.Infof("WhatsApp history sync received: type=%s conversations=%d progress=%d", event.Data.GetSyncType().String(), len(conversations), event.Data.GetProgress())
 
-	messages := make([]InboundMessage, 0)
-	parseFailures := 0
+	t.mu.Lock()
+	handler := t.historySync
+	t.mu.Unlock()
+	if handler == nil {
+		t.client.Log.Infof("WhatsApp history sync skipped: handler not set")
+		return
+	}
+
+	var totalArchived, totalParseFailures int
 	for _, conversation := range conversations {
 		if err := ctx.Err(); err != nil {
+			t.client.Log.Warnf("WhatsApp history sync canceled: %v", err)
 			return
 		}
 		chatJID, err := types.ParseJID(conversation.GetID())
 		if err != nil {
-			parseFailures++
+			totalParseFailures++
 			continue
 		}
 		title := strings.TrimSpace(conversation.GetDisplayName())
 		if title == "" {
 			title = strings.TrimSpace(conversation.GetName())
 		}
-		for _, historyMessage := range conversation.GetMessages() {
-			parsed, err := t.client.ParseWebMessage(chatJID, historyMessage.GetMessage())
-			if err != nil {
-				parseFailures++
-				continue
-			}
-			inbound, ok := t.convertMessage(parsed)
-			if !ok {
-				continue
-			}
-			inbound.ChatTitle = title
-			messages = append(messages, inbound)
+		historyMessages := conversation.GetMessages()
+		if len(historyMessages) == 0 {
+			continue
 		}
-	}
 
-	t.mu.Lock()
-	handler := t.historySync
-	t.mu.Unlock()
-	if handler == nil || len(messages) == 0 {
-		t.client.Log.Infof("WhatsApp history sync skipped: messages=%d parse_failures=%d handler=%t", len(messages), parseFailures, handler != nil)
-		return
+		results := make([]convertedHistoryMessage, len(historyMessages))
+		var g errgroup.Group
+		g.SetLimit(historySyncDownloadConcurrency)
+		for i, historyMessage := range historyMessages {
+			i, historyMessage := i, historyMessage
+			g.Go(func() error {
+				if err := ctx.Err(); err != nil {
+					return nil
+				}
+				// History-sync messages parse into the same *waE2E.Message shape as
+				// live events (ParseWebMessage sets RawMessage = webMsg.GetMessage()),
+				// including the per-attachment MediaKey/DirectPath fields, so the same
+				// download path applies. In practice many of these URLs will have
+				// expired by the time history sync runs; that surfaces as a per-item
+				// DownloadError rather than a structural difference to special-case.
+				parsed, err := t.client.ParseWebMessage(chatJID, historyMessage.GetMessage())
+				if err != nil {
+					results[i] = convertedHistoryMessage{parseFailed: true}
+					return nil
+				}
+				// convertMessage derives downloadCtx from ctx (not gctx), so
+				// canceling ctx unblocks an in-flight download promptly even
+				// though this pool does not use errgroup.WithContext.
+				inbound, ok := t.convertMessage(ctx, parsed)
+				if !ok {
+					return nil
+				}
+				inbound.ChatTitle = title
+				results[i] = convertedHistoryMessage{inbound: inbound, ok: true}
+				return nil
+			})
+		}
+		_ = g.Wait()
+
+		batch := make([]InboundMessage, 0, len(results))
+		for _, r := range results {
+			if r.parseFailed {
+				totalParseFailures++
+				continue
+			}
+			if r.ok {
+				batch = append(batch, r.inbound)
+			}
+		}
+		if len(batch) == 0 {
+			continue
+		}
+		if err := handler(ctx, batch); err != nil {
+			t.client.Log.Warnf("WhatsApp history sync archive completed with errors: chat=%s messages=%d error=%v", conversation.GetID(), len(batch), err)
+			continue
+		}
+		totalArchived += len(batch)
 	}
-	if err := handler(ctx, messages); err != nil {
-		t.client.Log.Warnf("WhatsApp history sync archive completed with errors: messages=%d parse_failures=%d error=%v", len(messages), parseFailures, err)
-		return
-	}
-	t.client.Log.Infof("WhatsApp history sync archived: messages=%d parse_failures=%d", len(messages), parseFailures)
+	t.client.Log.Infof("WhatsApp history sync archived: messages=%d parse_failures=%d", totalArchived, totalParseFailures)
 }
 
 func (t *WhatsmeowTransport) logWhatsAppEvent(evt any) {
@@ -586,7 +776,7 @@ func (t *WhatsmeowTransport) logWhatsAppEvent(evt any) {
 	}
 }
 
-func (t *WhatsmeowTransport) convertMessage(evt *events.Message) (InboundMessage, bool) {
+func (t *WhatsmeowTransport) convertMessage(ctx context.Context, evt *events.Message) (InboundMessage, bool) {
 	if evt == nil || evt.Message == nil || evt.Info.ID == "" {
 		return InboundMessage{}, false
 	}
@@ -623,21 +813,175 @@ func (t *WhatsmeowTransport) convertMessage(evt *events.Message) (InboundMessage
 		}, true
 	}
 	text := MessageText(evt.Message)
-	if text == "" {
+	attachment := t.downloadMediaAttachment(ctx, evt.Message)
+	// A media message with no caption (e.g. a bare PDF or photo) must still be
+	// archived: only drop the event when there is neither text nor media.
+	if text == "" && attachment == nil {
 		return InboundMessage{}, false
 	}
 	return InboundMessage{
-		Account:   t.account,
-		ChatJID:   chat,
-		SenderJID: sender,
-		MessageID: string(evt.Info.ID),
-		PushName:  evt.Info.PushName,
-		Text:      text,
-		Timestamp: evt.Info.Timestamp,
-		IsFromMe:  evt.Info.IsFromMe,
-		IsGroup:   evt.Info.IsGroup,
-		RawJSON:   raw,
+		Account:    t.account,
+		ChatJID:    chat,
+		SenderJID:  sender,
+		MessageID:  string(evt.Info.ID),
+		PushName:   evt.Info.PushName,
+		Text:       text,
+		Timestamp:  evt.Info.Timestamp,
+		IsFromMe:   evt.Info.IsFromMe,
+		IsGroup:    evt.Info.IsGroup,
+		RawJSON:    raw,
+		Attachment: attachment,
 	}, true
+}
+
+// downloadMediaAttachment extracts and downloads the media payload (if any)
+// referenced by msg. It returns nil when the message carries no downloadable
+// media. A non-nil result with empty Data means a media payload was present
+// but the bytes could not be fetched (e.g. an expired media key, a network
+// error, or a declared size over maxMediaDownloadBytes) — the caller archives
+// the message anyway with whatever metadata was available; the failure is
+// logged here and is not retried.
+func (t *WhatsmeowTransport) downloadMediaAttachment(ctx context.Context, msg *waE2E.Message) *InboundAttachment {
+	downloadable, meta, ok := extractMediaMessage(msg)
+	if !ok {
+		return nil
+	}
+	attachment := &InboundAttachment{
+		Filename:  meta.filename,
+		MimeType:  meta.mimetype,
+		MediaType: meta.mediaType,
+		Size:      meta.size,
+	}
+	if meta.size > maxMediaDownloadBytes {
+		attachment.DownloadError = fmt.Sprintf("declared size %d bytes exceeds %d byte download cap", meta.size, maxMediaDownloadBytes)
+		if t.log != nil {
+			t.log.Warnf("WhatsApp media download skipped (%s, %s): %s", meta.mediaType, meta.filename, attachment.DownloadError)
+		}
+		return attachment
+	}
+	// Snapshot the downloader under the same mutex resetClient uses to
+	// install a fresh one: reading t.downloader directly here would race
+	// with a concurrent Logout/resetClient (see resetClient), which is
+	// reachable while whatsmeow's event-dispatch goroutine is still
+	// delivering in-flight events for the old client.
+	t.mu.Lock()
+	downloader := t.downloader
+	t.mu.Unlock()
+	if downloader == nil {
+		attachment.DownloadError = "no whatsapp client available for media download"
+		return attachment
+	}
+	downloadCtx, cancel := context.WithTimeout(ctx, mediaDownloadTimeout(meta.size))
+	defer cancel()
+	data, err := downloader.Download(downloadCtx, downloadable)
+	if err != nil {
+		attachment.DownloadError = err.Error()
+		if t.log != nil {
+			t.log.Warnf("WhatsApp media download failed (%s, %s): %v", meta.mediaType, meta.filename, err)
+		}
+		return attachment
+	}
+	attachment.Data = data
+	attachment.Size = int64(len(data))
+	return attachment
+}
+
+// waMediaMeta is the caption-independent metadata whatsmeow exposes for a
+// downloadable media message, ahead of (and regardless of) the actual download.
+type waMediaMeta struct {
+	filename  string
+	mimetype  string
+	mediaType string
+	size      int64
+}
+
+// extractMediaMessage finds the downloadable media sub-message (if any) on
+// msg and returns it along with its metadata. Only one of Image/Video/
+// Document/Audio/Sticker is expected to be set per message.
+func extractMediaMessage(msg *waE2E.Message) (whatsmeow.DownloadableMessage, waMediaMeta, bool) {
+	if msg == nil {
+		return nil, waMediaMeta{}, false
+	}
+	switch {
+	case msg.GetImageMessage() != nil:
+		m := msg.GetImageMessage()
+		return m, waMediaMeta{
+			filename:  mediaFilename("", m.GetMimetype(), "image"),
+			mimetype:  m.GetMimetype(),
+			mediaType: "image",
+			size:      fileLengthInt64(m.GetFileLength()),
+		}, true
+	case msg.GetVideoMessage() != nil:
+		m := msg.GetVideoMessage()
+		return m, waMediaMeta{
+			filename:  mediaFilename("", m.GetMimetype(), "video"),
+			mimetype:  m.GetMimetype(),
+			mediaType: "video",
+			size:      fileLengthInt64(m.GetFileLength()),
+		}, true
+	case msg.GetDocumentMessage() != nil:
+		m := msg.GetDocumentMessage()
+		filename := strings.TrimSpace(m.GetFileName())
+		if filename == "" {
+			filename = mediaFilename(m.GetTitle(), m.GetMimetype(), "document")
+		}
+		return m, waMediaMeta{
+			filename:  filename,
+			mimetype:  m.GetMimetype(),
+			mediaType: "document",
+			size:      fileLengthInt64(m.GetFileLength()),
+		}, true
+	case msg.GetAudioMessage() != nil:
+		m := msg.GetAudioMessage()
+		mediaType := "audio"
+		if m.GetPTT() {
+			mediaType = "voice_note"
+		}
+		return m, waMediaMeta{
+			filename:  mediaFilename("", m.GetMimetype(), mediaType),
+			mimetype:  m.GetMimetype(),
+			mediaType: mediaType,
+			size:      fileLengthInt64(m.GetFileLength()),
+		}, true
+	case msg.GetStickerMessage() != nil:
+		m := msg.GetStickerMessage()
+		return m, waMediaMeta{
+			filename:  mediaFilename("", m.GetMimetype(), "sticker"),
+			mimetype:  m.GetMimetype(),
+			mediaType: "sticker",
+			size:      fileLengthInt64(m.GetFileLength()),
+		}, true
+	default:
+		return nil, waMediaMeta{}, false
+	}
+}
+
+// mediaFilename derives a reasonable filename for a media payload that has no
+// filename of its own (WhatsApp only sends one for document messages). base,
+// when non-empty, is used as the name stem (e.g. a document's title);
+// otherwise kind (e.g. "image") is used. The mimetype's registered extension
+// is appended when it is not already present.
+func mediaFilename(base, mimetype, kind string) string {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		base = kind
+	}
+	if ext := extensionForMimetype(mimetype); ext != "" && !strings.HasSuffix(strings.ToLower(base), ext) {
+		base += ext
+	}
+	return base
+}
+
+func extensionForMimetype(mimetype string) string {
+	mimetype = strings.TrimSpace(strings.SplitN(mimetype, ";", 2)[0])
+	if mimetype == "" {
+		return ""
+	}
+	exts, err := stdmime.ExtensionsByType(mimetype)
+	if err != nil || len(exts) == 0 {
+		return ""
+	}
+	return exts[0]
 }
 
 func MessageText(msg *waE2E.Message) string {
@@ -655,17 +999,38 @@ func MessageText(msg *waE2E.Message) string {
 		return msg.GetVideoMessage().GetCaption()
 	case msg.GetDocumentMessage().GetCaption() != "":
 		return msg.GetDocumentMessage().GetCaption()
-	case msg.GetLiveLocationMessage().GetCaption() != "":
-		return msg.GetLiveLocationMessage().GetCaption()
-	case msg.GetLocationMessage().GetName() != "":
-		return msg.GetLocationMessage().GetName()
-	case msg.GetLocationMessage().GetAddress() != "":
-		return msg.GetLocationMessage().GetAddress()
+	case msg.GetLiveLocationMessage() != nil:
+		if caption := msg.GetLiveLocationMessage().GetCaption(); caption != "" {
+			return caption
+		}
+		// A live location update with no caption is still a real message
+		// (someone started/updated sharing their location): fall back to
+		// coordinates so it is never empty (see locationText).
+		return locationText(msg.GetLiveLocationMessage().GetDegreesLatitude(), msg.GetLiveLocationMessage().GetDegreesLongitude())
+	case msg.GetLocationMessage() != nil:
+		if name := msg.GetLocationMessage().GetName(); name != "" {
+			return name
+		}
+		if address := msg.GetLocationMessage().GetAddress(); address != "" {
+			return address
+		}
+		// A bare pin-drop (no name or address) is still a real message and
+		// must not be dropped for lack of text (see locationText).
+		return locationText(msg.GetLocationMessage().GetDegreesLatitude(), msg.GetLocationMessage().GetDegreesLongitude())
 	case msg.GetContactMessage().GetDisplayName() != "":
 		return msg.GetContactMessage().GetDisplayName()
 	default:
 		return ""
 	}
+}
+
+// locationText formats a location message that has no name, address, or
+// caption as coordinates, so it always has non-empty text. Without this,
+// convertMessage would drop a bare pin-drop entirely: location messages are
+// not downloadable media (extractMediaMessage has no case for them), so text
+// is the only thing that can keep such a message from looking empty.
+func locationText(lat, lng float64) string {
+	return fmt.Sprintf("📍 %.4f, %.4f", lat, lng)
 }
 
 func ParseChatJID(raw string) (types.JID, error) {

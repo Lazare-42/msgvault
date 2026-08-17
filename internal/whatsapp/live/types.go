@@ -99,6 +99,28 @@ type InboundMessage struct {
 	IsGroup   bool
 	RawJSON   []byte
 	Reaction  *InboundReaction
+	// Attachment is non-nil when the message carries a downloadable media
+	// payload (image/video/document/audio/sticker), even if the caption is
+	// empty. A non-nil Attachment with empty Data means the media reference
+	// existed but the bytes could not be downloaded (see DownloadError); the
+	// message is archived regardless so it is never silently dropped.
+	Attachment *InboundAttachment
+}
+
+// InboundAttachment captures a WhatsApp media payload discovered on an
+// inbound message. Data is only populated when the bytes were downloaded
+// successfully; decryption requires whatsmeow's live event context, so this
+// must happen where the *events.Message is first observed (registerEventHandler
+// / archiveHistorySync), not later from stored metadata alone.
+type InboundAttachment struct {
+	Filename  string
+	MimeType  string
+	MediaType string // image, video, document, audio, voice_note, sticker
+	Size      int64
+	Data      []byte
+	// DownloadError explains why Data is empty (e.g. expired media key,
+	// network failure). Empty when Data was downloaded successfully.
+	DownloadError string
 }
 
 type InboundReaction struct {

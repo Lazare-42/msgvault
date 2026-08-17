@@ -6,23 +6,28 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"go.kenn.io/msgvault/internal/export"
+	"go.kenn.io/msgvault/internal/mime"
 	"go.kenn.io/msgvault/internal/store"
 )
 
 const reactionTypeEmoji = "emoji"
 
 type Service struct {
-	store        *store.Store
-	transport    Transport
-	account      string
-	loginContext context.Context
-	now          func() time.Time
-	notify       func(context.Context, InboundEvent)
+	store          *store.Store
+	transport      Transport
+	account        string
+	loginContext   context.Context
+	now            func() time.Time
+	notify         func(context.Context, InboundEvent)
+	attachmentsDir string
+	logger         *slog.Logger
 }
 
 type ServiceOptions struct {
@@ -34,6 +39,14 @@ type ServiceOptions struct {
 	// Notify, when set, is called after a message (inbound or outbound
 	// echo) has been archived. Reactions do not notify.
 	Notify func(context.Context, InboundEvent)
+	// AttachmentsDir is the content-addressed attachment store root (same
+	// directory Gmail/IMAP sync writes into). When empty, inbound media bytes
+	// are not persisted even if they were successfully downloaded.
+	AttachmentsDir string
+	// Logger receives warnings for failures that must not fail an
+	// already-committed message (e.g. attachment persistence — see
+	// archiveInbound). Defaults to slog.Default() when nil.
+	Logger *slog.Logger
 }
 
 type QRPairingTransport interface {
@@ -56,13 +69,19 @@ func NewService(opts ServiceOptions) (*Service, error) {
 	if loginContext == nil {
 		loginContext = context.Background()
 	}
+	logger := opts.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	return &Service{
-		store:        opts.Store,
-		transport:    opts.Transport,
-		account:      strings.TrimSpace(opts.Account),
-		loginContext: loginContext,
-		now:          now,
-		notify:       opts.Notify,
+		store:          opts.Store,
+		transport:      opts.Transport,
+		account:        strings.TrimSpace(opts.Account),
+		loginContext:   loginContext,
+		now:            now,
+		notify:         opts.Notify,
+		attachmentsDir: opts.AttachmentsDir,
+		logger:         logger,
 	}, nil
 }
 
@@ -518,6 +537,18 @@ func (s *Service) archiveInbound(ctx context.Context, msg InboundMessage, recomp
 		_ = s.store.EnsureConversationParticipant(conversationID, pid, "member")
 	}
 
+	// Gmail's raw.SizeEstimate and IMAP's RFC822Size both include attachment
+	// bytes; match that here using len(Data) directly (rather than trusting
+	// Attachment.Size, which downloadMediaAttachment only overwrites with the
+	// real byte count on a successful download — using len(Data) is
+	// self-consistent regardless of what Size happens to hold). A failed
+	// download (Data empty) correctly contributes 0, since nothing was
+	// durably stored for it.
+	sizeEstimate := int64(len(msg.Text))
+	if msg.Attachment != nil {
+		sizeEstimate += int64(len(msg.Attachment.Data))
+	}
+
 	body := sql.NullString{String: msg.Text, Valid: msg.Text != ""}
 	messageID, err := s.store.UpsertMessage(&store.Message{
 		ConversationID:  conversationID,
@@ -530,7 +561,7 @@ func (s *Service) archiveInbound(ctx context.Context, msg InboundMessage, recomp
 		SenderID:        senderID,
 		IsFromMe:        msg.IsFromMe,
 		Snippet:         sql.NullString{String: snippet(msg.Text), Valid: msg.Text != ""},
-		SizeEstimate:    int64(len(msg.Text)),
+		SizeEstimate:    sizeEstimate,
 	})
 	if err != nil {
 		return 0, fmt.Errorf("upsert message: %w", err)
@@ -552,12 +583,30 @@ func (s *Service) archiveInbound(ctx context.Context, msg InboundMessage, recomp
 		}
 	}
 
+	attachmentStored := false
+	if msg.Attachment != nil {
+		var attachmentErr error
+		attachmentStored, attachmentErr = s.storeInboundAttachment(messageID, msg.ChatJID, msg.MessageID, msg.Attachment)
+		if attachmentErr != nil {
+			// The message (and its body/raw JSON) are already durably
+			// committed above via separate auto-commit statements. Returning
+			// an error here would make the caller believe archival of the
+			// whole message failed (and skip recomputeStats/notify below) for
+			// a message that in fact exists — log and continue instead,
+			// matching Gmail/IMAP sync's storeAttachment convention
+			// (internal/sync/sync.go: a failed attachment is logged, not
+			// fatal to the message).
+			s.logger.Warn("failed to store whatsapp attachment",
+				"message_id", messageID, "filename", msg.Attachment.Filename, "error", attachmentErr)
+		}
+	}
+
 	if recomputeStats {
 		_ = s.store.RecomputeConversationStats(source.ID)
 	}
 
 	if notify && s.notify != nil {
-		s.notify(ctx, InboundEvent{
+		event := InboundEvent{
 			Account:         source.Identifier,
 			Source:          store.WhatsAppSourceType,
 			ChatJID:         msg.ChatJID,
@@ -570,9 +619,94 @@ func (s *Service) archiveInbound(ctx context.Context, msg InboundMessage, recomp
 			Timestamp:       msg.Timestamp,
 			IsFromMe:        msg.IsFromMe,
 			IsGroup:         msg.IsGroup,
-		})
+		}
+		if msg.Attachment != nil && attachmentStored {
+			event.HasAttachment = true
+			event.AttachmentMediaType = msg.Attachment.MediaType
+			event.AttachmentFilename = msg.Attachment.Filename
+		}
+		s.notify(ctx, event)
 	}
 	return messageID, nil
+}
+
+// whatsappAttachmentID returns the source_attachment_id used to mark a
+// WhatsApp-managed attachment row: prefixed so
+// Store.ReplaceMessageWhatsAppAttachments only ever touches WhatsApp's own
+// rows, and derived from the same chat+message identity as the message's own
+// source_message_id (see store.WhatsAppSourceMessageID) — a WhatsApp message
+// carries at most one downloadable attachment, so this is always unique per
+// message.
+func whatsappAttachmentID(chatJID, messageID string) string {
+	return "whatsapp:" + store.WhatsAppSourceMessageID(chatJID, messageID)
+}
+
+// storeInboundAttachment persists a WhatsApp media payload through the same
+// content-addressed attachment store Gmail/IMAP sync writes into (see
+// internal/export.StoreAttachmentFile), using the AttachmentRef/Replace*
+// pattern shared with Discord/Slack/Beeper (internal/store/attachments.go)
+// rather than the plain UpsertAttachment call Gmail/IMAP sync uses — that
+// both records media_type (UpsertAttachment has no such parameter) and lets a
+// failed download still leave a durable, queryable marker row instead of no
+// row at all.
+//
+// Unlike Beeper/Slack/Discord, a failed WhatsApp download is deliberately not
+// retried by a later backfill pass: those sources' asset references (mxc://
+// IDs, Slack permalinks, Discord CDN URLs) stay fetchable indefinitely, but a
+// WhatsApp media URL and decryption key are only meaningful for the live
+// session that observed the *events.Message (see
+// WhatsmeowTransport.downloadMediaAttachment) and are typically already gone
+// from WhatsApp's CDN by the time any later pass could revisit them —
+// archiveHistorySync's own doc comment notes that many history-sync media
+// URLs are already expired on the very first attempt. So the marker row left
+// behind here exists purely to make the failure visible and queryable
+// (attachments.content_hash IS NULL AND source_attachment_id LIKE
+// 'whatsapp:%'), not as a retry queue.
+//
+// The returned stored bool is true only when real bytes were written to the
+// content-addressed store (not for a marker row), so callers can tell a
+// successfully-archived attachment from one that merely left a failure
+// marker (see archiveInbound's notify call).
+func (s *Service) storeInboundAttachment(messageID int64, chatJID, waMessageID string, att *InboundAttachment) (stored bool, err error) {
+	if att == nil {
+		return false, nil
+	}
+	ref := store.AttachmentRef{
+		Filename:           att.Filename,
+		MimeType:           att.MimeType,
+		MediaType:          att.MediaType,
+		SourceAttachmentID: whatsappAttachmentID(chatJID, waMessageID),
+	}
+	var storeErr error
+	if len(att.Data) > 0 && s.attachmentsDir != "" {
+		mimeAtt := &mime.Attachment{
+			Filename:    att.Filename,
+			ContentType: att.MimeType,
+			Content:     att.Data,
+		}
+		storagePath, ferr := export.StoreAttachmentFile(s.attachmentsDir, mimeAtt)
+		if ferr != nil {
+			storeErr = fmt.Errorf("store whatsapp attachment file: %w", ferr)
+		} else if storagePath != "" {
+			ref.StoragePath = storagePath
+			ref.ContentHash = mimeAtt.ContentHash
+			ref.Size = len(att.Data)
+			stored = true
+		}
+	}
+	if !stored {
+		// No CAS bytes to point at (download failed, no attachments dir
+		// configured, or the write above failed): leave a marker row — see
+		// the doc comment above — instead of no row at all.
+		ref.StoragePath = "whatsapp:pending:" + ref.SourceAttachmentID
+	}
+	if err := s.store.ReplaceMessageWhatsAppAttachments(messageID, []store.AttachmentRef{ref}); err != nil {
+		storeErr = errors.Join(storeErr, fmt.Errorf("replace whatsapp attachment: %w", err))
+	}
+	if err := s.store.RecomputeMessageAttachmentStats(messageID); err != nil {
+		storeErr = errors.Join(storeErr, fmt.Errorf("recompute whatsapp attachment stats: %w", err))
+	}
+	return stored, storeErr
 }
 
 func (s *Service) archiveReaction(ctx context.Context, sourceID int64, msg InboundMessage) (int64, error) {
