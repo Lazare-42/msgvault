@@ -2,11 +2,14 @@ package live
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	assertpkg "github.com/stretchr/testify/assert"
 	requirepkg "github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/export"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
 )
@@ -462,4 +465,194 @@ func TestServiceStartLoginUsesLoginContextForReconnect(t *testing.T) {
 	_, err = svc.StartLogin(ctx)
 	requirepkg.NoError(t, err)
 	assertpkg.Equal(t, "daemon", gotScope)
+}
+
+// attachmentRow is a minimal snapshot of one `attachments` row, read via raw
+// SQL because the plain UpsertAttachment path this package uses (mirroring
+// Gmail/IMAP sync) has no dedicated typed accessor.
+type attachmentRow struct {
+	filename    string
+	mimeType    string
+	storagePath string
+	contentHash string
+	size        int64
+}
+
+func queryWhatsAppAttachment(t *testing.T, st *store.Store, messageID int64) (attachmentRow, bool) {
+	t.Helper()
+	var row attachmentRow
+	err := st.DB().QueryRow(st.Rebind(`
+		SELECT filename, mime_type, storage_path, COALESCE(content_hash, ''), size
+		FROM attachments
+		WHERE message_id = ?
+	`), messageID).Scan(&row.filename, &row.mimeType, &row.storagePath, &row.contentHash, &row.size)
+	if err != nil {
+		return attachmentRow{}, false
+	}
+	return row, true
+}
+
+func queryMessageAttachmentStats(t *testing.T, st *store.Store, messageID int64) (hasAttachments bool, count int64) {
+	t.Helper()
+	requirepkg.NoError(t, st.DB().QueryRow(st.Rebind(`
+		SELECT has_attachments, attachment_count FROM messages WHERE id = ?
+	`), messageID).Scan(&hasAttachments, &count))
+	return hasAttachments, count
+}
+
+func TestServiceArchiveInboundStoresDownloadedAttachment(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewTestStore(t)
+	attachmentsDir := t.TempDir()
+	transport := &mockTransport{
+		status: Status{AccountJID: "15551234567@s.whatsapp.net", Paired: true},
+	}
+	svc, err := NewService(ServiceOptions{
+		Store:          st,
+		Transport:      transport,
+		AttachmentsDir: attachmentsDir,
+	})
+	requirepkg.NoError(t, err)
+
+	content := []byte("%PDF-1.4 synthetic bank details")
+	messageID, err := svc.ArchiveInbound(ctx, InboundMessage{
+		Account:   "15551234567@s.whatsapp.net",
+		ChatJID:   "15557654321@s.whatsapp.net",
+		SenderJID: "15557654321@s.whatsapp.net",
+		MessageID: "media-1",
+		Timestamp: time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC),
+		Attachment: &InboundAttachment{
+			Filename:  "RIB.pdf",
+			MimeType:  "application/pdf",
+			MediaType: "document",
+			Data:      content,
+		},
+	})
+	requirepkg.NoError(t, err, "a captionless attachment message must still archive")
+	requirepkg.NotZero(t, messageID)
+
+	row, ok := queryWhatsAppAttachment(t, st, messageID)
+	requirepkg.True(t, ok, "attachment row must exist for downloaded media")
+	assertpkg.Equal(t, "RIB.pdf", row.filename)
+	assertpkg.Equal(t, "application/pdf", row.mimeType)
+	assertpkg.Equal(t, int64(len(content)), row.size)
+	assertpkg.NotEmpty(t, row.contentHash)
+
+	storedPath, err := export.StoragePath(attachmentsDir, row.contentHash)
+	requirepkg.NoError(t, err)
+	stored, err := os.ReadFile(storedPath)
+	requirepkg.NoError(t, err)
+	assertpkg.Equal(t, content, stored)
+
+	hasAttachments, count := queryMessageAttachmentStats(t, st, messageID)
+	assertpkg.True(t, hasAttachments)
+	assertpkg.Equal(t, int64(1), count)
+}
+
+func TestServiceArchiveInboundDownloadFailureArchivesMessageWithoutAttachmentRow(t *testing.T) {
+	tests := []struct {
+		name              string
+		configureAttchDir bool
+		attachment        *InboundAttachment
+	}{
+		{
+			name:              "media key expired",
+			configureAttchDir: true,
+			attachment: &InboundAttachment{
+				Filename:      "RIB.pdf",
+				MimeType:      "application/pdf",
+				MediaType:     "document",
+				DownloadError: "media key expired",
+			},
+		},
+		{
+			name:              "attachments dir not configured",
+			configureAttchDir: false,
+			attachment: &InboundAttachment{
+				Filename:  "RIB.pdf",
+				MimeType:  "application/pdf",
+				MediaType: "document",
+				Data:      []byte("downloaded but nowhere to put it"),
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			st := testutil.NewTestStore(t)
+			var dir string
+			if tt.configureAttchDir {
+				dir = t.TempDir()
+			}
+			transport := &mockTransport{
+				status: Status{AccountJID: "15551234567@s.whatsapp.net", Paired: true},
+			}
+			svc, err := NewService(ServiceOptions{
+				Store:          st,
+				Transport:      transport,
+				AttachmentsDir: dir,
+			})
+			requirepkg.NoError(t, err)
+
+			messageID, err := svc.ArchiveInbound(ctx, InboundMessage{
+				Account:    "15551234567@s.whatsapp.net",
+				ChatJID:    "15557654321@s.whatsapp.net",
+				SenderJID:  "15557654321@s.whatsapp.net",
+				MessageID:  "media-2",
+				Timestamp:  time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC),
+				Attachment: tt.attachment,
+			})
+			requirepkg.NoError(t, err, "a failed/unstorable download must not drop the message")
+			requirepkg.NotZero(t, messageID)
+
+			_, ok := queryWhatsAppAttachment(t, st, messageID)
+			assertpkg.False(t, ok, "no attachments row for bytes that were never durably stored")
+
+			hasAttachments, count := queryMessageAttachmentStats(t, st, messageID)
+			assertpkg.False(t, hasAttachments)
+			assertpkg.Zero(t, count)
+		})
+	}
+}
+
+func TestServiceArchiveInboundCaptionlessAttachmentMessageIsRetrievable(t *testing.T) {
+	ctx := context.Background()
+	st := testutil.NewTestStore(t)
+	attachmentsDir := t.TempDir()
+	transport := &mockTransport{
+		status: Status{AccountJID: "15551234567@s.whatsapp.net", Paired: true},
+	}
+	svc, err := NewService(ServiceOptions{
+		Store:          st,
+		Transport:      transport,
+		AttachmentsDir: attachmentsDir,
+	})
+	requirepkg.NoError(t, err)
+
+	// Regression coverage for the reported bug: a bare document with no
+	// caption text used to be silently dropped (MessageText returned "" and
+	// convertMessage discarded the event), so nothing was ever archived.
+	messageID, err := svc.ArchiveInbound(ctx, InboundMessage{
+		Account:   "15551234567@s.whatsapp.net",
+		ChatJID:   "15557654321@s.whatsapp.net",
+		SenderJID: "15557654321@s.whatsapp.net",
+		MessageID: "media-3",
+		Timestamp: time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC),
+		Attachment: &InboundAttachment{
+			Filename:  "RIB.pdf",
+			MimeType:  "application/pdf",
+			MediaType: "document",
+			Data:      []byte("bank details"),
+		},
+	})
+	requirepkg.NoError(t, err)
+	requirepkg.NotZero(t, messageID)
+
+	var storagePath string
+	requirepkg.NoError(t, st.DB().QueryRow(st.Rebind(`
+		SELECT storage_path FROM attachments WHERE message_id = ?
+	`), messageID).Scan(&storagePath))
+	assertpkg.NotEmpty(t, storagePath)
+	assertpkg.Equal(t, filepath.ToSlash(storagePath), storagePath, "storage path uses the CAS convention (hash[:2]/hash)")
 }

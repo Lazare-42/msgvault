@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	stdmime "mime"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -26,6 +27,18 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+// mediaDownloadTimeout bounds a single media download attempt. WhatsApp CDN
+// URLs and media keys expire, so a hung or slow download must not stall the
+// live event handler indefinitely.
+const mediaDownloadTimeout = 60 * time.Second
+
+// mediaDownloader is the subset of *whatsmeow.Client used to fetch the bytes
+// referenced by a downloadable media message. It exists so tests can supply a
+// fake without standing up a real whatsmeow client/session.
+type mediaDownloader interface {
+	Download(ctx context.Context, msg whatsmeow.DownloadableMessage) ([]byte, error)
+}
+
 type WhatsmeowOptions struct {
 	SessionPath string
 	Account     string
@@ -38,6 +51,7 @@ type WhatsmeowTransport struct {
 	sessionPath string
 	account     string
 	log         waLog.Logger
+	downloader  mediaDownloader
 
 	mu            sync.Mutex
 	handlerID     uint32
@@ -78,6 +92,7 @@ func NewWhatsmeowTransport(ctx context.Context, opts WhatsmeowOptions) (*Whatsme
 		sessionPath: opts.SessionPath,
 		account:     strings.TrimSpace(opts.Account),
 		log:         log,
+		downloader:  client,
 	}, nil
 }
 
@@ -204,6 +219,7 @@ func (t *WhatsmeowTransport) resetClient(ctx context.Context) error {
 		t.pairingCancel = nil
 	}
 	t.client = client
+	t.downloader = client
 	t.handlerID = 0
 	t.pairingState = QRPairingState{}
 	t.mu.Unlock()
@@ -479,7 +495,7 @@ func (t *WhatsmeowTransport) registerEventHandler(ctx context.Context) {
 }
 
 func (t *WhatsmeowTransport) convertAndArchiveMessage(ctx context.Context, msg *events.Message, chatTitle string) (bool, error) {
-	inbound, ok := t.convertMessage(msg)
+	inbound, ok := t.convertMessage(ctx, msg)
 	if !ok {
 		return false, nil
 	}
@@ -521,7 +537,13 @@ func (t *WhatsmeowTransport) archiveHistorySync(ctx context.Context, event *even
 				parseFailures++
 				continue
 			}
-			inbound, ok := t.convertMessage(parsed)
+			// History-sync messages parse into the same *waE2E.Message shape as
+			// live events (ParseWebMessage sets RawMessage = webMsg.GetMessage()),
+			// including the per-attachment MediaKey/DirectPath fields, so the same
+			// download path applies. In practice many of these URLs will have
+			// expired by the time history sync runs; that surfaces as a per-item
+			// DownloadError rather than a structural difference to special-case.
+			inbound, ok := t.convertMessage(ctx, parsed)
 			if !ok {
 				continue
 			}
@@ -586,7 +608,7 @@ func (t *WhatsmeowTransport) logWhatsAppEvent(evt any) {
 	}
 }
 
-func (t *WhatsmeowTransport) convertMessage(evt *events.Message) (InboundMessage, bool) {
+func (t *WhatsmeowTransport) convertMessage(ctx context.Context, evt *events.Message) (InboundMessage, bool) {
 	if evt == nil || evt.Message == nil || evt.Info.ID == "" {
 		return InboundMessage{}, false
 	}
@@ -623,21 +645,159 @@ func (t *WhatsmeowTransport) convertMessage(evt *events.Message) (InboundMessage
 		}, true
 	}
 	text := MessageText(evt.Message)
-	if text == "" {
+	attachment := t.downloadMediaAttachment(ctx, evt.Message)
+	// A media message with no caption (e.g. a bare PDF or photo) must still be
+	// archived: only drop the event when there is neither text nor media.
+	if text == "" && attachment == nil {
 		return InboundMessage{}, false
 	}
 	return InboundMessage{
-		Account:   t.account,
-		ChatJID:   chat,
-		SenderJID: sender,
-		MessageID: string(evt.Info.ID),
-		PushName:  evt.Info.PushName,
-		Text:      text,
-		Timestamp: evt.Info.Timestamp,
-		IsFromMe:  evt.Info.IsFromMe,
-		IsGroup:   evt.Info.IsGroup,
-		RawJSON:   raw,
+		Account:    t.account,
+		ChatJID:    chat,
+		SenderJID:  sender,
+		MessageID:  string(evt.Info.ID),
+		PushName:   evt.Info.PushName,
+		Text:       text,
+		Timestamp:  evt.Info.Timestamp,
+		IsFromMe:   evt.Info.IsFromMe,
+		IsGroup:    evt.Info.IsGroup,
+		RawJSON:    raw,
+		Attachment: attachment,
 	}, true
+}
+
+// downloadMediaAttachment extracts and downloads the media payload (if any)
+// referenced by msg. It returns nil when the message carries no downloadable
+// media. A non-nil result with empty Data means a media payload was present
+// but the bytes could not be fetched (e.g. an expired media key or a network
+// error) — the caller archives the message anyway with whatever metadata was
+// available; the failure is logged here and is not retried.
+func (t *WhatsmeowTransport) downloadMediaAttachment(ctx context.Context, msg *waE2E.Message) *InboundAttachment {
+	downloadable, meta, ok := extractMediaMessage(msg)
+	if !ok {
+		return nil
+	}
+	attachment := &InboundAttachment{
+		Filename:  meta.filename,
+		MimeType:  meta.mimetype,
+		MediaType: meta.mediaType,
+		Size:      meta.size,
+	}
+	if t.downloader == nil {
+		attachment.DownloadError = "no whatsapp client available for media download"
+		return attachment
+	}
+	downloadCtx, cancel := context.WithTimeout(ctx, mediaDownloadTimeout)
+	defer cancel()
+	data, err := t.downloader.Download(downloadCtx, downloadable)
+	if err != nil {
+		attachment.DownloadError = err.Error()
+		if t.log != nil {
+			t.log.Warnf("WhatsApp media download failed (%s, %s): %v", meta.mediaType, meta.filename, err)
+		}
+		return attachment
+	}
+	attachment.Data = data
+	attachment.Size = int64(len(data))
+	return attachment
+}
+
+// waMediaMeta is the caption-independent metadata whatsmeow exposes for a
+// downloadable media message, ahead of (and regardless of) the actual download.
+type waMediaMeta struct {
+	filename  string
+	mimetype  string
+	mediaType string
+	size      int64
+}
+
+// extractMediaMessage finds the downloadable media sub-message (if any) on
+// msg and returns it along with its metadata. Only one of Image/Video/
+// Document/Audio/Sticker is expected to be set per message.
+func extractMediaMessage(msg *waE2E.Message) (whatsmeow.DownloadableMessage, waMediaMeta, bool) {
+	if msg == nil {
+		return nil, waMediaMeta{}, false
+	}
+	switch {
+	case msg.GetImageMessage() != nil:
+		m := msg.GetImageMessage()
+		return m, waMediaMeta{
+			filename:  mediaFilename("", m.GetMimetype(), "image"),
+			mimetype:  m.GetMimetype(),
+			mediaType: "image",
+			size:      int64(m.GetFileLength()),
+		}, true
+	case msg.GetVideoMessage() != nil:
+		m := msg.GetVideoMessage()
+		return m, waMediaMeta{
+			filename:  mediaFilename("", m.GetMimetype(), "video"),
+			mimetype:  m.GetMimetype(),
+			mediaType: "video",
+			size:      int64(m.GetFileLength()),
+		}, true
+	case msg.GetDocumentMessage() != nil:
+		m := msg.GetDocumentMessage()
+		filename := strings.TrimSpace(m.GetFileName())
+		if filename == "" {
+			filename = mediaFilename(m.GetTitle(), m.GetMimetype(), "document")
+		}
+		return m, waMediaMeta{
+			filename:  filename,
+			mimetype:  m.GetMimetype(),
+			mediaType: "document",
+			size:      int64(m.GetFileLength()),
+		}, true
+	case msg.GetAudioMessage() != nil:
+		m := msg.GetAudioMessage()
+		mediaType := "audio"
+		if m.GetPTT() {
+			mediaType = "voice_note"
+		}
+		return m, waMediaMeta{
+			filename:  mediaFilename("", m.GetMimetype(), mediaType),
+			mimetype:  m.GetMimetype(),
+			mediaType: mediaType,
+			size:      int64(m.GetFileLength()),
+		}, true
+	case msg.GetStickerMessage() != nil:
+		m := msg.GetStickerMessage()
+		return m, waMediaMeta{
+			filename:  mediaFilename("", m.GetMimetype(), "sticker"),
+			mimetype:  m.GetMimetype(),
+			mediaType: "sticker",
+			size:      int64(m.GetFileLength()),
+		}, true
+	default:
+		return nil, waMediaMeta{}, false
+	}
+}
+
+// mediaFilename derives a reasonable filename for a media payload that has no
+// filename of its own (WhatsApp only sends one for document messages). base,
+// when non-empty, is used as the name stem (e.g. a document's title);
+// otherwise kind (e.g. "image") is used. The mimetype's registered extension
+// is appended when it is not already present.
+func mediaFilename(base, mimetype, kind string) string {
+	base = strings.TrimSpace(base)
+	if base == "" {
+		base = kind
+	}
+	if ext := extensionForMimetype(mimetype); ext != "" && !strings.HasSuffix(strings.ToLower(base), ext) {
+		base += ext
+	}
+	return base
+}
+
+func extensionForMimetype(mimetype string) string {
+	mimetype = strings.TrimSpace(strings.SplitN(mimetype, ";", 2)[0])
+	if mimetype == "" {
+		return ""
+	}
+	exts, err := stdmime.ExtensionsByType(mimetype)
+	if err != nil || len(exts) == 0 {
+		return ""
+	}
+	return exts[0]
 }
 
 func MessageText(msg *waE2E.Message) string {

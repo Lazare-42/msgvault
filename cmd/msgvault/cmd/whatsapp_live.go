@@ -96,9 +96,10 @@ var whatsappLiveMCPCmd = &cobra.Command{
 			logger.Info("WhatsApp inbound webhook enabled", "url", webhookURL)
 		}
 		serviceOpts := whatsapplive.ServiceOptions{
-			Store:        st,
-			Transport:    transport,
-			LoginContext: cmd.Context(),
+			Store:          st,
+			Transport:      transport,
+			LoginContext:   cmd.Context(),
+			AttachmentsDir: cfg.AttachmentsDir(),
 		}
 		if notifier != nil {
 			serviceOpts.Notify = notifier.Notify
