@@ -11,18 +11,21 @@ import (
 	"unicode/utf8"
 
 	"github.com/google/uuid"
+	"go.kenn.io/msgvault/internal/export"
+	"go.kenn.io/msgvault/internal/mime"
 	"go.kenn.io/msgvault/internal/store"
 )
 
 const reactionTypeEmoji = "emoji"
 
 type Service struct {
-	store        *store.Store
-	transport    Transport
-	account      string
-	loginContext context.Context
-	now          func() time.Time
-	notify       func(context.Context, InboundEvent)
+	store          *store.Store
+	transport      Transport
+	account        string
+	loginContext   context.Context
+	now            func() time.Time
+	notify         func(context.Context, InboundEvent)
+	attachmentsDir string
 }
 
 type ServiceOptions struct {
@@ -34,6 +37,10 @@ type ServiceOptions struct {
 	// Notify, when set, is called after a message (inbound or outbound
 	// echo) has been archived. Reactions do not notify.
 	Notify func(context.Context, InboundEvent)
+	// AttachmentsDir is the content-addressed attachment store root (same
+	// directory Gmail/IMAP sync writes into). When empty, inbound media bytes
+	// are not persisted even if they were successfully downloaded.
+	AttachmentsDir string
 }
 
 type QRPairingTransport interface {
@@ -57,12 +64,13 @@ func NewService(opts ServiceOptions) (*Service, error) {
 		loginContext = context.Background()
 	}
 	return &Service{
-		store:        opts.Store,
-		transport:    opts.Transport,
-		account:      strings.TrimSpace(opts.Account),
-		loginContext: loginContext,
-		now:          now,
-		notify:       opts.Notify,
+		store:          opts.Store,
+		transport:      opts.Transport,
+		account:        strings.TrimSpace(opts.Account),
+		loginContext:   loginContext,
+		now:            now,
+		notify:         opts.Notify,
+		attachmentsDir: opts.AttachmentsDir,
 	}, nil
 }
 
@@ -552,6 +560,12 @@ func (s *Service) archiveInbound(ctx context.Context, msg InboundMessage, recomp
 		}
 	}
 
+	if msg.Attachment != nil {
+		if err := s.storeInboundAttachment(messageID, msg.Attachment); err != nil {
+			return 0, fmt.Errorf("store attachment: %w", err)
+		}
+	}
+
 	if recomputeStats {
 		_ = s.store.RecomputeConversationStats(source.ID)
 	}
@@ -573,6 +587,45 @@ func (s *Service) archiveInbound(ctx context.Context, msg InboundMessage, recomp
 		})
 	}
 	return messageID, nil
+}
+
+// storeInboundAttachment persists a downloaded WhatsApp media payload through
+// the same content-addressed attachment store Gmail/IMAP sync writes into
+// (see internal/export.StoreAttachmentFile and internal/sync.Syncer.storeAttachment).
+//
+// att.Data is empty when the download failed (expired media key, network
+// error, ...); that failure was already logged where the download was
+// attempted (WhatsmeowTransport.downloadMediaAttachment), so this is a no-op
+// beyond keeping the message's attachment stats consistent with the real
+// attachments table — no attachments row is created for bytes that were
+// never fetched, matching the convention the offline WhatsApp DYI importer
+// uses for the same "no content" case.
+func (s *Service) storeInboundAttachment(messageID int64, att *InboundAttachment) error {
+	if att == nil {
+		return nil
+	}
+	var storeErr error
+	if len(att.Data) > 0 && s.attachmentsDir != "" {
+		mimeAtt := &mime.Attachment{
+			Filename:    att.Filename,
+			ContentType: att.MimeType,
+			Content:     att.Data,
+		}
+		storagePath, err := export.StoreAttachmentFile(s.attachmentsDir, mimeAtt)
+		if err != nil {
+			storeErr = fmt.Errorf("store whatsapp attachment file: %w", err)
+		} else if storagePath != "" {
+			if err := s.store.UpsertAttachment(
+				messageID, att.Filename, att.MimeType, storagePath, mimeAtt.ContentHash, len(att.Data),
+			); err != nil {
+				storeErr = fmt.Errorf("upsert whatsapp attachment: %w", err)
+			}
+		}
+	}
+	if err := s.store.RecomputeMessageAttachmentStats(messageID); err != nil && storeErr == nil {
+		storeErr = fmt.Errorf("recompute whatsapp attachment stats: %w", err)
+	}
+	return storeErr
 }
 
 func (s *Service) archiveReaction(ctx context.Context, sourceID int64, msg InboundMessage) (int64, error) {
