@@ -88,6 +88,22 @@ func (s *Store) listPendingAttachmentMessages(sourceID int64, providerPrefix str
 	return items, rows.Err()
 }
 
+// ReplaceMessageWhatsAppAttachments replaces WhatsApp-managed attachment rows
+// for a message (rows whose source_attachment_id carries the "whatsapp:"
+// prefix). A WhatsApp message carries at most one downloadable attachment, so
+// refs normally holds zero or one entries. A row with a content hash is
+// downloaded media; a row without one is a marker left when the download
+// failed or attachment storage was not configured. Unlike the Beeper/Slack/
+// Discord pending markers of the same shape, this marker is not meant to be
+// retried by a later backfill pass — WhatsApp media keys/URLs are tied to the
+// live session that observed them and are typically gone from WhatsApp's CDN
+// soon after (see internal/whatsapp/live/service.go's storeInboundAttachment)
+// — it exists purely so the failure is visible/queryable instead of the
+// message looking attachment-free.
+func (s *Store) ReplaceMessageWhatsAppAttachments(messageID int64, refs []AttachmentRef) error {
+	return s.replaceMessageProviderAttachments(messageID, "whatsapp:", refs)
+}
+
 // ReplaceMessageDiscordAttachments replaces Discord-managed attachment rows.
 // Pending rows retain an observed CDN URL or deterministic provider sentinel.
 // Hashless rows with a trusted local CAS path are duplicate-content aliases.
