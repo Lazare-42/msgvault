@@ -54,6 +54,15 @@ type QRPairingTransport interface {
 	PairingState(ctx context.Context) (QRPairingState, error)
 }
 
+// HistorySyncTransport is implemented by transports that can ask WhatsApp's
+// own on-demand history-sync mechanism for more messages in a chat (see
+// WhatsmeowTransport.RequestHistorySync). Optional, like QRPairingTransport:
+// checked with a type assertion in Service.RequestHistorySync so transports
+// that don't support it (e.g. test fakes) are unaffected.
+type HistorySyncTransport interface {
+	RequestHistorySync(ctx context.Context, req TransportRequestHistorySyncRequest) error
+}
+
 func NewService(opts ServiceOptions) (*Service, error) {
 	if opts.Store == nil {
 		return nil, errors.New("store is required")
@@ -455,6 +464,78 @@ func (s *Service) SendReaction(ctx context.Context, req SendReactionRequest) (Se
 	result.Status = store.WhatsAppOutboxSent
 	result.RemoteMessageID = remote.RemoteMessageID
 	return result, nil
+}
+
+// RequestHistorySync asks WhatsApp for more history in one chat, anchored on
+// the oldest message msgvault has already archived for it (see
+// RequestHistorySyncRequest's doc comment for why this is best-effort and
+// asynchronous — the request is sent, but the archive only actually gains
+// messages later, if and when a corresponding *events.HistorySync arrives
+// through the normal history-sync handler).
+//
+// Unlike SendMessage/SendReaction, a returned error here only ever means the
+// *request itself* could not be sent (not ready, unknown chat, no archived
+// anchor message, transport/network failure) — it is never a signal about
+// whether WhatsApp will actually return older messages.
+func (s *Service) RequestHistorySync(ctx context.Context, req RequestHistorySyncRequest) (RequestHistorySyncResult, error) {
+	req.ChatID = strings.TrimSpace(req.ChatID)
+	if req.ChatID == "" {
+		return RequestHistorySyncResult{}, errors.New("chat_id is required")
+	}
+	if _, err := s.requireReady(ctx); err != nil {
+		return RequestHistorySyncResult{}, err
+	}
+	syncer, ok := s.transport.(HistorySyncTransport)
+	if !ok {
+		return RequestHistorySyncResult{}, errors.New("whatsapp history sync request is not supported by this transport")
+	}
+
+	source, err := s.sourceForAccount(ctx, req.Account)
+	if err != nil {
+		return RequestHistorySyncResult{}, err
+	}
+
+	anchor, err := s.store.GetOldestWhatsAppMessage(ctx, source.ID, req.ChatID)
+	if err != nil {
+		return RequestHistorySyncResult{}, fmt.Errorf("find oldest archived message for %q: %w", req.ChatID, err)
+	}
+	if anchor == nil {
+		return RequestHistorySyncResult{}, fmt.Errorf(
+			"no archived whatsapp messages found for chat %q; at least one already-archived message is required as a history-sync anchor",
+			req.ChatID,
+		)
+	}
+
+	count := req.Count
+	if count <= 0 {
+		count = DefaultHistorySyncRequestCount
+	}
+	if count > MaxHistorySyncRequestCount {
+		count = MaxHistorySyncRequestCount
+	}
+
+	_, anchorMessageID, ok := store.SplitWhatsAppSourceMessageID(anchor.SourceMessageID)
+	if !ok {
+		anchorMessageID = anchor.SourceMessageID
+	}
+
+	if err := syncer.RequestHistorySync(ctx, TransportRequestHistorySyncRequest{
+		ChatJID:         req.ChatID,
+		AnchorMessageID: anchorMessageID,
+		AnchorTimestamp: anchor.SentAt,
+		AnchorIsFromMe:  anchor.IsFromMe,
+		Count:           count,
+	}); err != nil {
+		return RequestHistorySyncResult{}, fmt.Errorf("send history sync request: %w", err)
+	}
+
+	return RequestHistorySyncResult{
+		ChatJID:         req.ChatID,
+		AnchorMessageID: anchorMessageID,
+		AnchorTimestamp: anchor.SentAt,
+		AnchorIsFromMe:  anchor.IsFromMe,
+		RequestedCount:  count,
+	}, nil
 }
 
 func (s *Service) ArchiveInbound(ctx context.Context, msg InboundMessage) (int64, error) {
