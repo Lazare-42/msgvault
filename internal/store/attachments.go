@@ -144,6 +144,15 @@ func normalizeDiscordAttachmentRefs(refs []AttachmentRef) []AttachmentRef {
 	return normalized
 }
 
+// MessageWhatsAppAttachments returns WhatsApp-managed attachment rows for
+// messageID, keyed by source_attachment_id. A row with a non-empty
+// ContentHash has downloaded content; a row with an empty ContentHash is the
+// "download failed" marker left by storeInboundAttachment (see
+// internal/whatsapp/live/service.go) and carries no retrievable blob.
+func (s *Store) MessageWhatsAppAttachments(messageID int64) (map[string]AttachmentRef, error) {
+	return s.messageProviderAttachments(messageID, "whatsapp:")
+}
+
 // IsDiscordAttachmentDownloaded reports whether a Discord row references a
 // trusted local SHA-256 CAS path. A duplicate-content alias may omit its hash;
 // URLs, provider sentinels, malformed paths, and hash/path mismatches are not

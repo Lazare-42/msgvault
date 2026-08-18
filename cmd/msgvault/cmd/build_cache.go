@@ -1786,6 +1786,33 @@ func rebuildCacheAfterWrite(dbPath string) error {
 	return nil
 }
 
+// rebuildCacheForHome is rebuildCacheAfterWrite for a caller that is not
+// operating on the globally configured cfg — e.g. merge-whatsapp-history,
+// which writes into an explicit --into archive home that may differ from
+// (or not even be) the process's own MSGVAULT_HOME. Takes analyticsDir
+// explicitly instead of reading cfg.AnalyticsDir().
+func rebuildCacheForHome(dbPath, analyticsDir string) error {
+	if store.IsPostgresURL(dbPath) {
+		return nil
+	}
+	staleness := cacheNeedsBuild(dbPath, analyticsDir)
+	if !staleness.NeedsBuild {
+		return nil
+	}
+	result, err := buildCacheAuto(dbPath, analyticsDir)
+	if err != nil {
+		return fmt.Errorf("refresh analytics cache: %w", err)
+	}
+	switch {
+	case result.Skipped:
+	case result.IdentityOnly:
+		logger.Info("identity datasets refreshed", "data_dir", analyticsDir)
+	default:
+		logger.Info("cache rebuilt", "data_dir", analyticsDir, "exported", result.ExportedCount)
+	}
+	return nil
+}
+
 // buildCacheSubprocess runs `msgvault build-cache` as a child process
 // instead of calling buildCache in-process.
 //

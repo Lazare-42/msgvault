@@ -730,6 +730,29 @@ See [Text Messages](/usage/text-messages/) for usage examples.
 
 ---
 
+## merge-whatsapp-history
+
+One-time backfill of WhatsApp-sourced conversations, messages, attachments, and reactions from one archive home into another. Intended for the situation where a combined archive was split into a Gmail-only home and a separate, isolated WhatsApp home (a live WhatsApp bridge must hold an exclusive lock on its archive) — history captured before the split is only visible in the old combined home.
+
+```bash
+msgvault merge-whatsapp-history --from <old-home> --into <new-home>
+msgvault merge-whatsapp-history --from <old-home> --into <new-home> --apply
+```
+
+`--from` is opened read-only and never modified. Only `whatsapp`-sourced rows in `--from` are considered; every `--from` WhatsApp source must have a matching WhatsApp source already registered in `--into` (matched by JID) — this command backfills an existing live-synced account, it never creates one. Messages are deduplicated by `(source, source_message_id)` and attachments by content hash, so re-running is safe and never creates duplicates.
+
+The default is a dry-run report; pass `--apply` to write. `--apply` requires exclusive write access to `--into` — the same lock a live WhatsApp bridge or `msgvault serve` holds for that home — and fails fast with an actionable error if either is running against it. After a successful `--apply`, the analytics cache for `--into` is rebuilt.
+
+| Flag | Required | Description |
+|---|---|---|
+| `--from` | Yes | Source archive home to read WhatsApp history from |
+| `--into` | Yes | Target archive home to backfill WhatsApp history into |
+| `--apply` | No | Write the copy (default is a dry-run report only) |
+| `--identifier` | No | Scope to one WhatsApp source identifier (JID) in `--from`, when it has more than one |
+| `--max-attachment-bytes` | No | Max size of a single attachment blob to copy (default 300MiB) |
+
+---
+
 ## import-imessage
 
 Import messages from the local iMessage database on macOS. Requires Full Disk Access in System Settings.
