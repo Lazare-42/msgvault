@@ -362,7 +362,7 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 					summary.AttachmentsFound++
 					mediaType := mapMediaType(waMsg.MessageType)
 
-					storagePath, contentHash := imp.handleMediaFile(media, opts)
+					storagePath, contentHash, storedSize := imp.handleMediaFile(media, opts)
 					if storagePath != "" {
 						summary.MediaCopied++
 					}
@@ -377,16 +377,28 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 						filename = filepath.Base(media.FilePath.String)
 					}
 
-					size := 0
-					if media.FileSize.Valid {
-						size = int(media.FileSize.Int64)
+					size := int64(0)
+					if storagePath != "" {
+						size = storedSize
+					} else if media.FileSize.Valid {
+						size = media.FileSize.Int64
 					}
 
 					// Only insert attachment row when we have actual content.
 					// Without --media-dir, storagePath and contentHash are both
 					// empty; inserting would create broken records.
 					if storagePath != "" || contentHash != "" {
-						err := imp.store.UpsertAttachment(messageID, filename, mimeType, storagePath, contentHash, size)
+						role := store.AttachmentRoleStandalone
+						roleSource := store.AttachmentRoleSourceImporterSemantics
+						if mediaType == "sticker" {
+							role = store.AttachmentRoleSticker
+							roleSource = store.AttachmentRoleSourceProviderExplicit
+						}
+						err := imp.store.UpsertAttachmentRecord(ctx, messageID, store.AttachmentWrite{
+							Filename: filename, MIMEType: mimeType, StoragePath: storagePath,
+							ContentHash: contentHash, Size: size, MediaType: mediaType,
+							Role: role, RoleSource: roleSource, SourcePartKey: "whatsapp:media",
+						})
 						if err != nil {
 							summary.Errors++
 							imp.progress.OnError(fmt.Errorf("upsert attachment for message %s: %w", waMsg.KeyID, err))
@@ -413,7 +425,7 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 
 					// Store media metadata in the attachments table is done above.
 					// For extra metadata (width, height, duration, media_type),
-					// update via a direct SQL call since UpsertAttachment doesn't have those fields.
+					// update via a direct SQL call for provider dimensions and duration.
 					if mediaType != "" || (media.Width.Valid && media.Width.Int64 > 0) {
 						imp.updateAttachmentMetadata(messageID, contentHash, mediaType, media)
 					}
@@ -529,10 +541,11 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 }
 
 // handleMediaFile attempts to find and copy a media file to content-addressed storage.
-// Returns (storagePath, contentHash). Both empty if file not found.
-func (imp *Importer) handleMediaFile(media waMedia, opts ImportOptions) (string, string) {
+// Returns (storagePath, contentHash, storedSize). All are empty or zero if the
+// file is not found.
+func (imp *Importer) handleMediaFile(media waMedia, opts ImportOptions) (string, string, int64) {
 	if opts.MediaDir == "" || opts.AttachmentsDir == "" || !media.FilePath.Valid || media.FilePath.String == "" {
-		return "", ""
+		return "", "", 0
 	}
 
 	mediaDir := opts.MediaDir
@@ -554,18 +567,18 @@ func (imp *Importer) handleMediaFile(media waMedia, opts ImportOptions) (string,
 	fullPath := filepath.Join(mediaDir, relPath)
 	absMediaDir, err := filepath.Abs(mediaDir)
 	if err != nil {
-		return "", ""
+		return "", "", 0
 	}
 	absFullPath, err := filepath.Abs(fullPath)
 	if err != nil {
-		return "", ""
+		return "", "", 0
 	}
 	if !strings.HasPrefix(absFullPath, absMediaDir+string(filepath.Separator)) && absFullPath != absMediaDir {
 		// Path escapes mediaDir — fall back to base filename only.
 		fullPath = filepath.Join(mediaDir, filepath.Base(relPath))
 		absFullPath, _ = filepath.Abs(fullPath)
 		if !strings.HasPrefix(absFullPath, absMediaDir+string(filepath.Separator)) {
-			return "", ""
+			return "", "", 0
 		}
 	}
 
@@ -576,7 +589,7 @@ func (imp *Importer) handleMediaFile(media waMedia, opts ImportOptions) (string,
 		fullPath = filepath.Join(mediaDir, filepath.Base(relPath))
 		info, err = os.Stat(fullPath)
 		if err != nil {
-			return "", ""
+			return "", "", 0
 		}
 	}
 
@@ -586,17 +599,17 @@ func (imp *Importer) handleMediaFile(media waMedia, opts ImportOptions) (string,
 		maxSize = 100 * 1024 * 1024 // 100MB default
 	}
 	if info.Size() > maxSize {
-		return "", ""
+		return "", "", 0
 	}
 
-	relStoragePath, contentHash, _, err := export.StoreAttachmentFromPath(
+	relStoragePath, contentHash, storedSize, err := export.StoreAttachmentFromPath(
 		opts.AttachmentsDir, fullPath, maxSize)
 	if err != nil {
 		// contentHash is non-empty when hashing succeeded but storage failed;
 		// callers use it to attach metadata to the unstored attachment row.
-		return "", contentHash
+		return "", contentHash, 0
 	}
-	return relStoragePath, contentHash
+	return relStoragePath, contentHash, storedSize
 }
 
 // updateAttachmentMetadata updates media-specific metadata on an attachment record.

@@ -402,6 +402,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err := registerAttachmentMaintenanceJob(sched, attachmentMaint); err != nil {
 		return fmt.Errorf("schedule attachment maintenance: %w", err)
 	}
+	if err := configureDocumentReconcileJob(
+		ctx, sched, s, cfg.Attachments.Documents.Enabled,
+	); err != nil {
+		return fmt.Errorf("configure document reconciliation: %w", err)
+	}
 	if err := registerActivityProjectionJob(
 		sched, s, cfg.Activity, logger); err != nil {
 		return fmt.Errorf("schedule activity projection: %w", err)
@@ -1114,6 +1119,8 @@ var _ api.ClusterLookupStore = (*storeAPIAdapter)(nil)
 var _ api.ConversationWindowStore = (*storeAPIAdapter)(nil)
 var _ api.ChangedMessageLister = (*storeAPIAdapter)(nil)
 var _ api.ArchiveIdentifier = (*storeAPIAdapter)(nil)
+var _ api.DocumentSearchStore = (*storeAPIAdapter)(nil)
+var _ api.DocumentStatusStore = (*storeAPIAdapter)(nil)
 var _ api.ActivityStore = (*storeAPIAdapter)(nil)
 
 func (a *storeAPIAdapter) ContactStateContext(
@@ -1186,6 +1193,51 @@ func (a *storeAPIAdapter) ListChangedMessages(
 // reports itself unavailable on every production request.
 func (a *storeAPIAdapter) ArchiveUIDContext(ctx context.Context) (string, error) {
 	return a.store.ArchiveUIDContext(ctx)
+}
+
+func (a *storeAPIAdapter) SearchDocuments(
+	ctx context.Context,
+	request store.DocumentSearchRequest,
+) (store.DocumentSearchResponse, error) {
+	if err := reconcileDocumentOccurrencesForSearch(ctx, a.store); err != nil {
+		return store.DocumentSearchResponse{}, err
+	}
+	return a.store.SearchDocuments(ctx, request)
+}
+
+func (a *storeAPIAdapter) ReconcileDocumentOccurrences(ctx context.Context) error {
+	return reconcileDocumentOccurrencesForSearch(ctx, a.store)
+}
+
+func (a *storeAPIAdapter) GetDocumentIndexStatusForScope(
+	ctx context.Context,
+	profileID string,
+	extractionInputKey string,
+	allowedMediaTypes []string,
+	allowedMessageTypes []string,
+) (store.DocumentIndexStatus, error) {
+	return a.store.GetDocumentIndexStatusForScope(
+		ctx, profileID, extractionInputKey, allowedMediaTypes, allowedMessageTypes,
+	)
+}
+
+func (a *storeAPIAdapter) GetActiveDocumentExtractionRebuild(
+	ctx context.Context,
+	profileID string,
+	extractionInputKey string,
+) (store.DocumentExtractionRebuild, error) {
+	return a.store.GetActiveDocumentExtractionRebuild(ctx, profileID, extractionInputKey)
+}
+
+func (a *storeAPIAdapter) CountIncompleteDocumentExtractionRebuild(
+	ctx context.Context,
+	rebuild store.DocumentExtractionRebuild,
+	allowedMediaTypes []string,
+	allowedMessageTypes []string,
+) (int64, error) {
+	return a.store.CountIncompleteDocumentExtractionRebuild(
+		ctx, rebuild, allowedMediaTypes, allowedMessageTypes,
+	)
 }
 
 func (a *storeAPIAdapter) GetStats() (*api.StoreStats, error) {

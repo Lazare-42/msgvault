@@ -5,13 +5,17 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/api"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/documentindex"
+	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
+	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
 
 func TestServeRuntimeConfigCarriesVectorScopeBeforeInitialization(t *testing.T) {
@@ -37,6 +41,50 @@ func TestStoreAPIAdapterExposesFileMetadataCatalog(t *testing.T) {
 	files, err := adapter.GetFileMetadataBatch(t.Context(), nil)
 	requirements.NoError(err)
 	assertions.Empty(files)
+}
+
+func TestStoreAPIAdapterRecreatesConsentedDocumentSearchConsumer(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	fixture := storetest.New(t)
+	messageID := fixture.CreateMessage("document-search-adapter")
+	hash := strings.Repeat("a", 64)
+	require.NoError(fixture.Store.UpsertAttachmentRecord(t.Context(), messageID, store.AttachmentWrite{
+		Filename: "evidence.pdf", MIMEType: "application/pdf", Size: 128,
+		StoragePath: hash[:2] + "/" + hash, ContentHash: hash,
+		Role: store.AttachmentRoleStandalone, RoleSource: store.AttachmentRoleSourceImporterSemantics,
+		SourcePartKey: "part:1",
+	}))
+	fingerprint := strings.Repeat("b", 64)
+	profile := store.DocumentExtractionProfile{
+		ID: "profile-" + fingerprint, Fingerprint: fingerprint,
+		Provider: "mistral", Endpoint: "https://api.mistral.ai/v1/ocr",
+		Region: "eu", Model: documentindex.ModelMistralOCR,
+		RetentionPosture:  string(documentindex.RetentionStandard),
+		TrainingPosture:   string(documentindex.TrainingOptedOut),
+		AllowedMediaTypes: []string{"application/pdf"},
+		PolicyJSON:        []byte(`{"normalization":1}`),
+	}
+	_, err := fixture.Store.EnsureDocumentExtractionProfile(t.Context(), profile)
+	require.NoError(err)
+	require.NoError(fixture.Store.RecordDocumentProviderConsent(t.Context(), store.DocumentProviderConsent{
+		ProfileID: profile.ID, ProfileFingerprint: profile.Fingerprint,
+		RetentionPosture: profile.RetentionPosture, TrainingPosture: profile.TrainingPosture,
+	}))
+
+	adapter := &storeAPIAdapter{store: fixture.Store}
+	_, err = adapter.SearchDocuments(t.Context(), store.DocumentSearchRequest{Query: "absent"})
+	require.NoError(err)
+	consumer, err := fixture.Store.GetAttachmentChangeConsumer(
+		t.Context(), documentindex.DocumentAttachmentConsumerKey,
+	)
+	require.NoError(err)
+	assert.True(consumer.ReconciliationComplete)
+	var occurrences int
+	require.NoError(fixture.Store.DB().QueryRow(
+		`SELECT COUNT(*) FROM document_occurrences`,
+	).Scan(&occurrences))
+	assert.Equal(1, occurrences)
 }
 
 func TestStoreAPIAdapterServesProfileAndCommunicationServiceRoutes(t *testing.T) {

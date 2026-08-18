@@ -147,6 +147,7 @@ func fakeChannelGraph(t *testing.T) *httptest.Server {
 }
 
 func TestInlineImageDownloaded(t *testing.T) {
+	assert := assert.New(t)
 	serverURL := ""
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -175,8 +176,13 @@ func TestInlineImageDownloaded(t *testing.T) {
 	imp := NewImporter(st, NewClient(srv.URL, func(context.Context) (string, error) { return "t", nil }, 50))
 	sum, err := imp.Import(context.Background(), ImportOptions{Email: "me@example.com", AttachmentsDir: dir})
 	require.NoError(t, err)
-	assert.EqualValues(t, 1, sum.InlineImagesCopied)
-	assert.EqualValues(t, 0, sum.Errors)
+	assert.EqualValues(1, sum.InlineImagesCopied)
+	assert.EqualValues(0, sum.Errors)
+	var role, roleSource string
+	require.NoError(t, st.DB().QueryRow(`
+		SELECT attachment_role, role_source FROM attachments LIMIT 1`).Scan(&role, &roleSource))
+	assert.Equal("inline", role)
+	assert.Equal("importer_semantics", roleSource)
 }
 
 func TestContentlessGraphAttachmentDoesNotSetMessageAttachmentStats(t *testing.T) {
@@ -1522,7 +1528,10 @@ func TestTeamsMixedInlineAndLinkAttachmentsRefreshMessageStats(t *testing.T) {
 				"createdDateTime":"2025-01-01T00:00:00Z",
 				"lastModifiedDateTime":"2025-01-01T00:00:00Z",
 				"body":{"contentType":"html","content":` + jsonString(t, body) + `},
-				"attachments":[{"id":"a1","contentType":"reference","contentUrl":"https://sp/file.docx","name":"file.docx"}]
+				"attachments":[
+					{"id":"a1","contentType":"reference","contentUrl":"https://sp/file.docx","name":"file.docx"},
+					{"id":"a2","contentType":"reference","contentUrl":"https://sp/notes.txt","name":"notes.txt"}
+				]
 			}]}`))
 		default:
 			http.Error(w, "404", http.StatusNotFound)
@@ -1551,8 +1560,8 @@ func TestTeamsMixedInlineAndLinkAttachmentsRefreshMessageStats(t *testing.T) {
 		GROUP BY m.id, m.has_attachments, m.attachment_count
 	`), chatSourceMessageID("19:mixed@thread.v2", "m1")).Scan(&hasAttachments, &messageAttachmentCount, &actualAttachmentRows))
 	assert.True(hasAttachments)
-	assert.Equal(2, actualAttachmentRows)
-	assert.Equal(2, messageAttachmentCount)
+	assert.Equal(3, actualAttachmentRows)
+	assert.Equal(3, messageAttachmentCount)
 }
 
 func TestDuplicateMentionDedup(t *testing.T) {

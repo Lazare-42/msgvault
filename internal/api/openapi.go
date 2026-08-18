@@ -198,7 +198,10 @@ import (
 // 1.43.0 adds structured analytical-cache readiness responses, including the
 // transient building state, to cache-dependent coverage and detail routes.
 // Additive (minor bump): existing success responses remain unchanged.
-const APISchemaVersion = "1.43.0"
+// 1.44.0 adds dedicated extracted-document search and status routes. Additive
+// (minor bump): existing message, file, profile, media, and activity routes are
+// unchanged.
+const APISchemaVersion = "1.44.0"
 
 // OpenAPIDocument builds the API schema from the same Huma route registration
 // used by the daemon. It binds no socket and needs no database.
