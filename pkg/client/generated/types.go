@@ -2724,6 +2724,7 @@ func (o OCRResult) Validate() error {
 
 type OCRRuntimeStatus struct {
 	Enabled              bool   `json:"enabled"`
+	Exhausted            int64  `json:"exhausted"`
 	ExtractorFingerprint string `json:"extractor_fingerprint" validate:"required"`
 	Failed               int64  `json:"failed"`
 	Pending              int64  `json:"pending"`
@@ -2750,6 +2751,15 @@ type OCRSearchHit struct {
 }
 
 func (o OCRSearchHit) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(o))
+}
+
+type OcrSearchRequest struct {
+	Limit *int64 `json:"limit,omitempty"`
+	Query string `json:"query" validate:"required"`
+}
+
+func (o OcrSearchRequest) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(o))
 }
 

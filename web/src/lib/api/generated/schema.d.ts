@@ -125,6 +125,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/attachments/{hash}/text": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get cached attachment text */
+        get: operations["getAttachmentText"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/attachments/{hash}/text/request": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Queue attachment text extraction */
+        post: operations["requestAttachmentText"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/attachments/{id}": {
         parameters: {
             query?: never;
@@ -947,6 +981,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/files/text-search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Search cached attachment text */
+        post: operations["searchAttachmentText"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/files/{id}": {
         parameters: {
             query?: never;
@@ -1215,6 +1266,23 @@ export interface paths {
         post?: never;
         /** Unlink a task from an archived email */
         delete: operations["unlinkMessageTask"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/ocr/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get attachment text extraction status */
+        get: operations["getOCRStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -2086,6 +2154,7 @@ export interface components {
             oauth_app?: string;
             /** Format: int64 */
             source_deleted_count: number;
+            sync_config?: string;
             type: string;
         } & {
             [key: string]: unknown;
@@ -3010,6 +3079,82 @@ export interface components {
             name: string;
             /** Format: int64 */
             source_count?: number;
+        } & {
+            [key: string]: unknown;
+        };
+        OCRPage: {
+            /** Format: double */
+            confidence?: number;
+            method: string;
+            /** Format: int64 */
+            page_number: number;
+            text: string;
+        } & {
+            [key: string]: unknown;
+        };
+        OCRResult: {
+            /** Format: int64 */
+            attempts: number;
+            /** Format: double */
+            average_confidence?: number;
+            content_hash: string;
+            error_code?: string;
+            error_detail?: string;
+            extractor_fingerprint: string;
+            method?: string;
+            /** Format: int64 */
+            page_count?: number;
+            pages?: components["schemas"]["OCRPage"][] | null;
+            status: string;
+            /** Format: date-time */
+            updated_at: string;
+        } & {
+            [key: string]: unknown;
+        };
+        OCRRuntimeStatus: {
+            enabled: boolean;
+            /** Format: int64 */
+            exhausted: number;
+            extractor_fingerprint: string;
+            /** Format: int64 */
+            failed: number;
+            /** Format: int64 */
+            pending: number;
+            /** Format: int64 */
+            ready: number;
+            /** Format: int64 */
+            running: number;
+            /** Format: int64 */
+            unsupported: number;
+        } & {
+            [key: string]: unknown;
+        };
+        OCRSearchHit: {
+            /** Format: int64 */
+            attachment_id: number;
+            /** Format: double */
+            confidence?: number;
+            content_hash: string;
+            /** Format: int64 */
+            conversation_id: number;
+            filename: string;
+            /** Format: int64 */
+            message_id: number;
+            method: string;
+            mime_type: string;
+            /** Format: int64 */
+            page_number: number;
+            snippet: string;
+        } & {
+            [key: string]: unknown;
+        };
+        OcrSearchRequest: {
+            /** Format: int64 */
+            limit?: number;
+            query: string;
+        };
+        OcrSearchResponse: {
+            results: components["schemas"]["OCRSearchHit"][] | null;
         } & {
             [key: string]: unknown;
         };
@@ -4172,6 +4317,70 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getAttachmentText: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Attachment SHA-256 content hash */
+                hash: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OCRResult"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    requestAttachmentText: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Attachment SHA-256 content hash */
+                hash: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Accepted */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OCRResult"];
                 };
             };
             /** @description Error */
@@ -6773,6 +6982,39 @@ export interface operations {
             };
         };
     };
+    searchAttachmentText: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OcrSearchRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OcrSearchResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
     getFile: {
         parameters: {
             query?: never;
@@ -7505,6 +7747,35 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TaskLinkMutationResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getOCRStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OCRRuntimeStatus"];
                 };
             };
             /** @description Error */

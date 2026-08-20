@@ -530,11 +530,12 @@ func (c *Client) GetAttachmentContentWithResponse(ctx context.Context, options *
 }
 
 // GetAttachmentText Get cached attachment text
-func (c *Client) GetAttachmentTextWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetAttachmentTextResp, error) {
+func (c *Client) GetAttachmentTextWithResponse(ctx context.Context, options *GetAttachmentTextRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetAttachmentTextResp, error) {
 	var err error
 	reqParams := runtime.RequestOptionsParameters{
 		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/attachments/{hash}/text",
 		Method:     "GET",
+		Options:    options,
 	}
 
 	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
@@ -578,11 +579,12 @@ func (c *Client) GetAttachmentTextWithResponse(ctx context.Context, reqEditors .
 }
 
 // RequestAttachmentText Queue attachment text extraction
-func (c *Client) RequestAttachmentTextWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*RequestAttachmentTextResp, error) {
+func (c *Client) RequestAttachmentTextWithResponse(ctx context.Context, options *RequestAttachmentTextRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RequestAttachmentTextResp, error) {
 	var err error
 	reqParams := runtime.RequestOptionsParameters{
 		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/attachments/{hash}/text/request",
 		Method:     "POST",
+		Options:    options,
 	}
 
 	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
@@ -602,11 +604,11 @@ func (c *Client) RequestAttachmentTextWithResponse(ctx context.Context, reqEdito
 	}
 
 	switch resp.StatusCode {
-	case 200:
-		out.JSON200 = new(RequestAttachmentTextResponse)
+	case 202:
+		out.JSON202 = new(RequestAttachmentTextResponse)
 		bodyBytes := resp.Content
 		if len(bodyBytes) > 0 {
-			if err := json.Unmarshal(bodyBytes, out.JSON200); err != nil {
+			if err := json.Unmarshal(bodyBytes, out.JSON202); err != nil {
 				return out, &runtime.ResponseDecodeError{
 					StatusCode:    resp.StatusCode,
 					ContentType:   resp.Headers.Get("Content-Type"),
@@ -4672,11 +4674,13 @@ func (c *Client) SearchFilesWithResponse(ctx context.Context, options *SearchFil
 }
 
 // SearchAttachmentText Search cached attachment text
-func (c *Client) SearchAttachmentTextWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*SearchAttachmentTextResp, error) {
+func (c *Client) SearchAttachmentTextWithResponse(ctx context.Context, options *SearchAttachmentTextRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SearchAttachmentTextResp, error) {
 	var err error
 	reqParams := runtime.RequestOptionsParameters{
-		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/files/text-search",
-		Method:     "POST",
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/v1/files/text-search",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
 	}
 
 	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)

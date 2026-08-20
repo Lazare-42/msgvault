@@ -68,12 +68,12 @@ type ClientInterface interface {
 	GetAttachmentContentWithResponse(ctx context.Context, options *GetAttachmentContentRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetAttachmentContentResp, error)
 
 	// GetAttachmentText Get cached attachment text
-	GetAttachmentText(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetAttachmentTextResponse, error)
-	GetAttachmentTextWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetAttachmentTextResp, error)
+	GetAttachmentText(ctx context.Context, options *GetAttachmentTextRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetAttachmentTextResponse, error)
+	GetAttachmentTextWithResponse(ctx context.Context, options *GetAttachmentTextRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetAttachmentTextResp, error)
 
 	// RequestAttachmentText Queue attachment text extraction
-	RequestAttachmentText(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*RequestAttachmentTextResponse, error)
-	RequestAttachmentTextWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*RequestAttachmentTextResp, error)
+	RequestAttachmentText(ctx context.Context, options *RequestAttachmentTextRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RequestAttachmentTextResponse, error)
+	RequestAttachmentTextWithResponse(ctx context.Context, options *RequestAttachmentTextRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RequestAttachmentTextResp, error)
 
 	// GetAttachment Get attachment metadata
 	GetAttachment(ctx context.Context, options *GetAttachmentRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetAttachmentResponse, error)
@@ -292,8 +292,8 @@ type ClientInterface interface {
 	SearchFilesWithResponse(ctx context.Context, options *SearchFilesRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SearchFilesResp, error)
 
 	// SearchAttachmentText Search cached attachment text
-	SearchAttachmentText(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*SearchAttachmentTextResponse, error)
-	SearchAttachmentTextWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*SearchAttachmentTextResp, error)
+	SearchAttachmentText(ctx context.Context, options *SearchAttachmentTextRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SearchAttachmentTextResponse, error)
+	SearchAttachmentTextWithResponse(ctx context.Context, options *SearchAttachmentTextRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SearchAttachmentTextResp, error)
 
 	// GetFile Get authoritative file metadata
 	GetFile(ctx context.Context, options *GetFileRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetFileResponse, error)
@@ -1057,11 +1057,12 @@ func (c *Client) GetAttachmentContent(ctx context.Context, options *GetAttachmen
 }
 
 // GetAttachmentText Get cached attachment text
-func (c *Client) GetAttachmentText(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetAttachmentTextResponse, error) {
+func (c *Client) GetAttachmentText(ctx context.Context, options *GetAttachmentTextRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetAttachmentTextResponse, error) {
 	var err error
 	reqParams := runtime.RequestOptionsParameters{
 		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/attachments/{hash}/text",
 		Method:     "GET",
+		Options:    options,
 	}
 
 	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
@@ -1119,11 +1120,12 @@ func (c *Client) GetAttachmentText(ctx context.Context, reqEditors ...runtime.Re
 }
 
 // RequestAttachmentText Queue attachment text extraction
-func (c *Client) RequestAttachmentText(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*RequestAttachmentTextResponse, error) {
+func (c *Client) RequestAttachmentText(ctx context.Context, options *RequestAttachmentTextRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RequestAttachmentTextResponse, error) {
 	var err error
 	reqParams := runtime.RequestOptionsParameters{
 		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/attachments/{hash}/text/request",
 		Method:     "POST",
+		Options:    options,
 	}
 
 	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
@@ -1133,7 +1135,7 @@ func (c *Client) RequestAttachmentText(ctx context.Context, reqEditors ...runtim
 
 	responseParser := func(ctx context.Context, resp *runtime.Response) (*RequestAttachmentTextResponse, error) {
 		bodyBytes := resp.Content
-		if resp.StatusCode != 200 {
+		if resp.StatusCode != 202 {
 			target := new(RequestAttachmentTextErrorResponse)
 			// Handle empty error response body gracefully - skip unmarshal if no content
 			if len(bodyBytes) > 0 {
@@ -4486,11 +4488,13 @@ func (c *Client) SearchFiles(ctx context.Context, options *SearchFilesRequestOpt
 }
 
 // SearchAttachmentText Search cached attachment text
-func (c *Client) SearchAttachmentText(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*SearchAttachmentTextResponse, error) {
+func (c *Client) SearchAttachmentText(ctx context.Context, options *SearchAttachmentTextRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SearchAttachmentTextResponse, error) {
 	var err error
 	reqParams := runtime.RequestOptionsParameters{
-		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/files/text-search",
-		Method:     "POST",
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/v1/files/text-search",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
 	}
 
 	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)

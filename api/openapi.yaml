@@ -3012,6 +3012,9 @@ components:
       properties:
         enabled:
           type: boolean
+        exhausted:
+          format: int64
+          type: integer
         extractor_fingerprint:
           type: string
         failed:
@@ -3036,6 +3039,7 @@ components:
         - running
         - ready
         - failed
+        - exhausted
         - unsupported
       type: object
     OCRSearchHit:
@@ -3076,6 +3080,17 @@ components:
         - snippet
         - message_id
         - conversation_id
+      type: object
+    OcrSearchRequest:
+      additionalProperties: false
+      properties:
+        limit:
+          format: int64
+          type: integer
+        query:
+          type: string
+      required:
+        - query
       type: object
     OcrSearchResponse:
       additionalProperties: true
@@ -5264,6 +5279,13 @@ paths:
   /api/v1/attachments/{hash}/text:
     get:
       operationId: getAttachmentText
+      parameters:
+        - description: Attachment SHA-256 content hash
+          in: path
+          name: hash
+          required: true
+          schema:
+            type: string
       responses:
         "200":
           content:
@@ -5285,13 +5307,20 @@ paths:
   /api/v1/attachments/{hash}/text/request:
     post:
       operationId: requestAttachmentText
+      parameters:
+        - description: Attachment SHA-256 content hash
+          in: path
+          name: hash
+          required: true
+          schema:
+            type: string
       responses:
-        "200":
+        "202":
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/OCRResult"
-          description: OK
+          description: Accepted
         default:
           content:
             application/json:
@@ -7472,6 +7501,12 @@ paths:
   /api/v1/files/text-search:
     post:
       operationId: searchAttachmentText
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OcrSearchRequest"
+        required: true
       responses:
         "200":
           content:

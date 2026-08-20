@@ -15,6 +15,24 @@ func (g GetAttachmentContentPath) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(g))
 }
 
+type GetAttachmentTextPath struct {
+	// Hash Attachment SHA-256 content hash
+	Hash string `json:"hash" validate:"required"`
+}
+
+func (g GetAttachmentTextPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+}
+
+type RequestAttachmentTextPath struct {
+	// Hash Attachment SHA-256 content hash
+	Hash string `json:"hash" validate:"required"`
+}
+
+func (r RequestAttachmentTextPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(r))
+}
+
 type GetAttachmentPath struct {
 	// ID Attachment ID
 	ID int64 `json:"id"`

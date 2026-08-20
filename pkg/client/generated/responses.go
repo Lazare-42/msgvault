@@ -1478,7 +1478,7 @@ type RequestAttachmentTextResp struct {
 	HTTPResponse *http.Response
 	Body         []byte
 	StatusCode   int
-	JSON200      *RequestAttachmentTextResponse
+	JSON202      *RequestAttachmentTextResponse
 }
 
 type GetAttachmentResp struct {

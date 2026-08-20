@@ -64,6 +64,8 @@ type GroupFilesBody = FileGroupsHTTPRequest
 
 type SearchFilesBody = FileSearchHTTPRequest
 
+type SearchAttachmentTextBody = OcrSearchRequest
+
 type LinkIdentityParticipantsBody = IdentityLinkRequest
 
 type UnlinkIdentityParticipantsBody = IdentityLinkRequest
