@@ -31,8 +31,10 @@ var ocrExecutorCmd = &cobra.Command{
 		return ocr.ServeExecutor(cmd.Context(), ocr.ExecutorConfig{
 			Socket: socket, Languages: cfg.OCR.Languages, DPI: ocrExecutorDPI,
 			Timeout: timeout, TempDir: ocrExecutorTempDir,
+			MinImageSide: cfg.OCR.MinImageSide, MaxImageScale: cfg.OCR.MaxImageScale,
 			Limits: ocr.Limits{MaxFileBytes: cfg.OCR.MaxFileBytes, MaxPages: cfg.OCR.MaxPages,
-				MaxPixels: cfg.OCR.MaxPixels, MaxOutputBytes: cfg.OCR.MaxOutputBytes},
+				MaxPixels: cfg.OCR.MaxPixels, MaxPreprocessBytes: cfg.OCR.MaxPreprocessBytes,
+				MaxOutputBytes: cfg.OCR.MaxOutputBytes},
 		})
 	},
 }
