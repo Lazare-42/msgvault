@@ -128,6 +128,7 @@ type handlers struct {
 	whatsAppFactory   WhatsAppClientFactory
 	whatsAppLoginURL  string
 	googleDocsFactory GoogleDocsClientFactory
+	ocr               OCRClient
 
 	// Optional vector-search wiring. When hybridEngine is nil, the
 	// search_message_bodies handler rejects mode=vector and mode=hybrid with
@@ -144,6 +145,58 @@ type handlers struct {
 // servers can fetch the bytes over HTTP.
 type AttachmentReader interface {
 	ReadAttachment(ctx context.Context, contentHash string) ([]byte, error)
+}
+
+type OCRClient interface {
+	OCRStatus(context.Context) (*store.OCRRuntimeStatus, error)
+	SearchOCR(context.Context, string, int) ([]store.OCRSearchHit, error)
+	GetOCRResult(context.Context, string, bool) (*store.OCRResult, error)
+	RequestOCR(context.Context, string, string) (*store.OCRResult, error)
+}
+
+func (h *handlers) getOCRStatus(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	status, err := h.ocr.OCRStatus(ctx)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("get OCR status: %v", err)), nil
+	}
+	return structuredJSONResult(status)
+}
+
+func (h *handlers) searchAttachmentText(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	args := request.GetArguments()
+	query, _ := args["query"].(string)
+	if strings.TrimSpace(query) == "" {
+		return mcp.NewToolResultError("query is required"), nil
+	}
+	hits, err := h.ocr.SearchOCR(ctx, query, limitArg(args, "limit", 20))
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("search attachment text: %v", err)), nil
+	}
+	return structuredJSONResult(hits)
+}
+
+func (h *handlers) getAttachmentText(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	hash, _ := request.GetArguments()["content_hash"].(string)
+	if strings.TrimSpace(hash) == "" {
+		return mcp.NewToolResultError("content_hash is required"), nil
+	}
+	result, err := h.ocr.GetOCRResult(ctx, hash, true)
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("get attachment text: %v", err)), nil
+	}
+	return structuredJSONResult(result)
+}
+
+func (h *handlers) requestAttachmentText(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+	hash, _ := request.GetArguments()["content_hash"].(string)
+	if strings.TrimSpace(hash) == "" {
+		return mcp.NewToolResultError("content_hash is required"), nil
+	}
+	result, err := h.ocr.RequestOCR(ctx, hash, "")
+	if err != nil {
+		return mcp.NewToolResultError(fmt.Sprintf("request attachment text: %v", err)), nil
+	}
+	return structuredJSONResult(result)
 }
 
 // DeletionManifestSaver persists staged deletion manifests. It is optional:

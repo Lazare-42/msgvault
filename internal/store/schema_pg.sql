@@ -269,6 +269,34 @@ CREATE TABLE IF NOT EXISTS attachments (
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS attachment_ocr (
+    content_hash TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'pending',
+    extractor_fingerprint TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    method TEXT,
+    page_count INTEGER,
+    average_confidence DOUBLE PRECISION,
+    lease_expires_at TIMESTAMPTZ,
+    next_attempt_at TIMESTAMPTZ,
+    error_code TEXT,
+    error_detail TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS attachment_ocr_pages (
+    content_hash TEXT NOT NULL REFERENCES attachment_ocr(content_hash) ON DELETE CASCADE,
+    page_number INTEGER NOT NULL,
+    method TEXT NOT NULL,
+    text TEXT NOT NULL,
+    confidence DOUBLE PRECISION,
+    search_fts TSVECTOR GENERATED ALWAYS AS (to_tsvector('simple', coalesce(text, ''))) STORED,
+    PRIMARY KEY (content_hash, page_number)
+);
+
 -- ============================================================================
 -- LABELS
 -- ============================================================================
@@ -534,6 +562,10 @@ CREATE INDEX IF NOT EXISTS idx_attachments_hash ON attachments(content_hash);
 -- statement_timeout on a large archive (finding S1). SQLite keeps the indexes
 -- in schema.sql (no statement_timeout there).
 CREATE INDEX IF NOT EXISTS idx_attachments_storage_path ON attachments(storage_path);
+CREATE INDEX IF NOT EXISTS idx_attachment_ocr_claim
+    ON attachment_ocr(status, priority DESC, next_attempt_at, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_attachment_ocr_pages_fts
+    ON attachment_ocr_pages USING GIN(search_fts);
 -- idx_attachments_msg_content_hash is created in Go (Store.InitSchema)
 -- after a one-shot dedupe of legacy duplicate rows.
 

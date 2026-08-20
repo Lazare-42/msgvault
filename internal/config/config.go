@@ -346,10 +346,75 @@ type Config struct {
 	Backup       BackupConfig       `toml:"backup"`
 	Discord      DiscordConfig      `toml:"discord"`
 	GoogleDocs   GoogleDocsConfig   `toml:"google_docs"`
+	OCR          OCRConfig          `toml:"ocr"`
 
 	// Computed paths (not from config file)
 	HomeDir    string `toml:"-"`
 	configPath string // resolved path to the loaded config file
+}
+
+// OCRConfig controls asynchronous attachment text extraction. It is disabled
+// by default; the daemon remains the sole archive/CAS owner and talks to a
+// stateless executor over a local Unix socket.
+type OCRConfig struct {
+	Enabled        bool          `toml:"enabled"`
+	Socket         string        `toml:"socket"`
+	Schedule       string        `toml:"schedule"`
+	Languages      string        `toml:"languages"`
+	Fingerprint    string        `toml:"fingerprint"`
+	BatchSize      int           `toml:"batch_size"`
+	LeaseDuration  time.Duration `toml:"lease_duration"`
+	RequestTimeout time.Duration `toml:"request_timeout"`
+	MaxFileBytes   int64         `toml:"max_file_bytes"`
+	MaxPages       int           `toml:"max_pages"`
+	MaxPixels      int64         `toml:"max_pixels"`
+	MaxOutputBytes int64         `toml:"max_output_bytes"`
+}
+
+func (o *OCRConfig) ApplyDefaults() {
+	if o.Socket == "" {
+		o.Socket = filepath.Join(os.TempDir(), "msgvault-ocr.sock")
+	}
+	if o.Schedule == "" {
+		o.Schedule = "*/10 * * * *"
+	}
+	if o.Languages == "" {
+		o.Languages = "fra+eng"
+	}
+	if o.Fingerprint == "" {
+		o.Fingerprint = "poppler+tesseract-v1:" + o.Languages
+	}
+	if o.BatchSize <= 0 {
+		o.BatchSize = 1
+	}
+	if o.LeaseDuration <= 0 {
+		o.LeaseDuration = 15 * time.Minute
+	}
+	if o.RequestTimeout <= 0 {
+		o.RequestTimeout = 10 * time.Minute
+	}
+	if o.MaxFileBytes <= 0 {
+		o.MaxFileBytes = 100 << 20
+	}
+	if o.MaxPages <= 0 {
+		o.MaxPages = 200
+	}
+	if o.MaxPixels <= 0 {
+		o.MaxPixels = 40_000_000
+	}
+	if o.MaxOutputBytes <= 0 {
+		o.MaxOutputBytes = 16 << 20
+	}
+}
+
+func (o OCRConfig) Validate() error {
+	if o.Enabled && !filepath.IsAbs(o.Socket) {
+		return fmt.Errorf("invalid [ocr] socket %q: must be an absolute path", o.Socket)
+	}
+	if o.BatchSize < 1 || o.BatchSize > 16 {
+		return fmt.Errorf("invalid [ocr] batch_size %d: must be between 1 and 16", o.BatchSize)
+	}
+	return nil
 }
 
 // LogConfig holds logging configuration. File logging is opt-in:
@@ -541,6 +606,7 @@ func NewDefaultConfig() *Config {
 	cfg.Discord.ApplyDefaults()
 	cfg.Web.ApplyDefaults()
 	cfg.Integrations.Tasks.ApplyDefaults()
+	cfg.OCR.ApplyDefaults()
 	return cfg
 }
 
@@ -633,6 +699,7 @@ func decodeConfig(cfg *Config, path string, explicit, homeOverride bool, content
 	cfg.OAuth.ServiceAccountKey = expandPath(cfg.OAuth.ServiceAccountKey)
 	cfg.Vector.DBPath = expandPath(cfg.Vector.DBPath)
 	cfg.Backup.Repo = expandPath(cfg.Backup.Repo)
+	cfg.OCR.Socket = expandPath(cfg.OCR.Socket)
 	for name, app := range cfg.OAuth.Apps {
 		app.ClientSecrets = expandPath(app.ClientSecrets)
 		app.ServiceAccountKey = expandPath(app.ServiceAccountKey)
@@ -648,6 +715,7 @@ func decodeConfig(cfg *Config, path string, explicit, homeOverride bool, content
 		cfg.OAuth.ServiceAccountKey = resolveRelative(cfg.OAuth.ServiceAccountKey, cfg.HomeDir)
 		cfg.Vector.DBPath = resolveRelative(cfg.Vector.DBPath, cfg.HomeDir)
 		cfg.Backup.Repo = resolveRelative(cfg.Backup.Repo, cfg.HomeDir)
+		cfg.OCR.Socket = resolveRelative(cfg.OCR.Socket, cfg.HomeDir)
 		for name, app := range cfg.OAuth.Apps {
 			app.ClientSecrets = resolveRelative(app.ClientSecrets, cfg.HomeDir)
 			app.ServiceAccountKey = resolveRelative(app.ServiceAccountKey, cfg.HomeDir)
@@ -675,6 +743,10 @@ func decodeConfig(cfg *Config, path string, explicit, homeOverride bool, content
 	}
 	cfg.Integrations.Tasks.ApplyDefaults()
 	if err := cfg.Integrations.Tasks.Validate(); err != nil {
+		return nil, err
+	}
+	cfg.OCR.ApplyDefaults()
+	if err := cfg.OCR.Validate(); err != nil {
 		return nil, err
 	}
 	if err := cfg.Backup.Validate(); err != nil {

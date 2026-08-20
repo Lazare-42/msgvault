@@ -157,6 +157,13 @@ type AttachmentBlobStore interface {
 	OpenStream(ctx context.Context, hash string) (io.ReadCloser, int64, error)
 }
 
+type OCRStore interface {
+	OCRSummary(context.Context) (store.OCRSummary, error)
+	RequestOCR(context.Context, string, string) (*store.OCRResult, error)
+	GetOCRResult(context.Context, string, bool) (*store.OCRResult, error)
+	SearchOCR(context.Context, string, int) ([]store.OCRSearchHit, error)
+}
+
 // Server represents the HTTP API server.
 type Server struct {
 	cfg            *config.Config
@@ -245,6 +252,7 @@ type Server struct {
 	// and embedded callers that construct a Server without options, which
 	// fall back to the legacy loose-file open.
 	blobStore AttachmentBlobStore
+	ocrStore  OCRStore
 	// remoteImages is the SSRF-hardened fetcher behind
 	// POST /api/v1/content/remote-image. Tests replace it to inject a fake
 	// resolver and dialer.
@@ -416,6 +424,9 @@ func NewServerWithOptions(opts ServerOptions) *Server {
 		taskIntegrationProbe: taskProbe,
 		taskLinkOperations:   opts.TaskLinkOperations,
 		taskIdentityResolver: opts.TaskIdentityResolver,
+	}
+	if ocrStore, ok := opts.Store.(OCRStore); ok {
+		s.ocrStore = ocrStore
 	}
 	if s.taskIdentityResolver == nil {
 		s.taskIdentityResolver = s.resolveTaskMessageIdentity

@@ -91,6 +91,7 @@ func daemonMCPServeOptions(ctx context.Context, st *daemonclient.Client) (mcpser
 		AttachmentsDir:   cfg.AttachmentsDir(),
 		AttachmentReader: st,
 		ManifestSaver:    daemonMCPManifestSaver{client: st},
+		OCR:              st,
 		DataDir:          cfg.Data.DataDir,
 	}
 
