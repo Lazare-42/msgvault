@@ -585,6 +585,9 @@ type ServerOptions struct {
 	// GET /api/v1/messages/{id}/recordings. Nil serves an empty list.
 	MessageRecordings  *MessageRecordingReader
 	DocbankAttachments *DocbankAttachmentReader
+	// OCRStore owns attachment text queue/results. Kept explicit because the
+	// production MessageStore is an adapter rather than the concrete archive.
+	OCRStore OCRStore
 	// RequestTimeout caps each request by adding a deadline to the request
 	// context. Zero defaults to 60s. The underlying http.Server's WriteTimeout
 	// is set to RequestTimeout + 5s so handlers that honor cancellation can
@@ -719,9 +722,7 @@ func NewServerWithOptions(opts ServerOptions) *Server {
 		// kit's nil-reporter handler admits no event.
 		s.telemetryCapture = posthog.NewCaptureHandler(nil)
 	}
-	if ocrStore, ok := opts.Store.(OCRStore); ok {
-		s.ocrStore = ocrStore
-	}
+	s.ocrStore = opts.OCRStore
 	if s.taskIdentityResolver == nil {
 		s.taskIdentityResolver = s.resolveTaskMessageIdentity
 	}

@@ -575,13 +575,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 		ocrWorker := ocr.NewWorker(s, blobStore, ocrClient, ocr.WorkerConfig{
 			Fingerprint: cfg.OCR.Fingerprint, BatchSize: cfg.OCR.BatchSize,
 			Lease: cfg.OCR.LeaseDuration, MaxFileBytes: cfg.OCR.MaxFileBytes,
+			MaxAttempts: cfg.OCR.MaxAttempts,
 		}, logger)
 		if err := sched.AddJob(scheduler.Job{
 			Name: "attachment-ocr", Schedule: cfg.OCR.Schedule,
 			Run: func(ctx context.Context) error {
 				result, err := ocrWorker.RunOnce(ctx)
 				logger.Info("attachment OCR run", "discovered", result.Discovered,
-					"processed", result.Processed, "succeeded", result.Succeeded, "failed", result.Failed)
+					"processed", result.Processed, "succeeded", result.Succeeded,
+					"failed", result.Failed, "lost_lease", result.LostLease)
 				return err
 			},
 		}); err != nil {
@@ -948,6 +950,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		TelemetryCapture:              telemetry.CaptureHandler(telemetryReporter, cfg.Data.DataDir),
 		MessageRecordings:             messageRecordings,
 		DocbankAttachments:            docbankAttachments,
+ OCRStore: s,
 	}
 	apiOpts.GmailProfileAddress = func(ctx context.Context, source *store.Source) (string, error) {
 		client, serviceAccount, err := newDaemonGmailClient(
