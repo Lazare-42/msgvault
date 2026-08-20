@@ -10,6 +10,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/ocr"
 )
 
 func TestServerConfigDefaults(t *testing.T) {
@@ -1959,6 +1960,10 @@ func TestOCRDefaultsFollowArchiveHome(t *testing.T) {
 	requirements.NoError(err)
 	assertions.Equal(filepath.Join(home, "ocr", "executor.sock"), cfg.OCR.Socket)
 	assertions.Equal(5, cfg.OCR.MaxAttempts)
+	assertions.Equal("poppler+tesseract-v1:fra+eng", cfg.OCR.Fingerprint)
+	assertions.Equal(ocr.DefaultMinImageSide, cfg.OCR.MinImageSide)
+	assertions.Equal(ocr.DefaultMaxImageScale, cfg.OCR.MaxImageScale)
+	assertions.Equal(ocr.DefaultMaxPreprocessBytes, cfg.OCR.MaxPreprocessBytes)
 }
 
 func TestOCRMaxAttemptsValidation(t *testing.T) {
@@ -1967,4 +1972,26 @@ func TestOCRMaxAttemptsValidation(t *testing.T) {
 	err := cfg.OCR.Validate()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "max_attempts")
+}
+
+func TestOCRResourceValidation(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*OCRConfig)
+		field  string
+	}{
+		{name: "pixels", mutate: func(cfg *OCRConfig) { cfg.MaxPixels = ocr.MaxConfiguredPixels + 1 }, field: "max_pixels"},
+		{name: "preprocess bytes", mutate: func(cfg *OCRConfig) { cfg.MaxPreprocessBytes = ocr.MaxConfiguredPreprocessBytes + 1 }, field: "max_preprocess_bytes"},
+		{name: "minimum side", mutate: func(cfg *OCRConfig) { cfg.MinImageSide = 4097 }, field: "min_image_side"},
+		{name: "scale", mutate: func(cfg *OCRConfig) { cfg.MaxImageScale = 9 }, field: "max_image_scale"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := NewDefaultConfig()
+			tt.mutate(&cfg.OCR)
+			err := cfg.OCR.Validate()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tt.field)
+		})
+	}
 }

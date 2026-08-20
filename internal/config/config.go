@@ -358,19 +358,22 @@ type Config struct {
 // by default; the daemon remains the sole archive/CAS owner and talks to a
 // stateless executor over a local Unix socket.
 type OCRConfig struct {
-	Enabled        bool          `toml:"enabled"`
-	Socket         string        `toml:"socket"`
-	Schedule       string        `toml:"schedule"`
-	Languages      string        `toml:"languages"`
-	Fingerprint    string        `toml:"fingerprint"`
-	BatchSize      int           `toml:"batch_size"`
-	LeaseDuration  time.Duration `toml:"lease_duration"`
-	RequestTimeout time.Duration `toml:"request_timeout"`
-	MaxFileBytes   int64         `toml:"max_file_bytes"`
-	MaxPages       int           `toml:"max_pages"`
-	MaxPixels      int64         `toml:"max_pixels"`
-	MaxOutputBytes int64         `toml:"max_output_bytes"`
-	MaxAttempts    int           `toml:"max_attempts"`
+	Enabled            bool          `toml:"enabled"`
+	Socket             string        `toml:"socket"`
+	Schedule           string        `toml:"schedule"`
+	Languages          string        `toml:"languages"`
+	Fingerprint        string        `toml:"fingerprint"`
+	BatchSize          int           `toml:"batch_size"`
+	LeaseDuration      time.Duration `toml:"lease_duration"`
+	RequestTimeout     time.Duration `toml:"request_timeout"`
+	MaxFileBytes       int64         `toml:"max_file_bytes"`
+	MaxPages           int           `toml:"max_pages"`
+	MaxPixels          int64         `toml:"max_pixels"`
+	MaxPreprocessBytes int64         `toml:"max_preprocess_bytes"`
+	MaxOutputBytes     int64         `toml:"max_output_bytes"`
+	MaxAttempts        int           `toml:"max_attempts"`
+	MinImageSide       int           `toml:"min_image_side"`
+	MaxImageScale      int           `toml:"max_image_scale"`
 }
 
 func (o *OCRConfig) ApplyDefaults(homeDir string) {
@@ -397,13 +400,21 @@ func (o *OCRConfig) ApplyDefaults(homeDir string) {
 	}
 	limits := ocr.Limits{
 		MaxFileBytes: o.MaxFileBytes, MaxPages: o.MaxPages,
-		MaxPixels: o.MaxPixels, MaxOutputBytes: o.MaxOutputBytes,
+		MaxPixels: o.MaxPixels, MaxPreprocessBytes: o.MaxPreprocessBytes,
+		MaxOutputBytes: o.MaxOutputBytes,
 	}
 	ocr.ApplyLimitDefaults(&limits)
 	o.MaxFileBytes, o.MaxPages = limits.MaxFileBytes, limits.MaxPages
-	o.MaxPixels, o.MaxOutputBytes = limits.MaxPixels, limits.MaxOutputBytes
+	o.MaxPixels, o.MaxPreprocessBytes = limits.MaxPixels, limits.MaxPreprocessBytes
+	o.MaxOutputBytes = limits.MaxOutputBytes
 	if o.MaxAttempts <= 0 {
 		o.MaxAttempts = ocr.DefaultMaxAttempts
+	}
+	if o.MinImageSide <= 0 {
+		o.MinImageSide = ocr.DefaultMinImageSide
+	}
+	if o.MaxImageScale <= 0 {
+		o.MaxImageScale = ocr.DefaultMaxImageScale
 	}
 }
 
@@ -416,6 +427,18 @@ func (o OCRConfig) Validate() error {
 	}
 	if o.MaxAttempts < 1 || o.MaxAttempts > 100 {
 		return fmt.Errorf("invalid [ocr] max_attempts %d: must be between 1 and 100", o.MaxAttempts)
+	}
+	if o.MaxPixels > ocr.MaxConfiguredPixels {
+		return fmt.Errorf("invalid [ocr] max_pixels %d: must not exceed %d", o.MaxPixels, ocr.MaxConfiguredPixels)
+	}
+	if o.MaxPreprocessBytes > ocr.MaxConfiguredPreprocessBytes {
+		return fmt.Errorf("invalid [ocr] max_preprocess_bytes %d: must not exceed %d", o.MaxPreprocessBytes, ocr.MaxConfiguredPreprocessBytes)
+	}
+	if o.MinImageSide < 1 || o.MinImageSide > 4096 {
+		return fmt.Errorf("invalid [ocr] min_image_side %d: must be between 1 and 4096", o.MinImageSide)
+	}
+	if o.MaxImageScale < 1 || o.MaxImageScale > 8 {
+		return fmt.Errorf("invalid [ocr] max_image_scale %d: must be between 1 and 8", o.MaxImageScale)
 	}
 	return nil
 }
