@@ -4130,6 +4130,20 @@ type GetAttachmentContentResp struct {
 	JSONDefault  *GetAttachmentContentErrorResponseJSONDefault
 }
 
+type GetAttachmentTextResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *GetAttachmentTextResponse
+}
+
+type RequestAttachmentTextResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *RequestAttachmentTextResponse
+}
+
 type GetAttachmentResp struct {
 	HTTPResponse *http.Response
 	Body         []byte
@@ -5363,6 +5377,13 @@ type SuggestFilesResp struct {
 	JSON422      *SuggestFilesErrorResponseJSON
 	JSON503      *SuggestFilesErrorResponseJSON503
 	JSONDefault  *SuggestFilesErrorResponseJSONDefault
+}
+
+type SearchAttachmentTextResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *SearchAttachmentTextResponse
 }
 
 type GetFileResp struct {

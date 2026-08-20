@@ -60,3 +60,9 @@ AFTER UPDATE OF text ON document_chunks BEGIN
     VALUES ('delete', old.id, old.text);
     INSERT INTO document_chunks_fts(rowid, text) VALUES (new.id, new.text);
 END;
+CREATE VIRTUAL TABLE IF NOT EXISTS attachment_ocr_fts USING fts5(
+    content_hash UNINDEXED,
+    page_number UNINDEXED,
+    text,
+    tokenize='unicode61 remove_diacritics 1'
+);

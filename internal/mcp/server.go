@@ -133,6 +133,10 @@ const (
 	ToolAppendGoogleDocText    = "append_google_doc_text"
 	ToolReplaceGoogleDocText   = "replace_google_doc_text"
 	ToolWhatsAppRequestHistorySync = "whatsapp_request_history_sync"
+	ToolSearchAttachmentText       = "search_attachment_text"
+	ToolGetAttachmentText          = "get_attachment_text"
+	ToolRequestAttachmentText      = "request_attachment_text"
+	ToolGetOCRStatus               = "get_ocr_status"
 )
 
 // search_message_bodies/search_in_message mode values (wire format).
@@ -196,6 +200,7 @@ type ServeOptions struct {
 	// AllowKataWrites exposes Kata issue creation and evidence linking when
 	// the transport's general write policy also permits writes.
 	AllowKataWrites bool
+	OCR OCRClient
 
 	// HybridEngine is optional. When nil, semantic_search_messages rejects
 	// vector/hybrid searches with a vector_not_enabled error.

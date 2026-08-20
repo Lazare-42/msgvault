@@ -253,6 +253,13 @@ type analyticsEngineState struct {
 
 type analyticsEngineContextKey struct{}
 
+type OCRStore interface {
+	OCRSummary(context.Context) (store.OCRSummary, error)
+	RequestOCR(context.Context, string, string) (*store.OCRResult, error)
+	GetOCRResult(context.Context, string, bool) (*store.OCRResult, error)
+	SearchOCR(context.Context, string, int) ([]store.OCRSearchHit, error)
+}
+
 // Server represents the HTTP API server.
 type Server struct {
 	// statsSnapshots and accountCountSnapshots bound /stats and
@@ -433,6 +440,7 @@ type Server struct {
 	// an empty list.
 	messageRecordings  *MessageRecordingReader
 	docbankAttachments *DocbankAttachmentReader
+	ocrStore  OCRStore
 	// remoteImages is the SSRF-hardened fetcher behind
 	// POST /api/v1/content/remote-image. Tests replace it to inject a fake
 	// resolver and dialer.
@@ -710,6 +718,9 @@ func NewServerWithOptions(opts ServerOptions) *Server {
 	if s.telemetryCapture == nil {
 		// kit's nil-reporter handler admits no event.
 		s.telemetryCapture = posthog.NewCaptureHandler(nil)
+	}
+	if ocrStore, ok := opts.Store.(OCRStore); ok {
+		s.ocrStore = ocrStore
 	}
 	if s.taskIdentityResolver == nil {
 		s.taskIdentityResolver = s.resolveTaskMessageIdentity

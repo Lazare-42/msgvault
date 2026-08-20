@@ -17128,6 +17128,48 @@ paths:
       summary: Download attachment content by SHA-256 hash
       tags:
         - API
+  /api/v1/attachments/{hash}/text:
+    get:
+      operationId: getAttachmentText
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OCRResult"
+          description: OK
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Get cached attachment text
+      tags:
+        - API
+  /api/v1/attachments/{hash}/text/request:
+    post:
+      operationId: requestAttachmentText
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OCRResult"
+          description: OK
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Queue attachment text extraction
+      tags:
+        - API
   /api/v1/attachments/{id}:
     get:
       operationId: getAttachment
