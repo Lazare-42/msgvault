@@ -143,7 +143,7 @@ func TestOCRStaleWorkerCannotCompleteReclaimedLease(t *testing.T) {
 	stale, err := f.Store.ClaimOCRJob(t.Context(), "extractor-v1", time.Minute)
 	requirements.NoError(err)
 	requirements.NotNil(stale)
-	_, err = f.Store.DB().ExecContext(t.Context(), `UPDATE attachment_ocr SET lease_expires_at = ? WHERE content_hash = ?`, time.Now().Add(-time.Minute), hash)
+	_, err = f.Store.DB().ExecContext(t.Context(), `UPDATE attachment_ocr SET lease_expires_at = ? WHERE content_hash = ?`, "2000-01-01 00:00:00", hash)
 	requirements.NoError(err)
 	current, err := f.Store.ClaimOCRJob(t.Context(), "extractor-v1", time.Minute)
 	requirements.NoError(err)
