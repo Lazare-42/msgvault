@@ -346,6 +346,9 @@ type ServerOptions struct {
 	// packed CAS storage with a loose-file fallback. Nil keeps the legacy
 	// loose-file-only read path.
 	BlobStore AttachmentBlobStore
+	// OCRStore owns attachment text queue/results. Kept explicit because the
+	// production MessageStore is an adapter rather than the concrete archive.
+	OCRStore OCRStore
 	// RequestTimeout caps each request by adding a deadline to the request
 	// context. Zero defaults to 60s. The underlying http.Server's WriteTimeout
 	// is set to RequestTimeout + 5s so handlers that honor cancellation can
@@ -425,9 +428,7 @@ func NewServerWithOptions(opts ServerOptions) *Server {
 		taskLinkOperations:   opts.TaskLinkOperations,
 		taskIdentityResolver: opts.TaskIdentityResolver,
 	}
-	if ocrStore, ok := opts.Store.(OCRStore); ok {
-		s.ocrStore = ocrStore
-	}
+	s.ocrStore = opts.OCRStore
 	if s.taskIdentityResolver == nil {
 		s.taskIdentityResolver = s.resolveTaskMessageIdentity
 	}

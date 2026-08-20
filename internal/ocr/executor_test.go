@@ -28,6 +28,8 @@ func TestParseTSVPreservesLinesAndConfidence(t *testing.T) {
 }
 
 func TestExtractImageWithRealTesseract(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
 	tesseract, err := exec.LookPath("tesseract")
 	if err != nil {
 		t.Skip("tesseract not installed")
@@ -39,9 +41,9 @@ func TestExtractImageWithRealTesseract(t *testing.T) {
 	}
 	drawBlockText(img, 30, 35, "TEST123", 12)
 	f, err := os.Create(path)
-	require.NoError(t, err)
-	require.NoError(t, png.Encode(f, img))
-	require.NoError(t, f.Close())
+	requirements.NoError(err)
+	requirements.NoError(png.Encode(f, img))
+	requirements.NoError(f.Close())
 
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
@@ -49,15 +51,17 @@ func TestExtractImageWithRealTesseract(t *testing.T) {
 		Languages: "eng", Tesseract: tesseract,
 		Limits: Limits{MaxPixels: 1_000_000, MaxOutputBytes: 1 << 20},
 	}, path)
-	assert.Empty(t, resp.ErrorCode, resp.Error)
-	assert.Equal(t, "ocr", resp.Method)
-	if assert.Len(t, resp.Pages, 1) {
-		assert.Equal(t, "ocr", resp.Pages[0].Method)
-		assert.NotEmpty(t, resp.Pages[0].Text)
+	assertions.Empty(resp.ErrorCode, resp.Error)
+	assertions.Equal("ocr", resp.Method)
+	if assertions.Len(resp.Pages, 1) {
+		assertions.Equal("ocr", resp.Pages[0].Method)
+		assertions.NotEmpty(resp.Pages[0].Text)
 	}
 }
 
 func TestExtractPDFNativeWithRealPoppler(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
 	pdfinfo, err := exec.LookPath("pdfinfo")
 	if err != nil {
 		t.Skip("pdfinfo not installed")
@@ -67,7 +71,7 @@ func TestExtractPDFNativeWithRealPoppler(t *testing.T) {
 		t.Skip("pdftotext not installed")
 	}
 	path := filepath.Join(t.TempDir(), "synthetic.pdf")
-	require.NoError(t, os.WriteFile(path, syntheticTextPDF("SYNTHETIC ORCHID INVOICE 417"), 0o600))
+	requirements.NoError(os.WriteFile(path, syntheticTextPDF("SYNTHETIC ORCHID INVOICE 417"), 0o600))
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
 	resp := extractPDF(ctx, ExecutorConfig{
@@ -75,11 +79,11 @@ func TestExtractPDFNativeWithRealPoppler(t *testing.T) {
 		Limits: Limits{MaxPages: 10, MaxPixels: 40_000_000, MaxOutputBytes: 1 << 20},
 		DPI:    200,
 	}, path, t.TempDir())
-	assert.Empty(t, resp.ErrorCode, resp.Error)
-	assert.Equal(t, "native", resp.Method)
-	if assert.Len(t, resp.Pages, 1) {
-		assert.Equal(t, "native", resp.Pages[0].Method)
-		assert.Contains(t, resp.Pages[0].Text, "ORCHID")
+	assertions.Empty(resp.ErrorCode, resp.Error)
+	assertions.Equal("native", resp.Method)
+	if assertions.Len(resp.Pages, 1) {
+		assertions.Equal("native", resp.Pages[0].Method)
+		assertions.Contains(resp.Pages[0].Text, "ORCHID")
 	}
 }
 
@@ -137,4 +141,12 @@ func drawBlockText(img *image.Gray, x, y int, text string, scale int) {
 func TestUsefulTextThreshold(t *testing.T) {
 	assert.False(t, usefulText("page 1"))
 	assert.True(t, usefulText("A synthetic native PDF paragraph 12345"))
+}
+
+func TestSplitPDFTextAndPageMetrics(t *testing.T) {
+	assertions := assert.New(t)
+	pages := splitPDFText([]byte("first\fsecond\f"), 2)
+	assertions.Equal([]string{"first", "second"}, pages)
+	info := "Page    1 size: 612 x 792 pts\nPage    2 size: 300 x 400 pts\n"
+	assertions.Equal(int64(2_082_500), estimatedPDFPixels(info, 2, 300))
 }

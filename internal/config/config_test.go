@@ -1950,3 +1950,21 @@ repo = "backups"
 	expected := filepath.Join(tmpDir, "backups")
 	assert.Equal(expected, cfg.Backup.Repo)
 }
+
+func TestOCRDefaultsFollowArchiveHome(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	home := t.TempDir()
+	cfg, err := Load("", home)
+	requirements.NoError(err)
+	assertions.Equal(filepath.Join(home, "ocr", "executor.sock"), cfg.OCR.Socket)
+	assertions.Equal(5, cfg.OCR.MaxAttempts)
+}
+
+func TestOCRMaxAttemptsValidation(t *testing.T) {
+	cfg := NewDefaultConfig()
+	cfg.OCR.MaxAttempts = 101
+	err := cfg.OCR.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "max_attempts")
+}

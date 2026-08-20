@@ -2,6 +2,7 @@ package ocr
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -14,8 +15,8 @@ import (
 type WorkStore interface {
 	EnqueueOCRBacklog(context.Context, string, int) (int64, error)
 	ClaimOCRJob(context.Context, string, time.Duration) (*store.OCRJob, error)
-	CompleteOCR(context.Context, string, string, string, []store.OCRPage) error
-	FailOCR(context.Context, string, string, string, string, bool, time.Duration) error
+	CompleteOCR(context.Context, string, string, int, string, []store.OCRPage) error
+	FailOCR(context.Context, string, string, int, string, string, string, time.Duration) error
 }
 
 type BlobStore interface {
@@ -39,6 +40,7 @@ type RunResult struct {
 	Processed  int   `json:"processed"`
 	Succeeded  int   `json:"succeeded"`
 	Failed     int   `json:"failed"`
+	LostLease  int   `json:"lost_lease"`
 }
 
 type Worker struct {
@@ -57,10 +59,10 @@ func NewWorker(workStore WorkStore, blobs BlobStore, extractor Extractor, cfg Wo
 		cfg.Lease = 15 * time.Minute
 	}
 	if cfg.MaxFileBytes <= 0 {
-		cfg.MaxFileBytes = 100 << 20
+		cfg.MaxFileBytes = DefaultMaxFileBytes
 	}
 	if cfg.MaxAttempts <= 0 {
-		cfg.MaxAttempts = 5
+		cfg.MaxAttempts = DefaultMaxAttempts
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -85,6 +87,11 @@ func (w *Worker) RunOnce(ctx context.Context) (RunResult, error) {
 		}
 		result.Processed++
 		if err := w.process(ctx, job); err != nil {
+			if errors.Is(err, store.ErrOCRLeaseLost) {
+				result.LostLease++
+				w.log.Info("OCR result discarded after lease loss", "content_hash", job.ContentHash)
+				continue
+			}
 			result.Failed++
 			w.log.Warn("OCR attachment failed", "content_hash", job.ContentHash, "error", err)
 			continue
@@ -104,25 +111,34 @@ func (w *Worker) process(ctx context.Context, job *store.OCRJob) error {
 	}
 	resp, extractErr := w.extractor.Extract(ctx, job.Filename, job.MIMEType, size, reader)
 	closeErr := reader.Close()
-	if extractErr != nil || closeErr != nil {
+	if extractErr != nil {
 		return w.recordFailure(ctx, job, "executor_unavailable", fmt.Sprint(errorsJoin(extractErr, closeErr)), false)
+	}
+	if closeErr != nil {
+		w.log.Warn("attachment reader close failed after successful OCR extraction",
+			"content_hash", job.ContentHash, "error", closeErr)
 	}
 	if resp.ErrorCode != "" {
 		return w.recordFailure(ctx, job, resp.ErrorCode, resp.Error, resp.Permanent)
 	}
-	if err := w.store.CompleteOCR(ctx, job.ContentHash, w.cfg.Fingerprint, resp.Method, resp.Pages); err != nil {
+	if err := w.store.CompleteOCR(ctx, job.ContentHash, w.cfg.Fingerprint, job.Attempts, resp.Method, resp.Pages); err != nil {
 		return fmt.Errorf("store OCR result: %w", err)
 	}
 	return nil
 }
 
 func (w *Worker) recordFailure(ctx context.Context, job *store.OCRJob, code, detail string, permanent bool) error {
-	if job.Attempts >= w.cfg.MaxAttempts {
-		permanent = true
+	status := store.OCRFailed
+	if permanent {
+		status = store.OCRUnsupported
+	}
+	if !permanent && job.Attempts >= w.cfg.MaxAttempts {
+		status = store.OCRExhausted
+		detail = fmt.Sprintf("last failure %s: %s", code, detail)
 		code = "attempts_exhausted"
 	}
 	backoff := time.Duration(math.Pow(2, float64(max(0, job.Attempts-1)))) * time.Minute
-	if err := w.store.FailOCR(ctx, job.ContentHash, w.cfg.Fingerprint, code, detail, permanent, backoff); err != nil {
+	if err := w.store.FailOCR(ctx, job.ContentHash, w.cfg.Fingerprint, job.Attempts, code, detail, status, backoff); err != nil {
 		return fmt.Errorf("record OCR failure after %s: %w", code, err)
 	}
 	return fmt.Errorf("%s: %s", code, detail)

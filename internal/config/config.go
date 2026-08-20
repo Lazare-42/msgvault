@@ -17,6 +17,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"go.kenn.io/msgvault/internal/fileutil"
+	"go.kenn.io/msgvault/internal/ocr"
 	"go.kenn.io/msgvault/internal/taskclient"
 	"go.kenn.io/msgvault/internal/vector"
 )
@@ -369,17 +370,18 @@ type OCRConfig struct {
 	MaxPages       int           `toml:"max_pages"`
 	MaxPixels      int64         `toml:"max_pixels"`
 	MaxOutputBytes int64         `toml:"max_output_bytes"`
+	MaxAttempts    int           `toml:"max_attempts"`
 }
 
-func (o *OCRConfig) ApplyDefaults() {
+func (o *OCRConfig) ApplyDefaults(homeDir string) {
 	if o.Socket == "" {
-		o.Socket = filepath.Join(os.TempDir(), "msgvault-ocr.sock")
+		o.Socket = ocr.DefaultSocket(homeDir)
 	}
 	if o.Schedule == "" {
 		o.Schedule = "*/10 * * * *"
 	}
 	if o.Languages == "" {
-		o.Languages = "fra+eng"
+		o.Languages = ocr.DefaultLanguages
 	}
 	if o.Fingerprint == "" {
 		o.Fingerprint = "poppler+tesseract-v1:" + o.Languages
@@ -391,19 +393,17 @@ func (o *OCRConfig) ApplyDefaults() {
 		o.LeaseDuration = 15 * time.Minute
 	}
 	if o.RequestTimeout <= 0 {
-		o.RequestTimeout = 10 * time.Minute
+		o.RequestTimeout = ocr.DefaultRequestTimeout
 	}
-	if o.MaxFileBytes <= 0 {
-		o.MaxFileBytes = 100 << 20
+	limits := ocr.Limits{
+		MaxFileBytes: o.MaxFileBytes, MaxPages: o.MaxPages,
+		MaxPixels: o.MaxPixels, MaxOutputBytes: o.MaxOutputBytes,
 	}
-	if o.MaxPages <= 0 {
-		o.MaxPages = 200
-	}
-	if o.MaxPixels <= 0 {
-		o.MaxPixels = 40_000_000
-	}
-	if o.MaxOutputBytes <= 0 {
-		o.MaxOutputBytes = 16 << 20
+	ocr.ApplyLimitDefaults(&limits)
+	o.MaxFileBytes, o.MaxPages = limits.MaxFileBytes, limits.MaxPages
+	o.MaxPixels, o.MaxOutputBytes = limits.MaxPixels, limits.MaxOutputBytes
+	if o.MaxAttempts <= 0 {
+		o.MaxAttempts = ocr.DefaultMaxAttempts
 	}
 }
 
@@ -413,6 +413,9 @@ func (o OCRConfig) Validate() error {
 	}
 	if o.BatchSize < 1 || o.BatchSize > 16 {
 		return fmt.Errorf("invalid [ocr] batch_size %d: must be between 1 and 16", o.BatchSize)
+	}
+	if o.MaxAttempts < 1 || o.MaxAttempts > 100 {
+		return fmt.Errorf("invalid [ocr] max_attempts %d: must be between 1 and 100", o.MaxAttempts)
 	}
 	return nil
 }
@@ -606,7 +609,7 @@ func NewDefaultConfig() *Config {
 	cfg.Discord.ApplyDefaults()
 	cfg.Web.ApplyDefaults()
 	cfg.Integrations.Tasks.ApplyDefaults()
-	cfg.OCR.ApplyDefaults()
+	cfg.OCR.ApplyDefaults(cfg.HomeDir)
 	return cfg
 }
 
@@ -625,6 +628,7 @@ func Load(path, homeDir string) (*Config, error) {
 	// --home overrides the default home directory, just like MSGVAULT_HOME.
 	if homeDir != "" {
 		homeDir = expandPath(homeDir)
+		cfg.rebaseDefaultOCRSocket(homeDir)
 		cfg.HomeDir = homeDir
 		cfg.Data.DataDir = homeDir
 	}
@@ -661,6 +665,7 @@ func LoadConfigFile(snapshot ConfigFile, homeDir string) (*Config, error) {
 	cfg := NewDefaultConfig()
 	if homeDir != "" {
 		homeDir = expandPath(homeDir)
+		cfg.rebaseDefaultOCRSocket(homeDir)
 		cfg.HomeDir = homeDir
 		cfg.Data.DataDir = homeDir
 	}
@@ -679,6 +684,7 @@ func decodeConfig(cfg *Config, path string, explicit, homeOverride bool, content
 	// directory so that tokens, database, attachments, etc. live alongside
 	// the config.
 	if explicit && !homeOverride {
+		cfg.rebaseDefaultOCRSocket(filepath.Dir(path))
 		cfg.HomeDir = filepath.Dir(path)
 		cfg.Data.DataDir = cfg.HomeDir
 	}
@@ -745,7 +751,7 @@ func decodeConfig(cfg *Config, path string, explicit, homeOverride bool, content
 	if err := cfg.Integrations.Tasks.Validate(); err != nil {
 		return nil, err
 	}
-	cfg.OCR.ApplyDefaults()
+	cfg.OCR.ApplyDefaults(cfg.HomeDir)
 	if err := cfg.OCR.Validate(); err != nil {
 		return nil, err
 	}
@@ -760,6 +766,12 @@ func decodeConfig(cfg *Config, path string, explicit, homeOverride bool, content
 	}
 
 	return cfg, nil
+}
+
+func (c *Config) rebaseDefaultOCRSocket(homeDir string) {
+	if c.OCR.Socket == "" || c.OCR.Socket == ocr.DefaultSocket(c.HomeDir) {
+		c.OCR.Socket = ocr.DefaultSocket(homeDir)
+	}
 }
 
 func (c *Config) applySynctechSMSDefaults() {

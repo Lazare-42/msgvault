@@ -555,6 +555,11 @@ CREATE INDEX IF NOT EXISTS idx_whatsapp_outbox_remote_message
 
 CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_hash ON attachments(content_hash);
+CREATE INDEX IF NOT EXISTS idx_attachments_ocr_candidates ON attachments(LOWER(content_hash))
+    WHERE content_hash IS NOT NULL AND content_hash <> ''
+      AND (LOWER(COALESCE(mime_type, '')) = 'application/pdf'
+           OR LOWER(COALESCE(mime_type, '')) LIKE 'image/%'
+           OR LOWER(COALESCE(filename, '')) LIKE '%.pdf');
 -- Thumbnail hash/path and LOWER(content_hash)/LOWER(thumbnail_hash) indexes
 -- are created in Go (Store.InitSchema) under the maintenance escape hatch:
 -- this file executes before that hatch is available, and the one-time index

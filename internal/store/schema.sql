@@ -562,6 +562,11 @@ CREATE INDEX IF NOT EXISTS idx_whatsapp_outbox_remote_message
 CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_hash ON attachments(content_hash);
 CREATE INDEX IF NOT EXISTS idx_attachments_content_hash_lower ON attachments(LOWER(content_hash));
+CREATE INDEX IF NOT EXISTS idx_attachments_ocr_candidates ON attachments(LOWER(content_hash))
+    WHERE content_hash IS NOT NULL AND content_hash <> ''
+      AND (LOWER(COALESCE(mime_type, '')) = 'application/pdf'
+           OR LOWER(COALESCE(mime_type, '')) LIKE 'image/%'
+           OR LOWER(COALESCE(filename, '')) LIKE '%.pdf');
 CREATE INDEX IF NOT EXISTS idx_attachments_thumbnail_hash ON attachments(thumbnail_hash);
 CREATE INDEX IF NOT EXISTS idx_attachments_thumbnail_hash_lower ON attachments(LOWER(thumbnail_hash));
 CREATE INDEX IF NOT EXISTS idx_attachments_thumbnail_path ON attachments(thumbnail_path);

@@ -587,7 +587,7 @@ func rawRouteParameters(operationID string) []*huma.Param {
 		return []*huma.Param{pathIntegerParam("Any member participant ID of the counterpart's identity cluster")}
 	case "getDomain", "getDomainTimeline", "getDomainContextSummary", "searchDomainFiles":
 		return []*huma.Param{pathStringParam("domain", "Exact normalized domain fact")}
-	case "getAttachmentContent":
+	case "getAttachmentContent", "getAttachmentText", "requestAttachmentText":
 		return []*huma.Param{pathStringParam("hash", "Attachment SHA-256 content hash")}
 	case "getMessageInlinePart":
 		return []*huma.Param{

@@ -40,26 +40,15 @@ type ExecutorConfig struct {
 
 func (c *ExecutorConfig) defaults() {
 	if c.Languages == "" {
-		c.Languages = "fra+eng"
+		c.Languages = DefaultLanguages
 	}
 	if c.DPI <= 0 {
-		c.DPI = 200
+		c.DPI = DefaultDPI
 	}
 	if c.Timeout <= 0 {
-		c.Timeout = 10 * time.Minute
+		c.Timeout = DefaultRequestTimeout
 	}
-	if c.Limits.MaxFileBytes <= 0 {
-		c.Limits.MaxFileBytes = 100 << 20
-	}
-	if c.Limits.MaxPages <= 0 {
-		c.Limits.MaxPages = 200
-	}
-	if c.Limits.MaxPixels <= 0 {
-		c.Limits.MaxPixels = 40_000_000
-	}
-	if c.Limits.MaxOutputBytes <= 0 {
-		c.Limits.MaxOutputBytes = 16 << 20
-	}
+	ApplyLimitDefaults(&c.Limits)
 	if c.PDFInfo == "" {
 		c.PDFInfo = "pdfinfo"
 	}
@@ -176,15 +165,31 @@ func extractPDF(ctx context.Context, cfg ExecutorConfig, input, dir string) Resp
 	if pages > cfg.Limits.MaxPages {
 		return failure("too_many_pages", fmt.Sprintf("PDF has %d pages; limit is %d", pages, cfg.Limits.MaxPages), true)
 	}
+	textOutput, err := runBounded(ctx, cfg.Limits.MaxOutputBytes, cfg.PDFToText,
+		"-f", "1", "-l", strconv.Itoa(pages), "-layout", input, "-")
+	if err != nil {
+		return commandFailure(ctx, "pdf_text_failed", err)
+	}
+	nativePages := splitPDFText(textOutput, pages)
+	needsOCR := make([]int, 0, pages)
+	for page, text := range nativePages {
+		if !usefulText(strings.TrimSpace(text)) {
+			needsOCR = append(needsOCR, page+1)
+		}
+	}
+	pageInfo := info
+	if len(needsOCR) > 0 {
+		pageInfo, err = runBounded(ctx, max(int64(64<<10), int64(pages)*1024), cfg.PDFInfo,
+			"-f", "1", "-l", strconv.Itoa(pages), "-box", input)
+		if err != nil {
+			return commandFailure(ctx, "invalid_pdf", err)
+		}
+	}
 	result := Response{Pages: make([]store.OCRPage, 0, pages)}
 	native, ocrCount := 0, 0
 	var outputBytes int64
 	for page := 1; page <= pages; page++ {
-		text, err := runBounded(ctx, cfg.Limits.MaxOutputBytes, cfg.PDFToText, "-f", strconv.Itoa(page), "-l", strconv.Itoa(page), "-layout", input, "-")
-		if err != nil {
-			return commandFailure(ctx, "pdf_text_failed", err)
-		}
-		clean := strings.TrimSpace(string(text))
+		clean := strings.TrimSpace(nativePages[page-1])
 		if usefulText(clean) {
 			outputBytes += int64(len(clean))
 			if outputBytes > cfg.Limits.MaxOutputBytes {
@@ -195,11 +200,7 @@ func extractPDF(ctx context.Context, cfg ExecutorConfig, input, dir string) Resp
 			continue
 		}
 		prefix := filepath.Join(dir, fmt.Sprintf("page-%04d", page))
-		pageInfo, infoErr := runBounded(ctx, 64<<10, cfg.PDFInfo, "-f", strconv.Itoa(page), "-l", strconv.Itoa(page), input)
-		if infoErr != nil {
-			return commandFailure(ctx, "invalid_pdf", infoErr)
-		}
-		if pixels := estimatedPDFPixels(string(pageInfo), cfg.DPI); pixels <= 0 || pixels > cfg.Limits.MaxPixels {
+		if pixels := estimatedPDFPixels(string(pageInfo), page, cfg.DPI); pixels <= 0 || pixels > cfg.Limits.MaxPixels {
 			return failure("too_many_pixels", fmt.Sprintf("rendered page would have %d pixels; limit is %d", pixels, cfg.Limits.MaxPixels), true)
 		}
 		_, err = runBounded(ctx, 64<<10, cfg.PDFToPPM, "-f", strconv.Itoa(page), "-l", strconv.Itoa(page), "-singlefile", "-gray", "-r", strconv.Itoa(cfg.DPI), "-png", input, prefix)
@@ -281,24 +282,48 @@ func parsePDFPages(info string) int {
 	return 0
 }
 
-func estimatedPDFPixels(info string, dpi int) int64 {
+func splitPDFText(text []byte, pages int) []string {
+	parts := strings.Split(string(text), "\f")
+	if len(parts) > pages {
+		parts = parts[:pages]
+	}
+	for len(parts) < pages {
+		parts = append(parts, "")
+	}
+	return parts
+}
+
+func estimatedPDFPixels(info string, page, dpi int) int64 {
+	var fallback int64
 	for _, line := range strings.Split(info, "\n") {
 		key, value, ok := strings.Cut(line, ":")
-		if !ok || !strings.EqualFold(strings.TrimSpace(key), "Page size") {
+		if !ok {
 			continue
 		}
+		key = strings.TrimSpace(key)
 		fields := strings.Fields(value)
 		if len(fields) < 3 {
-			return 0
+			continue
 		}
 		width, errW := strconv.ParseFloat(fields[0], 64)
 		height, errH := strconv.ParseFloat(fields[2], 64)
 		if errW != nil || errH != nil {
-			return 0
+			continue
 		}
-		return int64(width*float64(dpi)/72) * int64(height*float64(dpi)/72)
+		pixels := int64(width*float64(dpi)/72) * int64(height*float64(dpi)/72)
+		if strings.EqualFold(key, "Page size") {
+			fallback = pixels
+			continue
+		}
+		keyFields := strings.Fields(key)
+		if len(keyFields) == 3 && strings.EqualFold(keyFields[0], "Page") && strings.EqualFold(keyFields[2], "size") {
+			n, parseErr := strconv.Atoi(keyFields[1])
+			if parseErr == nil && n == page {
+				return pixels
+			}
+		}
 	}
-	return 0
+	return fallback
 }
 
 func usefulText(text string) bool {

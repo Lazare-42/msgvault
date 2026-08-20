@@ -14,7 +14,13 @@ const (
 	OCRRunning     = "running"
 	OCRReady       = "ready"
 	OCRFailed      = "failed"
+	OCRExhausted   = "exhausted"
 	OCRUnsupported = "unsupported"
+)
+
+var (
+	ErrOCRLeaseLost         = errors.New("OCR lease lost")
+	ErrOCRSearchUnavailable = errors.New("OCR full-text search is unavailable")
 )
 
 type OCRJob struct {
@@ -64,6 +70,7 @@ type OCRSummary struct {
 	Running     int64 `json:"running"`
 	Ready       int64 `json:"ready"`
 	Failed      int64 `json:"failed"`
+	Exhausted   int64 `json:"exhausted"`
 	Unsupported int64 `json:"unsupported"`
 }
 
@@ -95,6 +102,8 @@ func (s *Store) OCRSummary(ctx context.Context) (OCRSummary, error) {
 			out.Ready = count
 		case OCRFailed:
 			out.Failed = count
+		case OCRExhausted:
+			out.Exhausted = count
 		case OCRUnsupported:
 			out.Unsupported = count
 		}
@@ -128,7 +137,8 @@ func (s *Store) EnqueueOCRBacklog(ctx context.Context, fingerprint string, limit
 		  priority = 0, attempts = 0, lease_expires_at = NULL,
 		  next_attempt_at = NULL, error_code = NULL, error_detail = NULL,
 		  updated_at = CURRENT_TIMESTAMP, completed_at = NULL
-		WHERE attachment_ocr.extractor_fingerprint <> excluded.extractor_fingerprint`,
+		WHERE attachment_ocr.extractor_fingerprint <> excluded.extractor_fingerprint
+		  AND attachment_ocr.status <> 'running'`,
 		fingerprint, fingerprint, limit)
 	if err != nil {
 		return 0, fmt.Errorf("enqueue OCR backlog: %w", err)
@@ -153,12 +163,29 @@ func (s *Store) RequestOCR(ctx context.Context, contentHash, fingerprint string)
 		INSERT INTO attachment_ocr (content_hash, status, extractor_fingerprint, priority)
 		VALUES (?, 'pending', ?, 100)
 		ON CONFLICT(content_hash) DO UPDATE SET
-		  priority = 100,
-		  status = CASE WHEN attachment_ocr.status = 'ready'
+		  priority = CASE WHEN attachment_ocr.priority > 100 THEN attachment_ocr.priority ELSE 100 END,
+		  status = CASE WHEN attachment_ocr.status = 'running' THEN 'running'
+		                WHEN attachment_ocr.status = 'ready'
 		                 AND attachment_ocr.extractor_fingerprint = excluded.extractor_fingerprint
 		                THEN 'ready' ELSE 'pending' END,
-		  extractor_fingerprint = excluded.extractor_fingerprint,
-		  next_attempt_at = NULL, updated_at = CURRENT_TIMESTAMP`, contentHash, fingerprint)
+		  extractor_fingerprint = CASE WHEN attachment_ocr.status = 'running'
+		                               THEN attachment_ocr.extractor_fingerprint
+		                               ELSE excluded.extractor_fingerprint END,
+		  attempts = CASE WHEN attachment_ocr.status = 'running'
+		                       OR (attachment_ocr.status = 'ready'
+		                           AND attachment_ocr.extractor_fingerprint = excluded.extractor_fingerprint)
+		                  THEN attachment_ocr.attempts ELSE 0 END,
+		  next_attempt_at = CASE WHEN attachment_ocr.status = 'running'
+		                         THEN attachment_ocr.next_attempt_at ELSE NULL END,
+		  error_code = CASE WHEN attachment_ocr.status = 'running'
+		                    THEN attachment_ocr.error_code ELSE NULL END,
+		  error_detail = CASE WHEN attachment_ocr.status = 'running'
+		                      THEN attachment_ocr.error_detail ELSE NULL END,
+		  completed_at = CASE WHEN attachment_ocr.status = 'running'
+		                      OR (attachment_ocr.status = 'ready'
+		                          AND attachment_ocr.extractor_fingerprint = excluded.extractor_fingerprint)
+		                 THEN attachment_ocr.completed_at ELSE NULL END,
+		  updated_at = CURRENT_TIMESTAMP`, contentHash, fingerprint)
 	if err != nil {
 		return nil, fmt.Errorf("request OCR: %w", err)
 	}
@@ -178,15 +205,16 @@ func (s *Store) ClaimOCRJob(ctx context.Context, fingerprint string, lease time.
 	var job OCRJob
 	now := time.Now().UTC()
 	err = tx.QueryRowContext(ctx, `
-		SELECT o.content_hash, COALESCE(MIN(a.filename), ''),
-		       COALESCE(MIN(a.mime_type), ''), COALESCE(MAX(a.size), 0), o.attempts
+		SELECT o.content_hash, COALESCE(a.filename, ''),
+		       COALESCE(a.mime_type, ''), COALESCE(a.size, 0), o.attempts
 		FROM attachment_ocr o
-		JOIN attachments a ON LOWER(a.content_hash) = o.content_hash
+		JOIN attachments a ON a.id = (
+		    SELECT MIN(a2.id) FROM attachments a2
+		    WHERE LOWER(a2.content_hash) = o.content_hash)
 		WHERE o.extractor_fingerprint = ?
 		  AND ((o.status IN ('pending', 'failed') AND
 		        (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?))
 		       OR (o.status = 'running' AND o.lease_expires_at < ?))
-		GROUP BY o.content_hash, o.attempts, o.priority, o.created_at
 		ORDER BY o.priority DESC, o.created_at, o.content_hash
 		LIMIT 1`, fingerprint, now, now).Scan(&job.ContentHash, &job.Filename, &job.MIMEType, &job.Size, &job.Attempts)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -215,7 +243,7 @@ func (s *Store) ClaimOCRJob(ctx context.Context, fingerprint string, lease time.
 	return &job, nil
 }
 
-func (s *Store) CompleteOCR(ctx context.Context, hash, fingerprint, method string, pages []OCRPage) error {
+func (s *Store) CompleteOCR(ctx context.Context, hash, fingerprint string, attempt int, method string, pages []OCRPage) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin complete OCR: %w", err)
@@ -251,14 +279,17 @@ func (s *Store) CompleteOCR(ctx context.Context, hash, fingerprint, method strin
 		page_count = ?, average_confidence = ?, priority = 0, lease_expires_at = NULL,
 		next_attempt_at = NULL, error_code = NULL, error_detail = NULL,
 		updated_at = CURRENT_TIMESTAMP, completed_at = CURRENT_TIMESTAMP
-		WHERE content_hash = ? AND extractor_fingerprint = ? AND status = 'running'`,
-		method, len(pages), confidence, hash, fingerprint)
+		WHERE content_hash = ? AND extractor_fingerprint = ? AND status = 'running' AND attempts = ?`,
+		method, len(pages), confidence, hash, fingerprint, attempt)
 	if err != nil {
 		return fmt.Errorf("complete OCR row: %w", err)
 	}
 	n, err := res.RowsAffected()
-	if err != nil || n != 1 {
-		return fmt.Errorf("OCR completion lost lease")
+	if err != nil {
+		return fmt.Errorf("read OCR completion rows affected: %w", err)
+	}
+	if n != 1 {
+		return fmt.Errorf("%w during completion for %s", ErrOCRLeaseLost, hash)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit OCR completion: %w", err)
@@ -266,22 +297,31 @@ func (s *Store) CompleteOCR(ctx context.Context, hash, fingerprint, method strin
 	return nil
 }
 
-func (s *Store) FailOCR(ctx context.Context, hash, fingerprint, code, detail string, permanent bool, backoff time.Duration) error {
-	status := OCRFailed
+func (s *Store) FailOCR(ctx context.Context, hash, fingerprint string, attempt int, code, detail, status string, backoff time.Duration) error {
+	if status != OCRFailed && status != OCRUnsupported && status != OCRExhausted {
+		return fmt.Errorf("invalid OCR failure status %q", status)
+	}
 	if backoff <= 0 {
 		backoff = 5 * time.Minute
 	}
 	var retryAt any = time.Now().UTC().Add(backoff)
-	if permanent {
-		status = OCRUnsupported
+	if status != OCRFailed {
 		retryAt = nil
 	}
-	_, err := s.db.ExecContext(ctx, `UPDATE attachment_ocr SET status = ?, error_code = ?,
+	res, err := s.db.ExecContext(ctx, `UPDATE attachment_ocr SET status = ?, error_code = ?,
 		error_detail = ?, lease_expires_at = NULL, next_attempt_at = ?,
-		updated_at = CURRENT_TIMESTAMP WHERE content_hash = ? AND extractor_fingerprint = ?`,
-		status, code, detail, retryAt, hash, fingerprint)
+		updated_at = CURRENT_TIMESTAMP WHERE content_hash = ? AND extractor_fingerprint = ?
+		AND status = 'running' AND attempts = ?`,
+		status, code, detail, retryAt, hash, fingerprint, attempt)
 	if err != nil {
 		return fmt.Errorf("fail OCR: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read OCR failure rows affected: %w", err)
+	}
+	if n != 1 {
+		return fmt.Errorf("%w while recording failure for %s", ErrOCRLeaseLost, hash)
 	}
 	return nil
 }
@@ -327,6 +367,9 @@ func (s *Store) SearchOCR(ctx context.Context, query string, limit int) ([]OCRSe
 	searchArg := s.dialect.BuildFTSArg(strings.Fields(query))
 	if searchArg == "" {
 		return nil, errors.New("OCR search query has no searchable terms")
+	}
+	if s.dialect.DriverName() != "pgx" && !s.fts5Available {
+		return nil, ErrOCRSearchUnavailable
 	}
 	var statement string
 	if s.dialect.DriverName() == "pgx" {

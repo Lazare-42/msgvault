@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/danielgtaylor/huma/v2"
+	msgexport "go.kenn.io/msgvault/internal/export"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -23,8 +24,8 @@ type ocrSearchResponse struct {
 func (s *Server) registerOCRRoutes(apiV1 huma.API) {
 	registerAPIV1RawHumaJSONRoute[store.OCRRuntimeStatus](apiV1, "getOCRStatus", http.MethodGet, "/ocr/status", "Get attachment text extraction status", s.handleOCRStatus)
 	registerAPIV1RawHumaJSONRoute[store.OCRResult](apiV1, "getAttachmentText", http.MethodGet, "/attachments/{hash}/text", "Get cached attachment text", s.handleGetOCR)
-	registerAPIV1RawHumaJSONRoute[store.OCRResult](apiV1, "requestAttachmentText", http.MethodPost, "/attachments/{hash}/text/request", "Queue attachment text extraction", s.handleRequestOCR)
-	registerAPIV1RawHumaJSONRoute[ocrSearchResponse](apiV1, "searchAttachmentText", http.MethodPost, "/files/text-search", "Search cached attachment text", s.handleSearchOCR)
+	registerAPIV1RawHumaJSONRoute[store.OCRResult](apiV1, "requestAttachmentText", http.MethodPost, "/attachments/{hash}/text/request", "Queue attachment text extraction", s.handleRequestOCR, http.StatusAccepted)
+	registerAPIV1RawHumaJSONRouteWithRequest[ocrSearchRequest, ocrSearchResponse](apiV1, "searchAttachmentText", http.MethodPost, "/files/text-search", "Search cached attachment text", s.handleSearchOCR)
 }
 
 func (s *Server) handleOCRStatus(w http.ResponseWriter, r *http.Request) {
@@ -45,7 +46,11 @@ func (s *Server) handleGetOCR(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "ocr_unavailable", "OCR persistence is unavailable")
 		return
 	}
-	result, err := s.ocrStore.GetOCRResult(r.Context(), ocrHash(r), true)
+	hash, ok := validatedOCRHash(w, r)
+	if !ok {
+		return
+	}
+	result, err := s.ocrStore.GetOCRResult(r.Context(), hash, true)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "ocr_not_found", "No OCR result exists for this attachment")
 		return
@@ -66,7 +71,11 @@ func (s *Server) handleRequestOCR(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "ocr_unavailable", "OCR persistence is unavailable")
 		return
 	}
-	result, err := s.ocrStore.RequestOCR(r.Context(), ocrHash(r), s.cfg.OCR.Fingerprint)
+	hash, ok := validatedOCRHash(w, r)
+	if !ok {
+		return
+	}
+	result, err := s.ocrStore.RequestOCR(r.Context(), hash, s.cfg.OCR.Fingerprint)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "attachment_not_found", "Attachment was not found")
 		return
@@ -76,7 +85,7 @@ func (s *Server) handleRequestOCR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.scheduler != nil && s.scheduler.IsJobScheduled("attachment-ocr") {
-		_ = s.scheduler.TriggerJob("attachment-ocr")
+		_ = s.scheduler.StartJob("attachment-ocr")
 	}
 	writeJSON(w, http.StatusAccepted, result)
 }
@@ -96,6 +105,10 @@ func (s *Server) handleSearchOCR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	hits, err := s.ocrStore.SearchOCR(r.Context(), req.Query, req.Limit)
+	if errors.Is(err, store.ErrOCRSearchUnavailable) {
+		writeError(w, http.StatusServiceUnavailable, "ocr_search_unavailable", err.Error())
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "ocr_search_failed", err.Error())
 		return
@@ -103,15 +116,11 @@ func (s *Server) handleSearchOCR(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, ocrSearchResponse{Results: hits})
 }
 
-func ocrHash(r *http.Request) string {
-	if value := r.PathValue("hash"); value != "" {
-		return strings.ToLower(value)
+func validatedOCRHash(w http.ResponseWriter, r *http.Request) (string, bool) {
+	hash := strings.ToLower(r.PathValue("hash"))
+	if err := msgexport.ValidateContentHash(hash); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_hash", "Attachment hash must be a 64-character hex SHA-256")
+		return "", false
 	}
-	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	for i := range parts {
-		if parts[i] == "attachments" && i+1 < len(parts) {
-			return strings.ToLower(parts[i+1])
-		}
-	}
-	return ""
+	return hash, true
 }
