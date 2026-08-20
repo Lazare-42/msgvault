@@ -8,9 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"image"
+	"image/color"
 	_ "image/gif"
 	_ "image/jpeg"
-	_ "image/png"
+	"image/png"
 	"io"
 	"net"
 	"net/http"
@@ -26,16 +27,18 @@ import (
 )
 
 type ExecutorConfig struct {
-	Socket    string
-	Languages string
-	DPI       int
-	Timeout   time.Duration
-	Limits    Limits
-	TempDir   string
-	PDFInfo   string
-	PDFToText string
-	PDFToPPM  string
-	Tesseract string
+	Socket        string
+	Languages     string
+	DPI           int
+	MinImageSide  int
+	MaxImageScale int
+	Timeout       time.Duration
+	Limits        Limits
+	TempDir       string
+	PDFInfo       string
+	PDFToText     string
+	PDFToPPM      string
+	Tesseract     string
 }
 
 func (c *ExecutorConfig) defaults() {
@@ -44,6 +47,12 @@ func (c *ExecutorConfig) defaults() {
 	}
 	if c.DPI <= 0 {
 		c.DPI = DefaultDPI
+	}
+	if c.MinImageSide <= 0 {
+		c.MinImageSide = DefaultMinImageSide
+	}
+	if c.MaxImageScale <= 0 {
+		c.MaxImageScale = DefaultMaxImageScale
 	}
 	if c.Timeout <= 0 {
 		c.Timeout = DefaultRequestTimeout
@@ -207,7 +216,16 @@ func extractPDF(ctx context.Context, cfg ExecutorConfig, input, dir string) Resp
 		if err != nil {
 			return commandFailure(ctx, "pdf_render_failed", err)
 		}
-		ocrPage, err := tesseractPage(ctx, cfg, prefix+".png", page)
+		rendered := prefix + ".png"
+		info, err := inspectImage(ctx, rendered)
+		if err != nil {
+			return commandFailure(ctx, "pdf_render_failed", err)
+		}
+		ocrInput, ocrInfo, permanent, err := prepareImageForOCR(ctx, cfg, rendered, info)
+		if err != nil {
+			return failure("image_preprocess_failed", err.Error(), permanent)
+		}
+		ocrPage, err := tesseractPage(ctx, cfg, ocrInput, page, ocrInfo)
 		if err != nil {
 			return commandFailure(ctx, "ocr_failed", err)
 		}
@@ -230,36 +248,149 @@ func extractPDF(ctx context.Context, cfg ExecutorConfig, input, dir string) Resp
 }
 
 func extractImage(ctx context.Context, cfg ExecutorConfig, input string) Response {
-	f, err := os.Open(input)
+	ic, err := inspectImage(ctx, input)
 	if err != nil {
-		return failure("invalid_image", err.Error(), true)
-	}
-	ic, _, err := image.DecodeConfig(f)
-	_ = f.Close()
-	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return commandFailure(ctx, "image_inspection_failed", err)
+		}
 		return failure("unsupported_image", err.Error(), true)
 	}
 	pixels := int64(ic.Width) * int64(ic.Height)
 	if pixels <= 0 || pixels > cfg.Limits.MaxPixels {
 		return failure("too_many_pixels", fmt.Sprintf("image has %d pixels; limit is %d", pixels, cfg.Limits.MaxPixels), true)
 	}
-	page, err := tesseractPage(ctx, cfg, input, 1)
+	ocrInput, ocrInfo, permanent, err := prepareImageForOCR(ctx, cfg, input, ic)
+	if err != nil {
+		return failure("image_preprocess_failed", err.Error(), permanent)
+	}
+	page, err := tesseractPage(ctx, cfg, ocrInput, 1, ocrInfo)
 	if err != nil {
 		return commandFailure(ctx, "ocr_failed", err)
 	}
 	return Response{Method: "ocr", Pages: []store.OCRPage{page}}
 }
 
-func tesseractPage(ctx context.Context, cfg ExecutorConfig, imagePath string, page int) (store.OCRPage, error) {
-	f, err := os.Open(imagePath)
-	if err != nil {
-		return store.OCRPage{}, err
+// smallImageScale brings short screenshots and table strips into Tesseract's
+// useful character-size range. Scaling is bounded both by a small fixed factor
+// and the configured decoded-pixel ceiling.
+func smallImageScale(width, height, minSide, maxScale int, maxPixels, maxBytes int64) int {
+	shortSide := min(width, height)
+	if shortSide <= 0 || shortSide >= minSide || maxScale <= 1 {
+		return 1
 	}
-	ic, _, err := image.DecodeConfig(f)
-	_ = f.Close()
-	if err != nil {
-		return store.OCRPage{}, fmt.Errorf("decode rendered page: %w", err)
+	scale := min(maxScale, (minSide+shortSide-1)/shortSide)
+	pixels := int64(width) * int64(height)
+	for scale > 1 && (pixels*int64(scale)*int64(scale) > maxPixels ||
+		pixels*int64(scale)*int64(scale)*4 > maxBytes) {
+		scale--
 	}
+	return scale
+}
+
+func inspectImage(ctx context.Context, path string) (image.Config, error) {
+	if err := ctx.Err(); err != nil {
+		return image.Config{}, err
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return image.Config{}, err
+	}
+	info, _, decodeErr := image.DecodeConfig(contextReader{ctx: ctx, reader: f})
+	closeErr := f.Close()
+	if err := ctx.Err(); err != nil {
+		return image.Config{}, errors.Join(err, closeErr)
+	}
+	if decodeErr != nil || closeErr != nil {
+		return image.Config{}, errors.Join(decodeErr, closeErr)
+	}
+	return info, nil
+}
+
+func prepareImageForOCR(ctx context.Context, cfg ExecutorConfig, input string, info image.Config) (string, image.Config, bool, error) {
+	scale := smallImageScale(info.Width, info.Height, cfg.MinImageSide, cfg.MaxImageScale,
+		cfg.Limits.MaxPixels, cfg.Limits.MaxPreprocessBytes)
+	if scale == 1 {
+		return input, info, false, nil
+	}
+	return upscaleImage(ctx, input, scale)
+}
+
+func upscaleImage(ctx context.Context, input string, scale int) (string, image.Config, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return "", image.Config{}, false, err
+	}
+	f, err := os.Open(input)
+	if err != nil {
+		return "", image.Config{}, false, fmt.Errorf("open image for upscaling: %w", err)
+	}
+	source, _, decodeErr := image.Decode(contextReader{ctx: ctx, reader: f})
+	closeErr := f.Close()
+	if err := ctx.Err(); err != nil {
+		return "", image.Config{}, false, errors.Join(err, closeErr)
+	}
+	if decodeErr != nil {
+		permanent := !errors.Is(decodeErr, context.Canceled) && !errors.Is(decodeErr, context.DeadlineExceeded)
+		return "", image.Config{}, permanent, fmt.Errorf("decode image for upscaling: %w", decodeErr)
+	}
+	if closeErr != nil {
+		return "", image.Config{}, false, fmt.Errorf("close image after decode: %w", closeErr)
+	}
+	bounds := source.Bounds()
+	target := image.NewNRGBA(image.Rect(0, 0, bounds.Dx()*scale, bounds.Dy()*scale))
+	for sourceY := range bounds.Dy() {
+		if err := ctx.Err(); err != nil {
+			return "", image.Config{}, false, err
+		}
+		for sourceX := range bounds.Dx() {
+			pixel := color.NRGBAModel.Convert(source.At(bounds.Min.X+sourceX, bounds.Min.Y+sourceY)).(color.NRGBA)
+			for dy := range scale {
+				row := (sourceY*scale+dy)*target.Stride + sourceX*scale*4
+				for dx := range scale {
+					offset := row + dx*4
+					target.Pix[offset], target.Pix[offset+1] = pixel.R, pixel.G
+					target.Pix[offset+2], target.Pix[offset+3] = pixel.B, pixel.A
+				}
+			}
+		}
+	}
+	path := strings.TrimSuffix(input, filepath.Ext(input)) + "-upscaled.png"
+	out, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return "", image.Config{}, false, fmt.Errorf("create upscaled image: %w", err)
+	}
+	encodeErr := png.Encode(contextWriter{ctx: ctx, writer: out}, target)
+	closeErr = out.Close()
+	if encodeErr != nil || closeErr != nil {
+		return "", image.Config{}, false, fmt.Errorf("write upscaled image: %w", errors.Join(encodeErr, closeErr))
+	}
+	return path, image.Config{ColorModel: color.NRGBAModel, Width: bounds.Dx() * scale, Height: bounds.Dy() * scale}, false, nil
+}
+
+type contextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
+}
+
+type contextWriter struct {
+	ctx    context.Context
+	writer io.Writer
+}
+
+func (w contextWriter) Write(p []byte) (int, error) {
+	if err := w.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return w.writer.Write(p)
+}
+
+func tesseractPage(ctx context.Context, cfg ExecutorConfig, imagePath string, page int, ic image.Config) (store.OCRPage, error) {
 	if pixels := int64(ic.Width) * int64(ic.Height); pixels <= 0 || pixels > cfg.Limits.MaxPixels {
 		return store.OCRPage{}, fmt.Errorf("rendered page has %d pixels; limit is %d", pixels, cfg.Limits.MaxPixels)
 	}

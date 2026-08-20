@@ -34,8 +34,46 @@ func TestExtractImageWithRealTesseract(t *testing.T) {
 	if err != nil {
 		t.Skip("tesseract not installed")
 	}
-	path := filepath.Join(t.TempDir(), "synthetic.png")
-	img := image.NewGray(image.Rect(0, 0, 520, 160))
+	dir := t.TempDir()
+	path := filepath.Join(dir, "synthetic.png")
+	img := image.NewGray(image.Rect(0, 0, 260, 60))
+	for i := range img.Pix {
+		img.Pix[i] = 255
+	}
+	drawBlockText(img, 10, 10, "TEST123", 4)
+	f, err := os.Create(path)
+	requirements.NoError(err)
+	requirements.NoError(png.Encode(f, img))
+	requirements.NoError(f.Close())
+
+	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	cfg := ExecutorConfig{
+		Languages: "eng", Tesseract: tesseract,
+		Limits: Limits{MaxPixels: 1_000_000, MaxPreprocessBytes: 8 << 20, MaxOutputBytes: 1 << 20},
+	}
+	cfg.defaults()
+	resp := extractImage(ctx, cfg, path)
+	assertions.Empty(resp.ErrorCode, resp.Error)
+	assertions.Equal("ocr", resp.Method)
+	if assertions.Len(resp.Pages, 1) {
+		assertions.Equal("ocr", resp.Pages[0].Method)
+		assertions.Contains(resp.Pages[0].Text, "TEST")
+	}
+	_, err = os.Stat(filepath.Join(dir, "synthetic-upscaled.png"))
+	assertions.NoError(err, "small-image integration must exercise preprocessing")
+}
+
+func TestExtractLargeImageWithRealTesseract(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	tesseract, err := exec.LookPath("tesseract")
+	if err != nil {
+		t.Skip("tesseract not installed")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "large.png")
+	img := image.NewGray(image.Rect(0, 0, 520, 400))
 	for i := range img.Pix {
 		img.Pix[i] = 255
 	}
@@ -44,19 +82,107 @@ func TestExtractImageWithRealTesseract(t *testing.T) {
 	requirements.NoError(err)
 	requirements.NoError(png.Encode(f, img))
 	requirements.NoError(f.Close())
-
-	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
-	defer cancel()
-	resp := extractImage(ctx, ExecutorConfig{
+	cfg := ExecutorConfig{
 		Languages: "eng", Tesseract: tesseract,
-		Limits: Limits{MaxPixels: 1_000_000, MaxOutputBytes: 1 << 20},
-	}, path)
-	assertions.Empty(resp.ErrorCode, resp.Error)
-	assertions.Equal("ocr", resp.Method)
-	if assertions.Len(resp.Pages, 1) {
-		assertions.Equal("ocr", resp.Pages[0].Method)
-		assertions.NotEmpty(resp.Pages[0].Text)
+		Limits: Limits{MaxPixels: 1_000_000, MaxPreprocessBytes: 8 << 20, MaxOutputBytes: 1 << 20},
 	}
+	cfg.defaults()
+	resp := extractImage(t.Context(), cfg, path)
+	assertions.Empty(resp.ErrorCode, resp.Error)
+	if assertions.Len(resp.Pages, 1) {
+		assertions.Contains(resp.Pages[0].Text, "TEST")
+	}
+	_, err = os.Stat(filepath.Join(dir, "large-upscaled.png"))
+	assertions.ErrorIs(err, os.ErrNotExist, "normal-size image must keep direct OCR path")
+}
+
+func TestSmallImageScale(t *testing.T) {
+	tests := []struct {
+		name      string
+		width     int
+		height    int
+		maxPixels int64
+		maxBytes  int64
+		wantScale int
+	}{
+		{name: "short table strip", width: 858, height: 80, maxPixels: 40_000_000, maxBytes: 64 << 20, wantScale: 4},
+		{name: "ordinary image", width: 800, height: 600, maxPixels: 40_000_000, maxBytes: 64 << 20, wantScale: 1},
+		{name: "pixel limit", width: 10_000, height: 80, maxPixels: 5_000_000, maxBytes: 64 << 20, wantScale: 2},
+		{name: "memory limit", width: 858, height: 80, maxPixels: 40_000_000, maxBytes: 2 << 20, wantScale: 2},
+		{name: "invalid dimensions", width: 0, height: 80, maxPixels: 40_000_000, maxBytes: 64 << 20, wantScale: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.wantScale, smallImageScale(tt.width, tt.height,
+				DefaultMinImageSide, DefaultMaxImageScale, tt.maxPixels, tt.maxBytes))
+		})
+	}
+}
+
+func TestUpscaleImagePreservesPixels(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	dir := t.TempDir()
+	input := filepath.Join(dir, "input.png")
+	img := image.NewNRGBA(image.Rect(0, 0, 2, 1))
+	img.Set(0, 0, color.NRGBA{R: 255, A: 255})
+	img.Set(1, 0, color.NRGBA{B: 255, A: 255})
+	f, err := os.Create(input)
+	requirements.NoError(err)
+	requirements.NoError(png.Encode(f, img))
+	requirements.NoError(f.Close())
+
+	output, info, permanent, err := upscaleImage(t.Context(), input, 4)
+	requirements.NoError(err)
+	assertions.False(permanent)
+	assertions.Equal(8, info.Width)
+	assertions.Equal(4, info.Height)
+	out, err := os.Open(output)
+	requirements.NoError(err)
+	upscaled, _, err := image.Decode(out)
+	requirements.NoError(err)
+	requirements.NoError(out.Close())
+	assertions.Equal(image.Rect(0, 0, 8, 4), upscaled.Bounds())
+	assertions.Equal(color.NRGBAModel.Convert(img.At(0, 0)), color.NRGBAModel.Convert(upscaled.At(3, 3)))
+	assertions.Equal(color.NRGBAModel.Convert(img.At(1, 0)), color.NRGBAModel.Convert(upscaled.At(4, 0)))
+}
+
+func TestPrepareImageCancellationIsRetryable(t *testing.T) {
+	requirements := require.New(t)
+	dir := t.TempDir()
+	input := filepath.Join(dir, "input.png")
+	img := image.NewGray(image.Rect(0, 0, 20, 20))
+	f, err := os.Create(input)
+	requirements.NoError(err)
+	requirements.NoError(png.Encode(f, img))
+	requirements.NoError(f.Close())
+	cfg := ExecutorConfig{}
+	cfg.defaults()
+	info, err := inspectImage(t.Context(), input)
+	requirements.NoError(err)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, _, permanent, err := prepareImageForOCR(ctx, cfg, input, info)
+	requirements.ErrorIs(err, context.Canceled)
+	assert.False(t, permanent)
+}
+
+func TestPrepareImageDecodeFailureIsPermanent(t *testing.T) {
+	requirements := require.New(t)
+	dir := t.TempDir()
+	input := filepath.Join(dir, "truncated.png")
+	img := image.NewGray(image.Rect(0, 0, 20, 20))
+	var encoded bytes.Buffer
+	requirements.NoError(png.Encode(&encoded, img))
+	data := encoded.Bytes()
+	requirements.NoError(os.WriteFile(input, data[:len(data)/2], 0o600))
+	info, err := inspectImage(t.Context(), input)
+	requirements.NoError(err, "PNG header must remain readable")
+	cfg := ExecutorConfig{}
+	cfg.defaults()
+	_, _, permanent, err := prepareImageForOCR(t.Context(), cfg, input, info)
+	requirements.Error(err)
+	assert.True(t, permanent)
 }
 
 func TestExtractPDFNativeWithRealPoppler(t *testing.T) {
