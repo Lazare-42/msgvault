@@ -2814,6 +2814,154 @@ components:
       required:
         - name
       type: object
+    OCRPage:
+      properties:
+        confidence:
+          format: double
+          type: number
+        method:
+          type: string
+        page_number:
+          format: int64
+          type: integer
+        text:
+          type: string
+      required:
+        - page_number
+        - method
+        - text
+      type: object
+    OCRResult:
+      properties:
+        attempts:
+          format: int64
+          type: integer
+        average_confidence:
+          format: double
+          type: number
+        content_hash:
+          type: string
+        error_code:
+          type: string
+        error_detail:
+          type: string
+        extractor_fingerprint:
+          type: string
+        method:
+          type: string
+        page_count:
+          format: int64
+          type: integer
+        pages:
+          items:
+            $ref: "#/components/schemas/OCRPage"
+          nullable: true
+          type: array
+        status:
+          type: string
+        updated_at:
+          format: date-time
+          type: string
+      required:
+        - content_hash
+        - status
+        - extractor_fingerprint
+        - attempts
+        - updated_at
+      type: object
+    OCRRuntimeStatus:
+      properties:
+        enabled:
+          type: boolean
+        exhausted:
+          format: int64
+          type: integer
+        extractor_fingerprint:
+          type: string
+        failed:
+          format: int64
+          type: integer
+        pending:
+          format: int64
+          type: integer
+        ready:
+          format: int64
+          type: integer
+        running:
+          format: int64
+          type: integer
+        unsupported:
+          format: int64
+          type: integer
+      required:
+        - enabled
+        - extractor_fingerprint
+        - pending
+        - running
+        - ready
+        - failed
+        - exhausted
+        - unsupported
+      type: object
+    OCRSearchHit:
+      properties:
+        attachment_id:
+          format: int64
+          type: integer
+        confidence:
+          format: double
+          type: number
+        content_hash:
+          type: string
+        conversation_id:
+          format: int64
+          type: integer
+        filename:
+          type: string
+        message_id:
+          format: int64
+          type: integer
+        method:
+          type: string
+        mime_type:
+          type: string
+        page_number:
+          format: int64
+          type: integer
+        snippet:
+          type: string
+      required:
+        - attachment_id
+        - content_hash
+        - filename
+        - mime_type
+        - page_number
+        - method
+        - snippet
+        - message_id
+        - conversation_id
+      type: object
+    OcrSearchRequest:
+      additionalProperties: false
+      properties:
+        limit:
+          format: int64
+          type: integer
+        query:
+          type: string
+      required:
+        - query
+      type: object
+    OcrSearchResponse:
+      properties:
+        results:
+          items:
+            $ref: "#/components/schemas/OCRSearchHit"
+          nullable: true
+          type: array
+      required:
+        - results
+      type: object
     OperationHealth:
       properties:
         busy:
@@ -4888,6 +5036,62 @@ paths:
       security:
         - apiKey: []
       summary: Download attachment content by SHA-256 hash
+      tags:
+        - API
+  /api/v1/attachments/{hash}/text:
+    get:
+      operationId: getAttachmentText
+      parameters:
+        - description: Attachment SHA-256 content hash
+          in: path
+          name: hash
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OCRResult"
+          description: OK
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Get cached attachment text
+      tags:
+        - API
+  /api/v1/attachments/{hash}/text/request:
+    post:
+      operationId: requestAttachmentText
+      parameters:
+        - description: Attachment SHA-256 content hash
+          in: path
+          name: hash
+          required: true
+          schema:
+            type: string
+      responses:
+        "202":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OCRResult"
+          description: Accepted
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Queue attachment text extraction
       tags:
         - API
   /api/v1/attachments/{id}:
@@ -7056,6 +7260,33 @@ paths:
       summary: Search analytical files
       tags:
         - Exploration
+  /api/v1/files/text-search:
+    post:
+      operationId: searchAttachmentText
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OcrSearchRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OcrSearchResponse"
+          description: OK
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Search cached attachment text
+      tags:
+        - API
   /api/v1/files/{id}:
     get:
       operationId: getFile
@@ -7820,6 +8051,27 @@ paths:
       security:
         - apiKey: []
       summary: Unlink a task from an archived email
+      tags:
+        - API
+  /api/v1/ocr/status:
+    get:
+      operationId: getOCRStatus
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OCRRuntimeStatus"
+          description: OK
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Get attachment text extraction status
       tags:
         - API
   /api/v1/people/search:

@@ -27,6 +27,7 @@ import (
 	"go.kenn.io/msgvault/internal/meetingimport"
 	"go.kenn.io/msgvault/internal/microsoft"
 	"go.kenn.io/msgvault/internal/oauth"
+	"go.kenn.io/msgvault/internal/ocr"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/search"
@@ -330,6 +331,27 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err := registerAttachmentMaintenanceJob(sched, attachmentMaint); err != nil {
 		return fmt.Errorf("schedule attachment maintenance: %w", err)
 	}
+	if cfg.OCR.Enabled {
+		ocrClient := ocr.NewClient(cfg.OCR.Socket, cfg.OCR.RequestTimeout)
+		ocrWorker := ocr.NewWorker(s, blobStore, ocrClient, ocr.WorkerConfig{
+			Fingerprint: cfg.OCR.Fingerprint, BatchSize: cfg.OCR.BatchSize,
+			Lease: cfg.OCR.LeaseDuration, MaxFileBytes: cfg.OCR.MaxFileBytes,
+			MaxAttempts: cfg.OCR.MaxAttempts,
+		}, logger)
+		if err := sched.AddJob(scheduler.Job{
+			Name: "attachment-ocr", Schedule: cfg.OCR.Schedule,
+			Run: func(ctx context.Context) error {
+				result, err := ocrWorker.RunOnce(ctx)
+				logger.Info("attachment OCR run", "discovered", result.Discovered,
+					"processed", result.Processed, "succeeded", result.Succeeded,
+					"failed", result.Failed, "lost_lease", result.LostLease)
+				return err
+			},
+		}); err != nil {
+			return fmt.Errorf("schedule attachment OCR: %w", err)
+		}
+		logger.Info("scheduled attachment OCR", "schedule", cfg.OCR.Schedule, "socket", cfg.OCR.Socket)
+	}
 
 	if cfg.Beeper.Enabled && cfg.Beeper.Schedule == "" {
 		logger.Warn("beeper is enabled but has no schedule — the daemon will not sync it; its freshness will eventually go stale",
@@ -465,6 +487,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		IdleTracker:   idleTracker,
 		OperationGate: operationGate,
 		BlobStore:     blobStore,
+		OCRStore:      s,
 	}
 	applyServerRuntimeConfig(&apiOpts, cfg)
 	if cfg.Vector.Enabled {

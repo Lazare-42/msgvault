@@ -212,6 +212,7 @@ func (s *Server) registerHumaRoutes(api huma.API, apiV1 huma.API) {
 	s.registerSavedViewRoutes(apiV1)
 	s.registerExploreRoutes(apiV1)
 	s.registerFilesRoutes(apiV1)
+	s.registerOCRRoutes(apiV1)
 	s.registerPersonProfileRoutes(apiV1)
 	s.registerPeopleRoutes(apiV1)
 	s.registerRelationshipRoutes(apiV1)
@@ -586,7 +587,7 @@ func rawRouteParameters(operationID string) []*huma.Param {
 		return []*huma.Param{pathIntegerParam("Any member participant ID of the counterpart's identity cluster")}
 	case "getDomain", "getDomainTimeline", "getDomainContextSummary", "searchDomainFiles":
 		return []*huma.Param{pathStringParam("domain", "Exact normalized domain fact")}
-	case "getAttachmentContent":
+	case "getAttachmentContent", "getAttachmentText", "requestAttachmentText":
 		return []*huma.Param{pathStringParam("hash", "Attachment SHA-256 content hash")}
 	case "getMessageInlinePart":
 		return []*huma.Param{

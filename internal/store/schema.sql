@@ -313,6 +313,36 @@ CREATE TABLE IF NOT EXISTS attachments (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Extracted attachment text is deliberately separate from canonical message
+-- bodies. One row per content hash deduplicates repeated files across messages;
+-- page rows retain extraction provenance for source verification.
+CREATE TABLE IF NOT EXISTS attachment_ocr (
+    content_hash TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'pending',
+    extractor_fingerprint TEXT NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    method TEXT,
+    page_count INTEGER,
+    average_confidence REAL,
+    lease_expires_at DATETIME,
+    next_attempt_at DATETIME,
+    error_code TEXT,
+    error_detail TEXT,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME
+);
+
+CREATE TABLE IF NOT EXISTS attachment_ocr_pages (
+    content_hash TEXT NOT NULL REFERENCES attachment_ocr(content_hash) ON DELETE CASCADE,
+    page_number INTEGER NOT NULL,
+    method TEXT NOT NULL,
+    text TEXT NOT NULL,
+    confidence REAL,
+    PRIMARY KEY (content_hash, page_number)
+);
+
 -- ============================================================================
 -- LABELS & ORGANIZATION
 -- ============================================================================
@@ -532,10 +562,19 @@ CREATE INDEX IF NOT EXISTS idx_whatsapp_outbox_remote_message
 CREATE INDEX IF NOT EXISTS idx_attachments_message ON attachments(message_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_hash ON attachments(content_hash);
 CREATE INDEX IF NOT EXISTS idx_attachments_content_hash_lower ON attachments(LOWER(content_hash));
+CREATE INDEX IF NOT EXISTS idx_attachments_ocr_candidates ON attachments(LOWER(content_hash))
+    WHERE content_hash IS NOT NULL AND content_hash <> ''
+      AND (LOWER(COALESCE(mime_type, '')) = 'application/pdf'
+           OR LOWER(COALESCE(mime_type, '')) LIKE 'image/%'
+           OR LOWER(COALESCE(filename, '')) LIKE '%.pdf');
 CREATE INDEX IF NOT EXISTS idx_attachments_thumbnail_hash ON attachments(thumbnail_hash);
 CREATE INDEX IF NOT EXISTS idx_attachments_thumbnail_hash_lower ON attachments(LOWER(thumbnail_hash));
 CREATE INDEX IF NOT EXISTS idx_attachments_thumbnail_path ON attachments(thumbnail_path);
 CREATE INDEX IF NOT EXISTS idx_attachments_storage_path ON attachments(storage_path);
+CREATE INDEX IF NOT EXISTS idx_attachment_ocr_claim
+    ON attachment_ocr(status, priority DESC, next_attempt_at, lease_expires_at);
+CREATE INDEX IF NOT EXISTS idx_attachment_ocr_pages_hash
+    ON attachment_ocr_pages(content_hash, page_number);
 -- The partial unique index on (message_id, content_hash) for
 -- UpsertAttachment idempotency is created in Go (Store.InitSchema)
 -- after a one-shot dedupe of legacy duplicate rows.

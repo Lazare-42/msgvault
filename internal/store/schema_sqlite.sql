@@ -17,3 +17,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     cc_addr,
     tokenize='unicode61 remove_diacritics 1'
 );
+
+CREATE VIRTUAL TABLE IF NOT EXISTS attachment_ocr_fts USING fts5(
+    content_hash UNINDEXED,
+    page_number UNINDEXED,
+    text,
+    tokenize='unicode61 remove_diacritics 1'
+);

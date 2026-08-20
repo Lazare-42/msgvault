@@ -226,6 +226,94 @@ func (o *GetAttachmentContentRequestOptions) GetHeader() (map[string]string, err
 	return nil, nil
 }
 
+// GetAttachmentTextRequestOptions is the options needed to make a request to GetAttachmentText.
+type GetAttachmentTextRequestOptions struct {
+	PathParams *GetAttachmentTextPath
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *GetAttachmentTextRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.PathParams != nil {
+		if v, ok := any(o.PathParams).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PathParams", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *GetAttachmentTextRequestOptions) GetPathParams() (map[string]any, error) {
+	return runtime.AsMap[any](o.PathParams)
+}
+
+// GetQuery returns the query params as a map.
+func (o *GetAttachmentTextRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *GetAttachmentTextRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *GetAttachmentTextRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// RequestAttachmentTextRequestOptions is the options needed to make a request to RequestAttachmentText.
+type RequestAttachmentTextRequestOptions struct {
+	PathParams *RequestAttachmentTextPath
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *RequestAttachmentTextRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.PathParams != nil {
+		if v, ok := any(o.PathParams).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PathParams", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *RequestAttachmentTextRequestOptions) GetPathParams() (map[string]any, error) {
+	return runtime.AsMap[any](o.PathParams)
+}
+
+// GetQuery returns the query params as a map.
+func (o *RequestAttachmentTextRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *RequestAttachmentTextRequestOptions) GetBody() any {
+	return nil
+}
+
+// GetHeader returns the headers as a map.
+func (o *RequestAttachmentTextRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
 // GetAttachmentRequestOptions is the options needed to make a request to GetAttachment.
 type GetAttachmentRequestOptions struct {
 	PathParams *GetAttachmentPath
@@ -2354,6 +2442,50 @@ func (o *SearchFilesRequestOptions) GetBody() any {
 
 // GetHeader returns the headers as a map.
 func (o *SearchFilesRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
+// SearchAttachmentTextRequestOptions is the options needed to make a request to SearchAttachmentText.
+type SearchAttachmentTextRequestOptions struct {
+	Body *SearchAttachmentTextBody
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *SearchAttachmentTextRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *SearchAttachmentTextRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *SearchAttachmentTextRequestOptions) GetQuery() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *SearchAttachmentTextRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *SearchAttachmentTextRequestOptions) GetHeader() (map[string]string, error) {
 	return nil, nil
 }
 

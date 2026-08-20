@@ -157,6 +157,13 @@ type AttachmentBlobStore interface {
 	OpenStream(ctx context.Context, hash string) (io.ReadCloser, int64, error)
 }
 
+type OCRStore interface {
+	OCRSummary(context.Context) (store.OCRSummary, error)
+	RequestOCR(context.Context, string, string) (*store.OCRResult, error)
+	GetOCRResult(context.Context, string, bool) (*store.OCRResult, error)
+	SearchOCR(context.Context, string, int) ([]store.OCRSearchHit, error)
+}
+
 // Server represents the HTTP API server.
 type Server struct {
 	cfg            *config.Config
@@ -245,6 +252,7 @@ type Server struct {
 	// and embedded callers that construct a Server without options, which
 	// fall back to the legacy loose-file open.
 	blobStore AttachmentBlobStore
+	ocrStore  OCRStore
 	// remoteImages is the SSRF-hardened fetcher behind
 	// POST /api/v1/content/remote-image. Tests replace it to inject a fake
 	// resolver and dialer.
@@ -338,6 +346,9 @@ type ServerOptions struct {
 	// packed CAS storage with a loose-file fallback. Nil keeps the legacy
 	// loose-file-only read path.
 	BlobStore AttachmentBlobStore
+	// OCRStore owns attachment text queue/results. Kept explicit because the
+	// production MessageStore is an adapter rather than the concrete archive.
+	OCRStore OCRStore
 	// RequestTimeout caps each request by adding a deadline to the request
 	// context. Zero defaults to 60s. The underlying http.Server's WriteTimeout
 	// is set to RequestTimeout + 5s so handlers that honor cancellation can
@@ -417,6 +428,7 @@ func NewServerWithOptions(opts ServerOptions) *Server {
 		taskLinkOperations:   opts.TaskLinkOperations,
 		taskIdentityResolver: opts.TaskIdentityResolver,
 	}
+	s.ocrStore = opts.OCRStore
 	if s.taskIdentityResolver == nil {
 		s.taskIdentityResolver = s.resolveTaskMessageIdentity
 	}

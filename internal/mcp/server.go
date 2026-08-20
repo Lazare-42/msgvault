@@ -74,6 +74,10 @@ const (
 	ToolGetGoogleDoc               = "get_google_doc"
 	ToolAppendGoogleDocText        = "append_google_doc_text"
 	ToolReplaceGoogleDocText       = "replace_google_doc_text"
+	ToolSearchAttachmentText       = "search_attachment_text"
+	ToolGetAttachmentText          = "get_attachment_text"
+	ToolRequestAttachmentText      = "request_attachment_text"
+	ToolGetOCRStatus               = "get_ocr_status"
 )
 
 // search_message_bodies/search_in_message mode values (wire format).
@@ -127,6 +131,7 @@ type ServeOptions struct {
 	HybridSearcher   HybridSearcher
 	SimilarSearcher  SimilarSearcher
 	DataDir          string
+	OCR              OCRClient
 
 	// HybridEngine is optional. When nil, semantic_search_messages rejects
 	// vector/hybrid searches with a vector_not_enabled error.
@@ -167,6 +172,7 @@ func BuildMCPServer(opts ServeOptions) *server.MCPServer {
 		hybridSearcher:    opts.HybridSearcher,
 		similarSearcher:   opts.SimilarSearcher,
 		dataDir:           opts.DataDir,
+		ocr:               opts.OCR,
 		hybridEngine:      opts.HybridEngine,
 		vectorCfg:         opts.VectorCfg,
 		backend:           opts.Backend,
@@ -188,6 +194,12 @@ func BuildMCPServer(opts ServeOptions) *server.MCPServer {
 	s.AddTool(semanticSearchMessagesTool(vectorAvailable), h.semanticSearchMessages)
 	s.AddTool(getMessageTool(), h.getMessage)
 	s.AddTool(getAttachmentTool(), h.getAttachment)
+	if opts.OCR != nil {
+		s.AddTool(getOCRStatusTool(), h.getOCRStatus)
+		s.AddTool(searchAttachmentTextTool(), h.searchAttachmentText)
+		s.AddTool(getAttachmentTextTool(), h.getAttachmentText)
+		s.AddTool(requestAttachmentTextTool(), h.requestAttachmentText)
+	}
 	s.AddTool(searchInMessageTool(vectorInMessageAvailable), h.searchInMessage)
 	s.AddTool(exportAttachmentTool(), h.exportAttachment)
 	s.AddTool(listMessagesTool(), h.listMessages)
@@ -374,6 +386,32 @@ func searchMetadataTool() mcp.Tool {
 		withLimit("20"),
 		withOffset(),
 	)
+}
+
+func searchAttachmentTextTool() mcp.Tool {
+	return mcp.NewTool(ToolSearchAttachmentText,
+		mcp.WithDescription("Search cached text extracted asynchronously from PDF and image attachments. Results include attachment, page, confidence, parent message, and conversation."),
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithString("query", mcp.Required(), mcp.Description("Text to search for")), withLimit("20"))
+}
+
+func getOCRStatusTool() mcp.Tool {
+	return mcp.NewTool(ToolGetOCRStatus,
+		mcp.WithDescription("Get asynchronous attachment extraction queue and availability status."),
+		mcp.WithReadOnlyHintAnnotation(true))
+}
+
+func getAttachmentTextTool() mcp.Tool {
+	return mcp.NewTool(ToolGetAttachmentText,
+		mcp.WithDescription("Get cached page-level text and extraction provenance for an attachment content hash. Never runs OCR inline."),
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithString("content_hash", mcp.Required(), mcp.Description("Attachment SHA-256 content hash")))
+}
+
+func requestAttachmentTextTool() mcp.Tool {
+	return mcp.NewTool(ToolRequestAttachmentText,
+		mcp.WithDescription("Raise an attachment OCR job to interactive priority and return its state immediately. Never waits for extraction."),
+		mcp.WithString("content_hash", mcp.Required(), mcp.Description("Attachment SHA-256 content hash")))
 }
 
 // searchMessagesTool preserves the pre-split search_messages contract for
