@@ -13,6 +13,8 @@ const (
 	keyNameEnter = "enter"
 	keyNameEsc   = "esc"
 	keyNameDown  = "down"
+	keyNameCtrlN = "ctrl+n"
+	keyNameCtrlP = "ctrl+p"
 )
 
 // handleInlineSearchKeys handles keys when inline search bar is active.
@@ -383,7 +385,7 @@ func (m Model) handleMessageListKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// between navigation and the early return. This is because navigation keys
 	// (even when cursor is clamped at the boundary) may need to trigger loading
 	// more search results. navigateList only returns true for navigation keys
-	// (up/down/j/k/pgup/pgdown/home/end/G), so handled=true is safe to use
+	// (up/down/j/k/ctrl+n/ctrl+p/pgup/pgdown/home/end/G), so handled=true is safe to use
 	// as the gate for pagination checks.
 	handled := m.navigateList(msg.String(), len(m.messages))
 
@@ -801,7 +803,7 @@ func (m Model) handleMessageDetailKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd)
 		return m.navigateDetailNext()
 
 	// Scroll content
-	case "up", "k":
+	case "up", "k", keyNameCtrlP:
 		// Clamp first in case scroll is out of range after resize
 		m.clampDetailScroll()
 		if m.detailScroll > 0 {
@@ -809,7 +811,7 @@ func (m Model) handleMessageDetailKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd)
 		} else {
 			return m.showFlash("At top")
 		}
-	case keyNameDown, "j":
+	case keyNameDown, "j", keyNameCtrlN:
 		// Clamp first in case scroll is out of range after resize
 		m.clampDetailScroll()
 		maxScroll := max(m.detailLineCount-m.detailPageSize(), 0)
@@ -893,12 +895,12 @@ func (m Model) handleThreadViewKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.goBack()
 
 	// Navigation
-	case "up", "k":
+	case "up", "k", keyNameCtrlP:
 		if m.threadCursor > 0 {
 			m.threadCursor--
 			m.ensureThreadCursorVisible()
 		}
-	case keyNameDown, "j":
+	case keyNameDown, "j", keyNameCtrlN:
 		if m.threadCursor < len(m.threadMessages)-1 {
 			m.threadCursor++
 			m.ensureThreadCursorVisible()
@@ -1014,11 +1016,11 @@ func (m Model) handleAccountSelectorKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cm
 	accounts := m.selectableAccounts()
 	maxIdx := len(accounts) // 0 = All Accounts/Sources, then selectable sources
 	switch msg.String() {
-	case "up", "k":
+	case "up", "k", keyNameCtrlP:
 		if m.modalCursor > 0 {
 			m.modalCursor--
 		}
-	case keyNameDown, "j":
+	case keyNameDown, "j", keyNameCtrlN:
 		if m.modalCursor < maxIdx {
 			m.modalCursor++
 		}
@@ -1082,11 +1084,11 @@ const filterOptionCount = 2
 
 func (m Model) handleFilterToggleKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "up", "k":
+	case "up", "k", keyNameCtrlP:
 		if m.modalCursor > 0 {
 			m.modalCursor--
 		}
-	case keyNameDown, "j":
+	case keyNameDown, "j", keyNameCtrlN:
 		if m.modalCursor < filterOptionCount-1 {
 			m.modalCursor++
 		}
@@ -1139,11 +1141,11 @@ func (m Model) handleExportAttachmentsKeys(msg tea.KeyPressMsg) (tea.Model, tea.
 	}
 	maxIdx := len(m.messageDetail.Attachments) - 1
 	switch msg.String() {
-	case "up", "k":
+	case "up", "k", keyNameCtrlP:
 		if m.exportCursor > 0 {
 			m.exportCursor--
 		}
-	case keyNameDown, "j":
+	case keyNameDown, "j", keyNameCtrlN:
 		if m.exportCursor < maxIdx {
 			m.exportCursor++
 		}
@@ -1195,9 +1197,9 @@ func (m Model) handleErrorKeys() (tea.Model, tea.Cmd) {
 
 func (m Model) handleHelpKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case keyNameDown, "j":
+	case keyNameDown, "j", keyNameCtrlN:
 		m.helpScroll++
-	case "up", "k":
+	case "up", "k", keyNameCtrlP:
 		if m.helpScroll > 0 {
 			m.helpScroll--
 		}
