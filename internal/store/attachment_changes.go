@@ -226,6 +226,16 @@ func (s *Store) AdvanceAttachmentChangeConsumer(
 	}
 	return s.withTxContext(ctx, func(tx *loggedTx) error {
 		q := boundQuerier{ctx: ctx, q: tx}
+		if !s.IsPostgreSQL() {
+			// Reserve SQLite's writer slot before reading the cursor and event.
+			// A deferred transaction cannot upgrade a stale WAL snapshot after
+			// a peer advances the same consumer and commits.
+			if _, err := q.Exec(`
+				UPDATE attachment_change_consumers
+				SET last_sequence = last_sequence WHERE consumer_key = ?`, consumerKey); err != nil {
+				return fmt.Errorf("lock attachment change consumer: %w", err)
+			}
+		}
 		var current int64
 		var complete bool
 		if err := q.QueryRow(`
@@ -250,6 +260,17 @@ func (s *Store) AdvanceAttachmentChangeConsumer(
 				return fmt.Errorf("verify attachment change acknowledgement: %w", err)
 			}
 			if !exists {
+				// A peer can advance the cursor and prune this event after our
+				// first cursor read. Treat that committed advance as success.
+				var advanced int64
+				if err := q.QueryRow(`
+					SELECT last_sequence FROM attachment_change_consumers
+					WHERE consumer_key = ?`, consumerKey).Scan(&advanced); err != nil {
+					return fmt.Errorf("recheck attachment consumer cursor after pruned event: %w", err)
+				}
+				if advanced >= sequence {
+					return pruneAttachmentChanges(q)
+				}
 				return errors.New("attachment change acknowledgement is not a retained event")
 			}
 			result, err := q.Exec(`
