@@ -42,6 +42,11 @@ Exactly one of the two cutoff flags is required:
 
 ## What gets skipped
 
+- **Wrong source mailbox** — for IMAP accounts, the mailbox encoded in each
+  canonical `mailbox|UID` source ID must match `--label`. Historical labels
+  retained after deduplication cannot move a message out of an archive, sent,
+  deleted, or other physical folder. These are counted as
+  `skipped_wrong_mailbox`.
 - **Treated labels** — `--not-label <name>` (repeatable): messages carrying
   any of these labels are considered handled. Matching is case-insensitive
   but exact per label, so a treated label `handled` does not match a folder
@@ -76,13 +81,15 @@ Progress goes to stderr; stdout carries a single JSON object:
   "scanned": 42,
   "moved": [101, 102],
   "move_errors": 0,
+  "move_noops": 1,
+  "skipped_wrong_mailbox": 4,
   "skipped_treated": 7,
   "skipped_by_id": 2,
   "skipped_already_queued": 3,
   "replied": [
     {
       "id": 117,
-      "source_message_id": "imap-inbox-4711",
+      "source_message_id": "INBOX|4711",
       "subject": "Quick question",
       "reply_text": "Thanks, we shipped the fix yesterday..."
     }
@@ -92,5 +99,7 @@ Progress goes to stderr; stdout carries a single JSON object:
 ```
 
 `moved` lists archive message IDs (with `--dry-run` it lists the messages that
-would move). Moves are executed in chunks; a failed chunk is counted in
-`move_errors` and the run continues with the remaining chunks.
+would move). Live moves execute one at a time: only server-confirmed moves enter
+`moved`, stale or ambiguous source UIDs increment `move_noops`, and individual
+failures increment `move_errors`. Processing continues after a per-message
+failure unless the command context is cancelled.

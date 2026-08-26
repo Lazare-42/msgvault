@@ -17,7 +17,7 @@ type fakeTriageFolderMover struct {
 
 func (f *fakeTriageFolderMover) MoveMessageToFolder(
 	_ context.Context,
-	messageID, _ string,
+	messageID, _, _ string,
 ) (bool, error) {
 	return f.confirmed[messageID], f.errors[messageID]
 }
@@ -62,7 +62,7 @@ func TestFilterTriageSourceMailbox(t *testing.T) {
 	msgs := []query.MessageSummary{
 		{ID: 1, SourceMessageID: "INBOX|10"},
 		{ID: 2, SourceMessageID: "inbox|11"},
-		{ID: 3, SourceMessageID: "INBOX/2026/AVIGNON|12"},
+		{ID: 3, SourceMessageID: "INBOX/2026/SITE-A|12"},
 		{ID: 4, SourceMessageID: "0 A traiter|13"},
 		{ID: 5, SourceMessageID: "INBOX|not-a-uid"},
 		{ID: 6, SourceMessageID: "gmail-id"},
@@ -93,7 +93,7 @@ func TestExecuteTriageMovesReportsConfirmedMovesOnly(t *testing.T) {
 	}
 
 	moved, noops, moveErrors := executeTriageMoves(
-		context.Background(), client, msgs, "0 A traiter")
+		context.Background(), client, msgs, "INBOX", "Queue")
 
 	assert.Equal(t, []int64{101, 104}, moved)
 	assert.Equal(t, 1, noops)
