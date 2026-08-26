@@ -5425,6 +5425,7 @@ export interface components {
             has_attachments: boolean;
             /** Format: int64 */
             id: number;
+            is_from_me?: boolean;
             labels: string[] | null;
             message_type?: string;
             sent_at: string;

@@ -287,6 +287,7 @@ type MessageDetail struct {
 
 	Body     string `json:"body"`
 	BodyHTML string `json:"body_html,omitempty"`
+	IsFromMe bool   `json:"is_from_me,omitempty"`
 	// BodyOmitted marks a conversation-window message whose body was left
 	// out to keep the response within the cumulative inline-body budget.
 	// The snippet is still present; fetch the full body via
@@ -503,6 +504,7 @@ func messageDetailFromQuery(qMsg *query.MessageDetail) MessageDetail {
 		Labels:          labels,
 		HasAttach:       qMsg.HasAttachments,
 		SizeBytes:       qMsg.SizeEstimate,
+		IsFromMe:        qMsg.IsFromMe,
 		Body:            body,
 		BodyHTML:        qMsg.BodyHTML,
 		Attachments:     attachments,
@@ -706,6 +708,7 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 		MessageSummary: toMessageSummary(*msg),
 		Body:           msg.Body,
 		BodyHTML:       msg.BodyHTML,
+		IsFromMe:       msg.IsFromMe,
 	}
 
 	attachments := make([]AttachmentInfo, 0, len(msg.Attachments))
