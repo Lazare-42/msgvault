@@ -2,9 +2,11 @@ package testutil
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
+	"sync/atomic"
 	"testing"
 
 	imap "github.com/emersion/go-imap/v2"
@@ -38,6 +40,69 @@ type selectErrorSession struct {
 
 	mailbox   string
 	remaining int
+}
+
+type createErrorSession struct {
+	imapserver.Session
+
+	mailbox string
+}
+
+type phantomUIDSession struct {
+	imapserver.Session
+
+	uid     imap.UID
+	claimed *atomic.Bool
+}
+
+func (s *phantomUIDSession) Search(
+	kind imapserver.NumKind,
+	criteria *imap.SearchCriteria,
+	options *imap.SearchOptions,
+) (*imap.SearchData, error) {
+	if kind == imapserver.NumKindUID && s.claimed.CompareAndSwap(false, true) {
+		var uids imap.UIDSet
+		uids.AddNum(s.uid)
+		return &imap.SearchData{
+			All:   uids,
+			Min:   uint32(s.uid),
+			Max:   uint32(s.uid),
+			Count: 1,
+		}, nil
+	}
+	data, err := s.Session.Search(kind, criteria, options)
+	if err != nil {
+		return nil, fmt.Errorf("search session: %w", err)
+	}
+	return data, nil
+}
+
+func (s *phantomUIDSession) Move(
+	w *imapserver.MoveWriter,
+	numSet imap.NumSet,
+	dest string,
+) error {
+	mover, ok := s.Session.(imapserver.SessionMove)
+	if !ok {
+		return errors.New("wrapped session does not support MOVE")
+	}
+	if err := mover.Move(w, numSet, dest); err != nil {
+		return fmt.Errorf("move session: %w", err)
+	}
+	return nil
+}
+
+func (s *createErrorSession) Create(mailbox string, options *imap.CreateOptions) error {
+	if mailbox == s.mailbox {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: "Mailbox already exists.",
+		}
+	}
+	if err := s.Session.Create(mailbox, options); err != nil {
+		return fmt.Errorf("create mailbox %q: %w", mailbox, err)
+	}
+	return nil
 }
 
 func (s *selectErrorSession) Select(
@@ -152,7 +217,7 @@ func AppendIMAPMessageWithMessageID(
 // down via t.Cleanup.
 func StartIMAPMemServer(t *testing.T, messagesPerMailbox map[string]int) (string, *imapmemserver.User) {
 	t.Helper()
-	return startIMAPMemServer(t, messagesPerMailbox, nil, "", 0)
+	return startIMAPMemServer(t, messagesPerMailbox, nil, "", 0, "", 0)
 }
 
 // StartIMAPMemServerWithSpecialUse runs an in-memory IMAP server whose LIST
@@ -163,7 +228,30 @@ func StartIMAPMemServerWithSpecialUse(
 	specialUse map[string][]imap.MailboxAttr,
 ) (string, *imapmemserver.User) {
 	t.Helper()
-	return startIMAPMemServer(t, messagesPerMailbox, specialUse, "", 0)
+	return startIMAPMemServer(t, messagesPerMailbox, specialUse, "", 0, "", 0)
+}
+
+// StartIMAPMemServerWithCreateError runs an in-memory IMAP server that returns
+// an Exchange-style plain NO when CREATE targets one named mailbox.
+func StartIMAPMemServerWithCreateError(
+	t *testing.T,
+	messagesPerMailbox map[string]int,
+	createErrorMailbox string,
+) (string, *imapmemserver.User) {
+	t.Helper()
+	return startIMAPMemServer(t, messagesPerMailbox, nil, "", 0, createErrorMailbox, 0)
+}
+
+// StartIMAPMemServerWithPhantomUID runs an in-memory IMAP server whose first
+// UID SEARCH reports a missing UID. MOVE then emits an empty COPYUID response,
+// reproducing servers where a message disappears between lookup and mutation.
+func StartIMAPMemServerWithPhantomUID(
+	t *testing.T,
+	messagesPerMailbox map[string]int,
+	phantomUID imap.UID,
+) (string, *imapmemserver.User) {
+	t.Helper()
+	return startIMAPMemServer(t, messagesPerMailbox, nil, "", 0, "", phantomUID)
 }
 
 // StartIMAPMemServerWithSelectError runs an in-memory IMAP server that rejects
@@ -176,7 +264,7 @@ func StartIMAPMemServerWithSelectError(
 ) (string, *imapmemserver.User) {
 	t.Helper()
 	return startIMAPMemServer(
-		t, messagesPerMailbox, specialUse, selectErrorMailbox, -1)
+		t, messagesPerMailbox, specialUse, selectErrorMailbox, -1, "", 0)
 }
 
 // StartIMAPMemServerWithOneShotSelectError runs an in-memory IMAP server that
@@ -189,7 +277,7 @@ func StartIMAPMemServerWithOneShotSelectError(
 ) (string, *imapmemserver.User) {
 	t.Helper()
 	return startIMAPMemServer(
-		t, messagesPerMailbox, specialUse, selectErrorMailbox, 1)
+		t, messagesPerMailbox, specialUse, selectErrorMailbox, 1, "", 0)
 }
 
 func startIMAPMemServer(
@@ -198,6 +286,8 @@ func startIMAPMemServer(
 	specialUse map[string][]imap.MailboxAttr,
 	selectErrorMailbox string,
 	selectErrorCount int,
+	createErrorMailbox string,
+	phantomUID imap.UID,
 ) (string, *imapmemserver.User) {
 	t.Helper()
 	user := imapmemserver.NewUser(IMAPTestUsername, IMAPTestPassword)
@@ -212,6 +302,15 @@ func startIMAPMemServer(
 	sort.Strings(mailboxes)
 	memServer := imapmemserver.New()
 	memServer.AddUser(user)
+	var phantomUIDClaimed atomic.Bool
+	var caps imap.CapSet
+	if phantomUID != 0 {
+		caps = imap.CapSet{
+			imap.CapIMAP4rev1: {},
+			imap.CapMove:      {},
+			imap.CapUIDPlus:   {},
+		}
+	}
 
 	server := imapserver.New(&imapserver.Options{
 		NewSession: func(*imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
@@ -231,8 +330,22 @@ func startIMAPMemServer(
 					remaining: selectErrorCount,
 				}
 			}
+			if createErrorMailbox != "" {
+				session = &createErrorSession{
+					Session: session,
+					mailbox: createErrorMailbox,
+				}
+			}
+			if phantomUID != 0 {
+				session = &phantomUIDSession{
+					Session: session,
+					uid:     phantomUID,
+					claimed: &phantomUIDClaimed,
+				}
+			}
 			return session, nil, nil
 		},
+		Caps:         caps,
 		InsecureAuth: true,
 	})
 
