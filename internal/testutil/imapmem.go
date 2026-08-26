@@ -2,6 +2,8 @@ package testutil
 
 import (
 	"bytes"
+"errors"
+"sync/atomic"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -685,4 +687,85 @@ func ExpungeIMAPMessage(t *testing.T, addr, mailbox string, uid imap.UID) {
 		Flags: []imap.Flag{imap.FlagDeleted},
 	}, nil).Close())
 	require.NoError(t, client.Expunge().Close())
+}
+
+type createErrorSession struct {
+	imapserver.Session
+
+	mailbox string
+}
+
+type phantomUIDSession struct {
+	imapserver.Session
+
+	uid     imap.UID
+	claimed *atomic.Bool
+}
+
+func (s *phantomUIDSession) Search(
+	kind imapserver.NumKind,
+	criteria *imap.SearchCriteria,
+	options *imap.SearchOptions,
+) (*imap.SearchData, error) {
+	if kind == imapserver.NumKindUID && s.claimed.CompareAndSwap(false, true) {
+		var uids imap.UIDSet
+		uids.AddNum(s.uid)
+		return &imap.SearchData{
+			All:   uids,
+			Min:   uint32(s.uid),
+			Max:   uint32(s.uid),
+			Count: 1,
+		}, nil
+	}
+	data, err := s.Session.Search(kind, criteria, options)
+	if err != nil {
+		return nil, fmt.Errorf("search session: %w", err)
+	}
+	return data, nil
+}
+
+func (s *phantomUIDSession) Move(
+	w *imapserver.MoveWriter,
+	numSet imap.NumSet,
+	dest string,
+) error {
+	mover, ok := s.Session.(imapserver.SessionMove)
+	if !ok {
+		return errors.New("wrapped session does not support MOVE")
+	}
+	if err := mover.Move(w, numSet, dest); err != nil {
+		return fmt.Errorf("move session: %w", err)
+	}
+	return nil
+}
+
+func (s *createErrorSession) Create(mailbox string, options *imap.CreateOptions) error {
+	if mailbox == s.mailbox {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: "Mailbox already exists.",
+		}
+	}
+	if err := s.Session.Create(mailbox, options); err != nil {
+		return fmt.Errorf("create mailbox %q: %w", mailbox, err)
+	}
+	return nil
+}
+
+func StartIMAPMemServerWithCreateError(
+	t *testing.T,
+	messagesPerMailbox map[string]int,
+	createErrorMailbox string,
+) (string, *imapmemserver.User) {
+	t.Helper()
+	return startIMAPMemServer(t, messagesPerMailbox, nil, "", 0, createErrorMailbox, 0)
+}
+
+func StartIMAPMemServerWithPhantomUID(
+	t *testing.T,
+	messagesPerMailbox map[string]int,
+	phantomUID imap.UID,
+) (string, *imapmemserver.User) {
+	t.Helper()
+	return startIMAPMemServer(t, messagesPerMailbox, nil, "", 0, "", phantomUID)
 }

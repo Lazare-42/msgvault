@@ -44,9 +44,12 @@ var triageQueueCmd = &cobra.Command{
 	Long: `Move stale untreated messages from a label pool into a queue folder.
 
 Scans the archive (through the msgvault daemon) for messages in --label
-older than a staleness cutoff, skips messages already treated (any
---not-label, repeatable, matched case-insensitively) or already in the
-queue folder, and moves the rest to --move-to on the mail server.
+older than a staleness cutoff. For IMAP accounts, the canonical source
+mailbox must also match --label; a historical label retained after
+deduplication cannot move a message out of another mailbox. Messages
+already treated (any --not-label, repeatable, matched case-insensitively)
+or already in the queue folder are skipped, and the rest move to
+--move-to on the mail server.
 
 The cutoff is either an absolute date (--before) or a number of full
 working days Mon-Fri (--older-than-workdays): run on a Monday with
@@ -90,11 +93,17 @@ type triageReport struct {
 	Scanned              int                  `json:"scanned"`
 	Moved                []int64              `json:"moved"`
 	MoveErrors           int                  `json:"move_errors"`
+	MoveNoops            int                  `json:"move_noops"`
+	SkippedWrongMailbox  int                  `json:"skipped_wrong_mailbox"`
 	SkippedTreated       int                  `json:"skipped_treated"`
 	SkippedByID          int                  `json:"skipped_by_id"`
 	SkippedAlreadyQueued int                  `json:"skipped_already_queued"`
 	Replied              []triageRepliedEntry `json:"replied"`
 	DryRun               bool                 `json:"dry_run"`
+}
+
+type triageFolderMover interface {
+	MoveMessageToFolder(ctx context.Context, messageID, folder string) (bool, error)
 }
 
 func runTriageQueue(cmd *cobra.Command, _ []string) error {
@@ -156,7 +165,13 @@ func runTriageQueue(cmd *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("scan messages: %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "Scanned %d message(s).\n", len(msgs))
+	scanned := len(msgs)
+	skippedWrongMailbox := 0
+	if account.Type == sourceTypeIMAP {
+		msgs, skippedWrongMailbox = filterTriageSourceMailbox(msgs, triageLabel)
+	}
+	fmt.Fprintf(os.Stderr, "Scanned %d message(s); %d canonical source mailbox mismatch(es).\n",
+		scanned, skippedWrongMailbox)
 
 	res := triage.Classify(msgs, triage.Options{
 		QueueFolder:   moveTo,
@@ -167,8 +182,9 @@ func runTriageQueue(cmd *cobra.Command, _ []string) error {
 
 	report := triageReport{
 		Cutoff:               cutoff.Format(time.RFC3339),
-		Scanned:              len(msgs),
+		Scanned:              scanned,
 		Moved:                []int64{},
+		SkippedWrongMailbox:  skippedWrongMailbox,
 		SkippedTreated:       res.SkippedTreated,
 		SkippedByID:          res.SkippedByID,
 		SkippedAlreadyQueued: res.SkippedAlreadyQueued,
@@ -188,9 +204,13 @@ func runTriageQueue(cmd *cobra.Command, _ []string) error {
 		return printJSON(report)
 	}
 
-	report.Moved, report.MoveErrors = executeTriageMoves(ctx, apiClient, res.Move, moveTo)
-	fmt.Fprintf(os.Stderr, "Moved %d message(s) to %q (%d error(s)).\n",
-		len(report.Moved), moveTo, report.MoveErrors)
+	mover, ok := apiClient.(triageFolderMover)
+	if !ok {
+		return errors.New("IMAP client does not report folder move results")
+	}
+	report.Moved, report.MoveNoops, report.MoveErrors = executeTriageMoves(ctx, mover, res.Move, moveTo)
+	fmt.Fprintf(os.Stderr, "Moved %d message(s) to %q (%d no-op(s), %d error(s)).\n",
+		len(report.Moved), moveTo, report.MoveNoops, report.MoveErrors)
 	if err := printJSON(report); err != nil {
 		return err
 	}
@@ -198,6 +218,37 @@ func runTriageQueue(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("%d message(s) failed to move", report.MoveErrors)
 	}
 	return nil
+}
+
+// filterTriageSourceMailbox keeps only messages whose canonical composite
+// source ID points at mailbox. IMAP deduplication can retain historical folder
+// labels after a message moves, so label membership alone is unsafe for writes.
+func filterTriageSourceMailbox(
+	msgs []query.MessageSummary,
+	mailbox string,
+) ([]query.MessageSummary, int) {
+	kept := make([]query.MessageSummary, 0, len(msgs))
+	skipped := 0
+	for _, msg := range msgs {
+		sourceMailbox, ok := triageSourceMailbox(msg.SourceMessageID)
+		if !ok || !strings.EqualFold(sourceMailbox, mailbox) {
+			skipped++
+			continue
+		}
+		kept = append(kept, msg)
+	}
+	return kept, skipped
+}
+
+func triageSourceMailbox(sourceMessageID string) (string, bool) {
+	separator := strings.LastIndex(sourceMessageID, "|")
+	if separator <= 0 || separator == len(sourceMessageID)-1 {
+		return "", false
+	}
+	if _, err := strconv.ParseUint(sourceMessageID[separator+1:], 10, 32); err != nil {
+		return "", false
+	}
+	return sourceMessageID[:separator], true
 }
 
 // triageCutoff derives the staleness cutoff from --before XOR
@@ -386,25 +437,38 @@ func triageReplyText(
 	return triage.TruncateText(text, triageReplyTextLimit), nil
 }
 
-// executeTriageMoves moves msgs into folder in chunks. A failed chunk
-// counts all of its messages as errors and the run continues; only
-// messages from fully successful chunks are reported as moved.
+// executeTriageMoves moves msgs into folder one at a time so the report can
+// distinguish confirmed moves from stale source UIDs and per-message errors.
 func executeTriageMoves(
 	ctx context.Context,
-	client gmail.API,
+	client triageFolderMover,
 	msgs []query.MessageSummary,
 	folder string,
-) (moved []int64, moveErrors int) {
+) (moved []int64, moveNoops, moveErrors int) {
 	moved = []int64{}
-	ids := make([]string, 0, len(msgs))
-	for _, m := range msgs {
-		ids = append(ids, m.SourceMessageID)
+	for i, msg := range msgs {
+		confirmed, err := client.MoveMessageToFolder(ctx, msg.SourceMessageID, folder)
+		if err != nil {
+			moveErrors++
+			fmt.Fprintf(os.Stderr, "Warning: move message %d failed: %v\n", msg.ID, err)
+			if ctx.Err() != nil {
+				moveErrors += len(msgs) - i - 1
+				break
+			}
+		} else if confirmed {
+			moved = append(moved, msg.ID)
+		} else {
+			moveNoops++
+		}
+
+		processed := i + 1
+		if processed%labelWriteChunkSize == 0 || processed == len(msgs) {
+			fmt.Fprintf(os.Stderr,
+				"Processed %d/%d move(s): %d confirmed, %d no-op, %d error(s).\n",
+				processed, len(msgs), len(moved), moveNoops, moveErrors)
+		}
 	}
-	okIdx, moveErrors := batchModifyLabelsChunked(ctx, client, ids, []string{"folder:" + folder}, nil, "Moved")
-	for _, i := range okIdx {
-		moved = append(moved, msgs[i].ID)
-	}
-	return moved, moveErrors
+	return moved, moveNoops, moveErrors
 }
 
 func init() {
