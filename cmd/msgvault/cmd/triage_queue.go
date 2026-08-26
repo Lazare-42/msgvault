@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/gmail"
+	imaplib "go.kenn.io/msgvault/internal/imap"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/triage"
 )
@@ -103,7 +104,10 @@ type triageReport struct {
 }
 
 type triageFolderMover interface {
-	MoveMessageToFolder(ctx context.Context, messageID, folder string) (bool, error)
+	MoveMessageToFolder(
+		ctx context.Context,
+		messageID, expectedSource, folder string,
+	) (bool, error)
 }
 
 func runTriageQueue(cmd *cobra.Command, _ []string) error {
@@ -208,7 +212,8 @@ func runTriageQueue(cmd *cobra.Command, _ []string) error {
 	if !ok {
 		return errors.New("IMAP client does not report folder move results")
 	}
-	report.Moved, report.MoveNoops, report.MoveErrors = executeTriageMoves(ctx, mover, res.Move, moveTo)
+	report.Moved, report.MoveNoops, report.MoveErrors = executeTriageMoves(
+		ctx, mover, res.Move, triageLabel, moveTo)
 	fmt.Fprintf(os.Stderr, "Moved %d message(s) to %q (%d no-op(s), %d error(s)).\n",
 		len(report.Moved), moveTo, report.MoveNoops, report.MoveErrors)
 	if err := printJSON(report); err != nil {
@@ -230,25 +235,14 @@ func filterTriageSourceMailbox(
 	kept := make([]query.MessageSummary, 0, len(msgs))
 	skipped := 0
 	for _, msg := range msgs {
-		sourceMailbox, ok := triageSourceMailbox(msg.SourceMessageID)
-		if !ok || !strings.EqualFold(sourceMailbox, mailbox) {
+		sourceMailbox, err := imaplib.SourceMailboxFromMessageID(msg.SourceMessageID)
+		if err != nil || !strings.EqualFold(sourceMailbox, mailbox) {
 			skipped++
 			continue
 		}
 		kept = append(kept, msg)
 	}
 	return kept, skipped
-}
-
-func triageSourceMailbox(sourceMessageID string) (string, bool) {
-	separator := strings.LastIndex(sourceMessageID, "|")
-	if separator <= 0 || separator == len(sourceMessageID)-1 {
-		return "", false
-	}
-	if _, err := strconv.ParseUint(sourceMessageID[separator+1:], 10, 32); err != nil {
-		return "", false
-	}
-	return sourceMessageID[:separator], true
 }
 
 // triageCutoff derives the staleness cutoff from --before XOR
@@ -443,11 +437,11 @@ func executeTriageMoves(
 	ctx context.Context,
 	client triageFolderMover,
 	msgs []query.MessageSummary,
-	folder string,
+	expectedSource, folder string,
 ) (moved []int64, moveNoops, moveErrors int) {
 	moved = []int64{}
 	for i, msg := range msgs {
-		confirmed, err := client.MoveMessageToFolder(ctx, msg.SourceMessageID, folder)
+		confirmed, err := client.MoveMessageToFolder(ctx, msg.SourceMessageID, expectedSource, folder)
 		if err != nil {
 			moveErrors++
 			fmt.Fprintf(os.Stderr, "Warning: move message %d failed: %v\n", msg.ID, err)

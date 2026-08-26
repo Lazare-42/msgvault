@@ -1003,6 +1003,14 @@ func parseCompositeID(id string) (mailbox string, uid imap.UID, err error) {
 	return id[:idx], imap.UID(n), nil
 }
 
+// SourceMailboxFromMessageID returns the mailbox encoded in a composite IMAP
+// message ID. Callers that select candidates by folder should use this helper
+// rather than duplicating the mailbox|UID grammar.
+func SourceMailboxFromMessageID(id string) (string, error) {
+	mailbox, _, err := parseCompositeID(id)
+	return mailbox, err
+}
+
 // GetProfile returns the IMAP account profile.
 // Uses STATUS INBOX to get the message count; the username is used as the email address.
 func (c *Client) GetProfile(ctx context.Context) (*gmailapi.Profile, error) {
@@ -1706,10 +1714,11 @@ func (c *Client) ModifyMessageLabels(ctx context.Context, messageID string, addL
 			}
 		}
 		if ops.destFolder != "" && !strings.EqualFold(mailbox, ops.destFolder) {
-			if err := c.ensureMailboxLocked(conn, ops.destFolder); err != nil {
+			dest, err := c.ensureMailboxLocked(conn, ops.destFolder)
+			if err != nil {
 				return err
 			}
-			if _, err := c.moveUIDLocked(ctx, mailbox, uid, ops.destFolder); err != nil {
+			if _, err := c.moveUIDLocked(ctx, mailbox, uid, dest); err != nil {
 				return err
 			}
 		}
@@ -1717,15 +1726,24 @@ func (c *Client) ModifyMessageLabels(ctx context.Context, messageID string, addL
 	})
 }
 
-// MoveMessageToFolder moves one composite IMAP message ID into folder and
-// reports whether the server confirmed a move. A missing source UID, a move to
-// the current mailbox, or a malformed COPYUID response recovered after the
-// source disappeared returns moved=false without turning an idempotent retry
-// into an error.
-func (c *Client) MoveMessageToFolder(ctx context.Context, messageID, folder string) (moved bool, err error) {
+// MoveMessageToFolder moves one composite IMAP message ID from expectedSource
+// into folder and reports whether the server confirmed a move. The expected
+// source guard prevents a stale historical label from moving mail out of a
+// different physical mailbox. A missing source UID, a move to the current
+// mailbox, or an ambiguous MOVE error after the source disappeared returns
+// moved=false without turning an idempotent retry into an error.
+func (c *Client) MoveMessageToFolder(
+	ctx context.Context,
+	messageID, expectedSource, folder string,
+) (moved bool, err error) {
 	mailbox, uid, err := parseCompositeID(messageID)
 	if err != nil {
 		return false, err
+	}
+	if !strings.EqualFold(mailbox, strings.TrimSpace(expectedSource)) {
+		return false, fmt.Errorf(
+			"source mailbox mismatch for %q: got %q, expected %q",
+			messageID, mailbox, expectedSource)
 	}
 	ops, err := parseIMAPLabelOps([]string{"folder:" + folder}, nil)
 	if err != nil {
@@ -1739,20 +1757,20 @@ func (c *Client) MoveMessageToFolder(ctx context.Context, messageID, folder stri
 		if err := c.selectMailbox(mailbox); err != nil {
 			return err
 		}
-		if err := c.ensureMailboxLocked(conn, ops.destFolder); err != nil {
+		dest, err := c.ensureMailboxLocked(conn, ops.destFolder)
+		if err != nil {
 			return err
 		}
-		moved, err = c.moveUIDLocked(ctx, mailbox, uid, ops.destFolder)
+		moved, err = c.moveUIDLocked(ctx, mailbox, uid, dest)
 		return err
 	})
 	return moved, err
 }
 
-// moveUIDLocked moves one UID idempotently. Some servers emit an invalid empty
-// COPYUID response when the source UID disappeared before MOVE. Check first to
-// avoid that response, then recover from the remaining search/MOVE race by
-// reconnecting and verifying that the UID is no longer in the source mailbox.
-// Caller must hold c.mu.
+// moveUIDLocked moves one UID idempotently. Check source existence first, then
+// resolve any ambiguous MOVE failure by reconnecting and checking whether the
+// source UID remains. This avoids depending on unstable decoder error strings
+// for malformed COPYUID responses. Caller must hold c.mu.
 func (c *Client) moveUIDLocked(ctx context.Context, source string, uid imap.UID, dest string) (bool, error) {
 	exists, err := uidExists(c.conn, uid)
 	if err != nil {
@@ -1767,9 +1785,6 @@ func (c *Client) moveUIDLocked(ctx context.Context, source string, uid imap.UID,
 	var uidSet imap.UIDSet
 	uidSet.AddNum(uid)
 	if _, err := c.conn.Move(uidSet, dest).Wait(); err != nil {
-		if !isMalformedCopyUIDError(err) {
-			return false, fmt.Errorf("MOVE to %q: %w", dest, err)
-		}
 		moveErr := err
 		if err := c.reconnect(ctx); err != nil {
 			return false, fmt.Errorf("MOVE to %q: %w; reconnect to verify: %w", dest, moveErr, err)
@@ -1782,7 +1797,7 @@ func (c *Client) moveUIDLocked(ctx context.Context, source string, uid imap.UID,
 			return false, fmt.Errorf("MOVE to %q: %w; verify source UID: %w", dest, moveErr, err)
 		}
 		if exists {
-			return false, fmt.Errorf("MOVE to %q left UID %d in %q after malformed COPYUID: %w", dest, uid, source, moveErr)
+			return false, fmt.Errorf("MOVE to %q failed and left UID %d in %q: %w", dest, uid, source, moveErr)
 		}
 		confirmed = false
 	}
@@ -1800,54 +1815,60 @@ func uidExists(conn *imapclient.Client, uid imap.UID) (bool, error) {
 	return slices.Contains(data.AllUIDs(), uid), nil
 }
 
-func isMalformedCopyUIDError(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "resp-code-copy")
-}
-
-// ensureMailboxLocked creates the named mailbox if it does not already exist.
-// Caller must hold c.mu. LIST is the source of truth because some servers
-// return a plain NO without the ALREADYEXISTS response code when CREATE targets
-// an existing mailbox. A post-error LIST also covers a concurrent creator.
-func (c *Client) ensureMailboxLocked(conn *imapclient.Client, name string) error {
-	mailboxes, err := c.listMailboxesLocked()
+// ensureMailboxLocked creates name when no case-insensitive selectable match
+// exists and returns the server's canonical mailbox spelling. It performs a
+// live LIST on every call so an external rename/delete cannot leave moves
+// relying on stale client cache state. Exchange plain-NO already-exists errors
+// are accepted only when their status text says so and a post-error LIST finds
+// the mailbox; quota, ACL, and other CREATE failures remain errors.
+// Caller must hold c.mu.
+func (c *Client) ensureMailboxLocked(conn *imapclient.Client, name string) (string, error) {
+	mailboxes, err := listMailboxesLockedFromConn(conn)
 	if err != nil {
-		return fmt.Errorf("check mailbox %q before CREATE: %w", name, err)
+		return "", fmt.Errorf("check mailbox %q before CREATE: %w", name, err)
 	}
-	if slices.Contains(mailboxes, name) {
-		return nil
+	if actual, ok := findMailboxFold(mailboxes, name); ok {
+		c.mailboxCache = nil
+		return actual, nil
 	}
 
 	if err := conn.Create(name, nil).Wait(); err != nil {
-		var imapErr *imap.Error
-		if errors.As(err, &imapErr) && imapErr.Code == imap.ResponseCodeAlreadyExists {
-			c.mailboxCache = append(c.mailboxCache, name)
-			return nil
+		if !isMailboxAlreadyExistsError(err) {
+			return "", fmt.Errorf("CREATE mailbox %q: %w", name, err)
 		}
-		exists, listErr := mailboxExists(conn, name)
-		if listErr == nil && exists {
-			c.mailboxCache = append(c.mailboxCache, name)
-			return nil
-		}
+		mailboxes, listErr := listMailboxesLockedFromConn(conn)
 		if listErr != nil {
-			return fmt.Errorf("CREATE mailbox %q: %w (verify with LIST: %w)", name, err, listErr)
+			return "", fmt.Errorf("CREATE mailbox %q: %w (verify with LIST: %w)", name, err, listErr)
 		}
-		return fmt.Errorf("CREATE mailbox %q: %w", name, err)
+		if actual, ok := findMailboxFold(mailboxes, name); ok {
+			c.mailboxCache = nil
+			return actual, nil
+		}
+		return "", fmt.Errorf("CREATE mailbox %q: %w", name, err)
 	}
-	c.mailboxCache = append(c.mailboxCache, name)
-	return nil
+	c.mailboxCache = nil
+	return name, nil
 }
 
-func mailboxExists(conn *imapclient.Client, name string) (bool, error) {
-	items, err := conn.List("", name, nil).Collect()
-	if err != nil {
-		return false, fmt.Errorf("LIST mailbox %q: %w", name, err)
-	}
-	for _, item := range items {
-		if item.Mailbox == name {
-			return true, nil
+func findMailboxFold(mailboxes []string, name string) (string, bool) {
+	for _, mailbox := range mailboxes {
+		if strings.EqualFold(mailbox, name) {
+			return mailbox, true
 		}
 	}
-	return false, nil
+	return "", false
+}
+
+func isMailboxAlreadyExistsError(err error) bool {
+	var imapErr *imap.Error
+	if !errors.As(err, &imapErr) {
+		return false
+	}
+	if imapErr.Code == imap.ResponseCodeAlreadyExists {
+		return true
+	}
+	return imapErr.Type == imap.StatusResponseTypeNo &&
+		strings.Contains(strings.ToLower(imapErr.Text), "already exists")
 }
 
 func (c *Client) BatchModifyLabels(ctx context.Context, messageIDs, addLabelIDs, removeLabelIDs []string) error {
@@ -1869,13 +1890,16 @@ func (c *Client) CreateLabel(ctx context.Context, name string) (*gmailapi.Label,
 	if trimmed == "" {
 		return nil, errors.New("mailbox name is required")
 	}
+	actual := trimmed
 	if err := c.withConn(ctx, func(conn *imapclient.Client) error {
-		return c.ensureMailboxLocked(conn, trimmed)
+		var err error
+		actual, err = c.ensureMailboxLocked(conn, trimmed)
+		return err
 	}); err != nil {
 		return nil, err
 	}
 	c.clearMessageCaches()
-	return &gmailapi.Label{ID: trimmed, Name: trimmed}, nil
+	return &gmailapi.Label{ID: actual, Name: actual}, nil
 }
 
 func (c *Client) DeleteLabel(_ context.Context, _ string) error {

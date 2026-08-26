@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -45,7 +46,10 @@ type selectErrorSession struct {
 type createErrorSession struct {
 	imapserver.Session
 
-	mailbox string
+	mailboxes []string
+	mailbox   string
+	createErr error
+	listed    *atomic.Bool
 }
 
 type phantomUIDSession struct {
@@ -93,14 +97,42 @@ func (s *phantomUIDSession) Move(
 }
 
 func (s *createErrorSession) Create(mailbox string, options *imap.CreateOptions) error {
-	if mailbox == s.mailbox {
-		return &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Text: "Mailbox already exists.",
-		}
+	if strings.EqualFold(mailbox, s.mailbox) {
+		return s.createErr
 	}
 	if err := s.Session.Create(mailbox, options); err != nil {
 		return fmt.Errorf("create mailbox %q: %w", mailbox, err)
+	}
+	return nil
+}
+
+// List hides the configured mailbox from the first LIST call, forcing clients
+// to issue CREATE. Later LIST calls reveal the existing mailbox so tests can
+// exercise post-CREATE error verification rather than a preflight fast path.
+func (s *createErrorSession) List(
+	w *imapserver.ListWriter,
+	ref string,
+	patterns []string,
+	_ *imap.ListOptions,
+) error {
+	hideTarget := s.listed.CompareAndSwap(false, true)
+	for _, mailbox := range s.mailboxes {
+		if hideTarget && strings.EqualFold(mailbox, s.mailbox) {
+			continue
+		}
+		matches := false
+		for _, pattern := range patterns {
+			if imapserver.MatchList(mailbox, '/', ref, pattern) {
+				matches = true
+				break
+			}
+		}
+		if !matches {
+			continue
+		}
+		if err := w.WriteList(&imap.ListData{Mailbox: mailbox, Delim: '/'}); err != nil {
+			return fmt.Errorf("write LIST response for %q: %w", mailbox, err)
+		}
 	}
 	return nil
 }
@@ -217,7 +249,7 @@ func AppendIMAPMessageWithMessageID(
 // down via t.Cleanup.
 func StartIMAPMemServer(t *testing.T, messagesPerMailbox map[string]int) (string, *imapmemserver.User) {
 	t.Helper()
-	return startIMAPMemServer(t, messagesPerMailbox, nil, "", 0, "", 0)
+	return startIMAPMemServer(t, messagesPerMailbox, nil, "", 0, nil, 0)
 }
 
 // StartIMAPMemServerWithSpecialUse runs an in-memory IMAP server whose LIST
@@ -228,7 +260,7 @@ func StartIMAPMemServerWithSpecialUse(
 	specialUse map[string][]imap.MailboxAttr,
 ) (string, *imapmemserver.User) {
 	t.Helper()
-	return startIMAPMemServer(t, messagesPerMailbox, specialUse, "", 0, "", 0)
+	return startIMAPMemServer(t, messagesPerMailbox, specialUse, "", 0, nil, 0)
 }
 
 // StartIMAPMemServerWithCreateError runs an in-memory IMAP server that returns
@@ -239,7 +271,32 @@ func StartIMAPMemServerWithCreateError(
 	createErrorMailbox string,
 ) (string, *imapmemserver.User) {
 	t.Helper()
-	return startIMAPMemServer(t, messagesPerMailbox, nil, "", 0, createErrorMailbox, 0)
+	return startIMAPMemServer(t, messagesPerMailbox, nil, "", 0, &createErrorConfig{
+		mailbox: createErrorMailbox,
+		err: &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: "Mailbox already exists.",
+		},
+	}, 0)
+}
+
+// StartIMAPMemServerWithCreateFailure hides an existing mailbox from the first
+// LIST and returns a genuine CREATE failure. Clients must not swallow the error
+// merely because a later LIST reveals a same-named mailbox.
+func StartIMAPMemServerWithCreateFailure(
+	t *testing.T,
+	messagesPerMailbox map[string]int,
+	createErrorMailbox string,
+) (string, *imapmemserver.User) {
+	t.Helper()
+	return startIMAPMemServer(t, messagesPerMailbox, nil, "", 0, &createErrorConfig{
+		mailbox: createErrorMailbox,
+		err: &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeOverQuota,
+			Text: "Mailbox quota exceeded.",
+		},
+	}, 0)
 }
 
 // StartIMAPMemServerWithPhantomUID runs an in-memory IMAP server whose first
@@ -251,7 +308,7 @@ func StartIMAPMemServerWithPhantomUID(
 	phantomUID imap.UID,
 ) (string, *imapmemserver.User) {
 	t.Helper()
-	return startIMAPMemServer(t, messagesPerMailbox, nil, "", 0, "", phantomUID)
+	return startIMAPMemServer(t, messagesPerMailbox, nil, "", 0, nil, phantomUID)
 }
 
 // StartIMAPMemServerWithSelectError runs an in-memory IMAP server that rejects
@@ -264,7 +321,7 @@ func StartIMAPMemServerWithSelectError(
 ) (string, *imapmemserver.User) {
 	t.Helper()
 	return startIMAPMemServer(
-		t, messagesPerMailbox, specialUse, selectErrorMailbox, -1, "", 0)
+		t, messagesPerMailbox, specialUse, selectErrorMailbox, -1, nil, 0)
 }
 
 // StartIMAPMemServerWithOneShotSelectError runs an in-memory IMAP server that
@@ -277,7 +334,12 @@ func StartIMAPMemServerWithOneShotSelectError(
 ) (string, *imapmemserver.User) {
 	t.Helper()
 	return startIMAPMemServer(
-		t, messagesPerMailbox, specialUse, selectErrorMailbox, 1, "", 0)
+		t, messagesPerMailbox, specialUse, selectErrorMailbox, 1, nil, 0)
+}
+
+type createErrorConfig struct {
+	mailbox string
+	err     error
 }
 
 func startIMAPMemServer(
@@ -286,7 +348,7 @@ func startIMAPMemServer(
 	specialUse map[string][]imap.MailboxAttr,
 	selectErrorMailbox string,
 	selectErrorCount int,
-	createErrorMailbox string,
+	createError *createErrorConfig,
 	phantomUID imap.UID,
 ) (string, *imapmemserver.User) {
 	t.Helper()
@@ -303,6 +365,7 @@ func startIMAPMemServer(
 	memServer := imapmemserver.New()
 	memServer.AddUser(user)
 	var phantomUIDClaimed atomic.Bool
+	var createErrorListed atomic.Bool
 	var caps imap.CapSet
 	if phantomUID != 0 {
 		caps = imap.CapSet{
@@ -330,10 +393,13 @@ func startIMAPMemServer(
 					remaining: selectErrorCount,
 				}
 			}
-			if createErrorMailbox != "" {
+			if createError != nil {
 				session = &createErrorSession{
-					Session: session,
-					mailbox: createErrorMailbox,
+					Session:   session,
+					mailboxes: mailboxes,
+					mailbox:   createError.mailbox,
+					createErr: createError.err,
+					listed:    &createErrorListed,
 				}
 			}
 			if phantomUID != 0 {

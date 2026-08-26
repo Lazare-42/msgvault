@@ -48,13 +48,27 @@ func TestClientMoveMessageToFolderReportsConfirmedMove(t *testing.T) {
 		Body:    "body",
 	}, nil)
 
-	moved, err := client.MoveMessageToFolder(context.Background(), id, "Archive")
+	moved, err := client.MoveMessageToFolder(context.Background(), id, "INBOX", "Archive")
 	require.NoError(t, err)
 	assert.True(t, moved)
 
-	moved, err = client.MoveMessageToFolder(context.Background(), id, "Archive")
+	moved, err = client.MoveMessageToFolder(context.Background(), id, "INBOX", "Archive")
 	require.NoError(t, err)
 	assert.False(t, moved, "stale source UID must report a no-op")
+}
+
+func TestClientMoveMessageToFolderRejectsSourceMismatch(t *testing.T) {
+	client := newDraftTestClient(t)
+	id := appendTestMessage(t, client, "Archive", &gmailapi.DraftCompose{
+		To:      []string{"applicant@example.com"},
+		Subject: "keep in archive",
+		Body:    "body",
+	}, nil)
+
+	moved, err := client.MoveMessageToFolder(context.Background(), id, "INBOX", "Queue")
+	require.ErrorContains(t, err, "source mailbox mismatch")
+	assert.False(t, moved)
+	assert.Len(t, listMailboxMessageIDs(t, client, "Archive"), 1)
 }
 
 func TestClientModifyMessageLabelsMoveToExistingFolderWithFlag(t *testing.T) {
@@ -84,7 +98,7 @@ func TestClientModifyMessageLabelsMoveToExistingFolderWithFlag(t *testing.T) {
 func TestClientModifyMessageLabelsMoveToExistingFolderWithPlainCreateNO(t *testing.T) {
 	addr, user := testutil.StartIMAPMemServerWithCreateError(t, map[string]int{
 		"INBOX": 0,
-		"Queue": 0,
+		"queue": 0,
 	}, "Queue")
 	testutil.AppendIMAPMessage(t, user, "INBOX")
 	client := newTestClient(t, addr)
@@ -95,6 +109,42 @@ func TestClientModifyMessageLabelsMoveToExistingFolderWithPlainCreateNO(t *testi
 		[]string{"folder:Queue"},
 		nil,
 	))
+	assert.Len(t, listMailboxMessageIDs(t, client, "queue"), 1)
+}
+
+func TestClientModifyMessageLabelsPreservesRealCreateError(t *testing.T) {
+	addr, user := testutil.StartIMAPMemServerWithCreateFailure(t, map[string]int{
+		"INBOX": 0,
+		"Queue": 0,
+	}, "Queue")
+	testutil.AppendIMAPMessage(t, user, "INBOX")
+	client := newTestClient(t, addr)
+
+	err := client.ModifyMessageLabels(
+		context.Background(),
+		"INBOX|1",
+		[]string{"folder:Queue"},
+		nil,
+	)
+	require.ErrorContains(t, err, "OVERQUOTA")
+	assert.Len(t, listMailboxMessageIDs(t, client, "INBOX"), 1)
+}
+
+func TestClientModifyMessageLabelsRefreshesMailboxExistence(t *testing.T) {
+	addr, user := testutil.StartIMAPMemServer(t, map[string]int{
+		"INBOX": 0,
+		"Queue": 0,
+	})
+	testutil.AppendIMAPMessage(t, user, "INBOX")
+	testutil.AppendIMAPMessage(t, user, "INBOX")
+	client := newTestClient(t, addr)
+
+	require.NoError(t, client.ModifyMessageLabels(
+		context.Background(), "INBOX|1", []string{"folder:Queue"}, nil))
+	require.NoError(t, user.Delete("Queue"))
+	require.NoError(t, client.ModifyMessageLabels(
+		context.Background(), "INBOX|2", []string{"folder:Queue"}, nil))
+
 	assert.Len(t, listMailboxMessageIDs(t, client, "Queue"), 1)
 }
 
@@ -106,14 +156,14 @@ func TestClientModifyMessageLabelsRecoversFromEmptyCopyUID(t *testing.T) {
 	}, missingUID)
 	client := newTestClient(t, addr)
 
-	moved, err := client.MoveMessageToFolder(context.Background(), "INBOX|999", "Queue")
+	moved, err := client.MoveMessageToFolder(context.Background(), "INBOX|999", "INBOX", "Queue")
 	require.NoError(t, err)
 	assert.False(t, moved, "empty COPYUID cannot confirm a move")
 
 	// Malformed COPYUID closes the first connection. A subsequent real move
 	// proves recovery left the client usable.
 	testutil.AppendIMAPMessage(t, user, "INBOX")
-	moved, err = client.MoveMessageToFolder(context.Background(), "INBOX|1", "Queue")
+	moved, err = client.MoveMessageToFolder(context.Background(), "INBOX|1", "INBOX", "Queue")
 	require.NoError(t, err)
 	assert.True(t, moved)
 	assert.Len(t, listMailboxMessageIDs(t, client, "Queue"), 1)
