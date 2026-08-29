@@ -1,5 +1,21 @@
 # CLAUDE.md
 
+@CONSTITUTION.md
+
+## Feature Discovery
+
+For uncertain new features, use these rules as a reasoning checkpoint.
+Do not create a design document merely to satisfy them.
+
+- Start from the concrete user outcome and inspect the nearest real artifact or production path with safe, reversible checks.
+- For local archives and importers, inspect schemas and aggregate metadata before recommending external services or indirect workflows.
+  Do not display personal content or identifiers unless explicitly needed and authorized.
+- Keep verified source capabilities, current msgvault support, workaround dependencies and trust costs, and unverified assumptions separate.
+- Prefer the smallest bounded end-to-end vertical slice through the relevant production path.
+  Treat only conditions blocking the next reversible step as prerequisites.
+- When the user asks to contribute upstream and the contribution is uncertain, prefer a focused draft PR linked to the motivating issue.
+  Defer unrelated hardening until evidence or feedback makes it necessary.
+
 ## General Workflow
 
 When a task involves multiple steps (e.g., implement + commit + PR), complete ALL steps in sequence without stopping. If creating a branch, committing, and opening a PR, finish the entire chain.

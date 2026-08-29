@@ -4,6 +4,7 @@ This file applies to all AI coding agents (Claude Code, Codex, Copilot CLI, etc.
 
 ## Authoritative References
 
+- Baseline operating principles: `CONSTITUTION.md` (read and follow it before acting).
 - Project guide: `CLAUDE.md` (this file is authoritative; AGENTS.md inherits its rules).
 
 ## Roborev
