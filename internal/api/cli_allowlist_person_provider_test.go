@@ -1,10 +1,12 @@
 package api
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/personenrichment"
 )
 
 func TestCLIRunCommandAllowedPermitsExactPersonProviderCommands(t *testing.T) {
@@ -105,4 +107,76 @@ func TestCLIAllowlistCodexProviderOperations(t *testing.T) {
 		checks.False(srv.cliRunEnvAllowedForCommand(
 			[]string{"person", "provider", operation}, "MUST_NOT_FORWARD"), operation)
 	}
+}
+
+func TestCLIRunCommandAllowedPermitsExactPersonEnrichmentCommandsAndRejectsRawShapes(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		want bool
+	}{
+		{name: "status", args: []string{"person", "enrichment", "status", "--limit=20", "--json"}, want: true},
+		{name: "profiles", args: []string{"person", "enrichment", "profiles"}, want: true},
+		{name: "consent", args: []string{"person", "enrichment", "consent", strings.Repeat("a", 64)}, want: true},
+		{name: "revoke", args: []string{"person", "enrichment", "revoke", "--all"}, want: true},
+		{name: "run", args: []string{"person", "enrichment", "run", "--person=7", "--provider=exa-default", "--idempotency-key=run-1"}, want: true},
+		{name: "safe digest suppression", args: []string{
+			"person", "enrichment", "suppress", "--provider-namespace=exa:" + strings.Repeat("a", 64),
+			"--identifier-class=email", "--normalization-version=email-v1", "--key-id=" + strings.Repeat("b", 64),
+			"--digest=" + strings.Repeat("c", 64), "--reason=opt_out", "--actor=cli",
+		}, want: true},
+		{name: "person suppression", args: []string{"person", "enrichment", "suppress", "--person=7", "--reason=data_subject_request"}, want: true},
+		{name: "raw provider flag rejected", args: []string{"person", "enrichment", "suppress", "--provider=exa-default", "--identifier-class=email", "--reason=opt_out"}},
+		{name: "raw positional rejected", args: []string{"person", "enrichment", "suppress", "person@example.test", "--reason=opt_out"}},
+		{name: "raw metadata field rejected", args: []string{
+			"person", "enrichment", "suppress", "--provider-namespace=exa:" + strings.Repeat("a", 64),
+			"--identifier-class=email", "--normalization-version=Opaque-ID", "--key-id=" + strings.Repeat("b", 64),
+			"--digest=" + strings.Repeat("c", 64), "--reason=opt_out", "--actor=cli",
+		}},
+		{name: "unknown flag rejected", args: []string{"person", "enrichment", "status", "--credential=secret"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, cliRunCommandAllowed(test.args))
+		})
+	}
+}
+
+func TestCLIRunCommandAllowedRejectsPersonSuppressionMetadataSmuggling(t *testing.T) {
+	for _, field := range []string{
+		"provider-namespace", "identifier-class", "normalization-version", "key-id", "digest", "actor",
+	} {
+		t.Run(field, func(t *testing.T) {
+			args := []string{"person", "enrichment", "suppress", "--person=7", "--reason=opt_out",
+				"--" + field + "=RAW-MARKER"}
+			assert.False(t, cliRunCommandAllowed(args))
+		})
+	}
+}
+
+func TestCLIAllowlistPersonEnrichmentForwardsOnlyCommandCredentials(t *testing.T) {
+	checks := assert.New(t)
+	srv := &Server{cfg: &config.Config{}}
+	srv.cfg.People.Enrichment.SuppressionKeyEnv = "ENRICHMENT_SUPPRESSION_KEY"
+	srv.cfg.People.Enrichment.Providers = []personenrichment.ProviderConfig{
+		{Name: "exa-primary", Enabled: true, APIKeyEnv: "EXA_PRIMARY_KEY"},
+		{Name: "exa-secondary", Enabled: true, APIKeyEnv: "EXA_SECONDARY_KEY"},
+		{Name: "exa-disabled", Enabled: false, APIKeyEnv: "EXA_DISABLED_KEY"},
+	}
+
+	run := []string{"person", "enrichment", "run", "--person=7", "--provider=exa-primary", "--idempotency-key=run-1"}
+	checks.True(srv.cliRunEnvAllowedForCommand(run, "ENRICHMENT_SUPPRESSION_KEY"))
+	checks.True(srv.cliRunEnvAllowedForCommand(run, "EXA_PRIMARY_KEY"))
+	checks.False(srv.cliRunEnvAllowedForCommand(run, "EXA_SECONDARY_KEY"))
+	checks.False(srv.cliRunEnvAllowedForCommand(run, "EXA_DISABLED_KEY"))
+
+	personSuppression := []string{"person", "enrichment", "suppress", "--person=7", "--reason=data_subject_request"}
+	checks.True(srv.cliRunEnvAllowedForCommand(personSuppression, "ENRICHMENT_SUPPRESSION_KEY"))
+	checks.False(srv.cliRunEnvAllowedForCommand(personSuppression, "EXA_PRIMARY_KEY"))
+
+	digestSuppression := []string{"person", "enrichment", "suppress", "--provider-namespace=exa:" + strings.Repeat("a", 64),
+		"--identifier-class=email", "--normalization-version=email-v1", "--key-id=" + strings.Repeat("b", 64),
+		"--digest=" + strings.Repeat("c", 64), "--reason=opt_out", "--actor=cli"}
+	checks.False(srv.cliRunEnvAllowedForCommand(digestSuppression, "ENRICHMENT_SUPPRESSION_KEY"))
+	checks.False(srv.cliRunEnvAllowedForCommand([]string{"person", "enrichment", "status"}, "EXA_PRIMARY_KEY"))
 }

@@ -6,6 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/google/uuid"
+	"go.kenn.io/msgvault/internal/personenrichment"
 )
 
 // PersonTracking reports whether a durable person is selected for future
@@ -71,20 +74,29 @@ func (s *Store) SetPersonTrackingContext(
 ) (*PersonTracking, error) {
 	var state *PersonTracking
 	err := s.withTxContext(ctx, func(tx *loggedTx) error {
+		if s.personEnrichmentTxBarrier != nil {
+			s.personEnrichmentTxBarrier("tracking_before_authority_lock")
+		}
+		if err := s.lockPersonEnrichmentAuthorityMutationTx(ctx, tx); err != nil {
+			return err
+		}
 		if err := s.lockProfileIdentityKeyTxContext(
 			ctx, tx, "person-fact-generation", personID); err != nil {
 			return err
 		}
-		var exists int
-		if err := tx.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM persons WHERE id = ?`, personID).Scan(&exists); err != nil {
-			return fmt.Errorf("check person %d for tracking: %w", personID, err)
-		}
-		if exists == 0 {
+		_, err := lockPersonEnrichmentPersonTx(ctx, tx, s.dialect, personID)
+		if errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("track person %d: %w", personID, ErrPersonNotFound)
 		}
+		if err != nil {
+			return err
+		}
+		if s.personEnrichmentTxBarrier != nil {
+			s.personEnrichmentTxBarrier("tracking_person_locked")
+		}
 
-		var err error
+		trackingAdded := false
+		trackingGeneration := ""
 		if tracked {
 			var result sql.Result
 			result, err = tx.ExecContext(ctx, `
@@ -95,6 +107,10 @@ func (s *Store) SetPersonTrackingContext(
 			var inserted int64
 			if err == nil {
 				inserted, err = result.RowsAffected()
+				trackingAdded = inserted == 1
+				if trackingAdded {
+					trackingGeneration = "enrollment:" + uuid.NewString()
+				}
 			}
 			if err == nil && inserted == 1 {
 				_, err = tx.ExecContext(ctx, `UPDATE person_sweep_cursors
@@ -126,6 +142,22 @@ func (s *Store) SetPersonTrackingContext(
 		}
 		if err != nil {
 			return fmt.Errorf("set person %d tracking to %t: %w", personID, tracked, err)
+		}
+		if tracked {
+			if trackingAdded {
+				if err := s.publishPersonEnrichmentTx(ctx, tx, personID,
+					personenrichment.TriggerTracked, trackingGeneration,
+					s.personEnrichmentTime()); err != nil {
+					return err
+				}
+			}
+		} else {
+			if s.personEnrichmentTxBarrier != nil {
+				s.personEnrichmentTxBarrier("untrack_authority_removed")
+			}
+			if err := s.forceInvalidatePersonEnrichmentTx(ctx, tx, personID); err != nil {
+				return err
+			}
 		}
 		state, err = s.getPersonTrackingTx(ctx, tx, personID)
 		return err

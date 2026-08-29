@@ -26,11 +26,225 @@ import (
 	"go.kenn.io/msgvault/internal/discord"
 	imaplib "go.kenn.io/msgvault/internal/imap"
 	"go.kenn.io/msgvault/internal/oauth"
+	"go.kenn.io/msgvault/internal/personenrichment"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
+
+func TestStoreAPIAdapterDeletePersonSuppressesCurrentIdentifiers(t *testing.T) {
+	require := require.New(t)
+	f := storetest.New(t)
+	participantID := f.EnsureParticipant("Delete.Person@Example.test", "Delete Person", "example.test")
+	person, _, err := f.Store.CreatePersonFromParticipantContext(t.Context(), participantID)
+	require.NoError(err)
+	_, profile, _ := scheduleWorkerProfile(t, f, "deletion-provider", "TEST_DELETE_PROVIDER_KEY")
+	key := strings.Repeat("d", 32)
+	_, err = f.Store.SetPersonTrackingContext(t.Context(), person.ID, true)
+	require.NoError(err)
+	_, _, err = f.Store.GrantPersonEnrichmentConsent(t.Context(), profile.Fingerprint, "test")
+	require.NoError(err)
+	_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
+		`UPDATE participants SET display_name = NULL WHERE id = ?`), participantID)
+	require.NoError(err)
+	displayName := "Delete Profile"
+	person, err = f.Store.UpdatePersonDisplayNameContext(
+		t.Context(), person.ID, person.Revision, &displayName)
+	require.NoError(err)
+	organization, err := f.Store.CreateOrganizationContext(t.Context(), store.OrganizationInput{
+		Name: "Example Labs", Kind: store.OrganizationKindCompany,
+	})
+	require.NoError(err)
+	_, err = f.Store.AddEmploymentContext(t.Context(), store.EmploymentInput{
+		PersonID: person.ID, OrganizationID: organization.ID,
+		IsCurrent: new(true), IsPrimary: new(true), Source: store.ProvenanceUser,
+	})
+	require.NoError(err)
+	person, err = f.Store.GetPersonContext(t.Context(), person.ID)
+	require.NoError(err)
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	run, _, err := f.Store.StartRun(t.Context(), personenrichment.RunStart{
+		Kind: "manual", RequestedBy: "disabled-deletion-history", RequestedAt: now,
+	})
+	require.NoError(err)
+	require.NoError(f.Store.PutPersonEnrichmentWorkContext(t.Context(), store.PersonEnrichmentWorkInput{
+		PersonID: person.ID, ProfileFingerprint: profile.Fingerprint,
+		Trigger: personenrichment.Trigger{Kind: personenrichment.TriggerManual, Generation: "manual:disabled-delete"},
+		DueAt:   now,
+	}))
+	lease, err := f.Store.ClaimWork(t.Context(), personenrichment.ClaimOptions{
+		RunID: run.ID, Owner: "disabled-deletion-worker", ProviderName: profile.Name,
+		Now: now, LeaseDuration: time.Minute,
+	})
+	require.NoError(err)
+	require.NotNil(lease)
+	hasher, err := personenrichment.NewSuppressionHasher([]byte(key))
+	require.NoError(err)
+	oldDigest := hasher.Digest(profile.ProviderNamespace, personenrichment.SuppressionEmail,
+		personenrichment.EmailNormalizationV1, "old-delete@example.test")
+	_, _, err = f.Store.BeginAttempt(t.Context(), lease.Token, personenrichment.AttemptStart{
+		RunID: run.ID, PersonID: person.ID, ProfileFingerprint: profile.Fingerprint,
+		PayloadHash: strings.Repeat("a", 64), RequestHash: strings.Repeat("b", 64),
+		PersonRevision: person.Revision, Trigger: lease.Trigger,
+		CheckedIdentifiers: []personenrichment.SuppressionDigest{oldDigest},
+	})
+	require.NoError(err)
+	adapter := &storeAPIAdapter{
+		store: f.Store,
+		personEnrichmentConfig: personenrichment.Config{
+			Enabled: false, SuppressionKeyEnv: "TEST_DELETE_SUPPRESSION_KEY",
+		},
+		lookupEnv: func(name string) (string, bool) {
+			assert.Equal(t, "TEST_DELETE_SUPPRESSION_KEY", name)
+			return key, true
+		},
+	}
+
+	require.NoError(adapter.DeletePersonContext(t.Context(), person.ID, person.Revision))
+	digest := hasher.Digest(profile.ProviderNamespace, personenrichment.SuppressionEmail,
+		personenrichment.EmailNormalizationV1, "delete.person@example.test")
+	found, err := f.Store.HasPersonEnrichmentSuppressionContext(t.Context(), digest)
+	require.NoError(err)
+	assert.True(t, found)
+	nameCompany, err := personenrichment.NormalizeSuppressionIdentifier(
+		personenrichment.SuppressionNameCompany, []string{"Delete Profile", "Example Labs"})
+	require.NoError(err)
+	digest = hasher.Digest(profile.ProviderNamespace, nameCompany.Class,
+		nameCompany.NormalizationVersion, nameCompany.Value)
+	found, err = f.Store.HasPersonEnrichmentSuppressionContext(t.Context(), digest)
+	require.NoError(err)
+	assert.True(t, found)
+}
+
+func TestStoreAPIAdapterDeletePersonWithoutEnrichmentHistoryNeedsNoSuppressionKey(t *testing.T) {
+	f := storetest.New(t)
+	participantID := f.EnsureParticipant("unenriched-delete@example.test", "Unenriched Delete", "example.test")
+	person, _, err := f.Store.CreatePersonFromParticipantContext(t.Context(), participantID)
+	require.NoError(t, err)
+	adapter := &storeAPIAdapter{
+		store: f.Store,
+		personEnrichmentConfig: personenrichment.Config{
+			Enabled: false, SuppressionKeyEnv: "TEST_UNUSED_SUPPRESSION_KEY",
+		},
+		lookupEnv: func(string) (string, bool) {
+			require.FailNow(t, "deleting a person without enrichment history must not load a suppression key")
+			return "", false
+		},
+	}
+
+	require.NoError(t, adapter.DeletePersonContext(t.Context(), person.ID, person.Revision))
+	_, err = f.Store.GetPersonContext(t.Context(), person.ID)
+	require.ErrorIs(t, err, store.ErrPersonNotFound)
+}
+
+func TestStoreAPIAdapterDeletePersonFailsClosedWithoutMatchingSuppressionKey(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*testing.T, *storetest.Fixture, personenrichment.ProviderProfile)
+		key   func(string) (string, bool)
+	}{
+		{
+			name: "missing key",
+			key:  func(string) (string, bool) { return "", false },
+		},
+		{
+			name: "mismatched durable key",
+			setup: func(t *testing.T, f *storetest.Fixture, profile personenrichment.ProviderProfile) {
+				t.Helper()
+				hasher, err := personenrichment.NewSuppressionHasher(bytes.Repeat([]byte{'o'}, 32))
+				require.NoError(t, err)
+				digest := hasher.Digest(profile.ProviderNamespace, personenrichment.SuppressionEmail,
+					personenrichment.EmailNormalizationV1, "other@example.test")
+				require.NoError(t, f.Store.InsertPersonEnrichmentSuppressionsContext(t.Context(),
+					[]store.PersonEnrichmentSuppressionInput{{
+						ProviderNamespace: digest.ProviderNamespace, IdentifierClass: digest.IdentifierClass,
+						NormalizationVersion: digest.NormalizationVersion, KeyID: digest.KeyID,
+						Digest: digest.Digest, Reason: store.PersonEnrichmentSuppressionOptOut, Actor: "test",
+					}}))
+			},
+			key: func(string) (string, bool) { return strings.Repeat("n", 32), true },
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := storetest.New(t)
+			participantID := f.EnsureParticipant("closed@example.test", "Closed Person", "example.test")
+			person, _, err := f.Store.CreatePersonFromParticipantContext(t.Context(), participantID)
+			require.NoError(t, err)
+			_, profile, _ := scheduleWorkerProfile(t, f, "closed-provider", "TEST_CLOSED_PROVIDER_KEY")
+			if test.setup != nil {
+				test.setup(t, f, profile)
+			}
+			adapter := &storeAPIAdapter{
+				store: f.Store,
+				personEnrichmentConfig: personenrichment.Config{
+					Enabled: true, SuppressionKeyEnv: "TEST_CLOSED_SUPPRESSION_KEY",
+				},
+				lookupEnv: test.key,
+			}
+			err = adapter.DeletePersonContext(t.Context(), person.ID, person.Revision)
+			require.Error(t, err)
+			_, getErr := f.Store.GetPersonContext(t.Context(), person.ID)
+			require.NoError(t, getErr)
+		})
+	}
+}
+
+func TestStoreAPIAdapterDeletePersonRejectsRecordedAttemptKeyMismatch(t *testing.T) {
+	require := require.New(t)
+	f := storetest.New(t)
+	participantID := f.EnsureParticipant("attempt-key@example.test", "Attempt Key", "example.test")
+	person, _, err := f.Store.CreatePersonFromParticipantContext(t.Context(), participantID)
+	require.NoError(err)
+	_, err = f.Store.SetPersonTrackingContext(t.Context(), person.ID, true)
+	require.NoError(err)
+	_, profile, _ := scheduleWorkerProfile(t, f, "attempt-key-provider", "TEST_ATTEMPT_PROVIDER_KEY")
+	now := time.Date(2026, 8, 23, 22, 0, 0, 0, time.UTC)
+	_, _, err = f.Store.GrantPersonEnrichmentConsent(t.Context(), profile.Fingerprint, "test")
+	require.NoError(err)
+	run, _, err := f.Store.StartRun(t.Context(), personenrichment.RunStart{
+		Kind: "manual", RequestedBy: "attempt-key-run", RequestedAt: now,
+	})
+	require.NoError(err)
+	require.NoError(f.Store.PutPersonEnrichmentWorkContext(t.Context(), store.PersonEnrichmentWorkInput{
+		PersonID: person.ID, ProfileFingerprint: profile.Fingerprint,
+		Trigger: personenrichment.Trigger{Kind: personenrichment.TriggerManual, Generation: "manual:attempt-key"},
+		DueAt:   now,
+	}))
+	lease, err := f.Store.ClaimWork(t.Context(), personenrichment.ClaimOptions{
+		RunID: run.ID, Owner: "attempt-key-worker", ProviderName: profile.Name,
+		Now: now, LeaseDuration: time.Minute,
+	})
+	require.NoError(err)
+	require.NotNil(lease)
+	oldHasher, err := personenrichment.NewSuppressionHasher(bytes.Repeat([]byte{'o'}, 32))
+	require.NoError(err)
+	oldDigest := oldHasher.Digest(profile.ProviderNamespace, personenrichment.SuppressionEmail,
+		personenrichment.EmailNormalizationV1, "attempt-key@example.test")
+	_, _, err = f.Store.BeginAttempt(t.Context(), lease.Token, personenrichment.AttemptStart{
+		RunID: run.ID, PersonID: person.ID, ProfileFingerprint: profile.Fingerprint,
+		PayloadHash: strings.Repeat("a", 64), RequestHash: strings.Repeat("b", 64),
+		PersonRevision: person.Revision, Trigger: lease.Trigger,
+		CheckedIdentifiers: []personenrichment.SuppressionDigest{oldDigest},
+	})
+	require.NoError(err)
+	adapter := &storeAPIAdapter{
+		store: f.Store,
+		personEnrichmentConfig: personenrichment.Config{
+			Enabled: true, SuppressionKeyEnv: "TEST_DELETE_SUPPRESSION_KEY",
+		},
+		lookupEnv: func(string) (string, bool) { return strings.Repeat("n", 32), true },
+	}
+	err = adapter.DeletePersonContext(t.Context(), person.ID, person.Revision)
+	require.ErrorIs(err, personenrichment.ErrSuppressionKeyMismatch)
+	_, err = f.Store.GetPersonContext(t.Context(), person.ID)
+	require.NoError(err)
+	attempts, err := f.Store.ListPersonEnrichmentAttemptsContext(t.Context(),
+		store.PersonEnrichmentAttemptFilter{PersonID: person.ID, Limit: 10})
+	require.NoError(err)
+	assert.NotEmpty(t, attempts)
+}
 
 // serveLifecycleTestTimeout bounds waits for daemon-startup milestones (API
 // seam entered, analytics build started, health ready). Every use is a

@@ -434,6 +434,9 @@ func (s *Store) mergePersonsOnce(
 		); err != nil {
 			return err
 		}
+		if err := s.forceInvalidatePersonEnrichmentTx(ctx, tx, absorbed.ID); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM persons WHERE id = ?`, absorbed.ID); err != nil {
 			return fmt.Errorf("delete absorbed person: %w", err)
 		}
@@ -443,6 +446,11 @@ func (s *Store) mergePersonsOnce(
 			return fmt.Errorf("retire absorbed person UID: %w", err)
 		}
 		if err := s.bumpPersonRevisionsTx(ctx, tx, survivor.ID); err != nil {
+			return err
+		}
+		if err := s.invalidatePersonEnrichmentIdentitiesAfterRevisionTx(
+			ctx, tx, survivor.ID,
+		); err != nil {
 			return err
 		}
 		if err := s.recordPersonMergePostRowsTx(
