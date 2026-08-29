@@ -26,6 +26,7 @@ type qresyncServerConfig struct {
 	selectHighestModSeq      uint64
 	selectFailureConnection  int
 	selectFailureAt          int
+	numMessages              *uint32
 	searchUIDs               []imapv2.UID
 	fetchChanged             []imapv2.UID
 	fetchVanished            []imapv2.UID
@@ -107,9 +108,13 @@ func serveQresyncTestConn(
 			_, _ = fmt.Fprintf(conn, "%s OK LIST completed\r\n", tag)
 		case strings.HasPrefix(upper, "STATUS"):
 			mailbox := scriptedCommandMailbox(command, "STATUS")
+			messages := ""
+			if cfg.numMessages != nil {
+				messages = fmt.Sprintf("MESSAGES %d ", *cfg.numMessages)
+			}
 			_, _ = fmt.Fprintf(conn,
-				"* STATUS %q (UIDNEXT %d UIDVALIDITY %d HIGHESTMODSEQ %d)\r\n%s OK STATUS completed\r\n",
-				mailbox, cfg.uidNext, cfg.uidValidity, cfg.highestModSeq, tag)
+				"* STATUS %q (%sUIDNEXT %d UIDVALIDITY %d HIGHESTMODSEQ %d)\r\n%s OK STATUS completed\r\n",
+				mailbox, messages, cfg.uidNext, cfg.uidValidity, cfg.highestModSeq, tag)
 		case strings.HasPrefix(upper, "ENABLE"):
 			_, _ = fmt.Fprintf(conn, "* ENABLED QRESYNC\r\n%s OK ENABLE completed\r\n", tag)
 		case strings.HasPrefix(upper, "SELECT"):
@@ -334,10 +339,12 @@ func TestListMessagesQresyncUIDValidityMismatchResetsWithFullEnumeration(t *test
 	assert.True(deltas[0].Reset)
 	assert.False(deltas[0].Incremental)
 	assert.Equal([]imapv2.UID{1, 2, 3}, deltas[0].ChangedUIDs)
-	assert.NotContains(joinedCommands(server.commandsFor(1)), "UID SEARCH")
-	commands := joinedCommands(server.commandsFor(2))
+	// Ineligible before a single command went out, so the full enumeration
+	// reuses the connection instead of redialing to discard nothing.
+	commands := joinedCommands(server.commandsFor(1))
 	assert.Contains(commands, "UID SEARCH")
 	assert.NotContains(commands, "QRESYNC (")
+	assert.Empty(server.commandsFor(2))
 }
 
 func TestListMessagesQresyncFallsBackWithoutCompleteEligibility(t *testing.T) {
@@ -371,10 +378,11 @@ func TestListMessagesQresyncFallsBackWithoutCompleteEligibility(t *testing.T) {
 			require.Len(t, deltas, 1)
 			assert.True(deltas[0].Reset)
 			assert.False(deltas[0].Incremental)
-			assert.NotContains(joinedCommands(server.commandsFor(1)), "UID SEARCH")
-			commands := joinedCommands(server.commandsFor(2))
+			commands := joinedCommands(server.commandsFor(1))
 			assert.Contains(commands, "UID SEARCH")
 			assert.NotContains(commands, "QRESYNC (")
+			assert.Empty(server.commandsFor(2),
+				"an ineligible baseline issues no command, so nothing needs discarding")
 		})
 	}
 }
@@ -405,11 +413,11 @@ func TestListMessagesQresyncReconnectDoesNotReuseEnabledState(t *testing.T) {
 	client.mu.Unlock()
 
 	assert.Equal([]string{"INBOX|1", "INBOX|2", "INBOX|3"}, listQresyncMessages(t, client))
-	assert.NotContains(joinedCommands(server.commandsFor(2)), "UID SEARCH")
-	commands := joinedCommands(server.commandsFor(3))
+	commands := joinedCommands(server.commandsFor(2))
 	assert.Contains(commands, "UID SEARCH")
 	assert.NotContains(commands, "ENABLE QRESYNC")
 	assert.NotContains(commands, "QRESYNC (")
+	assert.Empty(server.commandsFor(3))
 }
 
 func TestListMessagesQresyncErrorDiscardsPartialDeltaStateBeforeFallback(t *testing.T) {
@@ -463,11 +471,11 @@ func TestListMessagesQresyncRegressedStatusModSeqForcesFullFallback(t *testing.T
 	require.Len(t, deltas, 1)
 	assert.True(deltas[0].Reset)
 	assert.False(deltas[0].Incremental)
-	assert.NotContains(joinedCommands(server.commandsFor(1)), "UID SEARCH")
-	commands := joinedCommands(server.commandsFor(2))
+	commands := joinedCommands(server.commandsFor(1))
 	assert.Contains(commands, "UID SEARCH")
 	assert.NotContains(commands, "ENABLE QRESYNC")
 	assert.NotContains(commands, "CHANGEDSINCE")
+	assert.Empty(server.commandsFor(2))
 }
 
 func TestListMessagesQresyncRegressedSelectModSeqForcesFreshFullFallback(t *testing.T) {
@@ -547,8 +555,10 @@ func TestListMessagesFallbackRebuildsKnownUIDBaseline(t *testing.T) {
 		"INBOX": {UIDValidity: 77, UIDNext: 4, KnownUIDs: []uint32{1, 2, 3}},
 	})
 
-	assert.Equal(t, []string{"INBOX|1", "INBOX|2", "INBOX|3", "INBOX|4"},
-		listQresyncMessages(t, client))
+	// The server reports no MESSAGES count, so the baseline cannot be verified
+	// arithmetically and a full UID SEARCH settles it. The search is ground
+	// truth, so only the UID missing from the baseline needs listing.
+	assert.Equal(t, []string{"INBOX|4"}, listQresyncMessages(t, client))
 	assert.Equal(t, []uint32{1, 2, 3, 4}, client.ObservedFolderStates()["INBOX"].KnownUIDs)
 }
 
@@ -589,4 +599,174 @@ func TestObservedSnapshotsPreserveEmptyKnownUIDBaseline(t *testing.T) {
 
 	assert.NotNil(t, client.ObservedFolderStates()["Empty"].KnownUIDs)
 	assert.NotNil(t, client.ObservedMailboxDeltas()[0].State.KnownUIDs)
+}
+
+// TestListMessagesToleratesBoundaryUIDAboveHighWaterMark pins the union-based
+// deletion check. RFC 3501 6.4.8 makes "UID SEARCH UID n:*" return the last
+// message in the mailbox even when n is past it, so a search above the saved
+// high water mark can re-report a UID the baseline already holds. Adding the
+// two counts would read that as a deletion; merging them does not. The
+// in-memory server resolves "*" to UIDNEXT-1 instead, so only a scripted
+// server can exercise this.
+func TestListMessagesToleratesBoundaryUIDAboveHighWaterMark(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	numMessages := uint32(2)
+	addr, server := startQresyncTestServer(t, qresyncServerConfig{
+		capabilities: []string{"IMAP4rev1"},
+		mailboxes:    []string{"INBOX"},
+		uidValidity:  1,
+		uidNext:      4, // a message arrived and was expunged
+		numMessages:  &numMessages,
+		searchUIDs:   []imapv2.UID{2}, // "3:*" re-reports the last message
+	})
+
+	client := newQresyncTestClient(t, addr, map[string]FolderState{
+		"INBOX": {UIDValidity: 1, UIDNext: 3, KnownUIDs: []uint32{1, 2}},
+	})
+	// Re-listing the boundary UID is harmless: it is already archived, so the
+	// syncer skips it. Re-enumerating the whole mailbox would not be.
+	assert.Equal([]string{"INBOX|2"}, listQresyncMessages(t, client))
+
+	deltas := client.ObservedMailboxDeltas()
+	require.Len(deltas, 1)
+	assert.False(deltas[0].Reset,
+		"a re-reported boundary UID is not evidence of a deletion")
+	assert.Equal([]uint32{1, 2}, deltas[0].State.KnownUIDs)
+	assert.Contains(joinedCommands(server.commandsFor(1)), "UID SEARCH UID 3:*")
+}
+
+// TestListMessagesCondStoreOnlyFlagChangeForcesFullEnumeration covers a server
+// that advertises CONDSTORE but not QRESYNC. A flags-only change advances
+// HIGHESTMODSEQ while UIDNEXT and the message count both stay put, so the
+// UIDNEXT high water mark alone would never look at the modified message. The
+// mod-sequence is the signal that something below the mark moved.
+func TestListMessagesCondStoreOnlyFlagChangeForcesFullEnumeration(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	numMessages := uint32(2)
+	addr, server := startQresyncTestServer(t, qresyncServerConfig{
+		capabilities:  []string{"IMAP4rev1 ENABLE CONDSTORE"},
+		mailboxes:     []string{"INBOX"},
+		uidValidity:   1,
+		uidNext:       3, // unchanged
+		numMessages:   &numMessages,
+		highestModSeq: 20, // a flag changed on an existing message
+		searchUIDs:    []imapv2.UID{1, 2},
+	})
+
+	client := newQresyncTestClient(t, addr, map[string]FolderState{
+		"INBOX": {
+			UIDValidity:   1,
+			UIDNext:       3,
+			HighestModSeq: 10,
+			KnownUIDs:     []uint32{1, 2},
+		},
+	})
+
+	assert.Equal([]string{"INBOX|1", "INBOX|2"}, listQresyncMessages(t, client),
+		"an advanced mod-sequence must re-read the mailbox, not just its tail")
+
+	deltas := client.ObservedMailboxDeltas()
+	require.Len(deltas, 1)
+	assert.True(deltas[0].Reset,
+		"a flags-only change is invisible to UIDNEXT and the message count")
+	assert.Equal(uint64(20), deltas[0].State.HighestModSeq)
+
+	commands := joinedCommands(server.commandsFor(1))
+	assert.Contains(commands, "UID SEARCH UID 1:*")
+	assert.NotContains(commands, "UID SEARCH UID 3:*")
+}
+
+// TestListMessagesIneligibleQresyncReusesConnection covers a server that never
+// reports a mod-sequence, which is the common case for Office 365 IMAP. No
+// mailbox can be QRESYNC-eligible, so tryBuildQresyncMessageList returns before
+// issuing a single command and leaves the connection, the mailbox plan and the
+// STATUS results intact. Reconnecting there would redial and re-STATUS every
+// mailbox on every scheduled sync to discard nothing.
+func TestListMessagesIneligibleQresyncReusesConnection(t *testing.T) {
+	assert := assert.New(t)
+
+	numMessages := uint32(2)
+	mailboxes := []string{"Archive", "INBOX", "Projects"}
+	addr, server := startQresyncTestServer(t, qresyncServerConfig{
+		capabilities: []string{"IMAP4rev1"},
+		mailboxes:    mailboxes,
+		uidValidity:  1,
+		uidNext:      3,
+		numMessages:  &numMessages,
+	})
+
+	states := make(map[string]FolderState, len(mailboxes))
+	for _, mailbox := range mailboxes {
+		states[mailbox] = FolderState{UIDValidity: 1, UIDNext: 3, KnownUIDs: []uint32{1, 2}}
+	}
+	client := newQresyncTestClient(t, addr, states)
+
+	assert.Empty(listQresyncMessages(t, client),
+		"every mailbox is proven unchanged by UIDNEXT and message count")
+
+	assert.Empty(server.commandsFor(2), "the fallback must not redial")
+	commands := joinedCommands(server.commandsFor(1))
+	assert.Equal(1, strings.Count(commands, "LIST "), "one LIST, not one per attempt")
+	assert.Equal(len(mailboxes), strings.Count(commands, "STATUS "),
+		"one STATUS per mailbox, not two")
+	assert.NotContains(commands, "QRESYNC (")
+}
+
+// TestListMessagesQresyncErrorStillCoversSkippedMailboxes pins the safety
+// property behind letting the post-error fallback take scan shortcuts. A failed
+// QRESYNC attempt invalidates nothing the plan depends on: the stored baseline
+// is untouched and the reconnect re-runs STATUS, so a mailbox proven unchanged
+// by UIDVALIDITY, UIDNEXT and message count is still safe to skip. What must
+// not happen is a skipped mailbox dropping out of the published topology --
+// applyIMAPMailboxDeltas retires every mailbox missing from the delta set,
+// deleting its memberships and tombstoning the messages that lived only there.
+func TestListMessagesQresyncErrorStillCoversSkippedMailboxes(t *testing.T) {
+	assert := assert.New(t)
+
+	numMessages := uint32(3)
+	mailboxes := []string{"Archive", "INBOX"}
+	addr, server := startQresyncTestServer(t, qresyncServerConfig{
+		capabilities:            []string{"IMAP4rev1 ENABLE QRESYNC CONDSTORE"},
+		mailboxes:               mailboxes,
+		uidValidity:             77,
+		uidNext:                 4,
+		highestModSeq:           20,
+		numMessages:             &numMessages,
+		selectFailureConnection: 1,
+		selectFailureAt:         1,
+		searchUIDs:              []imapv2.UID{1, 2, 3},
+	})
+
+	states := make(map[string]FolderState, len(mailboxes))
+	for _, mailbox := range mailboxes {
+		states[mailbox] = FolderState{
+			UIDValidity:   77,
+			UIDNext:       4,
+			HighestModSeq: 20,
+			KnownUIDs:     []uint32{1, 2, 3},
+		}
+	}
+	client := newQresyncTestClient(t, addr, states)
+	client.mailboxCache = mailboxes
+
+	// The QRESYNC SELECT fails, so the run redials and re-STATUSes. Every
+	// mailbox then matches its baseline and is skipped.
+	assert.Empty(listQresyncMessages(t, client))
+	assert.Contains(joinedCommands(server.commandsFor(2)), "STATUS",
+		"a genuine QRESYNC failure still redials and re-reads STATUS")
+
+	deltas := client.ObservedMailboxDeltas()
+	require.Len(t, deltas, len(mailboxes),
+		"a skipped mailbox must still appear in the topology or the store retires it")
+	for _, delta := range deltas {
+		assert.True(delta.Incremental, "%s", delta.Mailbox)
+		assert.False(delta.Reset, "%s", delta.Mailbox)
+		assert.Empty(delta.VanishedUIDs, "%s", delta.Mailbox)
+		assert.Equal([]uint32{1, 2, 3}, delta.State.KnownUIDs, "%s", delta.Mailbox)
+	}
+	assert.Len(client.ObservedFolderStates(), len(mailboxes))
 }

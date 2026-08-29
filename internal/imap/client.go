@@ -142,6 +142,12 @@ func NewClient(cfg *Config, password string, opts ...Option) *Client {
 // LabelsSnapshotComplete reports whether a sync sees every mailbox label.
 // Folder- and date-filtered syncs only have a partial label view and must not
 // replace labels or canonical message IDs discovered by an earlier full sync.
+//
+// A listing that skipped mailboxes it proved unchanged also holds a partial
+// in-session label map, but it stays complete here: those mailboxes' deltas and
+// memberships are published intact, and the post-sync mailbox-delta transaction
+// is what reconciles labels. Syncer guarantees the pairing by forcing full
+// enumeration on any client that reconciles labels immediately instead.
 func (c *Client) LabelsSnapshotComplete() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -425,6 +431,124 @@ func addMessageIDsFromHeaderFetchResults(dst map[string]bool, msgs []*imapclient
 	}
 }
 
+// mailboxScan is the resolved enumeration plan for one mailbox on a listing
+// without QRESYNC. It is computed once, before the label map is built, so the
+// label map and the message listing cannot disagree about what changed: a
+// mailbox skipped by one and enumerated by the other would publish a Reset
+// delta with no membership observations behind it.
+type mailboxScan struct {
+	skip     bool       // membership provably unchanged; publish a no-op delta
+	reset    bool       // republish the whole mailbox
+	uids     []imap.UID // UIDs to fetch and list
+	vanished []imap.UID // UIDs that left the mailbox since the baseline
+	known    []uint32   // resulting KnownUIDs baseline
+	err      error      // enumeration failed; the run is not authoritative
+}
+
+// statusMessageCount reports whether the server's MESSAGES count is known and
+// equals want.
+func statusMessageCount(state FolderState, want int) bool {
+	return state.NumMessages != nil && int(*state.NumMessages) == want
+}
+
+// planMailboxScans decides, per mailbox, whether a listing can skip the mailbox
+// entirely, enumerate only UIDs at or above the saved UIDNEXT, or must
+// enumerate it in full.
+//
+// STATUS MESSAGES stands in for the change tracking CONDSTORE would provide.
+// UIDNEXT is monotonic within a UIDVALIDITY epoch and is raised by every
+// APPEND, so an unchanged UIDNEXT proves no message arrived; an unchanged
+// message count then proves none was expunged either. When UIDNEXT has
+// advanced, the same count check applied to the merged UID set proves that
+// nothing below the high water mark vanished while the new messages arrived.
+//
+// Every uncertainty resolves toward more enumeration, never less: membership
+// rows are only ever written from UIDs the client actually observed, so a
+// baseline can lag the server but cannot spuriously exceed it, and a lagging
+// baseline fails the count check and triggers a full rebuild.
+//
+// Caller must hold c.mu.
+func (c *Client) planMailboxScans(
+	ctx context.Context, mailboxes []string, statuses map[string]FolderState,
+) map[string]mailboxScan {
+	scans := make(map[string]mailboxScan, len(mailboxes))
+	for _, mailbox := range mailboxes {
+		scans[mailbox] = c.planMailboxScan(ctx, mailbox, statuses)
+	}
+	return scans
+}
+
+func (c *Client) planMailboxScan(
+	ctx context.Context, mailbox string, statuses map[string]FolderState,
+) mailboxScan {
+	full := func() mailboxScan {
+		uids, err := c.enumerateMailbox(ctx, mailbox, 0)
+		if err != nil {
+			return mailboxScan{err: err}
+		}
+		return mailboxScan{reset: true, uids: uids, known: uidsToUint32(uids)}
+	}
+
+	status, ok := statuses[mailbox]
+	if !ok || c.forceFullEnumeration {
+		return full()
+	}
+	// A nil KnownUIDs means no baseline was ever recorded, which is not the
+	// same as a baseline of zero messages: GetIMAPKnownUIDs returns an empty
+	// non-nil slice for a mailbox that is genuinely empty.
+	prior, ok := c.priorFolderStates[mailbox]
+	if !ok || prior.KnownUIDs == nil ||
+		prior.UIDValidity != status.UIDValidity ||
+		prior.UIDNext > status.UIDNext {
+		return full()
+	}
+
+	if folderStateUnchanged(prior, status) &&
+		statusMessageCount(status, len(prior.KnownUIDs)) {
+		return mailboxScan{skip: true, known: cloneKnownUIDs(prior.KnownUIDs)}
+	}
+
+	// A server that reports mod-sequences can change flags on an existing
+	// message without moving UIDNEXT or the message count, and those messages
+	// sit below the high water mark where the search below cannot see them.
+	// Only servers that report no mod-sequence at all can be summarised by
+	// UIDNEXT plus a count; a QRESYNC server never reaches here, because
+	// CHANGEDSINCE handles it.
+	if status.HighestModSeq != prior.HighestModSeq {
+		return full()
+	}
+
+	uids, err := c.enumerateMailbox(ctx, mailbox, imap.UID(prior.UIDNext))
+	if err != nil {
+		return mailboxScan{err: err}
+	}
+	// Count the union rather than the sum: "UID SEARCH UID n:*" always returns
+	// the last message in the mailbox even when n is past it (RFC 3501 6.4.8),
+	// so a search above the high water mark can re-report a UID already in the
+	// baseline.
+	known := mergeKnownUIDs(prior.KnownUIDs, uids)
+	if statusMessageCount(status, len(known)) {
+		return mailboxScan{uids: uids, known: known}
+	}
+	// The counts disagree: something at or below the high water mark vanished.
+	// Only a full enumeration can say what, but its answer is a diff, not a
+	// reason to republish: prior.KnownUIDs is read back from the stored
+	// memberships, so the difference between it and the current UID set names
+	// the additions and the removals outright. Republishing instead would cost
+	// a Message-ID fetch for every message in the mailbox, twice -- once to
+	// rebuild the label map and once to refresh labels downstream.
+	current, err := c.enumerateMailbox(ctx, mailbox, 0)
+	if err != nil {
+		return mailboxScan{err: err}
+	}
+	added, vanished := diffKnownUIDs(prior.KnownUIDs, current)
+	return mailboxScan{
+		uids:     added,
+		vanished: vanished,
+		known:    uidsToUint32(current),
+	}
+}
+
 // enumerateMailbox lists UIDs in a single mailbox. A non-zero minUID
 // restricts the search to UIDs at or above it (new messages since a
 // saved UIDNEXT high water mark). It handles network errors with one
@@ -551,9 +675,16 @@ func (c *Client) fetchMailboxMessageIDs(
 // from the other mailboxes) and fetches Message-ID headers to build a
 // Message-ID → mailbox membership map. When \All is absent, every mailbox is
 // included.
+//
+// A non-nil scans supplies the enumeration plan resolved by planMailboxScans;
+// mailboxes it marks unchanged contribute no entries because their membership
+// rows already carry the answer, and mailboxes it marks incremental contribute
+// only their new UIDs. Skipping this way is a success, not a degradation: the
+// returned completeness flag stays true, because it reports whether the
+// published topology is authoritative, not how much of it was re-read.
 // Caller must hold mu.
 func (c *Client) buildLabelMap(
-	ctx context.Context, allMailboxes []string,
+	ctx context.Context, allMailboxes []string, scans map[string]mailboxScan,
 ) (bool, []gmailapi.MessageID, error) {
 	c.msgIDToLabels = make(map[string][]string)
 	complete := true
@@ -567,7 +698,17 @@ func (c *Client) buildLabelMap(
 			continue
 		}
 
-		uids, err := c.enumerateMailbox(ctx, mailbox, 0)
+		var uids []imap.UID
+		var err error
+		if scans == nil {
+			uids, err = c.enumerateMailbox(ctx, mailbox, 0)
+		} else {
+			scan := scans[mailbox]
+			if scan.skip {
+				continue
+			}
+			uids, err = scan.uids, scan.err
+		}
 		if err != nil {
 			complete = false
 			c.logger.Warn("skipping mailbox for label map",
@@ -692,12 +833,12 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 			!c.labelsSnapshotFilteredLocked() &&
 			len(c.priorFolderStates) > 0
 		handled, deltaErr := c.tryBuildQresyncMessageList(ctx, allMailboxes, folderStatuses)
-		if deltaErr != nil || (requireQresync && !handled) {
-			if deltaErr != nil {
-				c.logger.Warn("QRESYNC failed, reconnecting for full enumeration", "error", deltaErr)
-			} else {
-				c.logger.Info("QRESYNC unavailable, reconnecting for full enumeration")
-			}
+		switch {
+		case deltaErr != nil:
+			// A failed attempt has already issued ENABLE and CONDSTORE SELECTs
+			// and left partial deltas behind, so the connection and every
+			// observation derived from it are discarded before enumerating.
+			c.logger.Warn("QRESYNC failed, reconnecting for full enumeration", "error", deltaErr)
 			c.observedMailboxDeltas = nil
 			c.observedFolderStates = make(map[string]FolderState, len(allMailboxes))
 			c.messageListCache = nil
@@ -712,7 +853,16 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 			c.observedFolderStates = make(map[string]FolderState, len(allMailboxes))
 			folderStatuses = c.observeFolderStates(ctx, allMailboxes)
 			qresyncFallback = true
-		} else if handled {
+		case requireQresync && !handled:
+			// Ineligible rather than failed. tryBuildQresyncMessageList returns
+			// before issuing a command when no mailbox carries a mod-sequence
+			// baseline, so the connection, the mailbox plan and the STATUS
+			// results all still stand. A server that never reports a
+			// mod-sequence takes this path on every run, where reconnecting
+			// would redial and re-STATUS every mailbox to discard nothing.
+			c.logger.Info("QRESYNC unavailable, enumerating fully")
+			qresyncFallback = true
+		case handled:
 			return nil
 		}
 	}
@@ -723,9 +873,14 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 		c.observedMailboxDeltas = make([]MailboxDelta, 0, len(allMailboxes))
 	}
 
-	// A scan without saved folder states or after a QRESYNC fallback enumerates
-	// every UID, so it can build an authoritative membership map even when the
-	// server has no \All mailbox. Filtered saved-state scans remain additive.
+	// A scan without saved folder states or after a QRESYNC fallback builds an
+	// authoritative membership map even when the server has no \All mailbox.
+	// It is the mailbox coverage that makes the map authoritative, not a full
+	// re-read: a mailbox the scan plan proves unchanged contributes a no-op
+	// delta carrying its stored baseline, so the published topology still spans
+	// every mailbox and the store reconciles that mailbox's labels from the
+	// membership rows the no-op preserves. Filtered saved-state scans remain
+	// additive.
 	fullScanWithoutAll := c.allMailFolder == "" &&
 		trackFolders &&
 		(c.forceFullEnumeration || qresyncFallback || len(c.priorFolderStates) == 0) &&
@@ -734,6 +889,14 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 		len(c.folderFilterInclude) == 0 &&
 		len(c.folderFilterExclude) == 0
 	buildMembershipMap := c.allMailFolder != "" || fullScanWithoutAll
+
+	// Resolve every mailbox's enumeration plan up front so the label map and
+	// the listing below agree. Only the no-\All path takes shortcuts; with an
+	// \All mailbox both consumers keep their previous behaviour.
+	var scans map[string]mailboxScan
+	if trackFolders && c.allMailFolder == "" {
+		scans = c.planMailboxScans(ctx, allMailboxes, folderStatuses)
+	}
 	labelMapComplete := false
 	var unidentifiedMembershipMessages []gmailapi.MessageID
 	if c.allMailFolder != "" {
@@ -748,7 +911,7 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 	}
 	if buildMembershipMap {
 		var mapErr error
-		labelMapComplete, unidentifiedMembershipMessages, mapErr = c.buildLabelMap(ctx, allMailboxes)
+		labelMapComplete, unidentifiedMembershipMessages, mapErr = c.buildLabelMap(ctx, allMailboxes, scans)
 		if mapErr != nil {
 			return mapErr
 		}
@@ -764,30 +927,38 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 	var unchangedFolders int
 
 	listOne := func(mailbox string) bool {
-		var minUID imap.UID
 		var observed *FolderState
 		var trackState FolderState
 		var canTrackFolder bool
+		var scan mailboxScan
+		planned := false
 		if trackFolders && c.allMailFolder == "" {
 			if status, ok := folderStatuses[mailbox]; ok {
 				observed = &status
 				trackState = status
 				canTrackFolder = true
-				if !c.forceFullEnumeration && !qresyncFallback {
-					if prior, ok := c.priorFolderStates[mailbox]; ok &&
-						prior.UIDValidity == status.UIDValidity &&
-						prior.UIDNext <= status.UIDNext {
-						if folderStateUnchanged(prior, status) {
-							// Unchanged since the last completed sync:
-							// no new messages possible, skip enumeration.
-							c.observedFolderStates[mailbox] = status
-							unchangedFolders++
-							return true
-						}
-						if prior.HighestModSeq == 0 && status.HighestModSeq == 0 {
-							// Without CONDSTORE, UIDNEXT is the only available high water mark.
-							minUID = imap.UID(prior.UIDNext)
-						}
+				if scans != nil {
+					scan, planned = scans[mailbox], true
+					if scan.err != nil {
+						c.logger.Warn("skipping mailbox",
+							"mailbox", mailbox, "error", scan.err)
+						return false
+					}
+					if scan.skip {
+						// Publish an explicit no-op delta rather than dropping
+						// the mailbox. ApplyIMAPMailboxDeltas derives the
+						// current topology from the delta list alone and
+						// retires -- and tombstones the messages of -- every
+						// mailbox missing from it.
+						trackState.KnownUIDs = scan.known
+						c.observedFolderStates[mailbox] = trackState
+						c.observedMailboxDeltas = append(c.observedMailboxDeltas, MailboxDelta{
+							Mailbox:     mailbox,
+							State:       trackState,
+							Incremental: true,
+						})
+						unchangedFolders++
+						return true
 					}
 				}
 			}
@@ -798,14 +969,18 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 			}
 		}
 
-		uids, err := c.enumerateMailbox(ctx, mailbox, minUID)
-		if err != nil {
-			c.logger.Warn("skipping mailbox", "mailbox", mailbox, "error", err)
-			return false
-		}
-		knownUIDs := uidsToUint32(uids)
-		if minUID != 0 {
-			knownUIDs = mergeKnownUIDs(c.priorFolderStates[mailbox].KnownUIDs, uids)
+		var uids []imap.UID
+		var knownUIDs []uint32
+		if planned {
+			uids, knownUIDs = scan.uids, scan.known
+		} else {
+			var err error
+			uids, err = c.enumerateMailbox(ctx, mailbox, 0)
+			if err != nil {
+				c.logger.Warn("skipping mailbox", "mailbox", mailbox, "error", err)
+				return false
+			}
+			knownUIDs = uidsToUint32(uids)
 		}
 		if observed != nil {
 			observed.KnownUIDs = knownUIDs
@@ -830,15 +1005,18 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 		}
 		if canTrackFolder {
 			_, hadPrior := c.priorFolderStates[mailbox]
-			reset := !hadPrior || qresyncFallback || minUID == 0
+			// A planned scan already decided whether this mailbox needs a full
+			// republish; without a plan every listing is a full one.
+			reset := !hadPrior || !planned || scan.reset
 			if prior, ok := c.priorFolderStates[mailbox]; ok && prior.UIDValidity != trackState.UIDValidity {
 				reset = true
 			}
 			c.observedMailboxDeltas = append(c.observedMailboxDeltas, MailboxDelta{
-				Mailbox:     mailbox,
-				State:       trackState,
-				ChangedUIDs: append([]imap.UID(nil), uids...),
-				Reset:       reset,
+				Mailbox:      mailbox,
+				State:        trackState,
+				ChangedUIDs:  append([]imap.UID(nil), uids...),
+				VanishedUIDs: append([]imap.UID(nil), scan.vanished...),
+				Reset:        reset,
 			})
 		}
 		c.logger.Debug("listed mailbox", "mailbox", mailbox, "count", len(uids))
@@ -903,6 +1081,18 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 			}
 		}
 	}
+	if authoritativeSnapshot && c.observedMailboxDeltas != nil &&
+		!deltasCoverMailboxes(allMailboxes, c.observedMailboxDeltas) {
+		// Publishing a partial topology is destructive, not merely incomplete:
+		// the store retires every mailbox missing from the delta set, deleting
+		// its memberships and tombstoning the messages that lived only there.
+		c.logger.Warn("incomplete mailbox delta set, suppressing authoritative snapshot",
+			"mailboxes", len(allMailboxes), "deltas", len(c.observedMailboxDeltas))
+		labelMapComplete = false
+		c.observedFolderStates = nil
+		c.observedMailboxDeltas = nil
+		c.clearFolderAcknowledgements()
+	}
 	if unchangedFolders > 0 {
 		c.logger.Info("skipped unchanged mailboxes",
 			"unchanged", unchangedFolders, "total", len(listMailboxes))
@@ -912,6 +1102,22 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 	c.activeSourceAliases = activeSourceAliases
 	c.labelMapComplete = labelMapComplete && enumerationComplete
 	return nil
+}
+
+// deltasCoverMailboxes reports whether every current mailbox appears in the
+// delta set. A mailbox that is genuinely gone is absent from mailboxes too, so
+// a shortfall here means the listing dropped one, not that the server did.
+func deltasCoverMailboxes(mailboxes []string, deltas []MailboxDelta) bool {
+	covered := make(map[string]struct{}, len(deltas))
+	for _, delta := range deltas {
+		covered[delta.Mailbox] = struct{}{}
+	}
+	for _, mailbox := range mailboxes {
+		if _, ok := covered[mailbox]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func folderStatusesCoverMailboxes(
