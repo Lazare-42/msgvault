@@ -20,10 +20,10 @@
 // With --collection, dedup compares messages across every account in
 // the collection. This is the only way to merge duplicates that span
 // sources, and it is an explicit user opt-in. Pruned losers are hidden
-// locally and reversible via --undo. Remote-deletion staging stays
-// same-source-only even under collection scope, so the user's
-// authoritative remote mailbox can never be touched because of a
-// duplicate found in a different account.
+// locally and reversible via --undo. Remote-deletion staging requires
+// same-source, normalized-content-equivalent copies even under collection
+// scope, so the user's authoritative remote mailbox can never be touched
+// because of a duplicate found in a different account.
 //
 // Outside collection scope, dedup never merges messages across
 // different accounts. This is critical for sent messages: a message
@@ -98,7 +98,9 @@ type Config struct {
 	//      appears in remoteSourceTypes (gmail today; imap is gated
 	//      until staged manifests can be routed to an IMAP executor),
 	//   2. the surviving copy is in the SAME source_id (i.e. the
-	//      very same remote mailbox holds the winner).
+	//      very same remote mailbox holds the winner),
+	//   3. the pruned and surviving copies have matching normalized
+	//      raw MIME hashes.
 	//
 	// This second rule is load-bearing: it guarantees that a
 	// merged-pile dedup run can never cause deletions from the
@@ -183,12 +185,16 @@ type DuplicateMessage struct {
 	Subject          string
 	SentAt           time.Time
 	HasRawMIME       bool
+	PayloadBytes     int64
+	AttachmentCount  int
+	HasAttachments   bool
 	LabelCount       int
 	ArchivedAt       time.Time
 	IsFromMe         bool
 	HasSentLabel     bool
 	FromEmail        string
 	MatchedIdentity  bool
+	normalizedHash   string
 }
 
 // IsSentCopy reports whether this message appears to be the sender-side
@@ -229,6 +235,15 @@ type StagedManifest struct {
 	SourceType   string
 	ManifestID   string
 	MessageCount int
+}
+
+// RemoteDeletionTarget identifies one message that a dedup plan would stage
+// for deletion from its source server.
+type RemoteDeletionTarget struct {
+	SourceID         int64  `json:"source_id"`
+	SourceType       string `json:"source_type"`
+	SourceIdentifier string `json:"source_identifier"`
+	SourceMessageID  string `json:"source_message_id"`
 }
 
 // remoteKey groups remote source IDs by the (account, source_type) pair so
@@ -336,6 +351,20 @@ func (e *Engine) Scan(ctx context.Context) (*Report, error) {
 		return nil, fmt.Errorf("get duplicate group messages: %w", err)
 	}
 
+	var rawMessageIDs []int64
+	for _, msgs := range msgsByGroup {
+		for _, message := range msgs {
+			if message.HasRawMIME {
+				rawMessageIDs = append(rawMessageIDs, message.ID)
+			}
+		}
+	}
+	slices.Sort(rawMessageIDs)
+	normalizedHashes, err := e.normalizedRawMIMEHashes(rawMessageIDs)
+	if err != nil {
+		return nil, fmt.Errorf("fingerprint duplicate raw MIME: %w", err)
+	}
+
 	report := &Report{
 		TotalMessages:   totalMessages,
 		BySourcePair:    make(map[string]int),
@@ -371,12 +400,16 @@ func (e *Engine) Scan(ctx context.Context) (*Report, error) {
 				Subject:          m.Subject,
 				SentAt:           m.SentAt,
 				HasRawMIME:       m.HasRawMIME,
+				PayloadBytes:     m.PayloadBytes,
+				AttachmentCount:  m.AttachmentCount,
+				HasAttachments:   m.HasAttachments,
 				LabelCount:       m.LabelCount,
 				ArchivedAt:       m.ArchivedAt,
 				IsFromMe:         m.IsFromMe,
 				HasSentLabel:     m.HasSentLabel,
 				FromEmail:        m.FromEmail,
 				MatchedIdentity:  matched,
+				normalizedHash:   normalizedHashes[m.ID],
 			})
 		}
 
@@ -549,28 +582,14 @@ func (e *Engine) scanNormalizedHashGroups(
 	for range numWorkers {
 		wg.Go(func() {
 			for item := range work {
-				raw := item.rawData
-				if item.compress == "zlib" {
-					r, err := zlib.NewReader(bytes.NewReader(raw))
-					if err != nil {
-						if decompressionFailures.Add(1) <= maxDecompressionWarns {
-							e.logger.Warn("content-hash: zlib open failed",
-								"message_id", item.candidate.ID, "err", err)
-						}
-						results <- hashResult{skipped: true}
-						continue
+				hash, err := normalizedRawMIMEHash(item.rawData, item.compress)
+				if err != nil {
+					if decompressionFailures.Add(1) <= maxDecompressionWarns {
+						e.logger.Warn("content-hash: raw MIME fingerprint failed",
+							"message_id", item.candidate.ID, "err", err)
 					}
-					decompressed, err := io.ReadAll(r)
-					_ = r.Close()
-					if err != nil {
-						if decompressionFailures.Add(1) <= maxDecompressionWarns {
-							e.logger.Warn("content-hash: zlib read failed",
-								"message_id", item.candidate.ID, "err", err)
-						}
-						results <- hashResult{skipped: true}
-						continue
-					}
-					raw = decompressed
+					results <- hashResult{skipped: true}
+					continue
 				}
 
 				matched := false
@@ -581,7 +600,7 @@ func (e *Engine) scanNormalizedHashGroups(
 				}
 
 				results <- hashResult{
-					hash: sha256Hex(normalizeRawMIME(raw)),
+					hash: hash,
 					msg: DuplicateMessage{
 						ID:               item.candidate.ID,
 						SourceID:         item.candidate.SourceID,
@@ -591,12 +610,16 @@ func (e *Engine) scanNormalizedHashGroups(
 						Subject:          item.candidate.Subject,
 						SentAt:           item.candidate.SentAt,
 						HasRawMIME:       true,
+						PayloadBytes:     item.candidate.PayloadBytes,
+						AttachmentCount:  item.candidate.AttachmentCount,
+						HasAttachments:   item.candidate.HasAttachments,
 						LabelCount:       item.candidate.LabelCount,
 						ArchivedAt:       item.candidate.ArchivedAt,
 						IsFromMe:         item.candidate.IsFromMe,
 						HasSentLabel:     item.candidate.HasSentLabel,
 						FromEmail:        item.candidate.FromEmail,
 						MatchedIdentity:  matched,
+						normalizedHash:   hash,
 					},
 				}
 			}
@@ -756,6 +779,47 @@ func sha256Hex(data []byte) string {
 	return hex.EncodeToString(h[:])
 }
 
+func normalizedRawMIMEHash(raw []byte, compression string) (string, error) {
+	if compression == "zlib" {
+		r, err := zlib.NewReader(bytes.NewReader(raw))
+		if err != nil {
+			return "", fmt.Errorf("open zlib raw MIME: %w", err)
+		}
+		decompressed, readErr := io.ReadAll(r)
+		closeErr := r.Close()
+		if readErr != nil {
+			return "", fmt.Errorf("decompress raw MIME: %w", readErr)
+		}
+		if closeErr != nil {
+			return "", fmt.Errorf("close zlib raw MIME: %w", closeErr)
+		}
+		raw = decompressed
+	}
+	return sha256Hex(normalizeRawMIME(raw)), nil
+}
+
+func (e *Engine) normalizedRawMIMEHashes(
+	messageIDs []int64,
+) (map[int64]string, error) {
+	hashes := make(map[int64]string, len(messageIDs))
+	err := e.store.StreamMessageRaw(
+		messageIDs,
+		func(messageID int64, rawData []byte, compression string) {
+			hash, hashErr := normalizedRawMIMEHash(rawData, compression)
+			if hashErr != nil {
+				e.logger.Warn("dedup: raw MIME fingerprint failed",
+					"message_id", messageID, "err", hashErr)
+				return
+			}
+			hashes[messageID] = hash
+		},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return hashes, nil
+}
+
 // selectSurvivor picks the best message to keep in a duplicate group.
 func (e *Engine) selectSurvivor(group *DuplicateGroup) {
 	if len(group.Messages) <= 1 {
@@ -779,10 +843,22 @@ func (e *Engine) selectSurvivor(group *DuplicateGroup) {
 		candidates = sentIdxs
 	}
 
+	// Pairwise content checks can create a comparison cycle in mixed-hash
+	// groups. Enable completeness as one group-wide ordering tier instead.
+	contentHash := group.Messages[candidates[0]].normalizedHash
+	usePayloadCompleteness := contentHash != ""
+	for _, i := range candidates[1:] {
+		if group.Messages[i].normalizedHash != contentHash {
+			usePayloadCompleteness = false
+			break
+		}
+	}
+
 	best := candidates[0]
 	for _, i := range candidates[1:] {
 		if e.isBetter(
 			group.Messages[i], group.Messages[best], priorityMap,
+			usePayloadCompleteness,
 		) {
 			best = i
 		}
@@ -799,8 +875,12 @@ func allIndexes(n int) []int {
 }
 
 // isBetter returns true if candidate is a better survivor than current.
+// Attachment and payload-size metadata are trusted only when normalized raw
+// MIME proves that every eligible row contains the same message content.
 func (e *Engine) isBetter(
-	candidate, current DuplicateMessage, priorityMap map[string]int,
+	candidate, current DuplicateMessage,
+	priorityMap map[string]int,
+	usePayloadCompleteness bool,
 ) bool {
 	candPri := sourcePriority(candidate.SourceType, priorityMap)
 	currPri := sourcePriority(current.SourceType, priorityMap)
@@ -810,6 +890,17 @@ func (e *Engine) isBetter(
 	if candidate.HasRawMIME != current.HasRawMIME {
 		return candidate.HasRawMIME
 	}
+	if usePayloadCompleteness {
+		if candidate.AttachmentCount != current.AttachmentCount {
+			return candidate.AttachmentCount > current.AttachmentCount
+		}
+		if candidate.HasAttachments != current.HasAttachments {
+			return candidate.HasAttachments
+		}
+		if candidate.PayloadBytes != current.PayloadBytes {
+			return candidate.PayloadBytes > current.PayloadBytes
+		}
+	}
 	if candidate.LabelCount != current.LabelCount {
 		return candidate.LabelCount > current.LabelCount
 	}
@@ -817,6 +908,10 @@ func (e *Engine) isBetter(
 		return candidate.ArchivedAt.Before(current.ArchivedAt)
 	}
 	return candidate.ID < current.ID
+}
+
+func hasEquivalentContent(left, right DuplicateMessage) bool {
+	return left.normalizedHash != "" && left.normalizedHash == right.normalizedHash
 }
 
 func sourcePriority(sourceType string, priorityMap map[string]int) int {
@@ -835,6 +930,9 @@ func remoteDeletionTargets(ctx context.Context, report *Report) (map[remoteKey][
 		survivor := group.Messages[group.Survivor]
 		for i, message := range group.Messages {
 			if i == group.Survivor || !remoteSourceTypes[message.SourceType] || message.SourceID != survivor.SourceID {
+				continue
+			}
+			if !hasEquivalentContent(message, survivor) {
 				continue
 			}
 			switch {
@@ -856,10 +954,36 @@ func remoteDeletionTargets(ctx context.Context, report *Report) (map[remoteKey][
 	return bySource, nil
 }
 
+// PlannedRemoteDeletionTargets returns the canonical remote target set derived
+// from a scan report. Callers can bind confirmation to this exact destructive
+// plan without exposing normalized MIME hashes outside the dedup package.
+func PlannedRemoteDeletionTargets(
+	ctx context.Context, report *Report,
+) ([]RemoteDeletionTarget, error) {
+	bySource, err := remoteDeletionTargets(ctx, report)
+	if err != nil {
+		return nil, err
+	}
+
+	var targets []RemoteDeletionTarget
+	for _, key := range sortedRemoteKeys(bySource) {
+		for _, sourceMessageID := range dedupStrings(bySource[key]) {
+			targets = append(targets, RemoteDeletionTarget{
+				SourceID:         key.SourceID,
+				SourceType:       key.SourceType,
+				SourceIdentifier: key.Account,
+				SourceMessageID:  sourceMessageID,
+			})
+		}
+	}
+	return targets, nil
+}
+
 // Execute merges every duplicate group: unions labels onto the
 // survivor, soft-deletes the pruned duplicates, and — when
 // DeleteDupsFromSourceServer is enabled AND a pruned copy shares a
-// source_id with its survivor — writes a deletion manifest.
+// source_id and normalized raw MIME hash with its survivor — writes a
+// deletion manifest.
 func (e *Engine) Execute(
 	ctx context.Context, report *Report, batchID string,
 ) (*ExecutionSummary, error) {
@@ -948,19 +1072,7 @@ func (e *Engine) stageDeletionManifests(
 		return nil, fmt.Errorf("open deletion manager: %w", err)
 	}
 
-	keys := make([]remoteKey, 0, len(byKey))
-	for k := range byKey {
-		keys = append(keys, k)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		if keys[i].Account != keys[j].Account {
-			return keys[i].Account < keys[j].Account
-		}
-		if keys[i].SourceType != keys[j].SourceType {
-			return keys[i].SourceType < keys[j].SourceType
-		}
-		return keys[i].SourceID < keys[j].SourceID
-	})
+	keys := sortedRemoteKeys(byKey)
 
 	// Single-type accounts keep the original manifest ID (no source-type
 	// suffix) so existing consumers — and test fixtures — don't see a
@@ -1006,6 +1118,23 @@ func (e *Engine) stageDeletionManifests(
 		})
 	}
 	return staged, nil
+}
+
+func sortedRemoteKeys(byKey map[remoteKey][]string) []remoteKey {
+	keys := make([]remoteKey, 0, len(byKey))
+	for key := range byKey {
+		keys = append(keys, key)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if keys[i].Account != keys[j].Account {
+			return keys[i].Account < keys[j].Account
+		}
+		if keys[i].SourceType != keys[j].SourceType {
+			return keys[i].SourceType < keys[j].SourceType
+		}
+		return keys[i].SourceID < keys[j].SourceID
+	})
+	return keys
 }
 
 func manifestIDFor(batchID, account string) string {
@@ -1298,7 +1427,8 @@ func (e *Engine) FormatMethodology() string {
 	for i, st := range e.config.SourcePreference {
 		fmt.Fprintf(&sb, "  %d. %s\n", i+1, st)
 	}
-	sb.WriteString("  Tiebreakers: has raw MIME > more labels > " +
+	sb.WriteString("  Tiebreakers: has raw MIME > when all eligible copies have matching normalized MIME, " +
+		"more attachments > attachment signal > larger payload > more labels > " +
 		"earlier archived_at > lower id.\n\n")
 
 	sb.WriteString("Sent messages:\n")
@@ -1312,8 +1442,8 @@ func (e *Engine) FormatMethodology() string {
 				"accounts are members of\n" +
 				"  this collection, the loser will be hidden " +
 				"locally (reversible via\n" +
-				"  --undo). Remote deletion remains " +
-				"same-source-only and will not\n" +
+				"  --undo). Remote deletion requires matching normalized MIME " +
+				"in the same source and will not\n" +
 				"  touch a different account's mailbox. Only " +
 				"add accounts to a collection\n" +
 				"  when you actually want their copies merged.\n\n",

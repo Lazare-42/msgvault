@@ -2,16 +2,22 @@ package dedup_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
+	"log/slog"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/dedup"
 	"go.kenn.io/msgvault/internal/deletion"
+	"go.kenn.io/msgvault/internal/importer"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil/email"
 	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
 
@@ -71,6 +77,44 @@ func linkLabel(
 		st.LinkMessageLabel(msgID, lid),
 		"LinkMessageLabel "+sourceLabelID,
 	)
+}
+
+func ingestRawMessage(
+	t *testing.T,
+	st *store.Store,
+	source *store.Source,
+	sourceMessageID string,
+	raw []byte,
+	fallbackDate time.Time,
+) int64 {
+	t.Helper()
+	hash := sha256.Sum256(raw)
+	err := importer.IngestRawMessage(
+		context.Background(), st, source.ID, source.Identifier, "",
+		nil, sourceMessageID, hex.EncodeToString(hash[:]), raw, fallbackDate,
+		slog.New(slog.DiscardHandler),
+	)
+	require.NoError(t, err, "IngestRawMessage")
+
+	var messageID int64
+	err = st.DB().QueryRow(
+		st.Rebind(`SELECT id FROM messages
+			WHERE source_id = ? AND source_message_id = ?`),
+		source.ID, sourceMessageID,
+	).Scan(&messageID)
+	require.NoError(t, err, "find ingested message")
+	return messageID
+}
+
+func setArchivedAt(
+	t *testing.T, st *store.Store, messageID int64, archivedAt time.Time,
+) {
+	t.Helper()
+	_, err := st.DB().Exec(
+		st.Rebind("UPDATE messages SET archived_at = ? WHERE id = ?"),
+		archivedAt, messageID,
+	)
+	require.NoError(t, err, "set archived_at")
 }
 
 func TestEngine_Scan_UnionsLabelsOnSurvivor(t *testing.T) {
@@ -146,6 +190,18 @@ func TestEngine_SurvivorFavorsSentCopy(t *testing.T) {
 
 	idInbox := addMessage(t, st, gmail, "inbox-sent", "rfc-sent", false)
 	idSent := addMessage(t, st, gmail, "sent-sent", "rfc-sent", true)
+	_, err := st.DB().Exec(
+		st.Rebind(`UPDATE messages
+			SET size_estimate = ?, attachment_count = ? WHERE id = ?`),
+		int64(10000), 3, idInbox,
+	)
+	require.NoError(err, "make received copy payload-richer")
+	_, err = st.DB().Exec(
+		st.Rebind(`UPDATE messages
+			SET size_estimate = ?, attachment_count = ? WHERE id = ?`),
+		int64(100), 0, idSent,
+	)
+	require.NoError(err, "make sent copy payload-poorer")
 
 	linkLabel(t, st, gmail.ID, idInbox, "INBOX", "Inbox", "system")
 	linkLabel(t, st, gmail.ID, idSent, "SENT", "Sent", "system")
@@ -215,6 +271,10 @@ func TestEngine_OptIn_StagesOnlyWithinSameSourceID(t *testing.T) {
 	idLoser := addMessage(t, st, gmail, "g-2", "rfc-opt", false)
 	idOther := addMessage(t, st, otherGmail, "g-3", "rfc-opt", false)
 	idMbox := addMessage(t, st, mbox, "m-1", "rfc-opt", false)
+	raw := []byte("Message-ID: <rfc-opt>\r\nSubject: Same message\r\n\r\nBody")
+	for _, id := range []int64{idWinner, idLoser, idOther, idMbox} {
+		require.NoError(st.UpsertMessageRaw(id, raw), "store equivalent raw MIME")
+	}
 
 	deletionsDir := filepath.Join(t.TempDir(), "deletions")
 	eng := dedup.NewEngine(st, dedup.Config{
@@ -269,6 +329,9 @@ func TestEngine_OptIn_RejectsMissingSourceIdentifierBeforeMerge(t *testing.T) {
 
 	winnerID := addMessage(t, st, source, "g-1", "rfc-missing-source", false)
 	loserID := addMessage(t, st, source, "g-2", "rfc-missing-source", false)
+	raw := []byte("Message-ID: <rfc-missing-source>\r\nSubject: Same message\r\n\r\nBody")
+	require.NoError(st.UpsertMessageRaw(winnerID, raw), "store winner raw MIME")
+	require.NoError(st.UpsertMessageRaw(loserID, raw), "store loser raw MIME")
 	deletionsDir := filepath.Join(t.TempDir(), "deletions")
 	eng := dedup.NewEngine(st, dedup.Config{
 		AccountSourceIDs:           []int64{source.ID},
@@ -347,6 +410,50 @@ func TestEngine_ContentHashFallbackFindsNormalizedDuplicates(t *testing.T) {
 	require.Equal(1, report.DuplicateGroups, "groups")
 	require.Equal(1, report.ContentHashGroups, "contentHashGroups")
 	require.Equal("normalized-hash", report.Groups[0].KeyType, "keyType")
+}
+
+func TestEngine_ContentHashPrefersAttachmentCompleteCopy(t *testing.T) {
+	require := require.New(t)
+	f := storetest.New(t)
+	st := f.Store
+	source := f.Source
+
+	partialID := addMessage(t, st, source, "hash-partial", "", false)
+	fullID := addMessage(t, st, source, "hash-full", "", false)
+	raw := []byte("From: sender@example.test\r\nSubject: Same content\r\n\r\nBody")
+	require.NoError(st.UpsertMessageRaw(partialID, raw), "UpsertMessageRaw partial")
+	require.NoError(st.UpsertMessageRaw(fullID, raw), "UpsertMessageRaw full")
+
+	_, err := st.DB().Exec(
+		st.Rebind(`UPDATE messages
+			SET size_estimate = ?, attachment_count = ?, archived_at = ?
+			WHERE id = ?`),
+		int64(len(raw)), 0,
+		time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC), partialID,
+	)
+	require.NoError(err, "set partial completeness")
+	_, err = st.DB().Exec(
+		st.Rebind(`UPDATE messages
+			SET size_estimate = ?, attachment_count = ?, archived_at = ?
+			WHERE id = ?`),
+		int64(len(raw)+100), 1,
+		time.Date(2026, 3, 2, 12, 0, 0, 0, time.UTC), fullID,
+	)
+	require.NoError(err, "set full completeness")
+
+	eng := dedup.NewEngine(st, dedup.Config{
+		AccountSourceIDs:    []int64{source.ID},
+		Account:             source.Identifier,
+		ContentHashFallback: true,
+	}, nil)
+	report, err := eng.Scan(context.Background())
+	require.NoError(err, "Scan")
+	require.Len(report.Groups, 1, "duplicate groups")
+	require.Equal("normalized-hash", report.Groups[0].KeyType, "key type")
+
+	group := report.Groups[0]
+	survivor := group.Messages[group.Survivor]
+	require.Equal(fullID, survivor.ID, "attachment-complete content-hash survivor")
 }
 
 // TestEngine_ContentHash_TwoMessageIDSurvivors_BothPreserved verifies the
@@ -512,6 +619,11 @@ func TestEngine_FormatMethodology_MentionsSentPolicy(t *testing.T) {
 		"never merges messages across different",
 		"methodology missing cross-account guarantee",
 	)
+	assert.Contains(t,
+		out,
+		"Tiebreakers: has raw MIME > when all eligible copies have matching normalized MIME, more attachments > attachment signal > larger payload > more labels > earlier archived_at > lower id.",
+		"methodology missing payload completeness order",
+	)
 }
 
 // TestEngine_FormatMethodology_SingleMemberCollection asserts that a
@@ -537,7 +649,399 @@ func TestEngine_FormatMethodology_SingleMemberCollection(t *testing.T) {
 		"single-member collection should fall to the same-account guarantee; got:\n%s", out)
 }
 
+func TestEngine_NonEquivalentPayloadCannotSteerSurvivorOrRemoteDeletion(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := storetest.New(t)
+	st := f.Store
+
+	const messageID = "shared-message-id@example.test"
+	legitimateID := addMessage(
+		t, st, f.Source, "legitimate-source-id", messageID, false,
+	)
+	forgedID := addMessage(
+		t, st, f.Source, "forged-source-id", messageID, false,
+	)
+	require.NoError(st.UpsertMessageRaw(
+		legitimateID,
+		[]byte("Message-ID: <shared-message-id@example.test>\r\n"+
+			"From: sender@example.test\r\nSubject: Expected message\r\n\r\nExpected body"),
+	), "store legitimate raw MIME")
+	require.NoError(st.UpsertMessageRaw(
+		forgedID,
+		[]byte("Message-ID: <shared-message-id@example.test>\r\n"+
+			"From: attacker@example.test\r\nSubject: Different message\r\n\r\nDifferent body"),
+	), "store forged raw MIME")
+
+	_, err := st.DB().Exec(
+		st.Rebind(`UPDATE messages
+			SET size_estimate = ?, has_attachments = ?, attachment_count = ?
+			WHERE id = ?`),
+		int64(100), false, 0, legitimateID,
+	)
+	require.NoError(err, "set legitimate completeness")
+	_, err = st.DB().Exec(
+		st.Rebind(`UPDATE messages
+			SET size_estimate = ?, has_attachments = ?, attachment_count = ?
+			WHERE id = ?`),
+		int64(10000), true, 3, forgedID,
+	)
+	require.NoError(err, "set forged completeness")
+
+	deletionsDir := filepath.Join(t.TempDir(), "deletions")
+	eng := dedup.NewEngine(st, dedup.Config{
+		AccountSourceIDs:           []int64{f.Source.ID},
+		Account:                    f.Source.Identifier,
+		DeleteDupsFromSourceServer: true,
+		DeletionsDir:               deletionsDir,
+	}, nil)
+	report, err := eng.Scan(context.Background())
+	require.NoError(err, "Scan")
+	require.Len(report.Groups, 1, "duplicate groups")
+
+	group := report.Groups[0]
+	survivor := group.Messages[group.Survivor]
+	assert.Equal(legitimateID, survivor.ID,
+		"non-equivalent completeness metadata must not steer survivor selection")
+
+	summary, err := eng.Execute(context.Background(), report, "non-equivalent")
+	require.NoError(err, "Execute")
+	assert.Empty(summary.StagedManifests,
+		"non-equivalent Message-ID matches must not stage remote deletion")
+	assertSoftDeleted(t, st, legitimateID, false)
+	assertSoftDeleted(t, st, forgedID, true)
+
+	mgr, err := deletion.NewManager(deletionsDir)
+	require.NoError(err, "NewManager")
+	pending, err := mgr.ListPending()
+	require.NoError(err, "ListPending")
+	assert.Empty(pending, "pending remote deletions")
+}
+
+func TestEngine_MixedNormalizedHashesIgnorePayloadCompleteness(t *testing.T) {
+	type copySpec struct {
+		raw             []byte
+		payloadBytes    int64
+		attachmentCount int
+		hasAttachments  bool
+		labels          []string
+	}
+
+	const messageID = "mixed-normalized-hashes@example.test"
+	equivalentRaw := []byte("Message-ID: <mixed-normalized-hashes@example.test>\r\n" +
+		"Subject: Equivalent message\r\n\r\nEquivalent body")
+	specs := map[string]copySpec{
+		"payload-rich": {
+			raw:             equivalentRaw,
+			payloadBytes:    10000,
+			attachmentCount: 3,
+			hasAttachments:  true,
+		},
+		"label-rich": {
+			raw:          equivalentRaw,
+			payloadBytes: 100,
+			labels:       []string{"label-one", "label-two"},
+		},
+		"different-content": {
+			raw: []byte("Message-ID: <mixed-normalized-hashes@example.test>\r\n" +
+				"Subject: Different message\r\n\r\nDifferent body"),
+			payloadBytes: 100,
+			labels:       []string{"label-three"},
+		},
+	}
+	orders := [][]string{
+		{"payload-rich", "label-rich", "different-content"},
+		{"label-rich", "different-content", "payload-rich"},
+		{"different-content", "payload-rich", "label-rich"},
+	}
+
+	for _, order := range orders {
+		t.Run(strings.Join(order, "_then_"), func(t *testing.T) {
+			require := require.New(t)
+			f := storetest.New(t)
+			ids := make(map[string]int64, len(order))
+			for _, name := range order {
+				spec := specs[name]
+				id := addMessage(t, f.Store, f.Source, name, messageID, false)
+				ids[name] = id
+				require.NoError(f.Store.UpsertMessageRaw(id, spec.raw), "store "+name+" raw MIME")
+				_, err := f.Store.DB().Exec(
+					f.Store.Rebind(`UPDATE messages
+						SET size_estimate = ?, attachment_count = ?, has_attachments = ?
+						WHERE id = ?`),
+					spec.payloadBytes, spec.attachmentCount, spec.hasAttachments, id,
+				)
+				require.NoError(err, "set "+name+" metadata")
+				for _, label := range spec.labels {
+					linkLabel(t, f.Store, f.Source.ID, id, label, label, "user")
+				}
+			}
+
+			eng := dedup.NewEngine(f.Store, dedup.Config{
+				AccountSourceIDs: []int64{f.Source.ID},
+				Account:          f.Source.Identifier,
+			}, nil)
+			report, err := eng.Scan(t.Context())
+			require.NoError(err, "Scan")
+			require.Len(report.Groups, 1, "duplicate groups")
+
+			group := report.Groups[0]
+			survivor := group.Messages[group.Survivor]
+			require.Equal(ids["label-rich"], survivor.ID,
+				"mixed content hashes must fall back to the group-wide label ordering")
+		})
+	}
+}
+
+func TestEngine_PartialFirstFullLaterKeepsAttachmentCompleteCopy(t *testing.T) {
+	require := require.New(t)
+	f := storetest.New(t)
+	st := f.Store
+
+	source, err := st.GetOrCreateSource("apple-mail", "mailbox@example.test")
+	require.NoError(err, "GetOrCreateSource")
+
+	const messageID = "<partial-full@example.test>"
+	raw := email.NewMessage().
+		From("sender@example.test").
+		To("recipient@example.test").
+		Header("Message-ID", messageID).
+		Body("Complete body, attachment not cached.").
+		WithAttachment(
+			"report.txt", "text/plain", []byte("downloaded attachment"),
+		).
+		Bytes()
+
+	partialID := ingestRawMessage(
+		t, st, source, "partial-copy", raw,
+		time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC),
+	)
+	fullID := ingestRawMessage(
+		t, st, source, "full-copy", raw,
+		time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC),
+	)
+	_, err = st.DB().Exec(
+		st.Rebind("DELETE FROM attachments WHERE message_id = ?"), partialID,
+	)
+	require.NoError(err, "remove partial extracted attachment")
+	_, err = st.DB().Exec(
+		st.Rebind(`UPDATE messages
+			SET has_attachments = FALSE, attachment_count = 0 WHERE id = ?`),
+		partialID,
+	)
+	require.NoError(err, "mark attachment extraction incomplete")
+	setArchivedAt(t, st, partialID, time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
+	setArchivedAt(t, st, fullID, time.Date(2026, 1, 2, 12, 0, 0, 0, time.UTC))
+
+	eng := dedup.NewEngine(st, dedup.Config{
+		AccountSourceIDs: []int64{source.ID},
+		Account:          source.Identifier,
+	}, nil)
+	report, err := eng.Scan(context.Background())
+	require.NoError(err, "Scan")
+	require.Len(report.Groups, 1, "duplicate groups")
+
+	group := report.Groups[0]
+	survivor := group.Messages[group.Survivor]
+	require.Equal(fullID, survivor.ID, "attachment-complete survivor")
+
+	_, err = eng.Execute(context.Background(), report, "partial-full")
+	require.NoError(err, "Execute")
+	assertSoftDeleted(t, st, partialID, true)
+	assertSoftDeleted(t, st, fullID, false)
+}
+
+func TestEngine_CrossMailboxPartialFullKeepsAttachmentCompleteCopy(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := storetest.New(t)
+	st := f.Store
+
+	partialSource, err := st.GetOrCreateSource(
+		"apple-mail", "mailbox-a@example.test",
+	)
+	require.NoError(err, "GetOrCreateSource partial")
+	fullSource, err := st.GetOrCreateSource(
+		"apple-mail", "mailbox-b@example.test",
+	)
+	require.NoError(err, "GetOrCreateSource full")
+
+	const messageID = "<cross-mailbox-partial-full@example.test>"
+	raw := email.NewMessage().
+		Header("Message-ID", messageID).
+		Body("Message body").
+		WithAttachment(
+			"archive.bin", "application/octet-stream", []byte("complete payload"),
+		).
+		Bytes()
+
+	partialID := ingestRawMessage(
+		t, st, partialSource, "mailbox-a-partial", raw,
+		time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC),
+	)
+	fullID := ingestRawMessage(
+		t, st, fullSource, "mailbox-b-full", raw,
+		time.Date(2026, 2, 2, 12, 0, 0, 0, time.UTC),
+	)
+	_, err = st.DB().Exec(
+		st.Rebind("DELETE FROM attachments WHERE message_id = ?"), partialID,
+	)
+	require.NoError(err, "remove partial extracted attachment")
+	_, err = st.DB().Exec(
+		st.Rebind(`UPDATE messages
+			SET has_attachments = FALSE, attachment_count = 0 WHERE id = ?`),
+		partialID,
+	)
+	require.NoError(err, "mark attachment extraction incomplete")
+	setArchivedAt(t, st, partialID, time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC))
+	setArchivedAt(t, st, fullID, time.Date(2026, 2, 2, 12, 0, 0, 0, time.UTC))
+
+	eng := dedup.NewEngine(st, dedup.Config{
+		AccountSourceIDs:  []int64{partialSource.ID, fullSource.ID},
+		Account:           "Apple Mail",
+		ScopeIsCollection: true,
+	}, nil)
+	report, err := eng.Scan(context.Background())
+	require.NoError(err, "Scan")
+	require.Len(report.Groups, 1, "duplicate groups")
+
+	group := report.Groups[0]
+	survivor := group.Messages[group.Survivor]
+	require.Equal(fullID, survivor.ID, "attachment-complete cross-mailbox survivor")
+	assert.Equal(fullSource.ID, survivor.SourceID, "survivor source")
+}
+
+func TestEngine_SourcePriorityOutranksPayloadCompleteness(t *testing.T) {
+	require := require.New(t)
+	f := storetest.New(t)
+	st := f.Store
+	gmail := f.Source
+	appleMail, err := st.GetOrCreateSource(
+		"apple-mail", "archive@example.test",
+	)
+	require.NoError(err, "GetOrCreateSource apple-mail")
+
+	gmailID := addMessage(
+		t, st, gmail, "gmail-copy", "source-priority-completeness", false,
+	)
+	appleMailID := addMessage(
+		t, st, appleMail, "apple-mail-copy", "source-priority-completeness", false,
+	)
+	require.NoError(
+		st.UpsertMessageRaw(gmailID, []byte("From: sender@example.test\r\n\r\nBody")),
+		"UpsertMessageRaw gmail",
+	)
+	require.NoError(
+		st.UpsertMessageRaw(
+			appleMailID,
+			[]byte("From: sender@example.test\r\n\r\nBody with complete attachments"),
+		),
+		"UpsertMessageRaw apple-mail",
+	)
+	_, err = st.DB().Exec(
+		st.Rebind(`UPDATE messages
+			SET size_estimate = ?, attachment_count = ? WHERE id = ?`),
+		int64(100), 0, gmailID,
+	)
+	require.NoError(err, "set gmail completeness")
+	_, err = st.DB().Exec(
+		st.Rebind(`UPDATE messages
+			SET size_estimate = ?, attachment_count = ? WHERE id = ?`),
+		int64(10000), 3, appleMailID,
+	)
+	require.NoError(err, "set apple-mail completeness")
+
+	eng := dedup.NewEngine(st, dedup.Config{
+		AccountSourceIDs:  []int64{gmail.ID, appleMail.ID},
+		Account:           "collection",
+		ScopeIsCollection: true,
+	}, nil)
+	report, err := eng.Scan(context.Background())
+	require.NoError(err, "Scan")
+	require.Len(report.Groups, 1, "duplicate groups")
+
+	group := report.Groups[0]
+	survivor := group.Messages[group.Survivor]
+	require.Equal(gmailID, survivor.ID, "source-priority survivor")
+	require.Equal(0, survivor.AttachmentCount, "higher-priority source can be less complete")
+}
+
 func TestEngine_SurvivorTiebreakers(t *testing.T) {
+	t.Run("has attachments wins when attachment counts tie", func(t *testing.T) {
+		require := require.New(t)
+		f := storetest.New(t)
+		st := f.Store
+
+		idWithoutFlag := addMessage(
+			t, st, f.Source, "without-attachment-flag", "rfc-attachment-flag", false,
+		)
+		idWithFlag := addMessage(
+			t, st, f.Source, "with-attachment-flag", "rfc-attachment-flag", false,
+		)
+		raw := []byte("Message-ID: <rfc-attachment-flag>\r\nSubject: Same\r\n\r\nBody")
+		require.NoError(st.UpsertMessageRaw(idWithoutFlag, raw), "store first raw MIME")
+		require.NoError(st.UpsertMessageRaw(idWithFlag, raw), "store second raw MIME")
+
+		_, err := st.DB().Exec(
+			st.Rebind(`UPDATE messages
+				SET size_estimate = ?, has_attachments = ?, attachment_count = ?
+				WHERE id = ?`),
+			int64(len(raw)), false, 0, idWithoutFlag,
+		)
+		require.NoError(err, "clear attachment flag")
+		_, err = st.DB().Exec(
+			st.Rebind(`UPDATE messages
+				SET size_estimate = ?, has_attachments = ?, attachment_count = ?
+				WHERE id = ?`),
+			int64(len(raw)), true, 0, idWithFlag,
+		)
+		require.NoError(err, "set attachment flag")
+
+		eng := dedup.NewEngine(st, dedup.Config{
+			AccountSourceIDs: []int64{f.Source.ID},
+			Account:          "test",
+		}, nil)
+		report, err := eng.Scan(context.Background())
+		require.NoError(err, "Scan")
+		require.Len(report.Groups, 1, "duplicate groups")
+		survivor := report.Groups[0].Messages[report.Groups[0].Survivor]
+		assert.Equal(t, idWithFlag, survivor.ID, "survivor (has attachments flag)")
+	})
+
+	t.Run("larger payload wins when attachment count is equal", func(t *testing.T) {
+		require := require.New(t)
+		f := storetest.New(t)
+		st := f.Store
+
+		idSmaller := addMessage(t, st, f.Source, "smaller", "rfc-payload-tie", false)
+		idLarger := addMessage(t, st, f.Source, "larger", "rfc-payload-tie", false)
+		raw := []byte("Message-ID: <rfc-payload-tie>\r\nSubject: Same\r\n\r\nBody")
+		require.NoError(st.UpsertMessageRaw(idSmaller, raw), "store smaller raw MIME")
+		require.NoError(st.UpsertMessageRaw(idLarger, raw), "store larger raw MIME")
+		_, err := st.DB().Exec(
+			st.Rebind(`UPDATE messages
+				SET size_estimate = ?, attachment_count = ? WHERE id = ?`),
+			int64(1000), 1, idSmaller,
+		)
+		require.NoError(err, "set smaller payload completeness")
+		_, err = st.DB().Exec(
+			st.Rebind(`UPDATE messages
+				SET size_estimate = ?, attachment_count = ? WHERE id = ?`),
+			int64(2000), 1, idLarger,
+		)
+		require.NoError(err, "set larger payload completeness")
+
+		eng := dedup.NewEngine(st, dedup.Config{
+			AccountSourceIDs: []int64{f.Source.ID},
+			Account:          "test",
+		}, nil)
+		report, err := eng.Scan(context.Background())
+		require.NoError(err, "Scan")
+		require.Equal(1, report.DuplicateGroups, "groups")
+		survivor := report.Groups[0].Messages[report.Groups[0].Survivor]
+		assert.Equal(t, idLarger, survivor.ID, "survivor (larger payload)")
+	})
+
 	t.Run("raw MIME wins over no raw MIME", func(t *testing.T) {
 		require := require.New(t)
 		f := storetest.New(t)
