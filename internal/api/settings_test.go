@@ -11,11 +11,15 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/carddav"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
 func TestGetSettingsUsesAllowlistETagAndSecretStates(t *testing.T) {
@@ -23,6 +27,7 @@ func TestGetSettingsUsesAllowlistETagAndSecretStates(t *testing.T) {
 	require := require.New(t)
 	srv, _ := newSettingsTestServer(t, "# keep\n[web]\ntheme = \"dark\"\n"+
 		"[server]\napi_key = \"test-api-key\"\n"+
+		"[vector.embeddings]\ndocument_prefix = \"search_document: \"\nquery_prefix = \"search_query: \"\n"+
 		"[integrations.tasks]\napi_key = \"task-secret\"\n"+
 		"[unsupported]\nprivate_value = \"must-not-leak\"\n")
 	resp := performSettingsRequest(t, srv, http.MethodGet, settingsPath, nil, "", "test-api-key")
@@ -39,16 +44,186 @@ func TestGetSettingsUsesAllowlistETagAndSecretStates(t *testing.T) {
 	assert.Equal(&SecretSettingState{Configured: true}, byKey["server.api_key"].Secret)
 	assert.Nil(byKey["server.api_key"].Value)
 	assert.Equal(&SecretSettingState{Configured: true}, byKey["integrations.tasks.api_key"].Secret)
+	require.NotNil(byKey["vector.embeddings.api_format"].Value)
+	require.NotNil(byKey["vector.embeddings.api_format"].Value.String)
+	assert.Equal("openai", *byKey["vector.embeddings.api_format"].Value.String)
+	assert.Equal([]string{"openai", "voyage-contextual"}, byKey["vector.embeddings.api_format"].Options)
+	require.NotNil(byKey["vector.embeddings.document_prefix"].Value)
+	require.NotNil(byKey["vector.embeddings.document_prefix"].Value.String)
+	assert.Equal("search_document: ", *byKey["vector.embeddings.document_prefix"].Value.String)
+	require.NotNil(byKey["vector.embeddings.query_prefix"].Value)
+	require.NotNil(byKey["vector.embeddings.query_prefix"].Value.String)
+	assert.Equal("search_query: ", *byKey["vector.embeddings.query_prefix"].Value.String)
+	require.NotNil(byKey["vector.people.enabled"].Value)
+	require.NotNil(byKey["vector.people.enabled"].Value.Boolean)
+	assert.False(*byKey["vector.people.enabled"].Value.Boolean)
+	require.NotNil(byKey["vector.people.retention_posture"].Value)
+	require.NotNil(byKey["vector.people.training_posture"].Value)
 	require.NotNil(byKey["server.trusted_proxies"].Value)
 	assert.NotNil(byKey["server.trusted_proxies"].Value.Strings)
 	assert.NotContains(byKey, "unsupported.private_value")
 	for _, setting := range body.Settings {
 		assert.True(setting.RestartRequired, setting.Key)
-		assert.Equal(setting.Key == "vector.embeddings.api_key_env", setting.ReadOnly, setting.Key)
+		wantReadOnly := setting.Key == "vector.embeddings.api_key_env" ||
+			setting.Key == "vector.multimodal.api_key_env" ||
+			setting.Key == "vector.multimodal.capabilities_file" ||
+			strings.HasPrefix(setting.Key, "carddav.")
+		assert.Equal(wantReadOnly, setting.ReadOnly, setting.Key)
 	}
 	assert.NotContains(resp.Body.String(), "test-api-key")
 	assert.NotContains(resp.Body.String(), "task-secret")
 	assert.NotContains(resp.Body.String(), "must-not-leak")
+}
+
+func TestPatchSettingsExposesCompleteSemanticPersonOptInPolicy(t *testing.T) {
+	check := assert.New(t)
+	must := require.New(t)
+	srv, path := newSettingsTestServer(t, "[vector]\n"+
+		"enabled = true\n"+
+		"[vector.embeddings]\n"+
+		"endpoint = \"https://embedding.example.test/v1\"\n"+
+		"model = \"synthetic-model\"\n"+
+		"dimension = 4\n")
+	response := patchSettings(t, srv, `{"updates":[
+		{"key":"vector.people.enabled","value":{"boolean":true}},
+		{"key":"vector.people.retention_posture","value":{"string":"zero_data_retention"}},
+		{"key":"vector.people.training_posture","value":{"string":"no_training"}}
+	]}`)
+	must.Equal(http.StatusOK, response.Code, response.Body.String())
+
+	got, err := os.ReadFile(path)
+	must.NoError(err)
+	check.Contains(string(got), "people.enabled = true")
+	check.Contains(string(got), `people.retention_posture = "zero_data_retention"`)
+	check.Contains(string(got), `people.training_posture = "no_training"`)
+}
+
+func TestGetSettingsExposesReadOnlyCardDAVAccountStateWithoutCredential(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	srv, _ := newSettingsTestServer(t, `[carddav]
+base_url = "https://contacts.example/dav"
+username = "alice"
+schedule = "0 3 * * *"
+enabled = true
+`)
+	st := testutil.NewTestStore(t)
+	account, _, err := st.ReplaceCardDAVDiscoveryContext(t.Context(), store.CardDAVDiscoveryInput{
+		BaseURL: srv.cfg.CardDAV.BaseURL, Username: srv.cfg.CardDAV.Username,
+		PrincipalURL: "https://contacts.example/principal/alice/",
+		HomeURL:      "https://contacts.example/books/alice/",
+		Books: []store.CardDAVDiscoveredBook{{
+			CanonicalURL: "https://contacts.example/books/alice/personal/",
+		}},
+	})
+	require.NoError(err)
+	require.NoError(carddav.SaveCredential(srv.cfg.TokensDir(), carddav.Credential{
+		Password: "must-not-cross-api", BaseURL: srv.cfg.CardDAV.BaseURL,
+		Username: srv.cfg.CardDAV.Username, ConnectionGeneration: account.ConnectionGeneration,
+	}))
+	srv.cardDAV, err = NewCardDAVController(srv.cfg, st)
+	require.NoError(err)
+
+	resp := performSettingsRequest(t, srv, http.MethodGet, settingsPath, nil, "", "")
+	require.Equal(http.StatusOK, resp.Code, resp.Body.String())
+	var body SettingsResponse
+	require.NoError(json.Unmarshal(resp.Body.Bytes(), &body))
+	byKey := settingsByKey(body.Settings)
+	for _, key := range []string{"carddav.base_url", "carddav.username", "carddav.schedule", "carddav.enabled", "carddav.password"} {
+		require.Contains(byKey, key)
+		assert.True(byKey[key].ReadOnly, key)
+	}
+	assert.Equal(&SecretSettingState{Configured: true}, byKey["carddav.password"].Secret)
+	assert.NotContains(resp.Body.String(), "must-not-cross-api")
+
+	patch := performSettingsRequest(t, srv, http.MethodPatch, settingsPath,
+		[]byte(`{"updates":[{"key":"carddav.enabled","value":{"boolean":false}}]}`),
+		resp.Header().Get("ETag"), "")
+	assert.Equal(http.StatusBadRequest, patch.Code, patch.Body.String())
+}
+
+func TestGetSettingsReportsStaleCardDAVCredentialAsNotConfigured(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	srv, _ := newSettingsTestServer(t, `[carddav]
+base_url = "https://contacts.example/dav"
+username = "alice"
+enabled = true
+`)
+	st := testutil.NewTestStore(t)
+	discovery := store.CardDAVDiscoveryInput{
+		BaseURL: srv.cfg.CardDAV.BaseURL, Username: srv.cfg.CardDAV.Username,
+		PrincipalURL: "https://contacts.example/principal/alice/",
+		HomeURL:      "https://contacts.example/books/alice/",
+		Books: []store.CardDAVDiscoveredBook{{
+			CanonicalURL: "https://contacts.example/books/alice/personal/",
+		}},
+	}
+	account, _, err := st.ReplaceCardDAVDiscoveryContext(t.Context(), discovery)
+	require.NoError(err)
+	require.NoError(carddav.SaveCredential(srv.cfg.TokensDir(), carddav.Credential{
+		Password: "stale-password", BaseURL: srv.cfg.CardDAV.BaseURL,
+		Username: srv.cfg.CardDAV.Username, ConnectionGeneration: account.ConnectionGeneration,
+	}))
+	discovery.CredentialsChanged = true
+	account, _, err = st.ReplaceCardDAVDiscoveryContext(t.Context(), discovery)
+	require.NoError(err)
+	assert.Equal(int64(2), account.ConnectionGeneration)
+	srv.cardDAV, err = NewCardDAVController(srv.cfg, st)
+	require.NoError(err)
+
+	resp := performSettingsRequest(t, srv, http.MethodGet, settingsPath, nil, "", "")
+	require.Equal(http.StatusOK, resp.Code, resp.Body.String())
+	var body SettingsResponse
+	require.NoError(json.Unmarshal(resp.Body.Bytes(), &body))
+	assert.Equal(&SecretSettingState{Configured: false}, settingsByKey(body.Settings)["carddav.password"].Secret)
+	assert.NotContains(resp.Body.String(), "stale-password")
+}
+
+func TestPatchSettingsSelectsVoyageContextualEmbeddingFormat(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	srv, path := newSettingsTestServer(t, "[vector.embeddings]\n"+
+		"endpoint = \"https://api.voyageai.com/v1\"\n"+
+		"model = \"text-embedding-test\"\n"+
+		"dimension = 1024\n")
+
+	resp := patchSettings(t, srv,
+		`{"updates":[{"key":"vector.embeddings.api_format","value":{"string":"voyage-contextual"}},{"key":"vector.embeddings.model","value":{"string":"voyage-context-4"}}]}`)
+	require.Equal(http.StatusOK, resp.Code, resp.Body.String())
+
+	got, err := os.ReadFile(path)
+	require.NoError(err)
+	assert.Contains(string(got), `api_format = "voyage-contextual"`)
+	assert.Contains(string(got), `model = "voyage-context-4"`)
+}
+
+func TestGetSettingsExposesMultimodalPolicyWithoutCredentialState(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	t.Setenv("SYNTHETIC_VOYAGE_KEY", "synthetic-key-value")
+	srv, _ := newSettingsTestServer(t, `[vector.multimodal]
+enabled = true
+api_key_env = "SYNTHETIC_VOYAGE_KEY"
+include_images = false
+include_video = true
+`)
+	resp := performSettingsRequest(t, srv, http.MethodGet, settingsPath, nil, "", "")
+	require.Equal(http.StatusOK, resp.Code, resp.Body.String())
+
+	var body SettingsResponse
+	require.NoError(json.Unmarshal(resp.Body.Bytes(), &body))
+	byKey := settingsByKey(body.Settings)
+	require.NotNil(byKey["vector.multimodal.enabled"].Value.Boolean)
+	assert.True(*byKey["vector.multimodal.enabled"].Value.Boolean)
+	require.NotNil(byKey["vector.multimodal.include_images"].Value.Boolean)
+	assert.False(*byKey["vector.multimodal.include_images"].Value.Boolean)
+	require.NotNil(byKey["vector.multimodal.include_video"].Value.Boolean)
+	assert.True(*byKey["vector.multimodal.include_video"].Value.Boolean)
+	assert.True(byKey["vector.multimodal.api_key_env"].ReadOnly)
+	assert.NotContains(resp.Body.String(), "synthetic-key-value")
 }
 
 func TestPatchSettingsRequiresMatchingETag(t *testing.T) {
@@ -306,6 +481,31 @@ func TestPatchSettingsClearsEmbeddingsAPIKeyEnvWhenEndpointOriginChanges(t *test
 	assert.Empty(*byKey["vector.embeddings.api_key_env"].Value.String)
 }
 
+func TestPatchSettingsClearsMultimodalAPIKeyEnvWhenEndpointOriginChanges(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	srv, path := newSettingsTestServer(t,
+		"[vector.multimodal]\nendpoint = \"https://api.voyageai.com/v1\"\n"+
+			"api_key_env = \"SYNTHETIC_VOYAGE_KEY\"\n")
+
+	resp := patchSettings(t, srv,
+		`{"updates":[{"key":"vector.multimodal.endpoint","value":{"string":"https://voyage.example.test/v1"}}]}`)
+	require.Equal(http.StatusOK, resp.Code, resp.Body.String())
+
+	got, err := os.ReadFile(path)
+	require.NoError(err)
+	assert.Contains(string(got), `endpoint = "https://voyage.example.test/v1"`)
+	assert.Contains(string(got), `api_key_env = ""`)
+	assert.NotContains(string(got), "SYNTHETIC_VOYAGE_KEY")
+
+	var body SettingsResponse
+	require.NoError(json.Unmarshal(resp.Body.Bytes(), &body))
+	keySetting := settingsByKey(body.Settings)["vector.multimodal.api_key_env"]
+	require.NotNil(keySetting.Value)
+	require.NotNil(keySetting.Value.String)
+	assert.Empty(*keySetting.Value.String)
+}
+
 func TestPatchSettingsEditableChangeSucceedsWhileReadOnlySettingIsConfigured(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -463,7 +663,7 @@ func TestSettingsOpenAPIContract(t *testing.T) {
 	for _, status := range []string{"400", "409", "412", "422", "428"} {
 		assert.Contains(patch.Responses, status)
 	}
-	assert.Equal("1.33.0", doc.Info.Version)
+	assert.Equal(APISchemaVersion, doc.Info.Version)
 
 	settingValue := doc.Components.Schemas.Map()["SettingValue"]
 	require.NotNil(settingValue)

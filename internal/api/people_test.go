@@ -36,11 +36,21 @@ type peopleAPIEngine struct {
 	timeline             query.ExploreRequest
 	timelineResult       *query.ExploreResponse
 	peopleErr            error
+	completionRequest    query.PeopleCompletionRequest
+	completionResult     *query.PeopleCompletionResponse
+	completionErr        error
 }
 
 func (e *peopleAPIEngine) SearchPeople(_ context.Context, request query.PersonSearchRequest) (*query.PersonSearchResponse, error) {
 	e.peopleRequest = request
 	return e.peopleResult, e.peopleErr
+}
+
+func (e *peopleAPIEngine) CompletePeople(
+	_ context.Context, request query.PeopleCompletionRequest,
+) (*query.PeopleCompletionResponse, error) {
+	e.completionRequest = request
+	return e.completionResult, e.completionErr
 }
 
 func (e *peopleAPIEngine) GetPerson(_ context.Context, _ int64, _ query.Context, clusterMemberIDs []int64) (*query.PersonSummary, error) {
@@ -112,7 +122,7 @@ func TestPeopleSearchResolvesCanonicalFullTextCandidatesAndReturnsAuthority(t *t
 		CacheRevision: "cache-people", SearchProvenance: query.SearchProvenance{LexicalIndexRevision: "resolved"},
 	}}
 	store := &mockStore{messages: []APIMessage{{ID: 42}}, total: 1}
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/people/search", bytes.NewBufferString(`{
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/participants/search", bytes.NewBufferString(`{
 		"predicate":{"query":"needle","search_mode":"full_text"},
 		"identity_query":"Shared Name","limit":25
 	}`))
@@ -124,9 +134,50 @@ func TestPeopleSearchResolvesCanonicalFullTextCandidatesAndReturnsAuthority(t *t
 	assertions.Equal(query.SearchFullText, engine.peopleRequest.Explore.Search.Mode)
 	assertions.Equal([]int64{42}, engine.peopleRequest.Explore.Search.CandidateMessageIDs)
 	assertions.NotEmpty(engine.peopleRequest.Explore.Search.LexicalIndexRevision)
-	var body PersonSearchHTTPResponse
+	var body ParticipantSearchHTTPResponse
 	requirements.NoError(json.NewDecoder(response.Body).Decode(&body))
 	assertions.Equal(query.SearchProvenance{LexicalIndexRevision: "resolved"}, body.SearchProvenance)
+}
+
+func TestPeopleAdaptersResolveIdentityFilterOncePerRequest(t *testing.T) {
+	t.Run("search", func(t *testing.T) {
+		requirements := require.New(t)
+		assertions := assert.New(t)
+		fixture := newExploreIdentityAPIFixture(t)
+
+		response := postExploreJSON(t, fixture.server, "/api/v1/participants/search", `{
+			"predicate":{"filters":[
+				{"dimension":"source","values":["1"]},
+				{"dimension":"identity","values":["1","BOB@MEMBERS.EXAMPLE","recipient"]}
+			]},
+			"limit":25
+		}`)
+
+		requirements.Equal(http.StatusOK, response.Code, response.Body.String())
+		var body ParticipantSearchHTTPResponse
+		requirements.NoError(json.Unmarshal(response.Body.Bytes(), &body))
+		assertions.Equal(int64(2), body.TotalCount)
+		assertions.Equal(1, fixture.store.resolveCalls)
+	})
+
+	t.Run("summary", func(t *testing.T) {
+		requirements := require.New(t)
+		assertions := assert.New(t)
+		fixture := newExploreIdentityAPIFixture(t)
+
+		response := postExploreJSON(t, fixture.server, "/api/v1/participants/1/summary", `{
+			"filters":[
+				{"dimension":"source","values":["1"]},
+				{"dimension":"identity","values":["1","BOB@MEMBERS.EXAMPLE","recipient"]}
+			]
+		}`)
+
+		requirements.Equal(http.StatusOK, response.Code, response.Body.String())
+		var body ParticipantContextSummaryHTTPResponse
+		requirements.NoError(json.Unmarshal(response.Body.Bytes(), &body))
+		assertions.Equal(int64(1), body.Summary.ActivityCount)
+		assertions.Equal(1, fixture.store.resolveCalls)
+	})
 }
 
 func TestPeopleSearchNamesUnavailableSemanticAuthorityWithoutFallback(t *testing.T) {
@@ -134,7 +185,7 @@ func TestPeopleSearchNamesUnavailableSemanticAuthorityWithoutFallback(t *testing
 	engine := &peopleAPIEngine{MockEngine: &querytest.MockEngine{}, peopleResult: &query.PersonSearchResponse{
 		Rows: []query.PersonSummary{{ID: 11}}, TotalCount: 1, CacheRevision: "cache",
 	}}
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/people/search", bytes.NewBufferString(`{
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/participants/search", bytes.NewBufferString(`{
 		"predicate":{"query":"needle","search_mode":"semantic"},"limit":25
 	}`))
 	request.Header.Set("Content-Type", "application/json")
@@ -150,7 +201,7 @@ func TestContextualSummaryPOSTsCarryCanonicalSearchAndReturnNamed404(t *testing.
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	engine := &peopleAPIEngine{MockEngine: &querytest.MockEngine{},
-		personSummaryResult: &query.PersonSearchResponse{Rows: []query.PersonSummary{{ID: 11, DisplayLabel: "Person", ActivityCount: 1}}, CacheRevision: "cache-person", SearchProvenance: query.SearchProvenance{LexicalIndexRevision: "person-rev"}},
+		personSummaryResult: &query.PersonSearchResponse{Rows: []query.PersonSummary{{ID: 11, DisplayLabel: "Person", ActivityCount: 1, MeetingCount: 4}}, CacheRevision: "cache-person", SearchProvenance: query.SearchProvenance{LexicalIndexRevision: "person-rev"}},
 		domainSummaryResult: &query.DomainSearchResponse{Rows: []query.DomainSummary{}, CacheRevision: "cache-domain"},
 	}
 	store := &mockStore{messages: []APIMessage{{ID: 42}}, total: 1}
@@ -158,15 +209,16 @@ func TestContextualSummaryPOSTsCarryCanonicalSearchAndReturnNamed404(t *testing.
 	body := `{"query":"needle","search_mode":"full_text","filters":[{"dimension":"source","values":["7"]}]}`
 
 	person := httptest.NewRecorder()
-	personRequest := httptest.NewRequest(http.MethodPost, "/api/v1/people/11/summary", bytes.NewBufferString(body))
+	personRequest := httptest.NewRequest(http.MethodPost, "/api/v1/participants/11/summary", bytes.NewBufferString(body))
 	personRequest.Header.Set("Content-Type", "application/json")
 	srv.Router().ServeHTTP(person, personRequest)
 	requirements.Equal(http.StatusOK, person.Code, person.Body.String())
 	assertions.Equal([]int64{7}, engine.personSummaryRequest.Context.SourceIDs)
 	assertions.Equal([]int64{42}, engine.personSummaryRequest.Search.CandidateMessageIDs)
-	var personBody PersonContextSummaryHTTPResponse
+	var personBody ParticipantContextSummaryHTTPResponse
 	requirements.NoError(json.NewDecoder(person.Body).Decode(&personBody))
 	assertions.Equal(int64(1), personBody.Summary.ActivityCount)
+	assertions.Equal(int64(4), personBody.Summary.MeetingCount)
 	assertions.Equal(query.SearchProvenance{LexicalIndexRevision: "person-rev"}, personBody.SearchProvenance)
 
 	domain := httptest.NewRecorder()
@@ -187,7 +239,7 @@ func TestPeopleSearchForwardsCanonicalContextAndNeverAcceptsNameAsIdentity(t *te
 			{ID: 12, DisplayLabel: "Shared Name", ActivityCount: 1, FirstAt: when, LastAt: when},
 		}, TotalCount: 2, CacheRevision: "cache-people",
 	}}
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/people/search", bytes.NewBufferString(`{
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/participants/search", bytes.NewBufferString(`{
 		"predicate":{"filters":[{"dimension":"source","values":["7"]}]},
 		"identity_query":" Shared Name ","sort":{"field":"display_label","direction":"asc"},"limit":25
 	}`))
@@ -196,13 +248,41 @@ func TestPeopleSearchForwardsCanonicalContextAndNeverAcceptsNameAsIdentity(t *te
 	newPeopleAPIServer(engine).Router().ServeHTTP(response, request)
 
 	requirements.Equal(http.StatusOK, response.Code, response.Body.String())
-	var result PersonSearchHTTPResponse
+	var result ParticipantSearchHTTPResponse
 	requirements.NoError(json.NewDecoder(response.Body).Decode(&result))
 	requirements.Len(result.Rows, 2)
 	assertions.NotEqual(result.Rows[0].ID, result.Rows[1].ID)
 	assertions.Equal([]int64{7}, engine.peopleRequest.Explore.Context.SourceIDs)
 	assertions.Equal("Shared Name", engine.peopleRequest.Query)
 	assertions.Equal(query.SortSpec{Field: "display_label", Direction: "asc"}, engine.peopleRequest.Sort)
+}
+
+func TestPeopleSearchSerializesRelationshipTemperatureSummary(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	when := time.Date(2026, 7, 19, 10, 0, 0, 0, time.UTC)
+	engine := &peopleAPIEngine{MockEngine: &querytest.MockEngine{}, peopleResult: &query.PersonSearchResponse{
+		Rows: []query.PersonSummary{{
+			ID: 11, DisplayLabel: "Person", ActivityCount: 3,
+			CurrentRelationshipTemperature: 62,
+			PeakRelationshipTemperature:    97,
+			PeakRelationshipYear:           2018,
+			FirstAt:                        when, LastAt: when,
+		}}, TotalCount: 1, CacheRevision: "cache-people",
+	}}
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/participants/search",
+		bytes.NewBufferString(`{"identity_query":"Person","limit":25}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	newPeopleAPIServer(engine).Router().ServeHTTP(response, request)
+
+	require.Equal(http.StatusOK, response.Code, response.Body.String())
+	var body ParticipantSearchHTTPResponse
+	require.NoError(json.Unmarshal(response.Body.Bytes(), &body))
+	require.Len(body.Rows, 1)
+	assert.Equal(62, body.Rows[0].CurrentRelationshipTemperature)
+	assert.Equal(97, body.Rows[0].PeakRelationshipTemperature)
+	assert.Equal(2018, body.Rows[0].PeakRelationshipYear)
 }
 
 func TestPersonDetailAndTimelineRequireDurablePositiveID(t *testing.T) {
@@ -216,11 +296,11 @@ func TestPersonDetailAndTimelineRequireDurablePositiveID(t *testing.T) {
 	srv := newPeopleAPIServerWithStore(engine, &mockStore{messages: []APIMessage{{ID: 42}}, total: 1})
 
 	detail := httptest.NewRecorder()
-	srv.Router().ServeHTTP(detail, httptest.NewRequest(http.MethodGet, "/api/v1/people/11", nil))
+	srv.Router().ServeHTTP(detail, httptest.NewRequest(http.MethodGet, "/api/v1/participants/11", nil))
 	requirements.Equal(http.StatusOK, detail.Code, detail.Body.String())
 
 	timeline := httptest.NewRecorder()
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/people/11/timeline", bytes.NewBufferString(`{"query":"needle","search_mode":"full_text","limit":25}`))
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/participants/11/timeline", bytes.NewBufferString(`{"query":"needle","search_mode":"full_text","limit":25}`))
 	request.Header.Set("Content-Type", "application/json")
 	srv.Router().ServeHTTP(timeline, request)
 	requirements.Equal(http.StatusOK, timeline.Code, timeline.Body.String())
@@ -229,7 +309,7 @@ func TestPersonDetailAndTimelineRequireDurablePositiveID(t *testing.T) {
 	assertions.NotEmpty(engine.timeline.Search.LexicalIndexRevision)
 	assertions.Equal(query.PageSpec{Limit: 25}, engine.timeline.Page)
 
-	for _, path := range []string{"/api/v1/people/0", "/api/v1/people/name", "/api/v1/people/-4/timeline"} {
+	for _, path := range []string{"/api/v1/participants/0", "/api/v1/participants/name", "/api/v1/participants/-4/timeline"} {
 		method := http.MethodGet
 		var body *bytes.Buffer
 		if path[len(path)-9:] == "/timeline" {
@@ -276,7 +356,7 @@ func TestDomainEndpointsNormalizeExactDomainAndRejectAmbiguousOrSQLLikeValues(t 
 
 // TestGetPersonComposesClusterBlockFromStoreForLinkedParticipant covers the
 // handler-level composition documented in ClusterLookupStore and
-// handleGetPerson: for a linked participant, the handler must resolve
+// handleGetParticipant: for a linked participant, the handler must resolve
 // cluster membership from a real store (not a mock), forward every member
 // ID to the query layer so identifiers span the whole cluster, and attach a
 // PersonCluster with the canonical ID and every store-owned edge.
@@ -304,7 +384,7 @@ func TestGetPersonComposesClusterBlockFromStoreForLinkedParticipant(t *testing.T
 	})
 
 	response := httptest.NewRecorder()
-	srv.Router().ServeHTTP(response, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/people/%d", primary), nil))
+	srv.Router().ServeHTTP(response, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/participants/%d", primary), nil))
 	requirements.Equal(http.StatusOK, response.Code, response.Body.String())
 	assertions.ElementsMatch([]int64{primary, secondary}, engine.personClusterMembers,
 		"the handler must resolve cluster membership from the store and forward it to the query layer")
@@ -342,7 +422,7 @@ func TestGetPersonOmitsClusterBlockForUnlinkedParticipant(t *testing.T) {
 	})
 
 	response := httptest.NewRecorder()
-	srv.Router().ServeHTTP(response, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/people/%d", solo), nil))
+	srv.Router().ServeHTTP(response, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/participants/%d", solo), nil))
 	requirements.Equal(http.StatusOK, response.Code, response.Body.String())
 	assertions.Nil(engine.personClusterMembers)
 
@@ -382,7 +462,7 @@ func TestGetPersonAttachesDurableProfileFromStore(t *testing.T) {
 	})
 
 	response := httptest.NewRecorder()
-	srv.Router().ServeHTTP(response, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/people/%d", secondary), nil))
+	srv.Router().ServeHTTP(response, httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/v1/participants/%d", secondary), nil))
 	requirements.Equal(http.StatusOK, response.Code, response.Body.String())
 
 	var body query.PersonSummary
@@ -420,7 +500,7 @@ func TestPersonTimelineWidensScopeToIdentityCluster(t *testing.T) {
 	})
 	timeline := func(participantID int64) {
 		request := httptest.NewRequest(http.MethodPost,
-			fmt.Sprintf("/api/v1/people/%d/timeline", participantID), bytes.NewBufferString(`{}`))
+			fmt.Sprintf("/api/v1/participants/%d/timeline", participantID), bytes.NewBufferString(`{}`))
 		request.Header.Set("Content-Type", "application/json")
 		response := httptest.NewRecorder()
 		srv.Router().ServeHTTP(response, request)
@@ -467,7 +547,7 @@ func TestPersonContextSummaryWidensScopeToIdentityCluster(t *testing.T) {
 	})
 	summary := func(participantID int64) {
 		request := httptest.NewRequest(http.MethodPost,
-			fmt.Sprintf("/api/v1/people/%d/summary", participantID), bytes.NewBufferString(`{}`))
+			fmt.Sprintf("/api/v1/participants/%d/summary", participantID), bytes.NewBufferString(`{}`))
 		request.Header.Set("Content-Type", "application/json")
 		response := httptest.NewRecorder()
 		srv.Router().ServeHTTP(response, request)
@@ -490,10 +570,22 @@ func TestPersonContextSummaryWidensScopeToIdentityCluster(t *testing.T) {
 func TestPeopleEndpointsNameUnavailableCacheInsteadOfReturningEmpty(t *testing.T) {
 	assertions := assert.New(t)
 	engine := &peopleAPIEngine{MockEngine: &querytest.MockEngine{}, peopleErr: &query.CacheUnavailableError{Readiness: query.CacheStaleSchema}}
-	request := httptest.NewRequest(http.MethodPost, "/api/v1/people/search", bytes.NewBufferString(`{}`))
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/participants/search", bytes.NewBufferString(`{}`))
 	request.Header.Set("Content-Type", "application/json")
 	response := httptest.NewRecorder()
 	newPeopleAPIServer(engine).Router().ServeHTTP(response, request)
 	assertions.Equal(http.StatusServiceUnavailable, response.Code)
 	assertions.Contains(response.Body.String(), "stale_schema")
+}
+
+func TestParticipantDetailUsesParticipantNotFoundError(t *testing.T) {
+	engine := &peopleAPIEngine{MockEngine: &querytest.MockEngine{}}
+	response := httptest.NewRecorder()
+	newPeopleAPIServer(engine).Router().ServeHTTP(response,
+		httptest.NewRequest(http.MethodGet, "/api/v1/participants/7", nil))
+
+	require.Equal(t, http.StatusNotFound, response.Code)
+	var body ErrorResponse
+	require.NoError(t, json.NewDecoder(response.Body).Decode(&body))
+	assert.Equal(t, "participant_not_found", body.Error)
 }

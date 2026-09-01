@@ -52,8 +52,10 @@ on your own machine or network.
    target already passes `-tags "fts5 sqlite_vec"`. If you see errors
    mentioning "binary was built without -tags sqlite_vec", rebuild
    via `make build` (or `go build -tags "fts5 sqlite_vec"` if you are
-   invoking `go build` directly). PostgreSQL vector search additionally
-   requires the `pgvector` build tag, for example
+   invoking `go build` directly). The official Docker image also includes
+   `sqlite_vec`, so SQLite-backed container deployments do not need a custom
+   image for vector search. PostgreSQL vector search additionally requires the
+   `pgvector` build tag, for example
    `go build -tags "fts5 sqlite_vec pgvector" ./cmd/msgvault`.
 
 !!! tip "Fastest path to using embeddings on Mac"
@@ -110,6 +112,8 @@ endpoint = "http://tailnet-host:11434/v1"
 api_key_env = "OLLAMA_API_KEY"           # optional; omit for anonymous endpoints
 model = "nomic-embed-text"
 dimension = 768
+document_prefix = "search_document: "  # required by nomic-embed-text
+query_prefix = "search_query: "        # required by nomic-embed-text
 batch_size = 32                          # embeddings per HTTP call
 timeout = "30s"
 max_retries = 3
@@ -164,11 +168,27 @@ backend = "pgvector"
 endpoint = "http://localhost:11434/v1"
 model = "nomic-embed-text"
 dimension = 768
+document_prefix = "search_document: "
+query_prefix = "search_query: "
 ```
 
 pgvector embeddings live in the PostgreSQL database. `db_path` and
 `vectors.db` apply only to the SQLite sqlite-vec backend. See
 [PostgreSQL Backend](/architecture/postgresql/) for database setup.
+
+### Model task prefixes
+
+Some embedding models require different task instructions for indexed
+documents and search queries. The `nomic-embed-text` examples above use
+its required retrieval prefixes. Set `document_prefix` and `query_prefix`
+to the values required by your model, or leave them empty for models that
+do not use instructions.
+
+msgvault prepends `document_prefix` to every chunk after chunking and
+`query_prefix` to every vector-search query. Prefix characters do not
+reduce the `max_input_chars` content budget. Changing either prefix marks
+the existing vector generation stale so prefixed queries cannot be mixed
+with an index built from unprefixed documents.
 
 ### Matching `max_input_chars` to your embedder's context window
 
@@ -286,7 +306,7 @@ trigger).
 | Manual `sync-calendar` / `sync-teams` / `sync-discord` | No. Run `msgvault embeddings build` afterward |
 | Manual `sync-beeper` / `sync-granola` / `sync-circleback` | No. Run `msgvault embeddings build` afterward |
 | Scheduled account syncs in `msgvault serve` (Gmail, IMAP, Teams, Discord) | Yes, when `[vector.embed.schedule].run_after_sync = true` |
-| Scheduled calendar, Beeper, Granola, and Circleback syncs in `msgvault serve` | No immediate post-sync run. Picked up by the embed worker's `[vector.embed.schedule].cron` schedule |
+| Scheduled calendar, Slack, Beeper, Granola, and Circleback syncs in `msgvault serve` | No immediate post-sync run. Picked up by the embed worker's `[vector.embed.schedule].cron` schedule |
 | `import-pst`, `import-emlx`, `import-mbox` | No. Re-run `--full-rebuild` after large imports |
 | Chat/text imports (iMessage, WhatsApp, Google Voice, Messenger, SyncTech SMS) | No. Run a full rebuild after importing if you want chats included |
 
@@ -337,6 +357,55 @@ The scope is part of the generation fingerprint. Changing it requires
 or preprocessing policy. Scoped generations are useful when you want semantic
 search for a newer corpus such as Teams or SMS without embedding decades of
 email immediately.
+
+Generations can also be scoped to selected accounts, either durably in config
+(so the daemon's scheduled embeds obey it too):
+
+```toml
+[vector.embed.scope]
+accounts = ["you@gmail.com"]
+```
+
+or per run from the CLI (overriding the configured accounts for that run):
+
+```bash
+msgvault embeddings build --full-rebuild --account you@gmail.com
+msgvault embeddings build --account you@gmail.com --account you@work.com
+msgvault embeddings build --collection family   # every account in the collection
+```
+
+!!! warning
+    `--account` and `--collection` are one-run overrides. After they activate
+    a scoped generation, add the equivalent stable account identifiers under
+    `[vector.embed.scope].accounts` and restart the daemon before searching.
+    Otherwise the daemon expects a different generation fingerprint and
+    returns `index_stale`. Prefer the config form when the scoped index is
+    meant to persist.
+
+The `--account` flag accepts an identifier or display name like elsewhere,
+but the durable `[vector.embed.scope] accounts` list requires canonical
+account identifiers — display names are rejected because they are not
+stable identities for a privacy boundary. Unknown identifiers fail the run
+instead of silently embedding more than requested. Account scoping acts as a privacy boundary —
+message text from accounts *outside* the scope is never sent to the embedding
+endpoint — and is the cheapest way to pilot semantic search on one mailbox
+before paying to embed the whole archive.
+
+Account-scope caveats:
+
+- The fingerprint records the scope as source IDs, which are archive-local.
+  Removing and re-adding an account (or restoring a backup) can renumber its
+  source ID, producing a new fingerprint and requiring a full rebuild.
+- A scoped account resolves to *all* of its sources, including linked ones
+  such as a Google Calendar synced for the same account. Adding such a
+  source after a scoped generation activates changes the resolved source
+  set and therefore the fingerprint, so vector search reports `index_stale`
+  until a full rebuild.
+- Unlike a message-type scope, an account scope does NOT gate search:
+  unfiltered vector/hybrid queries keep working, and accounts outside the
+  scope simply have no vector matches (hybrid search ranks them on the BM25
+  signal alone). The web UI's semantic-coverage readout counts only in-scope
+  accounts as eligible.
 
 A scoped index is intentionally partial, so vector and hybrid search require an
 explicit compatible message-type filter:
@@ -412,7 +481,7 @@ filtering.
 
 ## Model Rotation
 
-To switch models, dimensions, preprocessing settings, or
+To switch models, dimensions, task prefixes, preprocessing settings, or
 `max_input_chars`, update your config, then run:
 
 ```bash
@@ -421,7 +490,7 @@ msgvault embeddings build --full-rebuild --yes
 
 This builds a new generation with the new fingerprint and activates
 it atomically when the build completes. The fingerprint includes the
-model, dimension, preprocessing policy, `max_input_chars`, and
+model, dimension, task prefixes, preprocessing policy, `max_input_chars`, and
 embedding output policy. While the rebuild is in flight,
 `mode=vector` and `mode=hybrid` return `index_stale` (the
 previously-active generation no longer matches the configured
@@ -443,7 +512,7 @@ body keywords.
 | Error | Meaning | Recovery |
 |---|---|---|
 | `vector_not_enabled` | The server or MCP process did not wire a vector backend, usually because `[vector] enabled = false`. | Set `enabled = true`, configure `[vector.embeddings]`, and start with a build that includes the needed backend (`sqlite_vec` or `pgvector`). |
-| `index_stale` | Active generation's fingerprint does not match the current model, dimension, preprocessing policy, `max_input_chars`, or embedding output policy. | Run `msgvault embeddings build --full-rebuild --yes`. |
+| `index_stale` | Active generation's fingerprint does not match the current embedding settings: model, dimension, task prefixes, preprocessing policy, `max_input_chars`, output policy, or scope. | For an existing account-scoped index built with CLI flags, set matching `[vector.embed.scope].accounts` and restart the daemon. Otherwise run `msgvault embeddings build --full-rebuild --yes`. |
 | `index_building` | No active generation yet; one is being built. | Finish running `msgvault embeddings build`, wait for the scheduler, or use the appropriate non-vector fallback. |
 | `missing_free_text` | `mode=vector` or `mode=hybrid` used with a filter-only query (no free text to embed). | Add free-text terms to `q`, or use the appropriate non-vector fallback. |
 | `index_scope_mismatch` | The active vector generation was built for selected message types and the query is unscoped or asks for a type outside that scope. | Add a compatible `message_type` filter, use the appropriate non-vector fallback, or rebuild an unscoped generation. |

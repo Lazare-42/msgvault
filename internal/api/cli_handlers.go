@@ -2,6 +2,8 @@ package api
 
 import (
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,13 +18,17 @@ import (
 	"time"
 
 	"go.kenn.io/msgvault/internal/accountops"
+	"go.kenn.io/msgvault/internal/apiprotocol"
 	"go.kenn.io/msgvault/internal/cacheops"
 	"go.kenn.io/msgvault/internal/clirun"
 	"go.kenn.io/msgvault/internal/collectionops"
+	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/deletion"
 	msgexport "go.kenn.io/msgvault/internal/export"
 	"go.kenn.io/msgvault/internal/identityops"
 	"go.kenn.io/msgvault/internal/opserr"
+	"go.kenn.io/msgvault/internal/peoplesweep"
+	"go.kenn.io/msgvault/internal/provideridentity"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/store"
@@ -86,6 +92,27 @@ type ContextCLIStore interface {
 	ListAccountIdentitiesContext(ctx context.Context, sourceID int64) ([]store.AccountIdentity, error)
 	AddAccountIdentityContext(ctx context.Context, sourceID int64, address, signal string) error
 	RemoveAccountIdentityContext(ctx context.Context, sourceID int64, address string) (int64, error)
+	CountIdentityDiscoveryMessagesContext(ctx context.Context, sourceID int64) (int64, error)
+	ScanIdentityDiscoveryPageContext(
+		ctx context.Context,
+		sourceID, afterID int64,
+		limit int,
+	) (store.IdentityDiscoveryPage, error)
+	ScanIdentityObservationsForSourceMessageIDsContext(
+		ctx context.Context,
+		sourceID int64,
+		sourceMessageIDs []string,
+	) ([]store.IdentityObservation, error)
+	AddAccountIdentitiesBatchContext(
+		ctx context.Context,
+		sourceID int64,
+		candidates []store.IdentityConfirmation,
+	) ([]store.IdentityConfirmationOutcome, error)
+	MergeConfirmedAccountIdentitySignalsContext(
+		ctx context.Context,
+		sourceID int64,
+		candidates []store.IdentityConfirmation,
+	) ([]store.IdentityConfirmationOutcome, error)
 	CountMessagesForSourceContext(ctx context.Context, sourceID int64) (int64, error)
 	CountSourceDeletedMessagesContext(ctx context.Context, sourceIDs ...int64) (int64, error)
 	NeedsFTSBackfillQuickContext(ctx context.Context) bool
@@ -180,6 +207,49 @@ func (s *requestCLIStore) AddAccountIdentity(sourceID int64, address, signal str
 
 func (s *requestCLIStore) RemoveAccountIdentity(sourceID int64, address string) (int64, error) {
 	return s.contextStore.RemoveAccountIdentityContext(s.ctx, sourceID, address)
+}
+
+func (s *requestCLIStore) CountIdentityDiscoveryMessagesContext(
+	_ context.Context,
+	sourceID int64,
+) (int64, error) {
+	return s.contextStore.CountIdentityDiscoveryMessagesContext(s.ctx, sourceID)
+}
+
+func (s *requestCLIStore) ScanIdentityDiscoveryPageContext(
+	_ context.Context,
+	sourceID, afterID int64,
+	limit int,
+) (store.IdentityDiscoveryPage, error) {
+	return s.contextStore.ScanIdentityDiscoveryPageContext(s.ctx, sourceID, afterID, limit)
+}
+
+func (s *requestCLIStore) ScanIdentityObservationsForSourceMessageIDsContext(
+	_ context.Context,
+	sourceID int64,
+	sourceMessageIDs []string,
+) ([]store.IdentityObservation, error) {
+	return s.contextStore.ScanIdentityObservationsForSourceMessageIDsContext(
+		s.ctx,
+		sourceID,
+		sourceMessageIDs,
+	)
+}
+
+func (s *requestCLIStore) AddAccountIdentitiesBatchContext(
+	_ context.Context,
+	sourceID int64,
+	candidates []store.IdentityConfirmation,
+) ([]store.IdentityConfirmationOutcome, error) {
+	return s.contextStore.AddAccountIdentitiesBatchContext(s.ctx, sourceID, candidates)
+}
+
+func (s *requestCLIStore) MergeConfirmedAccountIdentitySignalsContext(
+	_ context.Context,
+	sourceID int64,
+	candidates []store.IdentityConfirmation,
+) ([]store.IdentityConfirmationOutcome, error) {
+	return s.contextStore.MergeConfirmedAccountIdentitySignalsContext(s.ctx, sourceID, candidates)
 }
 
 func (s *requestCLIStore) CountMessagesForSource(sourceID int64) (int64, error) {
@@ -388,6 +458,8 @@ type CLICacheBuildEvent struct {
 type CLISyncRequest struct {
 	Full        bool
 	Email       string
+	SourceID    int64
+	SourceIDSet bool
 	Query       string
 	NoResume    bool
 	Before      string
@@ -423,9 +495,10 @@ type CLIRepairEncodingEvent struct {
 }
 
 type CLIRunRequest struct {
-	Args []string          `json:"args"`
-	Env  map[string]string `json:"env,omitempty"`
-	Cwd  string            `json:"cwd,omitempty"`
+	Args         []string          `json:"args"`
+	Env          map[string]string `json:"env,omitempty"`
+	Cwd          string            `json:"cwd,omitempty"`
+	GrantDecided bool              `json:"-"`
 }
 
 type CLIAddCalendarPlanRequest struct {
@@ -469,6 +542,7 @@ type CLIDeleteStagedPlanRequest struct {
 	DryRun              bool   `json:"dry_run,omitempty"`
 	List                bool   `json:"list,omitempty"`
 	Account             string `json:"account,omitempty"`
+	SourceID            *int64 `json:"source_id,omitempty"`
 	RemoteDeleteEnabled bool   `json:"remote_delete_enabled,omitempty"`
 }
 
@@ -479,6 +553,7 @@ type CLIDeleteStagedPlanResponse struct {
 	ConfirmationMode          string   `json:"confirmation_mode,omitempty"`
 	PlannedBatchIDs           []string `json:"planned_batch_ids,omitempty"`
 	PlanFingerprint           string   `json:"plan_fingerprint,omitempty"`
+	ResolvedSourceID          *int64   `json:"resolved_source_id,omitempty"`
 	NeedsScopeEscalation      bool     `json:"needs_scope_escalation,omitempty"`
 	ScopeEscalationHeadline   string   `json:"scope_escalation_headline,omitempty"`
 	ScopeEscalationBodyLines  []string `json:"scope_escalation_body_lines,omitempty"`
@@ -989,6 +1064,32 @@ func parseCLISyncRequest(r *http.Request, full bool) (CLISyncRequest, *apiHTTPEr
 		Before: values.Get("before"),
 		After:  values.Get("after"),
 	}
+	if rawSourceID, sourceIDSet := values["source_id"]; sourceIDSet {
+		if len(rawSourceID) != 1 {
+			return CLISyncRequest{}, newAPIHTTPError(
+				http.StatusBadRequest,
+				"invalid_source_id",
+				"source_id must be specified exactly once",
+			)
+		}
+		sourceID, err := strconv.ParseInt(rawSourceID[0], 10, 64)
+		if err != nil || sourceID <= 0 {
+			return CLISyncRequest{}, newAPIHTTPError(
+				http.StatusBadRequest,
+				"invalid_source_id",
+				"source_id must be a positive integer",
+			)
+		}
+		if req.Email != "" {
+			return CLISyncRequest{}, newAPIHTTPError(
+				http.StatusBadRequest,
+				"invalid_source_selector",
+				"email and source_id are mutually exclusive",
+			)
+		}
+		req.SourceID = sourceID
+		req.SourceIDSet = true
+	}
 	for _, v := range values["folder"] {
 		if v != "" {
 			req.Folders = append(req.Folders, v)
@@ -1141,8 +1242,20 @@ func (s *Server) handleCLIRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "command_not_allowed", "command is not allowed through the daemon CLI runner")
 		return
 	}
+	if cliRunArgsContainFlag(req.Args, "grant-decided") {
+		writeError(w, http.StatusBadRequest, "invalid_args", "--grant-decided is not accepted through the daemon CLI runner")
+		return
+	}
+	if proof := r.Header.Get(apiprotocol.DaemonRuntimeTokenHeader); proof != "" {
+		if req.Args[0] != "add-account" || s.shutdownToken == "" ||
+			subtle.ConstantTimeCompare([]byte(proof), []byte(s.shutdownToken)) != 1 {
+			writeError(w, http.StatusBadRequest, "invalid_grant_preflight", "grant preflight proof is invalid")
+			return
+		}
+		req.GrantDecided = true
+	}
 	for name := range req.Env {
-		if !s.cliRunEnvAllowed(name) {
+		if !s.cliRunEnvAllowedForCommand(req.Args, name) {
 			writeError(w, http.StatusBadRequest, "env_not_allowed", fmt.Sprintf("env %q is not allowed through the daemon CLI runner", name))
 			return
 		}
@@ -1159,6 +1272,73 @@ func (s *Server) handleCLIRun(w http.ResponseWriter, r *http.Request) {
 	if err := writeEvent(CLIRunEvent{Type: cliStreamEventTypeComplete}); err != nil {
 		s.logger.Error("failed to stream CLI run completion event", "error", err)
 	}
+}
+
+func (s *Server) cliRunEnvAllowedForCommand(args []string, name string) bool {
+	if len(args) >= 3 && args[0] == cliRunPersonCommand {
+		providerCall := args[1] == "provider" && args[2] == "check"
+		sweepCall := args[1] == "sweep" && args[2] == "run"
+		if providerCall || sweepCall {
+			keyEnv := s.configuredPeopleProviderKeyEnv()
+			return keyEnv != "" && keyEnv == name
+		}
+		enrichmentRun := args[1] == "enrichment" && args[2] == "run"
+		if enrichmentRun {
+			return s.cliRunPersonEnrichmentRunEnvAllowed(args, name)
+		}
+		personSuppression := args[1] == "enrichment" && args[2] == "suppress" &&
+			cliRunArgsContainFlag(args, "person")
+		return personSuppression && s.cfg != nil &&
+			s.cfg.People.Enrichment.SuppressionKeyEnv != "" &&
+			s.cfg.People.Enrichment.SuppressionKeyEnv == name
+	}
+	if keyEnv := s.configuredPeopleProviderKeyEnv(); keyEnv != "" && keyEnv == name {
+		return false
+	}
+	return s.cliRunEnvAllowed(name)
+}
+
+func (s *Server) cliRunPersonEnrichmentRunEnvAllowed(args []string, name string) bool {
+	if s.cfg == nil {
+		return false
+	}
+	if suppressionEnv := s.cfg.People.Enrichment.SuppressionKeyEnv; suppressionEnv != "" && suppressionEnv == name {
+		return true
+	}
+	providerName, ok := cliRunFlagValue(args, "provider")
+	if !ok {
+		return false
+	}
+	for _, provider := range s.cfg.People.Enrichment.Providers {
+		if provider.Enabled && provider.Name == providerName &&
+			provider.APIKeyEnv != "" && provider.APIKeyEnv == name {
+			return true
+		}
+	}
+	return false
+}
+
+func cliRunFlagValue(args []string, name string) (string, bool) {
+	flag := "--" + name
+	for i, arg := range args {
+		if value, ok := strings.CutPrefix(arg, flag+"="); ok {
+			return value, value != ""
+		}
+		if arg == flag && i+1 < len(args) {
+			return args[i+1], args[i+1] != ""
+		}
+	}
+	return "", false
+}
+
+func cliRunArgsContainFlag(args []string, name string) bool {
+	flag := "--" + name
+	for _, arg := range args {
+		if arg == flag || strings.HasPrefix(arg, flag+"=") {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) handleCLIAddCalendarPlan(w http.ResponseWriter, r *http.Request) {
@@ -1282,18 +1462,23 @@ func validateCLIDeletionManifest(manifest *deletion.Manifest) *apiHTTPError {
 	if manifest.Version == 0 {
 		manifest.Version = 1
 	}
+	if err := manifest.ValidateVersion(); err != nil {
+		return newAPIHTTPError(http.StatusBadRequest, "invalid_manifest_version", err.Error())
+	}
 	if manifest.CreatedBy == "" {
 		manifest.CreatedBy = "cli"
 	}
 	return nil
 }
 
+const cliRunPersonCommand = "person"
+
 // cliRunCommandAllowed reports whether a proxied CLI command may run through
 // the daemon CLI runner. Most commands are admitted by their leading word
-// alone; command groups whose subcommand matters (currently only "backup")
-// are checked against args[1] as well, since e.g. "backup init" and "backup
-// verify" run local, unfrozen archive mutations that the daemon's backup
-// freeze window does not protect against.
+// alone; command groups whose subcommand matters are checked against their
+// nested command path. Backup admits only the frozen create path, documents
+// admits only mutations that must run under the daemon's writer lock, and
+// person admits only the provider consent boundary and sweep operations.
 func cliRunCommandAllowed(args []string) bool {
 	if len(args) == 0 {
 		return false
@@ -1301,8 +1486,52 @@ func cliRunCommandAllowed(args []string) bool {
 	if args[0] == "backup" {
 		return len(args) >= 2 && args[1] == "create"
 	}
+	if args[0] == "documents" {
+		if len(args) < 2 {
+			return false
+		}
+		if args[1] == "vectors" {
+			if len(args) < 3 {
+				return false
+			}
+			switch args[2] {
+			case "build", "consent", "rebuild", "resume", "retire", "retry", "status":
+				return true
+			default:
+				return false
+			}
+		}
+		switch args[1] {
+		case "build", "consent-mistral", "purge-derived", "resume", "retire", "retry":
+			return true
+		default:
+			return false
+		}
+	}
+	if args[0] == cliRunPersonCommand {
+		if len(args) < 3 {
+			return false
+		}
+		if args[1] == "enrichment" {
+			return cliRunPersonEnrichmentAllowed(args[2:])
+		}
+		switch args[1] {
+		case "provider":
+			switch args[2] {
+			case "status", "consent", "revoke", "check", "login", "models":
+				return true
+			}
+		case "sweep":
+			switch args[2] {
+			case "run", "status", "history":
+				return true
+			}
+		}
+		return false
+	}
 	switch args[0] {
 	case "add-account",
+		"activity",
 		"add-beeper",
 		"add-calendar",
 		"add-circleback",
@@ -1338,9 +1567,12 @@ func cliRunCommandAllowed(args []string) bool {
 		"list-folders",
 		"logs",
 		"pack-attachments",
+		"purge-excluded-media",
 		"repair-dates",
+		"repair-identity",
 		"repack-attachments",
 		"remove-account",
+		"repair-derived",
 		"show-deletion",
 		"sync-beeper",
 		"sync-calendar",
@@ -1354,6 +1586,129 @@ func cliRunCommandAllowed(args []string) bool {
 	default:
 		return false
 	}
+}
+
+func cliRunPersonEnrichmentAllowed(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	operation := args[0]
+	values, positionals, ok := cliRunStrictFlagValues(args[1:])
+	if !ok {
+		return false
+	}
+	allowed := func(names ...string) bool {
+		set := make(map[string]struct{}, len(names)+4)
+		for _, name := range names {
+			set[name] = struct{}{}
+		}
+		for _, name := range []string{"log-level", "verbose", "log-sql", "log-sql-slow-ms"} {
+			set[name] = struct{}{}
+		}
+		for name := range values {
+			if _, exists := set[name]; !exists {
+				return false
+			}
+		}
+		return true
+	}
+	switch operation {
+	case "status":
+		return len(positionals) == 0 && allowed("limit", "json")
+	case "profiles":
+		return len(positionals) == 0 && allowed("json")
+	case "consent":
+		return len(positionals) == 1 && isLowerSHA256(positionals[0]) && allowed("json")
+	case "revoke":
+		return len(positionals) <= 1 && allowed("all", "json") &&
+			(len(positionals) == 0 || isLowerSHA256(positionals[0]))
+	case "run":
+		return len(positionals) == 0 && allowed("person", "provider", "idempotency-key", "json") &&
+			cliRunPositiveInt(values["person"]) && cliRunSafeToken(values["provider"]) &&
+			cliRunSafeToken(values["idempotency-key"])
+	case "suppress":
+		if len(positionals) != 0 || !allowed(
+			"person", "provider-namespace", "identifier-class", "normalization-version",
+			"key-id", "digest", "reason", "actor") {
+			return false
+		}
+		if person := values["person"]; person != "" {
+			return cliRunPositiveInt(person) && values["provider-namespace"] == "" &&
+				values["identifier-class"] == "" && values["normalization-version"] == "" &&
+				values["key-id"] == "" && values["digest"] == "" && values["actor"] == "" &&
+				(values["reason"] == "opt_out" || values["reason"] == "data_subject_request")
+		}
+		namespace := values["provider-namespace"]
+		kind, fingerprint, found := strings.Cut(namespace, ":")
+		class := values["identifier-class"]
+		versionByClass := map[string]string{
+			"email": "email-v1", "phone": "phone-v1", "public_profile_url": "public-url-v1",
+			"provider_person_id": "provider-person-id-v1", "name_company": "name-company-v1",
+		}
+		version, validClass := versionByClass[class]
+		return found && (kind == "exa" || kind == "sixtyfour") && isLowerSHA256(fingerprint) &&
+			validClass && values["normalization-version"] == version &&
+			isLowerSHA256(values["key-id"]) && isLowerSHA256(values["digest"]) &&
+			(values["reason"] == "opt_out" || values["reason"] == "data_subject_request") &&
+			values["actor"] == "cli"
+	default:
+		return false
+	}
+}
+
+func cliRunStrictFlagValues(args []string) (map[string]string, []string, bool) {
+	values := make(map[string]string)
+	positionals := make([]string, 0)
+	for _, arg := range args {
+		if !strings.HasPrefix(arg, "--") {
+			positionals = append(positionals, arg)
+			continue
+		}
+		nameValue := strings.TrimPrefix(arg, "--")
+		name, value, hasValue := strings.Cut(nameValue, "=")
+		if name == "" {
+			return nil, nil, false
+		}
+		if !hasValue {
+			value = "true"
+		}
+		if _, duplicate := values[name]; duplicate {
+			return nil, nil, false
+		}
+		values[name] = value
+	}
+	return values, positionals, true
+}
+
+func cliRunPositiveInt(value string) bool {
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	return err == nil && parsed > 0
+}
+
+func cliRunSafeToken(value string) bool {
+	if len(value) == 0 || len(value) > 128 {
+		return false
+	}
+	for _, char := range value {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || strings.ContainsRune("._:-", char) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func isLowerSHA256(value string) bool {
+	if len(value) != sha256.Size*2 {
+		return false
+	}
+	for _, char := range value {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 // newCLINDJSONEventWriter streams events as NDJSON. Write deadlines are
@@ -1376,9 +1731,9 @@ func newCLINDJSONEventWriter[T any](w http.ResponseWriter) func(T) error {
 	}
 }
 
-// cliRunEnvAllowed permits the static forwarding allowlist plus the
-// config-named embedding API key variable, which the frontend CLI forwards
-// so a key exported in the caller's shell reaches the embed subprocess.
+// cliRunEnvAllowed permits the static forwarding allowlist plus config-named
+// provider API key variables, which the frontend CLI forwards so a key
+// exported in the caller's shell reaches the daemon subprocess.
 func (s *Server) cliRunEnvAllowed(name string) bool {
 	if clirun.EnvAllowed(name) {
 		return true
@@ -1386,8 +1741,30 @@ func (s *Server) cliRunEnvAllowed(name string) bool {
 	if s.cfg == nil {
 		return false
 	}
-	keyEnv := s.cfg.Vector.Embeddings.APIKeyEnv
-	return keyEnv != "" && name == keyEnv
+	for _, keyEnv := range []string{
+		s.cfg.Vector.Embeddings.APIKeyEnv,
+		s.cfg.Attachments.Documents.APIKeyEnv,
+		s.configuredPeopleProviderKeyEnv(),
+		s.cfg.People.Enrichment.SuppressionKeyEnv,
+	} {
+		if keyEnv != "" && name == keyEnv {
+			return true
+		}
+	}
+	for _, provider := range s.cfg.People.Enrichment.Providers {
+		if provider.APIKeyEnv != "" && name == provider.APIKeyEnv {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) configuredPeopleProviderKeyEnv() string {
+	if s.cfg == nil ||
+		s.cfg.People.Sweep.Provider.Kind != peoplesweep.ProviderOpenAICompatible {
+		return ""
+	}
+	return s.cfg.People.Sweep.Provider.APIKeyEnv
 }
 
 func (s *Server) cliDedupDeleteStore() (CLIDedupDeleteStore, *apiHTTPError) {
@@ -1614,8 +1991,7 @@ func (s *Server) cliDedupDeleteError(err error) *apiHTTPError {
 	if err == nil {
 		return nil
 	}
-	var requestErr *cliRequestError
-	if errors.As(err, &requestErr) {
+	if requestErr, ok := errors.AsType[*cliRequestError](err); ok {
 		return newAPIHTTPError(http.StatusBadRequest, requestErr.code, requestErr.message)
 	}
 	s.logger.Error("failed CLI dedup delete operation", "error", err)
@@ -1623,7 +1999,7 @@ func (s *Server) cliDedupDeleteError(err error) *apiHTTPError {
 }
 
 func (s *Server) handleCLISearch(w http.ResponseWriter, r *http.Request) {
-	if s.store == nil || s.engine == nil {
+	if s.store == nil || s.queryEngineForContext(r.Context()) == nil {
 		writeError(w, http.StatusServiceUnavailable, "store_unavailable", "Database not available")
 		return
 	}
@@ -1649,6 +2025,12 @@ func (s *Server) handleCLISearch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
 		return
 	}
+	deletionScope, err := search.ParseDeletionScope(r.URL.Query().Get("deletion_scope"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_deletion_scope", err.Error())
+		return
+	}
+	parsed.DeletionScope = deletionScope
 	for _, raw := range r.URL.Query()["message_type"] {
 		for typ := range strings.SplitSeq(raw, ",") {
 			typ = strings.TrimSpace(strings.ToLower(typ))
@@ -1690,7 +2072,7 @@ func (s *Server) handleCLISearch(w http.ResponseWriter, r *http.Request) {
 		IndexState: s.ensureCLISearchIndexAsync(cliStore),
 	}
 
-	results, err := s.engine.Search(r.Context(), parsed, limit, offset)
+	results, err := s.queryEngineForContext(r.Context()).Search(r.Context(), parsed, limit, offset)
 	if err != nil {
 		s.logger.Error("CLI search failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "search_failed", err.Error())
@@ -2109,6 +2491,8 @@ func (s *Server) getCLIIdentities(
 	ctx context.Context,
 	account string,
 	collection string,
+	sourceID int64,
+	sourceIDSet bool,
 	primaryOnly bool,
 ) (cliIdentitiesResponse, error) {
 	if s.store == nil {
@@ -2124,16 +2508,30 @@ func (s *Server) getCLIIdentities(
 	}
 	cliStore = bindCLIStoreContext(ctx, cliStore)
 
-	if account != "" && collection != "" {
+	if sourceIDSet && sourceID <= 0 {
 		return cliIdentitiesResponse{}, newAPIHTTPError(
 			http.StatusBadRequest,
 			"invalid_scope",
-			errMutuallyExclusiveScope.Error(),
+			"source ID must be positive",
+		)
+	}
+	if (account != "" && collection != "") ||
+		(sourceIDSet && (account != "" || collection != "")) {
+		return cliIdentitiesResponse{}, newAPIHTTPError(
+			http.StatusBadRequest,
+			"invalid_scope",
+			"account, collection, and source ID selectors are mutually exclusive",
 		)
 	}
 
 	var sourceIDs []int64
 	switch {
+	case sourceIDSet:
+		src, err := identityops.ResolveSource(cliStore, identityops.SourceSelector{SourceID: sourceID})
+		if err != nil {
+			return cliIdentitiesResponse{}, s.cliScopeError(err)
+		}
+		sourceIDs = []int64{src.ID}
 	case primaryOnly:
 		if account == "" || collection != "" {
 			return cliIdentitiesResponse{}, newAPIHTTPError(
@@ -2224,6 +2622,197 @@ func (s *Server) addCLIIdentity(ctx context.Context, req identityops.AddRequest)
 	return result, nil
 }
 
+func (s *Server) importCLIIdentities(
+	ctx context.Context,
+	req identityops.ImportRequest,
+) (identityops.ImportResult, error) {
+	cliStore, apiErr := s.cliStore()
+	if apiErr != nil {
+		return identityops.ImportResult{}, apiErr
+	}
+	discoveryStore, ok := bindCLIStoreContext(ctx, cliStore).(identityops.DiscoveryStore)
+	if !ok {
+		return identityops.ImportResult{}, cliStoreUnavailableError()
+	}
+
+	result, err := identityops.Import(ctx, discoveryStore, req)
+	if discoveryAddedIdentity(result.Applied) {
+		s.scheduleAccountIdentityCacheRebuild(ctx)
+	}
+	if err != nil {
+		return result, s.operationError(
+			err,
+			identityOperationErrorPolicy,
+			"Failed to import identities",
+		)
+	}
+	return result, nil
+}
+
+func (s *Server) handleCLIIdentityDiscover(w http.ResponseWriter, r *http.Request) {
+	decoder := json.NewDecoder(r.Body)
+	var rawBody json.RawMessage
+	if err := decoder.Decode(&rawBody); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON request body")
+		return
+	}
+	if !requireSingleJSONValue(w, decoder, "invalid_request") {
+		return
+	}
+	var req identityops.DiscoverRequest
+	if err := json.Unmarshal(rawBody, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON request body")
+		return
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(rawBody, &fields); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON request body")
+		return
+	}
+	if _, sourceIDSet := fields["source_id"]; sourceIDSet && req.SourceID <= 0 {
+		writeAPIHTTPError(w, s.operationError(
+			opserr.Invalid(errors.New("source ID must be positive")),
+			identityOperationErrorPolicy,
+			"Failed to discover identities",
+		))
+		return
+	}
+
+	cliStore, apiErr := s.cliStore()
+	if apiErr != nil {
+		writeAPIHTTPError(w, apiErr)
+		return
+	}
+	discoveryStore, ok := bindCLIStoreContext(r.Context(), cliStore).(identityops.DiscoveryStore)
+	if !ok {
+		writeAPIHTTPError(w, cliStoreUnavailableError())
+		return
+	}
+
+	var externalEvidence []identityops.ExternalEvidence
+	if req.Provider {
+		source, resolveErr := identityops.ResolveSource(discoveryStore, req.SourceSelector)
+		if resolveErr != nil {
+			writeAPIHTTPError(w, s.operationError(
+				resolveErr,
+				identityOperationErrorPolicy,
+				"Failed to discover identities",
+			))
+			return
+		}
+		configured, configErr := s.cfg.FastmailSourceFor(cliStore, source.ID)
+		if configErr != nil {
+			wrappedConfigErr := fmt.Errorf("resolve [[fastmail]] configuration for source %d: %w", source.ID, configErr)
+			classifiedConfigErr := opserr.Invalid(wrappedConfigErr)
+			if errors.Is(configErr, config.ErrFastmailSourceLookup) {
+				classifiedConfigErr = opserr.Internal(wrappedConfigErr)
+			}
+			writeAPIHTTPError(w, s.operationError(
+				classifiedConfigErr,
+				identityOperationErrorPolicy,
+				"Failed to discover identities",
+			))
+			return
+		}
+		if configured == nil {
+			account := source.Identifier
+			if source.DisplayName.Valid && strings.TrimSpace(source.DisplayName.String) != "" {
+				account = strings.TrimSpace(source.DisplayName.String)
+			}
+			writeAPIHTTPError(w, s.operationError(
+				opserr.Invalid(fmt.Errorf(
+					"source %d (%s) has no matching [[fastmail]] configuration",
+					source.ID,
+					account,
+				)),
+				identityOperationErrorPolicy,
+				"Failed to discover identities",
+			))
+			return
+		}
+		inventory := s.fastmailInventoryFactory(configured.APIToken)
+		records, inventoryErr := inventory.ListIdentityRecords(r.Context())
+		if inventoryErr != nil {
+			writeAPIHTTPError(w, s.operationError(
+				opserr.Internal(fmt.Errorf("fastmail identity inventory request failed: %w", inventoryErr)),
+				identityOperationErrorPolicy,
+				"Failed to discover identities",
+			))
+			return
+		}
+		externalEvidence = provideridentity.Evidence(records)
+		req.SourceSelector = identityops.SourceSelector{SourceID: source.ID}
+	}
+
+	streamStarted := false
+	writeEvent := newCLINDJSONEventWriter[identityops.DiscoverEvent](w)
+	result, err := identityops.DiscoverWithExternalEvidence(r.Context(), discoveryStore, req, externalEvidence, func(progress identityops.DiscoverProgress) error {
+		streamStarted = true
+		return writeEvent(identityops.DiscoverEvent{Type: "progress", Progress: &progress})
+	})
+	if discoveryAddedIdentity(result.Applied) {
+		s.scheduleAccountIdentityCacheRebuild(r.Context())
+	}
+	if err != nil {
+		if !streamStarted {
+			if s.writeIfContextError(w, err) {
+				return
+			}
+			writeAPIHTTPError(w, s.operationError(
+				err,
+				identityOperationErrorPolicy,
+				"Failed to discover identities",
+			))
+			return
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || r.Context().Err() != nil {
+			return
+		}
+		terminalError := identityDiscoveryTerminalError(err)
+		s.logger.Info("CLI identity discovery stopped before completion", "error_code", terminalError.Code)
+		if writeErr := writeEvent(identityops.DiscoverEvent{Type: "error", Error: &terminalError}); writeErr != nil {
+			s.logger.Error("failed to stream CLI identity discovery error event", "error", writeErr)
+		}
+		return
+	}
+	if err := r.Context().Err(); err != nil {
+		s.logger.Info("CLI identity discovery canceled before result", "error", err)
+		return
+	}
+	if err := writeEvent(identityops.DiscoverEvent{Type: "result", Result: &result}); err != nil {
+		s.logger.Error("failed to stream CLI identity discovery result", "error", err)
+	}
+}
+
+func identityDiscoveryTerminalError(err error) identityops.DiscoverError {
+	switch opserr.KindOf(err) {
+	case opserr.KindInvalid:
+		return identityops.DiscoverError{
+			Code:    identityOperationErrorPolicy.InvalidCode,
+			Message: "Invalid identity discovery request",
+		}
+	case opserr.KindNotFound:
+		return identityops.DiscoverError{
+			Code:    identityOperationErrorPolicy.NotFoundCode,
+			Message: "Identity discovery target was not found",
+		}
+	default:
+		return identityops.DiscoverError{
+			Code:    "internal_error",
+			Message: "Failed to discover identities",
+		}
+	}
+}
+
+func discoveryAddedIdentity(outcomes []store.IdentityConfirmationOutcome) bool {
+	for _, outcome := range outcomes {
+		if outcome.Added {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) removeCLIIdentity(ctx context.Context, req identityops.RemoveRequest) (identityops.RemoveResult, error) {
 	cliStore, apiErr := s.cliStore()
 	if apiErr != nil {
@@ -2311,7 +2900,7 @@ func (s *Server) operationError(
 }
 
 func (s *Server) handleCLIMessage(w http.ResponseWriter, r *http.Request) {
-	if s.engine == nil {
+	if s.queryEngineForContext(r.Context()) == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
 		return
 	}
@@ -2335,7 +2924,7 @@ func (s *Server) handleCLIMessage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleCLIMessageRaw(w http.ResponseWriter, r *http.Request) {
-	if s.engine == nil {
+	if s.queryEngineForContext(r.Context()) == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
 		return
 	}
@@ -2355,7 +2944,7 @@ func (s *Server) handleCLIMessageRaw(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	raw, err := s.engine.GetMessageRaw(r.Context(), msg.ID)
+	raw, err := s.queryEngineForContext(r.Context()).GetMessageRaw(r.Context(), msg.ID)
 	if err != nil {
 		s.logger.Error("failed to get CLI raw message", "id", msg.ID, "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve raw message")
@@ -2448,14 +3037,14 @@ func (s *Server) resolveCLIMessage(r *http.Request, idStr string) (*query.Messag
 		err error
 	)
 	if id, parseErr := strconv.ParseInt(idStr, 10, 64); parseErr == nil {
-		msg, err = s.engine.GetMessage(r.Context(), id)
+		msg, err = s.queryEngineForContext(r.Context()).GetMessage(r.Context(), id)
 		if err != nil {
 			s.logger.Error("failed to get CLI message by id", "id", id, "error", err)
 			return nil, err
 		}
 	}
 	if msg == nil {
-		msg, err = s.engine.GetMessageBySourceID(r.Context(), idStr)
+		msg, err = s.queryEngineForContext(r.Context()).GetMessageBySourceID(r.Context(), idStr)
 		if err != nil {
 			s.logger.Error("failed to get CLI message by source id", "id", idStr, "error", err)
 			return nil, err

@@ -16,6 +16,7 @@ import (
 
 	"go.kenn.io/msgvault/internal/export"
 	"go.kenn.io/msgvault/internal/gmail"
+	"go.kenn.io/msgvault/internal/identityops"
 	"go.kenn.io/msgvault/internal/mime"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/textutil"
@@ -26,6 +27,8 @@ var ErrHistoryExpired = errors.New("history expired - run full sync")
 
 const (
 	labelTypeSystem               = "system"
+	labelIDChat                   = "CHAT"
+	conversationTypeChat          = "chat"
 	sourceTypeIMAP                = "imap"
 	invalidatedIMAPSourceIDPrefix = "msgvault-invalidated:"
 )
@@ -65,12 +68,21 @@ func DefaultOptions() *Options {
 
 // Syncer performs Gmail synchronization.
 type Syncer struct {
-	client   gmail.API
-	store    *store.Store
-	logger   *slog.Logger
-	progress gmail.SyncProgress
-	opts     *Options
+	client             gmail.API
+	store              *store.Store
+	logger             *slog.Logger
+	progress           gmail.SyncProgress
+	opts               *Options
+	successfulHookName string
+	successfulHook     SuccessfulSyncHook
 }
+
+// SuccessfulSyncHook runs after the durable sync run is marked complete.
+// mailboxChanged reports whether the run observed provider-side change; a
+// no-op incremental run passes false so the hook can skip provider-facing
+// work it has performed recently.
+// Its failure is warning-only and never replaces the successful sync result.
+type SuccessfulSyncHook func(ctx context.Context, source *store.Source, mailboxChanged bool) error
 
 type messageAcknowledger interface {
 	AcknowledgeMessages(ctx context.Context, messageIDs []string)
@@ -80,11 +92,23 @@ type labelSnapshotCompleteness interface {
 	LabelsSnapshotComplete() bool
 }
 
+type authoritativeLabelReconciliationDeferrer interface {
+	DefersAuthoritativeLabelReconciliation() bool
+}
+
+type limitedFullEnumerationForcer interface {
+	ForceFullEnumerationForLimitedSync()
+}
+
 type sourceMessageMatcher interface {
 	SourceMessageMatches(
 		ctx context.Context,
 		messageID, expectedRFC822MessageID string,
 	) (matches bool, conclusive bool, err error)
+}
+
+type sourceMessageAliaser interface {
+	CanonicalSourceMessageID(sourceMessageID string) (string, bool)
 }
 
 type preferredIMAPSourceID interface {
@@ -113,6 +137,17 @@ func New(client gmail.API, store *store.Store, opts *Options) *Syncer {
 		opts = DefaultOptions()
 	}
 
+	// Folder shortcuts leave this session's label map covering only the
+	// mailboxes that changed, which is safe only because the post-sync
+	// mailbox-delta transaction is what reconciles labels. A limited run cannot
+	// publish that transaction, and a client that reconciles immediately does
+	// not wait for it; either way the session's own view has to be complete.
+	if opts.Limit > 0 || !defersAuthoritativeLabelReconciliation(client) {
+		if forcer, ok := client.(limitedFullEnumerationForcer); ok {
+			forcer.ForceFullEnumerationForLimitedSync()
+		}
+	}
+
 	return &Syncer{
 		client:   client,
 		store:    store,
@@ -139,12 +174,191 @@ func (s *Syncer) labelsSnapshotComplete() bool {
 	return !ok || completeness.LabelsSnapshotComplete()
 }
 
+// defersAuthoritativeLabelReconciliation reports whether client leaves
+// authoritative label reconciliation to the post-sync mailbox-delta
+// transaction. Clients that do not implement the seam reconcile immediately.
+func defersAuthoritativeLabelReconciliation(client gmail.API) bool {
+	deferrer, ok := client.(authoritativeLabelReconciliationDeferrer)
+	return ok && deferrer.DefersAuthoritativeLabelReconciliation()
+}
+
+func (s *Syncer) defersAuthoritativeLabelReconciliation() bool {
+	// Only an unlimited run can publish the deferred mailbox snapshot. Limited
+	// runs must reconcile each processed message before returning.
+	if s.opts.SourceType != sourceTypeIMAP || s.opts.Limit > 0 || !s.labelsSnapshotComplete() {
+		return false
+	}
+	return defersAuthoritativeLabelReconciliation(s.client)
+}
+
+// WithSuccessfulSyncHook installs one best-effort post-completion hook.
+func (s *Syncer) WithSuccessfulSyncHook(name string, hook SuccessfulSyncHook) *Syncer {
+	s.successfulHookName = strings.TrimSpace(name)
+	s.successfulHook = hook
+	return s
+}
+
+func (s *Syncer) runSuccessfulSyncHook(ctx context.Context, source *store.Source, mailboxChanged bool) {
+	if s.successfulHook == nil {
+		return
+	}
+	if err := s.successfulHook(ctx, source, mailboxChanged); err != nil {
+		s.logger.Warn(
+			"successful sync hook failed",
+			"hook", s.successfulHookName,
+			"source_id", source.ID,
+			"error", err,
+		)
+	}
+}
+
+// completeSyncWithoutHook atomically publishes the source cursor and marks the
+// still-current run complete.
+func (s *Syncer) completeSyncWithoutHook(
+	ctx context.Context, syncID int64, sourceID int64, historyID string,
+) error {
+	if err := s.store.CompleteSyncAndUpdateSourceCursorContext(
+		ctx, syncID, sourceID, historyID,
+	); err != nil {
+		if !errors.Is(err, store.ErrSyncRunSuperseded) {
+			s.failSyncUnlessCanceled(syncID, err)
+		}
+		return fmt.Errorf("publish completed sync: %w", err)
+	}
+	return nil
+}
+
+func (s *Syncer) completeSyncAndRunHook(
+	ctx context.Context,
+	syncID int64,
+	historyID string,
+	source *store.Source,
+) error {
+	if err := s.completeSyncWithoutHook(ctx, syncID, source.ID, historyID); err != nil {
+		return err
+	}
+	s.runSuccessfulSyncHook(ctx, source, true)
+	return nil
+}
+
+// identityDiscoveryRetryBackoff is the delay before the second per-page
+// identity discovery attempt; each further attempt doubles it. It is a variable
+// so tests can run the retry loop without real backoff.
+var identityDiscoveryRetryBackoff = time.Second
+
+const (
+	identityDiscoveryAttempts          = 3
+	identityDiscoveryRetryLogMessage   = "identity discovery failed for sync page; retrying"
+	identityDiscoveryBacklogLogMessage = "identity discovery failed for sync page; recorded backlog"
+	identityDiscoveryDrainLogMessage   = "draining identity discovery backlog"
+)
+
+// runPageIdentityDiscovery merges one page's identity evidence into the
+// source's confirmed identities, retrying a bounded number of times.
+//
+// It deliberately returns no error. The page's messages are already durably
+// archived by the time it runs, and the evidence it derives is recomputable
+// from them, so failing the run here would discard real archived work over a
+// debt that RefreshConfirmedForSource can settle later. Persistent failure is
+// logged and parked in a durable per-source backlog marker instead. Callers
+// must still check ctx after it returns: a cancelled sync is an interruption,
+// not a discovery failure, and has to stay resumable.
+//
+// It reports whether the page ended up parking a backlog marker, which is the
+// signal callers use to decide whether an immediate drain is worth attempting.
+func (s *Syncer) runPageIdentityDiscovery(
+	ctx context.Context,
+	sourceID int64,
+	sourceMessageIDs []string,
+) (parkedBacklog bool) {
+	backoff := identityDiscoveryRetryBackoff
+	var err error
+	for attempt := range identityDiscoveryAttempts {
+		if _, err = identityops.DiscoverStrongForSourceMessageIDs(
+			ctx, s.store, sourceID, sourceMessageIDs,
+		); err == nil {
+			return false
+		}
+		if ctx.Err() != nil || attempt == identityDiscoveryAttempts-1 {
+			break
+		}
+		s.logger.Warn(identityDiscoveryRetryLogMessage,
+			"source_id", sourceID, "attempt", attempt+1, "error", err)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return false
+		}
+		backoff *= 2
+	}
+	if ctx.Err() != nil {
+		return false
+	}
+	err = fmt.Errorf("discover identities for sync page: %w", err)
+	s.logger.Warn(identityDiscoveryBacklogLogMessage, "source_id", sourceID, "error", err)
+	if setErr := s.store.SetIdentityDiscoveryBacklogContext(ctx, sourceID, err); setErr != nil {
+		s.logger.Warn("record identity discovery backlog", "source_id", sourceID, "error", setErr)
+	}
+	return true
+}
+
+// pageDiscoveryHealth tracks whether the most recent page's identity discovery
+// worked, so a run only spends an end-of-run whole-archive refresh when there
+// is reason to believe it can succeed.
+type pageDiscoveryHealth struct {
+	ran    bool
+	parked bool
+}
+
+func (h *pageDiscoveryHealth) observe(parkedBacklog bool) {
+	h.ran = true
+	h.parked = parkedBacklog
+}
+
+// shouldDrainAtCompletion reports whether a run that just finished its pages
+// should try to settle debt it parked itself. Retrying right after discovery
+// failed every attempt on the last page costs a full archive scan to learn
+// nothing; debt parked by an earlier page of a run that recovered is worth
+// settling now rather than making the archive wait for the next sync.
+func (h *pageDiscoveryHealth) shouldDrainAtCompletion() bool {
+	return h.ran && !h.parked
+}
+
+// drainIdentityDiscoveryBacklog settles a parked discovery debt by re-deriving
+// the source's confirmed identities from the whole archive. A refresh that
+// fails leaves the marker in place for the next attempt; it never fails the
+// sync that happens to be carrying it.
+func (s *Syncer) drainIdentityDiscoveryBacklog(ctx context.Context, sourceID int64) {
+	found, lastError, err := s.store.IdentityDiscoveryBacklogContext(ctx, sourceID)
+	if err != nil {
+		s.logger.Warn("read identity discovery backlog", "source_id", sourceID, "error", err)
+		return
+	}
+	if !found {
+		return
+	}
+	s.logger.Info(identityDiscoveryDrainLogMessage,
+		"source_id", sourceID, "last_error", lastError)
+	if err := identityops.RefreshConfirmedForSource(ctx, s.store, sourceID); err != nil {
+		s.logger.Warn("drain identity discovery backlog", "source_id", sourceID, "error", err)
+		return
+	}
+	if err := s.store.ClearIdentityDiscoveryBacklogContext(ctx, sourceID); err != nil {
+		s.logger.Warn("clear identity discovery backlog", "source_id", sourceID, "error", err)
+	}
+}
+
 // syncState holds the state for a sync operation.
 type syncState struct {
-	syncID     int64
-	checkpoint *store.Checkpoint
-	pageToken  string
-	wasResumed bool
+	syncID        int64
+	checkpoint    *store.Checkpoint
+	pageToken     string
+	handoffCursor string
+	wasResumed    bool
+}
+
+func isPinnedHistoryRecovery(run *store.SyncRun) bool {
+	return run != nil && run.CursorAfter.Valid && run.CursorAfter.String != ""
 }
 
 // failSyncUnlessCanceled marks the run failed for real errors. A cancelled
@@ -197,14 +411,55 @@ func (s *Syncer) initSyncState(sourceID int64) (*syncState, error) {
 	return state, nil
 }
 
+// initHistoryRecoveryState only resumes a full run that already pinned its
+// history handoff cursor. An ordinary full-sync checkpoint cannot be reused:
+// its processed prefix may have changed before recovery captured a cursor.
+func (s *Syncer) initHistoryRecoveryState(sourceID int64) (*syncState, error) {
+	if !s.opts.NoResume {
+		activeSync, err := s.store.GetActiveSync(sourceID)
+		if err != nil && !errors.Is(err, store.ErrSyncRunNotFound) {
+			return nil, fmt.Errorf("check active history recovery: %w", err)
+		}
+		if isPinnedHistoryRecovery(activeSync) {
+			state := &syncState{
+				syncID:        activeSync.ID,
+				checkpoint:    &store.Checkpoint{},
+				handoffCursor: activeSync.CursorAfter.String,
+				wasResumed:    true,
+			}
+			if activeSync.CursorBefore.Valid {
+				state.pageToken = activeSync.CursorBefore.String
+			}
+			state.checkpoint = &store.Checkpoint{
+				PageToken:         state.pageToken,
+				MessagesProcessed: activeSync.MessagesProcessed,
+				MessagesAdded:     activeSync.MessagesAdded,
+				MessagesUpdated:   activeSync.MessagesUpdated,
+				ErrorsCount:       activeSync.ErrorsCount,
+			}
+			s.logger.Info("resuming Gmail history recovery",
+				"messages_processed", state.checkpoint.MessagesProcessed,
+				"handoff_cursor", state.handoffCursor)
+			return state, nil
+		}
+	}
+
+	syncID, err := s.store.StartSync(sourceID, "full")
+	if err != nil {
+		return nil, fmt.Errorf("start history recovery: %w", err)
+	}
+	return &syncState{syncID: syncID, checkpoint: &store.Checkpoint{}}, nil
+}
+
 // batchResult holds the result of processing a batch.
 type batchResult struct {
-	processed    int64
-	added        int64
-	updated      int64
-	skipped      int64
-	oldestDate   time.Time
-	acknowledged []string
+	processed        int64
+	added            int64
+	updated          int64
+	skipped          int64
+	oldestDate       time.Time
+	acknowledged     []string
+	sourceMessageIDs []string
 }
 
 type inconclusiveLabelRefresh struct {
@@ -228,12 +483,32 @@ func (s *Syncer) processBatch(ctx context.Context, syncID, sourceID int64, listR
 		messageIDs[i] = m.ID
 		threadIDs[m.ID] = m.ThreadID
 	}
+	result.sourceMessageIDs = messageIDs
 
 	// Check which messages already exist
+	lookupMessageIDs := append([]string(nil), messageIDs...)
+	aliases := make(map[string]string)
+	if s.opts.SourceType == sourceTypeIMAP {
+		if aliaser, ok := s.client.(sourceMessageAliaser); ok {
+			for _, sourceMessageID := range messageIDs {
+				canonicalSourceMessageID, exists := aliaser.CanonicalSourceMessageID(sourceMessageID)
+				if !exists || canonicalSourceMessageID == sourceMessageID {
+					continue
+				}
+				aliases[sourceMessageID] = canonicalSourceMessageID
+				lookupMessageIDs = append(lookupMessageIDs, canonicalSourceMessageID)
+			}
+		}
+	}
 	existingMap, err := s.store.MessageMetadataWithRawBatch(
-		sourceID, messageIDs)
+		sourceID, lookupMessageIDs)
 	if err != nil {
 		return nil, fmt.Errorf("check existing: %w", err)
+	}
+	for sourceMessageID, canonicalSourceMessageID := range aliases {
+		if canonical, exists := existingMap[canonicalSourceMessageID]; exists {
+			existingMap[sourceMessageID] = canonical
+		}
 	}
 
 	// Existing exact IDs only need current label metadata. Clients with a
@@ -530,17 +805,20 @@ func (s *Syncer) processBatch(ctx context.Context, syncID, sourceID int64, listR
 			}
 
 			if alreadyExists {
-				changed, _, err := s.store.ReconcileMessageLabels(
-					existing.ID,
-					labelIDsFor(raw.LabelIDs, labelMap),
-					false,
-				)
-				if err != nil {
-					s.logger.Warn("failed to merge existing message labels",
-						"id", sourceMessageID, "error", err)
-					s.recordSyncItem(syncID, sourceMessageID, syncItemPhaseIngest, store.SyncRunItemStatusError, syncItemKindIngestError, err)
-					checkpoint.ErrorsCount++
-					continue
+				changed := false
+				if !s.defersAuthoritativeLabelReconciliation() {
+					changed, _, err = s.store.ReconcileMessageLabels(
+						existing.ID,
+						labelIDsFor(raw.LabelIDs, labelMap),
+						false,
+					)
+					if err != nil {
+						s.logger.Warn("failed to merge existing message labels",
+							"id", sourceMessageID, "error", err)
+						s.recordSyncItem(syncID, sourceMessageID, syncItemPhaseIngest, store.SyncRunItemStatusError, syncItemKindIngestError, err)
+						checkpoint.ErrorsCount++
+						continue
+					}
 				}
 				if changed {
 					result.updated++
@@ -606,6 +884,98 @@ func (s *Syncer) processBatch(ctx context.Context, syncID, sourceID int64, listR
 
 // Full performs a full synchronization.
 func (s *Syncer) Full(ctx context.Context, email string) (summary *gmail.SyncSummary, err error) {
+	sourceType := s.opts.SourceType
+	if sourceType == "" {
+		sourceType = "gmail"
+	}
+	if sourceType == "gmail" && !s.opts.NoResume {
+		source, sourceErr := s.store.GetOrCreateSource(sourceType, email)
+		if sourceErr != nil {
+			return nil, fmt.Errorf("get/create source: %w", sourceErr)
+		}
+		active, activeErr := s.store.GetActiveSync(source.ID)
+		if activeErr != nil && !errors.Is(activeErr, store.ErrSyncRunNotFound) {
+			return nil, fmt.Errorf("check active history recovery: %w", activeErr)
+		}
+		if isPinnedHistoryRecovery(active) {
+			return s.RecoverExpiredHistory(ctx, source)
+		}
+	}
+	return s.full(ctx, email, false)
+}
+
+// RecoverExpiredHistory rebuilds the archive from a complete Gmail listing,
+// reconciles source-presence metadata, then consumes changes made after the
+// full run pinned its starting history cursor.
+func (s *Syncer) RecoverExpiredHistory(
+	ctx context.Context, source *store.Source,
+) (*gmail.SyncSummary, error) {
+	if source == nil {
+		return nil, errors.New("recover expired history: no source provided")
+	}
+	if source.SourceType != "gmail" {
+		return nil, fmt.Errorf("recover expired history: source %d is %s, not gmail", source.ID, source.SourceType)
+	}
+	if s.opts.Query != "" || s.opts.Limit > 0 {
+		return nil, errors.New("recover expired history requires an unfiltered, unlimited full sync")
+	}
+
+	fullSummary, err := s.full(ctx, source.Identifier, true)
+	if err != nil {
+		return nil, fmt.Errorf("recover expired history: full sync: %w", err)
+	}
+	refreshed, err := s.store.GetSourceByID(source.ID)
+	if err != nil {
+		return nil, fmt.Errorf("recover expired history: reload source: %w", err)
+	}
+	catchup, err := s.Incremental(ctx, refreshed)
+	if err != nil {
+		return nil, fmt.Errorf("recover expired history: catch up from full-sync cursor: %w", err)
+	}
+	fullSummary.MessagesFound += catchup.MessagesFound
+	fullSummary.MessagesAdded += catchup.MessagesAdded
+	fullSummary.MessagesUpdated += catchup.MessagesUpdated
+	fullSummary.MessagesSkipped += catchup.MessagesSkipped
+	fullSummary.BytesDownloaded += catchup.BytesDownloaded
+	fullSummary.Errors += catchup.Errors
+	fullSummary.EndTime = catchup.EndTime
+	fullSummary.Duration = fullSummary.EndTime.Sub(fullSummary.StartTime)
+	fullSummary.FinalHistoryID = catchup.FinalHistoryID
+	return fullSummary, nil
+}
+
+// IncrementalWithHistoryRecovery resumes an interrupted history recovery
+// before starting a new incremental run. If Gmail reports an expired cursor,
+// it starts recovery immediately. onRecovery runs before the potentially long
+// recovery; resumed distinguishes a saved recovery from a newly expired cursor.
+func (s *Syncer) IncrementalWithHistoryRecovery(
+	ctx context.Context, source *store.Source, onRecovery func(resumed bool),
+) (*gmail.SyncSummary, error) {
+	if source == nil {
+		return nil, errors.New("no source provided - run full sync first")
+	}
+	active, err := s.store.GetActiveSync(source.ID)
+	if err != nil && !errors.Is(err, store.ErrSyncRunNotFound) {
+		return nil, fmt.Errorf("check active history recovery: %w", err)
+	}
+	if !s.opts.NoResume && isPinnedHistoryRecovery(active) {
+		if onRecovery != nil {
+			onRecovery(true)
+		}
+		return s.RecoverExpiredHistory(ctx, source)
+	}
+
+	summary, err := s.Incremental(ctx, source)
+	if !errors.Is(err, ErrHistoryExpired) {
+		return summary, err
+	}
+	if onRecovery != nil {
+		onRecovery(false)
+	}
+	return s.RecoverExpiredHistory(ctx, source)
+}
+
+func (s *Syncer) full(ctx context.Context, email string, reconcilePresence bool) (summary *gmail.SyncSummary, err error) {
 	startTime := time.Now()
 	summary = &gmail.SyncSummary{StartTime: startTime}
 
@@ -619,11 +989,21 @@ func (s *Syncer) Full(ctx context.Context, email string) (summary *gmail.SyncSum
 		return nil, fmt.Errorf("get/create source: %w", err)
 	}
 
-	// Initialize sync state (resume or start new)
-	state, err := s.initSyncState(source.ID)
+	// Recovery may only resume a run that pinned its history handoff cursor.
+	// Ordinary full-sync checkpoints predate that cursor and are unsafe to reuse.
+	var state *syncState
+	if reconcilePresence {
+		state, err = s.initHistoryRecoveryState(source.ID)
+	} else {
+		state, err = s.initSyncState(source.ID)
+	}
 	if err != nil {
 		return nil, err
 	}
+	scoped := *s
+	scoped.store = s.store.ScopedToSync(source.ID, state.syncID)
+	s = &scoped
+	summary.SyncRunID = state.syncID
 	summary.WasResumed = state.wasResumed
 	summary.ResumedFromToken = state.pageToken
 
@@ -646,6 +1026,22 @@ func (s *Syncer) Full(ctx context.Context, email string) (summary *gmail.SyncSum
 		s.failSyncUnlessCanceled(state.syncID, err)
 		return nil, fmt.Errorf("get profile: %w", err)
 	}
+	handoffHistoryID := profile.HistoryID
+	if reconcilePresence {
+		if state.handoffCursor == "" {
+			state.handoffCursor = strconv.FormatUint(profile.HistoryID, 10)
+			if err := s.store.PinSyncHandoffCursorContext(ctx, state.syncID, state.handoffCursor); err != nil {
+				s.failSyncUnlessCanceled(state.syncID, err)
+				return nil, fmt.Errorf("pin Gmail history recovery cursor: %w", err)
+			}
+		} else {
+			handoffHistoryID, err = strconv.ParseUint(state.handoffCursor, 10, 64)
+			if err != nil {
+				s.failSyncUnlessCanceled(state.syncID, err)
+				return nil, fmt.Errorf("parse Gmail history recovery cursor %q: %w", state.handoffCursor, err)
+			}
+		}
+	}
 
 	s.logger.Info("syncing account", "email", profile.EmailAddress, "messages", profile.MessagesTotal)
 
@@ -656,8 +1052,12 @@ func (s *Syncer) Full(ctx context.Context, email string) (summary *gmail.SyncSum
 		return nil, fmt.Errorf("sync labels: %w", err)
 	}
 
+	// Settle any discovery debt a previous run parked before this run adds to it.
+	s.drainIdentityDiscoveryBacklog(ctx, source.ID)
+
 	// List and sync messages
 	var totalEstimate int64
+	var discoveryHealth pageDiscoveryHealth
 	firstPage := true
 	pageToken := state.pageToken
 
@@ -700,12 +1100,19 @@ func (s *Syncer) Full(ctx context.Context, email string) (summary *gmail.SyncSum
 			return nil, err
 		}
 
-		state.checkpoint.MessagesProcessed += result.processed
-		state.checkpoint.MessagesAdded += result.added
-		state.checkpoint.MessagesUpdated += result.updated
+		discoveryHealth.observe(s.runPageIdentityDiscovery(ctx, source.ID, result.sourceMessageIDs))
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			err := fmt.Errorf("sync canceled during identity discovery: %w", ctxErr)
+			s.failSyncUnlessCanceled(state.syncID, err)
+			return nil, err
+		}
 		if ack, ok := s.client.(messageAcknowledger); ok && len(result.acknowledged) > 0 {
 			ack.AcknowledgeMessages(ctx, result.acknowledged)
 		}
+
+		state.checkpoint.MessagesProcessed += result.processed
+		state.checkpoint.MessagesAdded += result.added
+		state.checkpoint.MessagesUpdated += result.updated
 
 		// Report current position date before progress (so UI shows consistent state)
 		if !result.oldestDate.IsZero() {
@@ -735,22 +1142,40 @@ func (s *Syncer) Full(ctx context.Context, email string) (summary *gmail.SyncSum
 		}
 	}
 
+	if reconcilePresence {
+		present, err := s.listCompleteMessageSnapshot(ctx)
+		if err != nil {
+			s.failSyncUnlessCanceled(state.syncID, err)
+			return nil, err
+		}
+		reconciled, err := s.store.ReconcileSourceMessageSnapshot(ctx, source.ID, present)
+		if err != nil {
+			s.failSyncUnlessCanceled(state.syncID, err)
+			return nil, fmt.Errorf("reconcile Gmail message snapshot: %w", err)
+		}
+		if reconciled > 0 {
+			s.logger.Info("reconciled Gmail source deletions", "source_id", source.ID, "messages", reconciled)
+		}
+	}
+
+	// Debt parked by an earlier page of this run is settled now, provided the
+	// run showed discovery recovering.
+	if discoveryHealth.shouldDrainAtCompletion() {
+		s.drainIdentityDiscoveryBacklog(ctx, source.ID)
+	}
+
 	// Update source with final history ID.
 	// Full sync always advances the cursor (it records the starting point
 	// for future incremental syncs), but warn when errors occurred.
-	historyIDStr := strconv.FormatUint(profile.HistoryID, 10)
+	historyIDStr := strconv.FormatUint(handoffHistoryID, 10)
 	if state.checkpoint.ErrorsCount > 0 {
 		s.logger.Warn("full sync completed with errors",
 			"errors", state.checkpoint.ErrorsCount,
 			"history_id", historyIDStr)
 	}
-	if err := s.store.UpdateSourceSyncCursor(source.ID, historyIDStr); err != nil {
-		s.logger.Warn("failed to update sync cursor", "error", err)
-	}
-
-	// Mark sync complete
-	if err := s.store.CompleteSync(state.syncID, historyIDStr); err != nil {
-		s.logger.Warn("failed to complete sync", "error", err)
+	// Mark sync complete before running best-effort provider maintenance.
+	if err := s.completeSyncAndRunHook(ctx, state.syncID, historyIDStr, source); err != nil {
+		return nil, err
 	}
 
 	// Checkpoint WAL after sync to fold it back into the main database.
@@ -768,10 +1193,37 @@ func (s *Syncer) Full(ctx context.Context, email string) (summary *gmail.SyncSum
 	summary.MessagesUpdated = state.checkpoint.MessagesUpdated
 	summary.MessagesSkipped = state.checkpoint.MessagesProcessed - state.checkpoint.MessagesAdded - state.checkpoint.MessagesUpdated
 	summary.Errors = state.checkpoint.ErrorsCount
-	summary.FinalHistoryID = profile.HistoryID
+	summary.FinalHistoryID = handoffHistoryID
 
 	s.progress.OnComplete(summary)
 	return summary, nil
+}
+
+func (s *Syncer) listCompleteMessageSnapshot(ctx context.Context) (map[string]struct{}, error) {
+	lister, ok := s.client.(gmail.CompleteMessageSnapshotReader)
+	if !ok {
+		return nil, errors.New("complete Gmail message snapshot is unavailable")
+	}
+
+	present := make(map[string]struct{})
+	pageToken := ""
+	for {
+		response, err := lister.ListCompleteMessageSnapshot(ctx, pageToken)
+		if err != nil {
+			return nil, fmt.Errorf("list complete Gmail message snapshot: %w", err)
+		}
+		for _, message := range response.Messages {
+			present[message.ID] = struct{}{}
+		}
+		next := response.NextPageToken
+		if next == "" {
+			return present, nil
+		}
+		if next == pageToken {
+			return nil, fmt.Errorf("list complete Gmail message snapshot: page token did not advance from %q", pageToken)
+		}
+		pageToken = next
+	}
 }
 
 // syncLabels syncs all labels and returns a map of Gmail label ID to internal ID.
@@ -790,7 +1242,11 @@ func (s *Syncer) syncLabels(ctx context.Context, sourceID int64) (map[string]int
 				labelType = labelTypeSystem
 			}
 		}
-		labelInfos[l.ID] = store.LabelInfo{Name: l.Name, Type: labelType}
+		labelInfos[l.ID] = store.LabelInfo{
+			Name:       l.Name,
+			Type:       labelType,
+			SystemRole: l.SystemRole,
+		}
 	}
 
 	return s.store.EnsureLabelsBatch(sourceID, labelInfos)
@@ -828,20 +1284,16 @@ func (s *Syncer) parseToModel(sourceID int64, raw *gmail.RawMessage, threadID st
 		}
 	}
 
-	// Parse MIME - on failure, store with placeholder body
+	// Parse MIME - on failure, salvage headers and store a placeholder body
 	// (threading override for IMAP happens after parsing below)
-	parsed, parseErr := mime.Parse(raw.Raw)
+	parsed, parseErr := mime.ParseWithRecovery(
+		raw.Raw,
+		extractSubjectFromSnippet(raw.Snippet),
+	)
 	if parseErr != nil {
 		// Extract just the first line of error (enmime includes full stack traces)
 		errMsg := textutil.FirstLine(parseErr.Error())
-
-		// Create placeholder message for MIME parse failures
-		// This preserves the raw data for potential future re-parsing
-		parsed = &mime.Message{
-			Subject:  extractSubjectFromSnippet(raw.Snippet),
-			BodyText: fmt.Sprintf("[MIME parsing failed: %s]\n\nRaw MIME data is preserved in message_raw table.", errMsg),
-		}
-		s.logger.Warn("MIME parse failed, storing with placeholder",
+		s.logger.Warn("MIME parse failed, storing partial message",
 			"id", raw.ID,
 			"error", errMsg)
 	}
@@ -898,7 +1350,16 @@ func (s *Syncer) parseToModel(sourceID int64, raw *gmail.RawMessage, threadID st
 	if convSubject == "" {
 		convSubject = "(no subject)"
 	}
-	conversationID, err := s.store.EnsureConversation(sourceID, threadID, convSubject)
+	messageType := store.MessageTypeEmail
+	var conversationID int64
+	if s.isGmailChat(raw.LabelIDs) {
+		messageType = store.MessageTypeGoogleChat
+		conversationID, err = s.store.EnsureConversationWithType(
+			sourceID, threadID, conversationTypeChat, convSubject,
+		)
+	} else {
+		conversationID, err = s.store.EnsureConversation(sourceID, threadID, convSubject)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("ensure conversation: %w", err)
 	}
@@ -915,7 +1376,7 @@ func (s *Syncer) parseToModel(sourceID int64, raw *gmail.RawMessage, threadID st
 		SourceID:        sourceID,
 		SourceMessageID: raw.ID,
 		RFC822MessageID: rfc822ID,
-		MessageType:     "email",
+		MessageType:     messageType,
 		SenderID:        senderID,
 		Subject:         sql.NullString{String: subject, Valid: subject != ""},
 		Snippet:         sql.NullString{String: snippet, Valid: snippet != ""},
@@ -963,6 +1424,13 @@ func (s *Syncer) parseToModel(sourceID int64, raw *gmail.RawMessage, threadID st
 		attachments:    parsed.Attachments,
 		participantMap: participantMap,
 	}, nil
+}
+
+func (s *Syncer) isGmailChat(labelIDs []string) bool {
+	if s.opts.SourceType != "" && s.opts.SourceType != "gmail" {
+		return false
+	}
+	return slices.Contains(labelIDs, labelIDChat)
 }
 
 // persistMessage stores a parsed message and all related data, returning
@@ -1023,10 +1491,7 @@ func (s *Syncer) persistMessage(data *messageData, labelMap map[string]int64) (i
 			s.logger.Warn("failed to count stored attachments",
 				"message", messageID, "error", err)
 		} else if storedCount != len(data.attachments) {
-			if _, err := s.store.DB().Exec(
-				s.store.Rebind(`UPDATE messages SET has_attachments = ?, attachment_count = ? WHERE id = ?`),
-				storedCount > 0, storedCount, messageID,
-			); err != nil {
+			if err := s.store.RecomputeMessageAttachmentStats(messageID); err != nil {
 				s.logger.Warn("failed to update attachment metadata",
 					"message", messageID, "error", err)
 			}
@@ -1177,7 +1642,11 @@ func (s *Syncer) ingestMessage(
 						oldSourceMessageID, err)
 				}
 			}
+			deferLabels := s.defersAuthoritativeLabelReconciliation()
 			if !conclusive {
+				if deferLabels {
+					return false, errDeferredIMAPIdentity
+				}
 				changed, _, err := s.store.ReconcileMessageLabels(
 					existingID, labelIDs, false)
 				return dedupMutationResultWithSentinel(
@@ -1189,11 +1658,14 @@ func (s *Syncer) ingestMessage(
 			}
 			complete := s.labelsSnapshotComplete()
 			if matches {
-				changed, _, err := s.store.ReconcileMessageLabels(
-					existingID, labelIDs, complete)
-				if err != nil {
-					return false, fmt.Errorf(
-						"reconcile validated dedup labels: %w", err)
+				changed := false
+				if !deferLabels {
+					changed, _, err = s.store.ReconcileMessageLabels(
+						existingID, labelIDs, complete)
+					if err != nil {
+						return false, fmt.Errorf(
+							"reconcile validated dedup labels: %w", err)
+					}
 				}
 				if complete && oldSourceMessageID != data.message.SourceMessageID {
 					if preferred, ok := s.client.(preferredIMAPSourceID); ok &&
@@ -1216,6 +1688,20 @@ func (s *Syncer) ingestMessage(
 					changed, "reconcile validated dedup labels", nil)
 			}
 			if complete {
+				if deferLabels {
+					rekeyed, err := s.store.RekeyMessageSourceID(
+						existingID, oldSourceMessageID, data.message.SourceMessageID)
+					if err != nil {
+						return false, fmt.Errorf("rekey dedup message: %w", err)
+					}
+					if !rekeyed {
+						return false, fmt.Errorf(
+							"source message ID %q changed before dedup rekey",
+							oldSourceMessageID)
+					}
+					return dedupMutationResult(
+						true, "rekey dedup message", nil)
+				}
 				changed, err := s.store.UpdateMessageOnDedup(
 					existingID,
 					data.message.SourceMessageID,
@@ -1278,10 +1764,15 @@ func (s *Syncer) reconcileValidatedMessageLabels(
 	labelIDs []int64,
 	snapshotComplete bool,
 ) (bool, error) {
-	changed, extraLabelIDs, err := s.store.ReconcileMessageLabels(
-		existingID, labelIDs, snapshotComplete)
-	if err != nil {
-		return false, err
+	changed := false
+	var extraLabelIDs []int64
+	if !s.defersAuthoritativeLabelReconciliation() {
+		var err error
+		changed, extraLabelIDs, err = s.store.ReconcileMessageLabels(
+			existingID, labelIDs, snapshotComplete)
+		if err != nil {
+			return false, err
+		}
 	}
 	// Only labels the message already has beyond the desired set can be
 	// stale; ReconcileMessageLabels reports them from its own read of
@@ -1345,26 +1836,43 @@ func buildRecipientSet(recipientType string, addresses []mime.Address, participa
 		return rs
 	}
 
-	// Track participant ID -> display name, preferring non-empty names.
-	// Handles duplicates where the first occurrence might have an empty
-	// name but a later occurrence has a better display name.
+	// One row per (participant, normalized envelope address): two aliases
+	// that resolve to the same already-merged participant each keep their
+	// own envelope snapshot instead of collapsing onto the first-seen
+	// address, so identity discovery still observes both. Display names
+	// stay per participant, preferring non-empty names — a duplicate whose
+	// first occurrence has an empty name picks up a later, better one, and
+	// every row of that participant carries the same name.
+	type rowKey struct {
+		participantID int64
+		email         string
+	}
 	idToName := make(map[int64]string)
+	seen := make(map[rowKey]struct{})
 	var orderedIDs []int64
+	var orderedEmails []string
 
 	for _, addr := range addresses {
-		if id, ok := participantMap[addr.Email]; ok {
-			name := textutil.EnsureUTF8(addr.Name)
-			if _, seen := idToName[id]; !seen {
-				orderedIDs = append(orderedIDs, id)
-				idToName[id] = name
-			} else if idToName[id] == "" && name != "" {
-				idToName[id] = name
-			}
+		id, ok := participantMap[addr.Email]
+		if !ok {
+			continue
 		}
+		name := textutil.EnsureUTF8(addr.Name)
+		if existing, tracked := idToName[id]; !tracked || (existing == "" && name != "") {
+			idToName[id] = name
+		}
+		key := rowKey{participantID: id, email: strings.ToLower(addr.Email)}
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		orderedIDs = append(orderedIDs, id)
+		orderedEmails = append(orderedEmails, addr.Email)
 	}
 
 	rs.ParticipantIDs = orderedIDs
 	rs.DisplayNames = make([]string, len(orderedIDs))
+	rs.EmailAddresses = orderedEmails
 	for i, id := range orderedIDs {
 		rs.DisplayNames[i] = idToName[id]
 	}
@@ -1378,8 +1886,19 @@ func (s *Syncer) storeAttachment(messageID int64, att *mime.Attachment) error {
 		return err
 	}
 
-	// Record in database
-	return s.store.UpsertAttachment(messageID, att.Filename, att.ContentType, storagePath, att.ContentHash, len(att.Content))
+	role, roleSource := store.AttachmentRoleFromMIME(
+		att.Disposition, att.IsInline, att.ContentID)
+	return s.store.UpsertAttachmentRecord(context.Background(), messageID, store.AttachmentWrite{
+		Filename:      att.Filename,
+		MIMEType:      att.ContentType,
+		StoragePath:   storagePath,
+		ContentHash:   att.ContentHash,
+		Size:          int64(len(att.Content)),
+		Role:          role,
+		RoleSource:    roleSource,
+		SourcePartKey: att.PartKey,
+		ContentID:     att.ContentID,
+	})
 }
 
 // joinEmails concatenates email addresses from a slice of mime.Address with spaces.

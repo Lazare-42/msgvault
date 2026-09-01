@@ -26,7 +26,7 @@ type IdentitySearchHTTPRequest struct {
 	Limit         int                `json:"limit,omitempty" minimum:"0" maximum:"500"`
 }
 
-type PersonSearchHTTPResponse struct {
+type ParticipantSearchHTTPResponse struct {
 	Rows                []query.PersonSummary  `json:"rows"`
 	TotalCount          int64                  `json:"total_count"`
 	CacheRevision       string                 `json:"cache_revision"`
@@ -44,7 +44,7 @@ type DomainSearchHTTPResponse struct {
 	CandidateSnapshotID string                 `json:"candidate_snapshot_id,omitempty"`
 }
 
-type PersonContextSummaryHTTPResponse struct {
+type ParticipantContextSummaryHTTPResponse struct {
 	Summary             query.PersonSummary    `json:"summary"`
 	CacheRevision       string                 `json:"cache_revision"`
 	SearchProvenance    query.SearchProvenance `json:"search_provenance"`
@@ -70,23 +70,27 @@ type identitySearchPrepared struct {
 
 var domainFactPattern = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$`)
 
-func (s *Server) registerPeopleRoutes(api huma.API) {
-	registerExploreRoute[IdentitySearchHTTPRequest, PersonSearchHTTPResponse](
-		api, "searchPeople", "/people/search", "Search analytical people", s.handleSearchPeople,
+func (s *Server) registerParticipantRoutes(api huma.API) {
+	s.registerParticipantCompletionRoute(api)
+	registerExploreRoute[IdentitySearchHTTPRequest, ParticipantSearchHTTPResponse](
+		api, "searchParticipants", "/participants/search", "Search observed participant clusters", s.handleSearchParticipants,
 	)
-	registerAPIV1RawHumaJSONRoute[query.PersonSummary](
-		api, "getPerson", http.MethodGet, "/people/{id}", "Get one analytical person", s.handleGetPerson,
+	registerAnalyticalDetailRoute[query.PersonSummary](
+		api, "getParticipant", http.MethodGet, "/participants/{id}", "Get one observed participant cluster", s.handleGetParticipant,
 	)
-	registerExploreRoute[ExploreHTTPRequest, PersonContextSummaryHTTPResponse](
-		api, "getPersonContextSummary", "/people/{id}/summary", "Get one person's contextual analytical summary", s.handlePersonContextSummary,
+	registerAnalyticalDetailRoute[query.PersonInboxResponse](
+		api, "listParticipantInboxes", http.MethodGet, "/participants/{id}/inboxes", "List one participant cluster's messaging inboxes", s.handleParticipantInboxes,
+	)
+	registerExploreRoute[ExploreHTTPRequest, ParticipantContextSummaryHTTPResponse](
+		api, "getParticipantContextSummary", "/participants/{id}/summary", "Get one participant cluster's contextual analytical summary", s.handleParticipantContextSummary,
 	)
 	registerExploreRoute[ExploreHTTPRequest, ExploreHTTPResponse](
-		api, "getPersonTimeline", "/people/{id}/timeline", "Get one person's canonical activity timeline", s.handlePersonTimeline,
+		api, "getParticipantTimeline", "/participants/{id}/timeline", "Get one participant cluster's canonical activity timeline", s.handleParticipantTimeline,
 	)
 	registerExploreRoute[IdentitySearchHTTPRequest, DomainSearchHTTPResponse](
 		api, "searchDomains", "/domains/search", "Search analytical domains", s.handleSearchDomains,
 	)
-	registerAPIV1RawHumaJSONRoute[query.DomainSummary](
+	registerAnalyticalDetailRoute[query.DomainSummary](
 		api, "getDomain", http.MethodGet, "/domains/{domain}", "Get one analytical domain", s.handleGetDomain,
 	)
 	registerExploreRoute[ExploreHTTPRequest, DomainContextSummaryHTTPResponse](
@@ -97,15 +101,26 @@ func (s *Server) registerPeopleRoutes(api huma.API) {
 	)
 }
 
-func (s *Server) handleSearchPeople(w http.ResponseWriter, r *http.Request) {
+func registerAnalyticalDetailRoute[Resp any](
+	api huma.API,
+	operationID, method, path, summary string,
+	handler http.HandlerFunc,
+) {
+	op := rawAPIV1Operation(operationID, method, path, summary)
+	op.Responses = jsonResponsesFor[Resp](api)
+	op.Responses[httpStatusKey(http.StatusServiceUnavailable)] = exploreUnavailableResponseFor(api)
+	registerRawHumaRoute(api, op, handler)
+}
+
+func (s *Server) handleSearchParticipants(w http.ResponseWriter, r *http.Request) {
 	var request IdentitySearchHTTPRequest
 	prepared, ok := s.prepareIdentitySearch(w, r, &request)
 	if !ok {
 		return
 	}
-	analyzer, ok := s.engine.(query.PeopleAnalyzer)
+	analyzer, ok := s.queryEngineForContext(r.Context()).(query.PeopleAnalyzer)
 	if !ok {
-		writeExploreUnavailable(w, query.CacheAbsent)
+		s.writeExploreUnavailable(r.Context(), w, query.CacheAbsent)
 		return
 	}
 	result, err := analyzer.SearchPeople(r.Context(), query.PersonSearchRequest{
@@ -114,14 +129,14 @@ func (s *Server) handleSearchPeople(w http.ResponseWriter, r *http.Request) {
 		Page: query.PageSpec{Limit: request.Limit, Offset: prepared.offset},
 	})
 	if err != nil {
-		s.writeExploreError(w, err)
+		s.writeExploreError(r.Context(), w, err)
 		return
 	}
 	if request.Cursor != "" && prepared.cursor.Revision != result.CacheRevision {
 		writeError(w, http.StatusConflict, "archive_revision_changed", "The committed analytical cache changed; restart pagination")
 		return
 	}
-	response := PersonSearchHTTPResponse{Rows: result.Rows, TotalCount: result.TotalCount, CacheRevision: result.CacheRevision,
+	response := ParticipantSearchHTTPResponse{Rows: result.Rows, TotalCount: result.TotalCount, CacheRevision: result.CacheRevision,
 		SearchProvenance: result.SearchProvenance, CandidateSnapshotID: prepared.snapshotID}
 	if next := prepared.offset + len(result.Rows); next < int(result.TotalCount) {
 		response.NextCursor = s.encodeExploreCursor(exploreCursor{Offset: next, Request: prepared.requestHash, Revision: result.CacheRevision,
@@ -136,9 +151,9 @@ func (s *Server) handleSearchDomains(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	analyzer, ok := s.engine.(query.PeopleAnalyzer)
+	analyzer, ok := s.queryEngineForContext(r.Context()).(query.PeopleAnalyzer)
 	if !ok {
-		writeExploreUnavailable(w, query.CacheAbsent)
+		s.writeExploreUnavailable(r.Context(), w, query.CacheAbsent)
 		return
 	}
 	result, err := analyzer.SearchDomains(r.Context(), query.DomainSearchRequest{
@@ -147,7 +162,7 @@ func (s *Server) handleSearchDomains(w http.ResponseWriter, r *http.Request) {
 		Page: query.PageSpec{Limit: request.Limit, Offset: prepared.offset},
 	})
 	if err != nil {
-		s.writeExploreError(w, err)
+		s.writeExploreError(r.Context(), w, err)
 		return
 	}
 	if request.Cursor != "" && prepared.cursor.Revision != result.CacheRevision {
@@ -172,9 +187,9 @@ func (s *Server) prepareIdentitySearch(w http.ResponseWriter, r *http.Request, r
 		return identitySearchPrepared{}, false
 	}
 	request.Predicate.Cursor = ""
-	prepared, err := prepareExplorePredicate(request.Predicate)
+	prepared, err := s.prepareResolvedExplorePredicate(r.Context(), request.Predicate)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_identity_predicate", err.Error())
+		s.writeExploreFilterError(w, err, "invalid_identity_predicate")
 		return identitySearchPrepared{}, false
 	}
 	if request.Limit == 0 {
@@ -227,24 +242,24 @@ func (s *Server) prepareIdentitySearch(w http.ResponseWriter, r *http.Request, r
 		offset: offset, requestHash: requestHash, cursor: cursor, search: searchSpec, snapshotID: snapshotID}, true
 }
 
-func (s *Server) handleGetPerson(w http.ResponseWriter, r *http.Request) {
-	id, ok := positivePersonPathID(w, r)
+func (s *Server) handleGetParticipant(w http.ResponseWriter, r *http.Request) {
+	id, ok := positiveParticipantPathID(w, r)
 	if !ok {
 		return
 	}
-	analyzer, ok := s.engine.(query.PeopleAnalyzer)
+	analyzer, ok := s.queryEngineForContext(r.Context()).(query.PeopleAnalyzer)
 	if !ok {
-		writeExploreUnavailable(w, query.CacheAbsent)
+		s.writeExploreUnavailable(r.Context(), w, query.CacheAbsent)
 		return
 	}
 	members := s.clusterMemberIDs(id)
 	person, err := analyzer.GetPerson(r.Context(), id, query.Context{}, members)
 	if err != nil {
-		s.writeExploreError(w, err)
+		s.writeExploreError(r.Context(), w, err)
 		return
 	}
 	if person == nil {
-		writeError(w, http.StatusNotFound, "person_not_found", "Person not found")
+		writeError(w, http.StatusNotFound, "participant_not_found", "Participant cluster not found")
 		return
 	}
 	s.attachPersonCluster(person, id, members)
@@ -324,8 +339,8 @@ func (s *Server) attachPersonCluster(person *query.PersonSummary, id int64, memb
 	person.Cluster = &query.PersonCluster{CanonicalID: members[0], MemberIDs: members, Edges: clusterEdges}
 }
 
-func (s *Server) handlePersonContextSummary(w http.ResponseWriter, r *http.Request) {
-	id, ok := positivePersonPathID(w, r)
+func (s *Server) handleParticipantContextSummary(w http.ResponseWriter, r *http.Request) {
+	id, ok := positiveParticipantPathID(w, r)
 	if !ok {
 		return
 	}
@@ -333,9 +348,9 @@ func (s *Server) handlePersonContextSummary(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	analyzer, ok := s.engine.(query.PeopleAnalyzer)
+	analyzer, ok := s.queryEngineForContext(r.Context()).(query.PeopleAnalyzer)
 	if !ok {
-		writeExploreUnavailable(w, query.CacheAbsent)
+		s.writeExploreUnavailable(r.Context(), w, query.CacheAbsent)
 		return
 	}
 	// Scope the summary to the whole identity cluster so alias-owned
@@ -343,14 +358,14 @@ func (s *Server) handlePersonContextSummary(w http.ResponseWriter, r *http.Reque
 	// search for the same identity.
 	result, err := analyzer.GetPersonSummary(r.Context(), id, explore, s.clusterMemberIDs(id))
 	if err != nil {
-		s.writeExploreError(w, err)
+		s.writeExploreError(r.Context(), w, err)
 		return
 	}
 	if result == nil || len(result.Rows) == 0 {
-		writeError(w, http.StatusNotFound, "person_not_found", "Person not found in the active analytical context")
+		writeError(w, http.StatusNotFound, "participant_not_found", "Participant cluster not found in the active analytical context")
 		return
 	}
-	writeJSON(w, http.StatusOK, PersonContextSummaryHTTPResponse{Summary: result.Rows[0], CacheRevision: result.CacheRevision,
+	writeJSON(w, http.StatusOK, ParticipantContextSummaryHTTPResponse{Summary: result.Rows[0], CacheRevision: result.CacheRevision,
 		SearchProvenance: result.SearchProvenance, CandidateSnapshotID: snapshotID})
 }
 
@@ -359,14 +374,14 @@ func (s *Server) handleGetDomain(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	analyzer, ok := s.engine.(query.PeopleAnalyzer)
+	analyzer, ok := s.queryEngineForContext(r.Context()).(query.PeopleAnalyzer)
 	if !ok {
-		writeExploreUnavailable(w, query.CacheAbsent)
+		s.writeExploreUnavailable(r.Context(), w, query.CacheAbsent)
 		return
 	}
 	result, err := analyzer.GetDomain(r.Context(), domain, query.Context{})
 	if err != nil {
-		s.writeExploreError(w, err)
+		s.writeExploreError(r.Context(), w, err)
 		return
 	}
 	if result == nil {
@@ -385,14 +400,14 @@ func (s *Server) handleDomainContextSummary(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	analyzer, ok := s.engine.(query.PeopleAnalyzer)
+	analyzer, ok := s.queryEngineForContext(r.Context()).(query.PeopleAnalyzer)
 	if !ok {
-		writeExploreUnavailable(w, query.CacheAbsent)
+		s.writeExploreUnavailable(r.Context(), w, query.CacheAbsent)
 		return
 	}
 	result, err := analyzer.GetDomainSummary(r.Context(), domain, explore)
 	if err != nil {
-		s.writeExploreError(w, err)
+		s.writeExploreError(r.Context(), w, err)
 		return
 	}
 	if result == nil || len(result.Rows) == 0 {
@@ -412,9 +427,9 @@ func (s *Server) prepareIdentitySummary(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, "invalid_identity_predicate", "identity summary does not accept grouping")
 		return query.ExploreRequest{}, "", false
 	}
-	prepared, err := prepareExplorePredicate(request)
+	prepared, err := s.prepareResolvedExplorePredicate(r.Context(), request)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_identity_predicate", err.Error())
+		s.writeExploreFilterError(w, err, "invalid_identity_predicate")
 		return query.ExploreRequest{}, "", false
 	}
 	searchSpec, snapshotID, ok := s.resolveExploreSearch(r.Context(), w, prepared.request)
@@ -424,8 +439,8 @@ func (s *Server) prepareIdentitySummary(w http.ResponseWriter, r *http.Request) 
 	return query.ExploreRequest{Context: prepared.query.Context, Search: searchSpec}, snapshotID, true
 }
 
-func (s *Server) handlePersonTimeline(w http.ResponseWriter, r *http.Request) {
-	id, ok := positivePersonPathID(w, r)
+func (s *Server) handleParticipantTimeline(w http.ResponseWriter, r *http.Request) {
+	id, ok := positiveParticipantPathID(w, r)
 	if !ok {
 		return
 	}
@@ -454,12 +469,12 @@ func (s *Server) forwardIdentityTimeline(w http.ResponseWriter, r *http.Request,
 	s.handleExploreWithScope(w, r, &exact)
 }
 
-func positivePersonPathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
-	raw := strings.TrimPrefix(r.URL.Path, "/api/v1/people/")
-	raw = strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(raw, "/files/search"), "/timeline"), "/summary")
+func positiveParticipantPathID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	raw := strings.TrimPrefix(r.URL.Path, "/api/v1/participants/")
+	raw = strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(strings.TrimSuffix(raw, "/files/search"), "/inboxes"), "/timeline"), "/summary")
 	id, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil || id < 1 {
-		writeError(w, http.StatusBadRequest, "invalid_person_id", "person ID must be a positive integer")
+		writeError(w, http.StatusBadRequest, "invalid_participant_id", "participant ID must be a positive integer")
 		return 0, false
 	}
 	return id, true

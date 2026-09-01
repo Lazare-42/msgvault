@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -11,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +24,22 @@ import (
 	"go.kenn.io/msgvault/internal/identityindex"
 	"go.kenn.io/msgvault/internal/query"
 )
+
+func TestDaemonBuildCacheChildUsesQuietConsolePolicy(t *testing.T) {
+	t.Setenv(daemonCLISubprocessEnv, "")
+	t.Setenv(buildCacheDaemonSubprocessEnv, strconv.Itoa(os.Getppid()))
+	assert.True(t, isDaemonConsoleSubprocess())
+}
+
+func TestRunBuildCacheSubprocessCommandStreamsStderrOnSuccess(t *testing.T) {
+	cmd := helperProcessCommand(context.Background(), "stdout-stderr-ok")
+	var stderr bytes.Buffer
+
+	err := runBuildCacheSubprocessCommand(cmd, &stderr)
+
+	require.NoError(t, err)
+	assert.Equal(t, "cache build warning\n", stderr.String())
+}
 
 // setupTestSQLite creates a test SQLite database with realistic email data.
 func setupTestSQLite(t *testing.T) string {
@@ -86,7 +104,8 @@ func setupTestSQLite(t *testing.T) string {
 			message_id INTEGER NOT NULL REFERENCES messages(id),
 			participant_id INTEGER NOT NULL REFERENCES participants(id),
 			recipient_type TEXT NOT NULL,
-			display_name TEXT
+			display_name TEXT,
+			email_address TEXT
 		);
 
 		CREATE TABLE labels (
@@ -201,11 +220,11 @@ func setupTestSQLite(t *testing.T) string {
 			(5, 1, 'msg5', 104, 'Final', 'Preview 5', '2024-03-01 16:00:00', 500, 0);
 
 		-- Message recipients
-		-- msg1: from alice, to bob+carol
-		INSERT INTO message_recipients (message_id, participant_id, recipient_type, display_name) VALUES
-			(1, 1, 'from', 'Alice Smith'),
-			(1, 2, 'to', 'Bob Jones'),
-			(1, 3, 'to', 'Carol White');
+		-- msg1: from alice (with envelope snapshot), to bob+carol
+		INSERT INTO message_recipients (message_id, participant_id, recipient_type, display_name, email_address) VALUES
+			(1, 1, 'from', 'Alice Smith', 'alice-envelope@example.com'),
+			(1, 2, 'to', 'Bob Jones', NULL),
+			(1, 3, 'to', 'Carol White', NULL);
 		-- msg2: from alice, to bob, cc dan
 		INSERT INTO message_recipients (message_id, participant_id, recipient_type, display_name) VALUES
 			(2, 1, 'from', 'Alice Smith'),
@@ -776,6 +795,54 @@ func TestBuildCacheAutoReevaluatesUnderLock(t *testing.T) {
 	assert.False(explicit.Skipped, "explicit --full-rebuild must stay unconditional")
 }
 
+func TestBuildCacheScheduledReevaluatesIntervalUnderLock(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	tmpDir := setupTestSQLite(t)
+	dbPath := filepath.Join(tmpDir, "test.db")
+	analyticsDir := filepath.Join(tmpDir, "analytics")
+
+	first, err := buildCache(dbPath, analyticsDir, true)
+	requirements.NoError(err)
+	requirements.False(first.Skipped)
+	state, err := query.ReadCacheSyncState(analyticsDir)
+	requirements.NoError(err)
+
+	db, err := sql.Open("sqlite3", dbPath)
+	requirements.NoError(err)
+	_, err = db.Exec(`
+		INSERT INTO messages (
+			id, source_id, source_message_id, sent_at, subject, snippet
+		) VALUES (6, 1, 'msg6', ?, 'New subject', 'New snippet')
+	`, state.PublishedAt.Add(time.Minute))
+	requirements.NoError(err)
+	requirements.NoError(db.Close())
+
+	result, err := buildCacheScheduled(
+		dbPath,
+		analyticsDir,
+		6*time.Hour,
+		func() time.Time { return state.PublishedAt.Add(time.Hour) },
+	)
+	requirements.NoError(err)
+	assertions.True(result.Skipped,
+		"a scheduled waiter must recheck the interval after acquiring the build lock")
+
+	after, err := query.ReadCacheSyncState(analyticsDir)
+	requirements.NoError(err)
+	assertions.Equal(state.PublishedAt, after.PublishedAt)
+
+	result, err = buildCacheScheduled(
+		dbPath,
+		analyticsDir,
+		6*time.Hour,
+		func() time.Time { return state.PublishedAt.Add(7 * time.Hour) },
+	)
+	requirements.NoError(err)
+	assertions.False(result.Skipped,
+		"the lock-held recheck must build after the interval elapses")
+}
+
 // TestBuildCache_WaitsForCrossProcessBuildLock verifies buildCache blocks on
 // the inter-process build lock: buildCacheMu only serializes one process,
 // while daemon-owned CLI children rebuild the cache in their own processes.
@@ -908,6 +975,43 @@ func TestBuildCache_PublishesConversationParticipants(t *testing.T) {
 	).Scan(&count)
 	require.NoError(err)
 	assert.Equal(t, int64(9), count)
+}
+
+// TestBuildCache_ExportsRecipientEnvelopeAddress verifies the envelope
+// address snapshot reaches the message_recipients Parquet dataset (cache
+// schema v17): identity filters compare against it, so an export that drops
+// the column would silently degrade every filter to participant matching.
+func TestBuildCache_ExportsRecipientEnvelopeAddress(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	tmpDir := setupTestSQLite(t)
+	dbPath := filepath.Join(tmpDir, "test.db")
+	analyticsDir := filepath.Join(tmpDir, "analytics")
+
+	_, err := buildCache(dbPath, analyticsDir, false)
+	require.NoError(err)
+
+	duckdb, err := sql.Open("duckdb", "")
+	require.NoError(err)
+	defer func() { _ = duckdb.Close() }()
+	glob := filepath.Join(analyticsDir, "message_recipients", "*.parquet")
+
+	var envelope string
+	err = duckdb.QueryRow(
+		`SELECT email_address FROM read_parquet(?)
+		 WHERE message_id = 1 AND recipient_type = 'from'`, glob,
+	).Scan(&envelope)
+	require.NoError(err, "exported message_recipients must carry email_address")
+	assert.Equal("alice-envelope@example.com", envelope)
+
+	var withoutSnapshot int64
+	err = duckdb.QueryRow(
+		`SELECT COUNT(*) FROM read_parquet(?)
+		 WHERE COALESCE(email_address, '') = ''`, glob,
+	).Scan(&withoutSnapshot)
+	require.NoError(err)
+	assert.Equal(int64(11), withoutSnapshot,
+		"rows without a snapshot export as empty, keeping the participant fallback")
 }
 
 // TestBuildCache_DataIntegrity verifies the exported Parquet data matches SQLite.
@@ -2055,6 +2159,63 @@ func TestBuildCache_UTF8Handling(t *testing.T) {
 	assert.Equal("Test émoji 🎉 and unicode", subject, "unicode should be preserved")
 }
 
+func TestBuildCacheExportsAttachmentMetadataForRawQuery(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		forceCSV bool
+	}{
+		{name: "sqlite scanner"},
+		{name: "CSV fallback", forceCSV: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			if tc.forceCSV {
+				t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", "1")
+			} else {
+				t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", "")
+			}
+
+			tmpDir := setupTestSQLite(t)
+			dbPath := filepath.Join(tmpDir, "test.db")
+			analyticsDir := filepath.Join(tmpDir, "analytics")
+			db, err := sql.Open("sqlite3", dbPath)
+			require.NoError(err, "open SQLite fixture")
+			_, err = db.Exec(`ALTER TABLE attachments ADD COLUMN attachment_metadata JSON`)
+			require.NoError(err, "add attachment metadata column")
+			_, err = db.Exec(`UPDATE attachments SET attachment_metadata = '{"shared_url":"https://example.com/post"}' WHERE id = 1`)
+			require.NoError(err, "set link-preview metadata")
+			_, err = db.Exec(`UPDATE messages SET message_type = 'beeper' WHERE id = 2`)
+			require.NoError(err, "mark fixture message as Beeper")
+			require.NoError(db.Close(), "close SQLite fixture")
+
+			_, err = buildCache(dbPath, analyticsDir, true)
+			require.NoError(err, "build analytics cache")
+			engine, err := query.NewDuckDBEngine(analyticsDir, "", nil)
+			require.NoError(err, "open analytics query engine")
+			defer func() { _ = engine.Close() }()
+
+			result, err := engine.QuerySQL(context.Background(), `
+				SELECT COALESCE(a.attachment_metadata IS NOT NULL, 0) AS is_share,
+				       COUNT(*), SUM(a.size)
+				FROM attachments a
+				JOIN messages m ON m.id = a.message_id
+				WHERE m.message_type = 'beeper'
+				GROUP BY is_share
+				ORDER BY is_share`)
+			require.NoError(err, "run documented link-preview query")
+			assert.Equal([]string{"is_share", "count_star()", "sum(a.size)"}, result.Columns)
+			require.Len(result.Rows, 2)
+			assert.Equal("0", fmt.Sprint(result.Rows[0][0]))
+			assert.Equal("1", fmt.Sprint(result.Rows[0][1]))
+			assert.Equal("5000", fmt.Sprint(result.Rows[0][2]))
+			assert.Equal("1", fmt.Sprint(result.Rows[1][0]))
+			assert.Equal("1", fmt.Sprint(result.Rows[1][1]))
+			assert.Equal("10000", fmt.Sprint(result.Rows[1][2]))
+		})
+	}
+}
+
 // TestBuildCache_EmptyDatabase tests handling of empty database.
 func TestBuildCache_EmptyDatabase(t *testing.T) {
 	require := require.New(t)
@@ -2362,7 +2523,8 @@ func setupTestSQLiteEmpty(t *testing.T) string {
 			message_id INTEGER NOT NULL REFERENCES messages(id),
 			participant_id INTEGER NOT NULL REFERENCES participants(id),
 			recipient_type TEXT NOT NULL,
-			display_name TEXT
+			display_name TEXT,
+			email_address TEXT
 		);
 		CREATE TABLE labels (
 			id INTEGER PRIMARY KEY,
@@ -2535,6 +2697,100 @@ func TestBuildCacheCSVSnapshotFallback(t *testing.T) {
 	})
 }
 
+// TestBuildCacheDerivesAttributionFromEnvelopeAliasSnapshot pins the
+// envelope clause of the exported is_from_me derivation: msg1's 'from'
+// envelope snapshot carries alice-envelope@example.com — an address no
+// participant row or identifier holds, exactly the shape a participant merge
+// leaves behind — and its sender_id is NULL, so the participant-based
+// clauses can never match. Confirming that alias (in a different case) must
+// still bake is_from_me=TRUE into the cache, while a message without an
+// envelope snapshot stays FALSE.
+func TestBuildCacheDerivesAttributionFromEnvelopeAliasSnapshot(t *testing.T) {
+	run := func(t *testing.T) {
+		t.Helper()
+		require := require.New(t)
+		assert := assert.New(t)
+		tmpDir := setupTestSQLite(t)
+		dbPath := filepath.Join(tmpDir, "test.db")
+		analyticsDir := filepath.Join(tmpDir, "analytics")
+
+		db, err := sql.Open("sqlite3", dbPath)
+		require.NoError(err)
+		_, err = db.Exec(`
+			INSERT INTO account_identities (source_id, address)
+			VALUES (1, 'Alice-Envelope@Example.com')
+		`)
+		require.NoError(err)
+		require.NoError(db.Close())
+
+		result, err := buildCache(dbPath, analyticsDir, true)
+		require.NoError(err)
+		assert.Positive(result.ExportedCount)
+
+		duckDB, err := sql.Open("duckdb", "")
+		require.NoError(err)
+		defer func() { require.NoError(duckDB.Close()) }()
+
+		pattern := filepath.Join(analyticsDir, "messages", "**", "*.parquet")
+		readIsFromMe := func(messageID int64) bool {
+			var isFromMe bool
+			require.NoError(duckDB.QueryRow(
+				`SELECT is_from_me FROM read_parquet(?, hive_partitioning=true) WHERE id = ?`,
+				pattern, messageID,
+			).Scan(&isFromMe))
+			return isFromMe
+		}
+		assert.True(readIsFromMe(1),
+			"envelope-only alias snapshot must bake identity attribution into the cache")
+		assert.False(readIsFromMe(2),
+			"a message without a matching envelope snapshot must stay unattributed")
+	}
+
+	t.Run("sqlite snapshot", run)
+	t.Run("csv fallback", func(t *testing.T) {
+		t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", "1")
+		run(t)
+	})
+}
+
+func TestBuildCacheDoesNotFallbackFromEnvelopeToCurrentParticipant(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	tmpDir := setupTestSQLite(t)
+	dbPath := filepath.Join(tmpDir, "test.db")
+	analyticsDir := filepath.Join(tmpDir, "analytics")
+
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(err)
+	_, err = db.Exec(`
+		INSERT INTO account_identities (source_id, address)
+		VALUES (1, 'alice@example.com');
+		UPDATE messages SET sender_id = 1, is_from_me = FALSE WHERE id = 1;
+		UPDATE message_recipients
+		SET email_address = 'outside@example.com'
+		WHERE message_id = 1 AND recipient_type = 'from';
+	`)
+	require.NoError(err)
+	require.NoError(db.Close())
+
+	result, err := buildCache(dbPath, analyticsDir, true)
+	require.NoError(err)
+	assert.Positive(result.ExportedCount)
+
+	duckDB, err := sql.Open("duckdb", "")
+	require.NoError(err)
+	defer func() { require.NoError(duckDB.Close()) }()
+	var isFromMe bool
+	require.NoError(duckDB.QueryRow(
+		`SELECT is_from_me
+		 FROM read_parquet(?, hive_partitioning=true)
+		 WHERE id = 1`,
+		filepath.Join(analyticsDir, "messages", "**", "*.parquet"),
+	).Scan(&isFromMe))
+	assert.False(isFromMe,
+		"a non-empty From envelope must suppress current participant attribution")
+}
+
 func TestBuildCacheSnapshotPredicateAcceptsCSVStringIDs(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -2613,6 +2869,7 @@ func TestCacheNeedsBuild(t *testing.T) {
 		name       string
 		setup      func(t *testing.T, dbPath, analyticsDir string)
 		wantBuild  bool
+		wantUsable bool
 		wantReason string
 	}{
 		{
@@ -2624,7 +2881,8 @@ func TestCacheNeedsBuild(t *testing.T) {
 				writeSyncState(t, analyticsDir, 0)
 				createFakeParquet(t, analyticsDir)
 			},
-			wantBuild: false,
+			wantBuild:  false,
+			wantUsable: true,
 		},
 		{
 			name: "NoStateFile_NoParquet_NeedsBuild",
@@ -2659,6 +2917,7 @@ func TestCacheNeedsBuild(t *testing.T) {
 				createFakeParquet(t, analyticsDir)
 			},
 			wantBuild:  true,
+			wantUsable: true,
 			wantReason: "5 new messages",
 		},
 		{
@@ -2674,7 +2933,8 @@ func TestCacheNeedsBuild(t *testing.T) {
 				writeSyncState(t, analyticsDir, 10)
 				createFakeParquet(t, analyticsDir)
 			},
-			wantBuild: false,
+			wantBuild:  false,
+			wantUsable: true,
 		},
 		{
 			name: "HasState_EmptyParquetDir_NeedsBuild",
@@ -2705,7 +2965,8 @@ func TestCacheNeedsBuild(t *testing.T) {
 				writeSyncState(t, analyticsDir, 0)
 				createFakeParquet(t, analyticsDir)
 			},
-			wantBuild: false,
+			wantBuild:  false,
+			wantUsable: true,
 		},
 		{
 			name: "CalendarOnly_NoMessagesParquet_NoRebuild",
@@ -2722,7 +2983,8 @@ func TestCacheNeedsBuild(t *testing.T) {
 				writeSyncState(t, analyticsDir, 10)
 				createFakeParquet(t, analyticsDir)
 			},
-			wantBuild: false,
+			wantBuild:  false,
+			wantUsable: true,
 		},
 		{
 			name: "SourceDeletedAndDedupHiddenSinceBuild_NeedsBuild",
@@ -2744,6 +3006,7 @@ func TestCacheNeedsBuild(t *testing.T) {
 				createFakeParquet(t, analyticsDir)
 			},
 			wantBuild:  true,
+			wantUsable: true,
 			wantReason: "1 deletions",
 		},
 		{
@@ -2805,6 +3068,8 @@ func TestCacheNeedsBuild(t *testing.T) {
 
 			got := cacheNeedsBuild(dbPath, analyticsDir)
 			assert.Equal(t, tt.wantBuild, got.NeedsBuild, "cacheNeedsBuild() build (reason: %q)", got.Reason)
+			assert.Equal(t, tt.wantUsable, got.HasUsablePublication,
+				"cacheNeedsBuild() usable publication (reason: %q)", got.Reason)
 			if tt.wantReason != "" {
 				assert.Equal(t, tt.wantReason, got.Reason, "cacheNeedsBuild() reason")
 			}
@@ -2826,6 +3091,7 @@ func TestCacheNeedsBuild_DriftedPublicationForcesFullRebuild(t *testing.T) {
 	got := cacheNeedsBuild(dbPath, analyticsDir)
 	assert.True(got.NeedsBuild)
 	assert.True(got.FullRebuild)
+	assert.False(got.HasUsablePublication)
 	assert.Contains(got.Reason, "drift")
 }
 
@@ -3189,7 +3455,7 @@ func TestCacheNeedsBuild_IgnoresAlreadyProcessedUpdatedSyncRun(t *testing.T) {
 // schema version other than the current one now forces a full rebuild.
 func TestCacheNeedsBuild_SchemaVersionMismatch(t *testing.T) {
 	require := require.New(t)
-	require.Equal(16, cacheSchemaVersion, "relationship activity has_attachments requires cache v16")
+	require.Equal(24, cacheSchemaVersion, "relationship temperatures require cache v24")
 	tmpDir := setupTestSQLiteEmpty(t)
 
 	dbPath := filepath.Join(tmpDir, "test.db")
@@ -3224,7 +3490,7 @@ func TestCacheNeedsBuild_SchemaVersionMismatch(t *testing.T) {
 	require.False(result.Skipped, "schema mismatch must execute a full rebuild")
 	upgraded, err := query.ReadCacheSyncState(analyticsDir)
 	require.NoError(err, "read upgraded cache state")
-	require.Equal(16, upgraded.SchemaVersion)
+	require.Equal(cacheSchemaVersion, upgraded.SchemaVersion)
 	require.NoFileExists(filepath.Join(analyticsDir, tableParticipantIdentifiers, "data.parquet"),
 		"full rebuild must replace rather than extend the v11 identifier dataset")
 	identifierParquet := filepath.Join(analyticsDir, tableParticipantIdentifiers, "participant_identifiers.parquet")

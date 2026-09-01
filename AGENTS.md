@@ -4,6 +4,7 @@ This file applies to all AI coding agents (Claude Code, Codex, Copilot CLI, etc.
 
 ## Authoritative References
 
+- Baseline operating principles: `CONSTITUTION.md` (read and follow it before acting).
 - Project guide: `CLAUDE.md` (this file is authoritative; AGENTS.md inherits its rules).
 
 ## Roborev
@@ -45,6 +46,12 @@ Do not add bash tests that grep shell scripts, workflows, config files, or docs
 for expected implementation text. Those checks are usually tautological; prefer
 real execution, parser/tool-native validation, or a documented manual release
 check.
+
+## Testing — Wall-clock liveness
+
+Follow `CLAUDE.md`'s "Timing and liveness tests" rule. A timeout may bound a
+wait for an observable state transition. It must not turn runner throughput into
+a correctness requirement.
 
 ## Custom Helpers
 

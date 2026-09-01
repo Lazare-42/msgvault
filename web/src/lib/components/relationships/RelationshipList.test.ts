@@ -30,7 +30,9 @@ function relationshipRow(id: number, label: string, overrides: Partial<Relations
 function person(id: number, label: string): PersonSummary {
   return {
     id, display_label: label, partial_label: false, identifiers: [],
-    activity_count: 4, file_count: 0, source_counts: [], first_at: when, last_at: when, cache_revision: 'cache-rel'
+    activity_count: 4, meeting_count: 0, file_count: 0,
+    current_relationship_temperature: 0, peak_relationship_temperature: 0, peak_relationship_year: 0,
+    source_counts: [], first_at: when, last_at: when, cache_revision: 'cache-rel'
   };
 }
 
@@ -289,11 +291,32 @@ describe('RelationshipList', () => {
 
   it('renders the named degraded state with an Open Everything action instead of the grid', async () => {
     const onOpenEverything = vi.fn();
-    render(RelationshipList, { ...baseProps(), degraded: 'cache_unavailable', onOpenEverything });
+    render(RelationshipList, {
+      ...baseProps(),
+      degraded: {
+        error: 'analytical_cache_unavailable', message: 'The committed analytical cache is unavailable',
+        readiness: 'stale_schema', recovery_action: 'Rebuild the analytical cache'
+      },
+      onOpenEverything
+    });
 
     expect(screen.getByText('Relationship ranking needs the analytical cache/engine')).toBeDefined();
     expect(screen.queryByRole('grid')).toBeNull();
     await fireEvent.click(screen.getByRole('button', { name: 'Open Everything' }));
     expect(onOpenEverything).toHaveBeenCalledOnce();
+  });
+
+  it('shows cache preparation without manual rebuild instructions', () => {
+    render(RelationshipList, {
+      ...baseProps(),
+      degraded: {
+        error: 'analytical_cache_unavailable', message: 'The analytical cache is being prepared',
+        readiness: 'building', recovery_action: ''
+      }
+    });
+
+    expect(screen.getByText('Preparing relationship ranking…')).toBeDefined();
+    expect(screen.queryByText(/msgvault build-cache/)).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Open Everything' })).toBeNull();
   });
 });

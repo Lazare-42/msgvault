@@ -164,6 +164,8 @@ func TestParseSQLiteTime(t *testing.T) {
 // affinity); pgx/v5 always delivers time.Time for TIMESTAMP columns.
 // The scanner must accept all of these without erroring.
 func TestNullableTimestampScan(t *testing.T) {
+	checks := assert.New(t)
+	requirements := require.New(t)
 	tref := time.Date(2024, 6, 15, 10, 30, 45, 0, time.UTC)
 
 	tests := []struct {
@@ -174,6 +176,7 @@ func TestNullableTimestampScan(t *testing.T) {
 	}{
 		{"nil", nil, false, time.Time{}},
 		{"time.Time", tref, true, tref},
+		{"time.Time normalized to UTC", tref.In(time.FixedZone("driver-local", -6*60*60)), true, tref},
 		{"zero time.Time treated as invalid", time.Time{}, false, time.Time{}},
 		{"string SQLite datetime", "2024-06-15 10:30:45", true, tref},
 		{"string RFC3339", "2024-06-15T10:30:45Z", true, tref},
@@ -184,15 +187,18 @@ func TestNullableTimestampScan(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var n nullableTimestamp
-			require.NoError(t, n.Scan(tt.src), "Scan(%T %v)", tt.src, tt.src)
-			assert.Equal(t, tt.wantValid, n.Valid, "Valid")
-			assert.True(t, n.Time.Equal(tt.wantTime), "Time = %v, want %v", n.Time, tt.wantTime)
+			requirements.NoError(n.Scan(tt.src), "Scan(%T %v)", tt.src, tt.src)
+			checks.Equal(tt.wantValid, n.Valid, "Valid")
+			checks.True(n.Time.Equal(tt.wantTime), "Time = %v, want %v", n.Time, tt.wantTime)
+			if tt.wantValid {
+				checks.Equal(time.UTC, n.Time.Location(), "Location")
+			}
 		})
 	}
 
 	t.Run("unsupported type errors", func(t *testing.T) {
 		var n nullableTimestamp
-		require.Error(t, n.Scan(42), "Scan(int): expected error")
+		requirements.Error(n.Scan(42), "Scan(int): expected error")
 	})
 }
 

@@ -176,6 +176,43 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/attribute-definitions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List portable attribute definitions */
+        get: operations["listAttributeDefinitions"];
+        put?: never;
+        /** Create a user attribute definition */
+        post: operations["createAttributeDefinition"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/attribute-definitions/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get one attribute definition */
+        get: operations["getAttributeDefinition"];
+        put?: never;
+        post?: never;
+        /** Delete a user attribute definition */
+        delete: operations["deleteAttributeDefinition"];
+        options?: never;
+        head?: never;
+        /** Update mutable attribute definition fields */
+        patch: operations["patchAttributeDefinition"];
+        trace?: never;
+    };
     "/api/v1/auth/token/{email}": {
         parameters: {
             query?: never;
@@ -221,6 +258,161 @@ export interface paths {
         put?: never;
         /** End a backup freeze window */
         post: operations["endBackupFreeze"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/carddav/account": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Discover and save a CardDAV account */
+        put: operations["saveCardDAVAccount"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/carddav/account/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Test a CardDAV account */
+        post: operations["testCardDAVAccount"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/carddav/books": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List CardDAV address books */
+        get: operations["listCardDAVBooks"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/carddav/books/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Update CardDAV address book roles */
+        patch: operations["updateCardDAVBookRoles"];
+        trace?: never;
+    };
+    "/api/v1/carddav/conflicts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List unresolved CardDAV conflicts */
+        get: operations["listCardDAVConflicts"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/carddav/conflicts/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Inspect a CardDAV conflict */
+        get: operations["getCardDAVConflict"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/carddav/conflicts/{id}/resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Resolve a CardDAV conflict */
+        post: operations["resolveCardDAVConflict"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/carddav/publications/{person_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get CardDAV publication state */
+        get: operations["getCardDAVPublication"];
+        put?: never;
+        /** Publish a person to CardDAV */
+        post: operations["publishCardDAVPerson"];
+        /** Unpublish a person from CardDAV */
+        delete: operations["unpublishCardDAVPerson"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/carddav/sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Trigger CardDAV synchronization */
+        post: operations["syncCardDAV"];
         delete?: never;
         options?: never;
         head?: never;
@@ -520,6 +712,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/cli/identities/discover": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Discover source-scoped account identities */
+        post: operations["discoverCLIIdentities"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/cli/identities/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Preview or apply parsed source-scoped identities */
+        post: operations["importCLIIdentities"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/cli/init-db": {
         parameters: {
             query?: never;
@@ -707,6 +933,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/communication-services": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List communication services
+         * @description Lists the small open service catalog without pagination, including aliases and normalization policy.
+         */
+        get: operations["listCommunicationServices"];
+        put?: never;
+        /**
+         * Register a communication service
+         * @description Registers an unknown or custom service without a schema migration. Re-registering a slug is idempotent.
+         */
+        post: operations["createCommunicationService"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/content/remote-image": {
         parameters: {
             query?: never;
@@ -735,6 +985,58 @@ export interface paths {
         get: operations["getConversation"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/days/entries/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Delete an authored daily entry */
+        delete: operations["deleteDayEntry"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/days/{date}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get people, activity, and notes for a day */
+        get: operations["getActivityDay"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/days/{date}/entries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List authored entries for a day */
+        get: operations["listDayEntries"];
+        put?: never;
+        /** Create an authored entry for a day */
+        post: operations["createDayEntry"];
         delete?: never;
         options?: never;
         head?: never;
@@ -772,6 +1074,57 @@ export interface paths {
         post?: never;
         /** Cancel a staged deletion manifest */
         delete: operations["cancelDeletion"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/documents/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Search extracted document attachments */
+        get: operations["searchDocuments"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/documents/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get extracted document index status */
+        get: operations["getDocumentIndexStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/documents/vectors/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get document vector generation, consent, usage, and failure status */
+        get: operations["getDocumentVectorStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -856,6 +1209,76 @@ export interface paths {
         put?: never;
         /** Get one domain's canonical activity timeline */
         post: operations["getDomainTimeline"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/employments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create an employment record */
+        post: operations["createEmployment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/employments/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get an employment record */
+        get: operations["getEmployment"];
+        put?: never;
+        post?: never;
+        /** Delete an employment record */
+        delete: operations["deleteEmployment"];
+        options?: never;
+        head?: never;
+        /** Replace an employment record's mutable fields */
+        patch: operations["patchEmployment"];
+        trace?: never;
+    };
+    "/api/v1/employments/{id}/end": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** End an employment record */
+        post: operations["endEmployment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/employments/{id}/primary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Set the primary current employment */
+        post: operations["setPrimaryEmployment"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1066,6 +1489,66 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/identity/match-candidates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List reviewable identity match candidates
+         * @description Candidates are evidence-backed suggestions, never applied links. Only a repeated stable provider or Beeper user ID is confirmed automatically; a username, phone, email, display name, or shared conversation is evidence and waits for an explicit decision.
+         */
+        get: operations["listIdentityMatchCandidates"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/identity/match-candidates/{id}/accept": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Accept an identity match candidate
+         * @description Accepting is the explicit user confirmation the matching policy requires. The participant link is applied through the normal identity link path, so a match spanning two curated people is refused rather than merged.
+         */
+        post: operations["acceptIdentityMatchCandidate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/identity/match-candidates/{id}/reject": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reject an identity match candidate
+         * @description A rejected suggestion is retained rather than deleted, so the same low-quality inference is not proposed again on the next import.
+         */
+        post: operations["rejectIdentityMatchCandidate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/identity/unlinks": {
         parameters: {
             query?: never;
@@ -1160,6 +1643,23 @@ export interface paths {
         };
         /** List messages */
         get: operations["listMessages"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/messages/changes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List messages whose content changed since a cursor */
+        get: operations["listChangedMessages"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1271,6 +1771,91 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/multimodal/build": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Consent and run one bounded visual attachment embedding pass */
+        post: operations["startVisualAttachmentBuild"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/multimodal/retire": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Retire the visual attachment generation */
+        post: operations["retireVisualAttachmentGeneration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/multimodal/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Retry one visual attachment owner */
+        post: operations["retryVisualAttachmentOwner"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/multimodal/run": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Resume one bounded visual attachment embedding pass */
+        post: operations["resumeVisualAttachmentBuild"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/multimodal/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get visual attachment embedding status */
+        get: operations["getVisualAttachmentStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/ocr/status": {
         parameters: {
             query?: never;
@@ -1288,7 +1873,62 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/people/search": {
+    "/api/v1/organizations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List organizations */
+        get: operations["listOrganizations"];
+        put?: never;
+        /** Create an organization */
+        post: operations["createOrganization"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get an organization */
+        get: operations["getOrganization"];
+        put?: never;
+        post?: never;
+        /** Delete an organization without employment records */
+        delete: operations["deleteOrganization"];
+        options?: never;
+        head?: never;
+        /** Replace an organization's mutable fields */
+        patch: operations["patchOrganization"];
+        trace?: never;
+    };
+    "/api/v1/organizations/{id}/attributes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List organization typed attributes */
+        get: operations["listOrganizationAttributes"];
+        put?: never;
+        /** Set an organization typed attribute */
+        post: operations["setOrganizationAttribute"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{id}/attributes/{slug}": {
         parameters: {
             query?: never;
             header?: never;
@@ -1297,23 +1937,23 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Search analytical people */
-        post: operations["searchPeople"];
-        delete?: never;
+        post?: never;
+        /** Supersede an organization typed attribute */
+        delete: operations["clearOrganizationAttribute"];
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/api/v1/people/{id}": {
+    "/api/v1/organizations/{id}/employments": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        /** Get one analytical person */
-        get: operations["getPerson"];
+        /** List an organization's employment records */
+        get: operations["listOrganizationEmployments"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1322,7 +1962,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/people/{id}/files/search": {
+    "/api/v1/organizations/{id}/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get organization profile history */
+        get: operations["getOrganizationHistory"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{id}/merge": {
         parameters: {
             query?: never;
             header?: never;
@@ -1331,15 +1988,55 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Search one person's analytical files */
-        post: operations["searchPersonFiles"];
+        /** Merge another organization into this organization */
+        post: operations["mergeOrganization"];
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/api/v1/people/{id}/summary": {
+    "/api/v1/organizations/{id}/profile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Replace organization profile collections
+         * @description Replaces all structured organization profile collections with at most 200 total values.
+         */
+        put: operations["putOrganizationProfile"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/organizations/{id}/profile/media/{media_id}/content": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Download stored inline content for one organization profile media value
+         * @description Returns the exact inline bytes stored for one media value. URI-only values have no local content and return 404.
+         */
+        get: operations["getOrganizationProfileMediaContent"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/participants/completions": {
         parameters: {
             query?: never;
             header?: never;
@@ -1348,15 +2045,18 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Get one person's contextual analytical summary */
-        post: operations["getPersonContextSummary"];
+        /**
+         * Complete observed people by typed contact primitives
+         * @description Returns a bounded, typed completion set from the committed observed-person index and current curated profile primitives. The private query stays in the JSON body.
+         */
+        post: operations["completeParticipants"];
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/api/v1/people/{id}/timeline": {
+    "/api/v1/participants/search": {
         parameters: {
             query?: never;
             header?: never;
@@ -1365,15 +2065,100 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Get one person's canonical activity timeline */
-        post: operations["getPersonTimeline"];
+        /** Search observed participant clusters */
+        post: operations["searchParticipants"];
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
         trace?: never;
     };
-    "/api/v1/persons": {
+    "/api/v1/participants/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get one observed participant cluster */
+        get: operations["getParticipant"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/participants/{id}/files/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Search one participant cluster's analytical files */
+        post: operations["searchParticipantFiles"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/participants/{id}/inboxes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List one participant cluster's messaging inboxes */
+        get: operations["listParticipantInboxes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/participants/{id}/summary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Get one participant cluster's contextual analytical summary */
+        post: operations["getParticipantContextSummary"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/participants/{id}/timeline": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Get one participant cluster's canonical activity timeline */
+        post: operations["getParticipantTimeline"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people": {
         parameters: {
             query?: never;
             header?: never;
@@ -1382,9 +2167,9 @@ export interface paths {
         };
         /**
          * List durable person profiles
-         * @description Durable persons are curated profiles; /api/v1/people exposes derived analytics groupings. The listing is deliberately unpaginated: persons exist only through explicit promotion, so the set stays small.
+         * @description Durable people are curated profiles; /api/v1/participants exposes observed analytical groupings. The listing is deliberately unpaginated: persons exist only through explicit promotion, so the set stays small.
          */
-        get: operations["listPersons"];
+        get: operations["listPeople"];
         put?: never;
         /**
          * Promote a participant cluster to a durable person
@@ -1397,7 +2182,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/v1/persons/{id}": {
+    "/api/v1/people/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Search durable people semantically
+         * @description Searches only the curated person vector corpus and returns durable person roots in relevance order.
+         */
+        post: operations["searchPeople"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people/{id}": {
         parameters: {
             query?: never;
             header?: never;
@@ -1419,6 +2224,516 @@ export interface paths {
         patch: operations["patchPerson"];
         trace?: never;
     };
+    "/api/v1/people/{id}/attributes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List a person's typed attributes */
+        get: operations["listPersonAttributes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people/{id}/attributes/{slug}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Set a person's attribute value */
+        put: operations["setPersonAttribute"];
+        post?: never;
+        /** Supersede a person's attribute value */
+        delete: operations["clearPersonAttribute"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people/{id}/contact-state": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get computed contact state for a person */
+        get: operations["getPersonContactState"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people/{id}/days": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List calendar days intersecting a person */
+        get: operations["listPersonActivityDays"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people/{id}/days/{date}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get one person's activity and notes for a day */
+        get: operations["getPersonActivityDay"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people/{id}/employments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List a person's employment history */
+        get: operations["listPersonEmployments"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people/{id}/fact-claims": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List immutable person fact claims */
+        get: operations["listPersonFactClaims"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people/{id}/fact-decisions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List immutable person fact decisions */
+        get: operations["listPersonFactDecisions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people/{id}/fact-evidence": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List immutable person fact evidence */
+        get: operations["listPersonFactEvidence"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people/{id}/fact-evidence-status-events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List person fact evidence status history */
+        get: operations["listPersonFactEvidenceStatusEvents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people/{id}/fact-pins": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List effective person fact pins */
+        get: operations["listPersonFactPins"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people/{id}/fact-pins/{kind}/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Replace an effective person fact pin */
+        put: operations["setPersonFactPin"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people/{id}/files/search": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Search one durable person's analytical files */
+        post: operations["searchPersonFiles"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people/{id}/merge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Merge one durable person profile into another */
+        post: operations["mergePersons"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people/{id}/merges": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List merge history for a durable person */
+        get: operations["listPersonMerges"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people/{id}/notes/append": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Append to a person's notes */
+        post: operations["appendPersonNote"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people/{id}/profile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get a person's current structured profile
+         * @description Returns only current structured values at one person revision. Superseded values and archive observations are available from the separate history endpoint.
+         */
+        get: operations["getPersonStructuredProfile"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /**
+         * Atomically patch a person's structured profile
+         * @description Applies up to 200 explicit adds and supersedes atomically under If-Match. One patch advances the person revision once. Superseding closes world and transaction time without deletion.
+         */
+        patch: operations["patchPersonStructuredProfile"];
+        trace?: never;
+    };
+    "/api/v1/people/{id}/profile/history": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get a person's structured profile history
+         * @description Returns current and superseded structured values plus source-linked observations for every participant bound to the person.
+         */
+        get: operations["getPersonProfileHistory"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people/{id}/profile/media/{media_id}/content": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Download stored inline content for one person profile media value
+         * @description Returns the exact inline bytes stored for one media value. URI-only values have no local content and return 404.
+         */
+        get: operations["getPersonProfileMediaContent"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people/{id}/relationships": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List one person's relationships */
+        get: operations["listPersonRelationships"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people/{id}/split": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Split absorbed participant lineage into a new person */
+        post: operations["splitPersonMerge"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/people/{id}/tracking": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a person's tracking state */
+        get: operations["getPersonTracking"];
+        /** Replace a person's tracking state */
+        put: operations["setPersonTracking"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/person-fact-targets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List eligible automatic person fact targets */
+        get: operations["listPersonFactTargets"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/person-merge-candidates/{candidate_id}/decision": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Accept or reject a person merge attribute candidate */
+        post: operations["decidePersonMergeCandidate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/person-merges/{merge_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Inspect one durable person merge */
+        get: operations["getPersonMerge"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/person-merges/{merge_id}/snapshot": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Read and verify one person merge snapshot */
+        get: operations["getPersonMergeSnapshot"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/person-relationship-reviews": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List imported RELATED values awaiting review */
+        get: operations["listPersonRelationshipReviews"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/person-relationships": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Declare a relationship between two persons */
+        post: operations["createPersonRelationship"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/person-relationships/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get one person relationship */
+        get: operations["getPersonRelationship"];
+        put?: never;
+        post?: never;
+        /** Delete a person relationship */
+        delete: operations["deletePersonRelationship"];
+        options?: never;
+        head?: never;
+        /** End a relationship or replace its notes */
+        patch: operations["patchPersonRelationship"];
+        trace?: never;
+    };
     "/api/v1/query": {
         parameters: {
             query?: never;
@@ -1436,6 +2751,43 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/relationship-types": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List person relationship types */
+        get: operations["listRelationshipTypes"];
+        put?: never;
+        /** Create a user-owned relationship type */
+        post: operations["createRelationshipType"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/relationship-types/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get a relationship type */
+        get: operations["getRelationshipType"];
+        put?: never;
+        post?: never;
+        /** Delete an unused relationship type */
+        delete: operations["deleteRelationshipType"];
+        options?: never;
+        head?: never;
+        /** Update a relationship type */
+        patch: operations["patchRelationshipType"];
+        trace?: never;
+    };
     "/api/v1/relationships": {
         parameters: {
             query?: never;
@@ -1447,6 +2799,23 @@ export interface paths {
         put?: never;
         /** Rank counterparts by reciprocity-weighted interaction */
         post: operations["listRelationships"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/relationships/{id}/calendar": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Get one counterpart's timezone-aware relationship calendar */
+        post: operations["getRelationshipCalendar"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1535,6 +2904,23 @@ export interface paths {
         get: operations["searchMessages"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/search/attachments/visual": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Search visual attachment content */
+        post: operations["searchVisualAttachments"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1653,6 +3039,23 @@ export interface paths {
         };
         /** List source sync status */
         get: operations["listSourceStatus"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sources/{source_id}/identities": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List confirmed identities for one source */
+        get: operations["listSourceIdentities"];
         put?: never;
         post?: never;
         delete?: never;
@@ -1848,15 +3251,41 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        ActivityRef: {
+            channel: string;
+            /** Format: int64 */
+            conversation_id?: number;
+            date_origin: string;
+            date_precision: string;
+            direction: string;
+            evidence: string;
+            kind: string;
+            local_date: string;
+            /** Format: int64 */
+            message_id: number;
+            /** Format: date-time */
+            occurred_at: string;
+            ref: string;
+            role: string;
+            /** Format: int64 */
+            source_id: number;
+            timezone: string;
+            /** Format: int64 */
+            utc_offset_minutes: number;
+        } & {
+            [key: string]: unknown;
+        };
         AddAccountRequest: {
             email: string;
             enabled: boolean;
             schedule: string;
         };
         AddRequest: {
-            account: string;
+            account?: string;
             identifier: string;
             signal: string;
+            /** Format: int64 */
+            source_id?: number;
         };
         AddResult: {
             account: string;
@@ -1895,11 +3324,35 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        AnnualTemperatureSummary: {
+            /** Format: int64 */
+            population: number;
+            /** Format: int64 */
+            rank: number;
+            /** Format: double */
+            raw_score: number;
+            signals: components["schemas"]["TemperatureSignals"];
+            /** Format: int64 */
+            temperature: number;
+            /** Format: int64 */
+            year: number;
+        } & {
+            [key: string]: unknown;
+        };
         ApiHTTPError: {
             error: string;
             message?: string;
         } & {
             [key: string]: unknown;
+        };
+        AppendPersonNoteRequest: {
+            actor?: string;
+            /** Format: double */
+            confidence?: number;
+            /** @enum {string} */
+            source?: "user" | "carddav_import" | "vcard_import" | "archive_observation" | "extraction" | "enrichment" | "system";
+            source_ref?: string;
+            text: string;
         };
         AttachmentInfo: {
             content_hash?: string;
@@ -1912,6 +3365,99 @@ export interface components {
             url?: string;
         } & {
             [key: string]: unknown;
+        };
+        AttachmentSearchResult: {
+            /** Format: int64 */
+            attachment_id: number;
+            blob_hash: string;
+            /** Format: int64 */
+            conversation_id: number;
+            filename: string;
+            /** Format: int64 */
+            message_id: number;
+            mime_type: string;
+            person_provenance?: components["schemas"]["Provenance"];
+            /** Format: int64 */
+            rank: number;
+            /** Format: double */
+            score: number;
+            /** Format: date-time */
+            sent_at: string;
+            /** Format: int64 */
+            size: number;
+            /** Format: int64 */
+            source_id: number;
+            source_message_id: string;
+        } & {
+            [key: string]: unknown;
+        };
+        AttributeChoice: {
+            label: string;
+            value: string;
+        };
+        AttributeDefinition: {
+            api_mutable: boolean;
+            cardinality: string;
+            /** Format: date-time */
+            created_at: string;
+            derived_source?: string;
+            description?: string;
+            /** Format: int64 */
+            display_order: number;
+            field_type: string;
+            history_exempt: boolean;
+            /** Format: int64 */
+            id: number;
+            is_active: boolean;
+            is_audited: boolean;
+            is_deletable: boolean;
+            is_required: boolean;
+            is_searchable: boolean;
+            is_sensitive: boolean;
+            label: string;
+            object_type: string;
+            options?: components["schemas"]["AttributeOptions"];
+            ownership: string;
+            record_target?: string;
+            /** Format: int64 */
+            revision: number;
+            slug: string;
+            ui_creatable: boolean;
+            ui_editable: boolean;
+            universal_id: string;
+            /** Format: date-time */
+            updated_at: string;
+            value_type: string;
+            vcard_property?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        AttributeDefinitionsResponse: {
+            definitions: components["schemas"]["AttributeDefinition"][] | null;
+        } & {
+            [key: string]: unknown;
+        };
+        AttributeOptions: {
+            choices?: components["schemas"]["AttributeChoice"][] | null;
+            /** Format: int64 */
+            max_length?: number;
+            unit?: string;
+        };
+        AttributeValue: {
+            boolean?: boolean;
+            date?: string;
+            /** Format: int64 */
+            integer?: number;
+            json?: unknown;
+            /** Format: double */
+            real?: number;
+            /** Format: int64 */
+            record_id?: number;
+            record_type?: string;
+            text?: string;
+            /** Format: date-time */
+            timestamp?: string;
+            type: string;
         };
         BackupFreezeBeginResponse: {
             token: string;
@@ -2003,6 +3549,8 @@ export interface components {
             list?: boolean;
             permanent?: boolean;
             remote_delete_enabled?: boolean;
+            /** Format: int64 */
+            source_id?: number;
             yes?: boolean;
         };
         CLIDeleteStagedPlanResponse: {
@@ -2014,6 +3562,8 @@ export interface components {
             plan_fingerprint?: string;
             planned_batch_ids?: string[] | null;
             remote_delete_env_var?: string;
+            /** Format: int64 */
+            resolved_source_id?: number;
             scope_escalation_account?: string;
             scope_escalation_body_lines?: string[] | null;
             scope_escalation_cancel_hint?: string;
@@ -2139,6 +3689,179 @@ export interface components {
         CancelDeletionResponse: {
             id: string;
             status: string;
+        } & {
+            [key: string]: unknown;
+        };
+        Candidate: {
+            already_confirmed: boolean;
+            /** @enum {string} */
+            classification: "confirmed" | "strong" | "weak";
+            /** Format: date-time */
+            first_seen_at: string;
+            identifier: string;
+            /** Format: date-time */
+            last_seen_at: string;
+            normalized_identifier: string;
+            provider_states: string[];
+            /** Format: int64 */
+            received_message_count: number;
+            /** Format: int64 */
+            sent_message_count: number;
+            signals: string[] | null;
+        } & {
+            [key: string]: unknown;
+        };
+        CardDAVAccountRequest: {
+            base_url: string;
+            enabled: boolean;
+            password?: string;
+            schedule?: string;
+            username: string;
+        };
+        CardDAVAccountResponse: {
+            base_url: string;
+            /** Format: int64 */
+            books: number;
+            enabled: boolean;
+            schedule?: string;
+            username: string;
+        } & {
+            [key: string]: unknown;
+        };
+        CardDAVBookResponse: {
+            /** Format: int64 */
+            id: number;
+            lookup_source: boolean;
+            name: string;
+            needs_full_reconcile: boolean;
+            subscribed: boolean;
+            url: string;
+            write_target: boolean;
+        } & {
+            [key: string]: unknown;
+        };
+        CardDAVBookRolesRequest: {
+            lookup_source: boolean;
+            subscribed: boolean;
+            write_target: boolean;
+        };
+        CardDAVBooksResponse: {
+            books: components["schemas"]["CardDAVBookResponse"][] | null;
+        } & {
+            [key: string]: unknown;
+        };
+        CardDAVConflictDetailResponse: {
+            /** Format: int64 */
+            address_book_id: number;
+            href: string;
+            /** Format: int64 */
+            id: number;
+            local_tombstone: boolean;
+            local_vcard?: string;
+            remote_tombstone: boolean;
+            remote_vcard?: string;
+            status: string;
+        } & {
+            [key: string]: unknown;
+        };
+        CardDAVConflictResolutionResponse: {
+            /** Format: int64 */
+            id: number;
+            status: string;
+        } & {
+            [key: string]: unknown;
+        };
+        CardDAVConflictResponse: {
+            /** Format: int64 */
+            address_book_id: number;
+            href: string;
+            /** Format: int64 */
+            id: number;
+            local_tombstone: boolean;
+            remote_tombstone: boolean;
+            status: string;
+        } & {
+            [key: string]: unknown;
+        };
+        CardDAVConflictsResponse: {
+            conflicts: components["schemas"]["CardDAVConflictResponse"][] | null;
+        } & {
+            [key: string]: unknown;
+        };
+        CardDAVPublicationResponse: {
+            desired: boolean;
+            href?: string;
+            pending_operation?: string;
+            /** Format: int64 */
+            person_id: number;
+        } & {
+            [key: string]: unknown;
+        };
+        CardDAVResolveRequest: {
+            /** @enum {string} */
+            choice: "keep_local" | "keep_remote";
+        };
+        CardDAVSyncRequest: {
+            full?: boolean;
+        };
+        Catalog: {
+            fingerprint: string;
+            targets: components["schemas"]["TargetDescriptor"][] | null;
+            version: string;
+        } & {
+            [key: string]: unknown;
+        };
+        ChangedMessageJSON: {
+            /** Format: int64 */
+            attachment_count: number;
+            /** Format: date-time */
+            content_changed_at: string;
+            /** Format: int64 */
+            conversation_id: number;
+            /** Format: date-time */
+            deleted_at?: string;
+            /** Format: date-time */
+            deleted_from_source_at?: string;
+            has_attachments: boolean;
+            /** Format: int64 */
+            id: number;
+            /** Format: date-time */
+            internal_date?: string;
+            message_type?: string;
+            /** Format: date-time */
+            received_at?: string;
+            /** Format: date-time */
+            sent_at?: string;
+            /** Format: int64 */
+            size_estimate: number;
+            snippet?: string;
+            /** Format: int64 */
+            source_id: number;
+            source_message_id?: string;
+            subject?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        ChangesResponse: {
+            /**
+             * Format: date-time
+             * @description Instant the feed is complete through: every change committed strictly below it is reachable from this page's cursor. Null means no commit bound has been established yet; keep polling
+             */
+            complete_through: string | null;
+            /** Format: int64 */
+            count: number;
+            has_more: boolean;
+            messages: components["schemas"]["ChangedMessageJSON"][];
+            /** @description Opaque cursor for the next request. Always present and never empty. Store it and send it back as the cursor parameter; do not parse, construct, compare, or order it — its contents may change without notice */
+            next_cursor: string;
+            /** Format: date-time */
+            server_time: string;
+        } & {
+            [key: string]: unknown;
+        };
+        ChoiceDescriptor: {
+            label: string;
+            value: string;
         } & {
             [key: string]: unknown;
         };
@@ -2339,6 +4062,70 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        CommunicationService: {
+            aliases: string[] | null;
+            /** Format: date-time */
+            created_at: string;
+            default_scope_kind?: string;
+            display_label: string;
+            /** Format: int64 */
+            id: number;
+            is_active: boolean;
+            is_system: boolean;
+            normalization: string;
+            /** Format: int64 */
+            normalization_version: number;
+            profile_url_template?: string;
+            scope_policy: string;
+            slug: string;
+            /** Format: date-time */
+            updated_at: string;
+            uri_scheme?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        CommunicationServicesResponse: {
+            services: components["schemas"]["CommunicationService"][] | null;
+        } & {
+            [key: string]: unknown;
+        };
+        ConfidenceInputs: {
+            /** Format: int64 */
+            reported_score: number;
+        } & {
+            [key: string]: unknown;
+        };
+        ContactState: {
+            /** Format: date-time */
+            cadence_due_at?: string;
+            cadence_status: string;
+            /** Format: date-time */
+            computed_at: string;
+            /** Format: date-time */
+            first_contact_at?: string;
+            first_contact_ref?: string;
+            inferred_channel?: string;
+            /** Format: int64 */
+            interaction_count: number;
+            /** Format: date-time */
+            last_contact_at?: string;
+            last_contact_channel?: string;
+            last_contact_owner?: string;
+            last_contact_ref?: string;
+            /** Format: int64 */
+            last_contact_source_id?: number;
+            /** Format: date-time */
+            last_inbound_at?: string;
+            last_inbound_ref?: string;
+            /** Format: date-time */
+            last_outbound_at?: string;
+            last_outbound_ref?: string;
+            /** Format: int64 */
+            person_id: number;
+            stale: boolean;
+        } & {
+            [key: string]: unknown;
+        };
         ConversationResponse: {
             /** Format: int64 */
             anchor_id: number;
@@ -2352,9 +4139,68 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        CreateAttributeDefinitionRequest: {
+            /** @enum {string} */
+            cardinality?: "single" | "multi";
+            description?: string;
+            /** Format: int64 */
+            display_order?: number;
+            field_type: string;
+            is_audited?: boolean;
+            is_required?: boolean;
+            is_searchable?: boolean;
+            is_sensitive?: boolean;
+            label: string;
+            /** @enum {string} */
+            object_type: "person" | "organization";
+            options?: components["schemas"]["AttributeOptions"];
+            record_target?: string;
+            slug?: string;
+            value_type: string;
+            vcard_property?: string;
+        };
+        CreateCommunicationServiceRequest: {
+            aliases?: string[] | null;
+            default_scope_kind?: string;
+            display_label: string;
+            /** @enum {string} */
+            normalization: "none" | "lower" | "email" | "phone_e164" | "strip_at_lower" | "by_address_kind";
+            /** Format: int64 */
+            normalization_version?: number;
+            profile_url_template?: string;
+            /** @enum {string} */
+            scope_policy: "none" | "optional" | "required";
+            slug: string;
+            uri_scheme?: string;
+        };
+        CreateDailyNoteEntryRequest: {
+            author?: string;
+            body: string;
+            person_ids?: number[] | null;
+        };
+        CreatePersonRelationshipRequest: {
+            end_date?: string;
+            notes?: string | null;
+            relationship_type_slug: string;
+            /** Format: int64 */
+            source_person_id: number;
+            start_date?: string;
+            /** Format: int64 */
+            target_person_id: number;
+        };
         CreatePersonRequest: {
             /** Format: int64 */
             participant_id: number;
+        };
+        CreateRelationshipTypeRequest: {
+            color?: string | null;
+            description?: string | null;
+            forward_label: string;
+            icon?: string | null;
+            is_symmetric?: boolean;
+            reverse_label: string;
+            slug: string;
+            vcard_related_type?: string | null;
         };
         CreateRequest: {
             accounts: string[] | null;
@@ -2366,6 +4212,65 @@ export interface components {
             name: string;
             /** Format: int64 */
             schema_version: number;
+        };
+        DailyNoteEntriesResponse: {
+            entries: components["schemas"]["DailyNoteEntry"][];
+        } & {
+            [key: string]: unknown;
+        };
+        DailyNoteEntry: {
+            author: string;
+            body: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: int64 */
+            id: number;
+            local_date: string;
+            /** Format: int64 */
+            ordinal: number;
+            person_ids: number[] | null;
+            source: string;
+            source_ref?: string;
+            /** Format: date-time */
+            updated_at: string;
+        } & {
+            [key: string]: unknown;
+        };
+        DayPage: {
+            entries: components["schemas"]["DailyNoteEntry"][];
+            /** Format: int64 */
+            entry_total_count: number;
+            local_date: string;
+            /** Format: int64 */
+            person_total_count: number;
+            persons: components["schemas"]["DayPerson"][];
+        } & {
+            [key: string]: unknown;
+        };
+        DayPerson: {
+            activity: components["schemas"]["ActivityRef"][];
+            activity_truncated: boolean;
+            /** Format: int64 */
+            direct_count: number;
+            display_name?: string;
+            /** Format: int64 */
+            event_count: number;
+            /** Format: date-time */
+            last_at: string;
+            /** Format: int64 */
+            person_id: number;
+            vcard_uid: string;
+        } & {
+            [key: string]: unknown;
+        };
+        DecideIdentityMatchRequest: {
+            notes?: string;
+        };
+        DecidePersonMergeCandidateRequest: {
+            /** @enum {string} */
+            decision: "accept" | "reject";
+            /** Format: int64 */
+            person_id: number;
         };
         DeepSearchResponse: {
             body_contexts?: components["schemas"]["BodySearchContext"][] | null;
@@ -2392,6 +4297,7 @@ export interface components {
             id: string;
             /** Format: int64 */
             message_count: number;
+            source?: components["schemas"]["SourceReference"];
             status: string;
             summary?: components["schemas"]["Summary"];
         } & {
@@ -2406,6 +4312,328 @@ export interface components {
             /** Format: int64 */
             message_count: number;
             status: string;
+        } & {
+            [key: string]: unknown;
+        };
+        DeletionTarget: {
+            /** Format: int64 */
+            message_id: number;
+            /** Format: int64 */
+            source_id: number;
+            source_identifier: string;
+            source_message_id: string;
+            source_type: string;
+        } & {
+            [key: string]: unknown;
+        };
+        DiscoverError: {
+            code: string;
+            message: string;
+        } & {
+            [key: string]: unknown;
+        };
+        DiscoverEvent: {
+            error?: components["schemas"]["DiscoverError"];
+            progress?: components["schemas"]["DiscoverProgress"];
+            result?: components["schemas"]["DiscoverResult"];
+            /** @enum {string} */
+            type: "progress" | "result" | "error";
+        } & {
+            [key: string]: unknown;
+        };
+        DiscoverProgress: {
+            /** Format: int64 */
+            candidates: number;
+            /** Format: int64 */
+            done: number;
+            /** Format: int64 */
+            total: number;
+        } & {
+            [key: string]: unknown;
+        };
+        DiscoverRequest: {
+            account?: string;
+            apply?: boolean;
+            confirm?: string[] | null;
+            /** Format: int64 */
+            page_size?: number;
+            provider?: boolean;
+            /** Format: int64 */
+            source_id?: number;
+        };
+        DiscoverResult: {
+            account: string;
+            applied: components["schemas"]["IdentityConfirmationOutcome"][] | null;
+            candidates: components["schemas"]["Candidate"][] | null;
+            rejected: components["schemas"]["RejectedCandidate"][] | null;
+            /** Format: int64 */
+            scanned_messages: number;
+            /** Format: int64 */
+            source_id: number;
+            source_type: string;
+        } & {
+            [key: string]: unknown;
+        };
+        DocumentIndexRebuildStatus: {
+            /** Format: int64 */
+            remaining_owners: number;
+            /** Format: int64 */
+            snapshot_owners: number;
+        } & {
+            [key: string]: unknown;
+        };
+        DocumentIndexStatus: {
+            /** Format: double */
+            average_provider_latency_millis: number;
+            /** Format: int64 */
+            eligible_bytes: number;
+            /** Format: int64 */
+            eligible_occurrences: number;
+            /** Format: int64 */
+            eligible_owners: number;
+            exact_consent: boolean;
+            /** Format: int64 */
+            extraction_attempts: number;
+            /** Format: int64 */
+            failed_attempts: number;
+            /** Format: int64 */
+            ineligible_role_occurrences: number;
+            /** Format: int64 */
+            missing_owners: number;
+            /** Format: int64 */
+            missing_provider_byte_reports: number;
+            /** Format: int64 */
+            processed_provider_units: number;
+            profile_enabled: boolean;
+            profile_exists: boolean;
+            /** Format: int64 */
+            provider_latency_millis: number;
+            /** Format: int64 */
+            provider_requests: number;
+            /** Format: int64 */
+            provider_retries: number;
+            /** Format: int64 */
+            ready_owners: number;
+            /** Format: int64 */
+            reported_provider_bytes: number;
+            /** Format: int64 */
+            retry_owners: number;
+            /** Format: int64 */
+            staging_owners: number;
+            /** Format: int64 */
+            stored_plaintext_chunks: number;
+            /** Format: int64 */
+            successful_attempts: number;
+            /** Format: int64 */
+            terminal_owners: number;
+            /** Format: int64 */
+            unknown_role_occurrences: number;
+            /** Format: int64 */
+            verified_upload_bytes: number;
+        } & {
+            [key: string]: unknown;
+        };
+        DocumentIndexStatusResponse: {
+            active_rebuild?: components["schemas"]["DocumentIndexRebuildStatus"];
+            status: components["schemas"]["DocumentIndexStatus"];
+        } & {
+            [key: string]: unknown;
+        };
+        DocumentSearchResponse: {
+            effective_mode?: string;
+            next_cursor?: string;
+            results: components["schemas"]["DocumentSearchResult"][] | null;
+            /** Format: int64 */
+            revision: number;
+            truncated?: boolean;
+            vector_generation_fingerprint?: string;
+            /** Format: int64 */
+            vector_generation_id?: number;
+        } & {
+            [key: string]: unknown;
+        };
+        DocumentSearchResult: {
+            /** Format: int64 */
+            attachment_id: number;
+            canonical_blob_hash: string;
+            chunk_key: string;
+            /** Format: int64 */
+            chunk_ordinal: number;
+            containing_title?: string;
+            /** Format: int64 */
+            conversation_id: number;
+            excerpt: string;
+            extraction_id: string;
+            filename?: string;
+            /** Format: int64 */
+            first_unit_index: number;
+            /** Format: double */
+            fusion_score?: number;
+            heading_path?: string[] | null;
+            /** Format: int64 */
+            highlight_end: number;
+            /** Format: int64 */
+            highlight_start: number;
+            /** Format: int64 */
+            last_unit_index: number;
+            /** Format: int64 */
+            lexical_rank?: number;
+            matched_signals: string[] | null;
+            /** Format: int64 */
+            message_id: number;
+            mime_type?: string;
+            model: string;
+            /** Format: date-time */
+            occurred_at?: string;
+            occurrence_key: string;
+            /** Format: int64 */
+            other_live_copies: number;
+            person_provenance?: components["schemas"]["Provenance"];
+            profile_id: string;
+            provider: string;
+            /** Format: int64 */
+            rank: number;
+            /** Format: int64 */
+            semantic_rank?: number;
+            /** Format: double */
+            semantic_score?: number;
+            /** Format: int64 */
+            source_id: number;
+            source_message_id?: string;
+            source_part_key?: string;
+            truncated: boolean;
+            /** Format: int64 */
+            vector_dimension?: number;
+            vector_embedding_profile?: string;
+            vector_generation_fingerprint?: string;
+            /** Format: int64 */
+            vector_generation_id?: number;
+            vector_model?: string;
+            vector_token?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        DocumentVectorConsent: {
+            /** Format: date-time */
+            consented_at: string;
+            /** Format: int64 */
+            dimension: number;
+            egress_fingerprint: string;
+            embedding_profile: string;
+            fingerprint: string;
+            model: string;
+            purpose: string;
+            target_extraction_profile_id: string;
+        } & {
+            [key: string]: unknown;
+        };
+        DocumentVectorCoverage: {
+            /** Format: int64 */
+            ready: number;
+            /** Format: int64 */
+            required: number;
+        } & {
+            [key: string]: unknown;
+        };
+        DocumentVectorFailureDiagnostic: {
+            /** Format: int64 */
+            attempt_count: number;
+            error_code: string;
+            /** Format: date-time */
+            next_retry_at?: string;
+            terminal: boolean;
+            token: string;
+        } & {
+            [key: string]: unknown;
+        };
+        DocumentVectorGeneration: {
+            /** Format: date-time */
+            activated_at?: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: int64 */
+            dimension: number;
+            embedding_profile: string;
+            fingerprint: string;
+            /** Format: int64 */
+            id: number;
+            model: string;
+            /** Format: date-time */
+            retired_at?: string;
+            state: string;
+            target_extraction_profile_id: string;
+        } & {
+            [key: string]: unknown;
+        };
+        DocumentVectorGenerationSpec: {
+            /** Format: int64 */
+            dimension: number;
+            embedding_profile: string;
+            fingerprint: string;
+            model: string;
+            target_extraction_profile_id: string;
+        } & {
+            [key: string]: unknown;
+        };
+        DocumentVectorGenerationStatus: {
+            blocked: boolean;
+            /** Format: int64 */
+            cleanup_pending: number;
+            /** Format: int64 */
+            failure_after_generation_id?: number;
+            failure_after_token?: string;
+            failures: components["schemas"]["DocumentVectorFailureDiagnostic"][] | null;
+            failures_exhausted: boolean;
+            /** Format: int64 */
+            generation_id: number;
+            /** Format: int64 */
+            pending: number;
+            /** Format: int64 */
+            ready_live: number;
+            /** Format: int64 */
+            retryable: number;
+            /** Format: int64 */
+            stale_obsolete: number;
+            state: string;
+            /** Format: int64 */
+            terminal: number;
+        } & {
+            [key: string]: unknown;
+        };
+        DocumentVectorOperationsResponse: {
+            configured: boolean;
+            enabled: boolean;
+            scheduled_registration_requires_restart?: boolean;
+            status?: components["schemas"]["DocumentVectorOperationsStatus"];
+        } & {
+            [key: string]: unknown;
+        };
+        DocumentVectorOperationsStatus: {
+            active?: components["schemas"]["DocumentVectorGeneration"];
+            building?: components["schemas"]["DocumentVectorGeneration"];
+            configured_document_egress_fingerprint: string;
+            configured_query_egress_fingerprint: string;
+            configured_spec: components["schemas"]["DocumentVectorGenerationSpec"];
+            coverage?: components["schemas"]["DocumentVectorCoverage"];
+            document_consent?: components["schemas"]["DocumentVectorConsent"];
+            query_consent?: components["schemas"]["DocumentVectorConsent"];
+            selected?: components["schemas"]["DocumentVectorGenerationStatus"];
+            usage: components["schemas"]["DocumentVectorProviderUsage"];
+        } & {
+            [key: string]: unknown;
+        };
+        DocumentVectorProviderUsage: {
+            fingerprint: string;
+            /** Format: int64 */
+            provider_calls: number;
+            /** Format: int64 */
+            provider_chunks: number;
+            /** Format: int64 */
+            provider_documents: number;
+            /** Format: int64 */
+            provider_input_chars: number;
+            /** Format: date-time */
+            updated_at?: string;
         } & {
             [key: string]: unknown;
         };
@@ -2445,6 +4673,95 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        DuplicateCostRisk: {
+            at_least_once: boolean;
+            detail: string;
+            provider_idempotent: boolean;
+        } & {
+            [key: string]: unknown;
+        };
+        Employment: {
+            /** Format: int64 */
+            address_id?: number;
+            /** Format: double */
+            confidence?: number;
+            /** Format: date-time */
+            created_at: string;
+            department?: string;
+            description?: string;
+            end_date?: components["schemas"]["PartialDate"];
+            /** Format: int64 */
+            id: number;
+            is_current: boolean;
+            is_primary: boolean;
+            location?: string;
+            /** Format: int64 */
+            organization_id: number;
+            /** Format: int64 */
+            person_id: number;
+            /** Format: int64 */
+            revision: number;
+            role?: string;
+            source: string;
+            source_ref?: string;
+            start_date?: components["schemas"]["PartialDate"];
+            title?: string;
+            /** Format: date-time */
+            updated_at: string;
+        } & {
+            [key: string]: unknown;
+        };
+        EmploymentBody: {
+            /** Format: int64 */
+            address_id?: number | null;
+            /** Format: double */
+            confidence?: number | null;
+            department?: string | null;
+            description?: string | null;
+            end_date?: string | null;
+            is_current?: boolean | null;
+            is_primary?: boolean | null;
+            location?: string | null;
+            /** Format: int64 */
+            organization_id: number;
+            /** Format: int64 */
+            person_id: number;
+            role?: string | null;
+            /** @enum {string} */
+            source: "user" | "carddav_import" | "vcard_import" | "archive_observation" | "extraction" | "enrichment" | "system";
+            source_ref?: string | null;
+            start_date?: string | null;
+            title?: string | null;
+        };
+        EmploymentProjectionResponse: {
+            department?: string;
+            /** Format: int64 */
+            employment_id: number;
+            /** Format: int64 */
+            organization_id: number;
+            organization_name: string;
+            role?: string;
+            title?: string;
+            vcard: components["schemas"]["EmploymentVCard"];
+        } & {
+            [key: string]: unknown;
+        };
+        EmploymentVCard: {
+            org?: string[] | null;
+            role?: string;
+            title?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        EmploymentsResponse: {
+            employments: components["schemas"]["Employment"][] | null;
+            projection?: components["schemas"]["EmploymentProjectionResponse"];
+        } & {
+            [key: string]: unknown;
+        };
+        EndEmploymentBody: {
+            end_date: string;
+        };
         EntryRow: {
             /** Format: int64 */
             anchor_message_id?: number;
@@ -2462,6 +4779,8 @@ export interface components {
             key: string;
             kind: string;
             match: components["schemas"]["MatchSummary"];
+            matched_recipient_identities: string[];
+            matched_sender_identities: string[];
             /** Format: int64 */
             message_count: number;
             message_type: string;
@@ -2497,6 +4816,7 @@ export interface components {
             started_at: string;
             /** Format: int64 */
             succeeded: number;
+            tombstone_ids?: string[] | null;
         };
         ExploreActionTarget: {
             action: string;
@@ -2510,7 +4830,7 @@ export interface components {
             error: string;
             message: string;
             /** @enum {string} */
-            readiness: "absent" | "interrupted" | "stale_schema" | "drifted";
+            readiness: "absent" | "building" | "interrupted" | "stale_schema" | "drifted";
             recovery_action: string;
         } & {
             [key: string]: unknown;
@@ -2556,7 +4876,7 @@ export interface components {
         };
         ExploreFilter: {
             /** @enum {string} */
-            dimension: "source" | "participant" | "domain" | "message_type" | "after" | "before" | "deletion";
+            dimension: "source" | "participant" | "domain" | "message_type" | "after" | "before" | "deletion" | "identity";
             values: string[];
         };
         /** @enum {string} */
@@ -2692,6 +5012,14 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        FieldDescriptor: {
+            cardinality: string;
+            name: string;
+            required: boolean;
+            value_type: string;
+        } & {
+            [key: string]: unknown;
+        };
         FileGroupsHTTPRequest: {
             cursor?: string;
             filename_query?: string;
@@ -2733,6 +5061,16 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        FileSearchExplain: {
+            /** Format: int64 */
+            filename_rank?: number;
+            /** Format: double */
+            rrf: number;
+            /** Format: int64 */
+            visual_rank?: number;
+        } & {
+            [key: string]: unknown;
+        };
         FileSearchHTTPRequest: {
             cursor?: string;
             filename_query?: string;
@@ -2741,6 +5079,8 @@ export interface components {
             mime_families?: string[] | null;
             predicate: components["schemas"]["ExploreHTTPRequest"];
             sort: components["schemas"]["FileSearchSort"];
+            visual_image_base64?: string;
+            visual_query?: string;
         };
         FileSearchHTTPResponse: {
             cache_revision: string;
@@ -2774,6 +5114,7 @@ export interface components {
             participant_domains?: string[] | null;
             participant_ids?: number[] | null;
             participant_labels?: string[] | null;
+            search_explain?: components["schemas"]["FileSearchExplain"];
             /** Format: int64 */
             size_bytes: number;
             /** Format: int64 */
@@ -2808,6 +5149,23 @@ export interface components {
             sender_domains?: string[] | null;
             senders?: string[] | null;
         };
+        FormatCoverage: {
+            /** Format: int64 */
+            bytes: number;
+            /** Format: int64 */
+            current: number;
+            /** Format: int64 */
+            eligible: number;
+            mime_type: string;
+            /** Format: int64 */
+            retryable: number;
+            /** Format: int64 */
+            stale: number;
+            /** Format: int64 */
+            terminal: number;
+        } & {
+            [key: string]: unknown;
+        };
         GenerationSummary: {
             activated_at?: string;
             /** Format: int64 */
@@ -2824,11 +5182,13 @@ export interface components {
         };
         GmailIDsResponse: {
             gmail_ids: string[] | null;
+            targets?: components["schemas"]["DeletionTarget"][] | null;
         } & {
             [key: string]: unknown;
         };
         HealthResponse: {
             analytics_engine?: string;
+            api_schema_version?: string;
             operation?: components["schemas"]["OperationHealth"];
             status: string;
             vector?: components["schemas"]["VectorHealth"];
@@ -2904,6 +5264,13 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        IdentityConfirmationOutcome: {
+            added: boolean;
+            identifier: string;
+            signals: string[] | null;
+        } & {
+            [key: string]: unknown;
+        };
         IdentityLinkRequest: {
             /** Format: int64 */
             participant_a: number;
@@ -2913,6 +5280,78 @@ export interface components {
         IdentityLinkResponse: {
             /** @enum {string} */
             cache_state: "ready" | "stale";
+            /** Format: int64 */
+            identity_revision: number;
+        } & {
+            [key: string]: unknown;
+        };
+        IdentityMatchAcceptResponse: {
+            /** @enum {string} */
+            cache_state: "ready" | "stale";
+            candidate: components["schemas"]["IdentityMatchCandidate"];
+            /** Format: int64 */
+            identity_revision: number;
+        } & {
+            [key: string]: unknown;
+        };
+        IdentityMatchCandidate: {
+            basis: string;
+            /** Format: double */
+            confidence?: number;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: date-time */
+            decided_at?: string;
+            decided_by?: string;
+            evidence: components["schemas"]["IdentityMatchEvidence"][] | null;
+            /** Format: int64 */
+            id: number;
+            /** Format: int64 */
+            left_id: number;
+            left_kind: string;
+            normalized_value?: string;
+            notes?: string;
+            /** Format: int64 */
+            right_id: number;
+            right_kind: string;
+            scope_kind?: string;
+            scope_value?: string;
+            service_slug?: string;
+            source: string;
+            source_ref?: string;
+            state: string;
+            /** Format: date-time */
+            updated_at: string;
+        } & {
+            [key: string]: unknown;
+        };
+        IdentityMatchCandidatesResponse: {
+            candidates: components["schemas"]["IdentityMatchCandidate"][] | null;
+            /** Format: int64 */
+            limit: number;
+            /** Format: int64 */
+            offset: number;
+        } & {
+            [key: string]: unknown;
+        };
+        IdentityMatchEvidence: {
+            /** Format: int64 */
+            candidate_id: number;
+            /** Format: date-time */
+            created_at: string;
+            detail?: string;
+            evidence_kind: string;
+            evidence_ref?: string;
+            /** Format: int64 */
+            id: number;
+            source: string;
+        } & {
+            [key: string]: unknown;
+        };
+        IdentityMatchRejectResponse: {
+            /** @enum {string} */
+            cache_state: "ready" | "stale";
+            candidate: components["schemas"]["IdentityMatchCandidate"];
             /** Format: int64 */
             identity_revision: number;
         } & {
@@ -2932,6 +5371,28 @@ export interface components {
             /** @enum {string} */
             field: "activity_count" | "latest_at" | "display_label";
         };
+        ImportEntry: {
+            identifier: string;
+            state?: string;
+        };
+        ImportRequest: {
+            account?: string;
+            apply?: boolean;
+            entries: components["schemas"]["ImportEntry"][];
+            signal?: string;
+            /** Format: int64 */
+            source_id?: number;
+        };
+        ImportResult: {
+            account: string;
+            applied: components["schemas"]["IdentityConfirmationOutcome"][];
+            candidates: components["schemas"]["Candidate"][];
+            signal: string;
+            /** Format: int64 */
+            source_id: number;
+        } & {
+            [key: string]: unknown;
+        };
         ListDeletionsResponse: {
             manifests: components["schemas"]["DeletionManifestSummary"][] | null;
         } & {
@@ -2947,6 +5408,7 @@ export interface components {
             gmail_ids: string[] | null;
             id: string;
             raw_filter?: unknown;
+            source?: components["schemas"]["SourceReference"];
             status: string;
             summary?: components["schemas"]["Summary"];
             /** Format: int64 */
@@ -3006,6 +5468,16 @@ export interface components {
             email: string;
             name?: string;
         };
+        MergeOrganizationBody: {
+            /** Format: int64 */
+            losing_organization_id: number;
+            /** Format: int64 */
+            losing_revision: number;
+        };
+        MergePersonRequest: {
+            /** Format: int64 */
+            absorbed_person_id: number;
+        };
         MessageDetail: {
             attachments: components["schemas"]["AttachmentInfo"][] | null;
             bcc?: string[] | null;
@@ -3023,6 +5495,7 @@ export interface components {
             has_attachments: boolean;
             /** Format: int64 */
             id: number;
+            is_from_me?: boolean;
             labels: string[] | null;
             message_type?: string;
             sent_at: string;
@@ -3166,8 +5639,443 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        Organization: {
+            /** Format: date-time */
+            created_at: string;
+            description?: string;
+            /** Format: int64 */
+            id: number;
+            kind: string;
+            /** Format: int64 */
+            merged_into_id?: number;
+            name: string;
+            primary_domain?: string;
+            /** Format: date-time */
+            retired_at?: string;
+            /** Format: int64 */
+            revision: number;
+            /** Format: date-time */
+            updated_at: string;
+        } & {
+            [key: string]: unknown;
+        };
+        OrganizationAddress: {
+            address_kind: string;
+            country_code?: string;
+            country_name?: string;
+            envelope: components["schemas"]["ValueEnvelope"];
+            extended_address?: string;
+            extended_components?: string;
+            free_text?: string;
+            geo_uri?: string;
+            label?: string;
+            locality?: string;
+            /** Format: int64 */
+            organization_id: number;
+            original_value: string;
+            place_uri?: string;
+            post_office_box?: string;
+            postal_code?: string;
+            region?: string;
+            street_address?: string;
+            timezone?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        OrganizationAddressBody: {
+            /** Format: date-time */
+            active_from?: string | null;
+            address_kind: string;
+            /** Format: double */
+            confidence?: number | null;
+            country_code?: string | null;
+            country_name?: string | null;
+            extended_address?: string | null;
+            extended_components?: string | null;
+            free_text?: string | null;
+            geo_uri?: string | null;
+            label?: string | null;
+            locality?: string | null;
+            /** Format: int64 */
+            ordinal?: number;
+            original_value?: string;
+            place_uri?: string | null;
+            post_office_box?: string | null;
+            postal_code?: string | null;
+            /** Format: int64 */
+            pref?: number | null;
+            region?: string | null;
+            /** @enum {string} */
+            source: "user" | "carddav_import" | "vcard_import" | "archive_observation" | "extraction" | "enrichment" | "system";
+            source_ref?: string | null;
+            street_address?: string | null;
+            timezone?: string | null;
+            type_label?: string | null;
+            type_tokens?: string[] | null;
+            vcard_altid?: string | null;
+            vcard_group?: string | null;
+            vcard_pid?: string[] | null;
+            vcard_prop_id?: string | null;
+            vcard_property?: string | null;
+        };
+        OrganizationAttributeValue: {
+            /** Format: date-time */
+            active_from: string;
+            /** Format: date-time */
+            active_until?: string;
+            actor?: string;
+            /** Format: double */
+            confidence?: number;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: int64 */
+            definition_id: number;
+            definition_slug: string;
+            /** Format: int64 */
+            id: number;
+            /** Format: int64 */
+            ordinal: number;
+            /** Format: int64 */
+            organization_id: number;
+            source: string;
+            source_ref?: string;
+            /** Format: date-time */
+            superseded_at?: string;
+            value: components["schemas"]["AttributeValue"];
+        } & {
+            [key: string]: unknown;
+        };
+        OrganizationAttributeWrite: {
+            dry_run: boolean;
+            superseded?: components["schemas"]["OrganizationAttributeValue"];
+            value?: components["schemas"]["OrganizationAttributeValue"];
+        } & {
+            [key: string]: unknown;
+        };
+        OrganizationAttributesResponse: {
+            values: components["schemas"]["OrganizationAttributeValue"][] | null;
+        } & {
+            [key: string]: unknown;
+        };
+        OrganizationBody: {
+            description?: string | null;
+            /** @enum {string} */
+            kind?: "company" | "nonprofit" | "school" | "government" | "household" | "other";
+            name: string;
+            primary_domain?: string | null;
+            retired?: boolean | null;
+        };
+        OrganizationCategory: {
+            category: string;
+            category_normalized: string;
+            envelope: components["schemas"]["ValueEnvelope"];
+            /** Format: int64 */
+            organization_id: number;
+        } & {
+            [key: string]: unknown;
+        };
+        OrganizationCategoryBody: {
+            /** Format: date-time */
+            active_from?: string | null;
+            category: string;
+            /** Format: double */
+            confidence?: number | null;
+            /** Format: int64 */
+            ordinal?: number;
+            /** Format: int64 */
+            pref?: number | null;
+            /** @enum {string} */
+            source: "user" | "carddav_import" | "vcard_import" | "archive_observation" | "extraction" | "enrichment" | "system";
+            source_ref?: string | null;
+            type_label?: string | null;
+            type_tokens?: string[] | null;
+            vcard_altid?: string | null;
+            vcard_group?: string | null;
+            vcard_pid?: string[] | null;
+            vcard_prop_id?: string | null;
+            vcard_property?: string | null;
+        };
+        OrganizationContactPoint: {
+            address_kind: string;
+            envelope: components["schemas"]["ValueEnvelope"];
+            normalization: string;
+            /** Format: int64 */
+            normalization_version: number;
+            normalized_value: string;
+            /** Format: int64 */
+            organization_id: number;
+            original_value: string;
+            scope_kind?: string;
+            scope_value?: string;
+            service_slug?: string;
+            uri?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        OrganizationContactPointBody: {
+            /** Format: date-time */
+            active_from?: string | null;
+            /** Format: double */
+            confidence?: number | null;
+            /** @enum {string} */
+            contact_kind: "email" | "phone" | "username" | "impp" | "url" | "social" | "calendar" | "contact_uri" | "org_directory" | "language";
+            /** Format: int64 */
+            ordinal?: number;
+            original_value: string;
+            /** Format: int64 */
+            pref?: number | null;
+            scope_kind?: string | null;
+            scope_value?: string | null;
+            service_slug?: string | null;
+            /** @enum {string} */
+            source: "user" | "carddav_import" | "vcard_import" | "archive_observation" | "extraction" | "enrichment" | "system";
+            source_ref?: string | null;
+            type_label?: string | null;
+            type_tokens?: string[] | null;
+            uri?: string | null;
+            vcard_altid?: string | null;
+            vcard_group?: string | null;
+            vcard_pid?: string[] | null;
+            vcard_prop_id?: string | null;
+            vcard_property?: string | null;
+        };
+        OrganizationCreateBody: {
+            description?: string | null;
+            /** @enum {string} */
+            kind?: "company" | "nonprofit" | "school" | "government" | "household" | "other";
+            name: string;
+            primary_domain?: string | null;
+        };
+        OrganizationIdentifier: {
+            envelope: components["schemas"]["ValueEnvelope"];
+            identifier_kind: string;
+            identifier_value: string;
+            normalized_value: string;
+            /** Format: int64 */
+            organization_id: number;
+        } & {
+            [key: string]: unknown;
+        };
+        OrganizationIdentifierBody: {
+            /** Format: date-time */
+            active_from?: string | null;
+            /** Format: double */
+            confidence?: number | null;
+            /** @enum {string} */
+            identifier_kind: "domain" | "linkedin" | "duns" | "tax_id" | "registry" | "other";
+            identifier_value: string;
+            /** Format: int64 */
+            ordinal?: number;
+            /** Format: int64 */
+            pref?: number | null;
+            /** @enum {string} */
+            source: "user" | "carddav_import" | "vcard_import" | "archive_observation" | "extraction" | "enrichment" | "system";
+            source_ref?: string | null;
+            type_label?: string | null;
+            type_tokens?: string[] | null;
+            vcard_altid?: string | null;
+            vcard_group?: string | null;
+            vcard_pid?: string[] | null;
+            vcard_prop_id?: string | null;
+            vcard_property?: string | null;
+        };
+        OrganizationMedia: {
+            /** Format: int64 */
+            byte_size?: number;
+            content_hash?: string;
+            envelope: components["schemas"]["ValueEnvelope"];
+            has_data: boolean;
+            media_kind: string;
+            media_type?: string;
+            /** Format: int64 */
+            organization_id: number;
+            original_value: string;
+            uri?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        OrganizationMediaBody: {
+            /** Format: date-time */
+            active_from?: string | null;
+            /** Format: double */
+            confidence?: number | null;
+            content_hash?: string | null;
+            data?: string;
+            /** @enum {string} */
+            media_kind: "photo" | "logo" | "sound" | "key";
+            media_type?: string | null;
+            /** Format: int64 */
+            ordinal?: number;
+            original_value?: string;
+            /** Format: int64 */
+            pref?: number | null;
+            /** @enum {string} */
+            source: "user" | "carddav_import" | "vcard_import" | "archive_observation" | "extraction" | "enrichment" | "system";
+            source_ref?: string | null;
+            type_label?: string | null;
+            type_tokens?: string[] | null;
+            uri?: string | null;
+            vcard_altid?: string | null;
+            vcard_group?: string | null;
+            vcard_pid?: string[] | null;
+            vcard_prop_id?: string | null;
+            vcard_property?: string | null;
+        };
+        OrganizationName: {
+            envelope: components["schemas"]["ValueEnvelope"];
+            name: string;
+            name_kind: string;
+            name_normalized: string;
+            /** Format: int64 */
+            organization_id: number;
+        } & {
+            [key: string]: unknown;
+        };
+        OrganizationNameBody: {
+            /** Format: date-time */
+            active_from?: string | null;
+            /** Format: double */
+            confidence?: number | null;
+            name: string;
+            /** @enum {string} */
+            name_kind: "alias" | "legal" | "former" | "abbreviation" | "sort";
+            /** Format: int64 */
+            ordinal?: number;
+            /** Format: int64 */
+            pref?: number | null;
+            /** @enum {string} */
+            source: "user" | "carddav_import" | "vcard_import" | "archive_observation" | "extraction" | "enrichment" | "system";
+            source_ref?: string | null;
+            type_label?: string | null;
+            type_tokens?: string[] | null;
+            vcard_altid?: string | null;
+            vcard_group?: string | null;
+            vcard_pid?: string[] | null;
+            vcard_prop_id?: string | null;
+            vcard_property?: string | null;
+        };
+        OrganizationProfile: {
+            addresses: components["schemas"]["OrganizationAddress"][] | null;
+            categories: components["schemas"]["OrganizationCategory"][] | null;
+            contact_points: components["schemas"]["OrganizationContactPoint"][] | null;
+            identifiers: components["schemas"]["OrganizationIdentifier"][] | null;
+            media: components["schemas"]["OrganizationMedia"][] | null;
+            names: components["schemas"]["OrganizationName"][] | null;
+            organization: components["schemas"]["Organization"];
+        } & {
+            [key: string]: unknown;
+        };
+        OrganizationProfileBody: {
+            addresses?: components["schemas"]["OrganizationAddressBody"][] | null;
+            categories?: components["schemas"]["OrganizationCategoryBody"][] | null;
+            contact_points?: components["schemas"]["OrganizationContactPointBody"][] | null;
+            identifiers?: components["schemas"]["OrganizationIdentifierBody"][] | null;
+            media?: components["schemas"]["OrganizationMediaBody"][] | null;
+            names?: components["schemas"]["OrganizationNameBody"][] | null;
+        };
+        OrganizationsResponse: {
+            /** Format: int64 */
+            limit: number;
+            /** Format: int64 */
+            offset: number;
+            organizations: components["schemas"]["Organization"][] | null;
+            /** Format: int64 */
+            total: number;
+        } & {
+            [key: string]: unknown;
+        };
+        PartialDate: {
+            /** Format: int64 */
+            day?: number;
+            /** Format: int64 */
+            month?: number;
+            /** Format: int64 */
+            year?: number;
+        };
+        ParticipantCompletionHTTPRequest: {
+            /** Format: int64 */
+            limit?: number;
+            query: string;
+        };
+        ParticipantCompletionHTTPResponse: {
+            cache_revision: string;
+            rows: components["schemas"]["ParticipantCompletionHTTPRow"][] | null;
+        } & {
+            [key: string]: unknown;
+        };
+        ParticipantCompletionHTTPRow: {
+            display_label: string;
+            /** @enum {string} */
+            kind: "name" | "phone" | "email" | "username" | "impp" | "organization" | "title" | "role";
+            /** Format: int64 */
+            participant_id: number;
+            source: string;
+            value: string;
+        } & {
+            [key: string]: unknown;
+        };
+        ParticipantContactObservation: {
+            address_kind: string;
+            envelope: components["schemas"]["ValueEnvelope"];
+            normalization: string;
+            /** Format: int64 */
+            normalization_version: number;
+            normalized_value: string;
+            /** Format: date-time */
+            observed_at?: string;
+            original_value: string;
+            /** Format: int64 */
+            participant_id: number;
+            provider_user_id?: string;
+            scope_kind?: string;
+            scope_value?: string;
+            service_slug?: string;
+            /** Format: int64 */
+            source_id?: number;
+        } & {
+            [key: string]: unknown;
+        };
+        ParticipantContextSummaryHTTPResponse: {
+            cache_revision: string;
+            candidate_snapshot_id?: string;
+            search_provenance: components["schemas"]["SearchProvenance"];
+            summary: components["schemas"]["PersonSummary"];
+        } & {
+            [key: string]: unknown;
+        };
+        ParticipantSearchHTTPResponse: {
+            cache_revision: string;
+            candidate_snapshot_id?: string;
+            next_cursor?: string;
+            rows: components["schemas"]["PersonSummary"][] | null;
+            search_provenance: components["schemas"]["SearchProvenance"];
+            /** Format: int64 */
+            total_count: number;
+        } & {
+            [key: string]: unknown;
+        };
+        PatchAttributeDefinitionRequest: {
+            description?: string | null;
+            /** Format: int64 */
+            display_order?: number;
+            is_active?: boolean;
+            is_sensitive?: boolean;
+            label?: string;
+        };
+        PatchPersonRelationshipRequest: {
+            end_date?: string;
+            notes?: string | null;
+        };
         PatchPersonRequest: {
             display_name: string | null;
+        };
+        PatchRelationshipTypeRequest: {
+            color?: string;
+            description?: string;
+            forward_label?: string;
+            icon?: string;
+            reverse_label?: string;
+            vcard_related_type?: string;
         };
         PatchSavedViewRequest: {
             canonical_state?: components["schemas"]["SavedViewStateEnvelope"];
@@ -3175,6 +6083,11 @@ export interface components {
             name?: string;
             /** Format: int64 */
             schema_version?: number;
+        };
+        PeopleResponse: {
+            people: components["schemas"]["Person"][] | null;
+        } & {
+            [key: string]: unknown;
         };
         Person: {
             /** Format: date-time */
@@ -3190,6 +6103,126 @@ export interface components {
             vcard_uid: string;
         } & {
             [key: string]: unknown;
+        };
+        PersonAddress: {
+            address_kind: string;
+            country_code?: string;
+            country_name?: string;
+            envelope: components["schemas"]["ValueEnvelope"];
+            extended_address?: string;
+            extended_components?: string;
+            free_text?: string;
+            geo_uri?: string;
+            label?: string;
+            locality?: string;
+            original_value: string;
+            /** Format: int64 */
+            person_id: number;
+            place_uri?: string;
+            post_office_box?: string;
+            postal_code?: string;
+            region?: string;
+            street_address?: string;
+            timezone?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonAddressInputRequest: {
+            address_kind: string;
+            country_code?: string;
+            country_name?: string;
+            envelope: components["schemas"]["ValueEnvelopeInput"];
+            extended_address?: string;
+            extended_components?: string;
+            free_text?: string;
+            geo_uri?: string;
+            label?: string;
+            locality?: string;
+            original_value?: string;
+            place_uri?: string;
+            post_office_box?: string;
+            postal_code?: string;
+            region?: string;
+            street_address?: string;
+            timezone?: string;
+        };
+        PersonAddressPatchRequest: {
+            add?: components["schemas"]["PersonAddressInputRequest"][] | null;
+            supersede?: number[] | null;
+        };
+        PersonAttributeConflictResponse: {
+            current_value?: components["schemas"]["PersonAttributeValue"];
+            /** Format: int64 */
+            current_value_id?: number;
+            error: string;
+            message?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonAttributeGroup: {
+            current: components["schemas"]["PersonAttributeValue"][] | null;
+            definition: components["schemas"]["AttributeDefinition"];
+            history?: components["schemas"]["PersonAttributeValue"][] | null;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonAttributeValue: {
+            /** Format: date-time */
+            active_from: string;
+            /** Format: date-time */
+            active_until?: string;
+            actor?: string;
+            /** Format: double */
+            confidence?: number;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: int64 */
+            definition_id: number;
+            definition_slug: string;
+            /** Format: int64 */
+            id: number;
+            /** Format: int64 */
+            ordinal: number;
+            /** Format: int64 */
+            person_id: number;
+            source: string;
+            source_ref?: string;
+            /** Format: date-time */
+            superseded_at?: string;
+            value: components["schemas"]["AttributeValue"];
+        } & {
+            [key: string]: unknown;
+        };
+        PersonAttributeWrite: {
+            dry_run: boolean;
+            superseded?: components["schemas"]["PersonAttributeValue"];
+            value?: components["schemas"]["PersonAttributeValue"];
+        } & {
+            [key: string]: unknown;
+        };
+        PersonAttributesResponse: {
+            attributes: components["schemas"]["PersonAttributeGroup"][] | null;
+            /** Format: int64 */
+            person_id: number;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonCategory: {
+            envelope: components["schemas"]["ValueEnvelope"];
+            normalized_value: string;
+            original_value: string;
+            /** Format: int64 */
+            person_id: number;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonCategoryInputRequest: {
+            envelope: components["schemas"]["ValueEnvelopeInput"];
+            original_value: string;
+        };
+        PersonCategoryPatchRequest: {
+            add?: components["schemas"]["PersonCategoryInputRequest"][] | null;
+            supersede?: number[] | null;
         };
         PersonCluster: {
             /** Format: int64 */
@@ -3207,11 +6240,306 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        PersonContextSummaryHTTPResponse: {
+        PersonContactPoint: {
+            address_kind: string;
+            envelope: components["schemas"]["ValueEnvelope"];
+            normalization: string;
+            /** Format: int64 */
+            normalization_version: number;
+            normalized_value: string;
+            original_value: string;
+            /** Format: int64 */
+            person_id: number;
+            scope_kind?: string;
+            scope_value?: string;
+            service_slug?: string;
+            uri?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonContactPointInputRequest: {
+            address_kind: string;
+            envelope: components["schemas"]["ValueEnvelopeInput"];
+            original_value: string;
+            scope_kind?: string;
+            scope_value?: string;
+            service_slug?: string;
+            uri?: string;
+        };
+        PersonContactPointPatchRequest: {
+            add?: components["schemas"]["PersonContactPointInputRequest"][] | null;
+            supersede?: number[] | null;
+        };
+        PersonDate: {
+            calendar_scale?: string;
+            date: components["schemas"]["PartialDate"];
+            date_kind: string;
+            date_text?: string;
+            envelope: components["schemas"]["ValueEnvelope"];
+            label?: string;
+            original_value: string;
+            /** Format: int64 */
+            person_id: number;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonDateInputRequest: {
+            calendar_scale?: string;
+            date?: components["schemas"]["PartialDate"];
+            date_kind: string;
+            date_text?: string;
+            envelope: components["schemas"]["ValueEnvelopeInput"];
+            label?: string;
+            original_value?: string;
+        };
+        PersonDatePatchRequest: {
+            add?: components["schemas"]["PersonDateInputRequest"][] | null;
+            supersede?: number[] | null;
+        };
+        PersonDay: {
+            /** Format: int64 */
+            direct_count: number;
+            /** Format: int64 */
+            entry_count: number;
+            /** Format: int64 */
+            event_count: number;
+            local_date: string;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonDayPage: {
+            activity: components["schemas"]["ActivityRef"][];
+            /** Format: int64 */
+            activity_total_count: number;
+            entries: components["schemas"]["DailyNoteEntry"][];
+            /** Format: int64 */
+            entry_total_count: number;
+            local_date: string;
+            /** Format: int64 */
+            person_id: number;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonDaysPage: {
+            days: components["schemas"]["PersonDay"][];
+            /** Format: int64 */
+            person_id: number;
+            /** Format: int64 */
+            total_count: number;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonFactClaim: {
+            claim_key: string;
+            confidence: components["schemas"]["ConfidenceInputs"];
+            /** Format: date-time */
+            created_at: string;
+            evidence_ids: number[] | null;
+            /** Format: int64 */
+            generation_id: number;
+            /** Format: int64 */
+            id: number;
+            normalized_value?: string | null;
+            origin: string;
+            program_fingerprint: string;
+            program_id: string;
+            program_version: string;
+            relation: string;
+            submitted_value: string;
+            target: components["schemas"]["TargetRef"];
+            /** Format: date-time */
+            valid_from?: string | null;
+            /** Format: date-time */
+            valid_until?: string | null;
+            value_fingerprint?: string | null;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonFactClaimsResponse: {
+            claims: components["schemas"]["PersonFactClaim"][];
+        } & {
+            [key: string]: unknown;
+        };
+        PersonFactDecision: {
+            action: string;
+            claim_key: string;
+            competing_claim_key?: string;
+            /** Format: date-time */
+            created_at: string;
+            decision_key: string;
+            /** Format: int64 */
+            id: number;
+            projection?: components["schemas"]["ProjectionRef"];
+            reason: string;
+            /** Format: int64 */
+            resolution_id: number;
+            score: components["schemas"]["PersonFactScoreBreakdown"];
+        } & {
+            [key: string]: unknown;
+        };
+        PersonFactDecisionsResponse: {
+            decisions: components["schemas"]["PersonFactDecision"][];
+        } & {
+            [key: string]: unknown;
+        };
+        PersonFactEvidence: {
+            authority: string;
+            content_sha256: string | null;
+            /** Format: date-time */
+            created_at: string;
+            directness: string;
+            /** Format: date-time */
+            event_time: string;
+            evidence_key: string;
+            excerpt: string | null;
+            /** Format: int64 */
+            id: number;
+            /** Format: int64 */
+            identity_score: number;
+            latest_status?: components["schemas"]["PersonFactEvidenceStatusEvent"];
+            /** Format: date-time */
+            recorded_time: string;
+            source_class: string;
+            source_ref: string | null;
+            source_url: string | null;
+            source_version: string | null;
+            /** Format: int64 */
+            span_end?: number | null;
+            /** Format: int64 */
+            span_start?: number | null;
+            /** Format: int64 */
+            subject_person_id?: number | null;
+            subject_ref: string | null;
+            supported: boolean;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonFactEvidenceResponse: {
+            evidence: components["schemas"]["PersonFactEvidence"][];
+        } & {
+            [key: string]: unknown;
+        };
+        PersonFactEvidenceStatusEvent: {
+            /** Format: date-time */
+            created_at: string;
+            evidence_key: string;
+            /** Format: int64 */
+            generation_id: number;
+            /** Format: int64 */
+            id: number;
+            reason: string;
+            source_version: string | null;
+            supported: boolean;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonFactEvidenceStatusEventsResponse: {
+            events: components["schemas"]["PersonFactEvidenceStatusEvent"][];
+        } & {
+            [key: string]: unknown;
+        };
+        PersonFactPinWrite: {
+            projections: components["schemas"]["ProjectionRef"][] | null;
+            resolutions: components["schemas"]["PersonFactResolutionResult"][] | null;
+            state: components["schemas"]["PinState"];
+        } & {
+            [key: string]: unknown;
+        };
+        PersonFactPinsResponse: {
+            pins: components["schemas"]["PinState"][] | null;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonFactResolutionResult: {
+            decisions: components["schemas"]["PersonFactDecision"][] | null;
+            /** Format: int64 */
+            id: number;
+            input_fingerprint: string;
+            projections: components["schemas"]["ProjectionRef"][] | null;
+            /** Format: date-time */
+            resolved_at: string;
+            resolver_version: string;
+            target: components["schemas"]["TargetRef"];
+        } & {
+            [key: string]: unknown;
+        };
+        PersonFactScoreBreakdown: {
+            /** Format: int64 */
+            authority: number;
+            /** Format: int64 */
+            confidence: number;
+            /** Format: int64 */
+            corroboration: number;
+            /** Format: int64 */
+            directness: number;
+            /** Format: int64 */
+            freshness: number;
+            /** Format: int64 */
+            source_class: number;
+            /** Format: int64 */
+            total: number;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonFileProvenance: {
+            directions: ("from_person" | "to_person" | "group")[] | null;
+            participant_ids: number[] | null;
+            roles: ("from" | "to" | "cc" | "bcc" | "conversation_member")[] | null;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonFileSearchHTTPRequest: {
+            cursor?: string;
+            directions?: ("from_person" | "to_person" | "group")[] | null;
+            filename_query?: string;
+            /** Format: int64 */
+            limit?: number;
+            mime_families?: string[] | null;
+            predicate: components["schemas"]["ExploreHTTPRequest"];
+            sort: components["schemas"]["FileSearchSort"];
+            visual_image_base64?: string;
+            visual_query?: string;
+        };
+        PersonFileSearchHTTPResponse: {
             cache_revision: string;
             candidate_snapshot_id?: string;
+            files: components["schemas"]["PersonFileSearchRow"][] | null;
+            next_cursor?: string;
             search_provenance: components["schemas"]["SearchProvenance"];
-            summary: components["schemas"]["PersonSummary"];
+            /** Format: int64 */
+            total_count: number;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonFileSearchRow: {
+            containing_title: string;
+            content_available: boolean;
+            /** @enum {string} */
+            content_state: "metadata_only" | "url_only" | "missing_blob" | "local_content";
+            /** Format: int64 */
+            conversation_id: number;
+            entry_key: string;
+            filename: string;
+            /** Format: int64 */
+            id: number;
+            key: string;
+            /** Format: int64 */
+            message_id: number;
+            mime_family: string;
+            mime_type: string;
+            /** Format: date-time */
+            occurred_at: string;
+            participant_domains?: string[] | null;
+            participant_ids?: number[] | null;
+            participant_labels?: string[] | null;
+            person_provenance: components["schemas"]["PersonFileProvenance"];
+            search_explain?: components["schemas"]["FileSearchExplain"];
+            /** Format: int64 */
+            size_bytes: number;
+            /** Format: int64 */
+            source_id: number;
+            source_identifier: string;
+            source_type: string;
         } & {
             [key: string]: unknown;
         };
@@ -3226,6 +6554,264 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        PersonInboxResponse: {
+            cache_revision: string;
+            /** Format: int64 */
+            identity_revision: number;
+            rows: components["schemas"]["PersonInboxRow"][] | null;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonInboxRow: {
+            /** Format: int64 */
+            conversation_count: number;
+            /** Format: date-time */
+            latest_at: string;
+            /** Format: date-time */
+            latest_received_at?: string;
+            /** Format: date-time */
+            latest_sent_at?: string;
+            /** Format: int64 */
+            received_count: number;
+            /** Format: int64 */
+            sent_count: number;
+            /** Format: int64 */
+            source_id: number;
+            source_identifier: string;
+            source_type: string;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonMedia: {
+            /** Format: int64 */
+            byte_size?: number;
+            content_hash?: string;
+            envelope: components["schemas"]["ValueEnvelope"];
+            has_data: boolean;
+            media_kind: string;
+            media_type?: string;
+            original_value: string;
+            /** Format: int64 */
+            person_id: number;
+            uri?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonMediaInputRequest: {
+            data?: string;
+            envelope: components["schemas"]["ValueEnvelopeInput"];
+            media_kind: string;
+            media_type?: string;
+            original_value?: string;
+            uri?: string;
+        };
+        PersonMediaPatchRequest: {
+            add?: components["schemas"]["PersonMediaInputRequest"][] | null;
+            supersede?: number[] | null;
+        };
+        PersonMerge: {
+            /** Format: int64 */
+            absorbed_person_id: number;
+            /** Format: int64 */
+            absorbed_revision_before: number;
+            absorbed_vcard_uid: string;
+            actor: string;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: int64 */
+            current_person_id?: number;
+            /** Format: int64 */
+            id: number;
+            snapshot_sha256: string;
+            /** Format: int64 */
+            snapshot_version: number;
+            /** Format: int64 */
+            survivor_person_id: number;
+            /** Format: int64 */
+            survivor_revision_after: number;
+            /** Format: int64 */
+            survivor_revision_before: number;
+            survivor_vcard_uid: string;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonMergeDetail: {
+            merge: components["schemas"]["PersonMerge"];
+            participants: components["schemas"]["PersonMergeParticipant"][] | null;
+            review_candidates: components["schemas"]["PersonMergeReviewCandidate"][] | null;
+            rows: components["schemas"]["PersonMergeRow"][] | null;
+            splits: components["schemas"]["PersonSplit"][] | null;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonMergeParticipant: {
+            /** Format: int64 */
+            merge_id: number;
+            origin_side: string;
+            /** Format: int64 */
+            participant_id: number;
+            /** Format: int64 */
+            split_id?: number;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonMergeProfile: {
+            etag: string;
+            person: components["schemas"]["Person"];
+        } & {
+            [key: string]: unknown;
+        };
+        PersonMergeRequiredError: {
+            error: string;
+            message: string;
+            profiles: components["schemas"]["PersonMergeProfile"][] | null;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonMergeResult: {
+            /** @enum {string} */
+            cache_state: "ready" | "stale";
+            /** Format: int64 */
+            identity_revision: number;
+            merge: components["schemas"]["PersonMerge"];
+            person: components["schemas"]["Person"];
+            review_candidates: components["schemas"]["PersonMergeReviewCandidate"][] | null;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonMergeReviewCandidate: {
+            /** Format: int64 */
+            absorbed_value_id: number;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: int64 */
+            definition_id: number;
+            /** Format: int64 */
+            id: number;
+            /** Format: int64 */
+            merge_id: number;
+            /** Format: int64 */
+            person_id: number;
+            /** Format: int64 */
+            resolution_value_id?: number;
+            /** Format: date-time */
+            reviewed_at?: string;
+            reviewed_by?: string;
+            state: string;
+            /** Format: int64 */
+            survivor_value_id: number;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonMergeRow: {
+            action: string;
+            /** Format: int64 */
+            current_row_id?: number;
+            current_row_key?: string;
+            /** Format: int64 */
+            merge_id: number;
+            origin_side: string;
+            /** Format: int64 */
+            original_row_id?: number;
+            original_row_key: string;
+            /** Format: int64 */
+            participant_id?: number;
+            provenance_kind: string;
+            snapshot_path: string;
+            /** Format: int64 */
+            split_id?: number;
+            table_name: string;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonMergeRowRef: {
+            action: string;
+            /** Format: int64 */
+            original_row_id?: number;
+            original_row_key: string;
+            table_name: string;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonMergeSnapshotResponse: {
+            sha256: string;
+            snapshot: unknown;
+            /** Format: int64 */
+            version: number;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonMergeSummary: {
+            merge: components["schemas"]["PersonMerge"];
+            /** Format: int64 */
+            participant_count: number;
+            /** Format: int64 */
+            pending_candidate_count: number;
+            row_action_counts: {
+                [key: string]: number;
+            };
+            /** Format: int64 */
+            row_count: number;
+            /** Format: int64 */
+            split_count: number;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonMergesResponse: {
+            /** Format: int64 */
+            limit: number;
+            merges: components["schemas"]["PersonMergeSummary"][] | null;
+            /** Format: int64 */
+            offset: number;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonName: {
+            additional_names?: string;
+            envelope: components["schemas"]["ValueEnvelope"];
+            family_name?: string;
+            formatted?: string;
+            generation?: string;
+            given_name?: string;
+            honorific_prefixes?: string;
+            honorific_suffixes?: string;
+            is_derived: boolean;
+            language?: string;
+            name_kind: string;
+            original_value: string;
+            /** Format: int64 */
+            person_id: number;
+            phonetic_script?: string;
+            phonetic_system?: string;
+            script?: string;
+            secondary_surname?: string;
+            sort_as?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonNameInputRequest: {
+            additional_names?: string;
+            envelope: components["schemas"]["ValueEnvelopeInput"];
+            family_name?: string;
+            formatted?: string;
+            generation?: string;
+            given_name?: string;
+            honorific_prefixes?: string;
+            honorific_suffixes?: string;
+            is_derived?: boolean;
+            language?: string;
+            name_kind: string;
+            original_value?: string;
+            phonetic_script?: string;
+            phonetic_system?: string;
+            script?: string;
+            secondary_surname?: string;
+            sort_as?: string;
+        };
+        PersonNamePatchRequest: {
+            add?: components["schemas"]["PersonNameInputRequest"][] | null;
+            supersede?: number[] | null;
+        };
         PersonProfile: {
             display_name?: string;
             /** Format: int64 */
@@ -3235,14 +6821,129 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        PersonSearchHTTPResponse: {
-            cache_revision: string;
-            candidate_snapshot_id?: string;
-            next_cursor?: string;
-            rows: components["schemas"]["PersonSummary"][] | null;
-            search_provenance: components["schemas"]["SearchProvenance"];
+        PersonProfileHistory: {
+            addresses: components["schemas"]["PersonAddress"][] | null;
+            categories: components["schemas"]["PersonCategory"][] | null;
+            contact_points: components["schemas"]["PersonContactPoint"][] | null;
+            dates: components["schemas"]["PersonDate"][] | null;
+            media: components["schemas"]["PersonMedia"][] | null;
+            names: components["schemas"]["PersonName"][] | null;
+            observations: components["schemas"]["ParticipantContactObservation"][] | null;
+            person: components["schemas"]["Person"];
+        } & {
+            [key: string]: unknown;
+        };
+        PersonProfilePatchRequest: {
+            addresses?: components["schemas"]["PersonAddressPatchRequest"];
+            categories?: components["schemas"]["PersonCategoryPatchRequest"];
+            contact_points?: components["schemas"]["PersonContactPointPatchRequest"];
+            dates?: components["schemas"]["PersonDatePatchRequest"];
+            media?: components["schemas"]["PersonMediaPatchRequest"];
+            names?: components["schemas"]["PersonNamePatchRequest"];
+        };
+        PersonRelationship: {
+            /** Format: double */
+            confidence?: number;
+            /** Format: date-time */
+            created_at: string;
+            created_by: string;
+            end_date?: components["schemas"]["PartialDate"];
+            forward_label: string;
             /** Format: int64 */
-            total_count: number;
+            id: number;
+            is_symmetric: boolean;
+            notes?: string;
+            /** Format: int64 */
+            relationship_type_id: number;
+            reverse_label: string;
+            /** Format: int64 */
+            revision: number;
+            source: string;
+            /** Format: int64 */
+            source_person_id: number;
+            source_ref?: string;
+            source_resource_uid?: string;
+            start_date?: components["schemas"]["PartialDate"];
+            status: string;
+            /** Format: int64 */
+            target_person_id: number;
+            type_slug: string;
+            /** Format: date-time */
+            updated_at: string;
+            updated_by: string;
+            vcard_identity: components["schemas"]["VCardIdentity"];
+        } & {
+            [key: string]: unknown;
+        };
+        PersonRelationshipView: {
+            counterpart_display_name?: string;
+            counterpart_label: string;
+            /** Format: int64 */
+            counterpart_person_id: number;
+            counterpart_vcard_uid: string;
+            direction: string;
+            relationship: components["schemas"]["PersonRelationship"];
+        } & {
+            [key: string]: unknown;
+        };
+        PersonRelationshipsResponse: {
+            relationships: components["schemas"]["PersonRelationshipView"][] | null;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonSearchRequest: {
+            /**
+             * Format: int64
+             * @default 20
+             */
+            limit: number;
+            query: string;
+        };
+        PersonSearchResponse: {
+            results: components["schemas"]["PersonSearchResult"][];
+        } & {
+            [key: string]: unknown;
+        };
+        PersonSearchResult: {
+            person: components["schemas"]["Person"];
+            /** Format: double */
+            score: number;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonSplit: {
+            actor: string;
+            /** Format: date-time */
+            created_at: string;
+            exact_reversal: boolean;
+            /** Format: int64 */
+            id: number;
+            /** Format: int64 */
+            merge_id: number;
+            /** Format: int64 */
+            new_person_id: number;
+            new_person_uid: string;
+            /** Format: int64 */
+            source_person_id: number;
+            /** Format: int64 */
+            source_revision_after: number;
+            /** Format: int64 */
+            source_revision_before: number;
+        } & {
+            [key: string]: unknown;
+        };
+        PersonSplitResult: {
+            ambiguous_rows: components["schemas"]["PersonMergeRowRef"][] | null;
+            /** @enum {string} */
+            cache_state: "ready" | "stale";
+            exact_reversal: boolean;
+            /** Format: int64 */
+            identity_revision: number;
+            new_person: components["schemas"]["Person"];
+            source_person: components["schemas"]["Person"];
+            split: components["schemas"]["PersonSplit"];
+            uid_alias_disposition: string;
+            unrestored_rows: components["schemas"]["PersonMergeRowRef"][] | null;
         } & {
             [key: string]: unknown;
         };
@@ -3251,6 +6952,8 @@ export interface components {
             activity_count: number;
             cache_revision: string;
             cluster?: components["schemas"]["PersonCluster"];
+            /** Format: int64 */
+            current_relationship_temperature: number;
             display_label: string;
             display_name?: string;
             /** Format: int64 */
@@ -3262,14 +6965,33 @@ export interface components {
             identifiers: components["schemas"]["PersonIdentifier"][] | null;
             /** Format: date-time */
             last_at: string;
+            /** Format: int64 */
+            meeting_count: number;
             partial_label: boolean;
+            /** Format: int64 */
+            peak_relationship_temperature: number;
+            /** Format: int64 */
+            peak_relationship_year: number;
             profile?: components["schemas"]["PersonProfile"];
             source_counts: components["schemas"]["SourceCount"][] | null;
         } & {
             [key: string]: unknown;
         };
-        PersonsResponse: {
-            persons: components["schemas"]["Person"][] | null;
+        PersonTracking: {
+            /** Format: int64 */
+            person_id: number;
+            tracked: boolean;
+            /** Format: date-time */
+            tracked_at: string | null;
+        } & {
+            [key: string]: unknown;
+        };
+        PinState: {
+            actor?: string;
+            /** Format: int64 */
+            event_id?: number;
+            pinned: boolean;
+            target: components["schemas"]["TargetRef"];
         } & {
             [key: string]: unknown;
         };
@@ -3290,6 +7012,34 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        ProjectionRef: {
+            kind: string;
+            /** Format: int64 */
+            row_id: number;
+        } & {
+            [key: string]: unknown;
+        };
+        Provenance: {
+            directions: ("from_person" | "to_person" | "group")[] | null;
+            participant_ids: number[] | null;
+            roles: ("from" | "to" | "cc" | "bcc" | "conversation_member")[] | null;
+        } & {
+            [key: string]: unknown;
+        };
+        ProviderUsage: {
+            /** Format: double */
+            billed_units: number;
+            /** Format: int64 */
+            input_bytes: number;
+            /** Format: int64 */
+            requests: number;
+            usage_available: boolean;
+        } & {
+            [key: string]: unknown;
+        };
+        PutPersonTrackingRequest: {
+            tracked: boolean;
+        };
         QueryRequest: {
             sql: string;
         };
@@ -3298,6 +7048,96 @@ export interface components {
             /** Format: int64 */
             row_count: number;
             rows: (unknown[] | null)[] | null;
+        } & {
+            [key: string]: unknown;
+        };
+        RejectedCandidate: {
+            identifier: string;
+            reason: string;
+        } & {
+            [key: string]: unknown;
+        };
+        RelationshipCalendarDay: {
+            /** Format: int64 */
+            chat: number;
+            date: string;
+            /** Format: int64 */
+            email: number;
+            /** @enum {string} */
+            level: "NONE" | "FIRST_QUARTILE" | "SECOND_QUARTILE" | "THIRD_QUARTILE" | "FOURTH_QUARTILE";
+            /** Format: int64 */
+            meetings: number;
+            /** Format: int32 */
+            modality_mask: number;
+            /** Format: int64 */
+            received: number;
+            /** Format: int64 */
+            sent: number;
+            /** Format: int64 */
+            total: number;
+        } & {
+            [key: string]: unknown;
+        };
+        RelationshipCalendarHTTPRequest: {
+            timezone?: string;
+            /** Format: int64 */
+            year: number;
+        };
+        RelationshipCalendarHTTPResponse: {
+            annual: components["schemas"]["AnnualTemperatureSummary"][] | null;
+            cache_revision: string;
+            /** Format: int64 */
+            canonical_id: number;
+            current: components["schemas"]["TemperatureSummary"];
+            days: components["schemas"]["RelationshipCalendarDay"][] | null;
+            effective_date: string;
+            /** Format: int64 */
+            identity_revision: number;
+            /** Format: int64 */
+            participant_id: number;
+            /** Format: int64 */
+            peak_temperature: number;
+            /** Format: int64 */
+            peak_year: number;
+            /** Format: int64 */
+            score_version: number;
+            scoring_timezone: string;
+            timezone: string;
+            /** Format: int64 */
+            year: number;
+        } & {
+            [key: string]: unknown;
+        };
+        RelationshipReview: {
+            /** Format: int64 */
+            accepted_relationship_id?: number;
+            /** Format: date-time */
+            created_at: string;
+            created_by: string;
+            /** Format: int64 */
+            id: number;
+            /** Format: int64 */
+            matched_person_id?: number;
+            /** Format: int64 */
+            person_id: number;
+            raw_related_type: string;
+            raw_related_value: string;
+            /** Format: date-time */
+            reviewed_at?: string;
+            reviewed_by?: string;
+            source: string;
+            source_ref?: string;
+            source_resource_uid?: string;
+            status: string;
+            /** Format: date-time */
+            updated_at: string;
+            value_kind: string;
+            vcard_identity: components["schemas"]["VCardIdentity"];
+        } & {
+            [key: string]: unknown;
+        };
+        RelationshipReviewsResponse: {
+            reviews: components["schemas"]["RelationshipReview"][] | null;
         } & {
             [key: string]: unknown;
         };
@@ -3352,6 +7192,37 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        RelationshipType: {
+            color?: string;
+            /** Format: date-time */
+            created_at: string;
+            description?: string;
+            forward_label: string;
+            icon?: string;
+            /** Format: int64 */
+            id: number;
+            /** Format: int64 */
+            inverse_type_id?: number;
+            is_canonical: boolean;
+            is_deletable: boolean;
+            is_symmetric: boolean;
+            ownership: string;
+            reverse_label: string;
+            /** Format: int64 */
+            revision: number;
+            slug: string;
+            universal_id: string;
+            /** Format: date-time */
+            updated_at: string;
+            vcard_related_type?: string;
+        } & {
+            [key: string]: unknown;
+        };
+        RelationshipTypesResponse: {
+            relationship_types: components["schemas"]["RelationshipType"][] | null;
+        } & {
+            [key: string]: unknown;
+        };
         RelationshipsHTTPRequest: {
             cursor?: string;
             filters?: components["schemas"]["ExploreFilter"][] | null;
@@ -3375,8 +7246,10 @@ export interface components {
             url: string;
         };
         RemoveRequest: {
-            account: string;
+            account?: string;
             identifier: string;
+            /** Format: int64 */
+            source_id?: number;
         };
         RemoveResult: {
             account: string;
@@ -3486,6 +7359,17 @@ export interface components {
             /** Format: int64 */
             vector_generation?: number;
         };
+        SearchResponse: {
+            /** Format: int64 */
+            generation_id: number;
+            model: string;
+            next_cursor?: string;
+            query_mode: string;
+            results: components["schemas"]["AttachmentSearchResult"][] | null;
+            usage: components["schemas"]["Usage"];
+        } & {
+            [key: string]: unknown;
+        };
         SearchResult: {
             messages: components["schemas"]["MessageSummary"][] | null;
             /** Format: int64 */
@@ -3524,6 +7408,45 @@ export interface components {
             plain_http_warning: boolean;
         } & {
             [key: string]: unknown;
+        };
+        SetOrganizationAttributeBody: {
+            /** Format: date-time */
+            active_from?: string | null;
+            /** Format: date-time */
+            active_until?: string | null;
+            actor?: string | null;
+            /** Format: double */
+            confidence?: number | null;
+            definition_slug: string;
+            dry_run?: boolean;
+            /** Format: int64 */
+            expected_value_id?: number | null;
+            /** Format: int64 */
+            ordinal?: number | null;
+            /** @enum {string} */
+            source: "user" | "carddav_import" | "vcard_import" | "archive_observation" | "extraction" | "enrichment" | "system";
+            source_ref?: string | null;
+            value: components["schemas"]["AttributeValue"];
+        };
+        SetPersonAttributeRequest: {
+            /** Format: date-time */
+            active_from?: string;
+            /** Format: date-time */
+            active_until?: string;
+            actor?: string;
+            /** Format: double */
+            confidence?: number;
+            /** Format: int64 */
+            expected_value_id?: number;
+            /** Format: int64 */
+            ordinal?: number;
+            /** @enum {string} */
+            source?: "user" | "carddav_import" | "vcard_import" | "archive_observation" | "extraction" | "enrichment" | "system";
+            source_ref?: string;
+            value: components["schemas"]["AttributeValue"];
+        };
+        SetPersonFactPinRequest: {
+            pinned: boolean;
         };
         Setting: {
             /** @enum {string} */
@@ -3591,6 +7514,28 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        SourceIdentitiesResponse: {
+            account: string;
+            identities: components["schemas"]["SourceIdentityResponse"][];
+            /** Format: int64 */
+            source_id: number;
+        } & {
+            [key: string]: unknown;
+        };
+        SourceIdentityResponse: {
+            /** Format: date-time */
+            confirmed_at: string;
+            identifier: string;
+            signals: string[];
+        } & {
+            [key: string]: unknown;
+        };
+        SourceReference: {
+            /** Format: int64 */
+            id: number;
+            identifier: string;
+            type: string;
+        };
         SourceStatus: {
             active_sync: components["schemas"]["SyncRunStatus"] | null;
             can_sync: boolean;
@@ -3619,6 +7564,11 @@ export interface components {
         SourcesRequest: {
             accounts: string[] | null;
         };
+        SplitPersonRequest: {
+            /** Format: int64 */
+            merge_id: number;
+            participant_ids: number[] | null;
+        };
         StageDeletionFilter: {
             after?: string;
             before?: string;
@@ -3646,6 +7596,7 @@ export interface components {
             /** Format: int64 */
             message_count: number;
             sample_gmail_ids?: string[] | null;
+            source?: components["schemas"]["SourceReference"];
             status?: string;
         } & {
             [key: string]: unknown;
@@ -3669,6 +7620,9 @@ export interface components {
             total_threads: number;
             vector_search?: components["schemas"]["StatsView"];
             vector_status?: string;
+            vector_text_message_types?: string[] | null;
+            vector_text_status?: string;
+            vector_visual_status?: string;
         } & {
             [key: string]: unknown;
         };
@@ -3678,12 +7632,64 @@ export interface components {
             enabled: boolean;
             /** Format: int64 */
             missing_embeddings_total: number;
+            /** Format: int64 */
+            person_coverage_rejected: number;
+        } & {
+            [key: string]: unknown;
+        };
+        Status: {
+            /** Format: int64 */
+            active_leases: number;
+            /** Format: int64 */
+            converged: number;
+            /** Format: double */
+            convergence_ratio: number;
+            /** Format: int64 */
+            convergence_total: number;
+            /** Format: int64 */
+            current: number;
+            duplicate_cost: components["schemas"]["DuplicateCostRisk"];
+            /** Format: int64 */
+            eligible: number;
+            formats: components["schemas"]["FormatCoverage"][] | null;
+            generation: components["schemas"]["VisualGeneration"];
+            /** Format: int64 */
+            journal_cursor: number;
+            /** Format: int64 */
+            journal_high_water: number;
+            /** Format: int64 */
+            journal_lag: number;
+            reconciliation_complete: boolean;
+            /** Format: int64 */
+            retryable: number;
+            /** Format: int64 */
+            stale: number;
+            /** Format: int64 */
+            terminal: number;
+            /** Format: int64 */
+            tombstoned: number;
+            /** Format: int64 */
+            unavailable: number;
+            /** Format: int64 */
+            unknown_role: number;
+            usage: components["schemas"]["ProviderUsage"];
         } & {
             [key: string]: unknown;
         };
         StatusMessageResponse: {
             message: string;
             status: string;
+        } & {
+            [key: string]: unknown;
+        };
+        StructuredPersonProfile: {
+            addresses: components["schemas"]["PersonAddress"][] | null;
+            categories: components["schemas"]["PersonCategory"][] | null;
+            contact_points: components["schemas"]["PersonContactPoint"][] | null;
+            dates: components["schemas"]["PersonDate"][] | null;
+            media: components["schemas"]["PersonMedia"][] | null;
+            names: components["schemas"]["PersonName"][] | null;
+            person: components["schemas"]["Person"];
         } & {
             [key: string]: unknown;
         };
@@ -3695,6 +7701,18 @@ export interface components {
             top_senders: components["schemas"]["SenderCount"][] | null;
             /** Format: int64 */
             total_size_bytes: number;
+        };
+        SyncResult: {
+            /** Format: int64 */
+            books: number;
+            /** Format: int64 */
+            created: number;
+            /** Format: int64 */
+            removed: number;
+            /** Format: int64 */
+            updated: number;
+        } & {
+            [key: string]: unknown;
         };
         SyncRunItemStatus: {
             created_at: string;
@@ -3727,6 +7745,31 @@ export interface components {
             source_id: number;
             started_at: string;
             status: string;
+        } & {
+            [key: string]: unknown;
+        };
+        TargetDescriptor: {
+            cardinality: string;
+            choices: components["schemas"]["ChoiceDescriptor"][] | null;
+            description: string;
+            fields: components["schemas"]["FieldDescriptor"][] | null;
+            key: string;
+            kind: string;
+            /** Format: int64 */
+            max_length?: number;
+            record_target?: string;
+            revision: string;
+            sensitive: boolean;
+            slug: string;
+            universal_id: string;
+            value_type: string;
+        } & {
+            [key: string]: unknown;
+        };
+        TargetRef: {
+            key: string;
+            kind: string;
+            revision: string;
         } & {
             [key: string]: unknown;
         };
@@ -3807,6 +7850,31 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        TemperatureSignals: {
+            /** Format: double */
+            meeting_signal: number;
+            /** Format: int64 */
+            modalities: number;
+            /** Format: double */
+            received_volume: number;
+            /** Format: double */
+            sent_signal: number;
+        } & {
+            [key: string]: unknown;
+        };
+        TemperatureSummary: {
+            /** Format: int64 */
+            population: number;
+            /** Format: int64 */
+            rank: number;
+            /** Format: double */
+            raw_score: number;
+            signals: components["schemas"]["TemperatureSignals"];
+            /** Format: int64 */
+            temperature: number;
+        } & {
+            [key: string]: unknown;
+        };
         TextConversationRow: {
             /** Format: int64 */
             conversation_id: number;
@@ -3822,6 +7890,7 @@ export interface components {
             [key: string]: unknown;
         };
         TextConversationsResponse: {
+            cache_revision: string;
             conversations: components["schemas"]["TextConversationRow"][] | null;
             /** Format: int64 */
             count: number;
@@ -3834,6 +7903,19 @@ export interface components {
             [key: string]: unknown;
         };
         TextMessagesResponse: {
+            cache_revision: string;
+            /** Format: int64 */
+            count: number;
+            has_more: boolean;
+            /** Format: int64 */
+            limit: number;
+            messages: components["schemas"]["CLIQueryMessageSummary"][] | null;
+            /** Format: int64 */
+            offset: number;
+        } & {
+            [key: string]: unknown;
+        };
+        TextSearchResponse: {
             /** Format: int64 */
             count: number;
             has_more: boolean;
@@ -3905,8 +7987,11 @@ export interface components {
             text: string;
         };
         UpdateRequest: {
+            account?: string;
             display_name: string;
-            email: string;
+            email?: string;
+            /** Format: int64 */
+            source_id?: number;
         };
         UpdateResult: {
             display_name: string;
@@ -3914,11 +7999,119 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        Usage: {
+            available: boolean;
+            /** Format: int64 */
+            total_tokens: number;
+        } & {
+            [key: string]: unknown;
+        };
+        VCardIdentity: {
+            altid?: string;
+            group?: string;
+            pid?: string[] | null;
+            prop_id?: string;
+            property?: string;
+        };
+        ValueEnvelope: {
+            /** Format: date-time */
+            active_from?: string;
+            /** Format: date-time */
+            active_until?: string;
+            /** Format: double */
+            confidence?: number;
+            /** Format: date-time */
+            created_at: string;
+            /** Format: int64 */
+            id: number;
+            /** Format: int64 */
+            ordinal: number;
+            /** Format: int64 */
+            pref?: number;
+            source: string;
+            source_ref?: string;
+            source_resource_uid?: string;
+            /** Format: date-time */
+            superseded_at?: string;
+            type_label?: string;
+            type_tokens?: string[] | null;
+            /** Format: date-time */
+            updated_at: string;
+            vcard: components["schemas"]["VCardIdentity"];
+        } & {
+            [key: string]: unknown;
+        };
+        ValueEnvelopeInput: {
+            /** Format: date-time */
+            active_from?: string;
+            /** Format: date-time */
+            active_until?: string;
+            /** Format: double */
+            confidence?: number;
+            /** Format: int64 */
+            ordinal?: number;
+            /** Format: int64 */
+            pref?: number;
+            source: string;
+            source_ref?: string;
+            source_resource_uid?: string;
+            type_label?: string;
+            type_tokens?: string[] | null;
+            vcard?: components["schemas"]["VCardIdentity"];
+        };
         VectorHealth: {
             error?: string;
             status: string;
         } & {
             [key: string]: unknown;
+        };
+        VisualBuildRequest: {
+            consent: boolean;
+        };
+        VisualGeneration: {
+            consent_policy_fingerprint?: string;
+            consented: boolean;
+            /** Format: int64 */
+            dimension: number;
+            fingerprint: string;
+            /** Format: int64 */
+            id: number;
+            model: string;
+            /** Format: int64 */
+            source_fence: number;
+            state: string;
+        } & {
+            [key: string]: unknown;
+        };
+        VisualRetireRequest: {
+            /** Format: int64 */
+            generation_id: number;
+        };
+        VisualRetryRequest: {
+            blob_hash: string;
+            /** Format: int64 */
+            message_id: number;
+        };
+        VisualTextSearchRequest: {
+            after?: string;
+            before?: string;
+            cursor?: string;
+            directions?: string[] | null;
+            filename?: string;
+            /** Format: int64 */
+            limit?: number;
+            /** Format: int64 */
+            message_id?: number;
+            mime_prefix?: string;
+            /** Format: int64 */
+            participant_id?: number;
+            /** Format: int64 */
+            person_id?: number;
+            /** Format: int64 */
+            sender_person_id?: number;
+            /** Format: int64 */
+            source_id?: number;
+            text: string;
         };
     };
     responses: never;
@@ -4426,6 +8619,327 @@ export interface operations {
             };
         };
     };
+    listAttributeDefinitions: {
+        parameters: {
+            query?: {
+                /** @description Filter by object type */
+                object_type?: string;
+                /** @description Include deactivated definitions */
+                include_hidden?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttributeDefinitionsResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    createAttributeDefinition: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateAttributeDefinitionRequest"];
+            };
+        };
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    /** @description Strong attribute definition revision tag */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttributeDefinition"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getAttributeDefinition: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Attribute definition ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong attribute definition revision tag */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttributeDefinition"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    deleteAttributeDefinition: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Strong ETag returned by the latest definition read */
+                "If-Match": string;
+            };
+            path: {
+                /** @description Attribute definition ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description No Content */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    patchAttributeDefinition: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Strong ETag returned by the latest definition read */
+                "If-Match": string;
+            };
+            path: {
+                /** @description Attribute definition ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PatchAttributeDefinitionRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong attribute definition revision tag */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttributeDefinition"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
     uploadToken: {
         parameters: {
             query?: never;
@@ -4511,6 +9025,820 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["BackupFreezeEndResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    saveCardDAVAccount: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CardDAVAccountRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CardDAVAccountResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    /** @description Seconds until CardDAV retry is safe */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    testCardDAVAccount: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CardDAVAccountRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CardDAVAccountResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    /** @description Seconds until CardDAV retry is safe */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listCardDAVBooks: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CardDAVBooksResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    /** @description Seconds until CardDAV retry is safe */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    updateCardDAVBookRoles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CardDAVBookRolesRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CardDAVBookResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    /** @description Seconds until CardDAV retry is safe */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listCardDAVConflicts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CardDAVConflictsResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    /** @description Seconds until CardDAV retry is safe */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getCardDAVConflict: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CardDAVConflictDetailResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    /** @description Seconds until CardDAV retry is safe */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    resolveCardDAVConflict: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CardDAVResolveRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CardDAVConflictResolutionResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    /** @description Seconds until CardDAV retry is safe */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getCardDAVPublication: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                person_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CardDAVPublicationResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    /** @description Seconds until CardDAV retry is safe */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    publishCardDAVPerson: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                person_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CardDAVPublicationResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    /** @description Seconds until CardDAV retry is safe */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    unpublishCardDAVPerson: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                person_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CardDAVPublicationResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    /** @description Seconds until CardDAV retry is safe */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    syncCardDAV: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CardDAVSyncRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncResult"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    /** @description Seconds until CardDAV retry is safe */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
             /** @description Error */
@@ -5430,6 +10758,8 @@ export interface operations {
                 account?: string;
                 /** @description Restrict to all member accounts of one collection */
                 collection?: string;
+                /** @description Restrict to one source by numeric ID */
+                source_id?: number;
                 /** @description For account scope, return only the primary source instead of related sources */
                 primary_only?: boolean;
             };
@@ -5566,6 +10896,99 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RemoveResult"];
+                };
+            };
+            /** @description Bad Request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiHTTPError"];
+                };
+            };
+            /** @description Unprocessable Entity */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiHTTPError"];
+                };
+            };
+            /** @description Internal Server Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiHTTPError"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiHTTPError"];
+                };
+            };
+        };
+    };
+    discoverCLIIdentities: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DiscoverRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/x-ndjson": components["schemas"]["DiscoverEvent"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    importCLIIdentities: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ImportRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImportResult"];
                 };
             };
             /** @description Bad Request */
@@ -5846,6 +11269,8 @@ export interface operations {
                 offset?: number;
                 /** @description Message type filter; repeat or comma-separate for multiple values */
                 message_type?: string;
+                /** @description Source deletion scope: active (default), deleted, or any */
+                deletion_scope?: string;
                 /** @description Restrict to one account/source */
                 account?: string;
                 /** @description Restrict to one collection */
@@ -5916,6 +11341,8 @@ export interface operations {
             query?: {
                 /** @description Account email or display name to sync */
                 email?: string;
+                /** @description Exact source ID to sync */
+                source_id?: number;
                 /** @description IMAP folder names to include (repeatable) */
                 folder?: string[];
                 /** @description IMAP folder names to exclude (repeatable) */
@@ -5952,6 +11379,8 @@ export interface operations {
             query?: {
                 /** @description Account email or display name to sync */
                 email?: string;
+                /** @description Exact source ID to sync */
+                source_id?: number;
                 /** @description Gmail search query */
                 query?: string;
                 /** @description Only messages on or after this YYYY-MM-DD date */
@@ -6018,6 +11447,125 @@ export interface operations {
                 };
                 content: {
                     "application/x-ndjson": components["schemas"]["CLIVerifyEvent"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listCommunicationServices: {
+        parameters: {
+            query?: {
+                /** @description Include inactive catalog entries */
+                include_inactive?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommunicationServicesResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    createCommunicationService: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateCommunicationServiceRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommunicationService"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
             /** @description Error */
@@ -6130,6 +11678,366 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ConversationResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    deleteDayEntry: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Positive durable identifier */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description No Content */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getActivityDay: {
+        parameters: {
+            query?: {
+                /** @description Maximum primary rows to return */
+                limit?: number;
+                /** @description Zero-based primary row offset */
+                offset?: number;
+                /** @description Maximum authored entries to return independently */
+                entry_limit?: number;
+                /** @description Zero-based authored-entry offset */
+                entry_offset?: number;
+                /** @description Maximum activity references previewed for each person */
+                activity_limit_per_person?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Exact local calendar date */
+                date: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DayPage"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listDayEntries: {
+        parameters: {
+            query?: {
+                /** @description Maximum primary rows to return */
+                limit?: number;
+                /** @description Zero-based primary row offset */
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Exact local calendar date */
+                date: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DailyNoteEntriesResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    createDayEntry: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Exact local calendar date */
+                date: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateDailyNoteEntryRequest"];
+            };
+        };
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DailyNoteEntry"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
             /** @description Error */
@@ -6281,6 +12189,264 @@ export interface operations {
             };
         };
     };
+    searchDocuments: {
+        parameters: {
+            query: {
+                /** @description Extracted document content or filename query */
+                q: string;
+                /** @description Source IDs to include; repeat or comma-separate values */
+                source_id?: number[];
+                /** @description Message types to include; repeat or comma-separate values */
+                message_type?: string[];
+                /** @description Exact attachment occurrence ID */
+                attachment_id?: number;
+                /** @description Exact containing message ID */
+                message_id?: number;
+                /** @description Durable person ID */
+                person_id?: number;
+                /** @description Observed participant ID; translated through its durable person when bound */
+                participant_id?: number;
+                /** @description Person relation; repeat or comma-separate from_person, to_person, or group */
+                direction?: string[];
+                /** @description Only messages on or after an RFC3339 or YYYY-MM-DD date */
+                after?: string;
+                /** @description Only messages before an RFC3339 or YYYY-MM-DD date */
+                before?: string;
+                /** @description Maximum results to return (default 20, max 100) */
+                limit?: number;
+                /** @description Opaque cursor from the previous document search page */
+                cursor?: string;
+                /** @description Search mode: lexical (default and auto); semantic/hybrid send the query to the embedding provider */
+                mode?: string;
+                /** @description Maximum candidates (default/max: lexical 10000; semantic/hybrid 100/1000) */
+                candidate_limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentSearchResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getDocumentIndexStatus: {
+        parameters: {
+            query: {
+                /** @description Exact document extraction profile ID */
+                profile_id: string;
+                /** @description Exact extraction input key */
+                input_key: string;
+                /** @description Allowed document media types */
+                media_type: string[];
+                /** @description Allowed message types */
+                message_type?: string[];
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentIndexStatusResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getDocumentVectorStatus: {
+        parameters: {
+            query?: {
+                /** @description Generation whose bounded failures to inspect */
+                generation_id?: number;
+                /** @description Stable failure cursor token */
+                after_token?: string;
+                /** @description Maximum failure diagnostics (default 20, max 1000) */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DocumentVectorOperationsResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
     searchDomains: {
         parameters: {
             query?: never;
@@ -6360,6 +12526,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DomainSummary"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExploreCacheUnavailableResponse"] | components["schemas"]["ErrorResponse"];
                 };
             };
             /** @description Error */
@@ -6549,6 +12724,463 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ExploreCacheUnavailableResponse"] | components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    createEmployment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EmploymentBody"];
+            };
+        };
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    /** @description Strong employment revision tag for optimistic concurrency */
+                    ETag?: string;
+                    /** @description Canonical URL of the created employment record */
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Employment"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getEmployment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Employment ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong employment revision tag for optimistic concurrency */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Employment"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    deleteEmployment: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Strong ETag returned by the latest employment read */
+                "If-Match": string;
+            };
+            path: {
+                /** @description Employment ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description No Content */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    patchEmployment: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Strong ETag returned by the latest employment read */
+                "If-Match": string;
+            };
+            path: {
+                /** @description Employment ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EmploymentBody"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong employment revision tag for optimistic concurrency */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Employment"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    endEmployment: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Strong ETag returned by the latest employment read */
+                "If-Match": string;
+            };
+            path: {
+                /** @description Employment ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["EndEmploymentBody"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong employment revision tag for optimistic concurrency */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Employment"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    setPrimaryEmployment: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Strong ETag returned by the latest employment read */
+                "If-Match": string;
+            };
+            path: {
+                /** @description Employment ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong employment revision tag for optimistic concurrency */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Employment"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
             /** @description Error */
@@ -7175,6 +13807,186 @@ export interface operations {
                     "application/json": components["schemas"]["IdentityLinkResponse"];
                 };
             };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonMergeRequiredError"] | components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listIdentityMatchCandidates: {
+        parameters: {
+            query?: {
+                /** @description Candidate state filter (candidate, accepted, rejected, conflict); repeat or comma-separate for multiple values */
+                state?: string;
+                /** @description Maximum candidates to return (default 100, max 500) */
+                limit?: number;
+                /** @description Zero-based candidate offset */
+                offset?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentityMatchCandidatesResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    acceptIdentityMatchCandidate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identity match candidate ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["DecideIdentityMatchRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentityMatchAcceptResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonMergeRequiredError"] | components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    rejectIdentityMatchCandidate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Identity match candidate ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["DecideIdentityMatchRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentityMatchRejectResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
             /** @description Error */
             default: {
                 headers: {
@@ -7372,6 +14184,85 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["MessageListResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listChangedMessages: {
+        parameters: {
+            query?: {
+                /** @description Opaque cursor from the next_cursor of the previous response, sent back verbatim. Do not parse, construct, compare, or order it; its contents may change without notice. Omit, or send it empty, to start from the beginning of the archive. The token is not authenticated: the server does not sign it and cannot tell one it issued from a well-formed one you built, so a fabricated cursor naming this archive is accepted and simply moves your own position. Rejected with 400 invalid_cursor, rather than read as the beginning: a token the server cannot read, one carrying a cursor format this build does not speak, and one issued against a different archive */
+                cursor?: string;
+                /** @description Maximum number of rows to return (default 100, max 500; values below 1 fall back to the default) */
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ChangesResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
             /** @description Error */
@@ -7760,6 +14651,159 @@ export interface operations {
             };
         };
     };
+    startVisualAttachmentBuild: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VisualBuildRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Status"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    retireVisualAttachmentGeneration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VisualRetireRequest"];
+            };
+        };
+        responses: {
+            /** @description No Content */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retryVisualAttachmentOwner: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VisualRetryRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Status"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    resumeVisualAttachmentBuild: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Status"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getVisualAttachmentStatus: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Status"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
     getOCRStatus: {
         parameters: {
             query?: never;
@@ -7789,7 +14833,1012 @@ export interface operations {
             };
         };
     };
-    searchPeople: {
+    listOrganizations: {
+        parameters: {
+            query?: {
+                /** @description Maximum results */
+                limit?: number;
+                /** @description Results to skip */
+                offset?: number;
+                /** @description Include retired organizations */
+                include_retired?: boolean;
+                /** @description Normalized-name search */
+                q?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrganizationsResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    createOrganization: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OrganizationCreateBody"];
+            };
+        };
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    /** @description Strong organization revision tag for optimistic concurrency */
+                    ETag?: string;
+                    /** @description Canonical URL of the created organization */
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Organization"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getOrganization: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Organization ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong organization revision tag for optimistic concurrency */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrganizationProfile"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    deleteOrganization: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Strong ETag returned by the latest organization read */
+                "If-Match": string;
+            };
+            path: {
+                /** @description Organization ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description No Content */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    patchOrganization: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Strong ETag returned by the latest organization read */
+                "If-Match": string;
+            };
+            path: {
+                /** @description Organization ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OrganizationBody"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong organization revision tag for optimistic concurrency */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Organization"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listOrganizationAttributes: {
+        parameters: {
+            query?: {
+                /** @description Include superseded values */
+                include_superseded?: boolean;
+                /** @description Restrict to one definition */
+                definition_slug?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Organization ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrganizationAttributesResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    setOrganizationAttribute: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Organization ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetOrganizationAttributeBody"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrganizationAttributeWrite"];
+                };
+            };
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrganizationAttributeWrite"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    clearOrganizationAttribute: {
+        parameters: {
+            query?: {
+                /** @description Ordinal for a multi-valued definition */
+                ordinal?: number;
+                /** @description Compare-and-swap: the current value ID expected to be superseded */
+                expected_value_id?: number;
+                /** @description Validate and preview without writing */
+                dry_run?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description Organization ID */
+                id: number;
+                /** @description Immutable attribute definition slug */
+                slug: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrganizationAttributeWrite"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listOrganizationEmployments: {
+        parameters: {
+            query?: {
+                /** @description Only current employments */
+                current_only?: boolean;
+                /** @description Maximum results */
+                limit?: number;
+                /** @description Results to skip */
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Organization ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EmploymentsResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getOrganizationHistory: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Organization ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong organization revision tag for optimistic concurrency */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrganizationProfile"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    mergeOrganization: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Strong ETag returned by the latest organization read */
+                "If-Match": string;
+            };
+            path: {
+                /** @description Organization ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MergeOrganizationBody"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong organization revision tag for optimistic concurrency */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Organization"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    putOrganizationProfile: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Strong ETag returned by the latest organization read */
+                "If-Match": string;
+            };
+            path: {
+                /** @description Organization ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OrganizationProfileBody"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong organization revision tag for optimistic concurrency */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrganizationProfile"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getOrganizationProfileMediaContent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Organization ID */
+                id: number;
+                /** @description Structured organization profile media value ID */
+                media_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "*/*": string;
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    completeParticipants: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ParticipantCompletionHTTPRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ParticipantCompletionHTTPResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    searchParticipants: {
         parameters: {
             query?: never;
             header?: never;
@@ -7808,7 +15857,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["PersonSearchHTTPResponse"];
+                    "application/json": components["schemas"]["ParticipantSearchHTTPResponse"];
                 };
             };
             /** @description Error */
@@ -7849,12 +15898,12 @@ export interface operations {
             };
         };
     };
-    getPerson: {
+    getParticipant: {
         parameters: {
             query?: never;
             header?: never;
             path: {
-                /** @description Durable participant ID */
+                /** @description Observed participant cluster member ID */
                 id: number;
             };
             cookie?: never;
@@ -7870,6 +15919,15 @@ export interface operations {
                     "application/json": components["schemas"]["PersonSummary"];
                 };
             };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExploreCacheUnavailableResponse"] | components["schemas"]["ErrorResponse"];
+                };
+            };
             /** @description Error */
             default: {
                 headers: {
@@ -7881,19 +15939,19 @@ export interface operations {
             };
         };
     };
-    searchPersonFiles: {
+    searchParticipantFiles: {
         parameters: {
             query?: never;
             header?: never;
             path: {
-                /** @description Durable participant ID */
+                /** @description Observed participant cluster member ID */
                 id: number;
             };
             cookie?: never;
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["FileSearchHTTPRequest"];
+                "application/json": components["schemas"]["PersonFileSearchHTTPRequest"];
             };
         };
         responses: {
@@ -7903,7 +15961,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["FileSearchHTTPResponse"];
+                    "application/json": components["schemas"]["PersonFileSearchHTTPResponse"];
                 };
             };
             /** @description Error */
@@ -7916,7 +15974,25 @@ export interface operations {
                 };
             };
             /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -7944,12 +16020,53 @@ export interface operations {
             };
         };
     };
-    getPersonContextSummary: {
+    listParticipantInboxes: {
         parameters: {
             query?: never;
             header?: never;
             path: {
-                /** @description Durable participant ID */
+                /** @description Observed participant cluster member ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonInboxResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExploreCacheUnavailableResponse"] | components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getParticipantContextSummary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Observed participant cluster member ID */
                 id: number;
             };
             cookie?: never;
@@ -7966,7 +16083,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["PersonContextSummaryHTTPResponse"];
+                    "application/json": components["schemas"]["ParticipantContextSummaryHTTPResponse"];
                 };
             };
             /** @description Error */
@@ -8007,12 +16124,12 @@ export interface operations {
             };
         };
     };
-    getPersonTimeline: {
+    getParticipantTimeline: {
         parameters: {
             query?: never;
             header?: never;
             path: {
-                /** @description Durable participant ID */
+                /** @description Observed participant cluster member ID */
                 id: number;
             };
             cookie?: never;
@@ -8070,7 +16187,7 @@ export interface operations {
             };
         };
     };
-    listPersons: {
+    listPeople: {
         parameters: {
             query?: never;
             header?: never;
@@ -8085,7 +16202,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["PersonsResponse"];
+                    "application/json": components["schemas"]["PeopleResponse"];
                 };
             };
             /** @description Error */
@@ -8150,6 +16267,48 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    searchPeople: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PersonSearchRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonSearchResponse"];
                 };
             };
             /** @description Error */
@@ -8397,6 +16556,2459 @@ export interface operations {
             };
         };
     };
+    listPersonAttributes: {
+        parameters: {
+            query?: {
+                /** @description Include superseded values */
+                history?: boolean;
+                /** @description Restrict the response to one definition slug */
+                slug?: string;
+                /** @description Restrict the response to one portable definition identifier */
+                universal_id?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Durable person ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonAttributesResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    setPersonAttribute: {
+        parameters: {
+            query?: {
+                /** @description Validate and preview without writing */
+                dry_run?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description Durable person ID */
+                id: number;
+                /** @description Immutable attribute definition slug */
+                slug: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetPersonAttributeRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonAttributeWrite"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonAttributeConflictResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    clearPersonAttribute: {
+        parameters: {
+            query?: {
+                /** @description Ordinal for a multi-valued definition */
+                ordinal?: number;
+                /** @description Compare-and-swap: the current value ID expected to be superseded */
+                expected_value_id?: number;
+                /** @description Validate and preview without writing */
+                dry_run?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description Durable person ID */
+                id: number;
+                /** @description Immutable attribute definition slug */
+                slug: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonAttributeWrite"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Conflict */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonAttributeConflictResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getPersonContactState: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Positive durable identifier */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ContactState"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listPersonActivityDays: {
+        parameters: {
+            query?: {
+                /** @description Inclusive first local calendar date */
+                from?: string;
+                /** @description Inclusive last local calendar date */
+                to?: string;
+                /** @description Maximum primary rows to return */
+                limit?: number;
+                /** @description Zero-based primary row offset */
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Positive durable identifier */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonDaysPage"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getPersonActivityDay: {
+        parameters: {
+            query?: {
+                /** @description Maximum primary rows to return */
+                limit?: number;
+                /** @description Zero-based primary row offset */
+                offset?: number;
+                /** @description Maximum authored entries to return independently */
+                entry_limit?: number;
+                /** @description Zero-based authored-entry offset */
+                entry_offset?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Positive durable identifier */
+                id: number;
+                /** @description Exact local calendar date */
+                date: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonDayPage"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listPersonEmployments: {
+        parameters: {
+            query?: {
+                /** @description Only current employments */
+                current_only?: boolean;
+                /** @description Maximum results */
+                limit?: number;
+                /** @description Results to skip */
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Person ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EmploymentsResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listPersonFactClaims: {
+        parameters: {
+            query?: {
+                /** @description Exact target as kind:key:sha256:<64 lowercase hex characters> */
+                target?: string;
+                /** @description Maximum rows to return (default 50, max 200) */
+                limit?: number;
+                /** @description Zero-based row offset */
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Durable person ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonFactClaimsResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listPersonFactDecisions: {
+        parameters: {
+            query?: {
+                /** @description Exact target as kind:key:sha256:<64 lowercase hex characters> */
+                target?: string;
+                /** @description Maximum rows to return (default 50, max 200) */
+                limit?: number;
+                /** @description Zero-based row offset */
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Durable person ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonFactDecisionsResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listPersonFactEvidence: {
+        parameters: {
+            query?: {
+                /** @description Exact target as kind:key:sha256:<64 lowercase hex characters> */
+                target?: string;
+                /** @description Maximum rows to return (default 50, max 200) */
+                limit?: number;
+                /** @description Zero-based row offset */
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Durable person ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonFactEvidenceResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listPersonFactEvidenceStatusEvents: {
+        parameters: {
+            query?: {
+                /** @description Restrict to one immutable evidence key */
+                evidence_key?: string;
+                /** @description Restrict to supported or unsupported events */
+                supported?: boolean;
+                /** @description Maximum events to return (default 50, max 200) */
+                limit?: number;
+                /** @description Zero-based event offset */
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Durable person ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonFactEvidenceStatusEventsResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listPersonFactPins: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Durable person ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonFactPinsResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    setPersonFactPin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Durable person ID */
+                id: number;
+                /** @description Closed person fact target kind */
+                kind: "attribute" | "employment";
+                /** @description Exact person fact target key */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SetPersonFactPinRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonFactPinWrite"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    searchPersonFiles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Durable person ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PersonFileSearchHTTPRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonFileSearchHTTPResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExploreCacheUnavailableResponse"] | components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    mergePersons: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Exactly two comma-separated strong person revision tags, one for each profile */
+                "If-Match": string;
+                /** @description Opaque 1..128-byte retry key */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description Durable person ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MergePersonRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong person profile revision tag for optimistic concurrency */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonMergeResult"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listPersonMerges: {
+        parameters: {
+            query?: {
+                /** @description Maximum results */
+                limit?: number;
+                /** @description Results to skip */
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                /** @description Durable person ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonMergesResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    appendPersonNote: {
+        parameters: {
+            query?: {
+                /** @description Validate and preview without writing */
+                dry_run?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description Durable person ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AppendPersonNoteRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonAttributeWrite"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getPersonStructuredProfile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Durable person ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong person profile revision tag for optimistic concurrency */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StructuredPersonProfile"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    patchPersonStructuredProfile: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Strong ETag returned by the latest person profile read. Must be the exact single tag from that read; the RFC 7232 forms `*` and comma-separated tag lists are not supported. */
+                "If-Match": string;
+            };
+            path: {
+                /** @description Durable person ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PersonProfilePatchRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong person profile revision tag for optimistic concurrency */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StructuredPersonProfile"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getPersonProfileHistory: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Durable person ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonProfileHistory"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getPersonProfileMediaContent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Durable person ID */
+                id: number;
+                /** @description Structured person profile media value ID */
+                media_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "*/*": string;
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listPersonRelationships: {
+        parameters: {
+            query?: {
+                include_ended?: boolean;
+            };
+            header?: never;
+            path: {
+                /** @description Durable person ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonRelationshipsResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    splitPersonMerge: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Strong ETag returned by the latest person profile read. Must be the exact single tag from that read; the RFC 7232 forms `*` and comma-separated tag lists are not supported. */
+                "If-Match": string;
+                /** @description Opaque 1..128-byte retry key */
+                "Idempotency-Key": string;
+            };
+            path: {
+                /** @description Durable person ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SplitPersonRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong person profile revision tag for optimistic concurrency */
+                    ETag?: string;
+                    /** @description Strong revision tag for the new person created by a split */
+                    "X-New-Person-ETag"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonSplitResult"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getPersonTracking: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Durable person ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonTracking"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    setPersonTracking: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Durable person ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PutPersonTrackingRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonTracking"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listPersonFactTargets: {
+        parameters: {
+            query?: {
+                /** @description Include sensitive targets */
+                include_sensitive?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Catalog"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    decidePersonMergeCandidate: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Strong ETag returned by the latest person profile read. Must be the exact single tag from that read; the RFC 7232 forms `*` and comma-separated tag lists are not supported. */
+                "If-Match": string;
+            };
+            path: {
+                /** @description Person merge review candidate ID */
+                candidate_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DecidePersonMergeCandidateRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong person profile revision tag for optimistic concurrency */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonMergeReviewCandidate"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getPersonMerge: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Durable person merge ID */
+                merge_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonMergeDetail"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getPersonMergeSnapshot: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Durable person merge ID */
+                merge_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Always no-store because the response contains merge provenance */
+                    "Cache-Control"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonMergeSnapshotResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listPersonRelationshipReviews: {
+        parameters: {
+            query?: {
+                status?: "pending" | "accepted" | "rejected";
+                person_id?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationshipReviewsResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    createPersonRelationship: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreatePersonRelationshipRequest"];
+            };
+        };
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    /** @description Strong person relationship revision tag for optimistic concurrency */
+                    ETag?: string;
+                    /** @description Created person relationship */
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonRelationship"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getPersonRelationship: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Person relationship ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong person relationship revision tag for optimistic concurrency */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonRelationship"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    deletePersonRelationship: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Strong ETag returned by the latest person relationship read */
+                "If-Match": string;
+            };
+            path: {
+                /** @description Person relationship ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description No Content */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    patchPersonRelationship: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Strong ETag returned by the latest person relationship read */
+                "If-Match": string;
+            };
+            path: {
+                /** @description Person relationship ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PatchPersonRelationshipRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong person relationship revision tag for optimistic concurrency */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PersonRelationship"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
     runQuery: {
         parameters: {
             query?: never;
@@ -8417,6 +19029,324 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["QueryResult"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    listRelationshipTypes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationshipTypesResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    createRelationshipType: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateRelationshipTypeRequest"];
+            };
+        };
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    /** @description Strong relationship type revision tag for optimistic concurrency */
+                    ETag?: string;
+                    /** @description Created relationship type */
+                    Location?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationshipType"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getRelationshipType: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Relationship type ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong relationship type revision tag for optimistic concurrency */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationshipType"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    deleteRelationshipType: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Strong ETag returned by the latest relationship type read */
+                "If-Match": string;
+            };
+            path: {
+                /** @description Relationship type ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description No Content */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    patchRelationshipType: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Strong ETag returned by the latest relationship type read */
+                "If-Match": string;
+            };
+            path: {
+                /** @description Relationship type ID */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PatchRelationshipTypeRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    /** @description Strong relationship type revision tag for optimistic concurrency */
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationshipType"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            428: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
             /** @description Error */
@@ -8463,6 +19393,69 @@ export interface operations {
             };
             /** @description Error */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Service Unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExploreCacheUnavailableResponse"] | components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    getRelationshipCalendar: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Any member participant ID of the counterpart's identity cluster */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RelationshipCalendarHTTPRequest"];
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RelationshipCalendarHTTPResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -8912,7 +19905,7 @@ export interface operations {
             query: {
                 /** @description Search query */
                 q: string;
-                /** @description Search mode: fts, vector, or hybrid */
+                /** @description Search mode: fts, vector, or hybrid. Structured filter parameters are supported only in vector and hybrid modes */
                 mode?: string;
                 /** @description One-based page number (default 1; values below 1 are clamped to 1). Non-numeric values are rejected with 400. */
                 page?: number;
@@ -8932,6 +19925,26 @@ export interface operations {
                 account?: string;
                 /** @description Restrict to one collection */
                 collection?: string;
+                /** @description Exact sender email/address filter (vector or hybrid mode only) */
+                sender?: string;
+                /** @description Exact recipient email filter across to, cc, and bcc (vector or hybrid mode only) */
+                recipient?: string;
+                /** @description Exact sender domain filter (vector or hybrid mode only) */
+                domain?: string;
+                /** @description Exact case-insensitive label filter (vector or hybrid mode only) */
+                label?: string;
+                /** @description Calendar period in YYYY, YYYY-MM, or YYYY-MM-DD format (vector or hybrid mode only) */
+                time_period?: string;
+                /** @description Time bucket granularity (vector or hybrid mode only) */
+                time_granularity?: string;
+                /** @description Exact source ID (vector or hybrid mode only) */
+                source_id?: number;
+                /** @description Only include messages with attachments (vector or hybrid mode only) */
+                attachments_only?: boolean;
+                /** @description Lower date/time bound (RFC3339 or YYYY-MM-DD; vector or hybrid mode only) */
+                after?: string;
+                /** @description Upper date/time bound (RFC3339 or YYYY-MM-DD; vector or hybrid mode only) */
+                before?: string;
             };
             header?: never;
             path?: never;
@@ -8946,6 +19959,94 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SearchResult"] | components["schemas"]["HybridSearchResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
+    searchVisualAttachments: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VisualTextSearchRequest"];
+                "multipart/form-data": {
+                    after?: string;
+                    before?: string;
+                    cursor?: string;
+                    direction?: ("from_person" | "to_person" | "group")[];
+                    filename?: string;
+                    /**
+                     * Format: binary
+                     * @description Query image (JPEG, PNG, WebP, or still GIF)
+                     */
+                    image: string;
+                    limit?: string;
+                    message_id?: string;
+                    mime_prefix?: string;
+                    participant_id?: string;
+                    person_id?: string;
+                    sender_person_id?: string;
+                    source_id?: string;
+                };
+            };
+        };
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SearchResponse"];
+                };
+            };
+            /** @description Error */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+            /** @description Error */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
             /** @description Error */
@@ -8990,13 +20091,13 @@ export interface operations {
                     "application/json": components["schemas"]["ErrorResponse"];
                 };
             };
-            /** @description Error */
+            /** @description Service Unavailable */
             503: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ErrorResponse"];
+                    "application/json": components["schemas"]["ExploreCacheUnavailableResponse"] | components["schemas"]["ErrorResponse"];
                 };
             };
             /** @description Error */
@@ -9390,6 +20491,38 @@ export interface operations {
             };
         };
     };
+    listSourceIdentities: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Source ID */
+                source_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description OK */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SourceIdentitiesResponse"];
+                };
+            };
+            /** @description Error */
+            default: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
+        };
+    };
     getStats: {
         parameters: {
             query?: never;
@@ -9551,6 +20684,8 @@ export interface operations {
             query?: {
                 /** @description Source ID */
                 source_id?: number;
+                /** @description Exact participant cluster member IDs */
+                participant_id?: number[];
                 /** @description Sender phone/address filter */
                 contact_phone?: string;
                 /** @description Sender display-name filter */
@@ -9605,8 +20740,12 @@ export interface operations {
     listTextConversationMessages: {
         parameters: {
             query?: {
+                /** @description Full-text search within the conversation */
+                search_query?: string;
                 /** @description Source ID */
                 source_id?: number;
+                /** @description Exact participant cluster member IDs */
+                participant_id?: number[];
                 /** @description Sender phone/address filter */
                 contact_phone?: string;
                 /** @description Sender display-name filter */
@@ -9683,7 +20822,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TextMessagesResponse"];
+                    "application/json": components["schemas"]["TextSearchResponse"];
                 };
             };
             /** @description Error */

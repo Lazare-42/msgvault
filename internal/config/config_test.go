@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -8,10 +9,58 @@ import (
 	"testing"
 	"time"
 
+	"github.com/BurntSushi/toml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/ocr"
 )
+
+func TestCardDAVConfigLoadsWithoutSerializingAPassword(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(os.WriteFile(path, []byte(`[carddav]
+base_url = "https://contacts.example/dav"
+username = "alice"
+schedule = "15 */6 * * *"
+enabled = true
+`), 0o600))
+	cfg, err := Load(path, "")
+	require.NoError(err)
+	assert.Equal(CardDAVConfig{
+		BaseURL: "https://contacts.example/dav", Username: "alice",
+		Schedule: "15 */6 * * *", Enabled: true,
+	}, cfg.CardDAV)
+
+	var encoded bytes.Buffer
+	require.NoError(toml.NewEncoder(&encoded).Encode(cfg))
+	assert.NotContains(encoded.String(), "password")
+}
+
+func TestCardDAVConfigRejectsPasswordField(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(path, []byte(`[carddav]
+base_url = "https://contacts.example/dav"
+username = "alice"
+password = "must-not-live-here"
+`), 0o600))
+
+	_, err := Load(path, "")
+	require.ErrorContains(t, err, "tokens/carddav.json")
+	assert.NotContains(t, err.Error(), "must-not-live-here")
+}
+
+func TestConfigPeopleDefaultsKeepBothSubsystemsDisabled(t *testing.T) {
+	checks := assert.New(t)
+	cfg := NewDefaultConfig()
+	checks.False(cfg.People.Sweep.Enabled)
+	checks.False(cfg.People.Enrichment.Enabled)
+	checks.Equal("*/15 * * * *", cfg.People.Enrichment.Schedule)
+	checks.Equal(25, cfg.People.Enrichment.BatchSize)
+	checks.Equal(5*time.Minute, cfg.People.Enrichment.LeaseDuration)
+	checks.Empty(cfg.People.Enrichment.Providers)
+}
 
 func TestServerConfigDefaults(t *testing.T) {
 	// Create a temp dir without a config file
@@ -28,10 +77,98 @@ func TestServerConfigDefaults(t *testing.T) {
 }
 
 func TestAnalyticsConfigDefaults(t *testing.T) {
+	assertions := assert.New(t)
 	cfg := NewDefaultConfig()
 
-	assert.Equal(t, AnalyticsEngineAuto, cfg.Analytics.Engine)
-	assert.True(t, cfg.Analytics.AutoBuildCache)
+	assertions.Equal(AnalyticsEngineAuto, cfg.Analytics.Engine)
+	assertions.True(cfg.Analytics.AutoBuildCache)
+	assertions.Zero(cfg.Analytics.MinRebuildInterval)
+	assertions.Empty(cfg.Analytics.BuilderMemoryLimit)
+	assertions.Zero(cfg.Analytics.BuilderThreads)
+	assertions.Empty(cfg.Analytics.BuilderTempLimit)
+}
+
+func TestLoadWithAnalyticsMinRebuildInterval(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  time.Duration
+	}{
+		{name: "positive", value: `"6h"`, want: 6 * time.Hour},
+		{name: "zero", value: `"0s"`, want: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := filepath.Join(t.TempDir(), "config.toml")
+			content := "[analytics]\nmin_rebuild_interval = " + tt.value + "\n"
+			require.NoError(t, os.WriteFile(configPath, []byte(content), 0o600))
+
+			cfg, err := Load(configPath, "")
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, cfg.Analytics.MinRebuildInterval)
+		})
+	}
+}
+
+func TestLoadRejectsNegativeAnalyticsMinRebuildInterval(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(configPath, []byte(
+		"[analytics]\nmin_rebuild_interval = \"-1m\"\n",
+	), 0o600))
+
+	_, err := Load(configPath, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "invalid [analytics] min_rebuild_interval")
+}
+
+func TestLoadWithAnalyticsBuilderResourceLimits(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.toml")
+	requirements.NoError(os.WriteFile(configPath, []byte(`
+[analytics]
+builder_memory_limit = "1536mIb"
+builder_threads = 3
+builder_temp_limit = "12gB"
+`), 0o600))
+
+	cfg, err := Load(configPath, "")
+	requirements.NoError(err)
+	assertions.Equal("1536mIb", cfg.Analytics.BuilderMemoryLimit)
+	assertions.Equal(3, cfg.Analytics.BuilderThreads)
+	assertions.Equal("12gB", cfg.Analytics.BuilderTempLimit)
+}
+
+func TestLoadRejectsInvalidAnalyticsBuilderResourceLimits(t *testing.T) {
+	tests := []struct {
+		name  string
+		key   string
+		value string
+	}{
+		{name: "zero memory", key: "builder_memory_limit", value: `"0GB"`},
+		{name: "fractional memory", key: "builder_memory_limit", value: `"1.5GB"`},
+		{name: "missing memory unit", key: "builder_memory_limit", value: `"2"`},
+		{name: "whitespace in memory", key: "builder_memory_limit", value: `" 2GB"`},
+		{name: "zero temp", key: "builder_temp_limit", value: `"0GiB"`},
+		{name: "negative temp", key: "builder_temp_limit", value: `"-8GB"`},
+		{name: "missing temp number", key: "builder_temp_limit", value: `"GB"`},
+		{name: "negative threads", key: "builder_threads", value: "-1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			configPath := filepath.Join(tmpDir, "config.toml")
+			content := "[analytics]\n" + tt.key + " = " + tt.value + "\n"
+			require.NoError(t, os.WriteFile(configPath, []byte(content), 0o600))
+
+			_, err := Load(configPath, "")
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "invalid [analytics] "+tt.key)
+		})
+	}
 }
 
 func TestDiscordConfigDefaults(t *testing.T) {
@@ -1086,15 +1223,26 @@ mcp_enabled = true
 }
 
 func TestNewDefaultConfig(t *testing.T) {
+	assert := assert.New(t)
 	// Use a temp directory as MSGVAULT_HOME
 	tmpDir := t.TempDir()
 	t.Setenv("MSGVAULT_HOME", tmpDir)
 
 	cfg := NewDefaultConfig()
 
-	assert.Equal(t, tmpDir, cfg.HomeDir)
-	assert.Equal(t, tmpDir, cfg.Data.DataDir)
-	assert.Equal(t, 5, cfg.Sync.RateLimitQPS)
+	assert.Equal(tmpDir, cfg.HomeDir)
+	assert.Equal(tmpDir, cfg.Data.DataDir)
+	assert.False(cfg.Data.LooseAttachments)
+	assert.Equal(5, cfg.Sync.RateLimitQPS)
+}
+
+func TestDataLooseAttachmentsConfig(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(path, []byte("[data]\nloose_attachments = true\n"), 0o600))
+
+	cfg, err := Load(path, "")
+	require.NoError(t, err)
+	assert.True(t, cfg.Data.LooseAttachments)
 }
 
 func TestSaveAndLoad_RoundTrip(t *testing.T) {
@@ -1133,21 +1281,25 @@ func TestSaveAndLoad_RoundTrip(t *testing.T) {
 	assert.Equal("user@gmail.com", loaded.Accounts[0].Email)
 }
 
-func TestSave_CreatesFileWithSecurePermissions(t *testing.T) {
+func TestConfigFileModeOnSave(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	cfg := NewDefaultConfig()
 	cfg.HomeDir = tmpDir
+	cfg.Fastmail = []FastmailSource{{
+		SourceID: 14,
+		APIToken: "fm_test_file_mode",
+	}}
 
 	require.NoError(t, cfg.Save(), "Save()")
 
 	info, err := os.Stat(cfg.ConfigFilePath())
 	require.NoError(t, err, "Stat config")
 
-	// Should have no group/other permissions (0600 or stricter)
+	// The config may contain provider API tokens, so its Unix mode must be exact.
 	// Windows doesn't support Unix file permissions.
 	if runtime.GOOS != "windows" {
-		assert.Zero(t, info.Mode().Perm()&0077, "config perm = %04o, want no group/other access", info.Mode().Perm())
+		assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
 	}
 }
 
@@ -1612,6 +1764,48 @@ strip_signatures = false
 	assert.True(cfg.Vector.Preprocess.StripQuotesEnabled(), "StripQuotesEnabled() should be true (unset → default)")
 }
 
+func TestLoadAllowsIndependentMultimodalVectorLane(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.toml")
+	require.NoError(os.WriteFile(configPath, []byte(`
+[vector]
+enabled = false
+
+[vector.multimodal]
+enabled = true
+include_images = false
+include_video = true
+
+[vector.multimodal.scope]
+message_types = ["MMS", "beeper", "mms"]
+`), 0o600))
+
+	cfg, err := Load(configPath, "")
+	require.NoError(err)
+	assert.False(cfg.Vector.Enabled)
+	assert.True(cfg.Vector.AnyLaneEnabled())
+	assert.False(cfg.Vector.Multimodal.ImagesEnabled())
+	assert.True(cfg.Vector.Multimodal.VideoEnabled())
+	assert.Equal([]string{"beeper", "mms"},
+		cfg.Vector.Multimodal.Scope.BuildScope().MessageTypes)
+}
+
+func TestLoadRejectsInvalidEnabledMultimodalConfig(t *testing.T) {
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.toml")
+	require.NoError(t, os.WriteFile(configPath, []byte(`
+[vector.multimodal]
+enabled = true
+dimension = 768
+`), 0o600))
+
+	_, err := Load(configPath, "")
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "vector.multimodal.dimension")
+}
+
 func TestLoadWithNamedOAuthApps_RelativePaths(t *testing.T) {
 	require := require.New(t)
 	tmpDir := t.TempDir()
@@ -1994,4 +2188,21 @@ func TestOCRResourceValidation(t *testing.T) {
 			assert.Contains(t, err.Error(), tt.field)
 		})
 	}
+}
+func TestLoadNormalizesMultimodalCapabilitiesFile(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.toml")
+	require.NoError(os.WriteFile(configPath, []byte(`
+[vector.multimodal]
+capabilities_file = "manifests/voyage.json"
+`), 0o600))
+
+	// With --config, relative paths resolve against the config directory so
+	// the manifest does not depend on the daemon's working directory.
+	cfg, err := Load(configPath, "")
+	require.NoError(err)
+	assert.Equal(filepath.Join(tmpDir, "manifests/voyage.json"),
+		cfg.Vector.Multimodal.CapabilitiesFile)
 }

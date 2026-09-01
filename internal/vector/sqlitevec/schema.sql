@@ -48,12 +48,24 @@ CREATE TABLE IF NOT EXISTS embeddings (
     source_char_len  INTEGER NOT NULL,
     chunk_char_start INTEGER NOT NULL DEFAULT 0,
     chunk_char_end   INTEGER NOT NULL DEFAULT 0,
+    source_basis     INTEGER NOT NULL DEFAULT 0,
     truncated        INTEGER NOT NULL DEFAULT 0,
     UNIQUE (generation_id, message_id, chunk_index)
 );
 CREATE INDEX IF NOT EXISTS idx_embeddings_msg ON embeddings(message_id);
 CREATE INDEX IF NOT EXISTS idx_embeddings_gen_msg ON embeddings(generation_id, message_id);
 
+-- Person embeddings are a separate corpus. The synthetic embedding_id joins
+-- to person_vectors_vec_dN without ever entering message-owned tables.
+CREATE TABLE IF NOT EXISTS person_embeddings (
+    embedding_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    generation_id      INTEGER NOT NULL REFERENCES index_generations(id) ON DELETE CASCADE,
+    person_id          INTEGER NOT NULL,
+    published_revision TEXT NOT NULL,
+    dimension          INTEGER NOT NULL,
+    embedded_at        INTEGER NOT NULL,
+    UNIQUE (generation_id, person_id)
+);
 CREATE TABLE IF NOT EXISTS embed_runs (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     generation_id INTEGER NOT NULL REFERENCES index_generations(id),
@@ -80,3 +92,75 @@ CREATE TABLE IF NOT EXISTS embed_watermark (
     generation_id INTEGER PRIMARY KEY,
     watermark_id  INTEGER NOT NULL DEFAULT 0
 );
+
+-- Contextual document publication ledger. A document row is retained after
+-- tombstoning so replay and reconciliation can distinguish a published delete
+-- from a key that was never seen. Membership rows exist only for current
+-- documents; their primary key enforces one current owner per message.
+CREATE TABLE IF NOT EXISTS embedding_documents (
+    generation_id     INTEGER NOT NULL REFERENCES index_generations(id) ON DELETE CASCADE,
+    document_key      TEXT NOT NULL,
+    kind              TEXT NOT NULL,
+    scope_key         TEXT NOT NULL,
+    state             TEXT NOT NULL CHECK (state IN ('current', 'tombstoned')),
+    published_revision TEXT NOT NULL,
+    source_sequence   INTEGER NOT NULL,
+    updated_at        INTEGER NOT NULL,
+    PRIMARY KEY (generation_id, document_key)
+);
+CREATE INDEX IF NOT EXISTS idx_embedding_documents_scope
+    ON embedding_documents(generation_id, scope_key, state, document_key);
+
+-- The latest source snapshot applied to each scope. This row exists even when
+-- a scope publishes no documents, so a delayed older worker cannot resurrect
+-- content after a newer empty-scope publication.
+CREATE TABLE IF NOT EXISTS embedding_document_scopes (
+    generation_id  INTEGER NOT NULL REFERENCES index_generations(id) ON DELETE CASCADE,
+    scope_key      TEXT NOT NULL,
+    source_sequence INTEGER NOT NULL,
+    PRIMARY KEY (generation_id, scope_key)
+);
+
+CREATE TABLE IF NOT EXISTS embedding_document_members (
+    generation_id INTEGER NOT NULL,
+    message_id    INTEGER NOT NULL,
+    document_key  TEXT NOT NULL,
+    member_ordinal INTEGER NOT NULL,
+    PRIMARY KEY (generation_id, message_id),
+    UNIQUE (generation_id, document_key, member_ordinal),
+    FOREIGN KEY (generation_id, document_key)
+        REFERENCES embedding_documents(generation_id, document_key) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_embedding_document_members_document
+    ON embedding_document_members(generation_id, document_key, member_ordinal);
+
+CREATE TABLE IF NOT EXISTS embedding_document_progress (
+    generation_id   INTEGER PRIMARY KEY REFERENCES index_generations(id) ON DELETE CASCADE,
+    change_sequence INTEGER NOT NULL DEFAULT 0,
+    reconcile_cursor TEXT NOT NULL DEFAULT '',
+    journal_cursor TEXT NOT NULL DEFAULT ''
+);
+-- Visual vectors remain opaque in vectors.db. Ownership, source evidence,
+-- publication state, and model inputs stay in the authoritative archive.
+-- The fixed 1,024 dimension is the voyage-multimodal-3.5 contract.
+CREATE TABLE IF NOT EXISTS visual_vectors (
+    vector_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    vector_token TEXT NOT NULL UNIQUE,
+    dimension    INTEGER NOT NULL CHECK (dimension = 1024),
+    created_at   INTEGER NOT NULL
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS visual_vectors_vec USING vec0(
+    embedding float[1024] distance_metric=cosine
+);
+
+-- Independent attachment-document vectors. Publication tokens are globally
+-- unique opaque identities; generation IDs belong to the main document-vector
+-- ledger and intentionally do not reference message index_generations.
+CREATE TABLE IF NOT EXISTS document_vector_embeddings (
+    document_vector_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    token              TEXT NOT NULL UNIQUE,
+    generation_id      INTEGER NOT NULL,
+    dimension          INTEGER NOT NULL CHECK (dimension > 0)
+);
+CREATE INDEX IF NOT EXISTS idx_document_vector_embeddings_generation
+    ON document_vector_embeddings(generation_id, dimension, token);

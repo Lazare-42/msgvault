@@ -1,8 +1,11 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -11,11 +14,28 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/api"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/deletion"
 	mcpserver "go.kenn.io/msgvault/internal/mcp"
 )
+
+func TestMCPWriteHelpDisclosesMutationClassesAndProfileOptIn(t *testing.T) {
+	assert := assert.New(t)
+	require.NotNil(t, mcpCmd.Flags().Lookup("allow-profile-writes"))
+	var output bytes.Buffer
+	previousOutput := mcpCmd.OutOrStdout()
+	mcpCmd.SetOut(&output)
+	t.Cleanup(func() { mcpCmd.SetOut(previousOutput) })
+
+	require.NoError(t, mcpCmd.Help())
+	help := output.String()
+	assert.Contains(help, "attachment exports")
+	assert.Contains(help, "deletion manifests")
+	assert.Contains(help, "person promotion")
+	assert.Contains(help, "private Notes writes")
+}
 
 func TestMCPCommandUsesDaemonInsteadOfOpeningLocalDatabase(t *testing.T) {
 	require := require.New(t)
@@ -52,9 +72,22 @@ func TestMCPCommandUsesDaemonInsteadOfOpeningLocalDatabase(t *testing.T) {
 	assert.NotContains(err.Error(), "open database", "MCP command must not open SQLite directly")
 }
 
-func TestMCPCommandForwardsServerAPIKeyToHTTPTransport(t *testing.T) {
+func TestMCPCommandForwardsHTTPPolicy(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
 	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "daemon-key", r.Header.Get("X-Api-Key"))
+		assert.Equal("daemon-key", r.Header.Get("X-Api-Key"))
+		if r.URL.Path == "/api/v1/health" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "ok", "api_schema_version": api.APISchemaVersion,
+			})
+			return
+		}
+		if r.URL.Path == "/api/v1/multimodal/status" {
+			http.Error(w, `{"error":"visual_search_not_ready"}`, http.StatusServiceUnavailable)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/api/v1/stats":
@@ -70,7 +103,7 @@ func TestMCPCommandForwardsServerAPIKeyToHTTPTransport(t *testing.T) {
 			// Queried by buildGmailFactory to detect IMAP accounts.
 			_, _ = w.Write([]byte(`{"accounts": []}`))
 		default:
-			assert.Fail(t, "unexpected daemon path", r.URL.Path)
+			assert.Fail("unexpected daemon path", r.URL.Path)
 			http.NotFound(w, r)
 		}
 	}))
@@ -88,29 +121,41 @@ func TestMCPCommandForwardsServerAPIKeyToHTTPTransport(t *testing.T) {
 
 	savedHTTPAddr := mcpHTTPAddr
 	savedAllowInsecure := mcpHTTPAllowInsecure
+	savedAllowProfileWrites := mcpAllowProfileWrites
 	savedServeHTTP := serveMCPHTTPWithOptions
+	allowWritesFlag := mcpCmd.Flags().Lookup("http-allow-writes")
+	require.NotNil(allowWritesFlag, "mcp command must define --http-allow-writes")
+	require.NoError(allowWritesFlag.Value.Set("true"))
 	mcpHTTPAddr = "0.0.0.0:8081"
 	mcpHTTPAllowInsecure = true
+	mcpAllowProfileWrites = true
 	t.Cleanup(func() {
+		assert.NoError(allowWritesFlag.Value.Set("false"))
 		mcpHTTPAddr = savedHTTPAddr
 		mcpHTTPAllowInsecure = savedAllowInsecure
+		mcpAllowProfileWrites = savedAllowProfileWrites
 		serveMCPHTTPWithOptions = savedServeHTTP
 	})
 
 	wantErr := errors.New("stop after capture")
-	var gotAddr, gotAPIKey string
-	serveMCPHTTPWithOptions = func(_ context.Context, _ mcpserver.ServeOptions, addr, apiKey string) error {
-		gotAddr = addr
-		gotAPIKey = apiKey
+	var gotServeOpts mcpserver.ServeOptions
+	var gotHTTPOpts mcpserver.HTTPOptions
+	serveMCPHTTPWithOptions = func(_ context.Context, serveOpts mcpserver.ServeOptions, httpOpts mcpserver.HTTPOptions) error {
+		gotServeOpts = serveOpts
+		gotHTTPOpts = httpOpts
 		return wantErr
 	}
 
 	mcpCmd.SetContext(context.Background())
 	err := mcpCmd.RunE(mcpCmd, nil)
 
-	require.ErrorIs(t, err, wantErr)
-	assert.Equal(t, "0.0.0.0:8081", gotAddr)
-	assert.Equal(t, "mcp-http-key", gotAPIKey)
+	require.ErrorIs(err, wantErr)
+	assert.True(gotServeOpts.AllowProfileWrites)
+	assert.Equal(mcpserver.HTTPOptions{
+		Addr:        "0.0.0.0:8081",
+		APIKey:      "mcp-http-key",
+		AllowWrites: true,
+	}, gotHTTPOpts)
 }
 
 func TestDaemonMCPServeOptionsDisablesVectorToolsWhenDaemonVectorUnavailable(t *testing.T) {
@@ -133,8 +178,82 @@ func TestDaemonMCPServeOptionsDisablesVectorToolsWhenDaemonVectorUnavailable(t *
 	assert.NotNil(opts.Engine, "engine")
 	assert.NotNil(opts.AttachmentReader, "attachment reader")
 	assert.NotNil(opts.ManifestSaver, "manifest saver")
+	assert.NotNil(opts.DocumentSearcher, "document searcher")
+	assert.NotNil(opts.PersonFileSearcher, "person file searcher")
 	assert.Nil(opts.HybridSearcher, "hybrid searcher")
 	assert.Nil(opts.SimilarSearcher, "similar searcher")
+}
+
+func TestDaemonMCPServeOptionsGatesPeopleToolsByAPISchema(t *testing.T) {
+	withStoreResolverConfig(t, &config.Config{
+		Data: config.DataConfig{DataDir: t.TempDir()},
+	})
+	tests := []struct {
+		name          string
+		schemaVersion string
+		wantPeople    bool
+	}{
+		{name: "people schema", schemaVersion: "2.10.0", wantPeople: true},
+		{name: "newer schema", schemaVersion: "2.11.0", wantPeople: true},
+		{name: "older same-major schema", schemaVersion: "2.9.9"},
+		{name: "missing schema"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newMCPDaemonClient(t, func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/v1/health":
+					body := map[string]any{"status": "ok"}
+					if tt.schemaVersion != "" {
+						body["api_schema_version"] = tt.schemaVersion
+					}
+					_ = json.NewEncoder(w).Encode(body)
+				case "/api/v1/stats":
+					_, _ = w.Write([]byte(`{"total_messages":0}`))
+				case "/api/v1/multimodal/status":
+					http.Error(w, `{"error":"visual_search_not_ready"}`, http.StatusServiceUnavailable)
+				default:
+					assert.Failf(t, "unexpected request", "%s %s", r.Method, r.URL.Path)
+				}
+			})
+
+			opts, err := daemonMCPServeOptions(t.Context(), client)
+			require.NoError(t, err)
+			if tt.wantPeople {
+				assert.NotNil(t, opts.PeopleBackend)
+			} else {
+				assert.Nil(t, opts.PeopleBackend)
+			}
+		})
+	}
+}
+
+func TestDaemonMCPServeOptionsWarnsWhenPeopleCapabilityProbeFails(t *testing.T) {
+	withStoreResolverConfig(t, &config.Config{
+		Data: config.DataConfig{DataDir: t.TempDir()},
+	})
+	var logs bytes.Buffer
+	previousLogger := logger
+	logger = slog.New(slog.NewTextHandler(&logs, nil))
+	t.Cleanup(func() { logger = previousLogger })
+
+	client := newMCPDaemonClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/health":
+			http.Error(w, `{"error":"temporarily_unavailable"}`, http.StatusServiceUnavailable)
+		case "/api/v1/stats":
+			_, _ = w.Write([]byte(`{"total_messages":0}`))
+		case "/api/v1/multimodal/status":
+			http.Error(w, `{"error":"visual_search_not_ready"}`, http.StatusServiceUnavailable)
+		default:
+			assert.Failf(t, "unexpected request", "%s %s", r.Method, r.URL.Path)
+		}
+	})
+
+	opts, err := daemonMCPServeOptions(t.Context(), client)
+	require.NoError(t, err)
+	assert.Nil(t, opts.PeopleBackend)
+	assert.Contains(t, logs.String(), "people tools disabled")
 }
 
 func TestDaemonMCPServeOptionsSavesDeletionManifestsThroughDaemon(t *testing.T) {
@@ -147,6 +266,13 @@ func TestDaemonMCPServeOptionsSavesDeletionManifestsThroughDaemon(t *testing.T) 
 	var manifestRequests atomic.Int32
 	client := newMCPDaemonClient(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
+		case "/api/v1/health":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "ok", "api_schema_version": api.APISchemaVersion,
+			})
+		case "/api/v1/multimodal/status":
+			http.Error(w, `{"error":"visual_search_not_ready"}`, http.StatusServiceUnavailable)
+			return
 		case "/api/v1/stats":
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{
@@ -213,6 +339,18 @@ func newMCPStatsDaemonClient(t *testing.T, statsJSON string) *daemonclient.Clien
 	t.Helper()
 
 	return newMCPDaemonClient(t, func(w http.ResponseWriter, r *http.Request) {
+		// Registration also probes the daemon's multimodal status; these
+		// fixtures model a daemon without the visual lane.
+		if r.URL.Path == "/api/v1/health" {
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "ok", "api_schema_version": api.APISchemaVersion,
+			})
+			return
+		}
+		if r.URL.Path == "/api/v1/multimodal/status" {
+			http.Error(w, `{"error":"visual_search_not_ready"}`, http.StatusServiceUnavailable)
+			return
+		}
 		assert.Equal(t, "/api/v1/stats", r.URL.Path, "path")
 		assert.Equal(t, "key", r.Header.Get("X-Api-Key"), "api key")
 		w.Header().Set("Content-Type", "application/json")

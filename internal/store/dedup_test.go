@@ -300,14 +300,22 @@ func TestStore_GetDuplicateGroupMessages_PreservesFromCase(t *testing.T) {
 // caught. Iter13 claude follow-up.
 func TestStore_GetAllRawMIMECandidates_PreservesFromCase(t *testing.T) {
 	require := require.New(t)
+	assert := assert.New(t)
 	f := storetest.New(t)
 
 	mxid := "@Bob:matrix.org"
 	pid := f.EnsureParticipant(mxid, "", "")
 
 	id := newRFC822Message(t, f, "msg-mxid-raw", "rfc822-mxid-raw")
-
 	_, err := f.Store.DB().Exec(
+		f.Store.Rebind(`UPDATE messages
+			SET size_estimate = ?, has_attachments = ?, attachment_count = ?
+			WHERE id = ?`),
+		int64(2048), true, 2, id,
+	)
+	require.NoError(err, "set completeness metadata")
+
+	_, err = f.Store.DB().Exec(
 		f.Store.Rebind(`INSERT INTO message_recipients
 			(message_id, participant_id, recipient_type)
 			VALUES (?, ?, 'from')`),
@@ -331,7 +339,10 @@ func TestStore_GetAllRawMIMECandidates_PreservesFromCase(t *testing.T) {
 		}
 	}
 	require.NotNil(got, "test message %d not in candidates: %+v", id, cands)
-	assert.Equal(t, mxid, got.FromEmail, "FromEmail (case must be preserved)")
+	assert.Equal(mxid, got.FromEmail, "FromEmail (case must be preserved)")
+	assert.Equal(int64(2048), got.PayloadBytes, "PayloadBytes")
+	assert.Equal(2, got.AttachmentCount, "AttachmentCount")
+	assert.True(got.HasAttachments, "HasAttachments")
 }
 
 func TestStore_GetDuplicateGroupMessagesBatch_MatchesPerGroupQuery(t *testing.T) {

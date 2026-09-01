@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/api"
 	"go.kenn.io/msgvault/internal/daemonclient"
+	"go.kenn.io/msgvault/internal/peoplebrowser"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/tui"
 )
@@ -20,11 +22,13 @@ var deprecatedTUIForceSQL bool
 var deprecatedTUISkipCacheBuild bool
 var deprecatedTUINoSQLiteScanner bool
 
+var _ peoplebrowser.Backend = (*daemonclient.PeopleBrowser)(nil)
+
 var tuiCmd = &cobra.Command{
 	Use:   "tui",
 	Short: "Open the interactive terminal UI",
 	Long: `Open an interactive terminal UI for browsing email, text messages,
-and meeting transcripts.
+meeting transcripts, and people.
 
 Email mode provides aggregate views by:
   - Senders: Who sends you the most email
@@ -33,18 +37,19 @@ Email mode provides aggregate views by:
   - Labels: Gmail label distribution
   - Time: Message volume over time
 
-Press 'm' to cycle through Email, Texts, and Meetings. Texts is skipped when
-its engine is unavailable. Meetings shows a read-only list of Granola and
-Circleback transcripts and remains available before a source is configured.
+Press 'm' to cycle through Email, Texts, Meetings, and People. Texts is skipped
+when its engine is unavailable. Meetings remains available before a source is
+configured. People browses every observed contact and remains available when
+Texts is absent.
 
 Navigation:
   ↑/k, ↓/j    Move up/down
   PgUp/PgDn   Page up/down
   Enter       Drill down / view message
   Esc         Go back
-  m           Cycle Email / Texts / Meetings
+  m           Cycle Email / Texts / Meetings / People
   g           Cycle aggregate view (Email and Texts)
-  /           Search; find within an open meeting transcript
+  /           Search; Tab adds active-message-only Semantic mode when enabled
   A           Filter by account, or meeting source in Meetings mode
   s           Cycle sort field
   r           Reverse sort direction
@@ -77,11 +82,10 @@ HTTP Mode:
 			fmt.Printf("Connected to remote: %s\n", cfg.Remote.URL)
 		}
 
-		// Check if engine supports text queries
-		var textEngine query.TextEngine
-		if te, ok := backend.engine.(query.TextEngine); ok {
-			textEngine = te
-		}
+		// The shipped daemon engine provides Texts directly. People uses the
+		// focused wrapper because Engine.Search has a different query contract.
+		var textEngine query.TextEngine = backend.engine
+		peopleBackend := tuiPeopleBackend(cmd.Context(), backend.client, backend.engine)
 
 		notice := analyticsCacheNotice(cmd.Context(), backend.client)
 		if notice != "" {
@@ -89,15 +93,28 @@ HTTP Mode:
 		}
 
 		// Create and run TUI
+		semanticSearch := tuiSemanticSearcher(cmd.Context(), backend.client, backend.engine)
 		model := tui.New(backend.engine, tui.Options{
 			DataDir:          cfg.Data.DataDir,
 			Version:          Version,
 			TextEngine:       textEngine,
+			PeopleBackend:    peopleBackend,
 			ManifestSaver:    backend.client,
 			AttachmentReader: tuiAttachmentOpener{client: backend.client},
+			SemanticSearch:   semanticSearch,
 			AnalyticsNotice:  notice,
 		})
 		p := tea.NewProgram(model)
+		noticeCtx, stopNoticeRefresh := context.WithCancel(cmd.Context())
+		defer stopNoticeRefresh()
+		if notice != "" {
+			go refreshAnalyticsCacheNotice(
+				noticeCtx,
+				backend.client,
+				analyticsCacheNoticeRefreshInterval,
+				p.Send,
+			)
+		}
 
 		// Swap the slog default to a file-only logger for the
 		// duration of the TUI. Bubble Tea owns the terminal in
@@ -119,6 +136,47 @@ HTTP Mode:
 	},
 }
 
+func tuiSemanticSearcher(
+	ctx context.Context,
+	client *daemonclient.Client,
+	engine query.Engine,
+) query.SemanticMessageSearcher {
+	if client == nil || engine == nil {
+		return nil
+	}
+	compatible, err := client.SupportsAPISchemaVersion(ctx, semanticSearchMinAPISchemaVersion)
+	if err != nil || !compatible {
+		return nil
+	}
+	available, err := client.VectorSearchAvailableForMessageType(ctx, tuiSemanticMessageType)
+	if err != nil || !available {
+		return nil
+	}
+	searcher, _ := engine.(query.SemanticMessageSearcher)
+	return searcher
+}
+
+func tuiPeopleBackend(
+	ctx context.Context,
+	client *daemonclient.Client,
+	engine *daemonclient.Engine,
+) *daemonclient.PeopleBrowser {
+	if client == nil || engine == nil {
+		return nil
+	}
+	compatible, err := client.SupportsAPISchemaVersion(ctx, peopleMinAPISchemaVersion)
+	if err != nil || !compatible {
+		return nil
+	}
+	return daemonclient.NewPeopleBrowser(engine)
+}
+
+const (
+	semanticSearchMinAPISchemaVersion = "2.7.0"
+	peopleMinAPISchemaVersion         = "2.10.0"
+	tuiSemanticMessageType            = "email"
+)
+
 type tuiAttachmentOpener struct {
 	client *daemonclient.Client
 }
@@ -128,28 +186,75 @@ func (o tuiAttachmentOpener) OpenAttachment(ctx context.Context, contentHash str
 }
 
 type tuiBackend struct {
-	engine  query.Engine
+	engine  *daemonclient.Engine
 	client  *daemonclient.Client
 	info    HTTPStoreInfo
 	cleanup func()
 }
 
-// analyticsCacheNotice asks the daemon which analytics engine it actually
-// selected at startup (GET /health, no cache scans or archive access) and
-// warns when aggregate views run live SQL only because no usable cache
-// existed then. Deliberate live SQL (engine = "sql", PostgreSQL) reports a
-// different mode and stays silent, as do daemons predating the field. The
-// mode is fixed for the daemon's lifetime, so the notice stays accurate —
-// and keeps firing — after a cache build until the daemon restarts.
-// Best-effort: errors return an empty notice rather than blocking launch.
+const (
+	analyticsCacheNoticeRefreshInterval = time.Second
+	analyticsCacheFallbackNotice        = "Aggregate views are using live SQL while the analytics cache initializes or because no usable cache is available; they may load slowly. If this continues, run 'msgvault build-cache', then restart the daemon."
+)
+
+// analyticsCacheNotice asks the daemon which analytics engine currently
+// serves requests (GET /health, no cache scans or archive access). Deliberate
+// live SQL (engine = "sql", PostgreSQL) reports a different mode and stays
+// silent, as do daemons predating the field. Best-effort: errors return an
+// empty notice rather than blocking launch.
 func analyticsCacheNotice(ctx context.Context, client *daemonclient.Client) string {
+	mode, err := currentAnalyticsMode(ctx, client)
+	if err != nil || mode != api.AnalyticsModeSQLFallback {
+		return ""
+	}
+	return analyticsCacheFallbackNotice
+}
+
+func currentAnalyticsMode(ctx context.Context, client *daemonclient.Client) (string, error) {
+	if client == nil {
+		return "", errors.New("daemon client unavailable")
+	}
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	health, err := client.GetHealth(ctx)
-	if err != nil || health.AnalyticsEngine != api.AnalyticsModeSQLFallback {
-		return ""
+	if err != nil {
+		return "", err
 	}
-	return "Aggregate views are using live SQL because the daemon started without a usable analytics cache; they may load slowly. Run 'msgvault build-cache', then restart the daemon."
+	return health.AnalyticsEngine, nil
+}
+
+// refreshAnalyticsCacheNotice clears the launch notice when a background
+// cache initialization swaps the daemon to DuckDB. Health errors are
+// transient and leave the current notice unchanged.
+func refreshAnalyticsCacheNotice(
+	ctx context.Context,
+	client *daemonclient.Client,
+	interval time.Duration,
+	send func(tea.Msg),
+) {
+	if client == nil || send == nil {
+		return
+	}
+	if interval <= 0 {
+		interval = analyticsCacheNoticeRefreshInterval
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			mode, err := currentAnalyticsMode(ctx, client)
+			if err != nil {
+				continue
+			}
+			if mode == api.AnalyticsModeDuckDB {
+				send(tui.AnalyticsNoticeMsg{})
+				return
+			}
+		}
+	}
 }
 
 func openTUIBackend(ctx context.Context) (*tuiBackend, error) {
@@ -174,7 +279,7 @@ func openTUIBackend(ctx context.Context) (*tuiBackend, error) {
 
 func init() {
 	rootCmd.AddCommand(tuiCmd)
-	tuiCmd.Flags().BoolVar(&forceLocalTUI, "local", false, "Use the local daemon instead of the configured remote server")
+	tuiCmd.Flags().BoolVar(&forceLocalTUI, localValue, false, "Use the local daemon instead of the configured remote server")
 	tuiCmd.Flags().BoolVar(&deprecatedTUIForceSQL, "force-sql", false, "Deprecated in 0.17.0: set [analytics].engine = \"sql\" in config.toml")
 	tuiCmd.Flags().BoolVar(&deprecatedTUISkipCacheBuild, "no-cache-build", false, "Deprecated in 0.17.0: set [analytics].auto_build_cache = false in config.toml")
 	tuiCmd.Flags().BoolVar(&deprecatedTUINoSQLiteScanner, "no-sqlite-scanner", false, "Deprecated in 0.17.0: cache engine selection is daemon-managed")

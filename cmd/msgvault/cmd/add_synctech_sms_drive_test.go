@@ -225,13 +225,13 @@ func TestSynctechSMSDrivePartialFailureEnqueuesImportedMessages(t *testing.T) {
 	refreshErr := errors.New("cache refresh failed")
 	refreshCalls := 0
 	var refreshContextErr error
-	oldRunBuild := runBuildCacheSubprocess
-	runBuildCacheSubprocess = func(ctx context.Context, _ bool, _ bool) error {
+	oldRunBuild := runScheduledBuildCacheSubprocess
+	runScheduledBuildCacheSubprocess = func(ctx context.Context) error {
 		refreshCalls++
 		refreshContextErr = ctx.Err()
 		return refreshErr
 	}
-	t.Cleanup(func() { runBuildCacheSubprocess = oldRunBuild })
+	t.Cleanup(func() { runScheduledBuildCacheSubprocess = oldRunBuild })
 	src := synctechDriveTestSource()
 	client := fakeSynctechDriveClient{
 		files: []synctechsms.DriveFile{
@@ -318,7 +318,7 @@ func TestRunConfiguredSynctechSMSSourceLeavesManualSyncMessagesUnstamped(t *test
 
 	src := config.SynctechSMSSource{
 		Name:       "pixel-local",
-		Backend:    "local",
+		Backend:    localValue,
 		Path:       importDir,
 		OwnerPhone: "+15550000001",
 		IncludeSMS: true,
@@ -354,7 +354,7 @@ func TestConfiguredSynctechSMSCompletesAfterImport(t *testing.T) {
   <sms address="+15551234567" date="1717214400000" type="1" body="hello from local" read="1" status="-1" contact_name="Alice" />
 </smses>`), 0o600), "write sms fixture")
 	src := synctechDriveTestSource()
-	src.Backend = "local"
+	src.Backend = localValue
 	src.Path = xmlPath
 
 	err := runConfiguredSynctechSMSSourceWithStore(context.Background(), f.Store, src)
@@ -368,9 +368,9 @@ func TestConfiguredSynctechSMSCompletesAfterImport(t *testing.T) {
 
 func stubScheduledCacheBuild(t *testing.T) {
 	t.Helper()
-	old := runBuildCacheSubprocess
-	runBuildCacheSubprocess = func(context.Context, bool, bool) error { return nil }
-	t.Cleanup(func() { runBuildCacheSubprocess = old })
+	old := runScheduledBuildCacheSubprocess
+	runScheduledBuildCacheSubprocess = func(context.Context) error { return nil }
+	t.Cleanup(func() { runScheduledBuildCacheSubprocess = old })
 }
 
 type fakeSynctechDriveClient struct {

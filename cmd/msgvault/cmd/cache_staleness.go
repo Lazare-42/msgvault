@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"strings"
+	"time"
 
 	"go.kenn.io/msgvault/internal/identityindex"
 	"go.kenn.io/msgvault/internal/query"
@@ -13,9 +14,14 @@ import (
 // cacheStaleness describes why the analytics cache needs a rebuild.
 type cacheStaleness struct {
 	NeedsBuild bool
-	HasNew     bool // new messages since last build
-	HasDeleted bool // deletions since last build
-	HasUpdated bool // updates or additions within the cached ID boundary require repair
+	// HasUsablePublication distinguishes ordinary data drift, which may be
+	// throttled after a scheduled sync, from cache recovery conditions that
+	// must rebuild immediately. PublishedAt is valid only when this is true.
+	HasUsablePublication bool
+	PublishedAt          time.Time
+	HasNew               bool // new messages since last build
+	HasDeleted           bool // deletions since last build
+	HasUpdated           bool // updates or additions within the cached ID boundary require repair
 	// HasIdentityDrift signals participant_links or account_identities
 	// changed since the last build. Also set whenever
 	// HasAccountIdentityDrift is set (AddAccountIdentity/RemoveAccountIdentity
@@ -23,28 +29,38 @@ type cacheStaleness struct {
 	// index-only refresh applies must check HasAccountIdentityDrift too —
 	// see derivedDriftOnly in build_cache.go.
 	HasIdentityDrift bool
+	// HasDerivedDataDrift signals an offline repair rewrote existing message
+	// or attachment facts already inside the committed cache watermark. These
+	// facts require a full rebuild; neither incremental append nor the
+	// identity-only refresh can replace them.
+	HasDerivedDataDrift bool
 	// HasConversationParticipantDrift signals conversation membership changed
 	// for a conversation already represented by the committed message
 	// watermark. The index-only refresh can rebuild relationship_activity and
 	// its compact datasets without rewriting message facts.
 	HasConversationParticipantDrift bool
-	// HasConversationTypeDrift signals conversation_type changed for a
-	// conversation already represented by the committed message watermark.
-	// The type is baked into committed relationship_activity rows (and the
-	// replaceable conversations base dataset), so like membership drift it
-	// is repaired by the index-only refresh — unless new messages also
-	// arrived, in which case the incremental append cannot rewrite the
-	// already-committed rows and a full rebuild is forced below.
+	// HasConversationTypeDrift signals conversation_type or title changed for
+	// a conversation already represented by the committed message watermark.
+	// This metadata is baked into committed relationship_activity rows (and
+	// the replaceable conversations base dataset), so like membership drift it
+	// is repaired by the index-only refresh — unless new messages also arrived,
+	// in which case the incremental append cannot rewrite the already-committed
+	// rows and a full rebuild is forced below.
 	HasConversationTypeDrift bool
-	// HasParticipantIdentifierDrift signals identifier mappings changed
-	// (SetParticipantIdentifier created or repointed rows) since the last
-	// build. Identifiers bake into the identity directory datasets
+	// HasParticipantIdentifierDrift signals identifier rows or their
+	// service/scope classification changed since the last build. Identifiers
+	// bake into the identity directory datasets
 	// (participant_identifiers, relationship_people search values) but not
 	// into per-row activity facts, so this drift is repaired by the
 	// index-only refresh and — unlike link or conversation drift — never
 	// escalates to a full rebuild when new messages coincide: incremental
 	// builds re-stage participant_identifiers in full anyway.
 	HasParticipantIdentifierDrift bool
+	// HasParticipantDisplayNameDrift signals participant display-name changes
+	// since the last build. Display names are baked into participants.parquet
+	// and relationship_people, but not into message facts, so the index-only
+	// refresh can repair this drift without a full rebuild.
+	HasParticipantDisplayNameDrift bool
 	// HasAccountIdentityDrift signals an identity mutation that invalidates
 	// baked message data since the last build: an account identity was
 	// confirmed or removed, or two participants were merged (merges repoint
@@ -184,7 +200,10 @@ func cacheNeedsBuildLocked(dbPath, analyticsDir string) cacheStaleness {
 	// Collect staleness signals without short-circuiting so a mixed
 	// add+delete sync correctly triggers a full rebuild.
 	var reasons []string
-	result := cacheStaleness{}
+	result := cacheStaleness{
+		HasUsablePublication: true,
+		PublishedAt:          state.PublishedAt,
+	}
 
 	if maxLiveID > state.LastMessageID {
 		newCount := maxLiveID - state.LastMessageID
@@ -289,6 +308,19 @@ func cacheNeedsBuildLocked(dbPath, analyticsDir string) cacheStaleness {
 		}
 	}
 
+	derivedDataRevision, err := db.DerivedDataRevision()
+	if err != nil {
+		return cacheStaleness{
+			NeedsBuild: true, FullRebuild: true,
+			Reason: "cannot verify derived-data revision",
+		}
+	}
+	if derivedDataRevision != state.DerivedDataRevision {
+		result.HasDerivedDataDrift = true
+		result.FullRebuild = true
+		reasons = append(reasons, "derived message data changed")
+	}
+
 	// Account-identity drift covers identity mutations that invalidate baked
 	// message data: confirming or removing a confirmed "me" address via
 	// AddAccountIdentity/RemoveAccountIdentity, and participant merges via
@@ -344,6 +376,18 @@ func cacheNeedsBuildLocked(dbPath, analyticsDir string) cacheStaleness {
 		reasons = append(reasons, "participant identifiers changed")
 	}
 
+	participantDisplayNameRevision, err := db.ParticipantDisplayNameRevision()
+	if err != nil {
+		return cacheStaleness{
+			NeedsBuild: true, FullRebuild: true,
+			Reason: "cannot verify participant display-name revision",
+		}
+	}
+	if participantDisplayNameRevision != state.ParticipantDisplayNameRevision {
+		result.HasParticipantDisplayNameDrift = true
+		reasons = append(reasons, "participant display names changed")
+	}
+
 	conversationFingerprint, err := sourceConversationParticipantsFingerprint(
 		db.DB(),
 		state.LastMessageID,
@@ -366,12 +410,12 @@ func cacheNeedsBuildLocked(dbPath, analyticsDir string) cacheStaleness {
 	if err != nil {
 		return cacheStaleness{
 			NeedsBuild: true, FullRebuild: true,
-			Reason: "cannot verify conversation types",
+			Reason: "cannot verify conversation metadata",
 		}
 	}
 	if typesFingerprint != state.ConversationTypesFingerprint {
 		result.HasConversationTypeDrift = true
-		reasons = append(reasons, "conversation types changed")
+		reasons = append(reasons, "conversation metadata changed")
 	}
 
 	// An incremental build can append only new activity rows. If canonical
@@ -393,10 +437,9 @@ func cacheNeedsBuildLocked(dbPath, analyticsDir string) cacheStaleness {
 	return result
 }
 
-// sourceConversationTypesFingerprint hashes (id, conversation_type) for
+// sourceConversationTypesFingerprint hashes (id, conversation_type, title) for
 // conversations with exportable messages inside the committed watermark. The
-// NULL normalization must match the conversations Parquet export
-// (COALESCE(conversation_type, 'email_thread')) and
+// NULL normalization must match the conversations Parquet export and
 // fingerprintConversationTypesFromSnapshot so an unchanged database always
 // reproduces the stamped fingerprint.
 func sourceConversationTypesFingerprint(
@@ -404,7 +447,8 @@ func sourceConversationTypesFingerprint(
 	lastMessageID int64,
 ) (string, error) {
 	rows, err := db.Query(`
-		SELECT c.id, COALESCE(c.conversation_type, 'email_thread')
+		SELECT c.id, COALESCE(c.conversation_type, 'email_thread'),
+		       COALESCE(c.title, '')
 		FROM conversations c
 		WHERE EXISTS (
 			SELECT 1
@@ -416,12 +460,12 @@ func sourceConversationTypesFingerprint(
 		ORDER BY c.id
 	`, lastMessageID)
 	if err != nil {
-		return "", fmt.Errorf("query conversation types for fingerprint: %w", err)
+		return "", fmt.Errorf("query conversation metadata for fingerprint: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
-	fingerprint, err := identityindex.FingerprintConversationTypes(rows)
+	fingerprint, err := identityindex.FingerprintConversationMetadata(rows)
 	if rowsErr := rows.Err(); rowsErr != nil && err == nil {
-		return "", fmt.Errorf("iterate conversation types for fingerprint: %w", rowsErr)
+		return "", fmt.Errorf("iterate conversation metadata for fingerprint: %w", rowsErr)
 	}
 	return fingerprint, err
 }

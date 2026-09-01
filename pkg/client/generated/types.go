@@ -57,6 +57,28 @@ func (a AccountStatus) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(a))
 }
 
+type ActivityRef struct {
+	Channel          string    `json:"channel" validate:"required"`
+	ConversationID   *int64    `json:"conversation_id,omitempty"`
+	DateOrigin       string    `json:"date_origin" validate:"required"`
+	DatePrecision    string    `json:"date_precision" validate:"required"`
+	Direction        string    `json:"direction" validate:"required"`
+	Evidence         string    `json:"evidence" validate:"required"`
+	Kind             string    `json:"kind" validate:"required"`
+	LocalDate        string    `json:"local_date" validate:"required"`
+	MessageID        int64     `json:"message_id"`
+	OccurredAt       time.Time `json:"occurred_at" validate:"required"`
+	Ref              string    `json:"ref" validate:"required"`
+	Role             string    `json:"role" validate:"required"`
+	SourceID         int64     `json:"source_id"`
+	Timezone         string    `json:"timezone" validate:"required"`
+	UtcOffsetMinutes int64     `json:"utc_offset_minutes"`
+}
+
+func (a ActivityRef) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(a))
+}
+
 type AddAccountRequest struct {
 	Email    string `json:"email" validate:"required"`
 	Enabled  bool   `json:"enabled"`
@@ -68,9 +90,10 @@ func (a AddAccountRequest) Validate() error {
 }
 
 type AddRequest struct {
-	Account    string `json:"account" validate:"required"`
-	Identifier string `json:"identifier" validate:"required"`
-	Signal     string `json:"signal" validate:"required"`
+	Account    *string `json:"account,omitempty"`
+	Identifier string  `json:"identifier" validate:"required"`
+	Signal     string  `json:"signal" validate:"required"`
+	SourceID   *int64  `json:"source_id,omitempty"`
 }
 
 func (a AddRequest) Validate() error {
@@ -157,6 +180,28 @@ func (a AggregateRowJSON) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(a))
 }
 
+type AnnualTemperatureSummary struct {
+	Population  int64              `json:"population"`
+	Rank        int64              `json:"rank"`
+	RawScore    float64            `json:"raw_score"`
+	Signals     TemperatureSignals `json:"signals"`
+	Temperature int64              `json:"temperature"`
+	Year        int64              `json:"year"`
+}
+
+func (a AnnualTemperatureSummary) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(a.Signals).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Signals", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
 type APIHTTPError struct {
 	ErrorData string  `json:"error" validate:"required"`
 	Message   *string `json:"message,omitempty"`
@@ -170,6 +215,32 @@ func (s APIHTTPError) Error() string {
 	return "unmapped client error"
 }
 
+type AppendPersonNoteRequest struct {
+	Actor      *string                        `json:"actor,omitempty"`
+	Confidence *float64                       `json:"confidence,omitempty"`
+	Source     *AppendPersonNoteRequestSource `json:"source,omitempty"`
+	SourceRef  *string                        `json:"source_ref,omitempty"`
+	Text       string                         `json:"text" validate:"required"`
+}
+
+func (a AppendPersonNoteRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	if a.Source != nil {
+		if v, ok := any(a.Source).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Source", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(a.Text, "required"); err != nil {
+		errors = errors.Append("Text", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
 type AttachmentInfo struct {
 	ContentHash *string `json:"content_hash,omitempty"`
 	Filename    string  `json:"filename" validate:"required"`
@@ -180,6 +251,194 @@ type AttachmentInfo struct {
 }
 
 func (a AttachmentInfo) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(a))
+}
+
+type AttachmentSearchResult struct {
+	AttachmentID     int64       `json:"attachment_id"`
+	BlobHash         string      `json:"blob_hash" validate:"required"`
+	ConversationID   int64       `json:"conversation_id"`
+	Filename         string      `json:"filename" validate:"required"`
+	MessageID        int64       `json:"message_id"`
+	MimeType         string      `json:"mime_type" validate:"required"`
+	PersonProvenance *Provenance `json:"person_provenance,omitempty"`
+	Rank             int64       `json:"rank"`
+	Score            float64     `json:"score"`
+	SentAt           time.Time   `json:"sent_at" validate:"required"`
+	Size             int64       `json:"size"`
+	SourceID         int64       `json:"source_id"`
+	SourceMessageID  string      `json:"source_message_id" validate:"required"`
+}
+
+func (a AttachmentSearchResult) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(a.BlobHash, "required"); err != nil {
+		errors = errors.Append("BlobHash", err)
+	}
+	if err := typesValidator.Var(a.Filename, "required"); err != nil {
+		errors = errors.Append("Filename", err)
+	}
+	if err := typesValidator.Var(a.MimeType, "required"); err != nil {
+		errors = errors.Append("MimeType", err)
+	}
+	if a.PersonProvenance != nil {
+		if v, ok := any(a.PersonProvenance).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PersonProvenance", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(a.SentAt, "required"); err != nil {
+		errors = errors.Append("SentAt", err)
+	}
+	if err := typesValidator.Var(a.SourceMessageID, "required"); err != nil {
+		errors = errors.Append("SourceMessageID", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type AttributeChoice struct {
+	Label string `json:"label" validate:"required"`
+	Value string `json:"value" validate:"required"`
+}
+
+func (a AttributeChoice) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(a))
+}
+
+type AttributeDefinition struct {
+	APIMutable    bool              `json:"api_mutable"`
+	Cardinality   string            `json:"cardinality" validate:"required"`
+	CreatedAt     time.Time         `json:"created_at" validate:"required"`
+	DerivedSource *string           `json:"derived_source,omitempty"`
+	Description   *string           `json:"description,omitempty"`
+	DisplayOrder  int64             `json:"display_order"`
+	FieldType     string            `json:"field_type" validate:"required"`
+	HistoryExempt bool              `json:"history_exempt"`
+	ID            int64             `json:"id"`
+	IsActive      bool              `json:"is_active"`
+	IsAudited     bool              `json:"is_audited"`
+	IsDeletable   bool              `json:"is_deletable"`
+	IsRequired    bool              `json:"is_required"`
+	IsSearchable  bool              `json:"is_searchable"`
+	IsSensitive   bool              `json:"is_sensitive"`
+	Label         string            `json:"label" validate:"required"`
+	ObjectType    string            `json:"object_type" validate:"required"`
+	Options       *AttributeOptions `json:"options,omitempty"`
+	Ownership     string            `json:"ownership" validate:"required"`
+	RecordTarget  *string           `json:"record_target,omitempty"`
+	Revision      int64             `json:"revision"`
+	Slug          string            `json:"slug" validate:"required"`
+	UICreatable   bool              `json:"ui_creatable"`
+	UIEditable    bool              `json:"ui_editable"`
+	UniversalID   string            `json:"universal_id" validate:"required"`
+	UpdatedAt     time.Time         `json:"updated_at" validate:"required"`
+	ValueType     string            `json:"value_type" validate:"required"`
+	VcardProperty *string           `json:"vcard_property,omitempty"`
+}
+
+func (a AttributeDefinition) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(a.Cardinality, "required"); err != nil {
+		errors = errors.Append("Cardinality", err)
+	}
+	if err := typesValidator.Var(a.CreatedAt, "required"); err != nil {
+		errors = errors.Append("CreatedAt", err)
+	}
+	if err := typesValidator.Var(a.FieldType, "required"); err != nil {
+		errors = errors.Append("FieldType", err)
+	}
+	if err := typesValidator.Var(a.Label, "required"); err != nil {
+		errors = errors.Append("Label", err)
+	}
+	if err := typesValidator.Var(a.ObjectType, "required"); err != nil {
+		errors = errors.Append("ObjectType", err)
+	}
+	if a.Options != nil {
+		if v, ok := any(a.Options).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Options", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(a.Ownership, "required"); err != nil {
+		errors = errors.Append("Ownership", err)
+	}
+	if err := typesValidator.Var(a.Slug, "required"); err != nil {
+		errors = errors.Append("Slug", err)
+	}
+	if err := typesValidator.Var(a.UniversalID, "required"); err != nil {
+		errors = errors.Append("UniversalID", err)
+	}
+	if err := typesValidator.Var(a.UpdatedAt, "required"); err != nil {
+		errors = errors.Append("UpdatedAt", err)
+	}
+	if err := typesValidator.Var(a.ValueType, "required"); err != nil {
+		errors = errors.Append("ValueType", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type AttributeDefinitionsResponse struct {
+	Definitions []AttributeDefinition `json:"definitions,omitempty" validate:"required"`
+}
+
+func (a AttributeDefinitionsResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range a.Definitions {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Definitions[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type AttributeOptions struct {
+	Choices   []AttributeChoice `json:"choices,omitempty"`
+	MaxLength *int64            `json:"max_length,omitempty"`
+	Unit      *string           `json:"unit,omitempty"`
+}
+
+func (a AttributeOptions) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range a.Choices {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Choices[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type AttributeValue struct {
+	Boolean    *bool           `json:"boolean,omitempty"`
+	Date       *string         `json:"date,omitempty"`
+	Integer    *int64          `json:"integer,omitempty"`
+	JSON       json.RawMessage `json:"json,omitempty"`
+	Real       *float64        `json:"real,omitempty"`
+	RecordID   *int64          `json:"record_id,omitempty"`
+	RecordType *string         `json:"record_type,omitempty"`
+	Text       *string         `json:"text,omitempty"`
+	Timestamp  *time.Time      `json:"timestamp,omitempty"`
+	Type       string          `json:"type" validate:"required"`
+}
+
+func (a AttributeValue) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(a))
 }
 
@@ -309,6 +568,7 @@ type CLIDeleteStagedPlanRequest struct {
 	List                *bool   `json:"list,omitempty"`
 	Permanent           *bool   `json:"permanent,omitempty"`
 	RemoteDeleteEnabled *bool   `json:"remote_delete_enabled,omitempty"`
+	SourceID            *int64  `json:"source_id,omitempty"`
 	Yes                 *bool   `json:"yes,omitempty"`
 }
 
@@ -321,6 +581,7 @@ type CLIDeleteStagedPlanResponse struct {
 	PlanFingerprint           *string  `json:"plan_fingerprint,omitempty"`
 	PlannedBatchIds           []string `json:"planned_batch_ids,omitempty"`
 	RemoteDeleteEnvVar        *string  `json:"remote_delete_env_var,omitempty"`
+	ResolvedSourceID          *int64   `json:"resolved_source_id,omitempty"`
 	ScopeEscalationAccount    *string  `json:"scope_escalation_account,omitempty"`
 	ScopeEscalationBodyLines  []string `json:"scope_escalation_body_lines,omitempty"`
 	ScopeEscalationCancelHint *string  `json:"scope_escalation_cancel_hint,omitempty"`
@@ -506,6 +767,294 @@ type CancelDeletionResponse struct {
 }
 
 func (c CancelDeletionResponse) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(c))
+}
+
+type Candidate struct {
+	AlreadyConfirmed     bool                    `json:"already_confirmed"`
+	Classification       CandidateClassification `json:"classification" validate:"required"`
+	FirstSeenAt          time.Time               `json:"first_seen_at" validate:"required"`
+	Identifier           string                  `json:"identifier" validate:"required"`
+	LastSeenAt           time.Time               `json:"last_seen_at" validate:"required"`
+	NormalizedIdentifier string                  `json:"normalized_identifier" validate:"required"`
+	ProviderStates       []string                `json:"provider_states" validate:"required"`
+	ReceivedMessageCount int64                   `json:"received_message_count"`
+	SentMessageCount     int64                   `json:"sent_message_count"`
+	Signals              []string                `json:"signals,omitempty" validate:"required"`
+}
+
+func (c Candidate) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(c.Classification).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Classification", err)
+		}
+	}
+	if err := typesValidator.Var(c.FirstSeenAt, "required"); err != nil {
+		errors = errors.Append("FirstSeenAt", err)
+	}
+	if err := typesValidator.Var(c.Identifier, "required"); err != nil {
+		errors = errors.Append("Identifier", err)
+	}
+	if err := typesValidator.Var(c.LastSeenAt, "required"); err != nil {
+		errors = errors.Append("LastSeenAt", err)
+	}
+	if err := typesValidator.Var(c.NormalizedIdentifier, "required"); err != nil {
+		errors = errors.Append("NormalizedIdentifier", err)
+	}
+	if err := typesValidator.Var(c.ProviderStates, "required"); err != nil {
+		errors = errors.Append("ProviderStates", err)
+	}
+	if err := typesValidator.Var(c.Signals, "required"); err != nil {
+		errors = errors.Append("Signals", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type CardDAVAccountRequest struct {
+	BaseURL  string  `json:"base_url" validate:"required"`
+	Enabled  bool    `json:"enabled"`
+	Password *string `json:"password,omitempty"`
+	Schedule *string `json:"schedule,omitempty"`
+	Username string  `json:"username" validate:"required"`
+}
+
+func (c CardDAVAccountRequest) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(c))
+}
+
+type CardDAVAccountResponse struct {
+	BaseURL  string  `json:"base_url" validate:"required"`
+	Books    int64   `json:"books"`
+	Enabled  bool    `json:"enabled"`
+	Schedule *string `json:"schedule,omitempty"`
+	Username string  `json:"username" validate:"required"`
+}
+
+func (c CardDAVAccountResponse) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(c))
+}
+
+type CardDAVBookResponse struct {
+	ID                 int64  `json:"id"`
+	LookupSource       bool   `json:"lookup_source"`
+	Name               string `json:"name" validate:"required"`
+	NeedsFullReconcile bool   `json:"needs_full_reconcile"`
+	Subscribed         bool   `json:"subscribed"`
+	URL                string `json:"url" validate:"required"`
+	WriteTarget        bool   `json:"write_target"`
+}
+
+func (c CardDAVBookResponse) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(c))
+}
+
+type CardDAVBookRolesRequest struct {
+	LookupSource bool `json:"lookup_source"`
+	Subscribed   bool `json:"subscribed"`
+	WriteTarget  bool `json:"write_target"`
+}
+
+type CardDAVBooksResponse struct {
+	Books []CardDAVBookResponse `json:"books,omitempty" validate:"required"`
+}
+
+func (c CardDAVBooksResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range c.Books {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Books[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type CardDAVConflictDetailResponse struct {
+	AddressBookID   int64   `json:"address_book_id"`
+	Href            string  `json:"href" validate:"required"`
+	ID              int64   `json:"id"`
+	LocalTombstone  bool    `json:"local_tombstone"`
+	LocalVcard      *string `json:"local_vcard,omitempty"`
+	RemoteTombstone bool    `json:"remote_tombstone"`
+	RemoteVcard     *string `json:"remote_vcard,omitempty"`
+	Status          string  `json:"status" validate:"required"`
+}
+
+func (c CardDAVConflictDetailResponse) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(c))
+}
+
+type CardDAVConflictResolutionResponse struct {
+	ID     int64  `json:"id"`
+	Status string `json:"status" validate:"required"`
+}
+
+func (c CardDAVConflictResolutionResponse) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(c))
+}
+
+type CardDAVConflictResponse struct {
+	AddressBookID   int64  `json:"address_book_id"`
+	Href            string `json:"href" validate:"required"`
+	ID              int64  `json:"id"`
+	LocalTombstone  bool   `json:"local_tombstone"`
+	RemoteTombstone bool   `json:"remote_tombstone"`
+	Status          string `json:"status" validate:"required"`
+}
+
+func (c CardDAVConflictResponse) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(c))
+}
+
+type CardDAVConflictsResponse struct {
+	Conflicts []CardDAVConflictResponse `json:"conflicts,omitempty" validate:"required"`
+}
+
+func (c CardDAVConflictsResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range c.Conflicts {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Conflicts[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type CardDAVPublicationResponse struct {
+	Desired          bool    `json:"desired"`
+	Href             *string `json:"href,omitempty"`
+	PendingOperation *string `json:"pending_operation,omitempty"`
+	PersonID         int64   `json:"person_id"`
+}
+
+type CardDAVResolveRequest struct {
+	Choice CardDAVResolveRequestChoice `json:"choice" validate:"required"`
+}
+
+func (c CardDAVResolveRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(c.Choice).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Choice", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type CardDAVSyncRequest struct {
+	Full *bool `json:"full,omitempty"`
+}
+
+type Catalog struct {
+	Fingerprint string             `json:"fingerprint" validate:"required"`
+	Targets     []TargetDescriptor `json:"targets,omitempty" validate:"required"`
+	Version     string             `json:"version" validate:"required"`
+}
+
+func (c Catalog) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(c.Fingerprint, "required"); err != nil {
+		errors = errors.Append("Fingerprint", err)
+	}
+	for i, item := range c.Targets {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Targets[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(c.Version, "required"); err != nil {
+		errors = errors.Append("Version", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type ChangedMessageJSON struct {
+	AttachmentCount     int64      `json:"attachment_count"`
+	ContentChangedAt    time.Time  `json:"content_changed_at" validate:"required"`
+	ConversationID      int64      `json:"conversation_id"`
+	DeletedAt           *time.Time `json:"deleted_at,omitempty"`
+	DeletedFromSourceAt *time.Time `json:"deleted_from_source_at,omitempty"`
+	HasAttachments      bool       `json:"has_attachments"`
+	ID                  int64      `json:"id"`
+	InternalDate        *time.Time `json:"internal_date,omitempty"`
+	MessageType         *string    `json:"message_type,omitempty"`
+	ReceivedAt          *time.Time `json:"received_at,omitempty"`
+	SentAt              *time.Time `json:"sent_at,omitempty"`
+	SizeEstimate        int64      `json:"size_estimate"`
+	Snippet             *string    `json:"snippet,omitempty"`
+	SourceID            int64      `json:"source_id"`
+	SourceMessageID     *string    `json:"source_message_id,omitempty"`
+	Subject             *string    `json:"subject,omitempty"`
+}
+
+func (c ChangedMessageJSON) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(c))
+}
+
+type ChangesResponse struct {
+	// CompleteThrough Instant the feed is complete through: every change committed strictly below it is reachable from this page's cursor. Null means no commit bound has been established yet; keep polling
+	CompleteThrough *time.Time           `json:"complete_through,omitempty" validate:"required"`
+	Count           int64                `json:"count"`
+	HasMore         bool                 `json:"has_more"`
+	Messages        []ChangedMessageJSON `json:"messages" validate:"required"`
+
+	// NextCursor Opaque cursor for the next request. Always present and never empty. Store it and send it back as the cursor parameter; do not parse, construct, compare, or order it — its contents may change without notice
+	NextCursor string    `json:"next_cursor" validate:"required"`
+	ServerTime time.Time `json:"server_time" validate:"required"`
+}
+
+func (c ChangesResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if c.CompleteThrough != nil {
+		if err := typesValidator.Var(c.CompleteThrough, "required"); err != nil {
+			errors = errors.Append("CompleteThrough", err)
+		}
+	}
+	for i, item := range c.Messages {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Messages[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(c.NextCursor, "required"); err != nil {
+		errors = errors.Append("NextCursor", err)
+	}
+	if err := typesValidator.Var(c.ServerTime, "required"); err != nil {
+		errors = errors.Append("ServerTime", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type ChoiceDescriptor struct {
+	Label string `json:"label" validate:"required"`
+	Value string `json:"value" validate:"required"`
+}
+
+func (c ChoiceDescriptor) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(c))
 }
 
@@ -918,6 +1467,75 @@ func (c CliStatsResponse) Validate() error {
 	return errors
 }
 
+type CommunicationService struct {
+	Aliases              []string  `json:"aliases,omitempty" validate:"required"`
+	CreatedAt            time.Time `json:"created_at" validate:"required"`
+	DefaultScopeKind     *string   `json:"default_scope_kind,omitempty"`
+	DisplayLabel         string    `json:"display_label" validate:"required"`
+	ID                   int64     `json:"id"`
+	IsActive             bool      `json:"is_active"`
+	IsSystem             bool      `json:"is_system"`
+	Normalization        string    `json:"normalization" validate:"required"`
+	NormalizationVersion int64     `json:"normalization_version"`
+	ProfileURLTemplate   *string   `json:"profile_url_template,omitempty"`
+	ScopePolicy          string    `json:"scope_policy" validate:"required"`
+	Slug                 string    `json:"slug" validate:"required"`
+	UpdatedAt            time.Time `json:"updated_at" validate:"required"`
+	URIScheme            *string   `json:"uri_scheme,omitempty"`
+}
+
+func (c CommunicationService) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(c))
+}
+
+type CommunicationServicesResponse struct {
+	Services []CommunicationService `json:"services,omitempty" validate:"required"`
+}
+
+func (c CommunicationServicesResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range c.Services {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Services[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type ConfidenceInputs struct {
+	ReportedScore int64 `json:"reported_score"`
+}
+
+type ContactState struct {
+	CadenceDueAt        *time.Time `json:"cadence_due_at,omitempty"`
+	CadenceStatus       string     `json:"cadence_status" validate:"required"`
+	ComputedAt          time.Time  `json:"computed_at" validate:"required"`
+	FirstContactAt      *time.Time `json:"first_contact_at,omitempty"`
+	FirstContactRef     *string    `json:"first_contact_ref,omitempty"`
+	InferredChannel     *string    `json:"inferred_channel,omitempty"`
+	InteractionCount    int64      `json:"interaction_count"`
+	LastContactAt       *time.Time `json:"last_contact_at,omitempty"`
+	LastContactChannel  *string    `json:"last_contact_channel,omitempty"`
+	LastContactOwner    *string    `json:"last_contact_owner,omitempty"`
+	LastContactRef      *string    `json:"last_contact_ref,omitempty"`
+	LastContactSourceID *int64     `json:"last_contact_source_id,omitempty"`
+	LastInboundAt       *time.Time `json:"last_inbound_at,omitempty"`
+	LastInboundRef      *string    `json:"last_inbound_ref,omitempty"`
+	LastOutboundAt      *time.Time `json:"last_outbound_at,omitempty"`
+	LastOutboundRef     *string    `json:"last_outbound_ref,omitempty"`
+	PersonID            int64      `json:"person_id"`
+	Stale               bool       `json:"stale"`
+}
+
+func (c ContactState) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(c))
+}
+
 type ConversationResponse struct {
 	AnchorID  int64           `json:"anchor_id"`
 	HasAfter  bool            `json:"has_after"`
@@ -942,8 +1560,148 @@ func (c ConversationResponse) Validate() error {
 	return errors
 }
 
+type CreateAttributeDefinitionRequest struct {
+	Cardinality   *CreateAttributeDefinitionRequestCardinality `json:"cardinality,omitempty"`
+	Description   *string                                      `json:"description,omitempty"`
+	DisplayOrder  *int64                                       `json:"display_order,omitempty"`
+	FieldType     string                                       `json:"field_type" validate:"required"`
+	IsAudited     *bool                                        `json:"is_audited,omitempty"`
+	IsRequired    *bool                                        `json:"is_required,omitempty"`
+	IsSearchable  *bool                                        `json:"is_searchable,omitempty"`
+	IsSensitive   *bool                                        `json:"is_sensitive,omitempty"`
+	Label         string                                       `json:"label" validate:"required"`
+	ObjectType    CreateAttributeDefinitionRequestObjectType   `json:"object_type" validate:"required"`
+	Options       *AttributeOptions                            `json:"options,omitempty"`
+	RecordTarget  *string                                      `json:"record_target,omitempty"`
+	Slug          *string                                      `json:"slug,omitempty"`
+	ValueType     string                                       `json:"value_type" validate:"required"`
+	VcardProperty *string                                      `json:"vcard_property,omitempty"`
+}
+
+func (c CreateAttributeDefinitionRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	if c.Cardinality != nil {
+		if v, ok := any(c.Cardinality).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Cardinality", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(c.FieldType, "required"); err != nil {
+		errors = errors.Append("FieldType", err)
+	}
+	if err := typesValidator.Var(c.Label, "required"); err != nil {
+		errors = errors.Append("Label", err)
+	}
+	if v, ok := any(c.ObjectType).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("ObjectType", err)
+		}
+	}
+	if c.Options != nil {
+		if v, ok := any(c.Options).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Options", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(c.ValueType, "required"); err != nil {
+		errors = errors.Append("ValueType", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type CreateCommunicationServiceRequest struct {
+	Aliases              []string                                       `json:"aliases,omitempty"`
+	DefaultScopeKind     *string                                        `json:"default_scope_kind,omitempty"`
+	DisplayLabel         string                                         `json:"display_label" validate:"required"`
+	Normalization        CreateCommunicationServiceRequestNormalization `json:"normalization" validate:"required"`
+	NormalizationVersion *int64                                         `json:"normalization_version,omitempty"`
+	ProfileURLTemplate   *string                                        `json:"profile_url_template,omitempty"`
+	ScopePolicy          CreateCommunicationServiceRequestScopePolicy   `json:"scope_policy" validate:"required"`
+	Slug                 string                                         `json:"slug" validate:"required"`
+	URIScheme            *string                                        `json:"uri_scheme,omitempty"`
+}
+
+func (c CreateCommunicationServiceRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(c.DisplayLabel, "required"); err != nil {
+		errors = errors.Append("DisplayLabel", err)
+	}
+	if v, ok := any(c.Normalization).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Normalization", err)
+		}
+	}
+	if v, ok := any(c.ScopePolicy).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("ScopePolicy", err)
+		}
+	}
+	if err := typesValidator.Var(c.Slug, "required"); err != nil {
+		errors = errors.Append("Slug", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type CreateDailyNoteEntryRequest struct {
+	Author    *string `json:"author,omitempty"`
+	Body      string  `json:"body" validate:"required"`
+	PersonIds []int64 `json:"person_ids,omitempty"`
+}
+
+func (c CreateDailyNoteEntryRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(c.Body, "required"); err != nil {
+		errors = errors.Append("Body", err)
+	}
+	for i, item := range c.PersonIds {
+		if err := typesValidator.Var(item, "gte=1"); err != nil {
+			errors = errors.Append(fmt.Sprintf("PersonIds[%d]", i), err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type CreatePersonRelationshipRequest struct {
+	EndDate              *string `json:"end_date,omitempty"`
+	Notes                *string `json:"notes,omitempty"`
+	RelationshipTypeSlug string  `json:"relationship_type_slug" validate:"required"`
+	SourcePersonID       int64   `json:"source_person_id"`
+	StartDate            *string `json:"start_date,omitempty"`
+	TargetPersonID       int64   `json:"target_person_id"`
+}
+
+func (c CreatePersonRelationshipRequest) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(c))
+}
+
 type CreatePersonRequest struct {
 	ParticipantID int64 `json:"participant_id"`
+}
+
+type CreateRelationshipTypeRequest struct {
+	Color            *string `json:"color,omitempty"`
+	Description      *string `json:"description,omitempty"`
+	ForwardLabel     string  `json:"forward_label" validate:"required"`
+	Icon             *string `json:"icon,omitempty"`
+	IsSymmetric      *bool   `json:"is_symmetric,omitempty"`
+	ReverseLabel     string  `json:"reverse_label" validate:"required"`
+	Slug             string  `json:"slug" validate:"required"`
+	VcardRelatedType *string `json:"vcard_related_type,omitempty"`
+}
+
+func (c CreateRelationshipTypeRequest) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(c))
 }
 
 type CreateRequest struct {
@@ -971,6 +1729,129 @@ func (c CreateSavedViewRequest) Validate() error {
 	}
 	if err := typesValidator.Var(c.Name, "required"); err != nil {
 		errors = errors.Append("Name", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type DailyNoteEntriesResponse struct {
+	Entries []DailyNoteEntry `json:"entries" validate:"required"`
+}
+
+func (d DailyNoteEntriesResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range d.Entries {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Entries[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type DailyNoteEntry struct {
+	Author    string    `json:"author" validate:"required"`
+	Body      string    `json:"body" validate:"required"`
+	CreatedAt time.Time `json:"created_at" validate:"required"`
+	ID        int64     `json:"id"`
+	LocalDate string    `json:"local_date" validate:"required"`
+	Ordinal   int64     `json:"ordinal"`
+	PersonIds []int64   `json:"person_ids,omitempty" validate:"required"`
+	Source    string    `json:"source" validate:"required"`
+	SourceRef *string   `json:"source_ref,omitempty"`
+	UpdatedAt time.Time `json:"updated_at" validate:"required"`
+}
+
+func (d DailyNoteEntry) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(d))
+}
+
+type DayPage struct {
+	Entries          []DailyNoteEntry `json:"entries" validate:"required"`
+	EntryTotalCount  int64            `json:"entry_total_count"`
+	LocalDate        string           `json:"local_date" validate:"required"`
+	PersonTotalCount int64            `json:"person_total_count"`
+	Persons          []DayPerson      `json:"persons" validate:"required"`
+}
+
+func (d DayPage) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range d.Entries {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Entries[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(d.LocalDate, "required"); err != nil {
+		errors = errors.Append("LocalDate", err)
+	}
+	for i, item := range d.Persons {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Persons[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type DayPerson struct {
+	Activity          []ActivityRef `json:"activity" validate:"required"`
+	ActivityTruncated bool          `json:"activity_truncated"`
+	DirectCount       int64         `json:"direct_count"`
+	DisplayName       *string       `json:"display_name,omitempty"`
+	EventCount        int64         `json:"event_count"`
+	LastAt            time.Time     `json:"last_at" validate:"required"`
+	PersonID          int64         `json:"person_id"`
+	VcardUID          string        `json:"vcard_uid" validate:"required"`
+}
+
+func (d DayPerson) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range d.Activity {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Activity[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(d.LastAt, "required"); err != nil {
+		errors = errors.Append("LastAt", err)
+	}
+	if err := typesValidator.Var(d.VcardUID, "required"); err != nil {
+		errors = errors.Append("VcardUID", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type DecideIdentityMatchRequest struct {
+	Notes *string `json:"notes,omitempty"`
+}
+
+type DecidePersonMergeCandidateRequest struct {
+	Decision DecidePersonMergeCandidateRequestDecision `json:"decision" validate:"required"`
+	PersonID int64                                     `json:"person_id"`
+}
+
+func (d DecidePersonMergeCandidateRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(d.Decision).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Decision", err)
+		}
 	}
 	if len(errors) == 0 {
 		return nil
@@ -1015,15 +1896,16 @@ func (d DeepSearchResponse) Validate() error {
 }
 
 type DeletionManifestDetail struct {
-	Account      *string    `json:"account,omitempty"`
-	CreatedAt    time.Time  `json:"created_at" validate:"required"`
-	CreatedBy    string     `json:"created_by" validate:"required"`
-	Description  string     `json:"description" validate:"required"`
-	Execution    *Execution `json:"execution,omitempty"`
-	ID           string     `json:"id" validate:"required"`
-	MessageCount int64      `json:"message_count"`
-	Status       string     `json:"status" validate:"required"`
-	Summary      *Summary   `json:"summary,omitempty"`
+	Account      *string          `json:"account,omitempty"`
+	CreatedAt    time.Time        `json:"created_at" validate:"required"`
+	CreatedBy    string           `json:"created_by" validate:"required"`
+	Description  string           `json:"description" validate:"required"`
+	Execution    *Execution       `json:"execution,omitempty"`
+	ID           string           `json:"id" validate:"required"`
+	MessageCount int64            `json:"message_count"`
+	Source       *SourceReference `json:"source,omitempty"`
+	Status       string           `json:"status" validate:"required"`
+	Summary      *Summary         `json:"summary,omitempty"`
 }
 
 func (d DeletionManifestDetail) Validate() error {
@@ -1046,6 +1928,13 @@ func (d DeletionManifestDetail) Validate() error {
 	}
 	if err := typesValidator.Var(d.ID, "required"); err != nil {
 		errors = errors.Append("ID", err)
+	}
+	if d.Source != nil {
+		if v, ok := any(d.Source).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Source", err)
+			}
+		}
 	}
 	if err := typesValidator.Var(d.Status, "required"); err != nil {
 		errors = errors.Append("Status", err)
@@ -1073,6 +1962,504 @@ type DeletionManifestSummary struct {
 }
 
 func (d DeletionManifestSummary) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(d))
+}
+
+type DeletionTarget struct {
+	MessageID        int64  `json:"message_id"`
+	SourceID         int64  `json:"source_id"`
+	SourceIdentifier string `json:"source_identifier" validate:"required"`
+	SourceMessageID  string `json:"source_message_id" validate:"required"`
+	SourceType       string `json:"source_type" validate:"required"`
+}
+
+func (d DeletionTarget) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(d))
+}
+
+type DiscoverError struct {
+	Code    string `json:"code" validate:"required"`
+	Message string `json:"message" validate:"required"`
+}
+
+func (d DiscoverError) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(d))
+}
+
+type DiscoverEvent struct {
+	ErrorData *DiscoverError    `json:"error,omitempty"`
+	Progress  *DiscoverProgress `json:"progress,omitempty"`
+	Result    *DiscoverResult   `json:"result,omitempty"`
+	Type      DiscoverEventType `json:"type" validate:"required"`
+}
+
+func (d DiscoverEvent) Validate() error {
+	var errors runtime.ValidationErrors
+	if d.ErrorData != nil {
+		if v, ok := any(d.ErrorData).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("ErrorData", err)
+			}
+		}
+	}
+	if d.Progress != nil {
+		if v, ok := any(d.Progress).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Progress", err)
+			}
+		}
+	}
+	if d.Result != nil {
+		if v, ok := any(d.Result).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Result", err)
+			}
+		}
+	}
+	if v, ok := any(d.Type).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Type", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type DiscoverProgress struct {
+	Candidates int64 `json:"candidates"`
+	Done       int64 `json:"done"`
+	Total      int64 `json:"total"`
+}
+
+type DiscoverRequest struct {
+	Account  *string  `json:"account,omitempty"`
+	Apply    *bool    `json:"apply,omitempty"`
+	Confirm  []string `json:"confirm,omitempty"`
+	PageSize *int64   `json:"page_size,omitempty"`
+	Provider *bool    `json:"provider,omitempty"`
+	SourceID *int64   `json:"source_id,omitempty"`
+}
+
+type DiscoverResult struct {
+	Account         string                        `json:"account" validate:"required"`
+	Applied         []IdentityConfirmationOutcome `json:"applied,omitempty" validate:"required"`
+	Candidates      []Candidate                   `json:"candidates,omitempty" validate:"required"`
+	Rejected        []RejectedCandidate           `json:"rejected,omitempty" validate:"required"`
+	ScannedMessages int64                         `json:"scanned_messages"`
+	SourceID        int64                         `json:"source_id"`
+	SourceType      string                        `json:"source_type" validate:"required"`
+}
+
+func (d DiscoverResult) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(d.Account, "required"); err != nil {
+		errors = errors.Append("Account", err)
+	}
+	for i, item := range d.Applied {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Applied[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range d.Candidates {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Candidates[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range d.Rejected {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Rejected[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(d.SourceType, "required"); err != nil {
+		errors = errors.Append("SourceType", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type DocumentIndexRebuildStatus struct {
+	RemainingOwners int64 `json:"remaining_owners"`
+	SnapshotOwners  int64 `json:"snapshot_owners"`
+}
+
+type DocumentIndexStatus struct {
+	AverageProviderLatencyMillis float64 `json:"average_provider_latency_millis"`
+	EligibleBytes                int64   `json:"eligible_bytes"`
+	EligibleOccurrences          int64   `json:"eligible_occurrences"`
+	EligibleOwners               int64   `json:"eligible_owners"`
+	ExactConsent                 bool    `json:"exact_consent"`
+	ExtractionAttempts           int64   `json:"extraction_attempts"`
+	FailedAttempts               int64   `json:"failed_attempts"`
+	IneligibleRoleOccurrences    int64   `json:"ineligible_role_occurrences"`
+	MissingOwners                int64   `json:"missing_owners"`
+	MissingProviderByteReports   int64   `json:"missing_provider_byte_reports"`
+	ProcessedProviderUnits       int64   `json:"processed_provider_units"`
+	ProfileEnabled               bool    `json:"profile_enabled"`
+	ProfileExists                bool    `json:"profile_exists"`
+	ProviderLatencyMillis        int64   `json:"provider_latency_millis"`
+	ProviderRequests             int64   `json:"provider_requests"`
+	ProviderRetries              int64   `json:"provider_retries"`
+	ReadyOwners                  int64   `json:"ready_owners"`
+	ReportedProviderBytes        int64   `json:"reported_provider_bytes"`
+	RetryOwners                  int64   `json:"retry_owners"`
+	StagingOwners                int64   `json:"staging_owners"`
+	StoredPlaintextChunks        int64   `json:"stored_plaintext_chunks"`
+	SuccessfulAttempts           int64   `json:"successful_attempts"`
+	TerminalOwners               int64   `json:"terminal_owners"`
+	UnknownRoleOccurrences       int64   `json:"unknown_role_occurrences"`
+	VerifiedUploadBytes          int64   `json:"verified_upload_bytes"`
+}
+
+type DocumentIndexStatusResponse struct {
+	ActiveRebuild *DocumentIndexRebuildStatus `json:"active_rebuild,omitempty"`
+	Status        DocumentIndexStatus         `json:"status"`
+}
+
+func (d DocumentIndexStatusResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if d.ActiveRebuild != nil {
+		if v, ok := any(d.ActiveRebuild).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("ActiveRebuild", err)
+			}
+		}
+	}
+	if v, ok := any(d.Status).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Status", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type DocumentSearchResponse struct {
+	EffectiveMode               *string                `json:"effective_mode,omitempty"`
+	NextCursor                  *string                `json:"next_cursor,omitempty"`
+	Results                     []DocumentSearchResult `json:"results,omitempty" validate:"required"`
+	Revision                    int64                  `json:"revision"`
+	Truncated                   *bool                  `json:"truncated,omitempty"`
+	VectorGenerationFingerprint *string                `json:"vector_generation_fingerprint,omitempty"`
+	VectorGenerationID          *int64                 `json:"vector_generation_id,omitempty"`
+}
+
+func (d DocumentSearchResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range d.Results {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Results[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type DocumentSearchResult struct {
+	AttachmentID                int64       `json:"attachment_id"`
+	CanonicalBlobHash           string      `json:"canonical_blob_hash" validate:"required"`
+	ChunkKey                    string      `json:"chunk_key" validate:"required"`
+	ChunkOrdinal                int64       `json:"chunk_ordinal"`
+	ContainingTitle             *string     `json:"containing_title,omitempty"`
+	ConversationID              int64       `json:"conversation_id"`
+	Excerpt                     string      `json:"excerpt" validate:"required"`
+	ExtractionID                string      `json:"extraction_id" validate:"required"`
+	Filename                    *string     `json:"filename,omitempty"`
+	FirstUnitIndex              int64       `json:"first_unit_index"`
+	FusionScore                 *float64    `json:"fusion_score,omitempty"`
+	HeadingPath                 []string    `json:"heading_path,omitempty"`
+	HighlightEnd                int64       `json:"highlight_end"`
+	HighlightStart              int64       `json:"highlight_start"`
+	LastUnitIndex               int64       `json:"last_unit_index"`
+	LexicalRank                 *int64      `json:"lexical_rank,omitempty"`
+	MatchedSignals              []string    `json:"matched_signals,omitempty" validate:"required"`
+	MessageID                   int64       `json:"message_id"`
+	MimeType                    *string     `json:"mime_type,omitempty"`
+	Model                       string      `json:"model" validate:"required"`
+	OccurredAt                  *time.Time  `json:"occurred_at,omitempty"`
+	OccurrenceKey               string      `json:"occurrence_key" validate:"required"`
+	OtherLiveCopies             int64       `json:"other_live_copies"`
+	PersonProvenance            *Provenance `json:"person_provenance,omitempty"`
+	ProfileID                   string      `json:"profile_id" validate:"required"`
+	Provider                    string      `json:"provider" validate:"required"`
+	Rank                        int64       `json:"rank"`
+	SemanticRank                *int64      `json:"semantic_rank,omitempty"`
+	SemanticScore               *float64    `json:"semantic_score,omitempty"`
+	SourceID                    int64       `json:"source_id"`
+	SourceMessageID             *string     `json:"source_message_id,omitempty"`
+	SourcePartKey               *string     `json:"source_part_key,omitempty"`
+	Truncated                   bool        `json:"truncated"`
+	VectorDimension             *int64      `json:"vector_dimension,omitempty"`
+	VectorEmbeddingProfile      *string     `json:"vector_embedding_profile,omitempty"`
+	VectorGenerationFingerprint *string     `json:"vector_generation_fingerprint,omitempty"`
+	VectorGenerationID          *int64      `json:"vector_generation_id,omitempty"`
+	VectorModel                 *string     `json:"vector_model,omitempty"`
+	VectorToken                 *string     `json:"vector_token,omitempty"`
+}
+
+func (d DocumentSearchResult) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(d.CanonicalBlobHash, "required"); err != nil {
+		errors = errors.Append("CanonicalBlobHash", err)
+	}
+	if err := typesValidator.Var(d.ChunkKey, "required"); err != nil {
+		errors = errors.Append("ChunkKey", err)
+	}
+	if err := typesValidator.Var(d.Excerpt, "required"); err != nil {
+		errors = errors.Append("Excerpt", err)
+	}
+	if err := typesValidator.Var(d.ExtractionID, "required"); err != nil {
+		errors = errors.Append("ExtractionID", err)
+	}
+	if err := typesValidator.Var(d.MatchedSignals, "required"); err != nil {
+		errors = errors.Append("MatchedSignals", err)
+	}
+	if err := typesValidator.Var(d.Model, "required"); err != nil {
+		errors = errors.Append("Model", err)
+	}
+	if err := typesValidator.Var(d.OccurrenceKey, "required"); err != nil {
+		errors = errors.Append("OccurrenceKey", err)
+	}
+	if d.PersonProvenance != nil {
+		if v, ok := any(d.PersonProvenance).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("PersonProvenance", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(d.ProfileID, "required"); err != nil {
+		errors = errors.Append("ProfileID", err)
+	}
+	if err := typesValidator.Var(d.Provider, "required"); err != nil {
+		errors = errors.Append("Provider", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type DocumentVectorConsent struct {
+	ConsentedAt               time.Time `json:"consented_at" validate:"required"`
+	Dimension                 int64     `json:"dimension"`
+	EgressFingerprint         string    `json:"egress_fingerprint" validate:"required"`
+	EmbeddingProfile          string    `json:"embedding_profile" validate:"required"`
+	Fingerprint               string    `json:"fingerprint" validate:"required"`
+	Model                     string    `json:"model" validate:"required"`
+	Purpose                   string    `json:"purpose" validate:"required"`
+	TargetExtractionProfileID string    `json:"target_extraction_profile_id" validate:"required"`
+}
+
+func (d DocumentVectorConsent) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(d))
+}
+
+type DocumentVectorCoverage struct {
+	Ready    int64 `json:"ready"`
+	Required int64 `json:"required"`
+}
+
+type DocumentVectorFailureDiagnostic struct {
+	AttemptCount int64      `json:"attempt_count"`
+	ErrorCode    string     `json:"error_code" validate:"required"`
+	NextRetryAt  *time.Time `json:"next_retry_at,omitempty"`
+	Terminal     bool       `json:"terminal"`
+	Token        string     `json:"token" validate:"required"`
+}
+
+func (d DocumentVectorFailureDiagnostic) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(d))
+}
+
+type DocumentVectorGeneration struct {
+	ActivatedAt               *time.Time `json:"activated_at,omitempty"`
+	CreatedAt                 time.Time  `json:"created_at" validate:"required"`
+	Dimension                 int64      `json:"dimension"`
+	EmbeddingProfile          string     `json:"embedding_profile" validate:"required"`
+	Fingerprint               string     `json:"fingerprint" validate:"required"`
+	ID                        int64      `json:"id"`
+	Model                     string     `json:"model" validate:"required"`
+	RetiredAt                 *time.Time `json:"retired_at,omitempty"`
+	State                     string     `json:"state" validate:"required"`
+	TargetExtractionProfileID string     `json:"target_extraction_profile_id" validate:"required"`
+}
+
+func (d DocumentVectorGeneration) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(d))
+}
+
+type DocumentVectorGenerationSpec struct {
+	Dimension                 int64  `json:"dimension"`
+	EmbeddingProfile          string `json:"embedding_profile" validate:"required"`
+	Fingerprint               string `json:"fingerprint" validate:"required"`
+	Model                     string `json:"model" validate:"required"`
+	TargetExtractionProfileID string `json:"target_extraction_profile_id" validate:"required"`
+}
+
+func (d DocumentVectorGenerationSpec) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(d))
+}
+
+type DocumentVectorGenerationStatus struct {
+	Blocked                  bool                              `json:"blocked"`
+	CleanupPending           int64                             `json:"cleanup_pending"`
+	FailureAfterGenerationID *int64                            `json:"failure_after_generation_id,omitempty"`
+	FailureAfterToken        *string                           `json:"failure_after_token,omitempty"`
+	Failures                 []DocumentVectorFailureDiagnostic `json:"failures,omitempty" validate:"required"`
+	FailuresExhausted        bool                              `json:"failures_exhausted"`
+	GenerationID             int64                             `json:"generation_id"`
+	Pending                  int64                             `json:"pending"`
+	ReadyLive                int64                             `json:"ready_live"`
+	Retryable                int64                             `json:"retryable"`
+	StaleObsolete            int64                             `json:"stale_obsolete"`
+	State                    string                            `json:"state" validate:"required"`
+	Terminal                 int64                             `json:"terminal"`
+}
+
+func (d DocumentVectorGenerationStatus) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range d.Failures {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Failures[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(d.State, "required"); err != nil {
+		errors = errors.Append("State", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type DocumentVectorOperationsResponse struct {
+	Configured                           bool                            `json:"configured"`
+	Enabled                              bool                            `json:"enabled"`
+	ScheduledRegistrationRequiresRestart *bool                           `json:"scheduled_registration_requires_restart,omitempty"`
+	Status                               *DocumentVectorOperationsStatus `json:"status,omitempty"`
+}
+
+func (d DocumentVectorOperationsResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if d.Status != nil {
+		if v, ok := any(d.Status).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Status", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type DocumentVectorOperationsStatus struct {
+	Active                              *DocumentVectorGeneration       `json:"active,omitempty"`
+	Building                            *DocumentVectorGeneration       `json:"building,omitempty"`
+	ConfiguredDocumentEgressFingerprint string                          `json:"configured_document_egress_fingerprint" validate:"required"`
+	ConfiguredQueryEgressFingerprint    string                          `json:"configured_query_egress_fingerprint" validate:"required"`
+	ConfiguredSpec                      DocumentVectorGenerationSpec    `json:"configured_spec"`
+	Coverage                            *DocumentVectorCoverage         `json:"coverage,omitempty"`
+	DocumentConsent                     *DocumentVectorConsent          `json:"document_consent,omitempty"`
+	QueryConsent                        *DocumentVectorConsent          `json:"query_consent,omitempty"`
+	Selected                            *DocumentVectorGenerationStatus `json:"selected,omitempty"`
+	Usage                               DocumentVectorProviderUsage     `json:"usage"`
+}
+
+func (d DocumentVectorOperationsStatus) Validate() error {
+	var errors runtime.ValidationErrors
+	if d.Active != nil {
+		if v, ok := any(d.Active).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Active", err)
+			}
+		}
+	}
+	if d.Building != nil {
+		if v, ok := any(d.Building).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Building", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(d.ConfiguredDocumentEgressFingerprint, "required"); err != nil {
+		errors = errors.Append("ConfiguredDocumentEgressFingerprint", err)
+	}
+	if err := typesValidator.Var(d.ConfiguredQueryEgressFingerprint, "required"); err != nil {
+		errors = errors.Append("ConfiguredQueryEgressFingerprint", err)
+	}
+	if v, ok := any(d.ConfiguredSpec).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("ConfiguredSpec", err)
+		}
+	}
+	if d.Coverage != nil {
+		if v, ok := any(d.Coverage).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Coverage", err)
+			}
+		}
+	}
+	if d.DocumentConsent != nil {
+		if v, ok := any(d.DocumentConsent).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("DocumentConsent", err)
+			}
+		}
+	}
+	if d.QueryConsent != nil {
+		if v, ok := any(d.QueryConsent).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("QueryConsent", err)
+			}
+		}
+	}
+	if d.Selected != nil {
+		if v, ok := any(d.Selected).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Selected", err)
+			}
+		}
+	}
+	if v, ok := any(d.Usage).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Usage", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type DocumentVectorProviderUsage struct {
+	Fingerprint        string     `json:"fingerprint" validate:"required"`
+	ProviderCalls      int64      `json:"provider_calls"`
+	ProviderChunks     int64      `json:"provider_chunks"`
+	ProviderDocuments  int64      `json:"provider_documents"`
+	ProviderInputChars int64      `json:"provider_input_chars"`
+	UpdatedAt          *time.Time `json:"updated_at,omitempty"`
+}
+
+func (d DocumentVectorProviderUsage) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(d))
 }
 
@@ -1174,28 +2561,191 @@ func (d DomainSummary) Validate() error {
 	return errors
 }
 
+type DuplicateCostRisk struct {
+	AtLeastOnce        bool   `json:"at_least_once"`
+	Detail             string `json:"detail" validate:"required"`
+	ProviderIdempotent bool   `json:"provider_idempotent"`
+}
+
+func (d DuplicateCostRisk) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(d))
+}
+
+type Employment struct {
+	AddressID      *int64       `json:"address_id,omitempty"`
+	Confidence     *float64     `json:"confidence,omitempty"`
+	CreatedAt      time.Time    `json:"created_at" validate:"required"`
+	Department     *string      `json:"department,omitempty"`
+	Description    *string      `json:"description,omitempty"`
+	EndDate        *PartialDate `json:"end_date,omitempty"`
+	ID             int64        `json:"id"`
+	IsCurrent      bool         `json:"is_current"`
+	IsPrimary      bool         `json:"is_primary"`
+	Location       *string      `json:"location,omitempty"`
+	OrganizationID int64        `json:"organization_id"`
+	PersonID       int64        `json:"person_id"`
+	Revision       int64        `json:"revision"`
+	Role           *string      `json:"role,omitempty"`
+	Source         string       `json:"source" validate:"required"`
+	SourceRef      *string      `json:"source_ref,omitempty"`
+	StartDate      *PartialDate `json:"start_date,omitempty"`
+	Title          *string      `json:"title,omitempty"`
+	UpdatedAt      time.Time    `json:"updated_at" validate:"required"`
+}
+
+func (e Employment) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(e.CreatedAt, "required"); err != nil {
+		errors = errors.Append("CreatedAt", err)
+	}
+	if e.EndDate != nil {
+		if v, ok := any(e.EndDate).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("EndDate", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(e.Source, "required"); err != nil {
+		errors = errors.Append("Source", err)
+	}
+	if e.StartDate != nil {
+		if v, ok := any(e.StartDate).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("StartDate", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(e.UpdatedAt, "required"); err != nil {
+		errors = errors.Append("UpdatedAt", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type EmploymentBody struct {
+	AddressID      *int64               `json:"address_id,omitempty"`
+	Confidence     *float64             `json:"confidence,omitempty"`
+	Department     *string              `json:"department,omitempty"`
+	Description    *string              `json:"description,omitempty"`
+	EndDate        *string              `json:"end_date,omitempty"`
+	IsCurrent      *bool                `json:"is_current,omitempty"`
+	IsPrimary      *bool                `json:"is_primary,omitempty"`
+	Location       *string              `json:"location,omitempty"`
+	OrganizationID int64                `json:"organization_id"`
+	PersonID       int64                `json:"person_id"`
+	Role           *string              `json:"role,omitempty"`
+	Source         EmploymentBodySource `json:"source" validate:"required"`
+	SourceRef      *string              `json:"source_ref,omitempty"`
+	StartDate      *string              `json:"start_date,omitempty"`
+	Title          *string              `json:"title,omitempty"`
+}
+
+func (e EmploymentBody) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(e.Source).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Source", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type EmploymentProjectionResponse struct {
+	Department       *string         `json:"department,omitempty"`
+	EmploymentID     int64           `json:"employment_id"`
+	OrganizationID   int64           `json:"organization_id"`
+	OrganizationName string          `json:"organization_name" validate:"required"`
+	Role             *string         `json:"role,omitempty"`
+	Title            *string         `json:"title,omitempty"`
+	Vcard            EmploymentVCard `json:"vcard"`
+}
+
+func (e EmploymentProjectionResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(e.OrganizationName, "required"); err != nil {
+		errors = errors.Append("OrganizationName", err)
+	}
+	if v, ok := any(e.Vcard).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Vcard", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type EmploymentVCard struct {
+	Org   []string `json:"org,omitempty"`
+	Role  *string  `json:"role,omitempty"`
+	Title *string  `json:"title,omitempty"`
+}
+
+type EmploymentsResponse struct {
+	Employments []Employment                  `json:"employments,omitempty" validate:"required"`
+	Projection  *EmploymentProjectionResponse `json:"projection,omitempty"`
+}
+
+func (e EmploymentsResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range e.Employments {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Employments[%d]", i), err)
+			}
+		}
+	}
+	if e.Projection != nil {
+		if v, ok := any(e.Projection).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Projection", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type EndEmploymentBody struct {
+	EndDate string `json:"end_date" validate:"required"`
+}
+
+func (e EndEmploymentBody) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(e))
+}
+
 type EntryRow struct {
-	AnchorMessageID          *int64       `json:"anchor_message_id,omitempty"`
-	AttachmentCount          int64        `json:"attachment_count"`
-	AttachmentSize           int64        `json:"attachment_size"`
-	ConversationID           *int64       `json:"conversation_id,omitempty"`
-	ConversationType         string       `json:"conversation_type" validate:"required"`
-	CounterpartParticipantID *int64       `json:"counterpart_participant_id,omitempty"`
-	DeletedFromSource        bool         `json:"deleted_from_source"`
-	HasAttachments           bool         `json:"has_attachments"`
-	Key                      string       `json:"key" validate:"required"`
-	Kind                     string       `json:"kind" validate:"required"`
-	Match                    MatchSummary `json:"match"`
-	MessageCount             int64        `json:"message_count"`
-	MessageType              string       `json:"message_type" validate:"required"`
-	OccurredAt               time.Time    `json:"occurred_at" validate:"required"`
-	ParticipantIds           []int64      `json:"participant_ids,omitempty"`
-	ParticipantLabels        []string     `json:"participant_labels,omitempty"`
-	Preview                  string       `json:"preview" validate:"required"`
-	SourceID                 int64        `json:"source_id"`
-	SourceIdentifier         string       `json:"source_identifier" validate:"required"`
-	SourceType               string       `json:"source_type" validate:"required"`
-	Title                    string       `json:"title" validate:"required"`
+	AnchorMessageID            *int64       `json:"anchor_message_id,omitempty"`
+	AttachmentCount            int64        `json:"attachment_count"`
+	AttachmentSize             int64        `json:"attachment_size"`
+	ConversationID             *int64       `json:"conversation_id,omitempty"`
+	ConversationType           string       `json:"conversation_type" validate:"required"`
+	CounterpartParticipantID   *int64       `json:"counterpart_participant_id,omitempty"`
+	DeletedFromSource          bool         `json:"deleted_from_source"`
+	HasAttachments             bool         `json:"has_attachments"`
+	Key                        string       `json:"key" validate:"required"`
+	Kind                       string       `json:"kind" validate:"required"`
+	Match                      MatchSummary `json:"match"`
+	MatchedRecipientIdentities []string     `json:"matched_recipient_identities" validate:"required"`
+	MatchedSenderIdentities    []string     `json:"matched_sender_identities" validate:"required"`
+	MessageCount               int64        `json:"message_count"`
+	MessageType                string       `json:"message_type" validate:"required"`
+	OccurredAt                 time.Time    `json:"occurred_at" validate:"required"`
+	ParticipantIds             []int64      `json:"participant_ids,omitempty"`
+	ParticipantLabels          []string     `json:"participant_labels,omitempty"`
+	Preview                    string       `json:"preview" validate:"required"`
+	SourceID                   int64        `json:"source_id"`
+	SourceIdentifier           string       `json:"source_identifier" validate:"required"`
+	SourceType                 string       `json:"source_type" validate:"required"`
+	Title                      string       `json:"title" validate:"required"`
 }
 
 func (e EntryRow) Validate() error {
@@ -1213,6 +2763,12 @@ func (e EntryRow) Validate() error {
 		if err := v.Validate(); err != nil {
 			errors = errors.Append("Match", err)
 		}
+	}
+	if err := typesValidator.Var(e.MatchedRecipientIdentities, "required"); err != nil {
+		errors = errors.Append("MatchedRecipientIdentities", err)
+	}
+	if err := typesValidator.Var(e.MatchedSenderIdentities, "required"); err != nil {
+		errors = errors.Append("MatchedSenderIdentities", err)
 	}
 	if err := typesValidator.Var(e.MessageType, "required"); err != nil {
 		errors = errors.Append("MessageType", err)
@@ -1259,6 +2815,7 @@ type Execution struct {
 	Method             string     `json:"method" validate:"required"`
 	StartedAt          time.Time  `json:"started_at" validate:"required"`
 	Succeeded          int64      `json:"succeeded"`
+	TombstoneIds       []string   `json:"tombstone_ids,omitempty"`
 }
 
 func (e Execution) Validate() error {
@@ -1279,7 +2836,7 @@ type ExploreCacheUnavailableResponse struct {
 	ErrorData      string                                   `json:"error" validate:"required"`
 	Message        string                                   `json:"message" validate:"required"`
 	Readiness      ExploreCacheUnavailableResponseReadiness `json:"readiness" validate:"required"`
-	RecoveryAction string                                   `json:"recovery_action" validate:"required"`
+	RecoveryAction string                                   `json:"recovery_action" validate:"omitempty"`
 }
 
 func (e ExploreCacheUnavailableResponse) Validate() error {
@@ -1294,9 +2851,6 @@ func (e ExploreCacheUnavailableResponse) Validate() error {
 		if err := v.Validate(); err != nil {
 			errors = errors.Append("Readiness", err)
 		}
-	}
-	if err := typesValidator.Var(e.RecoveryAction, "required"); err != nil {
-		errors = errors.Append("RecoveryAction", err)
 	}
 	if len(errors) == 0 {
 		return nil
@@ -1819,6 +3373,17 @@ func (e ExploreUnavailableAction) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(e))
 }
 
+type FieldDescriptor struct {
+	Cardinality string `json:"cardinality" validate:"required"`
+	Name        string `json:"name" validate:"required"`
+	Required    bool   `json:"required"`
+	ValueType   string `json:"value_type" validate:"required"`
+}
+
+func (f FieldDescriptor) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(f))
+}
+
 type FileGroupsHTTPRequest struct {
 	Cursor        *string                 `json:"cursor,omitempty"`
 	FilenameQuery *string                 `json:"filename_query,omitempty"`
@@ -1932,13 +3497,21 @@ func (f FileMetadataResponse) Validate() error {
 	return errors
 }
 
+type FileSearchExplain struct {
+	FilenameRank *int64  `json:"filename_rank,omitempty"`
+	Rrf          float64 `json:"rrf"`
+	VisualRank   *int64  `json:"visual_rank,omitempty"`
+}
+
 type FileSearchHTTPRequest struct {
-	Cursor        *string            `json:"cursor,omitempty"`
-	FilenameQuery *string            `json:"filename_query,omitempty"`
-	Limit         *int64             `json:"limit,omitempty" validate:"omitempty,gte=0,lte=500"`
-	MimeFamilies  []string           `json:"mime_families,omitempty"`
-	Predicate     ExploreHTTPRequest `json:"predicate"`
-	Sort          FileSearchSort     `json:"sort"`
+	Cursor            *string            `json:"cursor,omitempty"`
+	FilenameQuery     *string            `json:"filename_query,omitempty"`
+	Limit             *int64             `json:"limit,omitempty" validate:"omitempty,gte=0,lte=500"`
+	MimeFamilies      []string           `json:"mime_families,omitempty"`
+	Predicate         ExploreHTTPRequest `json:"predicate"`
+	Sort              FileSearchSort     `json:"sort"`
+	VisualImageBase64 *string            `json:"visual_image_base64,omitempty"`
+	VisualQuery       *string            `json:"visual_query,omitempty"`
 }
 
 func (f FileSearchHTTPRequest) Validate() error {
@@ -2012,6 +3585,7 @@ type FileSearchRow struct {
 	ParticipantDomains []string                  `json:"participant_domains,omitempty"`
 	ParticipantIds     []int64                   `json:"participant_ids,omitempty"`
 	ParticipantLabels  []string                  `json:"participant_labels,omitempty"`
+	SearchExplain      *FileSearchExplain        `json:"search_explain,omitempty"`
 	SizeBytes          int64                     `json:"size_bytes"`
 	SourceID           int64                     `json:"source_id"`
 	SourceIdentifier   string                    `json:"source_identifier" validate:"required"`
@@ -2045,6 +3619,13 @@ func (f FileSearchRow) Validate() error {
 	}
 	if err := typesValidator.Var(f.OccurredAt, "required"); err != nil {
 		errors = errors.Append("OccurredAt", err)
+	}
+	if f.SearchExplain != nil {
+		if v, ok := any(f.SearchExplain).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("SearchExplain", err)
+			}
+		}
 	}
 	if err := typesValidator.Var(f.SourceIdentifier, "required"); err != nil {
 		errors = errors.Append("SourceIdentifier", err)
@@ -2100,6 +3681,20 @@ type Filters struct {
 	Senders       []string `json:"senders,omitempty"`
 }
 
+type FormatCoverage struct {
+	Bytes     int64  `json:"bytes"`
+	Current   int64  `json:"current"`
+	Eligible  int64  `json:"eligible"`
+	MimeType  string `json:"mime_type" validate:"required"`
+	Retryable int64  `json:"retryable"`
+	Stale     int64  `json:"stale"`
+	Terminal  int64  `json:"terminal"`
+}
+
+func (f FormatCoverage) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(f))
+}
+
 type GenerationSummary struct {
 	ActivatedAt  *string `json:"activated_at,omitempty"`
 	Dimension    int64   `json:"dimension"`
@@ -2115,18 +3710,34 @@ func (g GenerationSummary) Validate() error {
 }
 
 type GmailIDsResponse struct {
-	GmailIds []string `json:"gmail_ids,omitempty" validate:"required"`
+	GmailIds []string         `json:"gmail_ids,omitempty" validate:"required"`
+	Targets  []DeletionTarget `json:"targets,omitempty"`
 }
 
 func (g GmailIDsResponse) Validate() error {
-	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(g.GmailIds, "required"); err != nil {
+		errors = errors.Append("GmailIds", err)
+	}
+	for i, item := range g.Targets {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Targets[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
 }
 
 type HealthResponse struct {
-	AnalyticsEngine *string          `json:"analytics_engine,omitempty"`
-	Operation       *OperationHealth `json:"operation,omitempty"`
-	Status          string           `json:"status" validate:"required"`
-	Vector          *VectorHealth    `json:"vector,omitempty"`
+	AnalyticsEngine  *string          `json:"analytics_engine,omitempty"`
+	APISchemaVersion *string          `json:"api_schema_version,omitempty"`
+	Operation        *OperationHealth `json:"operation,omitempty"`
+	Status           string           `json:"status" validate:"required"`
+	Vector           *VectorHealth    `json:"vector,omitempty"`
 }
 
 func (h HealthResponse) Validate() error {
@@ -2281,6 +3892,16 @@ func (h HybridSearchResponse) Validate() error {
 	return errors
 }
 
+type IdentityConfirmationOutcome struct {
+	Added      bool     `json:"added"`
+	Identifier string   `json:"identifier" validate:"required"`
+	Signals    []string `json:"signals,omitempty" validate:"required"`
+}
+
+func (i IdentityConfirmationOutcome) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(i))
+}
+
 type IdentityLinkRequest struct {
 	ParticipantA int64 `json:"participant_a"`
 	ParticipantB int64 `json:"participant_b"`
@@ -2296,6 +3917,148 @@ func (i IdentityLinkResponse) Validate() error {
 	if v, ok := any(i.CacheState).(runtime.Validator); ok {
 		if err := v.Validate(); err != nil {
 			errors = errors.Append("CacheState", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type IdentityMatchAcceptResponse struct {
+	CacheState       IdentityMatchAcceptResponseCacheState `json:"cache_state" validate:"required"`
+	Candidate        IdentityMatchCandidate                `json:"candidate"`
+	IdentityRevision int64                                 `json:"identity_revision"`
+}
+
+func (i IdentityMatchAcceptResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(i.CacheState).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("CacheState", err)
+		}
+	}
+	if v, ok := any(i.Candidate).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Candidate", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type IdentityMatchCandidate struct {
+	Basis           string                  `json:"basis" validate:"required"`
+	Confidence      *float64                `json:"confidence,omitempty"`
+	CreatedAt       time.Time               `json:"created_at" validate:"required"`
+	DecidedAt       *time.Time              `json:"decided_at,omitempty"`
+	DecidedBy       *string                 `json:"decided_by,omitempty"`
+	Evidence        []IdentityMatchEvidence `json:"evidence,omitempty" validate:"required"`
+	ID              int64                   `json:"id"`
+	LeftID          int64                   `json:"left_id"`
+	LeftKind        string                  `json:"left_kind" validate:"required"`
+	NormalizedValue *string                 `json:"normalized_value,omitempty"`
+	Notes           *string                 `json:"notes,omitempty"`
+	RightID         int64                   `json:"right_id"`
+	RightKind       string                  `json:"right_kind" validate:"required"`
+	ScopeKind       *string                 `json:"scope_kind,omitempty"`
+	ScopeValue      *string                 `json:"scope_value,omitempty"`
+	ServiceSlug     *string                 `json:"service_slug,omitempty"`
+	Source          string                  `json:"source" validate:"required"`
+	SourceRef       *string                 `json:"source_ref,omitempty"`
+	State           string                  `json:"state" validate:"required"`
+	UpdatedAt       time.Time               `json:"updated_at" validate:"required"`
+}
+
+func (i IdentityMatchCandidate) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(i.Basis, "required"); err != nil {
+		errors = errors.Append("Basis", err)
+	}
+	if err := typesValidator.Var(i.CreatedAt, "required"); err != nil {
+		errors = errors.Append("CreatedAt", err)
+	}
+	for i, item := range i.Evidence {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Evidence[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(i.LeftKind, "required"); err != nil {
+		errors = errors.Append("LeftKind", err)
+	}
+	if err := typesValidator.Var(i.RightKind, "required"); err != nil {
+		errors = errors.Append("RightKind", err)
+	}
+	if err := typesValidator.Var(i.Source, "required"); err != nil {
+		errors = errors.Append("Source", err)
+	}
+	if err := typesValidator.Var(i.State, "required"); err != nil {
+		errors = errors.Append("State", err)
+	}
+	if err := typesValidator.Var(i.UpdatedAt, "required"); err != nil {
+		errors = errors.Append("UpdatedAt", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type IdentityMatchCandidatesResponse struct {
+	Candidates []IdentityMatchCandidate `json:"candidates,omitempty" validate:"required"`
+	Limit      int64                    `json:"limit"`
+	Offset     int64                    `json:"offset"`
+}
+
+func (i IdentityMatchCandidatesResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range i.Candidates {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Candidates[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type IdentityMatchEvidence struct {
+	CandidateID  int64     `json:"candidate_id"`
+	CreatedAt    time.Time `json:"created_at" validate:"required"`
+	Detail       *string   `json:"detail,omitempty"`
+	EvidenceKind string    `json:"evidence_kind" validate:"required"`
+	EvidenceRef  *string   `json:"evidence_ref,omitempty"`
+	ID           int64     `json:"id"`
+	Source       string    `json:"source" validate:"required"`
+}
+
+func (i IdentityMatchEvidence) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(i))
+}
+
+type IdentityMatchRejectResponse struct {
+	CacheState       IdentityMatchRejectResponseCacheState `json:"cache_state" validate:"required"`
+	Candidate        IdentityMatchCandidate                `json:"candidate"`
+	IdentityRevision int64                                 `json:"identity_revision"`
+}
+
+func (i IdentityMatchRejectResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(i.CacheState).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("CacheState", err)
+		}
+	}
+	if v, ok := any(i.Candidate).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Candidate", err)
 		}
 	}
 	if len(errors) == 0 {
@@ -2358,6 +4121,74 @@ func (i IdentitySearchSort) Validate() error {
 	return errors
 }
 
+type ImportEntry struct {
+	Identifier string  `json:"identifier" validate:"required"`
+	State      *string `json:"state,omitempty"`
+}
+
+func (i ImportEntry) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(i))
+}
+
+type ImportRequest struct {
+	Account  *string       `json:"account,omitempty"`
+	Apply    *bool         `json:"apply,omitempty"`
+	Entries  []ImportEntry `json:"entries" validate:"required"`
+	Signal   *string       `json:"signal,omitempty"`
+	SourceID *int64        `json:"source_id,omitempty"`
+}
+
+func (i ImportRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range i.Entries {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Entries[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type ImportResult struct {
+	Account    string                        `json:"account" validate:"required"`
+	Applied    []IdentityConfirmationOutcome `json:"applied" validate:"required"`
+	Candidates []Candidate                   `json:"candidates" validate:"required"`
+	Signal     string                        `json:"signal" validate:"required"`
+	SourceID   int64                         `json:"source_id"`
+}
+
+func (i ImportResult) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(i.Account, "required"); err != nil {
+		errors = errors.Append("Account", err)
+	}
+	for i, item := range i.Applied {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Applied[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range i.Candidates {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Candidates[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(i.Signal, "required"); err != nil {
+		errors = errors.Append("Signal", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
 type ListDeletionsResponse struct {
 	Manifests []DeletionManifestSummary `json:"manifests,omitempty" validate:"required"`
 }
@@ -2378,17 +4209,18 @@ func (l ListDeletionsResponse) Validate() error {
 }
 
 type Manifest struct {
-	CreatedAt   time.Time  `json:"created_at" validate:"required"`
-	CreatedBy   string     `json:"created_by" validate:"required"`
-	Description string     `json:"description" validate:"required"`
-	Execution   *Execution `json:"execution,omitempty"`
-	Filters     Filters    `json:"filters"`
-	GmailIds    []string   `json:"gmail_ids,omitempty" validate:"required"`
-	ID          string     `json:"id" validate:"required"`
-	RawFilter   *struct{}  `json:"raw_filter,omitempty"`
-	Status      string     `json:"status" validate:"required"`
-	Summary     *Summary   `json:"summary,omitempty"`
-	Version     int64      `json:"version"`
+	CreatedAt   time.Time        `json:"created_at" validate:"required"`
+	CreatedBy   string           `json:"created_by" validate:"required"`
+	Description string           `json:"description" validate:"required"`
+	Execution   *Execution       `json:"execution,omitempty"`
+	Filters     Filters          `json:"filters"`
+	GmailIds    []string         `json:"gmail_ids,omitempty" validate:"required"`
+	ID          string           `json:"id" validate:"required"`
+	RawFilter   *struct{}        `json:"raw_filter,omitempty"`
+	Source      *SourceReference `json:"source,omitempty"`
+	Status      string           `json:"status" validate:"required"`
+	Summary     *Summary         `json:"summary,omitempty"`
+	Version     int64            `json:"version"`
 }
 
 func (m Manifest) Validate() error {
@@ -2419,6 +4251,13 @@ func (m Manifest) Validate() error {
 	}
 	if err := typesValidator.Var(m.ID, "required"); err != nil {
 		errors = errors.Append("ID", err)
+	}
+	if m.Source != nil {
+		if v, ok := any(m.Source).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Source", err)
+			}
+		}
 	}
 	if err := typesValidator.Var(m.Status, "required"); err != nil {
 		errors = errors.Append("Status", err)
@@ -2551,6 +4390,15 @@ func (m MeetingPerson) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(m))
 }
 
+type MergeOrganizationBody struct {
+	LosingOrganizationID int64 `json:"losing_organization_id"`
+	LosingRevision       int64 `json:"losing_revision"`
+}
+
+type MergePersonRequest struct {
+	AbsorbedPersonID int64 `json:"absorbed_person_id"`
+}
+
 type MessageDetail struct {
 	Attachments     []AttachmentInfo `json:"attachments,omitempty" validate:"required"`
 	Bcc             []string         `json:"bcc,omitempty"`
@@ -2566,6 +4414,7 @@ type MessageDetail struct {
 	FromPhone       *string          `json:"from_phone,omitempty"`
 	HasAttachments  bool             `json:"has_attachments"`
 	ID              int64            `json:"id"`
+	IsFromMe        *bool            `json:"is_from_me,omitempty"`
 	Labels          []string         `json:"labels,omitempty" validate:"required"`
 	MessageType     *string          `json:"message_type,omitempty"`
 	SentAt          string           `json:"sent_at" validate:"required"`
@@ -2788,12 +4637,974 @@ type OperationHealth struct {
 	StartedAt *time.Time `json:"started_at,omitempty"`
 }
 
+type Organization struct {
+	CreatedAt     time.Time  `json:"created_at" validate:"required"`
+	Description   *string    `json:"description,omitempty"`
+	ID            int64      `json:"id"`
+	Kind          string     `json:"kind" validate:"required"`
+	MergedIntoID  *int64     `json:"merged_into_id,omitempty"`
+	Name          string     `json:"name" validate:"required"`
+	PrimaryDomain *string    `json:"primary_domain,omitempty"`
+	RetiredAt     *time.Time `json:"retired_at,omitempty"`
+	Revision      int64      `json:"revision"`
+	UpdatedAt     time.Time  `json:"updated_at" validate:"required"`
+}
+
+func (o Organization) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(o))
+}
+
+type OrganizationAddress struct {
+	AddressKind        string        `json:"address_kind" validate:"required"`
+	CountryCode        *string       `json:"country_code,omitempty"`
+	CountryName        *string       `json:"country_name,omitempty"`
+	Envelope           ValueEnvelope `json:"envelope"`
+	ExtendedAddress    *string       `json:"extended_address,omitempty"`
+	ExtendedComponents *string       `json:"extended_components,omitempty"`
+	FreeText           *string       `json:"free_text,omitempty"`
+	GeoURI             *string       `json:"geo_uri,omitempty"`
+	Label              *string       `json:"label,omitempty"`
+	Locality           *string       `json:"locality,omitempty"`
+	OrganizationID     int64         `json:"organization_id"`
+	OriginalValue      string        `json:"original_value" validate:"required"`
+	PlaceURI           *string       `json:"place_uri,omitempty"`
+	PostOfficeBox      *string       `json:"post_office_box,omitempty"`
+	PostalCode         *string       `json:"postal_code,omitempty"`
+	Region             *string       `json:"region,omitempty"`
+	StreetAddress      *string       `json:"street_address,omitempty"`
+	Timezone           *string       `json:"timezone,omitempty"`
+}
+
+func (o OrganizationAddress) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(o.AddressKind, "required"); err != nil {
+		errors = errors.Append("AddressKind", err)
+	}
+	if v, ok := any(o.Envelope).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Envelope", err)
+		}
+	}
+	if err := typesValidator.Var(o.OriginalValue, "required"); err != nil {
+		errors = errors.Append("OriginalValue", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type OrganizationAddressBody struct {
+	ActiveFrom         *time.Time                    `json:"active_from,omitempty"`
+	AddressKind        string                        `json:"address_kind" validate:"required"`
+	Confidence         *float64                      `json:"confidence,omitempty"`
+	CountryCode        *string                       `json:"country_code,omitempty"`
+	CountryName        *string                       `json:"country_name,omitempty"`
+	ExtendedAddress    *string                       `json:"extended_address,omitempty"`
+	ExtendedComponents *string                       `json:"extended_components,omitempty"`
+	FreeText           *string                       `json:"free_text,omitempty"`
+	GeoURI             *string                       `json:"geo_uri,omitempty"`
+	Label              *string                       `json:"label,omitempty"`
+	Locality           *string                       `json:"locality,omitempty"`
+	Ordinal            *int64                        `json:"ordinal,omitempty" validate:"omitempty,gte=0"`
+	OriginalValue      *string                       `json:"original_value,omitempty"`
+	PlaceURI           *string                       `json:"place_uri,omitempty"`
+	PostOfficeBox      *string                       `json:"post_office_box,omitempty"`
+	PostalCode         *string                       `json:"postal_code,omitempty"`
+	Pref               *int64                        `json:"pref,omitempty"`
+	Region             *string                       `json:"region,omitempty"`
+	Source             OrganizationAddressBodySource `json:"source" validate:"required"`
+	SourceRef          *string                       `json:"source_ref,omitempty"`
+	StreetAddress      *string                       `json:"street_address,omitempty"`
+	Timezone           *string                       `json:"timezone,omitempty"`
+	TypeLabel          *string                       `json:"type_label,omitempty"`
+	TypeTokens         []string                      `json:"type_tokens,omitempty"`
+	VcardAltid         *string                       `json:"vcard_altid,omitempty"`
+	VcardGroup         *string                       `json:"vcard_group,omitempty"`
+	VcardPid           []string                      `json:"vcard_pid,omitempty"`
+	VcardPropID        *string                       `json:"vcard_prop_id,omitempty"`
+	VcardProperty      *string                       `json:"vcard_property,omitempty"`
+}
+
+func (o OrganizationAddressBody) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(o.AddressKind, "required"); err != nil {
+		errors = errors.Append("AddressKind", err)
+	}
+	if o.Ordinal != nil {
+		if err := typesValidator.Var(o.Ordinal, "omitempty,gte=0"); err != nil {
+			errors = errors.Append("Ordinal", err)
+		}
+	}
+	if v, ok := any(o.Source).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Source", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type OrganizationAttributeValue struct {
+	ActiveFrom     time.Time      `json:"active_from" validate:"required"`
+	ActiveUntil    *time.Time     `json:"active_until,omitempty"`
+	Actor          *string        `json:"actor,omitempty"`
+	Confidence     *float64       `json:"confidence,omitempty"`
+	CreatedAt      time.Time      `json:"created_at" validate:"required"`
+	DefinitionID   int64          `json:"definition_id"`
+	DefinitionSlug string         `json:"definition_slug" validate:"required"`
+	ID             int64          `json:"id"`
+	Ordinal        int64          `json:"ordinal"`
+	OrganizationID int64          `json:"organization_id"`
+	Source         string         `json:"source" validate:"required"`
+	SourceRef      *string        `json:"source_ref,omitempty"`
+	SupersededAt   *time.Time     `json:"superseded_at,omitempty"`
+	Value          AttributeValue `json:"value"`
+}
+
+func (o OrganizationAttributeValue) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(o.ActiveFrom, "required"); err != nil {
+		errors = errors.Append("ActiveFrom", err)
+	}
+	if err := typesValidator.Var(o.CreatedAt, "required"); err != nil {
+		errors = errors.Append("CreatedAt", err)
+	}
+	if err := typesValidator.Var(o.DefinitionSlug, "required"); err != nil {
+		errors = errors.Append("DefinitionSlug", err)
+	}
+	if err := typesValidator.Var(o.Source, "required"); err != nil {
+		errors = errors.Append("Source", err)
+	}
+	if v, ok := any(o.Value).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Value", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type OrganizationAttributeWrite struct {
+	DryRun     bool                        `json:"dry_run"`
+	Superseded *OrganizationAttributeValue `json:"superseded,omitempty"`
+	Value      *OrganizationAttributeValue `json:"value,omitempty"`
+}
+
+func (o OrganizationAttributeWrite) Validate() error {
+	var errors runtime.ValidationErrors
+	if o.Superseded != nil {
+		if v, ok := any(o.Superseded).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Superseded", err)
+			}
+		}
+	}
+	if o.Value != nil {
+		if v, ok := any(o.Value).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Value", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type OrganizationAttributesResponse struct {
+	Values []OrganizationAttributeValue `json:"values,omitempty" validate:"required"`
+}
+
+func (o OrganizationAttributesResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range o.Values {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Values[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type OrganizationBody struct {
+	Description   *string               `json:"description,omitempty"`
+	Kind          *OrganizationBodyKind `json:"kind,omitempty"`
+	Name          string                `json:"name" validate:"required"`
+	PrimaryDomain *string               `json:"primary_domain,omitempty"`
+	Retired       *bool                 `json:"retired,omitempty"`
+}
+
+func (o OrganizationBody) Validate() error {
+	var errors runtime.ValidationErrors
+	if o.Kind != nil {
+		if v, ok := any(o.Kind).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Kind", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(o.Name, "required"); err != nil {
+		errors = errors.Append("Name", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type OrganizationCategory struct {
+	Category           string        `json:"category" validate:"required"`
+	CategoryNormalized string        `json:"category_normalized" validate:"required"`
+	Envelope           ValueEnvelope `json:"envelope"`
+	OrganizationID     int64         `json:"organization_id"`
+}
+
+func (o OrganizationCategory) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(o.Category, "required"); err != nil {
+		errors = errors.Append("Category", err)
+	}
+	if err := typesValidator.Var(o.CategoryNormalized, "required"); err != nil {
+		errors = errors.Append("CategoryNormalized", err)
+	}
+	if v, ok := any(o.Envelope).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Envelope", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type OrganizationCategoryBody struct {
+	ActiveFrom    *time.Time                     `json:"active_from,omitempty"`
+	Category      string                         `json:"category" validate:"required"`
+	Confidence    *float64                       `json:"confidence,omitempty"`
+	Ordinal       *int64                         `json:"ordinal,omitempty" validate:"omitempty,gte=0"`
+	Pref          *int64                         `json:"pref,omitempty"`
+	Source        OrganizationCategoryBodySource `json:"source" validate:"required"`
+	SourceRef     *string                        `json:"source_ref,omitempty"`
+	TypeLabel     *string                        `json:"type_label,omitempty"`
+	TypeTokens    []string                       `json:"type_tokens,omitempty"`
+	VcardAltid    *string                        `json:"vcard_altid,omitempty"`
+	VcardGroup    *string                        `json:"vcard_group,omitempty"`
+	VcardPid      []string                       `json:"vcard_pid,omitempty"`
+	VcardPropID   *string                        `json:"vcard_prop_id,omitempty"`
+	VcardProperty *string                        `json:"vcard_property,omitempty"`
+}
+
+func (o OrganizationCategoryBody) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(o.Category, "required"); err != nil {
+		errors = errors.Append("Category", err)
+	}
+	if o.Ordinal != nil {
+		if err := typesValidator.Var(o.Ordinal, "omitempty,gte=0"); err != nil {
+			errors = errors.Append("Ordinal", err)
+		}
+	}
+	if v, ok := any(o.Source).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Source", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type OrganizationContactPoint struct {
+	AddressKind          string        `json:"address_kind" validate:"required"`
+	Envelope             ValueEnvelope `json:"envelope"`
+	Normalization        string        `json:"normalization" validate:"required"`
+	NormalizationVersion int64         `json:"normalization_version"`
+	NormalizedValue      string        `json:"normalized_value" validate:"required"`
+	OrganizationID       int64         `json:"organization_id"`
+	OriginalValue        string        `json:"original_value" validate:"required"`
+	ScopeKind            *string       `json:"scope_kind,omitempty"`
+	ScopeValue           *string       `json:"scope_value,omitempty"`
+	ServiceSlug          *string       `json:"service_slug,omitempty"`
+	URI                  *string       `json:"uri,omitempty"`
+}
+
+func (o OrganizationContactPoint) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(o.AddressKind, "required"); err != nil {
+		errors = errors.Append("AddressKind", err)
+	}
+	if v, ok := any(o.Envelope).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Envelope", err)
+		}
+	}
+	if err := typesValidator.Var(o.Normalization, "required"); err != nil {
+		errors = errors.Append("Normalization", err)
+	}
+	if err := typesValidator.Var(o.NormalizedValue, "required"); err != nil {
+		errors = errors.Append("NormalizedValue", err)
+	}
+	if err := typesValidator.Var(o.OriginalValue, "required"); err != nil {
+		errors = errors.Append("OriginalValue", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type OrganizationContactPointBody struct {
+	ActiveFrom    *time.Time                              `json:"active_from,omitempty"`
+	Confidence    *float64                                `json:"confidence,omitempty"`
+	ContactKind   OrganizationContactPointBodyContactKind `json:"contact_kind" validate:"required"`
+	Ordinal       *int64                                  `json:"ordinal,omitempty" validate:"omitempty,gte=0"`
+	OriginalValue string                                  `json:"original_value" validate:"required"`
+	Pref          *int64                                  `json:"pref,omitempty"`
+	ScopeKind     *string                                 `json:"scope_kind,omitempty"`
+	ScopeValue    *string                                 `json:"scope_value,omitempty"`
+	ServiceSlug   *string                                 `json:"service_slug,omitempty"`
+	Source        OrganizationContactPointBodySource      `json:"source" validate:"required"`
+	SourceRef     *string                                 `json:"source_ref,omitempty"`
+	TypeLabel     *string                                 `json:"type_label,omitempty"`
+	TypeTokens    []string                                `json:"type_tokens,omitempty"`
+	URI           *string                                 `json:"uri,omitempty"`
+	VcardAltid    *string                                 `json:"vcard_altid,omitempty"`
+	VcardGroup    *string                                 `json:"vcard_group,omitempty"`
+	VcardPid      []string                                `json:"vcard_pid,omitempty"`
+	VcardPropID   *string                                 `json:"vcard_prop_id,omitempty"`
+	VcardProperty *string                                 `json:"vcard_property,omitempty"`
+}
+
+func (o OrganizationContactPointBody) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(o.ContactKind).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("ContactKind", err)
+		}
+	}
+	if o.Ordinal != nil {
+		if err := typesValidator.Var(o.Ordinal, "omitempty,gte=0"); err != nil {
+			errors = errors.Append("Ordinal", err)
+		}
+	}
+	if err := typesValidator.Var(o.OriginalValue, "required"); err != nil {
+		errors = errors.Append("OriginalValue", err)
+	}
+	if v, ok := any(o.Source).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Source", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type OrganizationCreateBody struct {
+	Description   *string                     `json:"description,omitempty"`
+	Kind          *OrganizationCreateBodyKind `json:"kind,omitempty"`
+	Name          string                      `json:"name" validate:"required"`
+	PrimaryDomain *string                     `json:"primary_domain,omitempty"`
+}
+
+func (o OrganizationCreateBody) Validate() error {
+	var errors runtime.ValidationErrors
+	if o.Kind != nil {
+		if v, ok := any(o.Kind).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Kind", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(o.Name, "required"); err != nil {
+		errors = errors.Append("Name", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type OrganizationIdentifier struct {
+	Envelope        ValueEnvelope `json:"envelope"`
+	IdentifierKind  string        `json:"identifier_kind" validate:"required"`
+	IdentifierValue string        `json:"identifier_value" validate:"required"`
+	NormalizedValue string        `json:"normalized_value" validate:"required"`
+	OrganizationID  int64         `json:"organization_id"`
+}
+
+func (o OrganizationIdentifier) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(o.Envelope).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Envelope", err)
+		}
+	}
+	if err := typesValidator.Var(o.IdentifierKind, "required"); err != nil {
+		errors = errors.Append("IdentifierKind", err)
+	}
+	if err := typesValidator.Var(o.IdentifierValue, "required"); err != nil {
+		errors = errors.Append("IdentifierValue", err)
+	}
+	if err := typesValidator.Var(o.NormalizedValue, "required"); err != nil {
+		errors = errors.Append("NormalizedValue", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type OrganizationIdentifierBody struct {
+	ActiveFrom      *time.Time                               `json:"active_from,omitempty"`
+	Confidence      *float64                                 `json:"confidence,omitempty"`
+	IdentifierKind  OrganizationIdentifierBodyIdentifierKind `json:"identifier_kind" validate:"required"`
+	IdentifierValue string                                   `json:"identifier_value" validate:"required"`
+	Ordinal         *int64                                   `json:"ordinal,omitempty" validate:"omitempty,gte=0"`
+	Pref            *int64                                   `json:"pref,omitempty"`
+	Source          OrganizationIdentifierBodySource         `json:"source" validate:"required"`
+	SourceRef       *string                                  `json:"source_ref,omitempty"`
+	TypeLabel       *string                                  `json:"type_label,omitempty"`
+	TypeTokens      []string                                 `json:"type_tokens,omitempty"`
+	VcardAltid      *string                                  `json:"vcard_altid,omitempty"`
+	VcardGroup      *string                                  `json:"vcard_group,omitempty"`
+	VcardPid        []string                                 `json:"vcard_pid,omitempty"`
+	VcardPropID     *string                                  `json:"vcard_prop_id,omitempty"`
+	VcardProperty   *string                                  `json:"vcard_property,omitempty"`
+}
+
+func (o OrganizationIdentifierBody) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(o.IdentifierKind).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("IdentifierKind", err)
+		}
+	}
+	if err := typesValidator.Var(o.IdentifierValue, "required"); err != nil {
+		errors = errors.Append("IdentifierValue", err)
+	}
+	if o.Ordinal != nil {
+		if err := typesValidator.Var(o.Ordinal, "omitempty,gte=0"); err != nil {
+			errors = errors.Append("Ordinal", err)
+		}
+	}
+	if v, ok := any(o.Source).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Source", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type OrganizationMedia struct {
+	ByteSize       *int64        `json:"byte_size,omitempty"`
+	ContentHash    *string       `json:"content_hash,omitempty"`
+	Envelope       ValueEnvelope `json:"envelope"`
+	HasData        bool          `json:"has_data"`
+	MediaKind      string        `json:"media_kind" validate:"required"`
+	MediaType      *string       `json:"media_type,omitempty"`
+	OrganizationID int64         `json:"organization_id"`
+	OriginalValue  string        `json:"original_value" validate:"required"`
+	URI            *string       `json:"uri,omitempty"`
+}
+
+func (o OrganizationMedia) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(o.Envelope).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Envelope", err)
+		}
+	}
+	if err := typesValidator.Var(o.MediaKind, "required"); err != nil {
+		errors = errors.Append("MediaKind", err)
+	}
+	if err := typesValidator.Var(o.OriginalValue, "required"); err != nil {
+		errors = errors.Append("OriginalValue", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type OrganizationMediaBody struct {
+	ActiveFrom    *time.Time                     `json:"active_from,omitempty"`
+	Confidence    *float64                       `json:"confidence,omitempty"`
+	ContentHash   *string                        `json:"content_hash,omitempty"`
+	Data          *string                        `json:"data,omitempty"`
+	MediaKind     OrganizationMediaBodyMediaKind `json:"media_kind" validate:"required"`
+	MediaType     *string                        `json:"media_type,omitempty"`
+	Ordinal       *int64                         `json:"ordinal,omitempty" validate:"omitempty,gte=0"`
+	OriginalValue *string                        `json:"original_value,omitempty"`
+	Pref          *int64                         `json:"pref,omitempty"`
+	Source        OrganizationMediaBodySource    `json:"source" validate:"required"`
+	SourceRef     *string                        `json:"source_ref,omitempty"`
+	TypeLabel     *string                        `json:"type_label,omitempty"`
+	TypeTokens    []string                       `json:"type_tokens,omitempty"`
+	URI           *string                        `json:"uri,omitempty"`
+	VcardAltid    *string                        `json:"vcard_altid,omitempty"`
+	VcardGroup    *string                        `json:"vcard_group,omitempty"`
+	VcardPid      []string                       `json:"vcard_pid,omitempty"`
+	VcardPropID   *string                        `json:"vcard_prop_id,omitempty"`
+	VcardProperty *string                        `json:"vcard_property,omitempty"`
+}
+
+func (o OrganizationMediaBody) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(o.MediaKind).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("MediaKind", err)
+		}
+	}
+	if o.Ordinal != nil {
+		if err := typesValidator.Var(o.Ordinal, "omitempty,gte=0"); err != nil {
+			errors = errors.Append("Ordinal", err)
+		}
+	}
+	if v, ok := any(o.Source).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Source", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type OrganizationName struct {
+	Envelope       ValueEnvelope `json:"envelope"`
+	Name           string        `json:"name" validate:"required"`
+	NameKind       string        `json:"name_kind" validate:"required"`
+	NameNormalized string        `json:"name_normalized" validate:"required"`
+	OrganizationID int64         `json:"organization_id"`
+}
+
+func (o OrganizationName) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(o.Envelope).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Envelope", err)
+		}
+	}
+	if err := typesValidator.Var(o.Name, "required"); err != nil {
+		errors = errors.Append("Name", err)
+	}
+	if err := typesValidator.Var(o.NameKind, "required"); err != nil {
+		errors = errors.Append("NameKind", err)
+	}
+	if err := typesValidator.Var(o.NameNormalized, "required"); err != nil {
+		errors = errors.Append("NameNormalized", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type OrganizationNameBody struct {
+	ActiveFrom    *time.Time                   `json:"active_from,omitempty"`
+	Confidence    *float64                     `json:"confidence,omitempty"`
+	Name          string                       `json:"name" validate:"required"`
+	NameKind      OrganizationNameBodyNameKind `json:"name_kind" validate:"required"`
+	Ordinal       *int64                       `json:"ordinal,omitempty" validate:"omitempty,gte=0"`
+	Pref          *int64                       `json:"pref,omitempty"`
+	Source        OrganizationNameBodySource   `json:"source" validate:"required"`
+	SourceRef     *string                      `json:"source_ref,omitempty"`
+	TypeLabel     *string                      `json:"type_label,omitempty"`
+	TypeTokens    []string                     `json:"type_tokens,omitempty"`
+	VcardAltid    *string                      `json:"vcard_altid,omitempty"`
+	VcardGroup    *string                      `json:"vcard_group,omitempty"`
+	VcardPid      []string                     `json:"vcard_pid,omitempty"`
+	VcardPropID   *string                      `json:"vcard_prop_id,omitempty"`
+	VcardProperty *string                      `json:"vcard_property,omitempty"`
+}
+
+func (o OrganizationNameBody) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(o.Name, "required"); err != nil {
+		errors = errors.Append("Name", err)
+	}
+	if v, ok := any(o.NameKind).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("NameKind", err)
+		}
+	}
+	if o.Ordinal != nil {
+		if err := typesValidator.Var(o.Ordinal, "omitempty,gte=0"); err != nil {
+			errors = errors.Append("Ordinal", err)
+		}
+	}
+	if v, ok := any(o.Source).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Source", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type OrganizationProfile struct {
+	Addresses     []OrganizationAddress      `json:"addresses,omitempty" validate:"required"`
+	Categories    []OrganizationCategory     `json:"categories,omitempty" validate:"required"`
+	ContactPoints []OrganizationContactPoint `json:"contact_points,omitempty" validate:"required"`
+	Identifiers   []OrganizationIdentifier   `json:"identifiers,omitempty" validate:"required"`
+	Media         []OrganizationMedia        `json:"media,omitempty" validate:"required"`
+	Names         []OrganizationName         `json:"names,omitempty" validate:"required"`
+	Organization  Organization               `json:"organization"`
+}
+
+func (o OrganizationProfile) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range o.Addresses {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Addresses[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range o.Categories {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Categories[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range o.ContactPoints {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("ContactPoints[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range o.Identifiers {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Identifiers[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range o.Media {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Media[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range o.Names {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Names[%d]", i), err)
+			}
+		}
+	}
+	if v, ok := any(o.Organization).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Organization", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type OrganizationProfileBody struct {
+	Addresses     []OrganizationAddressBody      `json:"addresses,omitempty"`
+	Categories    []OrganizationCategoryBody     `json:"categories,omitempty"`
+	ContactPoints []OrganizationContactPointBody `json:"contact_points,omitempty"`
+	Identifiers   []OrganizationIdentifierBody   `json:"identifiers,omitempty"`
+	Media         []OrganizationMediaBody        `json:"media,omitempty"`
+	Names         []OrganizationNameBody         `json:"names,omitempty"`
+}
+
+func (o OrganizationProfileBody) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range o.Addresses {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Addresses[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range o.Categories {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Categories[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range o.ContactPoints {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("ContactPoints[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range o.Identifiers {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Identifiers[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range o.Media {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Media[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range o.Names {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Names[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type OrganizationsResponse struct {
+	Limit         int64          `json:"limit"`
+	Offset        int64          `json:"offset"`
+	Organizations []Organization `json:"organizations,omitempty" validate:"required"`
+	Total         int64          `json:"total"`
+}
+
+func (o OrganizationsResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range o.Organizations {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Organizations[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PartialDate struct {
+	Day   *int64 `json:"day,omitempty"`
+	Month *int64 `json:"month,omitempty"`
+	Year  *int64 `json:"year,omitempty"`
+}
+
+type ParticipantCompletionHTTPRequest struct {
+	Limit *int64 `json:"limit,omitempty" validate:"omitempty,gte=0,lte=20"`
+	Query string `json:"query" validate:"required"`
+}
+
+func (p ParticipantCompletionHTTPRequest) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type ParticipantCompletionHTTPResponse struct {
+	CacheRevision string                         `json:"cache_revision" validate:"required"`
+	Rows          []ParticipantCompletionHTTPRow `json:"rows,omitempty" validate:"required"`
+}
+
+func (p ParticipantCompletionHTTPResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(p.CacheRevision, "required"); err != nil {
+		errors = errors.Append("CacheRevision", err)
+	}
+	for i, item := range p.Rows {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Rows[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type ParticipantCompletionHTTPRow struct {
+	DisplayLabel  string                           `json:"display_label" validate:"required"`
+	Kind          ParticipantCompletionHTTPRowKind `json:"kind" validate:"required"`
+	ParticipantID int64                            `json:"participant_id"`
+	Source        string                           `json:"source" validate:"required"`
+	Value         string                           `json:"value" validate:"required"`
+}
+
+func (p ParticipantCompletionHTTPRow) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(p.DisplayLabel, "required"); err != nil {
+		errors = errors.Append("DisplayLabel", err)
+	}
+	if v, ok := any(p.Kind).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Kind", err)
+		}
+	}
+	if err := typesValidator.Var(p.Source, "required"); err != nil {
+		errors = errors.Append("Source", err)
+	}
+	if err := typesValidator.Var(p.Value, "required"); err != nil {
+		errors = errors.Append("Value", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type ParticipantContactObservation struct {
+	AddressKind          string        `json:"address_kind" validate:"required"`
+	Envelope             ValueEnvelope `json:"envelope"`
+	Normalization        string        `json:"normalization" validate:"required"`
+	NormalizationVersion int64         `json:"normalization_version"`
+	NormalizedValue      string        `json:"normalized_value" validate:"required"`
+	ObservedAt           *time.Time    `json:"observed_at,omitempty"`
+	OriginalValue        string        `json:"original_value" validate:"required"`
+	ParticipantID        int64         `json:"participant_id"`
+	ProviderUserID       *string       `json:"provider_user_id,omitempty"`
+	ScopeKind            *string       `json:"scope_kind,omitempty"`
+	ScopeValue           *string       `json:"scope_value,omitempty"`
+	ServiceSlug          *string       `json:"service_slug,omitempty"`
+	SourceID             *int64        `json:"source_id,omitempty"`
+}
+
+func (p ParticipantContactObservation) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(p.AddressKind, "required"); err != nil {
+		errors = errors.Append("AddressKind", err)
+	}
+	if v, ok := any(p.Envelope).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Envelope", err)
+		}
+	}
+	if err := typesValidator.Var(p.Normalization, "required"); err != nil {
+		errors = errors.Append("Normalization", err)
+	}
+	if err := typesValidator.Var(p.NormalizedValue, "required"); err != nil {
+		errors = errors.Append("NormalizedValue", err)
+	}
+	if err := typesValidator.Var(p.OriginalValue, "required"); err != nil {
+		errors = errors.Append("OriginalValue", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type ParticipantContextSummaryHTTPResponse struct {
+	CacheRevision       string           `json:"cache_revision" validate:"required"`
+	CandidateSnapshotID *string          `json:"candidate_snapshot_id,omitempty"`
+	SearchProvenance    SearchProvenance `json:"search_provenance"`
+	Summary             PersonSummary    `json:"summary"`
+}
+
+func (p ParticipantContextSummaryHTTPResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(p.CacheRevision, "required"); err != nil {
+		errors = errors.Append("CacheRevision", err)
+	}
+	if v, ok := any(p.SearchProvenance).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("SearchProvenance", err)
+		}
+	}
+	if v, ok := any(p.Summary).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Summary", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type ParticipantSearchHTTPResponse struct {
+	CacheRevision       string           `json:"cache_revision" validate:"required"`
+	CandidateSnapshotID *string          `json:"candidate_snapshot_id,omitempty"`
+	NextCursor          *string          `json:"next_cursor,omitempty"`
+	Rows                []PersonSummary  `json:"rows,omitempty" validate:"required"`
+	SearchProvenance    SearchProvenance `json:"search_provenance"`
+	TotalCount          int64            `json:"total_count"`
+}
+
+func (p ParticipantSearchHTTPResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(p.CacheRevision, "required"); err != nil {
+		errors = errors.Append("CacheRevision", err)
+	}
+	for i, item := range p.Rows {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Rows[%d]", i), err)
+			}
+		}
+	}
+	if v, ok := any(p.SearchProvenance).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("SearchProvenance", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PatchAttributeDefinitionRequest struct {
+	Description  *string `json:"description,omitempty"`
+	DisplayOrder *int64  `json:"display_order,omitempty"`
+	IsActive     *bool   `json:"is_active,omitempty"`
+	IsSensitive  *bool   `json:"is_sensitive,omitempty"`
+	Label        *string `json:"label,omitempty"`
+}
+
+type PatchPersonRelationshipRequest struct {
+	EndDate *string `json:"end_date,omitempty"`
+	Notes   *string `json:"notes,omitempty"`
+}
+
 type PatchPersonRequest struct {
 	DisplayName *string `json:"display_name" validate:"omitempty"`
 }
 
 func (p PatchPersonRequest) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type PatchRelationshipTypeRequest struct {
+	Color            *string `json:"color,omitempty"`
+	Description      *string `json:"description,omitempty"`
+	ForwardLabel     *string `json:"forward_label,omitempty"`
+	Icon             *string `json:"icon,omitempty"`
+	ReverseLabel     *string `json:"reverse_label,omitempty"`
+	VcardRelatedType *string `json:"vcard_related_type,omitempty"`
 }
 
 type PatchSavedViewRequest struct {
@@ -2818,6 +5629,25 @@ func (p PatchSavedViewRequest) Validate() error {
 	return errors
 }
 
+type PeopleResponse struct {
+	People []Person `json:"people,omitempty" validate:"required"`
+}
+
+func (p PeopleResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.People {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("People[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
 type Person struct {
 	CreatedAt      time.Time `json:"created_at" validate:"required"`
 	DisplayName    *string   `json:"display_name,omitempty"`
@@ -2830,6 +5660,317 @@ type Person struct {
 
 func (p Person) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type PersonAddress struct {
+	AddressKind        string        `json:"address_kind" validate:"required"`
+	CountryCode        *string       `json:"country_code,omitempty"`
+	CountryName        *string       `json:"country_name,omitempty"`
+	Envelope           ValueEnvelope `json:"envelope"`
+	ExtendedAddress    *string       `json:"extended_address,omitempty"`
+	ExtendedComponents *string       `json:"extended_components,omitempty"`
+	FreeText           *string       `json:"free_text,omitempty"`
+	GeoURI             *string       `json:"geo_uri,omitempty"`
+	Label              *string       `json:"label,omitempty"`
+	Locality           *string       `json:"locality,omitempty"`
+	OriginalValue      string        `json:"original_value" validate:"required"`
+	PersonID           int64         `json:"person_id"`
+	PlaceURI           *string       `json:"place_uri,omitempty"`
+	PostOfficeBox      *string       `json:"post_office_box,omitempty"`
+	PostalCode         *string       `json:"postal_code,omitempty"`
+	Region             *string       `json:"region,omitempty"`
+	StreetAddress      *string       `json:"street_address,omitempty"`
+	Timezone           *string       `json:"timezone,omitempty"`
+}
+
+func (p PersonAddress) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(p.AddressKind, "required"); err != nil {
+		errors = errors.Append("AddressKind", err)
+	}
+	if v, ok := any(p.Envelope).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Envelope", err)
+		}
+	}
+	if err := typesValidator.Var(p.OriginalValue, "required"); err != nil {
+		errors = errors.Append("OriginalValue", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonAddressInputRequest struct {
+	AddressKind        string             `json:"address_kind" validate:"required"`
+	CountryCode        *string            `json:"country_code,omitempty"`
+	CountryName        *string            `json:"country_name,omitempty"`
+	Envelope           ValueEnvelopeInput `json:"envelope"`
+	ExtendedAddress    *string            `json:"extended_address,omitempty"`
+	ExtendedComponents *string            `json:"extended_components,omitempty"`
+	FreeText           *string            `json:"free_text,omitempty"`
+	GeoURI             *string            `json:"geo_uri,omitempty"`
+	Label              *string            `json:"label,omitempty"`
+	Locality           *string            `json:"locality,omitempty"`
+	OriginalValue      *string            `json:"original_value,omitempty"`
+	PlaceURI           *string            `json:"place_uri,omitempty"`
+	PostOfficeBox      *string            `json:"post_office_box,omitempty"`
+	PostalCode         *string            `json:"postal_code,omitempty"`
+	Region             *string            `json:"region,omitempty"`
+	StreetAddress      *string            `json:"street_address,omitempty"`
+	Timezone           *string            `json:"timezone,omitempty"`
+}
+
+func (p PersonAddressInputRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(p.AddressKind, "required"); err != nil {
+		errors = errors.Append("AddressKind", err)
+	}
+	if v, ok := any(p.Envelope).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Envelope", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonAddressPatchRequest struct {
+	Add       []PersonAddressInputRequest `json:"add,omitempty"`
+	Supersede []int64                     `json:"supersede,omitempty"`
+}
+
+func (p PersonAddressPatchRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Add {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Add[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonAttributeConflictResponse struct {
+	CurrentValue   *PersonAttributeValue `json:"current_value,omitempty"`
+	CurrentValueID *int64                `json:"current_value_id,omitempty"`
+	ErrorData      string                `json:"error" validate:"required"`
+	Message        *string               `json:"message,omitempty"`
+}
+
+func (p PersonAttributeConflictResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if p.CurrentValue != nil {
+		if v, ok := any(p.CurrentValue).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("CurrentValue", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(p.ErrorData, "required"); err != nil {
+		errors = errors.Append("ErrorData", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonAttributeGroup struct {
+	Current    []PersonAttributeValue `json:"current,omitempty" validate:"required"`
+	Definition AttributeDefinition    `json:"definition"`
+	History    []PersonAttributeValue `json:"history,omitempty"`
+}
+
+func (p PersonAttributeGroup) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Current {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Current[%d]", i), err)
+			}
+		}
+	}
+	if v, ok := any(p.Definition).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Definition", err)
+		}
+	}
+	for i, item := range p.History {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("History[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonAttributeValue struct {
+	ActiveFrom     time.Time      `json:"active_from" validate:"required"`
+	ActiveUntil    *time.Time     `json:"active_until,omitempty"`
+	Actor          *string        `json:"actor,omitempty"`
+	Confidence     *float64       `json:"confidence,omitempty"`
+	CreatedAt      time.Time      `json:"created_at" validate:"required"`
+	DefinitionID   int64          `json:"definition_id"`
+	DefinitionSlug string         `json:"definition_slug" validate:"required"`
+	ID             int64          `json:"id"`
+	Ordinal        int64          `json:"ordinal"`
+	PersonID       int64          `json:"person_id"`
+	Source         string         `json:"source" validate:"required"`
+	SourceRef      *string        `json:"source_ref,omitempty"`
+	SupersededAt   *time.Time     `json:"superseded_at,omitempty"`
+	Value          AttributeValue `json:"value"`
+}
+
+func (p PersonAttributeValue) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(p.ActiveFrom, "required"); err != nil {
+		errors = errors.Append("ActiveFrom", err)
+	}
+	if err := typesValidator.Var(p.CreatedAt, "required"); err != nil {
+		errors = errors.Append("CreatedAt", err)
+	}
+	if err := typesValidator.Var(p.DefinitionSlug, "required"); err != nil {
+		errors = errors.Append("DefinitionSlug", err)
+	}
+	if err := typesValidator.Var(p.Source, "required"); err != nil {
+		errors = errors.Append("Source", err)
+	}
+	if v, ok := any(p.Value).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Value", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonAttributeWrite struct {
+	DryRun     bool                  `json:"dry_run"`
+	Superseded *PersonAttributeValue `json:"superseded,omitempty"`
+	Value      *PersonAttributeValue `json:"value,omitempty"`
+}
+
+func (p PersonAttributeWrite) Validate() error {
+	var errors runtime.ValidationErrors
+	if p.Superseded != nil {
+		if v, ok := any(p.Superseded).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Superseded", err)
+			}
+		}
+	}
+	if p.Value != nil {
+		if v, ok := any(p.Value).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Value", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonAttributesResponse struct {
+	Attributes []PersonAttributeGroup `json:"attributes,omitempty" validate:"required"`
+	PersonID   int64                  `json:"person_id"`
+}
+
+func (p PersonAttributesResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Attributes {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Attributes[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonCategory struct {
+	Envelope        ValueEnvelope `json:"envelope"`
+	NormalizedValue string        `json:"normalized_value" validate:"required"`
+	OriginalValue   string        `json:"original_value" validate:"required"`
+	PersonID        int64         `json:"person_id"`
+}
+
+func (p PersonCategory) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(p.Envelope).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Envelope", err)
+		}
+	}
+	if err := typesValidator.Var(p.NormalizedValue, "required"); err != nil {
+		errors = errors.Append("NormalizedValue", err)
+	}
+	if err := typesValidator.Var(p.OriginalValue, "required"); err != nil {
+		errors = errors.Append("OriginalValue", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonCategoryInputRequest struct {
+	Envelope      ValueEnvelopeInput `json:"envelope"`
+	OriginalValue string             `json:"original_value" validate:"required"`
+}
+
+func (p PersonCategoryInputRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(p.Envelope).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Envelope", err)
+		}
+	}
+	if err := typesValidator.Var(p.OriginalValue, "required"); err != nil {
+		errors = errors.Append("OriginalValue", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonCategoryPatchRequest struct {
+	Add       []PersonCategoryInputRequest `json:"add,omitempty"`
+	Supersede []int64                      `json:"supersede,omitempty"`
+}
+
+func (p PersonCategoryPatchRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Add {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Add[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
 }
 
 type PersonCluster struct {
@@ -2861,27 +6002,810 @@ type PersonClusterEdge struct {
 	ParticipantB int64 `json:"participant_b"`
 }
 
-type PersonContextSummaryHTTPResponse struct {
-	CacheRevision       string           `json:"cache_revision" validate:"required"`
-	CandidateSnapshotID *string          `json:"candidate_snapshot_id,omitempty"`
-	SearchProvenance    SearchProvenance `json:"search_provenance"`
-	Summary             PersonSummary    `json:"summary"`
+type PersonContactPoint struct {
+	AddressKind          string        `json:"address_kind" validate:"required"`
+	Envelope             ValueEnvelope `json:"envelope"`
+	Normalization        string        `json:"normalization" validate:"required"`
+	NormalizationVersion int64         `json:"normalization_version"`
+	NormalizedValue      string        `json:"normalized_value" validate:"required"`
+	OriginalValue        string        `json:"original_value" validate:"required"`
+	PersonID             int64         `json:"person_id"`
+	ScopeKind            *string       `json:"scope_kind,omitempty"`
+	ScopeValue           *string       `json:"scope_value,omitempty"`
+	ServiceSlug          *string       `json:"service_slug,omitempty"`
+	URI                  *string       `json:"uri,omitempty"`
 }
 
-func (p PersonContextSummaryHTTPResponse) Validate() error {
+func (p PersonContactPoint) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(p.AddressKind, "required"); err != nil {
+		errors = errors.Append("AddressKind", err)
+	}
+	if v, ok := any(p.Envelope).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Envelope", err)
+		}
+	}
+	if err := typesValidator.Var(p.Normalization, "required"); err != nil {
+		errors = errors.Append("Normalization", err)
+	}
+	if err := typesValidator.Var(p.NormalizedValue, "required"); err != nil {
+		errors = errors.Append("NormalizedValue", err)
+	}
+	if err := typesValidator.Var(p.OriginalValue, "required"); err != nil {
+		errors = errors.Append("OriginalValue", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonContactPointInputRequest struct {
+	AddressKind   string             `json:"address_kind" validate:"required"`
+	Envelope      ValueEnvelopeInput `json:"envelope"`
+	OriginalValue string             `json:"original_value" validate:"required"`
+	ScopeKind     *string            `json:"scope_kind,omitempty"`
+	ScopeValue    *string            `json:"scope_value,omitempty"`
+	ServiceSlug   *string            `json:"service_slug,omitempty"`
+	URI           *string            `json:"uri,omitempty"`
+}
+
+func (p PersonContactPointInputRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(p.AddressKind, "required"); err != nil {
+		errors = errors.Append("AddressKind", err)
+	}
+	if v, ok := any(p.Envelope).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Envelope", err)
+		}
+	}
+	if err := typesValidator.Var(p.OriginalValue, "required"); err != nil {
+		errors = errors.Append("OriginalValue", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonContactPointPatchRequest struct {
+	Add       []PersonContactPointInputRequest `json:"add,omitempty"`
+	Supersede []int64                          `json:"supersede,omitempty"`
+}
+
+func (p PersonContactPointPatchRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Add {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Add[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonDate struct {
+	CalendarScale *string       `json:"calendar_scale,omitempty"`
+	Date          PartialDate   `json:"date"`
+	DateKind      string        `json:"date_kind" validate:"required"`
+	DateText      *string       `json:"date_text,omitempty"`
+	Envelope      ValueEnvelope `json:"envelope"`
+	Label         *string       `json:"label,omitempty"`
+	OriginalValue string        `json:"original_value" validate:"required"`
+	PersonID      int64         `json:"person_id"`
+}
+
+func (p PersonDate) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(p.Date).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Date", err)
+		}
+	}
+	if err := typesValidator.Var(p.DateKind, "required"); err != nil {
+		errors = errors.Append("DateKind", err)
+	}
+	if v, ok := any(p.Envelope).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Envelope", err)
+		}
+	}
+	if err := typesValidator.Var(p.OriginalValue, "required"); err != nil {
+		errors = errors.Append("OriginalValue", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonDateInputRequest struct {
+	CalendarScale *string            `json:"calendar_scale,omitempty"`
+	Date          *PartialDate       `json:"date,omitempty"`
+	DateKind      string             `json:"date_kind" validate:"required"`
+	DateText      *string            `json:"date_text,omitempty"`
+	Envelope      ValueEnvelopeInput `json:"envelope"`
+	Label         *string            `json:"label,omitempty"`
+	OriginalValue *string            `json:"original_value,omitempty"`
+}
+
+func (p PersonDateInputRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	if p.Date != nil {
+		if v, ok := any(p.Date).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Date", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(p.DateKind, "required"); err != nil {
+		errors = errors.Append("DateKind", err)
+	}
+	if v, ok := any(p.Envelope).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Envelope", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonDatePatchRequest struct {
+	Add       []PersonDateInputRequest `json:"add,omitempty"`
+	Supersede []int64                  `json:"supersede,omitempty"`
+}
+
+func (p PersonDatePatchRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Add {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Add[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonDay struct {
+	DirectCount int64  `json:"direct_count"`
+	EntryCount  int64  `json:"entry_count"`
+	EventCount  int64  `json:"event_count"`
+	LocalDate   string `json:"local_date" validate:"required"`
+}
+
+func (p PersonDay) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type PersonDayPage struct {
+	Activity           []ActivityRef    `json:"activity" validate:"required"`
+	ActivityTotalCount int64            `json:"activity_total_count"`
+	Entries            []DailyNoteEntry `json:"entries" validate:"required"`
+	EntryTotalCount    int64            `json:"entry_total_count"`
+	LocalDate          string           `json:"local_date" validate:"required"`
+	PersonID           int64            `json:"person_id"`
+}
+
+func (p PersonDayPage) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Activity {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Activity[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range p.Entries {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Entries[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(p.LocalDate, "required"); err != nil {
+		errors = errors.Append("LocalDate", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonDaysPage struct {
+	Days       []PersonDay `json:"days" validate:"required"`
+	PersonID   int64       `json:"person_id"`
+	TotalCount int64       `json:"total_count"`
+}
+
+func (p PersonDaysPage) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Days {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Days[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonFactClaim struct {
+	ClaimKey           string           `json:"claim_key" validate:"required"`
+	Confidence         ConfidenceInputs `json:"confidence"`
+	CreatedAt          time.Time        `json:"created_at" validate:"required"`
+	EvidenceIds        []int64          `json:"evidence_ids,omitempty" validate:"required"`
+	GenerationID       int64            `json:"generation_id"`
+	ID                 int64            `json:"id"`
+	NormalizedValue    *string          `json:"normalized_value,omitempty"`
+	Origin             string           `json:"origin" validate:"required"`
+	ProgramFingerprint string           `json:"program_fingerprint" validate:"required"`
+	ProgramID          string           `json:"program_id" validate:"required"`
+	ProgramVersion     string           `json:"program_version" validate:"required"`
+	Relation           string           `json:"relation" validate:"required"`
+	SubmittedValue     string           `json:"submitted_value" validate:"required"`
+	Target             TargetRef        `json:"target"`
+	ValidFrom          *time.Time       `json:"valid_from,omitempty"`
+	ValidUntil         *time.Time       `json:"valid_until,omitempty"`
+	ValueFingerprint   *string          `json:"value_fingerprint,omitempty"`
+}
+
+func (p PersonFactClaim) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(p.ClaimKey, "required"); err != nil {
+		errors = errors.Append("ClaimKey", err)
+	}
+	if v, ok := any(p.Confidence).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Confidence", err)
+		}
+	}
+	if err := typesValidator.Var(p.CreatedAt, "required"); err != nil {
+		errors = errors.Append("CreatedAt", err)
+	}
+	if err := typesValidator.Var(p.EvidenceIds, "required"); err != nil {
+		errors = errors.Append("EvidenceIds", err)
+	}
+	if err := typesValidator.Var(p.Origin, "required"); err != nil {
+		errors = errors.Append("Origin", err)
+	}
+	if err := typesValidator.Var(p.ProgramFingerprint, "required"); err != nil {
+		errors = errors.Append("ProgramFingerprint", err)
+	}
+	if err := typesValidator.Var(p.ProgramID, "required"); err != nil {
+		errors = errors.Append("ProgramID", err)
+	}
+	if err := typesValidator.Var(p.ProgramVersion, "required"); err != nil {
+		errors = errors.Append("ProgramVersion", err)
+	}
+	if err := typesValidator.Var(p.Relation, "required"); err != nil {
+		errors = errors.Append("Relation", err)
+	}
+	if err := typesValidator.Var(p.SubmittedValue, "required"); err != nil {
+		errors = errors.Append("SubmittedValue", err)
+	}
+	if v, ok := any(p.Target).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Target", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonFactClaimsResponse struct {
+	Claims []PersonFactClaim `json:"claims" validate:"required"`
+}
+
+func (p PersonFactClaimsResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Claims {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Claims[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonFactDecision struct {
+	Action            string                   `json:"action" validate:"required"`
+	ClaimKey          string                   `json:"claim_key" validate:"required"`
+	CompetingClaimKey *string                  `json:"competing_claim_key,omitempty"`
+	CreatedAt         time.Time                `json:"created_at" validate:"required"`
+	DecisionKey       string                   `json:"decision_key" validate:"required"`
+	ID                int64                    `json:"id"`
+	Projection        *ProjectionRef           `json:"projection,omitempty"`
+	Reason            string                   `json:"reason" validate:"required"`
+	ResolutionID      int64                    `json:"resolution_id"`
+	Score             PersonFactScoreBreakdown `json:"score"`
+}
+
+func (p PersonFactDecision) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(p.Action, "required"); err != nil {
+		errors = errors.Append("Action", err)
+	}
+	if err := typesValidator.Var(p.ClaimKey, "required"); err != nil {
+		errors = errors.Append("ClaimKey", err)
+	}
+	if err := typesValidator.Var(p.CreatedAt, "required"); err != nil {
+		errors = errors.Append("CreatedAt", err)
+	}
+	if err := typesValidator.Var(p.DecisionKey, "required"); err != nil {
+		errors = errors.Append("DecisionKey", err)
+	}
+	if p.Projection != nil {
+		if v, ok := any(p.Projection).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Projection", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(p.Reason, "required"); err != nil {
+		errors = errors.Append("Reason", err)
+	}
+	if v, ok := any(p.Score).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Score", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonFactDecisionsResponse struct {
+	Decisions []PersonFactDecision `json:"decisions" validate:"required"`
+}
+
+func (p PersonFactDecisionsResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Decisions {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Decisions[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonFactEvidence struct {
+	Authority       string                         `json:"authority" validate:"required"`
+	ContentSha256   *string                        `json:"content_sha256,omitempty" validate:"required"`
+	CreatedAt       time.Time                      `json:"created_at" validate:"required"`
+	Directness      string                         `json:"directness" validate:"required"`
+	EventTime       time.Time                      `json:"event_time" validate:"required"`
+	EvidenceKey     string                         `json:"evidence_key" validate:"required"`
+	Excerpt         *string                        `json:"excerpt,omitempty" validate:"required"`
+	ID              int64                          `json:"id"`
+	IdentityScore   int64                          `json:"identity_score"`
+	LatestStatus    *PersonFactEvidenceStatusEvent `json:"latest_status,omitempty"`
+	RecordedTime    time.Time                      `json:"recorded_time" validate:"required"`
+	SourceClass     string                         `json:"source_class" validate:"required"`
+	SourceRef       *string                        `json:"source_ref,omitempty" validate:"required"`
+	SourceURL       *string                        `json:"source_url,omitempty" validate:"required"`
+	SourceVersion   *string                        `json:"source_version,omitempty" validate:"required"`
+	SpanEnd         *int64                         `json:"span_end,omitempty"`
+	SpanStart       *int64                         `json:"span_start,omitempty"`
+	SubjectPersonID *int64                         `json:"subject_person_id,omitempty"`
+	SubjectRef      *string                        `json:"subject_ref,omitempty" validate:"required"`
+	Supported       bool                           `json:"supported"`
+}
+
+func (p PersonFactEvidence) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(p.Authority, "required"); err != nil {
+		errors = errors.Append("Authority", err)
+	}
+	if err := typesValidator.Var(p.ContentSha256, "required"); err != nil {
+		errors = errors.Append("ContentSha256", err)
+	}
+	if err := typesValidator.Var(p.CreatedAt, "required"); err != nil {
+		errors = errors.Append("CreatedAt", err)
+	}
+	if err := typesValidator.Var(p.Directness, "required"); err != nil {
+		errors = errors.Append("Directness", err)
+	}
+	if err := typesValidator.Var(p.EventTime, "required"); err != nil {
+		errors = errors.Append("EventTime", err)
+	}
+	if err := typesValidator.Var(p.EvidenceKey, "required"); err != nil {
+		errors = errors.Append("EvidenceKey", err)
+	}
+	if err := typesValidator.Var(p.Excerpt, "required"); err != nil {
+		errors = errors.Append("Excerpt", err)
+	}
+	if p.LatestStatus != nil {
+		if v, ok := any(p.LatestStatus).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("LatestStatus", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(p.RecordedTime, "required"); err != nil {
+		errors = errors.Append("RecordedTime", err)
+	}
+	if err := typesValidator.Var(p.SourceClass, "required"); err != nil {
+		errors = errors.Append("SourceClass", err)
+	}
+	if err := typesValidator.Var(p.SourceRef, "required"); err != nil {
+		errors = errors.Append("SourceRef", err)
+	}
+	if err := typesValidator.Var(p.SourceURL, "required"); err != nil {
+		errors = errors.Append("SourceURL", err)
+	}
+	if err := typesValidator.Var(p.SourceVersion, "required"); err != nil {
+		errors = errors.Append("SourceVersion", err)
+	}
+	if err := typesValidator.Var(p.SubjectRef, "required"); err != nil {
+		errors = errors.Append("SubjectRef", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonFactEvidenceResponse struct {
+	Evidence []PersonFactEvidence `json:"evidence" validate:"required"`
+}
+
+func (p PersonFactEvidenceResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Evidence {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Evidence[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonFactEvidenceStatusEvent struct {
+	CreatedAt     time.Time `json:"created_at" validate:"required"`
+	EvidenceKey   string    `json:"evidence_key" validate:"required"`
+	GenerationID  int64     `json:"generation_id"`
+	ID            int64     `json:"id"`
+	Reason        string    `json:"reason" validate:"required"`
+	SourceVersion *string   `json:"source_version,omitempty" validate:"required"`
+	Supported     bool      `json:"supported"`
+}
+
+func (p PersonFactEvidenceStatusEvent) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type PersonFactEvidenceStatusEventsResponse struct {
+	Events []PersonFactEvidenceStatusEvent `json:"events" validate:"required"`
+}
+
+func (p PersonFactEvidenceStatusEventsResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Events {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Events[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonFactPinWrite struct {
+	Projections []ProjectionRef              `json:"projections,omitempty" validate:"required"`
+	Resolutions []PersonFactResolutionResult `json:"resolutions,omitempty" validate:"required"`
+	State       PinState                     `json:"state"`
+}
+
+func (p PersonFactPinWrite) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Projections {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Projections[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range p.Resolutions {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Resolutions[%d]", i), err)
+			}
+		}
+	}
+	if v, ok := any(p.State).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("State", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonFactPinsResponse struct {
+	Pins []PinState `json:"pins,omitempty" validate:"required"`
+}
+
+func (p PersonFactPinsResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Pins {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Pins[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonFactResolutionResult struct {
+	Decisions        []PersonFactDecision `json:"decisions,omitempty" validate:"required"`
+	ID               int64                `json:"id"`
+	InputFingerprint string               `json:"input_fingerprint" validate:"required"`
+	Projections      []ProjectionRef      `json:"projections,omitempty" validate:"required"`
+	ResolvedAt       time.Time            `json:"resolved_at" validate:"required"`
+	ResolverVersion  string               `json:"resolver_version" validate:"required"`
+	Target           TargetRef            `json:"target"`
+}
+
+func (p PersonFactResolutionResult) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Decisions {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Decisions[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(p.InputFingerprint, "required"); err != nil {
+		errors = errors.Append("InputFingerprint", err)
+	}
+	for i, item := range p.Projections {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Projections[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(p.ResolvedAt, "required"); err != nil {
+		errors = errors.Append("ResolvedAt", err)
+	}
+	if err := typesValidator.Var(p.ResolverVersion, "required"); err != nil {
+		errors = errors.Append("ResolverVersion", err)
+	}
+	if v, ok := any(p.Target).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Target", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonFactScoreBreakdown struct {
+	Authority     int64 `json:"authority"`
+	Confidence    int64 `json:"confidence"`
+	Corroboration int64 `json:"corroboration"`
+	Directness    int64 `json:"directness"`
+	Freshness     int64 `json:"freshness"`
+	SourceClass   int64 `json:"source_class"`
+	Total         int64 `json:"total"`
+}
+
+type PersonFileProvenance struct {
+	Directions     []PersonFileProvenanceDirections `json:"directions,omitempty" validate:"required"`
+	ParticipantIds []int64                          `json:"participant_ids,omitempty" validate:"required"`
+	Roles          []PersonFileProvenanceRoles      `json:"roles,omitempty" validate:"required"`
+}
+
+func (p PersonFileProvenance) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Directions {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Directions[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(p.ParticipantIds, "required"); err != nil {
+		errors = errors.Append("ParticipantIds", err)
+	}
+	for i, item := range p.Roles {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Roles[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonFileSearchHTTPRequest struct {
+	Cursor            *string                                 `json:"cursor,omitempty"`
+	Directions        []PersonFileSearchHTTPRequestDirections `json:"directions,omitempty"`
+	FilenameQuery     *string                                 `json:"filename_query,omitempty"`
+	Limit             *int64                                  `json:"limit,omitempty" validate:"omitempty,gte=0,lte=500"`
+	MimeFamilies      []string                                `json:"mime_families,omitempty"`
+	Predicate         ExploreHTTPRequest                      `json:"predicate"`
+	Sort              FileSearchSort                          `json:"sort"`
+	VisualImageBase64 *string                                 `json:"visual_image_base64,omitempty"`
+	VisualQuery       *string                                 `json:"visual_query,omitempty"`
+}
+
+func (p PersonFileSearchHTTPRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Directions {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Directions[%d]", i), err)
+			}
+		}
+	}
+	if p.Limit != nil {
+		if err := typesValidator.Var(p.Limit, "omitempty,gte=0,lte=500"); err != nil {
+			errors = errors.Append("Limit", err)
+		}
+	}
+	if v, ok := any(p.Predicate).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Predicate", err)
+		}
+	}
+	if v, ok := any(p.Sort).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Sort", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonFileSearchHTTPResponse struct {
+	CacheRevision       string                `json:"cache_revision" validate:"required"`
+	CandidateSnapshotID *string               `json:"candidate_snapshot_id,omitempty"`
+	Files               []PersonFileSearchRow `json:"files,omitempty" validate:"required"`
+	NextCursor          *string               `json:"next_cursor,omitempty"`
+	SearchProvenance    SearchProvenance      `json:"search_provenance"`
+	TotalCount          int64                 `json:"total_count"`
+}
+
+func (p PersonFileSearchHTTPResponse) Validate() error {
 	var errors runtime.ValidationErrors
 	if err := typesValidator.Var(p.CacheRevision, "required"); err != nil {
 		errors = errors.Append("CacheRevision", err)
+	}
+	for i, item := range p.Files {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Files[%d]", i), err)
+			}
+		}
 	}
 	if v, ok := any(p.SearchProvenance).(runtime.Validator); ok {
 		if err := v.Validate(); err != nil {
 			errors = errors.Append("SearchProvenance", err)
 		}
 	}
-	if v, ok := any(p.Summary).(runtime.Validator); ok {
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonFileSearchRow struct {
+	ContainingTitle    string                          `json:"containing_title" validate:"required"`
+	ContentAvailable   bool                            `json:"content_available"`
+	ContentState       PersonFileSearchRowContentState `json:"content_state" validate:"required"`
+	ConversationID     int64                           `json:"conversation_id"`
+	EntryKey           string                          `json:"entry_key" validate:"required"`
+	Filename           *string                         `json:"filename,omitempty" validate:"required"`
+	ID                 int64                           `json:"id"`
+	Key                string                          `json:"key" validate:"required"`
+	MessageID          int64                           `json:"message_id"`
+	MimeFamily         string                          `json:"mime_family" validate:"required"`
+	MimeType           *string                         `json:"mime_type,omitempty" validate:"required"`
+	OccurredAt         time.Time                       `json:"occurred_at" validate:"required"`
+	ParticipantDomains []string                        `json:"participant_domains,omitempty"`
+	ParticipantIds     []int64                         `json:"participant_ids,omitempty"`
+	ParticipantLabels  []string                        `json:"participant_labels,omitempty"`
+	PersonProvenance   PersonFileProvenance            `json:"person_provenance"`
+	SearchExplain      *FileSearchExplain              `json:"search_explain,omitempty"`
+	SizeBytes          int64                           `json:"size_bytes"`
+	SourceID           int64                           `json:"source_id"`
+	SourceIdentifier   string                          `json:"source_identifier" validate:"required"`
+	SourceType         string                          `json:"source_type" validate:"required"`
+}
+
+func (p PersonFileSearchRow) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(p.ContainingTitle, "required"); err != nil {
+		errors = errors.Append("ContainingTitle", err)
+	}
+	if v, ok := any(p.ContentState).(runtime.Validator); ok {
 		if err := v.Validate(); err != nil {
-			errors = errors.Append("Summary", err)
+			errors = errors.Append("ContentState", err)
 		}
+	}
+	if err := typesValidator.Var(p.EntryKey, "required"); err != nil {
+		errors = errors.Append("EntryKey", err)
+	}
+	if err := typesValidator.Var(p.Filename, "required"); err != nil {
+		errors = errors.Append("Filename", err)
+	}
+	if err := typesValidator.Var(p.Key, "required"); err != nil {
+		errors = errors.Append("Key", err)
+	}
+	if err := typesValidator.Var(p.MimeFamily, "required"); err != nil {
+		errors = errors.Append("MimeFamily", err)
+	}
+	if err := typesValidator.Var(p.MimeType, "required"); err != nil {
+		errors = errors.Append("MimeType", err)
+	}
+	if err := typesValidator.Var(p.OccurredAt, "required"); err != nil {
+		errors = errors.Append("OccurredAt", err)
+	}
+	if v, ok := any(p.PersonProvenance).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("PersonProvenance", err)
+		}
+	}
+	if p.SearchExplain != nil {
+		if v, ok := any(p.SearchExplain).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("SearchExplain", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(p.SourceIdentifier, "required"); err != nil {
+		errors = errors.Append("SourceIdentifier", err)
+	}
+	if err := typesValidator.Var(p.SourceType, "required"); err != nil {
+		errors = errors.Append("SourceType", err)
 	}
 	if len(errors) == 0 {
 		return nil
@@ -2902,22 +6826,13 @@ func (p PersonIdentifier) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(p))
 }
 
-type PersonProfile struct {
-	DisplayName *string `json:"display_name,omitempty"`
-	ID          int64   `json:"id"`
-	Revision    int64   `json:"revision"`
+type PersonInboxResponse struct {
+	CacheRevision    string           `json:"cache_revision" validate:"required"`
+	IdentityRevision int64            `json:"identity_revision"`
+	Rows             []PersonInboxRow `json:"rows,omitempty" validate:"required"`
 }
 
-type PersonSearchHTTPResponse struct {
-	CacheRevision       string           `json:"cache_revision" validate:"required"`
-	CandidateSnapshotID *string          `json:"candidate_snapshot_id,omitempty"`
-	NextCursor          *string          `json:"next_cursor,omitempty"`
-	Rows                []PersonSummary  `json:"rows,omitempty" validate:"required"`
-	SearchProvenance    SearchProvenance `json:"search_provenance"`
-	TotalCount          int64            `json:"total_count"`
-}
-
-func (p PersonSearchHTTPResponse) Validate() error {
+func (p PersonInboxResponse) Validate() error {
 	var errors runtime.ValidationErrors
 	if err := typesValidator.Var(p.CacheRevision, "required"); err != nil {
 		errors = errors.Append("CacheRevision", err)
@@ -2929,9 +6844,858 @@ func (p PersonSearchHTTPResponse) Validate() error {
 			}
 		}
 	}
-	if v, ok := any(p.SearchProvenance).(runtime.Validator); ok {
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonInboxRow struct {
+	ConversationCount int64      `json:"conversation_count"`
+	LatestAt          time.Time  `json:"latest_at" validate:"required"`
+	LatestReceivedAt  *time.Time `json:"latest_received_at,omitempty"`
+	LatestSentAt      *time.Time `json:"latest_sent_at,omitempty"`
+	ReceivedCount     int64      `json:"received_count"`
+	SentCount         int64      `json:"sent_count"`
+	SourceID          int64      `json:"source_id"`
+	SourceIdentifier  string     `json:"source_identifier" validate:"required"`
+	SourceType        string     `json:"source_type" validate:"required"`
+}
+
+func (p PersonInboxRow) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type PersonMedia struct {
+	ByteSize      *int64        `json:"byte_size,omitempty"`
+	ContentHash   *string       `json:"content_hash,omitempty"`
+	Envelope      ValueEnvelope `json:"envelope"`
+	HasData       bool          `json:"has_data"`
+	MediaKind     string        `json:"media_kind" validate:"required"`
+	MediaType     *string       `json:"media_type,omitempty"`
+	OriginalValue string        `json:"original_value" validate:"required"`
+	PersonID      int64         `json:"person_id"`
+	URI           *string       `json:"uri,omitempty"`
+}
+
+func (p PersonMedia) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(p.Envelope).(runtime.Validator); ok {
 		if err := v.Validate(); err != nil {
-			errors = errors.Append("SearchProvenance", err)
+			errors = errors.Append("Envelope", err)
+		}
+	}
+	if err := typesValidator.Var(p.MediaKind, "required"); err != nil {
+		errors = errors.Append("MediaKind", err)
+	}
+	if err := typesValidator.Var(p.OriginalValue, "required"); err != nil {
+		errors = errors.Append("OriginalValue", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonMediaInputRequest struct {
+	Data          *string            `json:"data,omitempty"`
+	Envelope      ValueEnvelopeInput `json:"envelope"`
+	MediaKind     string             `json:"media_kind" validate:"required"`
+	MediaType     *string            `json:"media_type,omitempty"`
+	OriginalValue *string            `json:"original_value,omitempty"`
+	URI           *string            `json:"uri,omitempty"`
+}
+
+func (p PersonMediaInputRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(p.Envelope).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Envelope", err)
+		}
+	}
+	if err := typesValidator.Var(p.MediaKind, "required"); err != nil {
+		errors = errors.Append("MediaKind", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonMediaPatchRequest struct {
+	Add       []PersonMediaInputRequest `json:"add,omitempty"`
+	Supersede []int64                   `json:"supersede,omitempty"`
+}
+
+func (p PersonMediaPatchRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Add {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Add[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonMerge struct {
+	AbsorbedPersonID       int64     `json:"absorbed_person_id"`
+	AbsorbedRevisionBefore int64     `json:"absorbed_revision_before"`
+	AbsorbedVcardUID       string    `json:"absorbed_vcard_uid" validate:"required"`
+	Actor                  string    `json:"actor" validate:"required"`
+	CreatedAt              time.Time `json:"created_at" validate:"required"`
+	CurrentPersonID        *int64    `json:"current_person_id,omitempty"`
+	ID                     int64     `json:"id"`
+	SnapshotSha256         string    `json:"snapshot_sha256" validate:"required"`
+	SnapshotVersion        int64     `json:"snapshot_version"`
+	SurvivorPersonID       int64     `json:"survivor_person_id"`
+	SurvivorRevisionAfter  int64     `json:"survivor_revision_after"`
+	SurvivorRevisionBefore int64     `json:"survivor_revision_before"`
+	SurvivorVcardUID       string    `json:"survivor_vcard_uid" validate:"required"`
+}
+
+func (p PersonMerge) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type PersonMergeDetail struct {
+	Merge            PersonMerge                  `json:"merge"`
+	Participants     []PersonMergeParticipant     `json:"participants" validate:"required"`
+	ReviewCandidates []PersonMergeReviewCandidate `json:"review_candidates" validate:"required"`
+	Rows             []PersonMergeRow             `json:"rows" validate:"required"`
+	Splits           []PersonSplit                `json:"splits" validate:"required"`
+}
+
+func (p PersonMergeDetail) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(p.Merge).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Merge", err)
+		}
+	}
+	for i, item := range p.Participants {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Participants[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range p.ReviewCandidates {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("ReviewCandidates[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range p.Rows {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Rows[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range p.Splits {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Splits[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonMergeParticipant struct {
+	MergeID       int64  `json:"merge_id"`
+	OriginSide    string `json:"origin_side" validate:"required"`
+	ParticipantID int64  `json:"participant_id"`
+	SplitID       *int64 `json:"split_id,omitempty"`
+}
+
+func (p PersonMergeParticipant) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type PersonMergeProfile struct {
+	Etag   string `json:"etag" validate:"required"`
+	Person Person `json:"person"`
+}
+
+func (p PersonMergeProfile) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(p.Etag, "required"); err != nil {
+		errors = errors.Append("Etag", err)
+	}
+	if v, ok := any(p.Person).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Person", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonMergeRequiredError struct {
+	ErrorData string               `json:"error" validate:"required"`
+	Message   string               `json:"message" validate:"required"`
+	Profiles  []PersonMergeProfile `json:"profiles,omitempty" validate:"required"`
+}
+
+func (p PersonMergeRequiredError) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(p.ErrorData, "required"); err != nil {
+		errors = errors.Append("ErrorData", err)
+	}
+	if err := typesValidator.Var(p.Message, "required"); err != nil {
+		errors = errors.Append("Message", err)
+	}
+	for i, item := range p.Profiles {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Profiles[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonMergeResult struct {
+	CacheState       PersonMergeResultCacheState  `json:"cache_state" validate:"required"`
+	IdentityRevision int64                        `json:"identity_revision"`
+	Merge            PersonMerge                  `json:"merge"`
+	Person           Person                       `json:"person"`
+	ReviewCandidates []PersonMergeReviewCandidate `json:"review_candidates" validate:"required"`
+}
+
+func (p PersonMergeResult) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(p.CacheState).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("CacheState", err)
+		}
+	}
+	if v, ok := any(p.Merge).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Merge", err)
+		}
+	}
+	if v, ok := any(p.Person).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Person", err)
+		}
+	}
+	for i, item := range p.ReviewCandidates {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("ReviewCandidates[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonMergeReviewCandidate struct {
+	AbsorbedValueID   int64      `json:"absorbed_value_id"`
+	CreatedAt         time.Time  `json:"created_at" validate:"required"`
+	DefinitionID      int64      `json:"definition_id"`
+	ID                int64      `json:"id"`
+	MergeID           int64      `json:"merge_id"`
+	PersonID          int64      `json:"person_id"`
+	ResolutionValueID *int64     `json:"resolution_value_id,omitempty"`
+	ReviewedAt        *time.Time `json:"reviewed_at,omitempty"`
+	ReviewedBy        *string    `json:"reviewed_by,omitempty"`
+	State             string     `json:"state" validate:"required"`
+	SurvivorValueID   int64      `json:"survivor_value_id"`
+}
+
+func (p PersonMergeReviewCandidate) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type PersonMergeRow struct {
+	Action         string  `json:"action" validate:"required"`
+	CurrentRowID   *int64  `json:"current_row_id,omitempty"`
+	CurrentRowKey  *string `json:"current_row_key,omitempty"`
+	MergeID        int64   `json:"merge_id"`
+	OriginSide     string  `json:"origin_side" validate:"required"`
+	OriginalRowID  *int64  `json:"original_row_id,omitempty"`
+	OriginalRowKey string  `json:"original_row_key" validate:"required"`
+	ParticipantID  *int64  `json:"participant_id,omitempty"`
+	ProvenanceKind string  `json:"provenance_kind" validate:"required"`
+	SnapshotPath   string  `json:"snapshot_path" validate:"required"`
+	SplitID        *int64  `json:"split_id,omitempty"`
+	TableName      string  `json:"table_name" validate:"required"`
+}
+
+func (p PersonMergeRow) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type PersonMergeRowRef struct {
+	Action         string `json:"action" validate:"required"`
+	OriginalRowID  *int64 `json:"original_row_id,omitempty"`
+	OriginalRowKey string `json:"original_row_key" validate:"required"`
+	TableName      string `json:"table_name" validate:"required"`
+}
+
+func (p PersonMergeRowRef) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type PersonMergeSnapshotResponse struct {
+	Sha256   string          `json:"sha256" validate:"required"`
+	Snapshot json.RawMessage `json:"snapshot"`
+	Version  int64           `json:"version"`
+}
+
+func (p PersonMergeSnapshotResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(p.Sha256, "required"); err != nil {
+		errors = errors.Append("Sha256", err)
+	}
+	if v, ok := any(p.Snapshot).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Snapshot", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonMergeSummary struct {
+	Merge                 PersonMerge      `json:"merge"`
+	ParticipantCount      int64            `json:"participant_count"`
+	PendingCandidateCount int64            `json:"pending_candidate_count"`
+	RowActionCounts       map[string]int64 `json:"row_action_counts"`
+	RowCount              int64            `json:"row_count"`
+	SplitCount            int64            `json:"split_count"`
+}
+
+func (p PersonMergeSummary) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(p.Merge).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Merge", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonMergesResponse struct {
+	Limit  int64                `json:"limit"`
+	Merges []PersonMergeSummary `json:"merges,omitempty" validate:"required"`
+	Offset int64                `json:"offset"`
+}
+
+func (p PersonMergesResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Merges {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Merges[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonName struct {
+	AdditionalNames   *string       `json:"additional_names,omitempty"`
+	Envelope          ValueEnvelope `json:"envelope"`
+	FamilyName        *string       `json:"family_name,omitempty"`
+	Formatted         *string       `json:"formatted,omitempty"`
+	Generation        *string       `json:"generation,omitempty"`
+	GivenName         *string       `json:"given_name,omitempty"`
+	HonorificPrefixes *string       `json:"honorific_prefixes,omitempty"`
+	HonorificSuffixes *string       `json:"honorific_suffixes,omitempty"`
+	IsDerived         bool          `json:"is_derived"`
+	Language          *string       `json:"language,omitempty"`
+	NameKind          string        `json:"name_kind" validate:"required"`
+	OriginalValue     string        `json:"original_value" validate:"required"`
+	PersonID          int64         `json:"person_id"`
+	PhoneticScript    *string       `json:"phonetic_script,omitempty"`
+	PhoneticSystem    *string       `json:"phonetic_system,omitempty"`
+	Script            *string       `json:"script,omitempty"`
+	SecondarySurname  *string       `json:"secondary_surname,omitempty"`
+	SortAs            *string       `json:"sort_as,omitempty"`
+}
+
+func (p PersonName) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(p.Envelope).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Envelope", err)
+		}
+	}
+	if err := typesValidator.Var(p.NameKind, "required"); err != nil {
+		errors = errors.Append("NameKind", err)
+	}
+	if err := typesValidator.Var(p.OriginalValue, "required"); err != nil {
+		errors = errors.Append("OriginalValue", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonNameInputRequest struct {
+	AdditionalNames   *string            `json:"additional_names,omitempty"`
+	Envelope          ValueEnvelopeInput `json:"envelope"`
+	FamilyName        *string            `json:"family_name,omitempty"`
+	Formatted         *string            `json:"formatted,omitempty"`
+	Generation        *string            `json:"generation,omitempty"`
+	GivenName         *string            `json:"given_name,omitempty"`
+	HonorificPrefixes *string            `json:"honorific_prefixes,omitempty"`
+	HonorificSuffixes *string            `json:"honorific_suffixes,omitempty"`
+	IsDerived         *bool              `json:"is_derived,omitempty"`
+	Language          *string            `json:"language,omitempty"`
+	NameKind          string             `json:"name_kind" validate:"required"`
+	OriginalValue     *string            `json:"original_value,omitempty"`
+	PhoneticScript    *string            `json:"phonetic_script,omitempty"`
+	PhoneticSystem    *string            `json:"phonetic_system,omitempty"`
+	Script            *string            `json:"script,omitempty"`
+	SecondarySurname  *string            `json:"secondary_surname,omitempty"`
+	SortAs            *string            `json:"sort_as,omitempty"`
+}
+
+func (p PersonNameInputRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(p.Envelope).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Envelope", err)
+		}
+	}
+	if err := typesValidator.Var(p.NameKind, "required"); err != nil {
+		errors = errors.Append("NameKind", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonNamePatchRequest struct {
+	Add       []PersonNameInputRequest `json:"add,omitempty"`
+	Supersede []int64                  `json:"supersede,omitempty"`
+}
+
+func (p PersonNamePatchRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Add {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Add[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonProfile struct {
+	DisplayName *string `json:"display_name,omitempty"`
+	ID          int64   `json:"id"`
+	Revision    int64   `json:"revision"`
+}
+
+type PersonProfileHistory struct {
+	Addresses     []PersonAddress                 `json:"addresses,omitempty" validate:"required"`
+	Categories    []PersonCategory                `json:"categories,omitempty" validate:"required"`
+	ContactPoints []PersonContactPoint            `json:"contact_points,omitempty" validate:"required"`
+	Dates         []PersonDate                    `json:"dates,omitempty" validate:"required"`
+	Media         []PersonMedia                   `json:"media,omitempty" validate:"required"`
+	Names         []PersonName                    `json:"names,omitempty" validate:"required"`
+	Observations  []ParticipantContactObservation `json:"observations,omitempty" validate:"required"`
+	Person        Person                          `json:"person"`
+}
+
+func (p PersonProfileHistory) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Addresses {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Addresses[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range p.Categories {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Categories[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range p.ContactPoints {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("ContactPoints[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range p.Dates {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Dates[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range p.Media {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Media[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range p.Names {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Names[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range p.Observations {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Observations[%d]", i), err)
+			}
+		}
+	}
+	if v, ok := any(p.Person).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Person", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonProfilePatchRequest struct {
+	Addresses     *PersonAddressPatchRequest      `json:"addresses,omitempty"`
+	Categories    *PersonCategoryPatchRequest     `json:"categories,omitempty"`
+	ContactPoints *PersonContactPointPatchRequest `json:"contact_points,omitempty"`
+	Dates         *PersonDatePatchRequest         `json:"dates,omitempty"`
+	Media         *PersonMediaPatchRequest        `json:"media,omitempty"`
+	Names         *PersonNamePatchRequest         `json:"names,omitempty"`
+}
+
+func (p PersonProfilePatchRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	if p.Addresses != nil {
+		if v, ok := any(p.Addresses).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Addresses", err)
+			}
+		}
+	}
+	if p.Categories != nil {
+		if v, ok := any(p.Categories).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Categories", err)
+			}
+		}
+	}
+	if p.ContactPoints != nil {
+		if v, ok := any(p.ContactPoints).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("ContactPoints", err)
+			}
+		}
+	}
+	if p.Dates != nil {
+		if v, ok := any(p.Dates).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Dates", err)
+			}
+		}
+	}
+	if p.Media != nil {
+		if v, ok := any(p.Media).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Media", err)
+			}
+		}
+	}
+	if p.Names != nil {
+		if v, ok := any(p.Names).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Names", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonRelationship struct {
+	Confidence         *float64      `json:"confidence,omitempty"`
+	CreatedAt          time.Time     `json:"created_at" validate:"required"`
+	CreatedBy          string        `json:"created_by" validate:"required"`
+	EndDate            *PartialDate  `json:"end_date,omitempty"`
+	ForwardLabel       string        `json:"forward_label" validate:"required"`
+	ID                 int64         `json:"id"`
+	IsSymmetric        bool          `json:"is_symmetric"`
+	Notes              *string       `json:"notes,omitempty"`
+	RelationshipTypeID int64         `json:"relationship_type_id"`
+	ReverseLabel       string        `json:"reverse_label" validate:"required"`
+	Revision           int64         `json:"revision"`
+	Source             string        `json:"source" validate:"required"`
+	SourcePersonID     int64         `json:"source_person_id"`
+	SourceRef          *string       `json:"source_ref,omitempty"`
+	SourceResourceUID  *string       `json:"source_resource_uid,omitempty"`
+	StartDate          *PartialDate  `json:"start_date,omitempty"`
+	Status             string        `json:"status" validate:"required"`
+	TargetPersonID     int64         `json:"target_person_id"`
+	TypeSlug           string        `json:"type_slug" validate:"required"`
+	UpdatedAt          time.Time     `json:"updated_at" validate:"required"`
+	UpdatedBy          string        `json:"updated_by" validate:"required"`
+	VcardIdentity      VCardIdentity `json:"vcard_identity"`
+}
+
+func (p PersonRelationship) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(p.CreatedAt, "required"); err != nil {
+		errors = errors.Append("CreatedAt", err)
+	}
+	if err := typesValidator.Var(p.CreatedBy, "required"); err != nil {
+		errors = errors.Append("CreatedBy", err)
+	}
+	if p.EndDate != nil {
+		if v, ok := any(p.EndDate).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("EndDate", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(p.ForwardLabel, "required"); err != nil {
+		errors = errors.Append("ForwardLabel", err)
+	}
+	if err := typesValidator.Var(p.ReverseLabel, "required"); err != nil {
+		errors = errors.Append("ReverseLabel", err)
+	}
+	if err := typesValidator.Var(p.Source, "required"); err != nil {
+		errors = errors.Append("Source", err)
+	}
+	if p.StartDate != nil {
+		if v, ok := any(p.StartDate).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("StartDate", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(p.Status, "required"); err != nil {
+		errors = errors.Append("Status", err)
+	}
+	if err := typesValidator.Var(p.TypeSlug, "required"); err != nil {
+		errors = errors.Append("TypeSlug", err)
+	}
+	if err := typesValidator.Var(p.UpdatedAt, "required"); err != nil {
+		errors = errors.Append("UpdatedAt", err)
+	}
+	if err := typesValidator.Var(p.UpdatedBy, "required"); err != nil {
+		errors = errors.Append("UpdatedBy", err)
+	}
+	if v, ok := any(p.VcardIdentity).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("VcardIdentity", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonRelationshipView struct {
+	CounterpartDisplayName *string            `json:"counterpart_display_name,omitempty"`
+	CounterpartLabel       string             `json:"counterpart_label" validate:"required"`
+	CounterpartPersonID    int64              `json:"counterpart_person_id"`
+	CounterpartVcardUID    string             `json:"counterpart_vcard_uid" validate:"required"`
+	Direction              string             `json:"direction" validate:"required"`
+	Relationship           PersonRelationship `json:"relationship"`
+}
+
+func (p PersonRelationshipView) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(p.CounterpartLabel, "required"); err != nil {
+		errors = errors.Append("CounterpartLabel", err)
+	}
+	if err := typesValidator.Var(p.CounterpartVcardUID, "required"); err != nil {
+		errors = errors.Append("CounterpartVcardUID", err)
+	}
+	if err := typesValidator.Var(p.Direction, "required"); err != nil {
+		errors = errors.Append("Direction", err)
+	}
+	if v, ok := any(p.Relationship).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Relationship", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonRelationshipsResponse struct {
+	Relationships []PersonRelationshipView `json:"relationships,omitempty" validate:"required"`
+}
+
+func (p PersonRelationshipsResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Relationships {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Relationships[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonSearchRequest struct {
+	Limit *int64 `json:"limit,omitempty" validate:"omitempty,gte=0,lte=100"`
+	Query string `json:"query" validate:"required,min=1"`
+}
+
+func (p PersonSearchRequest) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type PersonSearchResponse struct {
+	Results []PersonSearchResult `json:"results" validate:"required"`
+}
+
+func (p PersonSearchResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Results {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Results[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonSearchResult struct {
+	Person Person  `json:"person"`
+	Score  float64 `json:"score"`
+}
+
+func (p PersonSearchResult) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(p.Person).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Person", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type PersonSplit struct {
+	Actor                string    `json:"actor" validate:"required"`
+	CreatedAt            time.Time `json:"created_at" validate:"required"`
+	ExactReversal        bool      `json:"exact_reversal"`
+	ID                   int64     `json:"id"`
+	MergeID              int64     `json:"merge_id"`
+	NewPersonID          int64     `json:"new_person_id"`
+	NewPersonUID         string    `json:"new_person_uid" validate:"required"`
+	SourcePersonID       int64     `json:"source_person_id"`
+	SourceRevisionAfter  int64     `json:"source_revision_after"`
+	SourceRevisionBefore int64     `json:"source_revision_before"`
+}
+
+func (p PersonSplit) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type PersonSplitResult struct {
+	AmbiguousRows       []PersonMergeRowRef         `json:"ambiguous_rows" validate:"required"`
+	CacheState          PersonSplitResultCacheState `json:"cache_state" validate:"required"`
+	ExactReversal       bool                        `json:"exact_reversal"`
+	IdentityRevision    int64                       `json:"identity_revision"`
+	NewPerson           Person                      `json:"new_person"`
+	SourcePerson        Person                      `json:"source_person"`
+	Split               PersonSplit                 `json:"split"`
+	UIDAliasDisposition string                      `json:"uid_alias_disposition" validate:"required"`
+	UnrestoredRows      []PersonMergeRowRef         `json:"unrestored_rows,omitempty" validate:"required"`
+}
+
+func (p PersonSplitResult) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.AmbiguousRows {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("AmbiguousRows[%d]", i), err)
+			}
+		}
+	}
+	if v, ok := any(p.CacheState).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("CacheState", err)
+		}
+	}
+	if v, ok := any(p.NewPerson).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("NewPerson", err)
+		}
+	}
+	if v, ok := any(p.SourcePerson).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("SourcePerson", err)
+		}
+	}
+	if v, ok := any(p.Split).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Split", err)
+		}
+	}
+	if err := typesValidator.Var(p.UIDAliasDisposition, "required"); err != nil {
+		errors = errors.Append("UIDAliasDisposition", err)
+	}
+	for i, item := range p.UnrestoredRows {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("UnrestoredRows[%d]", i), err)
+			}
 		}
 	}
 	if len(errors) == 0 {
@@ -2941,19 +7705,23 @@ func (p PersonSearchHTTPResponse) Validate() error {
 }
 
 type PersonSummary struct {
-	ActivityCount int64              `json:"activity_count"`
-	CacheRevision string             `json:"cache_revision" validate:"required"`
-	Cluster       *PersonCluster     `json:"cluster,omitempty"`
-	DisplayLabel  string             `json:"display_label" validate:"required"`
-	DisplayName   *string            `json:"display_name,omitempty"`
-	FileCount     int64              `json:"file_count"`
-	FirstAt       time.Time          `json:"first_at" validate:"required"`
-	ID            int64              `json:"id"`
-	Identifiers   []PersonIdentifier `json:"identifiers,omitempty" validate:"required"`
-	LastAt        time.Time          `json:"last_at" validate:"required"`
-	PartialLabel  bool               `json:"partial_label"`
-	Profile       *PersonProfile     `json:"profile,omitempty"`
-	SourceCounts  []SourceCount      `json:"source_counts,omitempty" validate:"required"`
+	ActivityCount                  int64              `json:"activity_count"`
+	CacheRevision                  string             `json:"cache_revision" validate:"required"`
+	Cluster                        *PersonCluster     `json:"cluster,omitempty"`
+	CurrentRelationshipTemperature int64              `json:"current_relationship_temperature"`
+	DisplayLabel                   string             `json:"display_label" validate:"required"`
+	DisplayName                    *string            `json:"display_name,omitempty"`
+	FileCount                      int64              `json:"file_count"`
+	FirstAt                        time.Time          `json:"first_at" validate:"required"`
+	ID                             int64              `json:"id"`
+	Identifiers                    []PersonIdentifier `json:"identifiers,omitempty" validate:"required"`
+	LastAt                         time.Time          `json:"last_at" validate:"required"`
+	MeetingCount                   int64              `json:"meeting_count"`
+	PartialLabel                   bool               `json:"partial_label"`
+	PeakRelationshipTemperature    int64              `json:"peak_relationship_temperature"`
+	PeakRelationshipYear           int64              `json:"peak_relationship_year"`
+	Profile                        *PersonProfile     `json:"profile,omitempty"`
+	SourceCounts                   []SourceCount      `json:"source_counts,omitempty" validate:"required"`
 }
 
 func (p PersonSummary) Validate() error {
@@ -3004,17 +7772,28 @@ func (p PersonSummary) Validate() error {
 	return errors
 }
 
-type PersonsResponse struct {
-	Persons []Person `json:"persons,omitempty" validate:"required"`
+type PersonTracking struct {
+	PersonID  int64      `json:"person_id"`
+	Tracked   bool       `json:"tracked"`
+	TrackedAt *time.Time `json:"tracked_at" validate:"omitempty"`
 }
 
-func (p PersonsResponse) Validate() error {
+func (p PersonTracking) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type PinState struct {
+	Actor   *string   `json:"actor,omitempty"`
+	EventID *int64    `json:"event_id,omitempty"`
+	Pinned  bool      `json:"pinned"`
+	Target  TargetRef `json:"target"`
+}
+
+func (p PinState) Validate() error {
 	var errors runtime.ValidationErrors
-	for i, item := range p.Persons {
-		if v, ok := any(item).(runtime.Validator); ok {
-			if err := v.Validate(); err != nil {
-				errors = errors.Append(fmt.Sprintf("Persons[%d]", i), err)
-			}
+	if v, ok := any(p.Target).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Target", err)
 		}
 	}
 	if len(errors) == 0 {
@@ -3035,6 +7814,57 @@ type Progress struct {
 	Total int64 `json:"total"`
 }
 
+type ProjectionRef struct {
+	Kind  string `json:"kind" validate:"required"`
+	RowID int64  `json:"row_id"`
+}
+
+func (p ProjectionRef) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type Provenance struct {
+	Directions     []ProvenanceDirections `json:"directions,omitempty" validate:"required"`
+	ParticipantIds []int64                `json:"participant_ids,omitempty" validate:"required"`
+	Roles          []ProvenanceRoles      `json:"roles,omitempty" validate:"required"`
+}
+
+func (p Provenance) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range p.Directions {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Directions[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(p.ParticipantIds, "required"); err != nil {
+		errors = errors.Append("ParticipantIds", err)
+	}
+	for i, item := range p.Roles {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Roles[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type ProviderUsage struct {
+	BilledUnits    float64 `json:"billed_units"`
+	InputBytes     int64   `json:"input_bytes"`
+	Requests       int64   `json:"requests"`
+	UsageAvailable bool    `json:"usage_available"`
+}
+
+type PutPersonTrackingRequest struct {
+	Tracked bool `json:"tracked"`
+}
+
 type QueryRequest struct {
 	SQL string `json:"sql" validate:"required"`
 }
@@ -3051,6 +7881,187 @@ type QueryResult struct {
 
 func (q QueryResult) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(q))
+}
+
+type RejectedCandidate struct {
+	Identifier string `json:"identifier" validate:"required"`
+	Reason     string `json:"reason" validate:"required"`
+}
+
+func (r RejectedCandidate) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(r))
+}
+
+type RelationshipCalendarDay struct {
+	Chat         int64                        `json:"chat"`
+	Date         string                       `json:"date" validate:"required"`
+	Email        int64                        `json:"email"`
+	Level        RelationshipCalendarDayLevel `json:"level" validate:"required"`
+	Meetings     int64                        `json:"meetings"`
+	ModalityMask int32                        `json:"modality_mask" validate:"gte=0"`
+	Received     int64                        `json:"received"`
+	Sent         int64                        `json:"sent"`
+	Total        int64                        `json:"total"`
+}
+
+func (r RelationshipCalendarDay) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(r.Date, "required"); err != nil {
+		errors = errors.Append("Date", err)
+	}
+	if v, ok := any(r.Level).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Level", err)
+		}
+	}
+	if err := typesValidator.Var(r.ModalityMask, "gte=0"); err != nil {
+		errors = errors.Append("ModalityMask", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type RelationshipCalendarHTTPRequest struct {
+	Timezone *string `json:"timezone,omitempty"`
+	Year     int64   `json:"year" validate:"gte=1970"`
+}
+
+func (r RelationshipCalendarHTTPRequest) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(r))
+}
+
+type RelationshipCalendarHTTPResponse struct {
+	Annual           []AnnualTemperatureSummary `json:"annual,omitempty" validate:"required"`
+	CacheRevision    string                     `json:"cache_revision" validate:"required"`
+	CanonicalID      int64                      `json:"canonical_id"`
+	Current          TemperatureSummary         `json:"current"`
+	Days             []RelationshipCalendarDay  `json:"days,omitempty" validate:"required"`
+	EffectiveDate    string                     `json:"effective_date" validate:"required"`
+	IdentityRevision int64                      `json:"identity_revision"`
+	ParticipantID    int64                      `json:"participant_id"`
+	PeakTemperature  int64                      `json:"peak_temperature"`
+	PeakYear         int64                      `json:"peak_year"`
+	ScoreVersion     int64                      `json:"score_version"`
+	ScoringTimezone  string                     `json:"scoring_timezone" validate:"required"`
+	Timezone         string                     `json:"timezone" validate:"required"`
+	Year             int64                      `json:"year"`
+}
+
+func (r RelationshipCalendarHTTPResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range r.Annual {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Annual[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(r.CacheRevision, "required"); err != nil {
+		errors = errors.Append("CacheRevision", err)
+	}
+	if v, ok := any(r.Current).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Current", err)
+		}
+	}
+	for i, item := range r.Days {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Days[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(r.EffectiveDate, "required"); err != nil {
+		errors = errors.Append("EffectiveDate", err)
+	}
+	if err := typesValidator.Var(r.ScoringTimezone, "required"); err != nil {
+		errors = errors.Append("ScoringTimezone", err)
+	}
+	if err := typesValidator.Var(r.Timezone, "required"); err != nil {
+		errors = errors.Append("Timezone", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type RelationshipReview struct {
+	AcceptedRelationshipID *int64        `json:"accepted_relationship_id,omitempty"`
+	CreatedAt              time.Time     `json:"created_at" validate:"required"`
+	CreatedBy              string        `json:"created_by" validate:"required"`
+	ID                     int64         `json:"id"`
+	MatchedPersonID        *int64        `json:"matched_person_id,omitempty"`
+	PersonID               int64         `json:"person_id"`
+	RawRelatedType         string        `json:"raw_related_type" validate:"required"`
+	RawRelatedValue        string        `json:"raw_related_value" validate:"required"`
+	ReviewedAt             *time.Time    `json:"reviewed_at,omitempty"`
+	ReviewedBy             *string       `json:"reviewed_by,omitempty"`
+	Source                 string        `json:"source" validate:"required"`
+	SourceRef              *string       `json:"source_ref,omitempty"`
+	SourceResourceUID      *string       `json:"source_resource_uid,omitempty"`
+	Status                 string        `json:"status" validate:"required"`
+	UpdatedAt              time.Time     `json:"updated_at" validate:"required"`
+	ValueKind              string        `json:"value_kind" validate:"required"`
+	VcardIdentity          VCardIdentity `json:"vcard_identity"`
+}
+
+func (r RelationshipReview) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(r.CreatedAt, "required"); err != nil {
+		errors = errors.Append("CreatedAt", err)
+	}
+	if err := typesValidator.Var(r.CreatedBy, "required"); err != nil {
+		errors = errors.Append("CreatedBy", err)
+	}
+	if err := typesValidator.Var(r.RawRelatedType, "required"); err != nil {
+		errors = errors.Append("RawRelatedType", err)
+	}
+	if err := typesValidator.Var(r.RawRelatedValue, "required"); err != nil {
+		errors = errors.Append("RawRelatedValue", err)
+	}
+	if err := typesValidator.Var(r.Source, "required"); err != nil {
+		errors = errors.Append("Source", err)
+	}
+	if err := typesValidator.Var(r.Status, "required"); err != nil {
+		errors = errors.Append("Status", err)
+	}
+	if err := typesValidator.Var(r.UpdatedAt, "required"); err != nil {
+		errors = errors.Append("UpdatedAt", err)
+	}
+	if err := typesValidator.Var(r.ValueKind, "required"); err != nil {
+		errors = errors.Append("ValueKind", err)
+	}
+	if v, ok := any(r.VcardIdentity).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("VcardIdentity", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type RelationshipReviewsResponse struct {
+	Reviews []RelationshipReview `json:"reviews,omitempty" validate:"required"`
+}
+
+func (r RelationshipReviewsResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range r.Reviews {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Reviews[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
 }
 
 type RelationshipRow struct {
@@ -3152,6 +8163,49 @@ func (r RelationshipTimelineHTTPResponse) Validate() error {
 	return errors
 }
 
+type RelationshipType struct {
+	Color            *string   `json:"color,omitempty"`
+	CreatedAt        time.Time `json:"created_at" validate:"required"`
+	Description      *string   `json:"description,omitempty"`
+	ForwardLabel     string    `json:"forward_label" validate:"required"`
+	Icon             *string   `json:"icon,omitempty"`
+	ID               int64     `json:"id"`
+	InverseTypeID    *int64    `json:"inverse_type_id,omitempty"`
+	IsCanonical      bool      `json:"is_canonical"`
+	IsDeletable      bool      `json:"is_deletable"`
+	IsSymmetric      bool      `json:"is_symmetric"`
+	Ownership        string    `json:"ownership" validate:"required"`
+	ReverseLabel     string    `json:"reverse_label" validate:"required"`
+	Revision         int64     `json:"revision"`
+	Slug             string    `json:"slug" validate:"required"`
+	UniversalID      string    `json:"universal_id" validate:"required"`
+	UpdatedAt        time.Time `json:"updated_at" validate:"required"`
+	VcardRelatedType *string   `json:"vcard_related_type,omitempty"`
+}
+
+func (r RelationshipType) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(r))
+}
+
+type RelationshipTypesResponse struct {
+	RelationshipTypes []RelationshipType `json:"relationship_types,omitempty" validate:"required"`
+}
+
+func (r RelationshipTypesResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range r.RelationshipTypes {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("RelationshipTypes[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
 type RelationshipsHTTPRequest struct {
 	Cursor  *string         `json:"cursor,omitempty"`
 	Filters []ExploreFilter `json:"filters,omitempty"`
@@ -3215,8 +8269,9 @@ func (r RemoteImageRequest) Validate() error {
 }
 
 type RemoveRequest struct {
-	Account    string `json:"account" validate:"required"`
-	Identifier string `json:"identifier" validate:"required"`
+	Account    *string `json:"account,omitempty"`
+	Identifier string  `json:"identifier" validate:"required"`
+	SourceID   *int64  `json:"source_id,omitempty"`
 }
 
 func (r RemoveRequest) Validate() error {
@@ -3496,6 +8551,41 @@ type SearchProvenance struct {
 	VectorGeneration     *int64  `json:"vector_generation,omitempty"`
 }
 
+type SearchResponse struct {
+	GenerationID int64                    `json:"generation_id"`
+	Model        string                   `json:"model" validate:"required"`
+	NextCursor   *string                  `json:"next_cursor,omitempty"`
+	QueryMode    string                   `json:"query_mode" validate:"required"`
+	Results      []AttachmentSearchResult `json:"results,omitempty" validate:"required"`
+	Usage        Usage                    `json:"usage"`
+}
+
+func (s SearchResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(s.Model, "required"); err != nil {
+		errors = errors.Append("Model", err)
+	}
+	if err := typesValidator.Var(s.QueryMode, "required"); err != nil {
+		errors = errors.Append("QueryMode", err)
+	}
+	for i, item := range s.Results {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Results[%d]", i), err)
+			}
+		}
+	}
+	if v, ok := any(s.Usage).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Usage", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
 type SearchResult struct {
 	Messages []MessageSummary `json:"messages,omitempty" validate:"required"`
 	Page     int64            `json:"page"`
@@ -3579,6 +8669,77 @@ func (s SessionStatus) Validate() error {
 		return nil
 	}
 	return errors
+}
+
+type SetOrganizationAttributeBody struct {
+	ActiveFrom      *time.Time                         `json:"active_from,omitempty"`
+	ActiveUntil     *time.Time                         `json:"active_until,omitempty"`
+	Actor           *string                            `json:"actor,omitempty"`
+	Confidence      *float64                           `json:"confidence,omitempty"`
+	DefinitionSlug  string                             `json:"definition_slug" validate:"required"`
+	DryRun          *bool                              `json:"dry_run,omitempty"`
+	ExpectedValueID *int64                             `json:"expected_value_id,omitempty"`
+	Ordinal         *int64                             `json:"ordinal,omitempty"`
+	Source          SetOrganizationAttributeBodySource `json:"source" validate:"required"`
+	SourceRef       *string                            `json:"source_ref,omitempty"`
+	Value           AttributeValue                     `json:"value"`
+}
+
+func (s SetOrganizationAttributeBody) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(s.DefinitionSlug, "required"); err != nil {
+		errors = errors.Append("DefinitionSlug", err)
+	}
+	if v, ok := any(s.Source).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Source", err)
+		}
+	}
+	if v, ok := any(s.Value).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Value", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type SetPersonAttributeRequest struct {
+	ActiveFrom      *time.Time                       `json:"active_from,omitempty"`
+	ActiveUntil     *time.Time                       `json:"active_until,omitempty"`
+	Actor           *string                          `json:"actor,omitempty"`
+	Confidence      *float64                         `json:"confidence,omitempty"`
+	ExpectedValueID *int64                           `json:"expected_value_id,omitempty"`
+	Ordinal         *int64                           `json:"ordinal,omitempty"`
+	Source          *SetPersonAttributeRequestSource `json:"source,omitempty"`
+	SourceRef       *string                          `json:"source_ref,omitempty"`
+	Value           AttributeValue                   `json:"value"`
+}
+
+func (s SetPersonAttributeRequest) Validate() error {
+	var errors runtime.ValidationErrors
+	if s.Source != nil {
+		if v, ok := any(s.Source).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Source", err)
+			}
+		}
+	}
+	if v, ok := any(s.Value).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Value", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type SetPersonFactPinRequest struct {
+	Pinned bool `json:"pinned"`
 }
 
 type Setting struct {
@@ -3798,6 +8959,50 @@ func (s SourceCount) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(s))
 }
 
+type SourceIdentitiesResponse struct {
+	Account    string                   `json:"account" validate:"required"`
+	Identities []SourceIdentityResponse `json:"identities" validate:"required"`
+	SourceID   int64                    `json:"source_id"`
+}
+
+func (s SourceIdentitiesResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(s.Account, "required"); err != nil {
+		errors = errors.Append("Account", err)
+	}
+	for i, item := range s.Identities {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Identities[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type SourceIdentityResponse struct {
+	ConfirmedAt time.Time `json:"confirmed_at" validate:"required"`
+	Identifier  string    `json:"identifier" validate:"required"`
+	Signals     []string  `json:"signals" validate:"required"`
+}
+
+func (s SourceIdentityResponse) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(s))
+}
+
+type SourceReference struct {
+	ID         int64  `json:"id"`
+	Identifier string `json:"identifier" validate:"required"`
+	Type       string `json:"type" validate:"required"`
+}
+
+func (s SourceReference) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(s))
+}
+
 type SourceStatus struct {
 	ActiveSync            *SyncRunStatus `json:"active_sync,omitempty"`
 	CanSync               bool           `json:"can_sync"`
@@ -3896,6 +9101,15 @@ func (s SourcesRequest) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(s))
 }
 
+type SplitPersonRequest struct {
+	MergeID        int64   `json:"merge_id"`
+	ParticipantIds []int64 `json:"participant_ids,omitempty" validate:"required"`
+}
+
+func (s SplitPersonRequest) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(s))
+}
+
 type StageDeletionFilter struct {
 	After         *string `json:"after,omitempty"`
 	Before        *string `json:"before,omitempty"`
@@ -3940,25 +9154,44 @@ func (s StageDeletionRequest) Validate() error {
 }
 
 type StageDeletionResponse struct {
-	Account        *string  `json:"account,omitempty"`
-	DryRun         bool     `json:"dry_run"`
-	ID             *string  `json:"id,omitempty"`
-	MessageCount   int64    `json:"message_count"`
-	SampleGmailIds []string `json:"sample_gmail_ids,omitempty"`
-	Status         *string  `json:"status,omitempty"`
+	Account        *string          `json:"account,omitempty"`
+	DryRun         bool             `json:"dry_run"`
+	ID             *string          `json:"id,omitempty"`
+	MessageCount   int64            `json:"message_count"`
+	SampleGmailIds []string         `json:"sample_gmail_ids,omitempty"`
+	Source         *SourceReference `json:"source,omitempty"`
+	Status         *string          `json:"status,omitempty"`
+}
+
+func (s StageDeletionResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if s.Source != nil {
+		if v, ok := any(s.Source).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Source", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
 }
 
 type StatsResponse struct {
-	ActiveMessages        int64      `json:"active_messages"`
-	DatabaseSizeBytes     int64      `json:"database_size_bytes"`
-	SourceDeletedMessages int64      `json:"source_deleted_messages"`
-	TotalAccounts         int64      `json:"total_accounts"`
-	TotalAttachments      int64      `json:"total_attachments"`
-	TotalLabels           int64      `json:"total_labels"`
-	TotalMessages         int64      `json:"total_messages"`
-	TotalThreads          int64      `json:"total_threads"`
-	VectorSearch          *StatsView `json:"vector_search,omitempty"`
-	VectorStatus          *string    `json:"vector_status,omitempty"`
+	ActiveMessages         int64      `json:"active_messages"`
+	DatabaseSizeBytes      int64      `json:"database_size_bytes"`
+	SourceDeletedMessages  int64      `json:"source_deleted_messages"`
+	TotalAccounts          int64      `json:"total_accounts"`
+	TotalAttachments       int64      `json:"total_attachments"`
+	TotalLabels            int64      `json:"total_labels"`
+	TotalMessages          int64      `json:"total_messages"`
+	TotalThreads           int64      `json:"total_threads"`
+	VectorSearch           *StatsView `json:"vector_search,omitempty"`
+	VectorStatus           *string    `json:"vector_status,omitempty"`
+	VectorTextMessageTypes []string   `json:"vector_text_message_types,omitempty"`
+	VectorTextStatus       *string    `json:"vector_text_status,omitempty"`
+	VectorVisualStatus     *string    `json:"vector_visual_status,omitempty"`
 }
 
 func (s StatsResponse) Validate() error {
@@ -3981,6 +9214,7 @@ type StatsView struct {
 	BuildingGeneration     *BuildingSummary  `json:"building_generation,omitempty"`
 	Enabled                bool              `json:"enabled"`
 	MissingEmbeddingsTotal int64             `json:"missing_embeddings_total"`
+	PersonCoverageRejected int64             `json:"person_coverage_rejected"`
 }
 
 func (s StatsView) Validate() error {
@@ -4003,6 +9237,59 @@ func (s StatsView) Validate() error {
 	return errors
 }
 
+type Status struct {
+	ActiveLeases           int64             `json:"active_leases"`
+	Converged              int64             `json:"converged"`
+	ConvergenceRatio       float64           `json:"convergence_ratio"`
+	ConvergenceTotal       int64             `json:"convergence_total"`
+	Current                int64             `json:"current"`
+	DuplicateCost          DuplicateCostRisk `json:"duplicate_cost"`
+	Eligible               int64             `json:"eligible"`
+	Formats                []FormatCoverage  `json:"formats,omitempty" validate:"required"`
+	Generation             VisualGeneration  `json:"generation"`
+	JournalCursor          int64             `json:"journal_cursor"`
+	JournalHighWater       int64             `json:"journal_high_water"`
+	JournalLag             int64             `json:"journal_lag"`
+	ReconciliationComplete bool              `json:"reconciliation_complete"`
+	Retryable              int64             `json:"retryable"`
+	Stale                  int64             `json:"stale"`
+	Terminal               int64             `json:"terminal"`
+	Tombstoned             int64             `json:"tombstoned"`
+	Unavailable            int64             `json:"unavailable"`
+	UnknownRole            int64             `json:"unknown_role"`
+	Usage                  ProviderUsage     `json:"usage"`
+}
+
+func (s Status) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(s.DuplicateCost).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("DuplicateCost", err)
+		}
+	}
+	for i, item := range s.Formats {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Formats[%d]", i), err)
+			}
+		}
+	}
+	if v, ok := any(s.Generation).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Generation", err)
+		}
+	}
+	if v, ok := any(s.Usage).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Usage", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
 type StatusMessageResponse struct {
 	Message string `json:"message" validate:"required"`
 	Status  string `json:"status" validate:"required"`
@@ -4010,6 +9297,71 @@ type StatusMessageResponse struct {
 
 func (s StatusMessageResponse) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(s))
+}
+
+type StructuredPersonProfile struct {
+	Addresses     []PersonAddress      `json:"addresses,omitempty" validate:"required"`
+	Categories    []PersonCategory     `json:"categories,omitempty" validate:"required"`
+	ContactPoints []PersonContactPoint `json:"contact_points,omitempty" validate:"required"`
+	Dates         []PersonDate         `json:"dates,omitempty" validate:"required"`
+	Media         []PersonMedia        `json:"media,omitempty" validate:"required"`
+	Names         []PersonName         `json:"names,omitempty" validate:"required"`
+	Person        Person               `json:"person"`
+}
+
+func (s StructuredPersonProfile) Validate() error {
+	var errors runtime.ValidationErrors
+	for i, item := range s.Addresses {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Addresses[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range s.Categories {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Categories[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range s.ContactPoints {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("ContactPoints[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range s.Dates {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Dates[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range s.Media {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Media[%d]", i), err)
+			}
+		}
+	}
+	for i, item := range s.Names {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Names[%d]", i), err)
+			}
+		}
+	}
+	if v, ok := any(s.Person).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Person", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
 }
 
 type Summary struct {
@@ -4039,6 +9391,13 @@ func (s Summary) Validate() error {
 		return nil
 	}
 	return errors
+}
+
+type SyncResult struct {
+	Books   int64 `json:"books"`
+	Created int64 `json:"created"`
+	Removed int64 `json:"removed"`
+	Updated int64 `json:"updated"`
 }
 
 type SyncRunItemStatus struct {
@@ -4109,6 +9468,78 @@ func (s SyncRunStatus) Validate() error {
 		return nil
 	}
 	return errors
+}
+
+type TargetDescriptor struct {
+	Cardinality  string             `json:"cardinality" validate:"required"`
+	Choices      []ChoiceDescriptor `json:"choices,omitempty" validate:"required"`
+	Description  string             `json:"description" validate:"required"`
+	Fields       []FieldDescriptor  `json:"fields,omitempty" validate:"required"`
+	Key          string             `json:"key" validate:"required"`
+	Kind         string             `json:"kind" validate:"required"`
+	MaxLength    *int64             `json:"max_length,omitempty"`
+	RecordTarget *string            `json:"record_target,omitempty"`
+	Revision     string             `json:"revision" validate:"required"`
+	Sensitive    bool               `json:"sensitive"`
+	Slug         string             `json:"slug" validate:"required"`
+	UniversalID  string             `json:"universal_id" validate:"required"`
+	ValueType    string             `json:"value_type" validate:"required"`
+}
+
+func (t TargetDescriptor) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(t.Cardinality, "required"); err != nil {
+		errors = errors.Append("Cardinality", err)
+	}
+	for i, item := range t.Choices {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Choices[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(t.Description, "required"); err != nil {
+		errors = errors.Append("Description", err)
+	}
+	for i, item := range t.Fields {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Fields[%d]", i), err)
+			}
+		}
+	}
+	if err := typesValidator.Var(t.Key, "required"); err != nil {
+		errors = errors.Append("Key", err)
+	}
+	if err := typesValidator.Var(t.Kind, "required"); err != nil {
+		errors = errors.Append("Kind", err)
+	}
+	if err := typesValidator.Var(t.Revision, "required"); err != nil {
+		errors = errors.Append("Revision", err)
+	}
+	if err := typesValidator.Var(t.Slug, "required"); err != nil {
+		errors = errors.Append("Slug", err)
+	}
+	if err := typesValidator.Var(t.UniversalID, "required"); err != nil {
+		errors = errors.Append("UniversalID", err)
+	}
+	if err := typesValidator.Var(t.ValueType, "required"); err != nil {
+		errors = errors.Append("ValueType", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type TargetRef struct {
+	Key      string `json:"key" validate:"required"`
+	Kind     string `json:"kind" validate:"required"`
+	Revision string `json:"revision" validate:"required"`
+}
+
+func (t TargetRef) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(t))
 }
 
 type TaskIntegrationStatusResponse struct {
@@ -4266,6 +9697,34 @@ func (t TaskSummary) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(t))
 }
 
+type TemperatureSignals struct {
+	MeetingSignal  float64 `json:"meeting_signal"`
+	Modalities     int64   `json:"modalities"`
+	ReceivedVolume float64 `json:"received_volume"`
+	SentSignal     float64 `json:"sent_signal"`
+}
+
+type TemperatureSummary struct {
+	Population  int64              `json:"population"`
+	Rank        int64              `json:"rank"`
+	RawScore    float64            `json:"raw_score"`
+	Signals     TemperatureSignals `json:"signals"`
+	Temperature int64              `json:"temperature"`
+}
+
+func (t TemperatureSummary) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(t.Signals).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Signals", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
 type TextConversationRow struct {
 	ConversationID   int64   `json:"conversation_id"`
 	LastMessageAt    *string `json:"last_message_at,omitempty"`
@@ -4281,6 +9740,7 @@ func (t TextConversationRow) Validate() error {
 }
 
 type TextConversationsResponse struct {
+	CacheRevision string                `json:"cache_revision" validate:"required"`
 	Conversations []TextConversationRow `json:"conversations,omitempty" validate:"required"`
 	Count         int64                 `json:"count"`
 	HasMore       bool                  `json:"has_more"`
@@ -4290,6 +9750,9 @@ type TextConversationsResponse struct {
 
 func (t TextConversationsResponse) Validate() error {
 	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(t.CacheRevision, "required"); err != nil {
+		errors = errors.Append("CacheRevision", err)
+	}
 	for i, item := range t.Conversations {
 		if v, ok := any(item).(runtime.Validator); ok {
 			if err := v.Validate(); err != nil {
@@ -4304,6 +9767,33 @@ func (t TextConversationsResponse) Validate() error {
 }
 
 type TextMessagesResponse struct {
+	CacheRevision string                   `json:"cache_revision" validate:"required"`
+	Count         int64                    `json:"count"`
+	HasMore       bool                     `json:"has_more"`
+	Limit         int64                    `json:"limit"`
+	Messages      []CLIQueryMessageSummary `json:"messages,omitempty" validate:"required"`
+	Offset        int64                    `json:"offset"`
+}
+
+func (t TextMessagesResponse) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(t.CacheRevision, "required"); err != nil {
+		errors = errors.Append("CacheRevision", err)
+	}
+	for i, item := range t.Messages {
+		if v, ok := any(item).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append(fmt.Sprintf("Messages[%d]", i), err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type TextSearchResponse struct {
 	Count    int64                    `json:"count"`
 	HasMore  bool                     `json:"has_more"`
 	Limit    int64                    `json:"limit"`
@@ -4311,7 +9801,7 @@ type TextMessagesResponse struct {
 	Offset   int64                    `json:"offset"`
 }
 
-func (t TextMessagesResponse) Validate() error {
+func (t TextSearchResponse) Validate() error {
 	var errors runtime.ValidationErrors
 	for i, item := range t.Messages {
 		if v, ok := any(item).(runtime.Validator); ok {
@@ -4382,8 +9872,10 @@ func (t TranscriptSegment) Validate() error {
 }
 
 type UpdateRequest struct {
-	DisplayName string `json:"display_name" validate:"required"`
-	Email       string `json:"email" validate:"required"`
+	Account     *string `json:"account,omitempty"`
+	DisplayName string  `json:"display_name" validate:"required"`
+	Email       *string `json:"email,omitempty"`
+	SourceID    *int64  `json:"source_id,omitempty"`
 }
 
 func (u UpdateRequest) Validate() error {
@@ -4399,11 +9891,153 @@ func (u UpdateResult) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(u))
 }
 
+type Usage struct {
+	Available   bool  `json:"available"`
+	TotalTokens int64 `json:"total_tokens"`
+}
+
+type VCardIdentity struct {
+	Altid    *string  `json:"altid,omitempty"`
+	Group    *string  `json:"group,omitempty"`
+	Pid      []string `json:"pid,omitempty"`
+	PropID   *string  `json:"prop_id,omitempty"`
+	Property *string  `json:"property,omitempty"`
+}
+
+type ValueEnvelope struct {
+	ActiveFrom        *time.Time    `json:"active_from,omitempty"`
+	ActiveUntil       *time.Time    `json:"active_until,omitempty"`
+	Confidence        *float64      `json:"confidence,omitempty"`
+	CreatedAt         time.Time     `json:"created_at" validate:"required"`
+	ID                int64         `json:"id"`
+	Ordinal           int64         `json:"ordinal"`
+	Pref              *int64        `json:"pref,omitempty"`
+	Source            string        `json:"source" validate:"required"`
+	SourceRef         *string       `json:"source_ref,omitempty"`
+	SourceResourceUID *string       `json:"source_resource_uid,omitempty"`
+	SupersededAt      *time.Time    `json:"superseded_at,omitempty"`
+	TypeLabel         *string       `json:"type_label,omitempty"`
+	TypeTokens        []string      `json:"type_tokens,omitempty"`
+	UpdatedAt         time.Time     `json:"updated_at" validate:"required"`
+	Vcard             VCardIdentity `json:"vcard"`
+}
+
+func (v ValueEnvelope) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(v.CreatedAt, "required"); err != nil {
+		errors = errors.Append("CreatedAt", err)
+	}
+	if err := typesValidator.Var(v.Source, "required"); err != nil {
+		errors = errors.Append("Source", err)
+	}
+	if err := typesValidator.Var(v.UpdatedAt, "required"); err != nil {
+		errors = errors.Append("UpdatedAt", err)
+	}
+	if v, ok := any(v.Vcard).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Vcard", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type ValueEnvelopeInput struct {
+	ActiveFrom        *time.Time     `json:"active_from,omitempty"`
+	ActiveUntil       *time.Time     `json:"active_until,omitempty"`
+	Confidence        *float64       `json:"confidence,omitempty"`
+	Ordinal           *int64         `json:"ordinal,omitempty" validate:"omitempty,gte=0"`
+	Pref              *int64         `json:"pref,omitempty"`
+	Source            string         `json:"source" validate:"required"`
+	SourceRef         *string        `json:"source_ref,omitempty"`
+	SourceResourceUID *string        `json:"source_resource_uid,omitempty"`
+	TypeLabel         *string        `json:"type_label,omitempty"`
+	TypeTokens        []string       `json:"type_tokens,omitempty"`
+	Vcard             *VCardIdentity `json:"vcard,omitempty"`
+}
+
+func (v ValueEnvelopeInput) Validate() error {
+	var errors runtime.ValidationErrors
+	if v.Ordinal != nil {
+		if err := typesValidator.Var(v.Ordinal, "omitempty,gte=0"); err != nil {
+			errors = errors.Append("Ordinal", err)
+		}
+	}
+	if err := typesValidator.Var(v.Source, "required"); err != nil {
+		errors = errors.Append("Source", err)
+	}
+	if v.Vcard != nil {
+		if v, ok := any(v.Vcard).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Vcard", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
 type VectorHealth struct {
 	ErrorData *string `json:"error,omitempty"`
 	Status    string  `json:"status" validate:"required"`
 }
 
 func (v VectorHealth) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(v))
+}
+
+type VisualBuildRequest struct {
+	Consent bool `json:"consent"`
+}
+
+type VisualGeneration struct {
+	ConsentPolicyFingerprint *string `json:"consent_policy_fingerprint,omitempty"`
+	Consented                bool    `json:"consented"`
+	Dimension                int64   `json:"dimension"`
+	Fingerprint              string  `json:"fingerprint" validate:"required"`
+	ID                       int64   `json:"id"`
+	Model                    string  `json:"model" validate:"required"`
+	SourceFence              int64   `json:"source_fence"`
+	State                    string  `json:"state" validate:"required"`
+}
+
+func (v VisualGeneration) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(v))
+}
+
+type VisualRetireRequest struct {
+	GenerationID int64 `json:"generation_id"`
+}
+
+type VisualRetryRequest struct {
+	BlobHash  string `json:"blob_hash" validate:"required"`
+	MessageID int64  `json:"message_id"`
+}
+
+func (v VisualRetryRequest) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(v))
+}
+
+type VisualTextSearchRequest struct {
+	After          *string  `json:"after,omitempty"`
+	Before         *string  `json:"before,omitempty"`
+	Cursor         *string  `json:"cursor,omitempty"`
+	Directions     []string `json:"directions,omitempty"`
+	Filename       *string  `json:"filename,omitempty"`
+	Limit          *int64   `json:"limit,omitempty"`
+	MessageID      *int64   `json:"message_id,omitempty"`
+	MimePrefix     *string  `json:"mime_prefix,omitempty"`
+	ParticipantID  *int64   `json:"participant_id,omitempty"`
+	PersonID       *int64   `json:"person_id,omitempty"`
+	SenderPersonID *int64   `json:"sender_person_id,omitempty"`
+	SourceID       *int64   `json:"source_id,omitempty"`
+	Text           string   `json:"text" validate:"required"`
+}
+
+func (v VisualTextSearchRequest) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(v))
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/api"
 	"go.kenn.io/msgvault/internal/daemonclient"
+	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/pgvector"
@@ -41,7 +42,7 @@ type embeddingGenerationRow struct {
 	MessageCount int64
 	// Coverage counts for this generation over the live-message universe,
 	// computed from the main DB (live/stamped/missing) plus the vector
-	// backend (embedded). Filled by fillCoverage / fillFullCoverage. The
+	// backend (embedded). Filled by fillFullCoverage. The
 	// invariant LiveCount == EmbeddedCount + BlankCount + MissingCount holds.
 	//
 	//   - LiveCount:     total live messages (the embedding universe).
@@ -58,29 +59,6 @@ type embeddingGenerationRow struct {
 	MissingCount  int64
 }
 
-// fillCoverage populates row.LiveCount and row.MissingCount from the main
-// DB so the management commands can gate on how many live messages still
-// need embedding for the generation. This is the cheap, backend-free path
-// used by the activation gate (which only needs MissingCount). It leaves
-// EmbeddedCount/BlankCount at zero — use fillFullCoverage for the display
-// table where the embedded/blank split is wanted. A failure is surfaced to
-// the caller.
-func fillCoverage(ctx context.Context, row *embeddingGenerationRow) error {
-	s, err := store.Open(cfg.DatabaseDSN())
-	if err != nil {
-		return fmt.Errorf("open main db for coverage: %w", err)
-	}
-	defer func() { _ = s.Close() }()
-	scope := cfg.Vector.Embed.Scope.BuildScope()
-	live, _, _, missing, err := s.CoverageCountsScoped(ctx, int64(row.ID), scope.MessageTypes)
-	if err != nil {
-		return err
-	}
-	row.LiveCount = live
-	row.MissingCount = missing
-	return nil
-}
-
 // fillFullCoverage populates the complete live/embedded/blank/missing split
 // for the generation. The main DB supplies live, stamped (embed_gen=id),
 // and missing; the vector backend supplies embedded (COUNT(DISTINCT
@@ -89,14 +67,13 @@ func fillCoverage(ctx context.Context, row *embeddingGenerationRow) error {
 // DONE but with no vector (the empty/unembeddable case). The invariant
 // live == embedded + blank + missing holds. The backend handle is passed
 // in by the caller (which already opened it for the generation listing).
-func fillFullCoverage(ctx context.Context, backend vector.Backend, row *embeddingGenerationRow) error {
+func fillFullCoverage(ctx context.Context, backend vector.Backend, scope vector.BuildScope, row *embeddingGenerationRow) error {
 	s, err := store.Open(cfg.DatabaseDSN())
 	if err != nil {
 		return fmt.Errorf("open main db for coverage: %w", err)
 	}
 	defer func() { _ = s.Close() }()
-	scope := cfg.Vector.Embed.Scope.BuildScope()
-	live, stamped, _, missing, err := s.CoverageCountsScoped(ctx, int64(row.ID), scope.MessageTypes)
+	live, stamped, _, missing, err := s.CoverageCountsScoped(ctx, int64(row.ID), scope.MessageTypes, scope.SourceIDs)
 	if err != nil {
 		return err
 	}
@@ -139,6 +116,9 @@ func runEmbeddingsList(cmd *cobra.Command, _ []string) error {
 	if err := ensureMainSchema(); err != nil {
 		return err
 	}
+	if err := ensureEmbedScopeResolved(); err != nil {
+		return err
+	}
 	db, rebind, closeDB, err := openEmbeddingsMetadataDB(cmd.Context())
 	if err != nil {
 		return err
@@ -176,7 +156,7 @@ func runEmbeddingsList(cmd *cobra.Command, _ []string) error {
 			if rows[i].State == vector.GenerationRetired {
 				continue
 			}
-			if err := fillFullCoverage(cmd.Context(), backend, &rows[i]); err != nil {
+			if err := fillFullCoverage(cmd.Context(), backend, cfg.Vector.Embed.Scope.BuildScope(), &rows[i]); err != nil {
 				return err
 			}
 		}
@@ -203,6 +183,40 @@ func runEmbeddingsList(cmd *cobra.Command, _ []string) error {
 	if err := w.Flush(); err != nil {
 		return fmt.Errorf("flush embedding generations table: %w", err)
 	}
+	return nil
+}
+
+func runEmbeddingsPruneCommand(cmd *cobra.Command, args []string) error {
+	if !isDaemonCLISubprocess() {
+		return runDaemonCLICommandHTTPFromCobra(cmd, args)
+	}
+	return runEmbeddingsPrune(cmd, args)
+}
+
+func runEmbeddingsPrune(cmd *cobra.Command, _ []string) error {
+	release, err := acquireDirectSQLiteWriteLock(cfg)
+	if err != nil {
+		return err
+	}
+	defer release()
+
+	if err := ensureMainSchema(); err != nil {
+		return err
+	}
+	backend, closeBackend, err := openEmbeddingsBackend(cmd.Context())
+	if err != nil {
+		return err
+	}
+	defer closeBackend()
+	pruner, ok := backend.(vector.OrphanEmbeddingPruner)
+	if !ok {
+		return errors.New("configured vector backend does not support orphan pruning")
+	}
+	pruned, err := pruner.PruneOrphanEmbeddings(cmd.Context())
+	if err != nil {
+		return fmt.Errorf("prune orphan embeddings: %w", err)
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Pruned %d orphan message embedding(s).\n", pruned)
 	return nil
 }
 
@@ -317,6 +331,9 @@ func runEmbeddingsActivate(cmd *cobra.Command, args []string) error {
 	if err := ensureMainSchema(); err != nil {
 		return err
 	}
+	if err := ensureEmbedScopeResolved(); err != nil {
+		return err
+	}
 
 	db, rebind, closeDB, err := openEmbeddingsMetadataDB(cmd.Context())
 	if err != nil {
@@ -336,18 +353,22 @@ func runEmbeddingsActivate(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("generation %d fingerprint=%q does not match config=%q; pass --force to activate anyway",
 			gen, row.Fingerprint, expected)
 	}
-	// The coverage gate is enforced inside backend.ActivateGeneration
-	// (atomically on PG; via a Go pre-check on SQLite). We still surface a
-	// friendly pre-flight error here (against the main-DB coverage) so the
-	// common case fails fast before opening a backend connection and before
-	// prompting — but the backend's gate is the authoritative guarantee.
+	// Check both message and exact curated-person coverage before prompting.
+	// Backends independently enforce message coverage during activation;
+	// person revisions span the source and vector stores, so read-time digest
+	// revalidation remains the stale-write/deletion safety boundary if source
+	// state changes after this convergence snapshot.
+	var contextualSequence *int64
 	if !embeddingsActivateForce {
-		if err := fillCoverage(cmd.Context(), &row); err != nil {
+		state, err := configuredConvergenceState(cmd.Context(), cfg.Vector, gen)
+		if err != nil {
 			return err
 		}
-		if row.MissingCount > 0 {
-			return fmt.Errorf("generation %d still has %d message(s) needing embedding; run `msgvault embeddings resume --backstop` to recover any below-watermark stragglers, or pass --force",
-				gen, row.MissingCount)
+		if !state.Complete() {
+			return manualConvergenceError(gen, state)
+		}
+		if cfg.Vector.Embeddings.EffectiveAPIFormat() == vector.APIFormatVoyageContextual {
+			contextualSequence = &state.LatestJournalSequence
 		}
 	}
 
@@ -379,7 +400,16 @@ func runEmbeddingsActivate(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	defer closeBackend()
-	if err := backend.ActivateGeneration(cmd.Context(), gen, embeddingsActivateForce); err != nil {
+	if contextualSequence != nil {
+		activator, ok := backend.(vector.ConvergedGenerationActivator)
+		if !ok {
+			return errors.New("contextual backend lacks sequence-bound activation")
+		}
+		err = activator.ActivateGenerationIfConverged(cmd.Context(), gen, *contextualSequence)
+	} else {
+		err = backend.ActivateGeneration(cmd.Context(), gen, embeddingsActivateForce)
+	}
+	if err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Generation %d activated.\n", gen)
@@ -494,6 +524,13 @@ func planCLIEmbeddingsActivate(
 	if err := ensureMainSchema(); err != nil {
 		return api.CLIEmbeddingsPlanResponse{}, err
 	}
+	// This runs on daemon HTTP handler goroutines, so the account scope is
+	// resolved into a per-request config copy — mutating the shared global
+	// cfg here would race with concurrent plan requests.
+	vecCfg, err := openResolvedVectorConfig()
+	if err != nil {
+		return api.CLIEmbeddingsPlanResponse{}, err
+	}
 	db, rebind, closeDB, err := openEmbeddingsMetadataDB(ctx)
 	if err != nil {
 		return api.CLIEmbeddingsPlanResponse{}, err
@@ -507,18 +544,14 @@ func planCLIEmbeddingsActivate(
 	if row.State != vector.GenerationBuilding {
 		return api.CLIEmbeddingsPlanResponse{}, fmt.Errorf("generation %d is %q, not %q", gen, row.State, vector.GenerationBuilding)
 	}
-	expected := cfg.Vector.GenerationFingerprint()
+	expected := vecCfg.GenerationFingerprint()
 	if row.Fingerprint != expected && !force {
 		return api.CLIEmbeddingsPlanResponse{}, fmt.Errorf("generation %d fingerprint=%q does not match config=%q; pass --force to activate anyway",
 			gen, row.Fingerprint, expected)
 	}
 	if !force {
-		if err := fillCoverage(ctx, &row); err != nil {
+		if err := requireConfiguredConvergence(ctx, vecCfg, gen); err != nil {
 			return api.CLIEmbeddingsPlanResponse{}, err
-		}
-		if row.MissingCount > 0 {
-			return api.CLIEmbeddingsPlanResponse{}, fmt.Errorf("generation %d still has %d message(s) needing embedding; run `msgvault embeddings resume --backstop` to recover any below-watermark stragglers, or pass --force",
-				gen, row.MissingCount)
 		}
 	}
 
@@ -535,6 +568,48 @@ func planCLIEmbeddingsActivate(
 		NeedsConfirmation: true,
 		Prompt:            prompt,
 	}, nil
+}
+
+// requireConfiguredConvergence and configuredConvergenceState take the
+// vector config explicitly so daemon HTTP handlers can pass their
+// per-request resolved copy (with [vector.embed.scope] accounts folded into
+// SourceIDs): the checker's missing count is scope-aware, and building it
+// from the unresolved global would count out-of-scope messages as missing
+// and refuse to activate a completed account-scoped generation.
+func requireConfiguredConvergence(ctx context.Context, vecCfg vector.Config, gen vector.GenerationID) error {
+	state, err := configuredConvergenceState(ctx, vecCfg, gen)
+	if err != nil {
+		return err
+	}
+	if !state.Complete() {
+		return convergenceError(gen, state)
+	}
+	return nil
+}
+
+func configuredConvergenceState(ctx context.Context, vecCfg vector.Config, gen vector.GenerationID) (scheduler.ConvergenceResult, error) {
+	mainStore, err := store.Open(cfg.DatabaseDSN())
+	if err != nil {
+		return scheduler.ConvergenceResult{}, fmt.Errorf("open main db for convergence: %w", err)
+	}
+	defer func() { _ = mainStore.Close() }()
+	backend, closeBackend, err := openEmbeddingsBackend(ctx)
+	if err != nil {
+		return scheduler.ConvergenceResult{}, err
+	}
+	defer closeBackend()
+	personGate := vector.NewPinnedExactSemanticPersonEmbeddingGate(
+		vecCfg, currentSemanticPersonVectorConfigSource(), mainStore,
+	)
+	checker, err := newConvergenceChecker(vecCfg, mainStore, backend, personGate)
+	if err != nil {
+		return scheduler.ConvergenceResult{}, err
+	}
+	state, err := checker.CheckConvergence(ctx, gen)
+	if err != nil {
+		return scheduler.ConvergenceResult{}, fmt.Errorf("check generation convergence: %w", err)
+	}
+	return state, nil
 }
 
 func remainingCoverageHint(gen vector.GenerationID, remaining int64) string {

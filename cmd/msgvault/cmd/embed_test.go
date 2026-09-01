@@ -48,7 +48,13 @@ func TestEmbeddingsCommandRegistration(t *testing.T) {
 	require.NoError(err)
 	require.Equal("activate", activateCmd.Name())
 	require.NotNil(activateCmd.Flags().Lookup("yes"))
-	require.NotNil(activateCmd.Flags().Lookup("force"))
+	forceFlag := activateCmd.Flags().Lookup("force")
+	require.NotNil(forceFlag)
+	assert.Contains(t, forceFlag.Usage, "person coverage")
+
+	pruneCmd, _, err := rootCmd.Find([]string{embeddingsCommandName, "prune"})
+	require.NoError(err)
+	require.Equal("prune", pruneCmd.Name())
 
 	legacyCmd, _, err := rootCmd.Find([]string{"build-embeddings"})
 	require.NoError(err)
@@ -83,6 +89,33 @@ func TestEmbeddingsListUsesDaemonRunner(t *testing.T) {
 	require.NoError(root.Execute(), "embeddings list")
 	assert.Equal(1, int(requests.Load()), "runner endpoint calls")
 	assert.Equal("ID\tSTATE\n1\tactive\n", stdout.String(), "stdout")
+}
+
+func TestEmbeddingsPruneUsesDaemonRunner(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	server, requests := newDaemonCLIRunnerTestServer(t, func(req daemonCLIRunTestRequest) {
+		assert.Equal([]string{embeddingsCommandName, "prune"}, req.Args, "args")
+	}, `{"type":"stdout","data":"Pruned 2 orphan message embedding(s).\n"}`, `{"type":"complete"}`)
+	configureRemoteDaemonForTest(t, server.URL)
+
+	root := &cobra.Command{Use: daemonService}
+	embeddings := &cobra.Command{Use: embeddingsCommandName}
+	prune := &cobra.Command{
+		Use:  "prune",
+		RunE: runEmbeddingsPruneCommand,
+	}
+	embeddings.AddCommand(prune)
+	root.AddCommand(embeddings)
+
+	var stdout bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetArgs([]string{embeddingsCommandName, "prune"})
+
+	require.NoError(root.Execute(), "embeddings prune")
+	assert.Equal(1, int(requests.Load()), "runner endpoint calls")
+	assert.Equal("Pruned 2 orphan message embedding(s).\n", stdout.String(), "stdout")
 }
 
 func TestEmbeddingsBuildPromptsBeforeDaemonRunner(t *testing.T) {
@@ -281,8 +314,8 @@ func TestListEmbeddingGenerationsIncludesActiveAndBuilding(t *testing.T) {
 	db := newEmbeddingMetadataTestDB(t)
 
 	// listEmbeddingGenerations reads only the generation metadata now;
-	// coverage (missing count) is filled separately from the main DB via
-	// fillCoverage, so it is not asserted here.
+	// Coverage is filled separately for the display path, so it is not
+	// asserted here.
 	rows, err := listEmbeddingGenerations(t.Context(), db, sqliteRebind)
 	require.NoError(err)
 	require.Len(rows, 2)
@@ -321,22 +354,6 @@ func TestRunEmbeddingsActivateRefusesMissingWithoutForce(t *testing.T) {
 	require.Error(err)
 	assert.Contains(err.Error(), "needing embedding")
 	assert.Contains(err.Error(), "msgvault embeddings resume --backstop")
-}
-
-func TestFillCoverageUsesEmbeddingScope(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	dataDir := t.TempDir()
-	dbPath := newEmbeddingMetadataTestDBFileAt(t, filepath.Join(dataDir, "vectors.db"))
-	seedMainDBWithScopedCoverageMessages(t, dataDir)
-	withEmbeddingCommandConfigDataDir(t, dbPath, dataDir)
-	cfg.Vector.Embed.Scope.MessageTypes = []string{"sms"}
-
-	row := embeddingGenerationRow{ID: 2}
-	require.NoError(fillCoverage(t.Context(), &row))
-
-	assert.Equal(int64(1), row.LiveCount)
-	assert.Equal(int64(0), row.MissingCount)
 }
 
 // TestRetireEmbeddingGenerationRefusesActiveWithoutForce_PreCheck pins the
@@ -436,22 +453,6 @@ func seedMainDBWithLiveMessage(t *testing.T, dataDir string) {
 INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'me@example.com');
 INSERT INTO conversations (id, source_id, conversation_type) VALUES (1, 1, 'email_thread');
 INSERT INTO messages (id, conversation_id, source_id, source_message_id, message_type, embed_gen) VALUES (1, 1, 1, 'm1', 'email', NULL);
-`)
-	require.NoError(t, err)
-}
-
-func seedMainDBWithScopedCoverageMessages(t *testing.T, dataDir string) {
-	t.Helper()
-	s, err := store.Open(filepath.Join(dataDir, "msgvault.db"))
-	require.NoError(t, err)
-	defer func() { require.NoError(t, s.Close()) }()
-	require.NoError(t, s.InitSchema())
-	_, err = s.DB().Exec(`
-INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'me@example.com');
-INSERT INTO conversations (id, source_id, conversation_type) VALUES (1, 1, 'email_thread'), (2, 1, 'sms_thread');
-INSERT INTO messages (id, conversation_id, source_id, source_message_id, message_type, embed_gen) VALUES
-	(1, 1, 1, 'email-missing', 'email', NULL),
-	(2, 2, 1, 'sms-stamped', 'sms', 2);
 `)
 	require.NoError(t, err)
 }

@@ -63,7 +63,7 @@ Scope:
                         is local-only and reversible with --undo;
                         --delete-dups-from-source-server only stages
                         remote deletion when the loser and the survivor
-                        share a source (same-source-only).
+                        share a source and matching normalized raw MIME.
   (no flag)             Dedup runs per-account independently for every
                         account. Source boundaries are never crossed.
 
@@ -440,7 +440,7 @@ func deduplicateCollectionIntro(st *store.Store, displayName string, sourceIDs [
 	if len(memberNames) > 1 {
 		out.WriteString(
 			"  Note: cross-source dedup is reversible (--undo); " +
-				"remote deletion stays same-source-only. " +
+				"remote deletion requires equivalent same-source raw MIME. " +
 				"Re-run with --dry-run to preview.\n",
 		)
 	}
@@ -560,7 +560,7 @@ func planCLIDeduplicateItem(
 	if sourceID == 0 && report.DuplicateGroups == 0 {
 		out.WriteString("\nNo duplicates found.\n")
 	}
-	fingerprint, err := deduplicatePlanFingerprint(cfgScoped, report)
+	fingerprint, err := deduplicatePlanFingerprint(ctx, cfgScoped, report)
 	if err != nil {
 		return api.CLIDeduplicatePlanItem{}, err
 	}
@@ -576,7 +576,9 @@ func planCLIDeduplicateItem(
 	}, nil
 }
 
-func deduplicatePlanFingerprint(cfgScoped dedup.Config, report *dedup.Report) (string, error) {
+func deduplicatePlanFingerprint(
+	ctx context.Context, cfgScoped dedup.Config, report *dedup.Report,
+) (string, error) {
 	type fingerprintGroup struct {
 		Key          string  `json:"key"`
 		KeyType      string  `json:"key_type"`
@@ -584,13 +586,14 @@ func deduplicatePlanFingerprint(cfgScoped dedup.Config, report *dedup.Report) (s
 		DuplicateIDs []int64 `json:"duplicate_ids"`
 	}
 	type fingerprintPayload struct {
-		SourceIDs           []int64            `json:"source_ids"`
-		Account             string             `json:"account"`
-		ScopeIsCollection   bool               `json:"scope_is_collection"`
-		ContentHashFallback bool               `json:"content_hash_fallback"`
-		DeleteFromSource    bool               `json:"delete_from_source"`
-		SourcePreference    []string           `json:"source_preference"`
-		Groups              []fingerprintGroup `json:"groups"`
+		SourceIDs             []int64                      `json:"source_ids"`
+		Account               string                       `json:"account"`
+		ScopeIsCollection     bool                         `json:"scope_is_collection"`
+		ContentHashFallback   bool                         `json:"content_hash_fallback"`
+		DeleteFromSource      bool                         `json:"delete_from_source"`
+		SourcePreference      []string                     `json:"source_preference"`
+		Groups                []fingerprintGroup           `json:"groups"`
+		RemoteDeletionTargets []dedup.RemoteDeletionTarget `json:"remote_deletion_targets,omitempty"`
 	}
 	payload := fingerprintPayload{
 		SourceIDs:           append([]int64(nil), cfgScoped.AccountSourceIDs...),
@@ -601,6 +604,13 @@ func deduplicatePlanFingerprint(cfgScoped dedup.Config, report *dedup.Report) (s
 		SourcePreference:    append([]string(nil), cfgScoped.SourcePreference...),
 	}
 	slices.Sort(payload.SourceIDs)
+	if cfgScoped.DeleteDupsFromSourceServer {
+		var err error
+		payload.RemoteDeletionTargets, err = dedup.PlannedRemoteDeletionTargets(ctx, report)
+		if err != nil {
+			return "", fmt.Errorf("plan remote deletion targets: %w", err)
+		}
+	}
 	for _, group := range report.Groups {
 		if len(group.Messages) == 0 || group.Survivor < 0 || group.Survivor >= len(group.Messages) {
 			continue
@@ -652,11 +662,13 @@ func parseDedupSourcePlans(values []string) (map[int64]string, error) {
 	return out, nil
 }
 
-func validateDeduplicatePlanFingerprint(cfgScoped dedup.Config, report *dedup.Report, expected string) error {
+func validateDeduplicatePlanFingerprint(
+	ctx context.Context, cfgScoped dedup.Config, report *dedup.Report, expected string,
+) error {
 	if expected == "" {
 		return errors.New("dedup confirmed plan did not include a fingerprint")
 	}
-	got, err := deduplicatePlanFingerprint(cfgScoped, report)
+	got, err := deduplicatePlanFingerprint(ctx, cfgScoped, report)
 	if err != nil {
 		return err
 	}
@@ -732,7 +744,7 @@ func runDeduplicatePerSource(
 			return fmt.Errorf("scan %s: %w", src.Identifier, err)
 		}
 		if dedupPlanConfirmed {
-			if err := validateDeduplicatePlanFingerprint(cfgScoped, report, expectedFingerprint); err != nil {
+			if err := validateDeduplicatePlanFingerprint(cmd.Context(), cfgScoped, report, expectedFingerprint); err != nil {
 				return err
 			}
 		}
@@ -895,7 +907,7 @@ func runDeduplicateOnce(
 		return fmt.Errorf("scan: %w", err)
 	}
 	if dedupPlanConfirmed {
-		if err := validateDeduplicatePlanFingerprint(cfgScoped, report, dedupPlanFingerprint); err != nil {
+		if err := validateDeduplicatePlanFingerprint(cmd.Context(), cfgScoped, report, dedupPlanFingerprint); err != nil {
 			return err
 		}
 	}
@@ -1123,7 +1135,7 @@ func init() {
 	deduplicateCmd.MarkFlagsMutuallyExclusive("undo", "collection")
 	deduplicateCmd.Flags().BoolVar(&dedupDeleteFromSourceSrvr,
 		"delete-dups-from-source-server", false,
-		"DESTRUCTIVE: stage pruned duplicates for remote deletion "+
+		"DESTRUCTIVE: stage equivalent same-source duplicates for remote deletion "+
 			"(execution requires MSGVAULT_ENABLE_REMOTE_DELETE=1)")
 	deduplicateCmd.Flags().BoolVarP(&dedupYes, "yes", "y", false,
 		"Skip confirmation prompt")

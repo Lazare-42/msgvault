@@ -1,4 +1,5 @@
 ---
+last_edited: "2026-08-17"
 title: Configuration
 description: Configuration file reference, environment variables, and file locations.
 ---
@@ -22,6 +23,9 @@ data_dir = "/path/to/msgvault/data"
 # Database URL (default: {data_dir}/msgvault.db; PostgreSQL DSN supported)
 database_url = "/path/to/msgvault.db"
 
+# Keep attachment content as individual files instead of creating packs.
+# loose_attachments = true
+
 [oauth]
 # Path to Google OAuth client secrets JSON for browser OAuth
 client_secrets = "/path/to/client_secret.json"
@@ -39,6 +43,12 @@ client_secrets = "/path/to/acme_workspace_secret.json"
 client_id = "your-azure-app-client-id"
 # redirect_uri = "http://localhost:8089/callback/microsoft"  # default
 # tenant_id = "your-tenant-id"   # optional, default "common"
+
+# Optional source-scoped Fastmail alias inventory.
+[[fastmail]]
+source_id = 14
+api_token = "replace-with-a-Fastmail-API-token"
+auto_confirm_identities = false
 
 [discord]
 # Per-attachment download cap (default: 50 MiB)
@@ -75,10 +85,13 @@ daemon_auto_restart = "newer" # newer, never, or always
 
 [analytics]
 # Daemon-side analytics engine for Web UI, TUI, and aggregate HTTP views:
-# "auto" uses DuckDB/Parquet when usable, otherwise live SQL.
+# "auto" starts on live SQL and switches to DuckDB after cache maintenance.
 # "sql" always uses live SQL. "duckdb" requires a usable Parquet cache.
 engine = "auto"
+# Build a stale/missing cache during daemon startup and after scheduled syncs.
 auto_build_cache = true
+# Minimum age of a usable cache before a scheduled sync may rebuild it again.
+# min_rebuild_interval = "6h"
 
 [backup]
 # Default repository for `msgvault backup`.
@@ -107,6 +120,8 @@ backend = "sqlite-vec"
 endpoint = "http://localhost:11434/v1"
 model = "nomic-embed-text"
 dimension = 768
+document_prefix = "search_document: "
+query_prefix = "search_query: "
 eta_window = 10
 
 [vector.preprocess]
@@ -120,6 +135,40 @@ collapse_whitespace = true
 [vector.embed.scope]
 # Empty means embed the full archive. Set this for partial generations.
 message_types = ["sms", "mms"]
+# Use stable account identifiers, not numeric source IDs. This keeps a scoped
+# generation usable after a daemon restart.
+# accounts = ["you@work.example"]
+
+[attachments.documents]
+# Hosted extraction is opt-in and requires a separately recorded consent.
+enabled = false
+provider = "mistral"
+region = "eu"
+api_key_env = "MISTRAL_API_KEY"
+model = "mistral-ocr-4-0"
+retention_posture = "zdr"
+training_posture = "opted-out"
+max_file_bytes = 52428800
+max_pages_per_document = 500
+max_response_bytes = 67108864
+max_normalized_chars = 25000000
+max_spool_bytes = 536870912
+min_free_space_bytes = 1073741824
+request_timeout = "5m"
+max_retries = 3
+max_pages_per_run = 10000
+max_estimated_cost_usd_per_run = 50
+# Set both pricing fields together to include a cost estimate in manual build preflight.
+# estimated_cost_usd_per_1000_units = 0.001
+# pricing_assumption_on = "2026-08-17"
+
+[attachments.documents.scope]
+# Empty includes every supported message type.
+message_types = ["email"]
+
+[attachments.documents.index]
+lexical = true
+store_chunk_text = true
 
 [[synctech_sms.sources]]
 name = "phone-backups"
@@ -153,8 +202,57 @@ client_secrets = 'C:\Users\you\Downloads\client_secret.json'
 |---|---|---|
 | `data_dir` | `~/.msgvault` | Base directory for all data |
 | `database_url` | `{data_dir}/msgvault.db` | SQLite database path or PostgreSQL DSN |
+| `loose_attachments` | `false` | Keep attachments as loose files and reject pack/repack commands instead of creating immutable packs |
 
 Attachments and OAuth tokens are stored in subdirectories of `data_dir` (`attachments/` and `tokens/` respectively). These paths are not independently configurable.
+
+Setting `loose_attachments = true` prevents new pack files but does not
+convert existing packs. Stop the daemon and run `msgvault unpack-attachments`
+once to materialize their contents as loose files. Backup restore also restores
+attachments loose while this setting is enabled.
+
+### `[attachments.documents]`
+
+Hosted extraction and local full-text indexing for standalone document
+attachments. It is disabled by default. Enabling it does not grant consent or
+send data: an operator must generate an authenticated capability manifest and
+record consent for the exact effective policy before a build can upload a
+document.
+
+| Key | Default | Description |
+|---|---:|---|
+| `enabled` | `false` | Allow explicit document extraction commands |
+| `provider` | `mistral` | Pinned extraction provider |
+| `region` | `eu` | Pinned provider region and EU endpoint |
+| `api_key_env` | `MISTRAL_API_KEY` | Environment variable containing the provider key |
+| `model` | `mistral-ocr-4-0` | Pinned OCR model |
+| `retention_posture` | `unknown` | Confirmed provider posture: `standard` or `zdr` |
+| `training_posture` | `unknown` | Confirmed provider posture: `default-opt-out` or `opted-out` |
+| `max_file_bytes` | `52428800` | Maximum original document size (50 MiB) |
+| `max_pages_per_document` | `500` | Maximum provider units for one document |
+| `max_response_bytes` | `67108864` | Maximum provider response size (64 MiB) |
+| `max_normalized_chars` | `25000000` | Maximum locally retained normalized characters |
+| `max_spool_bytes` | `536870912` | Maximum private staging-directory usage (512 MiB) |
+| `min_free_space_bytes` | `1073741824` | Free space preserved before staging (1 GiB) |
+| `request_timeout` | `5m` | Timeout for each provider request attempt |
+| `max_retries` | `3` | Maximum transient retries |
+| `max_pages_per_run` | `10000` | Conservative provider-unit budget for one run |
+| `max_estimated_cost_usd_per_run` | `50` | Cost-planning ceiling for one run |
+| `estimated_cost_usd_per_1000_units` | `0` | Operator-supplied current price assumption; zero disables cost calculation |
+| `pricing_assumption_on` | — | Date for the price assumption, in `YYYY-MM-DD` form |
+Provider uploads are manual-only: `msgvault serve` does not schedule document
+extraction. Each `documents build` or `documents resume` receives its capability
+manifest explicitly and displays its upload and cost preflight before requiring
+`--yes`. When document indexing is enabled, the daemon's weekly reconciliation
+and local derivative cleanup remain automatic and make no provider requests.
+
+`[attachments.documents.scope]` accepts `message_types`; an empty list includes
+all supported standalone attachment sources. The first release requires
+`[attachments.documents.index].lexical = true` and `store_chunk_text = true`.
+Hosted document embeddings are not enabled by this configuration.
+
+See [Document Attachment Indexing](/usage/document-indexing/) for the complete
+probe, consent, build, and recovery flow.
 
 ### `[oauth]`
 
@@ -195,6 +293,25 @@ sync. Required only if you use `add-o365`, `add-teams`, or `sync-teams`.
 | `tenant_id` | `common` | Azure AD tenant ID; `common` allows both personal and org accounts |
 
 See [OAuth Setup: Microsoft 365](/guides/oauth-setup/#microsoft-365-outlook-hotmail) for app registration steps. Teams uses the same `client_id` but requests Microsoft Graph scopes and stores tokens under `tokens/teams_<email>.json`; Outlook/Hotmail IMAP OAuth uses `tokens/microsoft_<email>.json`.
+
+### `[[fastmail]]`
+
+Optional source-scoped Fastmail JMAP identity inventory. This does not replace
+IMAP ingestion credentials: add and sync the mailbox normally, then use the API
+token only to discover masked and send-as addresses that belong to that source.
+
+| Key | Default | Description |
+|---|---|---|
+| `source_id` | — | Positive numeric archive source ID; mutually exclusive with `account` |
+| `account` | — | Unambiguous source identifier or display name; mutually exclusive with `source_id` |
+| `api_token` | (required) | Fastmail API token used for the JMAP identity inventory |
+| `auto_confirm_identities` | `false` | Refresh and apply strong provider identity evidence after successful mailbox syncs |
+
+Exactly one source selector is required. Prefer `source_id` when two sources
+share an identifier or display name. With automatic confirmation disabled,
+`msgvault identity discover --source-id <id> --provider` fetches the inventory
+for an explicit preview; add `--apply` only after reviewing it. See [People,
+Profiles, and Source Identities](/usage/people/#fastmail-alias-inventory).
 
 ### `[discord]`
 
@@ -317,10 +434,28 @@ Settings for daemon-side aggregate query behavior. The Web UI, TUI, MCP server, 
 
 | Key | Default | Description |
 |---|---|---|
-| `engine` | `auto` | Aggregate engine: `auto` uses DuckDB over Parquet when the cache is usable and falls back to live SQL; `sql` always uses live SQL; `duckdb` requires a usable Parquet cache |
-| `auto_build_cache` | `true` | Build a stale or missing Parquet cache before the daemon opens DuckDB for aggregate views |
+| `engine` | `auto` | Aggregate engine: `auto` starts with live SQL and switches to DuckDB after cache maintenance succeeds; `sql` always uses live SQL; `duckdb` requires a usable Parquet cache |
+| `auto_build_cache` | `true` | Build a stale or missing Parquet cache during daemon startup and after scheduled syncs; `false` skips both automatic paths |
+| `min_rebuild_interval` | `0s` | Minimum age of a usable cache before a scheduled sync may rebuild it; zero preserves rebuilding after each sync |
 
-Deprecated in 0.17.0: per-command analytics flags such as `msgvault tui --force-sql`, `msgvault mcp --force-sql`, `msgvault tui --no-cache-build`, and `--no-sqlite-scanner` were replaced by this daemon-level section. Use `engine = "sql"` for live SQL, `auto_build_cache = false` to skip automatic daemon cache builds, or `msgvault build-cache` to prebuild cache files on the daemon host. If `engine = "duckdb"` and the cache cannot be built or opened, `msgvault serve` fails instead of silently falling back.
+The daemon starts HTTP health and API routing before analytics cache
+maintenance. With `engine = "duckdb"`, analytics remain unavailable until a
+usable cache is ready; if the cache cannot be built or opened, `msgvault serve`
+fails instead of silently falling back. With `auto_build_cache = false`, use
+`msgvault build-cache` for explicit cache maintenance. Deprecated in 0.17.0:
+per-command analytics flags such as `msgvault tui --force-sql`,
+`msgvault mcp --force-sql`, `msgvault tui --no-cache-build`, and
+`--no-sqlite-scanner` were replaced by this daemon-level section. Use
+`engine = "sql"` to force live SQL.
+
+`min_rebuild_interval` limits only automatic post-sync rebuilds. A busy archive
+can therefore serve Parquet analytics that lag SQLite by approximately the
+configured interval plus cache build time. Explicit `msgvault build-cache`
+requests, startup maintenance, query-required builds, and recovery of an
+absent, interrupted, incompatible, or otherwise unusable cache are not delayed.
+Cache build memory and temporary disk usage scale with archive size, so a
+minimum interval can prevent repeated archive-scale work when sources sync
+frequently. Changes under `[analytics]` take effect after the daemon restarts.
 
 This setting governs the aggregate views (Senders/Domains/Labels/Time) and is ignored entirely when `[data].database_url` points at PostgreSQL — a PostgreSQL backend always uses live SQL for those views, and `build-cache` refuses to run against it. It does not affect the Web UI's Explore, Files, or People/domains workspaces, which require the SQLite + DuckDB/Parquet cache regardless of this setting and are unavailable on PostgreSQL; see [PostgreSQL Backend](/architecture/postgresql/) for the current scope.
 
@@ -552,6 +687,8 @@ External OpenAI-compatible embedding endpoint used to convert message text into 
 | `endpoint` | (required) | HTTP(S) base URL for an OpenAI-compatible embeddings API. msgvault appends `/embeddings` (for example, set `http://localhost:11434/v1`, not `.../embeddings`). |
 | `model` | (required) | Model name to pass in each request (e.g., `nomic-embed-text`). |
 | `dimension` | (required) | Vector dimension. Must match the model's output dimension. |
+| `document_prefix` | `""` | Model-specific instruction prepended to every document chunk after chunking (for example, `"search_document: "` for `nomic-embed-text`). The prefix does not reduce `max_input_chars`; maximum 4096 UTF-8 bytes. |
+| `query_prefix` | `""` | Model-specific instruction prepended to every vector-search query (for example, `"search_query: "` for `nomic-embed-text`); maximum 4096 UTF-8 bytes. |
 | `api_key_env` | — | Name of an environment variable containing the API key. Omit for anonymous endpoints. |
 | `batch_size` | `32` | Embedding inputs per HTTP call. Long messages can contribute multiple chunk inputs. |
 | `timeout` | `30s` | Per-request timeout. |
@@ -559,7 +696,7 @@ External OpenAI-compatible embedding endpoint used to convert message text into 
 | `max_input_chars` | `32768` | Character cap per embedding chunk. Set below your model's context window (e.g., `2000` for Ollama's default `nomic-embed-text`). |
 | `eta_window` | `10` | Number of recent progress samples used for ETA smoothing. |
 
-The index generation fingerprint includes the model, dimension, preprocessing settings, `max_input_chars`, and embedding policy. Changing those settings triggers a stale-index error on the next vector/hybrid query until you run `msgvault embeddings build --full-rebuild`.
+The index generation fingerprint includes the model, dimension, document and query prefixes, preprocessing settings, `max_input_chars`, embedding policy, and scope. Changing those settings triggers a stale-index error on the next vector/hybrid query. For an existing account-scoped generation built with CLI flags, set matching `[vector.embed.scope].accounts` and restart the daemon; otherwise run `msgvault embeddings build --full-rebuild`.
 
 #### `[vector.preprocess]`
 
@@ -601,6 +738,20 @@ a scoped index must include a compatible `message_type` filter, such as
 `msgvault search "release planning" --mode hybrid --message-type teams`; an
 unscoped vector/hybrid query returns `index_scope_mismatch` instead of using the
 partial index as if it covered the full archive.
+
+| Key | Default | Description |
+|---|---|---|
+| `message_types` | `[]` (all types) | Embed only messages of these types. |
+| `accounts` | `[]` (all accounts) | Embed only these accounts' messages, by canonical account identifier (display names are rejected here — they are not stable identities for a privacy boundary). Resolved to source IDs at startup; an unknown identifier fails vector initialization (or the CLI command). The daemon's scheduled embeds honor this scope, so it also acts as a privacy boundary: unlisted accounts' text is never sent to the embedding endpoint. |
+
+`accounts` and `message_types` compose (both filters apply). The CLI flags
+`--account`/`--collection` on `msgvault embeddings build`/`resume` override
+`accounts` for a single run. Either scope dimension is part of the generation
+fingerprint: changing it requires `msgvault embeddings build --full-rebuild`,
+and because the fingerprint records archive-local source IDs, re-adding an
+account under a new source ID also requires a rebuild. Account-scoped indexes
+do not gate search the way message-type scopes do: out-of-scope accounts
+simply have no vector matches and rank on BM25 alone in hybrid mode.
 
 #### `[vector.embed.schedule]`
 

@@ -24,6 +24,7 @@ oauth_client*.json
 # Local development state
 .beads/
 .mcp.json
+.worktrees/
 
 # Python
 __pycache__/
@@ -68,6 +69,7 @@ docs/.zensical-build.*
 docs/assets/static/
 docs/assets/generated/
 docs/screenshots/demo-data/
+.docs-fixture-staging/
 .kata.local.toml
 
 # wealthfolio runtime data — personal financial documents, NEVER commit
@@ -77,3 +79,4 @@ integrations/*/lazare-local.*
 
 # personal financial/legal scratch documents (real PII) — NEVER commit
 PHildev/
+/contextual-retrieval-eval

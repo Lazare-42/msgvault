@@ -426,32 +426,91 @@ func TestDuckDBEngine_DeletedMessagesIncluded(t *testing.T) {
 	assert.NotNil(msg, "expected message 2")
 }
 
-// TestDuckDBEngine_SearchHideDeleted verifies that Search (deep FTS path)
-// respects search.Query.HideDeleted via the sqliteEngine delegation.
-func TestDuckDBEngine_SearchHideDeleted(t *testing.T) {
+// TestDuckDBEngine_SearchDeletionScope verifies the sqliteEngine delegation
+// applies the same source-deletion scope as the native SQLite engine.
+func TestDuckDBEngine_SearchDeletionScope(t *testing.T) {
 	require := require.New(t)
-	assert := assert.New(t)
 	env := newTestEnv(t)
 
-	// Mark message 1 as deleted
 	_, err := env.DB.Exec("UPDATE messages SET deleted_from_source_at = datetime('now') WHERE id = 1")
 	require.NoError(err, "mark deleted")
+	_, err = env.DB.Exec("UPDATE messages SET deleted_at = datetime('now') WHERE id = 2")
+	require.NoError(err, "mark dedup-hidden")
 
 	engine, err := NewDuckDBEngine("", "", env.DB)
 	require.NoError(err, "NewDuckDBEngine")
 	t.Cleanup(func() { _ = engine.Close() })
 
-	ctx := context.Background()
+	assertSearchDeletionScopes(t, engine,
+		[]int64{3, 4, 5}, []int64{1}, []int64{1, 3, 4, 5})
+}
 
-	// Search without HideDeleted: all 5 messages
-	all, err := engine.Search(ctx, &search.Query{}, 100, 0)
-	require.NoError(err, "Search")
-	assert.Len(all, 5, "Search without HideDeleted")
+// TestDuckDBEngine_SearchDeletionScopeSQLiteScanner exercises the alternate
+// DuckDB sqlite_scanner path instead of the direct SQLite delegation.
+func TestDuckDBEngine_SearchDeletionScopeSQLiteScanner(t *testing.T) {
+	require := require.New(t)
+	dbPath := filepath.Join(t.TempDir(), "scope.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(err, "open sqlite")
+	schema, err := os.ReadFile("../store/schema.sql")
+	require.NoError(err, "read schema")
+	_, err = db.Exec(string(schema))
+	require.NoError(err, "create schema")
+	_, err = db.Exec(`
+		INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'scope@example.com');
+		INSERT INTO conversations (id, source_id, source_conversation_id, conversation_type, title)
+			VALUES (1, 1, 'scope-thread', 'email_thread', 'Scope');
+		INSERT INTO messages (
+			id, conversation_id, source_id, source_message_id, message_type,
+			sent_at, subject, snippet, size_estimate, has_attachments, attachment_count,
+			deleted_at, deleted_from_source_at
+		) VALUES
+			(1, 1, 1, 'scope-deleted', 'email', '2024-04-10 10:00:00', 'scope needle', '', 100, 0, 0, NULL, '2024-04-12 10:00:00'),
+			(2, 1, 1, 'scope-dedup', 'email', '2024-04-11 10:00:00', 'scope needle', '', 100, 0, 0, '2024-04-12 10:00:00', NULL),
+			(3, 1, 1, 'scope-live', 'email', '2024-04-12 10:00:00', 'scope needle', '', 100, 0, 0, NULL, NULL);
+	`)
+	require.NoError(err, "seed sqlite")
+	require.NoError(db.Close(), "close sqlite")
 
-	// Search with HideDeleted: 4 messages
-	hidden, err := engine.Search(ctx, &search.Query{HideDeleted: true}, 100, 0)
-	require.NoError(err, "Search(HideDeleted)")
-	assert.Len(hidden, 4, "Search with HideDeleted")
+	engine, err := NewDuckDBEngine("", dbPath, nil)
+	require.NoError(err, "NewDuckDBEngine")
+	t.Cleanup(func() { _ = engine.Close() })
+	if !engine.hasSQLite() {
+		t.Skip("DuckDB sqlite_scanner extension unavailable")
+	}
+
+	assertSearchDeletionScopes(t, engine, []int64{3}, []int64{1}, []int64{1, 3})
+}
+
+func assertSearchDeletionScopes(t *testing.T, engine Engine, activeIDs, deletedIDs, anyIDs []int64) {
+	t.Helper()
+	tests := []struct {
+		name        string
+		scope       search.DeletionScope
+		hideDeleted bool
+		wantIDs     []int64
+	}{
+		{name: "zero_value_keeps_hide_deleted_off", wantIDs: anyIDs},
+		{name: "zero_value_keeps_hide_deleted_on", hideDeleted: true, wantIDs: activeIDs},
+		{name: "active", scope: search.DeletionScopeActive, wantIDs: activeIDs},
+		{name: "deleted", scope: search.DeletionScopeDeleted, wantIDs: deletedIDs},
+		{name: "any", scope: search.DeletionScopeAny, wantIDs: anyIDs},
+		{name: "unknown_fails_closed_to_active", scope: search.DeletionScope("bogus"), wantIDs: activeIDs},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			results, err := engine.Search(context.Background(), &search.Query{
+				DeletionScope: tt.scope,
+				HideDeleted:   tt.hideDeleted,
+			}, 100, 0)
+			require.NoError(t, err)
+			gotIDs := make([]int64, 0, len(results))
+			for _, result := range results {
+				gotIDs = append(gotIDs, result.ID)
+			}
+			require.ElementsMatch(t, tt.wantIDs, gotIDs)
+		})
+	}
 }
 
 // TestDuckDBEngine_AggregateByRecipient verifies that recipient aggregation
@@ -651,7 +710,7 @@ func TestDuckDBEngine_ListMessages_SenderNameFilter(t *testing.T) {
 // has two authors: the queried email lives on Author A's from-row and the
 // queried name on Author B's — a cross-row match must NOT match, while the
 // same-row case still does. Covers both buildFilterConditions (ListMessages)
-// and GetGmailIDsByFilter.
+// and GetDeletionTargetsByFilter.
 func TestDuckDBEngine_SenderEmailAndName_SameFromRow(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -688,22 +747,24 @@ func TestDuckDBEngine_SenderEmailAndName_SameFromRow(t *testing.T) {
 	assert.True(slices.ContainsFunc(sameRow, func(m MessageSummary) bool { return m.Subject == "Two Authors" }),
 		"same-row sender email+name must still match")
 
-	// GetGmailIDsByFilter path.
-	crossIDs, err := engine.GetGmailIDsByFilter(ctx, MessageFilter{
+	// GetDeletionTargetsByFilter path.
+	crossIDs, err := deletionTargetSourceMessageIDs(engine.GetDeletionTargetsByFilter(ctx, MessageFilter{
 		Sender:     "author-a@example.com",
 		SenderName: "Author B",
-	})
-	require.NoError(err, "GetGmailIDsByFilter cross-row")
-	assert.NotContains(crossIDs, gmailID,
-		"cross-row sender email+name must not match in GetGmailIDsByFilter")
+	}))
 
-	sameIDs, err := engine.GetGmailIDsByFilter(ctx, MessageFilter{
+	require.NoError(err, "GetDeletionTargetsByFilter cross-row")
+	assert.NotContains(crossIDs, gmailID,
+		"cross-row sender email+name must not match in GetDeletionTargetsByFilter")
+
+	sameIDs, err := deletionTargetSourceMessageIDs(engine.GetDeletionTargetsByFilter(ctx, MessageFilter{
 		Sender:     "author-a@example.com",
 		SenderName: "Author A",
-	})
-	require.NoError(err, "GetGmailIDsByFilter same-row")
+	}))
+
+	require.NoError(err, "GetDeletionTargetsByFilter same-row")
 	assert.Contains(sameIDs, gmailID,
-		"same-row sender email+name must still match in GetGmailIDsByFilter")
+		"same-row sender email+name must still match in GetDeletionTargetsByFilter")
 }
 
 // TestDuckDBEngine_RecipientEmailAndName_SameToRow asserts the analytics
@@ -712,7 +773,7 @@ func TestDuckDBEngine_SenderEmailAndName_SameFromRow(t *testing.T) {
 // engine. The message has two recipients: the queried email lives on Recip A's
 // to-row and the queried name on Recip B's — a cross-row match must NOT match,
 // while the same-row case still does. Covers both buildFilterConditions
-// (ListMessages) and GetGmailIDsByFilter.
+// (ListMessages) and GetDeletionTargetsByFilter.
 func TestDuckDBEngine_RecipientEmailAndName_SameToRow(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -749,31 +810,33 @@ func TestDuckDBEngine_RecipientEmailAndName_SameToRow(t *testing.T) {
 	assert.True(slices.ContainsFunc(sameRow, func(m MessageSummary) bool { return m.Subject == "Two Recipients" }),
 		"same-row recipient email+name must still match")
 
-	// GetGmailIDsByFilter path.
-	crossIDs, err := engine.GetGmailIDsByFilter(ctx, MessageFilter{
+	// GetDeletionTargetsByFilter path.
+	crossIDs, err := deletionTargetSourceMessageIDs(engine.GetDeletionTargetsByFilter(ctx, MessageFilter{
 		Recipient:     "recip-a@example.com",
 		RecipientName: "Recip B",
-	})
-	require.NoError(err, "GetGmailIDsByFilter cross-row")
-	assert.NotContains(crossIDs, gmailID,
-		"cross-row recipient email+name must not match in GetGmailIDsByFilter")
+	}))
 
-	sameIDs, err := engine.GetGmailIDsByFilter(ctx, MessageFilter{
+	require.NoError(err, "GetDeletionTargetsByFilter cross-row")
+	assert.NotContains(crossIDs, gmailID,
+		"cross-row recipient email+name must not match in GetDeletionTargetsByFilter")
+
+	sameIDs, err := deletionTargetSourceMessageIDs(engine.GetDeletionTargetsByFilter(ctx, MessageFilter{
 		Recipient:     "recip-a@example.com",
 		RecipientName: "Recip A",
-	})
-	require.NoError(err, "GetGmailIDsByFilter same-row")
+	}))
+
+	require.NoError(err, "GetDeletionTargetsByFilter same-row")
 	assert.Contains(sameIDs, gmailID,
-		"same-row recipient email+name must still match in GetGmailIDsByFilter")
+		"same-row recipient email+name must still match in GetDeletionTargetsByFilter")
 }
 
-func TestDuckDBEngine_GetGmailIDsByFilter_SenderName(t *testing.T) {
+func TestDuckDBEngine_GetDeletionTargetsByFilter_SenderName(t *testing.T) {
 	engine := newParquetEngine(t)
 	ctx := context.Background()
 
 	filter := MessageFilter{SenderName: "Alice"}
-	ids, err := engine.GetGmailIDsByFilter(ctx, filter)
-	require.NoError(t, err, "GetGmailIDsByFilter")
+	ids, err := deletionTargetSourceMessageIDs(engine.GetDeletionTargetsByFilter(ctx, filter))
+	require.NoError(t, err, "GetDeletionTargetsByFilter")
 
 	assert.Len(t, ids, 3, "expected 3 gmail IDs for Alice")
 }
@@ -1979,7 +2042,7 @@ func TestDuckDBEngine_ListMessages_Filters(t *testing.T) {
 	}
 }
 
-func TestDuckDBEngine_GetGmailIDsByFilter(t *testing.T) {
+func TestDuckDBEngine_GetDeletionTargetsByFilter(t *testing.T) {
 	engine := newParquetEngine(t)
 	ctx := context.Background()
 
@@ -2052,14 +2115,14 @@ func TestDuckDBEngine_GetGmailIDsByFilter(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ids, err := engine.GetGmailIDsByFilter(ctx, tt.filter)
-			require.NoError(t, err, "GetGmailIDsByFilter")
+			ids, err := deletionTargetSourceMessageIDs(engine.GetDeletionTargetsByFilter(ctx, tt.filter))
+			require.NoError(t, err, "GetDeletionTargetsByFilter")
 			assertSetEqual(t, ids, tt.wantIDs)
 		})
 	}
 }
 
-func TestDuckDBEngine_GetGmailIDsByFilter_MessageTypeEmailIncludesLegacy(t *testing.T) {
+func TestDuckDBEngine_GetDeletionTargetsByFilter_MessageTypeEmailIncludesLegacy(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	b := NewTestDataBuilder(t)
@@ -2070,7 +2133,7 @@ func TestDuckDBEngine_GetGmailIDsByFilter_MessageTypeEmailIncludesLegacy(t *test
 	b.AddMessage(MessageOpt{Subject: "text", MessageType: "sms"})
 	engine := b.BuildEngine()
 
-	ids, err := engine.GetGmailIDsByFilter(context.Background(), MessageFilter{MessageType: "email"})
+	ids, err := deletionTargetSourceMessageIDs(engine.GetDeletionTargetsByFilter(context.Background(), MessageFilter{MessageType: "email"}))
 	require.NoError(err)
 	assert.ElementsMatch(
 		[]string{fmt.Sprintf("msg%d", typedEmailID), fmt.Sprintf("msg%d", legacyEmailID)},
@@ -2376,20 +2439,20 @@ func TestDuckDBEngine_SubAggregate_MultipleEmptyTargets(t *testing.T) {
 	}
 }
 
-// TestDuckDBEngine_GetGmailIDsByFilter_NoDataSource verifies error when no SQLite or Parquet available.
-func TestDuckDBEngine_GetGmailIDsByFilter_NoDataSource(t *testing.T) {
+// TestDuckDBEngine_GetDeletionTargetsByFilter_NoDataSource verifies error when no SQLite or Parquet available.
+func TestDuckDBEngine_GetDeletionTargetsByFilter_NoDataSource(t *testing.T) {
 	// Create engine without SQLite or Parquet
 	engine, err := NewDuckDBEngine("", "", nil)
 	require.NoError(t, err, "NewDuckDBEngine")
 	defer func() { _ = engine.Close() }()
 
 	ctx := context.Background()
-	_, err = engine.GetGmailIDsByFilter(ctx, MessageFilter{Sender: "test@example.com"})
+	_, err = deletionTargetSourceMessageIDs(engine.GetDeletionTargetsByFilter(ctx, MessageFilter{Sender: "test@example.com"}))
 	require.ErrorContains(t, err, "requires SQLite or Parquet")
 }
 
-// TestDuckDBEngine_GetGmailIDsByFilter_NonExistent verifies empty results for non-existent values.
-func TestDuckDBEngine_GetGmailIDsByFilter_NonExistent(t *testing.T) {
+// TestDuckDBEngine_GetDeletionTargetsByFilter_NonExistent verifies empty results for non-existent values.
+func TestDuckDBEngine_GetDeletionTargetsByFilter_NonExistent(t *testing.T) {
 	engine := newParquetEngine(t)
 	ctx := context.Background()
 
@@ -2405,28 +2468,28 @@ func TestDuckDBEngine_GetGmailIDsByFilter_NonExistent(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ids, err := engine.GetGmailIDsByFilter(ctx, tt.filter)
-			require.NoError(t, err, "GetGmailIDsByFilter")
+			ids, err := deletionTargetSourceMessageIDs(engine.GetDeletionTargetsByFilter(ctx, tt.filter))
+			require.NoError(t, err, "GetDeletionTargetsByFilter")
 			assert.Empty(t, ids, "results for non-existent filter")
 		})
 	}
 }
 
-// TestDuckDBEngine_GetGmailIDsByFilter_EmptyFilter verifies that empty filter returns all messages.
-func TestDuckDBEngine_GetGmailIDsByFilter_EmptyFilter(t *testing.T) {
+// TestDuckDBEngine_GetDeletionTargetsByFilter_EmptyFilter verifies that empty filter returns all messages.
+func TestDuckDBEngine_GetDeletionTargetsByFilter_EmptyFilter(t *testing.T) {
 	engine := newParquetEngine(t)
 	ctx := context.Background()
 
 	// Empty filter - should return all 5 messages
-	ids, err := engine.GetGmailIDsByFilter(ctx, MessageFilter{})
-	require.NoError(t, err, "GetGmailIDsByFilter with empty filter")
+	ids, err := deletionTargetSourceMessageIDs(engine.GetDeletionTargetsByFilter(ctx, MessageFilter{}))
+	require.NoError(t, err, "GetDeletionTargetsByFilter with empty filter")
 
 	assertSetEqual(t, ids, []string{"msg1", "msg2", "msg3", "msg4", "msg5"})
 }
 
-// TestDuckDBEngine_GetGmailIDsByFilter_CombinedNoMatch verifies empty results for
+// TestDuckDBEngine_GetDeletionTargetsByFilter_CombinedNoMatch verifies empty results for
 // combined filters that match nothing.
-func TestDuckDBEngine_GetGmailIDsByFilter_CombinedNoMatch(t *testing.T) {
+func TestDuckDBEngine_GetDeletionTargetsByFilter_CombinedNoMatch(t *testing.T) {
 	engine := newParquetEngine(t)
 	ctx := context.Background()
 
@@ -2439,29 +2502,29 @@ func TestDuckDBEngine_GetGmailIDsByFilter_CombinedNoMatch(t *testing.T) {
 		Label:  "IMPORTANT",
 	}
 
-	ids, err := engine.GetGmailIDsByFilter(ctx, filter)
-	require.NoError(t, err, "GetGmailIDsByFilter")
+	ids, err := deletionTargetSourceMessageIDs(engine.GetDeletionTargetsByFilter(ctx, filter))
+	require.NoError(t, err, "GetDeletionTargetsByFilter")
 
 	assert.Empty(t, ids, "results for bob+IMPORTANT")
 }
 
-// TestDuckDBEngine_GetGmailIDsByFilter_AfterBefore verifies that After/Before date
-// filters work correctly on the Parquet fallback of GetGmailIDsByFilter.
-func TestDuckDBEngine_GetGmailIDsByFilter_AfterBefore(t *testing.T) {
+// TestDuckDBEngine_GetDeletionTargetsByFilter_AfterBefore verifies that After/Before date
+// filters work correctly on the Parquet fallback of GetDeletionTargetsByFilter.
+func TestDuckDBEngine_GetDeletionTargetsByFilter_AfterBefore(t *testing.T) {
 	engine := newParquetEngine(t)
 	ctx := context.Background()
 	feb1 := time.Date(2024, 2, 1, 0, 0, 0, 0, time.UTC)
 	mar1 := time.Date(2024, 3, 1, 0, 0, 0, 0, time.UTC)
 
-	afterIDs, err := engine.GetGmailIDsByFilter(ctx, MessageFilter{After: &feb1})
+	afterIDs, err := deletionTargetSourceMessageIDs(engine.GetDeletionTargetsByFilter(ctx, MessageFilter{After: &feb1}))
 	require.NoError(t, err, "after-only")
 	assertSetEqual(t, afterIDs, []string{"msg3", "msg4", "msg5"})
 
-	beforeIDs, err := engine.GetGmailIDsByFilter(ctx, MessageFilter{Before: &feb1})
+	beforeIDs, err := deletionTargetSourceMessageIDs(engine.GetDeletionTargetsByFilter(ctx, MessageFilter{Before: &feb1}))
 	require.NoError(t, err, "before-only")
 	assertSetEqual(t, beforeIDs, []string{"msg1", "msg2"})
 
-	rangeIDs, err := engine.GetGmailIDsByFilter(ctx, MessageFilter{After: &feb1, Before: &mar1})
+	rangeIDs, err := deletionTargetSourceMessageIDs(engine.GetDeletionTargetsByFilter(ctx, MessageFilter{After: &feb1, Before: &mar1}))
 	require.NoError(t, err, "range")
 	assertSetEqual(t, rangeIDs, []string{"msg3", "msg4"})
 }
@@ -2848,13 +2911,13 @@ func TestDuckDBEngine_ListMessages_RecipientNameFilter(t *testing.T) {
 	assert.Len(t, results, 3, "messages to Bob")
 }
 
-func TestDuckDBEngine_GetGmailIDsByFilter_RecipientName(t *testing.T) {
+func TestDuckDBEngine_GetDeletionTargetsByFilter_RecipientName(t *testing.T) {
 	engine := newParquetEngine(t)
 	ctx := context.Background()
 
 	filter := MessageFilter{RecipientName: "Alice"}
-	ids, err := engine.GetGmailIDsByFilter(ctx, filter)
-	require.NoError(t, err, "GetGmailIDsByFilter")
+	ids, err := deletionTargetSourceMessageIDs(engine.GetDeletionTargetsByFilter(ctx, filter))
+	require.NoError(t, err, "GetDeletionTargetsByFilter")
 
 	// Alice received msgs 4, 5
 	assert.Len(t, ids, 2, "gmail IDs for Alice")
@@ -2865,8 +2928,8 @@ func TestDuckDBEngine_AggregateByRecipientName_EmptyStringFallback(t *testing.T)
 	// Build Parquet data with empty-string and whitespace display_names on recipients
 	engine := createEngineFromBuilder(t, newParquetBuilder(t).
 		addTable("messages", "messages/year=2024", "data.parquet", messagesCols, `
-			(1::BIGINT, 1::BIGINT, 'msg1', 100::BIGINT, 'Hello', 'Snippet', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, 0, NULL::TIMESTAMP, NULL::BIGINT, 'email', false, 2024, 1),
-			(2::BIGINT, 1::BIGINT, 'msg2', 101::BIGINT, 'World', 'Snippet', TIMESTAMP '2024-01-16 10:00:00', 1000::BIGINT, false, 0, NULL::TIMESTAMP, NULL::BIGINT, 'email', false, 2024, 1)
+			(1::BIGINT, 1::BIGINT, 'msg1', 100::BIGINT, 'Hello', 'Snippet', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, 0, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', false, 2024, 1),
+			(2::BIGINT, 1::BIGINT, 'msg2', 101::BIGINT, 'World', 'Snippet', TIMESTAMP '2024-01-16 10:00:00', 1000::BIGINT, false, 0, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', false, 2024, 1)
 		`).
 		addTable("sources", "sources", "sources.parquet", sourcesCols, `
 			(1::BIGINT, 'test@gmail.com', 'gmail')
@@ -2913,8 +2976,8 @@ func TestDuckDBEngine_ListMessages_MatchEmptyRecipientName(t *testing.T) {
 	// Build Parquet data with a message that has no recipients
 	engine := createEngineFromBuilder(t, newParquetBuilder(t).
 		addTable("messages", "messages/year=2024", "data.parquet", messagesCols, `
-			(1::BIGINT, 1::BIGINT, 'msg1', 100::BIGINT, 'Has Recipient', 'Snippet', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, 0, NULL::TIMESTAMP, NULL::BIGINT, 'email', false, 2024, 1),
-			(2::BIGINT, 1::BIGINT, 'msg2', 101::BIGINT, 'No Recipient', 'Snippet', TIMESTAMP '2024-01-16 10:00:00', 1000::BIGINT, false, 0, NULL::TIMESTAMP, NULL::BIGINT, 'email', false, 2024, 1)
+			(1::BIGINT, 1::BIGINT, 'msg1', 100::BIGINT, 'Has Recipient', 'Snippet', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, 0, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', false, 2024, 1),
+			(2::BIGINT, 1::BIGINT, 'msg2', 101::BIGINT, 'No Recipient', 'Snippet', TIMESTAMP '2024-01-16 10:00:00', 1000::BIGINT, false, 0, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', false, 2024, 1)
 		`).
 		addTable("sources", "sources", "sources.parquet", sourcesCols, `
 			(1::BIGINT, 'test@gmail.com', 'gmail')
@@ -3541,8 +3604,8 @@ func TestDuckDBEngine_VARCHARParquetColumns(t *testing.T) {
 	// string, to reproduce type mismatches in COALESCE, JOINs, and TRY_CAST paths.
 	engine := createEngineFromBuilder(t, newParquetBuilder(t).
 		addTable("messages", "messages/year=2024", "data.parquet", messagesCols, `
-			(1::BIGINT, 1::BIGINT, 'msg1', '100', 'Hello World', 'snippet1', TIMESTAMP '2024-01-15 10:00:00', '1000', '0', '0', NULL::TIMESTAMP, NULL::BIGINT, 'email', false, 2024, 1),
-			(2::BIGINT, 1::BIGINT, 'msg2', '101', 'Goodbye', 'snippet2', TIMESTAMP '2024-01-16 10:00:00', '2000', '1', '0', NULL::TIMESTAMP, NULL::BIGINT, 'email', false, 2024, 1)
+			(1::BIGINT, 1::BIGINT, 'msg1', '100', 'Hello World', 'snippet1', TIMESTAMP '2024-01-15 10:00:00', '1000', '0', '0', NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', false, 2024, 1),
+			(2::BIGINT, 1::BIGINT, 'msg2', '101', 'Goodbye', 'snippet2', TIMESTAMP '2024-01-16 10:00:00', '2000', '1', '0', NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', false, 2024, 1)
 		`).
 		addTable("sources", "sources", "sources.parquet", sourcesCols, `
 			(1::BIGINT, 'test@gmail.com', 'gmail')
@@ -3893,8 +3956,8 @@ func TestDuckDBEngine_StaleParquetSchema(t *testing.T) {
 
 	pb := newParquetBuilder(t).
 		addTable("messages", "messages/year=2024", "data.parquet", messagesCols, `
-			(1::BIGINT, 1::BIGINT, 'msg1', 100::BIGINT, 'Stale Hello', 'snip1', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, 'email', false, 2024, 1),
-			(2::BIGINT, 1::BIGINT, 'msg2', 101::BIGINT, 'Stale Goodbye', 'snip2', TIMESTAMP '2024-01-16 10:00:00', 2000::BIGINT, true, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, 'email', false, 2024, 1)
+			(1::BIGINT, 1::BIGINT, 'msg1', 100::BIGINT, 'Stale Hello', 'snip1', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', false, 2024, 1),
+			(2::BIGINT, 1::BIGINT, 'msg2', 101::BIGINT, 'Stale Goodbye', 'snip2', TIMESTAMP '2024-01-16 10:00:00', 2000::BIGINT, true, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', false, 2024, 1)
 		`).
 		addTable("sources", "sources", "sources.parquet", sourcesCols, `
 			(1::BIGINT, 'test@gmail.com', 'gmail')
@@ -4020,23 +4083,23 @@ func TestDuckDBEngine_StaleParquetSchema(t *testing.T) {
 	})
 }
 
-func TestDuckDBEngine_GetGmailIDsByMessageIDs(t *testing.T) {
-	ctx := context.Background()
+func TestDuckDBEngine_GetDeletionTargetsByMessageIDs(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
 
-	// Parquet fallback path (no SQLite engine attached).
-	parquet := newParquetEngine(t)
-	ids, err := parquet.GetGmailIDsByMessageIDs(ctx, []int64{1, 2, 999999})
-	require.NoError(t, err, "parquet path")
-	assertSetEqual(t, ids, []string{"msg1", "msg2"})
-
-	// SQLite delegation path.
-	sqlited := newSQLiteEngine(t)
-	ids, err = sqlited.GetGmailIDsByMessageIDs(ctx, []int64{1, 2, 999999})
-	require.NoError(t, err, "sqlite delegation path")
-	assertSetEqual(t, ids, []string{"msg1", "msg2"})
+	for _, engine := range []*DuckDBEngine{newParquetEngine(t), newSQLiteEngine(t)} {
+		targets, err := engine.GetDeletionTargetsByMessageIDs(context.Background(), []int64{1})
+		require.NoError(err)
+		require.Len(targets, 1)
+		assert.Equal(int64(1), targets[0].MessageID)
+		assert.Equal(int64(1), targets[0].SourceID)
+		assert.Equal("gmail", targets[0].SourceType)
+		assert.Equal("test@gmail.com", targets[0].SourceIdentifier)
+		assert.Equal("msg1", targets[0].SourceMessageID)
+	}
 }
 
-func TestDuckDBEngine_GetGmailIDsByMessageIDs_ChunkedLargeSelection(t *testing.T) {
+func TestDuckDBEngine_GetDeletionTargetsByMessageIDs_ChunkedLargeSelection(t *testing.T) {
 	ctx := context.Background()
 	parquet := newParquetEngine(t)
 
@@ -4050,49 +4113,9 @@ func TestDuckDBEngine_GetGmailIDsByMessageIDs_ChunkedLargeSelection(t *testing.T
 	}
 	ids = append(ids, 5)
 
-	gmailIDs, err := parquet.GetGmailIDsByMessageIDs(ctx, ids)
+	targets, err := parquet.GetDeletionTargetsByMessageIDs(ctx, ids)
 	require.NoError(t, err, "chunked parquet lookup")
+	gmailIDs, err := deletionTargetSourceMessageIDs(targets, nil)
+	require.NoError(t, err)
 	assert.Equal(t, []string{"msg5", "msg1"}, gmailIDs, "newest-first across chunks")
-}
-
-func TestDuckDBEngine_GetAccountsByGmailIDs(t *testing.T) {
-	require := require.New(t)
-
-	ctx := context.Background()
-
-	// Parquet fallback path (no SQLite engine attached).
-	parquet := newParquetEngine(t)
-	accounts, err := parquet.GetAccountsByGmailIDs(ctx, []string{"msg1", "msg2", "does-not-exist"})
-	require.NoError(err, "parquet path")
-	assertSetEqual(t, accounts, []string{"test@gmail.com"})
-
-	// SQLite delegation path.
-	sqlited := newSQLiteEngine(t)
-	accounts, err = sqlited.GetAccountsByGmailIDs(ctx, []string{"msg1", "msg2", "does-not-exist"})
-	require.NoError(err, "sqlite delegation path")
-	assertSetEqual(t, accounts, []string{"test@gmail.com"})
-
-	// Empty input short-circuits.
-	accounts, err = parquet.GetAccountsByGmailIDs(ctx, nil)
-	require.NoError(err, "empty input")
-	assert.Empty(t, accounts)
-}
-
-func TestDuckDBEngine_GetAccountsByGmailIDs_ChunkedLargeSelection(t *testing.T) {
-	ctx := context.Background()
-	parquet := newParquetEngine(t)
-
-	// More IDs than one account-lookup chunk, with the real IDs in the
-	// first and last chunk so the Parquet path exercises the cross-chunk
-	// union.
-	ids := make([]string, 0, 1200)
-	ids = append(ids, "msg1")
-	for len(ids) < 1199 {
-		ids = append(ids, fmt.Sprintf("missing-%d", len(ids)))
-	}
-	ids = append(ids, "msg5")
-
-	accounts, err := parquet.GetAccountsByGmailIDs(ctx, ids)
-	require.NoError(t, err, "chunked parquet lookup")
-	assertSetEqual(t, accounts, []string{"test@gmail.com"})
 }

@@ -1,11 +1,10 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
-	"slices"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -33,6 +32,17 @@ type RelationshipsHTTPResponse struct {
 	NextCursor       string                  `json:"next_cursor,omitempty"`
 }
 
+type RelationshipCalendarHTTPRequest struct {
+	Year     int    `json:"year" minimum:"1970"`
+	Timezone string `json:"timezone,omitempty"`
+}
+
+type RelationshipCalendarHTTPResponse struct {
+	*query.RelationshipCalendarResponse
+
+	ParticipantID int64 `json:"participant_id"`
+}
+
 func (s *Server) registerRelationshipRoutes(api huma.API) {
 	registerExploreRoute[RelationshipsHTTPRequest, RelationshipsHTTPResponse](
 		api, "listRelationships", "/relationships", "Rank counterparts by reciprocity-weighted interaction", s.handleRelationships,
@@ -41,6 +51,64 @@ func (s *Server) registerRelationshipRoutes(api huma.API) {
 		api, "getRelationshipTimeline", "/relationships/{id}/timeline",
 		"Get one counterpart's interaction timeline, with chat grouped into local-day bursts", s.handleRelationshipTimeline,
 	)
+	calendar := rawAPIV1Operation("getRelationshipCalendar", http.MethodPost,
+		"/relationships/{id}/calendar",
+		"Get one counterpart's timezone-aware relationship calendar")
+	calendar.Tags = []string{"Exploration"}
+	calendar.RequestBody = jsonRequestBodyFor[RelationshipCalendarHTTPRequest](api)
+	calendar.Responses = jsonResponsesFor[RelationshipCalendarHTTPResponse](api)
+	addErrorResponses(api, calendar.Responses, http.StatusBadRequest,
+		http.StatusNotFound, http.StatusServiceUnavailable)
+	calendar.Responses[httpStatusKey(http.StatusServiceUnavailable)] = exploreUnavailableResponseFor(api)
+	registerRawHumaRoute(api, calendar, s.handleRelationshipCalendar)
+}
+
+func (s *Server) handleRelationshipCalendar(w http.ResponseWriter, r *http.Request) {
+	participantID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || participantID < 1 {
+		writeError(w, http.StatusBadRequest, "invalid_participant_id",
+			"participant ID must be a positive integer")
+		return
+	}
+	var request RelationshipCalendarHTTPRequest
+	if !decodeExploreJSON(w, r, &request) {
+		return
+	}
+	engine := s.queryEngineForContext(r.Context())
+	resolver, ok := engine.(query.RelationshipCanonicalResolver)
+	if !ok {
+		s.writeExploreUnavailable(r.Context(), w, query.CacheAbsent)
+		return
+	}
+	analyzer, ok := engine.(query.RelationshipCalendarAnalyzer)
+	if !ok {
+		s.writeExploreUnavailable(r.Context(), w, query.CacheAbsent)
+		return
+	}
+	canonicalID, err := resolver.ResolveCanonicalParticipant(r.Context(), participantID)
+	if err != nil {
+		s.writeExploreError(r.Context(), w, err)
+		return
+	}
+	result, err := analyzer.RelationshipCalendar(r.Context(), query.RelationshipCalendarRequest{
+		CanonicalID: canonicalID, Year: request.Year, Timezone: request.Timezone,
+	})
+	if err != nil {
+		switch {
+		case errors.Is(err, query.ErrInvalidRelationshipYear):
+			writeError(w, http.StatusBadRequest, "invalid_year", err.Error())
+		case errors.Is(err, query.ErrInvalidRelationshipTimezone):
+			writeError(w, http.StatusBadRequest, "invalid_timezone", err.Error())
+		case errors.Is(err, query.ErrRelationshipPersonNotFound):
+			writeError(w, http.StatusNotFound, "participant_not_found", "Participant cluster not found")
+		default:
+			s.writeExploreError(r.Context(), w, err)
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, RelationshipCalendarHTTPResponse{
+		ParticipantID: participantID, RelationshipCalendarResponse: result,
+	})
 }
 
 func (s *Server) handleRelationships(w http.ResponseWriter, r *http.Request) {
@@ -51,7 +119,11 @@ func (s *Server) handleRelationships(w http.ResponseWriter, r *http.Request) {
 	canonicalizeRelationshipFilters(request.Filters)
 	analyticalContext, err := exploreContext(request.Filters)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_filter", err.Error())
+		s.writeExploreFilterError(w, err, "invalid_filter")
+		return
+	}
+	if err := s.resolveExploreIdentityContext(r.Context(), request.Filters, &analyticalContext); err != nil {
+		s.writeExploreFilterError(w, err, "invalid_filter")
 		return
 	}
 	if request.Limit == 0 {
@@ -77,16 +149,16 @@ func (s *Server) handleRelationships(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	analyzer, ok := s.engine.(query.RelationshipAnalyzer)
+	analyzer, ok := s.queryEngineForContext(r.Context()).(query.RelationshipAnalyzer)
 	if !ok {
-		writeExploreUnavailable(w, query.CacheAbsent)
+		s.writeExploreUnavailable(r.Context(), w, query.CacheAbsent)
 		return
 	}
 	result, err := analyzer.Relationships(r.Context(), query.RelationshipsRequest{
 		Context: analyticalContext, ShowAll: request.ShowAll, Limit: request.Limit, Offset: offset, Now: decayDate,
 	})
 	if err != nil {
-		s.writeExploreError(w, err)
+		s.writeExploreError(r.Context(), w, err)
 		return
 	}
 	if request.Cursor != "" {
@@ -180,7 +252,11 @@ func (s *Server) handleRelationshipTimeline(w http.ResponseWriter, r *http.Reque
 	canonicalizeRelationshipFilters(request.Filters)
 	analyticalContext, err := exploreContext(request.Filters)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_filter", err.Error())
+		s.writeExploreFilterError(w, err, "invalid_filter")
+		return
+	}
+	if err := s.resolveExploreIdentityContext(r.Context(), request.Filters, &analyticalContext); err != nil {
+		s.writeExploreFilterError(w, err, "invalid_filter")
 		return
 	}
 	if request.Limit == 0 {
@@ -191,14 +267,14 @@ func (s *Server) handleRelationshipTimeline(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	analyzer, ok := s.engine.(query.RelationshipAnalyzer)
+	analyzer, ok := s.queryEngineForContext(r.Context()).(query.RelationshipAnalyzer)
 	if !ok {
-		writeExploreUnavailable(w, query.CacheAbsent)
+		s.writeExploreUnavailable(r.Context(), w, query.CacheAbsent)
 		return
 	}
 	canonicalID, err := analyzer.ResolveCanonicalParticipant(r.Context(), participantID)
 	if err != nil {
-		s.writeExploreError(w, err)
+		s.writeExploreError(r.Context(), w, err)
 		return
 	}
 
@@ -222,7 +298,7 @@ func (s *Server) handleRelationshipTimeline(w http.ResponseWriter, r *http.Reque
 		Limit: request.Limit, Offset: offset,
 	})
 	if err != nil {
-		s.writeExploreError(w, err)
+		s.writeExploreError(r.Context(), w, err)
 		return
 	}
 	if request.Cursor != "" {
@@ -246,13 +322,5 @@ func (s *Server) handleRelationshipTimeline(w http.ResponseWriter, r *http.Reque
 }
 
 func canonicalizeRelationshipFilters(filters []ExploreFilter) {
-	for i := range filters {
-		filters[i].Dimension = strings.ToLower(strings.TrimSpace(filters[i].Dimension))
-		for j := range filters[i].Values {
-			filters[i].Values[j] = strings.TrimSpace(filters[i].Values[j])
-		}
-		slices.Sort(filters[i].Values)
-		filters[i].Values = slices.Compact(filters[i].Values)
-	}
-	slices.SortFunc(filters, func(a, b ExploreFilter) int { return strings.Compare(a.Dimension, b.Dimension) })
+	canonicalizeExploreFilters(filters)
 }

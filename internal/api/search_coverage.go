@@ -55,6 +55,7 @@ func (s *Server) registerSearchCoverageRoute(api huma.API) {
 	op.RequestBody = jsonRequestBodyFor[SearchCoverageRequest](api)
 	op.Responses = jsonResponsesFor[SearchCoverageResponse](api)
 	addErrorResponses(api, op.Responses, http.StatusBadRequest, http.StatusServiceUnavailable)
+	op.Responses[httpStatusKey(http.StatusServiceUnavailable)] = exploreUnavailableResponseFor(api)
 	registerRawHumaRoute(api, op, s.handleSearchCoverage)
 }
 
@@ -70,11 +71,15 @@ func (s *Server) handleSearchCoverage(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_filter", err.Error())
 		return
 	}
+	if err := s.resolveExploreIdentityContext(r.Context(), canonical.Filters, &ctx); err != nil {
+		s.writeExploreFilterError(w, err, "invalid_filter")
+		return
+	}
 	_, backend, cfg := s.vectorComponents()
 	ctx = semanticCoverageContext(ctx, cfg.Embed.Scope.BuildScope())
-	explorer, ok := s.engine.(query.Explorer)
+	explorer, ok := s.queryEngineForContext(r.Context()).(query.Explorer)
 	if !ok {
-		writeExploreUnavailable(w, query.CacheAbsent)
+		s.writeExploreUnavailable(r.Context(), w, query.CacheAbsent)
 		return
 	}
 	response := SearchCoverageResponse{
@@ -105,10 +110,10 @@ func (s *Server) handleSearchCoverage(w http.ResponseWriter, r *http.Request) {
 		Explore: query.ExploreRequest{Context: ctx}, IncludedKeys: []string{},
 	})
 	if err != nil {
-		s.writeExploreError(w, err)
+		s.writeExploreError(r.Context(), w, err)
 		return
 	}
-	contextHash := hashCanonicalValue(ctx, false)
+	contextHash := searchCoverageContextHash(ctx)
 	if entry, found := state.getCoverage(searchCoverageCacheKey(contextHash, probe.CacheRevision, *generation)); found {
 		response.EligibleCount, response.EmbeddedCount = entry.EligibleCount, entry.EmbeddedCount
 		response.CacheRevision = probe.CacheRevision
@@ -137,7 +142,7 @@ func (s *Server) handleSearchCoverage(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusOK, response)
 			return
 		}
-		s.writeExploreError(w, err)
+		s.writeExploreError(r.Context(), w, err)
 		return
 	}
 	currentStatus, _, current, _ := resolveSearchCoverageGeneration(
@@ -174,7 +179,12 @@ func (s *Server) resolveSearchCoverageState(
 	backend vector.Backend,
 	cfg vector.Config,
 ) searchCoverageState {
-	s.refreshVectorStatusIfStale(ctx)
+	// Run the throttled revalidations before reading the status: the UI
+	// polls this endpoint, so on a daemon whose embed job never runs (empty
+	// cron, run_after_sync=false) coverage would otherwise keep reporting
+	// "ready" computed from obsolete startup source IDs until some vector
+	// search happened to trigger the preflight.
+	s.refreshVectorStatus(ctx)
 	status, detail := s.VectorStatus()
 	backendStatus := coverageStatusForVectorStatus(status)
 	state := searchCoverageState{status: backendStatus, detail: detail, resolvedStatus: backendStatus}
@@ -218,6 +228,35 @@ func searchCoverageCacheKey(contextHash, cacheRevision string, generation vector
 	return fmt.Sprintf("%s|%s|%d|%s|%s|%d",
 		contextHash, cacheRevision,
 		generation.ID, generation.State, generation.Fingerprint, generation.MessageCount)
+}
+
+func searchCoverageContextHash(ctx query.Context) string {
+	type identityKey struct {
+		SourceID       int64   `json:"source_id"`
+		ParticipantIDs []int64 `json:"participant_ids"`
+		// EmailIdentifier participates in the key because envelope-first
+		// filtering makes two aliases with identical resolved participant
+		// sets select different populations.
+		EmailIdentifier string                  `json:"email_identifier,omitempty"`
+		MatchNone       bool                    `json:"match_none"`
+		Direction       query.IdentityDirection `json:"direction"`
+	}
+	var identity *identityKey
+	if ctx.Identity != nil {
+		participantIDs := slices.Clone(ctx.Identity.ParticipantIDs)
+		slices.Sort(participantIDs)
+		identity = &identityKey{
+			SourceID:        ctx.Identity.SourceID,
+			ParticipantIDs:  participantIDs,
+			EmailIdentifier: ctx.Identity.EmailIdentifier,
+			MatchNone:       ctx.Identity.MatchNone,
+			Direction:       ctx.Identity.Direction,
+		}
+	}
+	return hashCanonicalValue(struct {
+		Context  query.Context `json:"context"`
+		Identity *identityKey  `json:"identity,omitempty"`
+	}{Context: ctx, Identity: identity}, false)
 }
 
 func resolveSearchCoverageGeneration(
@@ -281,31 +320,58 @@ func sameCoverageGeneration(
 		got.MessageCount == want.MessageCount
 }
 
+// noSemanticEligibleMessageType is an impossible message type: forcing it
+// into a context guarantees an empty eligible population without touching
+// any other predicate.
+const noSemanticEligibleMessageType = "\x00no-semantic-eligible-message-type"
+
 func semanticCoverageContext(ctx query.Context, scope vector.BuildScope) query.Context {
 	// Vector generations cover only active archive messages.
 	if ctx.Deletion == query.DeletionDeleted {
-		ctx.MessageTypes = []string{"\x00no-semantic-eligible-message-type"}
+		ctx.MessageTypes = []string{noSemanticEligibleMessageType}
 		ctx.Deletion = query.DeletionActive
 		return ctx
 	}
 	ctx.Deletion = query.DeletionActive
-	if scope.IsEmpty() {
-		return ctx
-	}
-	if len(ctx.MessageTypes) == 0 {
-		ctx.MessageTypes = slices.Clone(scope.MessageTypes)
-		return ctx
-	}
-	eligible := make([]string, 0, len(ctx.MessageTypes))
-	for _, messageType := range ctx.MessageTypes {
-		if scope.ContainsMessageType(strings.ToLower(messageType)) {
-			eligible = append(eligible, messageType)
+	if len(scope.MessageTypes) > 0 {
+		if len(ctx.MessageTypes) == 0 {
+			ctx.MessageTypes = slices.Clone(scope.MessageTypes)
+		} else {
+			eligible := make([]string, 0, len(ctx.MessageTypes))
+			for _, messageType := range ctx.MessageTypes {
+				if scope.ContainsMessageType(strings.ToLower(messageType)) {
+					eligible = append(eligible, messageType)
+				}
+			}
+			if len(eligible) == 0 {
+				eligible = []string{noSemanticEligibleMessageType}
+			}
+			ctx.MessageTypes = eligible
 		}
 	}
-	if len(eligible) == 0 {
-		eligible = []string{"\x00no-semantic-eligible-message-type"}
+	if len(scope.SourceIDs) > 0 {
+		if len(ctx.SourceIDs) == 0 {
+			ctx.SourceIDs = slices.Clone(scope.SourceIDs)
+		} else {
+			eligible := make([]int64, 0, len(ctx.SourceIDs))
+			for _, id := range ctx.SourceIDs {
+				if scope.ContainsSource(id) {
+					eligible = append(eligible, id)
+				}
+			}
+			if len(eligible) == 0 {
+				// The source predicate cannot be rewritten to an empty
+				// sentinel: an identity filter pins Identity.SourceID to
+				// the selected source and the query validator rejects any
+				// divergence from ctx.SourceIDs. Force the empty
+				// intersection through the message-type sentinel instead
+				// and leave the sources untouched.
+				ctx.MessageTypes = []string{noSemanticEligibleMessageType}
+				return ctx
+			}
+			ctx.SourceIDs = eligible
+		}
 	}
-	ctx.MessageTypes = eligible
 	return ctx
 }
 

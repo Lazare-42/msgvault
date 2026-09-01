@@ -5,7 +5,7 @@ description: Build, test, lint, and code conventions.
 
 ## Build
 
-Source builds require Go 1.26+, Bun 1.3.14+, and a C/C++ compiler. The Make
+Source builds require Go 1.27+, Bun 1.3.14+, and a C/C++ compiler. The Make
 targets install the pinned browser dependencies when `web/package.json` or
 `web/bun.lock` changes, then embed the production UI in the Go binary.
 
@@ -79,6 +79,25 @@ make lint
 # Check for issues
 go vet ./...
 ```
+
+## vCard registry maintenance
+
+The lossless vCard 2.1/3.0/4.0 codec vendors the IANA vCard Elements registry
+under `internal/vcard/registry/data`. Registry checks are deliberate networked
+maintenance commands, not ordinary CI steps:
+
+```bash
+# Report whether the upstream registry differs from the vendored snapshot.
+make vcard-registry-check
+
+# Fetch, validate, and atomically update the snapshot for review.
+make vcard-registry-update
+```
+
+The codec preserves ordered properties, source spelling, parameter quoting,
+unknown extensions, and raw values. Keep new registry elements covered by an
+explicit handling declaration so an upstream addition cannot be silently
+ignored.
 
 ## Code Conventions
 

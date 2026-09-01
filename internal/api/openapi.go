@@ -48,7 +48,6 @@ import (
 // 1.6.0 adds the browser-session login, bootstrap, and logout routes. Existing
 // API-key security remains the documented scheme for protected API routes;
 // cookie authentication is an additive same-origin browser mechanism.
-//
 // 1.7.0 adds optimistic, secret-redacting browser settings reads and writes.
 //
 // 1.8.0 adds daemon-owned shared Saved View CRUD with schema-versioned
@@ -87,7 +86,8 @@ import (
 // a 400 (conversation_anchor_outside_range) rather than the default full-
 // conversation window. Additive (minor bump): omitting the params preserves
 // the existing full-conversation behavior.
-// 1.23.0 makes GET /api/v1/people/{id} cluster-aware: PersonIdentifier adds
+// 1.23.0 makes GET /api/v1/people/{id} (the analytical participant detail,
+// /api/v1/participants/{id} since 2.0.0) cluster-aware: PersonIdentifier adds
 // participant_id, and PersonSummary adds an additive cluster field
 // (canonical_id, member_ids, edges) populated only when the requested
 // participant is linked to at least one other participant. Identifiers on a
@@ -151,11 +151,96 @@ import (
 // cluster (201 on creation, 200 on idempotent re-promotion), list/get stable
 // profiles, update the display-name override and delete a profile with
 // revision-tag optimistic concurrency, and surface the covering profile on
-// the /people/{id} analytical detail.
+// the /people/{id} analytical detail (/participants/{id} since 2.0.0).
 // 1.33.0 adds provider-neutral single-meeting ingestion with strict request
 // schemas and idempotent create/update responses.
+// 1.34.0 adds GET /api/v1/messages/changes: a keyset feed over the
+// content_changed_at watermark that lets a consumer re-read the messages whose
+// content changed since its last poll, including hidden and source-deleted
+// rows. Position is carried by an opaque cursor a client stores and sends back;
+// timestamps in the page are serialised with full sub-second precision. An
+// empty page echoes the requested cursor so an idle consumer holds its place,
+// except that a cursor above the server clock is clamped down to the commit
+// bound, or echoed unchanged if the server has not yet established one. The
+// cursor is bound to the archive that issued it: an unreadable token, one from a
+// cursor format this build does not speak, and one issued against a different
+// archive are each rejected with 400 invalid_cursor rather than read as the
+// beginning of the archive. It is not signed, so a well-formed cursor naming
+// this archive is accepted whoever built it. Stores that cannot answer the
+// watermark query, or cannot identify their archive, report 503
+// feature_unavailable. Additive (minor bump): a new path only.
+// 1.35.0 adds the portable attribute registry and typed person attributes:
+// attribute-definition list/get/create/patch/delete with ETag/If-Match
+// optimistic concurrency, and person attribute list/set/clear with
+// value-level provenance, retained history, and dry-run previews.
 // Additive (minor bump): the major-version compatibility gate stays at 1.
-const APISchemaVersion = "1.33.0"
+// 1.36.0 resolves source-scoped identity filters on relationship ranking and
+// timeline routes, and adds a typed terminal error variant to CLI identity
+// discovery NDJSON streams. Additive (minor bump): existing progress/result
+// events and relationship requests without identity filters are unchanged.
+// 1.37.0 adds typed structured-person profile read, patch, and history routes,
+// plus an open communication-service catalog. Additive (minor bump): existing
+// person and source-identity routes keep their current contracts.
+// 1.38.0 adds authenticated raw access to inline person-profile media bytes.
+// Additive (minor bump): existing profile metadata and patch contracts are
+// unchanged, and URI-only media remains metadata-only.
+// 1.39.0 adds typed temporal person relationships: relationship-type CRUD,
+// one canonical edge with endpoint-aware presentation, optimistic PATCH and
+// delete operations, and unresolved RELATED review listing. Additive (minor
+// bump): existing endpoints and response fields are unchanged.
+// 1.40.0 adds organization profiles, employment history, and their typed
+// attribute, projection, and lifecycle routes.
+// 1.41.0 adds list, accept, and reject routes for reviewable identity match
+// candidates. Additive (minor bump): existing person, source-identity, and
+// meeting-import routes keep their current contracts.
+// 1.42.0 adds the dated activity and daily-note route families. Existing
+// profile, meeting, media, and other API contracts remain unchanged.
+// 1.43.0 adds structured analytical-cache readiness responses, including the
+// transient building state, to cache-dependent coverage and detail routes.
+// Additive (minor bump): existing success responses remain unchanged.
+// 1.44.0 adds dedicated extracted-document search and status routes. Additive
+// (minor bump): existing message, file, profile, media, and activity routes are
+// unchanged.
+// 2.0.0 separates observed participant analytics under /participants from
+// durable curated people under /people and removes the ambiguous old routes.
+// 2.1.0 adds portable attribute sensitivity metadata and per-person tracking,
+// and reports this version as api_schema_version on authenticated
+// /api/v1/health so remote CLI clients can verify compatibility on connect.
+// 2.2.0 adds participant-scoped file search responses and direction controls.
+// Additive (minor bump): the archive-wide file routes are unchanged.
+// 2.3.0 bounds organization profile replacements to 200 structured values and
+// 32 MiB of logical inline media, and documents the resulting 413 response.
+// 2.4.0 adds exact source selection to CLI sync and deletion transports. CLI
+// clients check this version before asking a daemon to perform a scoped sync.
+// 2.5.0 adds durable-person attachment retrieval across metadata, document,
+// and visual lanes while keeping participant references compatible.
+// 2.6.0 adds protected semantic search over durable curated people. Ranked
+// results contain only the durable person root and semantic score; person
+// projection text and raw profile details remain internal.
+// Additive (minor bump): existing person and participant routes are unchanged.
+// 2.7.0 adds exact structured sender, recipient, domain, label, source, date,
+// time-period, and attachment filters to vector and hybrid search. Stats also
+// report the text-vector message-type scope for compatible search clients.
+// Additive (minor bump): existing unfiltered searches are unchanged.
+// 2.8.0 adds CardDAV account setup, book roles, publication, conflict, and
+// sync routes. Passwords are request-only and never appear in responses.
+// 2.9.0 adds reversible person merge/split mutations, merge history, snapshot
+// inspection, and merge-candidate decisions. Mutations require strong person
+// revision tags; merge and split also require retry-stable Idempotency-Key
+// headers.
+// 2.10.0 adds graph-relative relationship temperatures to participant summaries
+// and a timezone-aware person/year relationship calendar endpoint.
+// Additive (minor bump): existing relationship and participant routes retain
+// their request and response behavior.
+// 2.11.0 adds bounded person fact catalog, evidence, evidence-status, claim,
+// decision, and pin diagnostics plus direct pin replacement. It adds no
+// candidate, review, accept, or reject workflow.
+// Additive (minor bump): existing person, participant, relationship, calendar,
+// and CardDAV routes are unchanged.
+// 2.12.0 adds deletion_scope=active|deleted|any to GET /api/v1/cli/search.
+// Omission preserves the active-only default. Additive (minor bump): existing
+// clients continue to receive the same result population.
+const APISchemaVersion = "2.12.0"
 
 // OpenAPIDocument builds the API schema from the same Huma route registration
 // used by the daemon. It binds no socket and needs no database.
@@ -186,7 +271,63 @@ func baseOpenAPIDocument() *huma.OpenAPI {
 	hardenExploreSchemas(doc)
 	hardenSearchCoverageSchemas(doc)
 	hardenTaskLinkSchemas(doc)
+	hardenPersonRelationshipSchemas(doc)
+	hardenPersonSearchSchemas(doc)
+	hardenActivitySchemas(doc)
 	return doc
+}
+
+func hardenPersonSearchSchemas(doc *huma.OpenAPI) {
+	if doc == nil || doc.Components == nil || doc.Components.Schemas == nil {
+		return
+	}
+	response := doc.Components.Schemas.Map()["PersonSearchResponse"]
+	if response != nil && response.Properties["results"] != nil {
+		response.Properties["results"].Nullable = false
+	}
+}
+
+func hardenPersonRelationshipSchemas(doc *huma.OpenAPI) {
+	if doc == nil || doc.Components == nil || doc.Components.Schemas == nil {
+		return
+	}
+	minProperties := 1
+	for _, name := range []string{"PatchPersonRelationshipRequest", "PatchRelationshipTypeRequest"} {
+		patch := doc.Components.Schemas.Map()[name]
+		if patch != nil {
+			patch.MinProperties = &minProperties
+		}
+	}
+}
+
+func hardenActivitySchemas(doc *huma.OpenAPI) {
+	if doc == nil || doc.Components == nil || doc.Components.Schemas == nil {
+		return
+	}
+	for schemaName, arrayFields := range map[string][]string{
+		"PersonDaysPage":           {"days"},
+		"PersonDayPage":            {"activity", "entries"},
+		"DayPage":                  {"persons", "entries"},
+		"DayPerson":                {"activity"},
+		"DailyNoteEntriesResponse": {"entries"},
+	} {
+		schema := doc.Components.Schemas.Map()[schemaName]
+		if schema == nil {
+			continue
+		}
+		for _, field := range arrayFields {
+			if property := schema.Properties[field]; property != nil {
+				property.Nullable = false
+			}
+		}
+	}
+	if request := doc.Components.Schemas.Map()["CreateDailyNoteEntryRequest"]; request != nil {
+		if personIDs := request.Properties["person_ids"]; personIDs != nil &&
+			personIDs.Items != nil {
+			minimum := float64(1)
+			personIDs.Items.Minimum = &minimum
+		}
+	}
 }
 
 func hardenTaskLinkSchemas(doc *huma.OpenAPI) {
@@ -278,6 +419,7 @@ func hardenExploreSchemas(doc *huma.OpenAPI) {
 		}
 	}
 	for schemaName, properties := range map[string][]string{
+		"EntryRow":                   {"matched_sender_identities", "matched_recipient_identities"},
 		"ExploreFilter":              {"values"},
 		"ExploreHTTPResponse":        {"rows"},
 		"ExploreGroupsHTTPRequest":   {"grouping"},
@@ -342,7 +484,7 @@ func hardenSettingsSchemas(doc *huma.OpenAPI) {
 		value.AdditionalProperties = nil
 		value.OneOf = []*huma.Schema{
 			settingsValueArm("string", &huma.Schema{Type: huma.TypeString}),
-			settingsValueArm("integer", &huma.Schema{Type: huma.TypeInteger, Format: "int64"}),
+			settingsValueArm("integer", &huma.Schema{Type: huma.TypeInteger, Format: formatInt64}),
 			settingsValueArm("number", &huma.Schema{Type: huma.TypeNumber, Format: "double"}),
 			settingsValueArm("boolean", &huma.Schema{Type: huma.TypeBoolean}),
 			settingsValueArm("strings", &huma.Schema{
@@ -467,7 +609,7 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 		}
 	}
 
-	for _, schemaName := range []string{"FileSearchRow", "FileMetadataResponse"} {
+	for _, schemaName := range []string{"FileSearchRow", "FileMetadataResponse", "PersonFileSearchRow"} {
 		if schema := schemas[schemaName]; schema != nil {
 			for _, property := range []string{"filename", "mime_type"} {
 				if schema.Properties[property] != nil {
@@ -487,6 +629,42 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 			}
 		}
 	}
+	if tracking := schemas["PersonTracking"]; tracking != nil {
+		if trackedAt := tracking.Properties["tracked_at"]; trackedAt != nil {
+			if trackedAt.Extensions == nil {
+				trackedAt.Extensions = map[string]any{}
+			}
+			trackedAt.Extensions["x-omitempty"] = false
+			trackedAt.Extensions["x-oapi-codegen-extra-tags"] = map[string]any{
+				"validate": "omitempty",
+			}
+		}
+	}
+	if response := schemas["PersonMergeSnapshotResponse"]; response != nil {
+		if snapshot := response.Properties["snapshot"]; snapshot != nil {
+			if snapshot.Extensions == nil {
+				snapshot.Extensions = map[string]any{}
+			}
+			snapshot.Extensions["x-go-type"] = "json.RawMessage"
+			snapshot.Extensions["x-go-type-import"] = map[string]any{pathKey: "encoding/json"}
+		}
+	}
+	for schemaName, properties := range map[string][]string{
+		"PersonMergeDetail": {"participants", "review_candidates", "rows", "splits"},
+		"PersonMergeResult": {"review_candidates"},
+		"PersonSplitResult": {"ambiguous_rows"},
+	} {
+		if schema := schemas[schemaName]; schema != nil {
+			for _, propertyName := range properties {
+				if property := schema.Properties[propertyName]; property != nil {
+					if property.Extensions == nil {
+						property.Extensions = map[string]any{}
+					}
+					property.Extensions["x-omitempty"] = false
+				}
+			}
+		}
+	}
 	for _, schemaName := range []string{"ExploreGroupsHTTPRequest", "FileGroupsHTTPRequest"} {
 		if groups := schemas[schemaName]; groups != nil && groups.Properties["grouping"] != nil {
 			grouping := groups.Properties["grouping"]
@@ -495,6 +673,16 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 			}
 			grouping.Extensions["x-oapi-codegen-extra-tags"] = map[string]any{
 				"validate": "required,min=1,max=1",
+			}
+		}
+	}
+	if unavailable := schemas["ExploreCacheUnavailableResponse"]; unavailable != nil {
+		if recoveryAction := unavailable.Properties["recovery_action"]; recoveryAction != nil {
+			if recoveryAction.Extensions == nil {
+				recoveryAction.Extensions = map[string]any{}
+			}
+			recoveryAction.Extensions["x-oapi-codegen-extra-tags"] = map[string]any{
+				"validate": "omitempty",
 			}
 		}
 	}
@@ -518,11 +706,37 @@ func applyClientCodegenExtensions(doc *huma.OpenAPI) {
 		})
 	}
 	for schemaName, properties := range map[string]map[string][]any{
+		"AppendPersonNoteRequest": {
+			exploreFilterSource: {
+				"AppendPersonNoteRequestSourceUser",
+				"AppendPersonNoteRequestSourceCarddavImport",
+				"AppendPersonNoteRequestSourceVcardImport",
+				"AppendPersonNoteRequestSourceArchiveObservation",
+				"AppendPersonNoteRequestSourceExtraction",
+				"AppendPersonNoteRequestSourceEnrichment",
+				"AppendPersonNoteRequestSourceSystem",
+			},
+		},
+		"CreateCommunicationServiceRequest": {
+			"normalization": {
+				"CreateCommunicationServiceRequestNormalizationNone",
+				"CreateCommunicationServiceRequestNormalizationLower",
+				"CreateCommunicationServiceRequestNormalizationEmail",
+				"CreateCommunicationServiceRequestNormalizationPhoneE164",
+				"CreateCommunicationServiceRequestNormalizationStripAtLower",
+				"CreateCommunicationServiceRequestNormalizationByAddressKind",
+			},
+			"scope_policy": {
+				"CreateCommunicationServiceRequestScopePolicyNone",
+				"CreateCommunicationServiceRequestScopePolicyOptional",
+				"CreateCommunicationServiceRequestScopePolicyRequired",
+			},
+		},
 		"ExploreCacheUnavailableResponse": {
-			"readiness": {"ExploreCacheUnavailableResponseReadinessAbsent", "ExploreCacheUnavailableResponseReadinessInterrupted", "ExploreCacheUnavailableResponseReadinessStaleSchema", "ExploreCacheUnavailableResponseReadinessDrifted"},
+			"readiness": {"ExploreCacheUnavailableResponseReadinessAbsent", "ExploreCacheUnavailableResponseReadinessBuilding", "ExploreCacheUnavailableResponseReadinessInterrupted", "ExploreCacheUnavailableResponseReadinessStaleSchema", "ExploreCacheUnavailableResponseReadinessDrifted"},
 		},
 		"ExploreFilter": {
-			"dimension": {"ExploreFilterDimensionSource", "ExploreFilterDimensionParticipant", "ExploreFilterDimensionDomain", "ExploreFilterDimensionMessageType", "ExploreFilterDimensionAfter", "ExploreFilterDimensionBefore", "ExploreFilterDimensionDeletion"},
+			"dimension": {"ExploreFilterDimensionSource", "ExploreFilterDimensionParticipant", "ExploreFilterDimensionDomain", "ExploreFilterDimensionMessageType", "ExploreFilterDimensionAfter", "ExploreFilterDimensionBefore", "ExploreFilterDimensionDeletion", "ExploreFilterDimensionIdentity"},
 		},
 		"ExploreGroupSort": {
 			"direction": {"ExploreGroupSortDirectionAsc", "ExploreGroupSortDirectionDesc"},

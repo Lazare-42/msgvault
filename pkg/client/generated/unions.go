@@ -272,6 +272,24 @@ func (s *SearchDomains_ErrorResponse_503_AnyOf) Validate() error {
 	return nil
 }
 
+type GetDomain_ErrorResponse_AnyOf struct {
+	runtime.Either[ExploreCacheUnavailableResponse, ErrorResponse]
+}
+
+func (g *GetDomain_ErrorResponse_AnyOf) Validate() error {
+	if g.IsA() {
+		if v, ok := any(g.A).(runtime.Validator); ok {
+			return v.Validate()
+		}
+	}
+	if g.IsB() {
+		if v, ok := any(g.B).(runtime.Validator); ok {
+			return v.Validate()
+		}
+	}
+	return nil
+}
+
 type SearchDomainFiles_ErrorResponse_503_AnyOf struct {
 	runtime.Either[ExploreCacheUnavailableResponse, ErrorResponse]
 }
@@ -452,11 +470,47 @@ func (s *SearchFiles_ErrorResponse_503_AnyOf) Validate() error {
 	return nil
 }
 
-type SearchPeople_ErrorResponse_503_AnyOf struct {
+type LinkIdentityParticipants_ErrorResponse_AnyOf struct {
+	runtime.Either[PersonMergeRequiredError, ErrorResponse]
+}
+
+func (l *LinkIdentityParticipants_ErrorResponse_AnyOf) Validate() error {
+	if l.IsA() {
+		if v, ok := any(l.A).(runtime.Validator); ok {
+			return v.Validate()
+		}
+	}
+	if l.IsB() {
+		if v, ok := any(l.B).(runtime.Validator); ok {
+			return v.Validate()
+		}
+	}
+	return nil
+}
+
+type AcceptIdentityMatchCandidate_ErrorResponse_409_AnyOf struct {
+	runtime.Either[PersonMergeRequiredError, ErrorResponse]
+}
+
+func (a *AcceptIdentityMatchCandidate_ErrorResponse_409_AnyOf) Validate() error {
+	if a.IsA() {
+		if v, ok := any(a.A).(runtime.Validator); ok {
+			return v.Validate()
+		}
+	}
+	if a.IsB() {
+		if v, ok := any(a.B).(runtime.Validator); ok {
+			return v.Validate()
+		}
+	}
+	return nil
+}
+
+type SearchParticipants_ErrorResponse_503_AnyOf struct {
 	runtime.Either[ExploreCacheUnavailableResponse, ErrorResponse]
 }
 
-func (s *SearchPeople_ErrorResponse_503_AnyOf) Validate() error {
+func (s *SearchParticipants_ErrorResponse_503_AnyOf) Validate() error {
 	if s.IsA() {
 		if v, ok := any(s.A).(runtime.Validator); ok {
 			return v.Validate()
@@ -464,6 +518,96 @@ func (s *SearchPeople_ErrorResponse_503_AnyOf) Validate() error {
 	}
 	if s.IsB() {
 		if v, ok := any(s.B).(runtime.Validator); ok {
+			return v.Validate()
+		}
+	}
+	return nil
+}
+
+type GetParticipant_ErrorResponse_AnyOf struct {
+	runtime.Either[ExploreCacheUnavailableResponse, ErrorResponse]
+}
+
+func (g *GetParticipant_ErrorResponse_AnyOf) Validate() error {
+	if g.IsA() {
+		if v, ok := any(g.A).(runtime.Validator); ok {
+			return v.Validate()
+		}
+	}
+	if g.IsB() {
+		if v, ok := any(g.B).(runtime.Validator); ok {
+			return v.Validate()
+		}
+	}
+	return nil
+}
+
+type SearchParticipantFiles_ErrorResponse_503_AnyOf struct {
+	runtime.Either[ExploreCacheUnavailableResponse, ErrorResponse]
+}
+
+func (s *SearchParticipantFiles_ErrorResponse_503_AnyOf) Validate() error {
+	if s.IsA() {
+		if v, ok := any(s.A).(runtime.Validator); ok {
+			return v.Validate()
+		}
+	}
+	if s.IsB() {
+		if v, ok := any(s.B).(runtime.Validator); ok {
+			return v.Validate()
+		}
+	}
+	return nil
+}
+
+type ListParticipantInboxes_ErrorResponse_AnyOf struct {
+	runtime.Either[ExploreCacheUnavailableResponse, ErrorResponse]
+}
+
+func (l *ListParticipantInboxes_ErrorResponse_AnyOf) Validate() error {
+	if l.IsA() {
+		if v, ok := any(l.A).(runtime.Validator); ok {
+			return v.Validate()
+		}
+	}
+	if l.IsB() {
+		if v, ok := any(l.B).(runtime.Validator); ok {
+			return v.Validate()
+		}
+	}
+	return nil
+}
+
+type GetParticipantContextSummary_ErrorResponse_503_AnyOf struct {
+	runtime.Either[ExploreCacheUnavailableResponse, ErrorResponse]
+}
+
+func (g *GetParticipantContextSummary_ErrorResponse_503_AnyOf) Validate() error {
+	if g.IsA() {
+		if v, ok := any(g.A).(runtime.Validator); ok {
+			return v.Validate()
+		}
+	}
+	if g.IsB() {
+		if v, ok := any(g.B).(runtime.Validator); ok {
+			return v.Validate()
+		}
+	}
+	return nil
+}
+
+type GetParticipantTimeline_ErrorResponse_503_AnyOf struct {
+	runtime.Either[ExploreCacheUnavailableResponse, ErrorResponse]
+}
+
+func (g *GetParticipantTimeline_ErrorResponse_503_AnyOf) Validate() error {
+	if g.IsA() {
+		if v, ok := any(g.A).(runtime.Validator); ok {
+			return v.Validate()
+		}
+	}
+	if g.IsB() {
+		if v, ok := any(g.B).(runtime.Validator); ok {
 			return v.Validate()
 		}
 	}
@@ -488,42 +632,6 @@ func (s *SearchPersonFiles_ErrorResponse_503_AnyOf) Validate() error {
 	return nil
 }
 
-type GetPersonContextSummary_ErrorResponse_503_AnyOf struct {
-	runtime.Either[ExploreCacheUnavailableResponse, ErrorResponse]
-}
-
-func (g *GetPersonContextSummary_ErrorResponse_503_AnyOf) Validate() error {
-	if g.IsA() {
-		if v, ok := any(g.A).(runtime.Validator); ok {
-			return v.Validate()
-		}
-	}
-	if g.IsB() {
-		if v, ok := any(g.B).(runtime.Validator); ok {
-			return v.Validate()
-		}
-	}
-	return nil
-}
-
-type GetPersonTimeline_ErrorResponse_503_AnyOf struct {
-	runtime.Either[ExploreCacheUnavailableResponse, ErrorResponse]
-}
-
-func (g *GetPersonTimeline_ErrorResponse_503_AnyOf) Validate() error {
-	if g.IsA() {
-		if v, ok := any(g.A).(runtime.Validator); ok {
-			return v.Validate()
-		}
-	}
-	if g.IsB() {
-		if v, ok := any(g.B).(runtime.Validator); ok {
-			return v.Validate()
-		}
-	}
-	return nil
-}
-
 type ListRelationships_ErrorResponse_503_AnyOf struct {
 	runtime.Either[ExploreCacheUnavailableResponse, ErrorResponse]
 }
@@ -536,6 +644,24 @@ func (l *ListRelationships_ErrorResponse_503_AnyOf) Validate() error {
 	}
 	if l.IsB() {
 		if v, ok := any(l.B).(runtime.Validator); ok {
+			return v.Validate()
+		}
+	}
+	return nil
+}
+
+type GetRelationshipCalendar_ErrorResponse_503_AnyOf struct {
+	runtime.Either[ExploreCacheUnavailableResponse, ErrorResponse]
+}
+
+func (g *GetRelationshipCalendar_ErrorResponse_503_AnyOf) Validate() error {
+	if g.IsA() {
+		if v, ok := any(g.A).(runtime.Validator); ok {
+			return v.Validate()
+		}
+	}
+	if g.IsB() {
+		if v, ok := any(g.B).(runtime.Validator); ok {
 			return v.Validate()
 		}
 	}
@@ -572,6 +698,24 @@ func (s *SearchMessages_Response_OneOf) Validate() error {
 	}
 	if s.IsB() {
 		if v, ok := any(s.B).(runtime.Validator); ok {
+			return v.Validate()
+		}
+	}
+	return nil
+}
+
+type GetSearchCoverage_ErrorResponse_503_AnyOf struct {
+	runtime.Either[ExploreCacheUnavailableResponse, ErrorResponse]
+}
+
+func (g *GetSearchCoverage_ErrorResponse_503_AnyOf) Validate() error {
+	if g.IsA() {
+		if v, ok := any(g.A).(runtime.Validator); ok {
+			return v.Validate()
+		}
+	}
+	if g.IsB() {
+		if v, ok := any(g.B).(runtime.Validator); ok {
 			return v.Validate()
 		}
 	}

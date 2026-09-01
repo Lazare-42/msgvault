@@ -1,10 +1,11 @@
 package mime
 
 import (
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/jhillyerd/enmime"
+	"github.com/jhillyerd/enmime/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	testemail "go.kenn.io/msgvault/internal/testutil/email"
@@ -30,6 +31,275 @@ func mustParse(t *testing.T, raw []byte) *Message {
 func parseEmail(t *testing.T, opts emailOptions) *Message {
 	t.Helper()
 	return mustParse(t, makeRawEmail(opts))
+}
+
+func TestParsePreservesAuthoritativeAttachmentEvidence(t *testing.T) {
+	assert := assert.New(t)
+	raw := []byte("From: sender@example.com\r\n" +
+		"To: recipient@example.com\r\n" +
+		"Subject: attachment evidence\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/mixed; boundary=outer\r\n\r\n" +
+		"--outer\r\nContent-Type: text/plain\r\n\r\nbody\r\n" +
+		"--outer\r\nContent-Type: application/pdf\r\n" +
+		"Content-Disposition: attachment; filename=report.pdf\r\n\r\npdf\r\n" +
+		"--outer\r\nContent-Type: image/png; name=inline.png\r\n" +
+		"Content-Disposition: inline; filename=inline.png\r\n" +
+		"Content-ID: <inline-1>\r\n\r\npng\r\n" +
+		"--outer--\r\n")
+
+	msg := mustParse(t, raw)
+	require.Len(t, msg.Attachments, 2)
+	assert.Equal("attachment", msg.Attachments[0].Disposition)
+	assert.False(msg.Attachments[0].IsInline)
+	assert.NotEmpty(msg.Attachments[0].PartKey)
+	assert.Equal("inline", msg.Attachments[1].Disposition)
+	assert.True(msg.Attachments[1].IsInline)
+	assert.Equal("inline-1", msg.Attachments[1].ContentID)
+	assert.NotEmpty(msg.Attachments[1].PartKey)
+	assert.NotEqual(msg.Attachments[0].PartKey, msg.Attachments[1].PartKey)
+
+	ambiguous := makeAttachment(&enmime.Part{
+		PartID: "4", ContentType: "image/jpeg", FileName: "ambiguous.jpg", Content: []byte("jpeg"),
+	}, false)
+	assert.Empty(ambiguous.Disposition)
+	assert.False(ambiguous.IsInline)
+	assert.Equal("mime:4", ambiguous.PartKey)
+}
+
+func TestParse_InvalidPartContentType(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	raw := []byte("From: sender@example.com\r\n" +
+		"To: recipient@example.com\r\n" +
+		"Subject: Statement ready\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/mixed; boundary=outer\r\n\r\n" +
+		"--outer\r\nContent-Type: text/plain\r\n\r\nAttached is a synthetic statement.\r\n" +
+		"--outer\r\nContent-Type: cannot open (No such file or directory)\r\n" +
+		"Content-Disposition: attachment; filename=statement.pdf\r\n" +
+		"Content-Transfer-Encoding: base64\r\n\r\nAAH+/w==\r\n" +
+		"--outer--\r\n")
+
+	msg, err := Parse(raw)
+	require.NoError(err)
+	assert.Equal("Statement ready", msg.Subject)
+	assert.Equal("Attached is a synthetic statement.", msg.BodyText)
+	require.Len(msg.Attachments, 1)
+	assert.Equal("statement.pdf", msg.Attachments[0].Filename)
+	assert.Equal("application/octet-stream", msg.Attachments[0].ContentType)
+	assert.Equal([]byte{0, 1, 254, 255}, msg.Attachments[0].Content)
+}
+
+func TestParse_InvalidTextPartContentTypeDefaultsToBody(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	raw := []byte("From: sender@example.com\r\n" +
+		"To: recipient@example.com\r\n" +
+		"Subject: malformed body type\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/mixed; boundary=outer\r\n\r\n" +
+		"--outer\r\nContent-Type: text plain\r\n\r\nsearchable body\r\n" +
+		"--outer--\r\n")
+
+	msg := mustParse(t, raw)
+	assert.Equal("searchable body", msg.BodyText)
+	assert.Empty(msg.Attachments)
+	require.Len(msg.Errors, 1)
+	assert.Contains(msg.Errors[0], "invalid Content-Type treated as text/plain")
+}
+
+func TestParse_InvalidPartContentTypePreservesNameParameter(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	raw := []byte("From: sender@example.com\r\n" +
+		"To: recipient@example.com\r\n" +
+		"Subject: name parameter\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/mixed; boundary=outer\r\n\r\n" +
+		"--outer\r\nContent-Type: text/plain\r\n\r\nbody\r\n" +
+		"--outer\r\nContent-Type: invalid value; name=named.pdf\r\n" +
+		"Content-Transfer-Encoding: base64\r\n\r\nc3ludGhldGljIHBkZiBieXRlcw==\r\n" +
+		"--outer--\r\n")
+
+	msg := mustParse(t, raw)
+	require.Len(msg.Attachments, 1)
+	assert.Equal("named.pdf", msg.Attachments[0].Filename)
+	assert.Equal("application/octet-stream", msg.Attachments[0].ContentType)
+	assert.Empty(msg.Attachments[0].Disposition)
+	assert.False(msg.Attachments[0].IsInline)
+	assert.Equal([]byte("synthetic pdf bytes"), msg.Attachments[0].Content)
+}
+
+func TestParse_InvalidPartContentTypePreservesContentIDAsInline(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	raw := []byte("From: sender@example.com\r\n" +
+		"To: recipient@example.com\r\n" +
+		"Subject: inline resource\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/related; boundary=outer\r\n\r\n" +
+		"--outer\r\nContent-Type: text/html\r\n\r\n<img src=\"cid:image-1\">\r\n" +
+		"--outer\r\nContent-Type: invalid value\r\n" +
+		"Content-ID: <image-1>\r\n" +
+		"Content-Transfer-Encoding: base64\r\n\r\nAAH+/w==\r\n" +
+		"--outer--\r\n")
+
+	msg := mustParse(t, raw)
+	require.Len(msg.Attachments, 1)
+	assert.Equal("application/octet-stream", msg.Attachments[0].ContentType)
+	assert.Equal("image-1", msg.Attachments[0].ContentID)
+	assert.Empty(msg.Attachments[0].Disposition)
+	assert.True(msg.Attachments[0].IsInline)
+	assert.Equal([]byte{0, 1, 254, 255}, msg.Attachments[0].Content)
+}
+
+func TestParse_InvalidMultipartContentTypeWithBoundaryRemainsFatal(t *testing.T) {
+	raw := []byte("From: sender@example.com\r\n" +
+		"To: recipient@example.com\r\n" +
+		"Subject: malformed multipart\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart mixed; boundary=outer\r\n\r\n" +
+		"--outer\r\nContent-Type: text/plain\r\n\r\nbody\r\n" +
+		"--outer--\r\n")
+
+	msg, err := Parse(raw)
+	assert.Nil(t, msg)
+	require.ErrorContains(t, err, "expected slash after first token")
+}
+
+func TestParseWithRecovery_FatalMultipartSalvagesHeaders(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	raw := []byte("From: Sender Example <sender@example.test>\r\n" +
+		"To: Recipient Example <recipient@example.test>\r\n" +
+		"Cc: Copy Example <copy@example.test>\r\n" +
+		"Subject: =?UTF-8?Q?Recovered_=E2=9C=93?=\r\n" +
+		"Date: Tue, 02 Jan 2024 15:04:05 +0000\r\n" +
+		"Received: from relay.example.test by mx.example.test; Wed, 03 Jan 2024 15:04:05 +0000\r\n" +
+		"Received: from sender.example.test by relay.example.test; Tue, 02 Jan 2024 15:04:05 +0000\r\n" +
+		"Message-ID: <message@example.test>\r\n" +
+		"In-Reply-To: <parent@example.test>\r\n" +
+		"References: <root@example.test>\r\n" +
+		"\t<parent@example.test>\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: multipart mixed; boundary=outer\r\n\r\n" +
+		"--outer\r\nContent-Type: text/plain\r\n\r\nbody\r\n" +
+		"--outer--\r\n")
+
+	msg, err := ParseWithRecovery(raw, "snippet fallback")
+	require.ErrorContains(err, "expected slash after first token")
+	require.NotNil(msg)
+	assert.Equal("Recovered ✓", msg.Subject)
+	assert.Equal(time.Date(2024, 1, 2, 15, 4, 5, 0, time.UTC), msg.Date)
+	assert.Equal("Tue, 02 Jan 2024 15:04:05 +0000", msg.RawDateHeader)
+	assert.Equal([]time.Time{
+		time.Date(2024, 1, 3, 15, 4, 5, 0, time.UTC),
+		time.Date(2024, 1, 2, 15, 4, 5, 0, time.UTC),
+	}, msg.ReceivedDates)
+	assert.Equal([]Address{{
+		Name: "Sender Example", Email: "sender@example.test", Domain: "example.test",
+	}}, msg.From)
+	assert.Equal([]Address{{
+		Name: "Recipient Example", Email: "recipient@example.test", Domain: "example.test",
+	}}, msg.To)
+	assert.Equal([]Address{{
+		Name: "Copy Example", Email: "copy@example.test", Domain: "example.test",
+	}}, msg.Cc)
+	assert.Equal("<message@example.test>", msg.MessageID)
+	assert.Equal("<parent@example.test>", msg.InReplyTo)
+	assert.Equal([]string{"root@example.test", "parent@example.test"}, msg.References)
+	assert.Contains(msg.BodyText, "MIME parsing failed")
+	assert.Contains(msg.BodyText, "Raw MIME data is preserved")
+	assert.Empty(msg.BodyHTML)
+	assert.Empty(msg.Attachments)
+}
+
+func TestParseWithRecovery_FatalMultipartSanitizesThreadingHeaders(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	raw := []byte("Message-ID: <message-\xff@example.test>\r\n" +
+		"In-Reply-To: <parent-\xfe@example.test>\r\n" +
+		"References: <root-\xfd@example.test>\r\n" +
+		"Content-Type: multipart mixed; boundary=outer\r\n\r\n" +
+		"--outer--\r\n")
+
+	msg, err := ParseWithRecovery(raw, "snippet fallback")
+
+	require.ErrorContains(err, "expected slash after first token")
+	assert.Equal("<message-\uFFFD@example.test>", msg.MessageID)
+	assert.Equal("<parent-\uFFFD@example.test>", msg.InReplyTo)
+	assert.Equal([]string{"root-\uFFFD@example.test"}, msg.References)
+}
+
+func TestParseWithRecovery_UsesFallbackWithoutRecoverableHeaders(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	msg, err := ParseWithRecovery(
+		[]byte("not valid mime at all - just garbage"),
+		"snippet fallback",
+	)
+
+	require.Error(err)
+	require.NotNil(msg)
+	assert.Equal("snippet fallback", msg.Subject)
+	assert.Empty(msg.From)
+	assert.True(msg.Date.IsZero())
+	assert.Contains(msg.BodyText, "MIME parsing failed")
+}
+
+func TestParseWithRecovery_DoesNotSalvageHeadersFromBody(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	raw := []byte("Content-Type: multipart mixed; boundary=outer\r\n\r\n" +
+		"Subject: body spoof\r\n" +
+		"From: body@example.test\r\n")
+
+	msg, err := ParseWithRecovery(raw, "snippet fallback")
+
+	require.Error(err)
+	require.NotNil(msg)
+	assert.Equal("snippet fallback", msg.Subject)
+	assert.Empty(msg.From)
+}
+
+func TestParseWithRecovery_SkipsMalformedTopLevelHeaderLine(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	raw := []byte("this is not a header\r\n" +
+		"From: sender@example.test\r\n" +
+		"Subject: recovered after malformed line\r\n\r\n" +
+		"body\r\n")
+
+	msg, err := ParseWithRecovery(raw, "snippet fallback")
+
+	require.Error(err)
+	require.NotNil(msg)
+	assert.Equal("recovered after malformed line", msg.Subject)
+	assert.Equal([]Address{{
+		Email: "sender@example.test", Domain: "example.test",
+	}}, msg.From)
+}
+
+func TestTokenizeHeaders_FoldedHeaderUsesBoundedAllocations(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	var raw strings.Builder
+	raw.WriteString("References: <root@example.test>\r\n")
+	for range 4096 {
+		raw.WriteString("\t<next@example.test>\r\n")
+	}
+	raw.WriteString("\r\n")
+	rawBytes := []byte(raw.String())
+
+	headers := tokenizeHeaders(rawBytes)
+	require.Len(headers["references"], 1)
+	assert.Contains(headers["references"][0], "<root@example.test> <next@example.test>")
+
+	allocations := testing.AllocsPerRun(1, func() {
+		tokenizeHeaders(rawBytes)
+	})
+	assert.Less(allocations, 100.0)
 }
 
 // assertAddress checks that got has exactly wantLen elements and got[idx] has the expected email and (optionally) domain.
@@ -351,6 +621,45 @@ func TestParse_MinimalMessage(t *testing.T) {
 	assert.Equal(t, "Test", msg.Subject)
 
 	assert.Equal(t, "Body text", msg.BodyText)
+}
+
+func TestParse_AddressListKeepsValidAndMalformedTokens(t *testing.T) {
+	raw := []byte("From: sender@example.com\r\n" +
+		"To: valid-a@example.com, v..porter@enron.com,\r\n" +
+		"\tvalid-b@example.com, valid-c@example.com\r\n" +
+		"Subject: Recipients\r\n\r\nBody")
+
+	msg := mustParse(t, raw)
+	got := make([]string, len(msg.To))
+	for i, address := range msg.To {
+		got[i] = address.Email
+	}
+
+	assert.ElementsMatch(t, []string{
+		"valid-a@example.com",
+		"v..porter@enron.com",
+		"valid-b@example.com",
+		"valid-c@example.com",
+	}, got)
+}
+
+func TestParse_AddressListFallbackIgnoresQuotedNamesAndComments(t *testing.T) {
+	raw := []byte("From: sender@example.com\r\n" +
+		"To: \"display email-like@example.com\" <valid-a@example.com>,\r\n" +
+		"\tv..porter@enron.com (comment@example.com), valid-b@example.com\r\n" +
+		"Subject: Recipients\r\n\r\nBody")
+
+	msg := mustParse(t, raw)
+	got := make([]string, len(msg.To))
+	for i, address := range msg.To {
+		got[i] = address.Email
+	}
+
+	assert.ElementsMatch(t, []string{
+		"valid-a@example.com",
+		"v..porter@enron.com",
+		"valid-b@example.com",
+	}, got)
 }
 
 // TestParse_MalformedContinuationLineAfterDate reproduces an mbox-derived

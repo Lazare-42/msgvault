@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/api"
+	"go.kenn.io/msgvault/internal/carddav"
 	"go.kenn.io/msgvault/internal/circleback"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/deletion"
@@ -28,6 +30,8 @@ import (
 	"go.kenn.io/msgvault/internal/microsoft"
 	"go.kenn.io/msgvault/internal/oauth"
 	"go.kenn.io/msgvault/internal/ocr"
+	"go.kenn.io/msgvault/internal/personenrichment"
+	"go.kenn.io/msgvault/internal/personfacts"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/search"
@@ -76,6 +80,17 @@ var buildCacheSubprocessForRun = func(ctx context.Context, fullRebuild bool) err
 	return buildCacheSubprocess(ctx, fullRebuild, true)
 }
 
+var buildStartupCacheSubprocessForRun = func(
+	ctx context.Context,
+	intent startupCacheBuildIntent,
+) error {
+	mode := buildCacheModeAuto
+	if intent == startupCacheBuildIntentFull {
+		mode = buildCacheModeFull
+	}
+	return buildCacheSubprocessMode(ctx, mode)
+}
+
 var executeBuildCacheSubprocessMode = buildCacheSubprocessMode
 
 var runDerivedCacheSubprocess = func(ctx context.Context, analyticsDir string) error {
@@ -101,6 +116,9 @@ var runDerivedCacheSubprocess = func(ctx context.Context, analyticsDir string) e
 var (
 	importDiscordSourceForScheduledRun  = importDiscordSource
 	rebuildCacheAfterScheduledSourceRun = rebuildCacheAfterScheduledSync
+	startServeAPIServer                 = func(server *api.Server, listener net.Listener) error {
+		return server.StartOnListener(listener)
+	}
 )
 
 type serveRuntimeAPIServer interface {
@@ -171,7 +189,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("claim daemon ownership: %w", err)
 	}
+	heartbeatCtx, stopHeartbeat := context.WithCancel(cmd.Context())
+	heartbeatDone := make(chan struct{})
+	go func() {
+		defer close(heartbeatDone)
+		runtimeRecordHeartbeat(heartbeatCtx, ownership, daemonRuntimeHeartbeatInterval)
+	}()
 	defer func() {
+		stopHeartbeat()
+		<-heartbeatDone
 		if err := ownership.Close(); err != nil {
 			logger.Warn("release daemon ownership failed", "error", err)
 		}
@@ -190,12 +216,31 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("open database: %w", err)
 	}
-	defer func() { _ = s.Close() }()
+	var analyticsInit *daemonAnalyticsInitHandle
+	var vectorInit *vectorInitHandle
+	resourceCleanupSafe := true
+	defer func() {
+		if !resourceCleanupSafe {
+			logger.Warn("archive database cleanup skipped", "error", "HTTP shutdown did not complete")
+			return
+		}
+		if err := closeDaemonStoreAfterInitializers(s, analyticsInit, vectorInit); err != nil {
+			logger.Warn("archive database cleanup skipped", "error", err)
+		}
+	}()
 	logger.Info("daemon startup step complete", "step", "open_archive_database")
 
 	setStartupPhase("migrating archive schema")
 	logger.Info("daemon startup step", "step", "init_archive_schema")
-	if err := s.InitSchema(); err != nil {
+	// Under the signal-cancelled root context, not a background one: on an
+	// existing archive this step runs a one-time full-table backfill that can
+	// take hours, and it runs before the port is bound. With a background
+	// context SIGINT and SIGTERM reach the process and nothing happens — the
+	// backfill and its open transaction carry on, and the operator's only
+	// remaining move is SIGKILL on a writing process. Cancelling here stops it
+	// at the next batch boundary, keeps every batch already committed, and
+	// leaves the migration unmarked so the next start resumes.
+	if err := s.InitSchemaContext(cmd.Context()); err != nil {
 		return fmt.Errorf("init schema: %w", err)
 	}
 	logger.Info("daemon startup step complete", "step", "init_archive_schema")
@@ -214,11 +259,17 @@ func runServe(cmd *cobra.Command, args []string) error {
 	operationGate := api.NewSerialOperationGate()
 	// Closed on shutdown so cached pack readers don't hold attachment pack
 	// files open past the daemon's lifetime (blocks deletion on Windows).
-	attachmentMaint, err := newAttachmentMaintenance(s, cfg.AttachmentsDir(), logger)
+	attachmentMaint, err := newAttachmentMaintenance(
+		s, cfg.AttachmentsDir(), logger, !cfg.Data.LooseAttachments,
+	)
 	if err != nil {
 		return fmt.Errorf("open attachment maintenance: %w", err)
 	}
-	defer func() { _ = attachmentMaint.close() }()
+	defer func() {
+		if resourceCleanupSafe {
+			_ = attachmentMaint.close()
+		}
+	}()
 	blobStore := attachmentMaint.blob
 
 	// Vector misconfiguration still fails startup fast; the expensive
@@ -228,18 +279,43 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err := precheckVectorFeatures(dbPath); err != nil {
 		return fmt.Errorf("vector features: %w", err)
 	}
-	if !cfg.Vector.Enabled {
+	if !cfg.Vector.AnyLaneEnabled() {
 		logger.Info("daemon startup step", "step", "skip_vector_backend", "enabled", false)
 	}
 
 	setStartupPhase("building analytics cache")
 	logger.Info("daemon startup step", "step", "init_analytics_engine")
-	engine, analyticsMode, err := openDaemonAnalyticsEngine(cmd.Context(), cfg, s)
+	startupCacheIntent, err := startupCacheBuildIntentFromEnv()
 	if err != nil {
 		return err
 	}
-	defer func() { _ = engine.Close() }()
-	logger.Info("daemon startup step complete", "step", "init_analytics_engine")
+	engine, analyticsMode, cacheOutcome, analyticsAsync, engineErr := prepareDaemonAnalyticsEngine(
+		ctx, cfg, s, startupCacheIntent,
+	)
+	if startupCacheIntent != startupCacheBuildIntentNone && !analyticsAsync {
+		if outcomeErr := ownership.SetStartupCacheBuildOutcome(cacheOutcome); outcomeErr != nil {
+			if engine != nil {
+				_ = engine.Close()
+			}
+			return outcomeErr
+		}
+	}
+	if engineErr != nil {
+		if engine != nil {
+			_ = engine.Close()
+		}
+		return engineErr
+	}
+	initialAnalyticsEngine := engine
+	analyticsServerStarted := false
+	defer func() {
+		if resourceCleanupSafe && !analyticsServerStarted && initialAnalyticsEngine != nil {
+			_ = initialAnalyticsEngine.Close()
+		}
+	}()
+	if !analyticsAsync {
+		logger.Info("daemon startup step complete", "step", "init_analytics_engine")
+	}
 
 	getOAuthMgr := oauthManagerCache()
 
@@ -257,6 +333,16 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Create and configure scheduler
 	sched := scheduler.New(syncFunc).WithLogger(logger).
 		WithWorkTracker(combineWorkTrackers(idleTracker, labelWorkTracker(operationGate, "a scheduled sync")))
+	cardDAVController, err := api.NewCardDAVController(cfg, s)
+	if err != nil {
+		return fmt.Errorf("configure CardDAV: %w", err)
+	}
+	cardDAVController.SetScheduleReconciler(func(cardDAVConfig config.CardDAVConfig, service api.CardDAVOperations) error {
+		return reconcileCardDAVSchedulerJob(sched, cardDAVConfig, service, logger)
+	})
+	if err := reconcileCardDAVSchedulerJob(sched, cfg.CardDAV, cardDAVController.Current(), logger); err != nil {
+		return err
+	}
 
 	// Add all scheduled accounts
 	count, errs := sched.AddAccountsFromConfig(cfg)
@@ -351,6 +437,29 @@ func runServe(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("schedule attachment OCR: %w", err)
 		}
 		logger.Info("scheduled attachment OCR", "schedule", cfg.OCR.Schedule, "socket", cfg.OCR.Socket)
+	}
+	if err := configureDocumentReconcileJob(
+		ctx, sched, s, cfg.Attachments.Documents.Enabled,
+	); err != nil {
+		return fmt.Errorf("configure document reconciliation: %w", err)
+	}
+	if err := registerActivityProjectionJob(
+		sched, s, cfg.Activity, logger); err != nil {
+		return fmt.Errorf("schedule activity projection: %w", err)
+	}
+	if cfg.People.Sweep.Enabled {
+		if err := cfg.People.Sweep.Validate(); err != nil {
+			return fmt.Errorf("validate people sweep: %w", err)
+		}
+	}
+	if err := addPeopleSweepJob(
+		sched, cfg.People.Sweep, newPeopleSweepScheduledRun(cfg.People.Sweep, s),
+	); err != nil {
+		return fmt.Errorf("schedule people sweep: %w", err)
+	}
+	if err := registerPersonEnrichmentJob(
+		ctx, sched, s, cfg.People.Enrichment); err != nil {
+		return fmt.Errorf("schedule person enrichment: %w", err)
 	}
 
 	if cfg.Beeper.Enabled && cfg.Beeper.Schedule == "" {
@@ -459,91 +568,144 @@ func runServe(cmd *cobra.Command, args []string) error {
 		AfterSourceSetup: func() error {
 			return runPostSourceCreateMigrations(s)
 		},
-		RefreshCache: rebuildCacheAfterScheduledSync,
-	})
+		RefreshCache: func(_ context.Context, label string) error {
+			// The import is already durable. Keep the refresh independent of the
+			// client, but let daemon shutdown stop it before the store closes.
+			return daemonCacheRefreshError(ctx, rebuildCacheAfterScheduledSync(ctx, label))
+		},
+	}).WithLogger(logger)
 	storeAdapter := &storeAPIAdapter{
-		store:                 s,
-		attachmentMaintenance: attachmentMaint,
-		meetingImporter:       meetingImporter,
-		analyticsDir:          cfg.AnalyticsDir(),
+		store:                  s,
+		attachmentMaintenance:  attachmentMaint,
+		meetingImporter:        meetingImporter,
+		analyticsDir:           cfg.AnalyticsDir(),
+		personEnrichmentConfig: cfg.People.Enrichment,
+		lookupEnv:              os.LookupEnv,
 	}
 	schedAdapter := &schedulerAdapter{scheduler: sched}
 
 	// Create and start API server
+	var apiServer *api.Server
 	apiOpts := api.ServerOptions{
 		Config:         cfg,
 		Store:          storeAdapter,
 		SavedViewStore: s,
 		Engine:         engine,
 		SQLQueryRunner: func(ctx context.Context, sql string) (*query.QueryResult, error) {
-			return runDaemonSQLQuery(ctx, cfg, s, engine, sql)
+			if apiServer == nil {
+				return nil, errors.New("daemon API server unavailable")
+			}
+			return runDaemonSQLQuery(ctx, cfg, s, apiServer.QueryEngineForRequest(ctx), sql)
 		},
-		ShutdownToken: ownership.shutdownToken,
-		ShutdownFunc:  cancel,
-		Scheduler:     schedAdapter,
-		Logger:        logger,
-		DaemonVersion: Version,
-		AnalyticsMode: analyticsMode,
-		IdleTracker:   idleTracker,
-		OperationGate: operationGate,
-		BlobStore:     blobStore,
-		OCRStore:      s,
+		OCRStore:                      s,
+		ShutdownToken:                 ownership.shutdownToken,
+		ShutdownFunc:                  cancel,
+		Scheduler:                     schedAdapter,
+		CardDAV:                       cardDAVController,
+		Logger:                        logger,
+		DaemonVersion:                 Version,
+		AnalyticsMode:                 analyticsMode,
+		AnalyticsInitializationActive: analyticsAsync,
+		IdleTracker:                   idleTracker,
+		OperationGate:                 operationGate,
+		BlobStore:                     blobStore,
 	}
 	applyServerRuntimeConfig(&apiOpts, cfg)
-	if cfg.Vector.Enabled {
+	if cfg.Vector.AnyLaneEnabled() {
 		apiOpts.VectorStatus = api.VectorStatusInitializing
 	}
-	apiServer := api.NewServerWithOptions(apiOpts)
+	apiServer = api.NewServerWithOptions(apiOpts)
 
 	// Start API server in goroutine
 	apiAddr := apiListener.Addr().String()
 	setStartupPhase("")
 	logger.Info("daemon startup step", "step", "start_api_server", "bind", apiAddr)
 	serverErr := make(chan error, 1)
-	listenerReserved = false
 	go func() {
-		if err := apiServer.StartOnListener(apiListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := startServeAPIServer(apiServer, apiListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
 		}
 	}()
-	if idleTracker != nil {
-		idleTracker.Touch()
-		go idleTracker.Run(ctx)
-		logger.Info("background daemon idle shutdown enabled", "timeout", cfg.Server.DaemonIdleTimeout)
-	}
-
-	vectorInit := startVectorInit(
-		ctx, s, dbPath,
-		combineWorkTrackers(idleTracker, labelWorkTracker(operationGate, "background embedding work")),
-		apiServer, sched,
-	)
-
-	fmt.Printf("msgvault daemon started\n")
-	fmt.Printf("  API server: http://%s\n", apiAddr)
-	fmt.Printf("  Scheduled accounts: %d\n", count)
-	fmt.Printf("  Data directory: %s\n", cfg.Data.DataDir)
-	fmt.Println()
-	fmt.Println("Press Ctrl+C to stop.")
-	fmt.Println()
-
-	// Print schedule info
-	for _, status := range sched.Status() {
-		fmt.Printf("  %s: next sync at %s\n", status.Email, status.NextRun.Local().Format("2006-01-02 15:04:05"))
-	}
-	fmt.Println()
-
-	// Wait for shutdown signal or server error
 	var serverStartupErr error
-	select {
-	case sig := <-sigChan:
-		logger.Info("received shutdown signal", "signal", sig)
-		fmt.Printf("\nReceived %s, shutting down...\n", sig)
-	case err := <-serverErr:
-		logger.Error("API server error", "error", err)
-		fmt.Printf("\nAPI server error: %v\n", err)
-		serverStartupErr = err
-	case <-ctx.Done():
-		logger.Info("context cancelled")
+	startErr := apiServer.WaitStarted(ctx)
+	if startErr != nil {
+		if ctx.Err() == nil {
+			serverStartupErr = startErr
+		}
+		// A cancelled context may win the readiness wait before the listener
+		// goroutine gets scheduled. Wait for its startup barrier to settle before
+		// shutdown or deferred cleanup can release resources used by startup.
+		if barrierErr := apiServer.WaitStarted(context.Background()); barrierErr != nil && serverStartupErr == nil {
+			serverStartupErr = barrierErr
+		} else if barrierErr == nil {
+			listenerReserved = false
+			resourceCleanupSafe = false
+		}
+		cancel()
+	} else {
+		listenerReserved = false
+		analyticsServerStarted = true
+		resourceCleanupSafe = false
+		if analyticsAsync {
+			analyticsInit = startDaemonAnalyticsInitializer(
+				ctx, cfg, s, startupCacheIntent, apiServer, ownership,
+				combineWorkTrackers(
+					idleTracker,
+					labelWorkTracker(operationGate, "analytics cache initialization"),
+				),
+			)
+		} else {
+			analyticsInit = completedDaemonAnalyticsInitHandle()
+		}
+		// Analytics must acquire the serial mutation gate before vector
+		// initialization can compete for it. This keeps an explicit cache
+		// request from waiting behind a long vector migration or backfill.
+		_ = analyticsInit.WaitStarted(ctx)
+		if idleTracker != nil {
+			idleTracker.Touch()
+			go idleTracker.Run(ctx)
+			logger.Info("background daemon idle shutdown enabled", "timeout", cfg.Server.DaemonIdleTimeout)
+		}
+
+		vectorInit = startVectorInit(
+			ctx, s, dbPath,
+			combineWorkTrackers(idleTracker, labelWorkTracker(operationGate, "background embedding work")),
+			apiServer, sched, blobStore,
+		)
+
+		fmt.Printf("msgvault daemon started\n")
+		fmt.Printf("  API server: http://%s\n", apiAddr)
+		fmt.Printf("  Scheduled accounts: %d\n", count)
+		fmt.Printf("  Data directory: %s\n", cfg.Data.DataDir)
+		fmt.Println()
+		fmt.Println("Press Ctrl+C to stop.")
+		fmt.Println()
+
+		// Print schedule info
+		for _, status := range sched.Status() {
+			fmt.Printf("  %s: next sync at %s\n", status.Email, status.NextRun.Local().Format("2006-01-02 15:04:05"))
+		}
+		fmt.Println()
+
+		// Wait for shutdown signal or server error
+		select {
+		case sig := <-sigChan:
+			logger.Info("received shutdown signal", "signal", sig)
+			fmt.Printf("\nReceived %s, shutting down...\n", sig)
+		case err := <-serverErr:
+			logger.Error("API server error", "error", err)
+			fmt.Printf("\nAPI server error: %v\n", err)
+			serverStartupErr = err
+		case err := <-analyticsInit.Fatal():
+			if ctx.Err() == nil {
+				logger.Error("analytics initialization error", "error", err)
+				fmt.Printf("\nAnalytics initialization error: %v\n", err)
+				serverStartupErr = err
+				cancel()
+			}
+		case <-ctx.Done():
+			logger.Info("context cancelled")
+		}
 	}
 
 	// Stop background work first: vector init honors ctx, so cancelling
@@ -553,6 +715,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), serveOperationDrainTimeout)
 	defer shutdownCancel()
 	shutdownErr := shutdownServeRuntime(shutdownCtx, cmd.OutOrStdout(), apiServer, sched, operationGate)
+	if shutdownErr == nil {
+		resourceCleanupSafe = true
+	}
 	// Wait for the background vector init regardless of the shutdown
 	// outcome: the deferred s.Close() must not run under a still-running
 	// init goroutine, and vectors.db needs closing whenever init finished.
@@ -560,10 +725,24 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// fresh full drain window — shutdownServeRuntime already consumed part
 	// of it, and `daemon stop` budgets only one drain window before it kills
 	// the daemon (serveStopGraceTimeout).
-	if vectorInit.WaitContext(shutdownCtx) {
-		vectorInit.CloseFeatures()
-	} else {
-		logger.Warn("vector init did not stop within the shutdown drain timeout; skipping vectors.db close")
+	if vectorInit != nil {
+		if vectorInit.WaitContext(shutdownCtx) {
+			if resourceCleanupSafe {
+				vectorInit.CloseFeatures()
+			}
+		} else {
+			logger.Warn("vector init did not stop within the shutdown drain timeout; skipping vectors.db close")
+		}
+	}
+	if analyticsInit != nil {
+		analyticsReady := analyticsInit.WaitContext(shutdownCtx)
+		if analyticsReady && resourceCleanupSafe {
+			if err := closeDaemonAnalyticsEngines(apiServer, initialAnalyticsEngine, analyticsInit); err != nil {
+				shutdownErr = errors.Join(shutdownErr, err)
+			}
+		} else if !analyticsReady {
+			logger.Warn("analytics initialization did not stop within the shutdown drain timeout; skipping analytics engine close")
+		}
 	}
 	if shutdownErr != nil {
 		logger.Error("daemon shutdown error", "error", shutdownErr)
@@ -574,6 +753,43 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 
 	return nil
+}
+
+func reconcileCardDAVSchedulerJob(sched *scheduler.Scheduler, cardDAVConfig config.CardDAVConfig, service api.CardDAVOperations, logger *slog.Logger) error {
+	if !cardDAVConfig.Enabled || cardDAVConfig.Schedule == "" {
+		sched.RemoveJob(api.CardDAVJobName)
+		if cardDAVConfig.Enabled && cardDAVConfig.Schedule == "" {
+			logger.Warn("carddav is enabled but has no schedule — the daemon will not sync it",
+				"hint", `set a cron schedule (e.g. "0 */6 * * *") in [carddav]`)
+		}
+		return nil
+	}
+	if service == nil {
+		sched.RemoveJob(api.CardDAVJobName)
+		logger.Warn("carddav credentials are unavailable or do not match saved discovery; skipping scheduled sync",
+			"hint", "save the CardDAV account with its password to repair the connection")
+		return nil
+	}
+	if err := sched.AddJob(scheduler.Job{
+		Name: api.CardDAVJobName, Schedule: cardDAVConfig.Schedule,
+		Run: func(ctx context.Context) error {
+			_, err := service.Sync(ctx, carddav.SyncOptions{})
+			return err
+		},
+	}); err != nil {
+		return fmt.Errorf("schedule CardDAV sync: %w", err)
+	}
+	return nil
+}
+
+func daemonCacheRefreshError(ctx context.Context, err error) error {
+	if err == nil {
+		return nil
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
 }
 
 func applyServerRuntimeConfig(options *api.ServerOptions, cfg *config.Config) {
@@ -683,6 +899,9 @@ func runDaemonSQLQuery(
 	if c == nil || s == nil {
 		return nil, errors.New("daemon query unavailable")
 	}
+	if engine == nil {
+		return nil, api.ErrSQLQueryEngineUnavailable
+	}
 	if s.IsPostgreSQL() {
 		if querier, ok := engine.(query.SQLQuerier); ok {
 			return querier.QuerySQL(ctx, sqlStr)
@@ -725,12 +944,18 @@ func openDaemonAnalyticsEngine(
 	ctx context.Context,
 	c *config.Config,
 	s *store.Store,
-) (query.Engine, string, error) {
+	intent startupCacheBuildIntent,
+) (query.Engine, string, startupCacheBuildOutcome, error) {
 	if c == nil || s == nil {
-		return nil, "", errors.New("daemon analytics engine unavailable")
+		return nil, "", startupCacheBuildOutcomeNone,
+			errors.New("daemon analytics engine unavailable")
 	}
 	if s.IsPostgreSQL() {
-		return query.NewEngine(s.DB(), true), api.AnalyticsModePostgres, nil
+		outcome := startupCacheBuildOutcomeNone
+		if intent != startupCacheBuildIntentNone {
+			outcome = startupCacheBuildOutcomeUnconsumed
+		}
+		return query.NewEngine(s.DB(), true), api.AnalyticsModePostgres, outcome, nil
 	}
 
 	engineMode := c.Analytics.Engine
@@ -740,51 +965,111 @@ func openDaemonAnalyticsEngine(
 	if engineMode == config.AnalyticsEngineSQL {
 		logger.Info("using live SQL analytics engine",
 			"engine", engineMode)
-		return query.NewEngine(s.DB(), false), api.AnalyticsModeSQL, nil
+		outcome := startupCacheBuildOutcomeNone
+		if intent != startupCacheBuildIntentNone {
+			outcome = startupCacheBuildOutcomeUnconsumed
+		}
+		return query.NewEngine(s.DB(), false), api.AnalyticsModeSQL, outcome, nil
 	}
 
 	dbPath := c.DatabaseDSN()
 	analyticsDir := c.AnalyticsDir()
 	staleness := cacheNeedsBuild(dbPath, analyticsDir)
-	if staleness.NeedsBuild && c.Analytics.AutoBuildCache {
+	outcome := startupCacheBuildOutcomeNone
+	shouldBuild := intent != startupCacheBuildIntentNone ||
+		(staleness.NeedsBuild && c.Analytics.AutoBuildCache)
+	if shouldBuild {
 		// Build the cache before serving rather than starting on live-SQL
 		// fallback: incremental rebuilds take seconds, and startup progress
 		// already streams to the CLI that auto-started the daemon. A failed
 		// build is fatal for engine="duckdb" (documented to never fall back)
 		// and falls back to live SQL for engine="auto".
-		if err := buildCacheSubprocessForRun(ctx, staleness.FullRebuild); err != nil {
-			if engineMode == config.AnalyticsEngineDuckDB {
-				return nil, "", fmt.Errorf("build analytics cache: %w", err)
-			}
-			logger.Warn("analytics cache build failed; using live SQL engine",
-				"error", err)
+		fullBuild := staleness.FullRebuild
+		reason := staleness.Reason
+		if intent == startupCacheBuildIntentFull {
+			fullBuild = true
+			reason = "explicit full rebuild requested"
+		}
+		logger.Info("daemon startup step",
+			"step", "build_analytics_cache",
+			"reason", reason,
+			"full_rebuild", fullBuild)
+
+		var buildErr error
+		if intent != startupCacheBuildIntentNone {
+			buildErr = buildStartupCacheSubprocessForRun(ctx, intent)
 		} else {
-			logger.Info("rebuilt analytics cache",
-				"reason", staleness.Reason,
-				"full_rebuild", staleness.FullRebuild)
+			buildErr = buildCacheSubprocessForRun(ctx, staleness.FullRebuild)
+		}
+		if buildErr != nil {
+			if intent != startupCacheBuildIntentNone {
+				outcome = startupCacheBuildOutcomeFailed
+			}
+			logger.Warn("daemon startup step failed",
+				"step", "build_analytics_cache",
+				"reason", reason,
+				"full_rebuild", fullBuild,
+				"error", buildErr)
+			if engineMode == config.AnalyticsEngineDuckDB {
+				if intent != startupCacheBuildIntentNone {
+					outcome = startupCacheBuildOutcomeFatal
+				}
+				return nil, "", outcome, fmt.Errorf("build analytics cache: %w", buildErr)
+			}
+			if intent != startupCacheBuildIntentNone {
+				return query.NewEngine(s.DB(), false), api.AnalyticsModeSQLFallback, outcome, nil
+			}
+		} else {
+			logger.Info("daemon startup step complete",
+				"step", "build_analytics_cache",
+				"reason", reason,
+				"full_rebuild", fullBuild)
 		}
 		staleness = cacheNeedsBuild(dbPath, analyticsDir)
 	}
 
 	if !staleness.NeedsBuild {
-		duckEngine, err := openDaemonDuckDBEngine(c, s)
+		duckEngine, err := openDaemonDuckDBEngineForRun(c, s)
 		if err != nil {
+			if intent != startupCacheBuildIntentNone {
+				outcome = startupCacheBuildOutcomeFailed
+			}
 			if engineMode == config.AnalyticsEngineDuckDB {
-				return nil, "", err
+				if intent != startupCacheBuildIntentNone {
+					outcome = startupCacheBuildOutcomeFatal
+				}
+				return nil, "", outcome, err
 			}
 			logger.Warn("DuckDB engine failed, falling back to live SQL",
 				"error", err)
-			return query.NewEngine(s.DB(), false), api.AnalyticsModeSQLFallback, nil
+			return query.NewEngine(s.DB(), false), api.AnalyticsModeSQLFallback, outcome, nil
 		}
-		return duckEngine, api.AnalyticsModeDuckDB, nil
+		if intent != startupCacheBuildIntentNone {
+			outcome = startupCacheBuildOutcomeFulfilled
+		}
+		if !c.Analytics.AutoBuildCache {
+			logger.Warn(
+				`automatic analytics cache refresh disabled; DuckDB analytics can become stale; engine = "sql" selects live aggregate data`,
+				"auto_build_cache", false,
+				"engine", engineMode,
+			)
+		}
+		return duckEngine, api.AnalyticsModeDuckDB, outcome, nil
 	}
 
+	if intent != startupCacheBuildIntentNone {
+		outcome = startupCacheBuildOutcomeFailed
+	}
 	if engineMode == config.AnalyticsEngineDuckDB {
+		if intent != startupCacheBuildIntentNone {
+			outcome = startupCacheBuildOutcomeFatal
+		}
 		reason := staleness.Reason
 		if reason == "" {
 			reason = "analytics cache is missing or incomplete"
 		}
-		return nil, "", fmt.Errorf("analytics engine=duckdb requires a usable cache: %s", reason)
+		return nil, "", outcome,
+			fmt.Errorf("analytics engine=duckdb requires a usable cache: %s", reason)
 	}
 	if staleness.Reason != "" {
 		logger.Info("analytics cache not usable, using live SQL engine",
@@ -794,8 +1079,10 @@ func openDaemonAnalyticsEngine(
 		logger.Info("analytics cache not built - using live SQL engine (run 'msgvault build-cache' for faster aggregates)",
 			"auto_build_cache", c.Analytics.AutoBuildCache)
 	}
-	return query.NewEngine(s.DB(), false), api.AnalyticsModeSQLFallback, nil
+	return query.NewEngine(s.DB(), false), api.AnalyticsModeSQLFallback, outcome, nil
 }
+
+var openDaemonDuckDBEngineForRun = openDaemonDuckDBEngine
 
 func openDaemonDuckDBEngine(c *config.Config, s *store.Store) (*query.DuckDBEngine, error) {
 	if c == nil || s == nil {
@@ -873,11 +1160,15 @@ type storeAPIAdapter struct {
 	meetingImporter       *meetingimport.Importer
 	// analyticsDir is the daemon's Parquet analytics cache directory, used
 	// to read the revision committed by the derived-refresh child.
-	analyticsDir string
+	analyticsDir           string
+	personEnrichmentConfig personenrichment.Config
+	lookupEnv              personenrichment.CredentialLookup
 }
 
 var _ api.MessageStore = (*storeAPIAdapter)(nil)
 var _ api.CtxMessageStore = (*storeAPIAdapter)(nil)
+var _ api.MessageIdentityStore = (*storeAPIAdapter)(nil)
+var _ api.PersonFactStore = (*storeAPIAdapter)(nil)
 var _ api.MeetingImporter = (*storeAPIAdapter)(nil)
 var _ api.SourceStatusStore = (*storeAPIAdapter)(nil)
 var _ api.CLIStore = (*storeAPIAdapter)(nil)
@@ -898,10 +1189,66 @@ var _ api.CLIEmbeddingsPlanner = (*storeAPIAdapter)(nil)
 var _ api.CLIDedupDeleteStore = (*storeAPIAdapter)(nil)
 var _ api.ContextCLIDedupDeleteStore = (*storeAPIAdapter)(nil)
 var _ api.IdentityLinkStore = (*storeAPIAdapter)(nil)
+var _ api.IdentityMatchStore = (*storeAPIAdapter)(nil)
 var _ api.PersonProfileStore = (*storeAPIAdapter)(nil)
+var _ api.PersonCompletionStore = (*storeAPIAdapter)(nil)
+var _ api.PersonTrackingStore = (*storeAPIAdapter)(nil)
+var _ api.PersonProfileValueStore = (*storeAPIAdapter)(nil)
+var _ api.CommunicationServiceStore = (*storeAPIAdapter)(nil)
+var _ api.AttributeDefinitionStore = (*storeAPIAdapter)(nil)
+var _ api.PersonAttributeStore = (*storeAPIAdapter)(nil)
+var _ api.PersonRelationshipStore = (*storeAPIAdapter)(nil)
+var _ api.OrganizationStore = (*storeAPIAdapter)(nil)
+var _ api.EmploymentStore = (*storeAPIAdapter)(nil)
 var _ api.IdentityCacheRefresher = (*storeAPIAdapter)(nil)
 var _ api.ClusterLookupStore = (*storeAPIAdapter)(nil)
 var _ api.ConversationWindowStore = (*storeAPIAdapter)(nil)
+var _ api.ChangedMessageLister = (*storeAPIAdapter)(nil)
+var _ api.ArchiveIdentifier = (*storeAPIAdapter)(nil)
+var _ api.DocumentSearchStore = (*storeAPIAdapter)(nil)
+var _ api.DocumentStatusStore = (*storeAPIAdapter)(nil)
+var _ api.DocumentVectorStatusStore = (*storeAPIAdapter)(nil)
+var _ api.ActivityStore = (*storeAPIAdapter)(nil)
+
+func (a *storeAPIAdapter) ContactStateContext(
+	ctx context.Context, personID int64, now time.Time,
+) (store.ContactState, error) {
+	return a.store.ContactStateContext(ctx, personID, now)
+}
+
+func (a *storeAPIAdapter) PersonDaysContext(
+	ctx context.Context, request store.PersonDaysRequest,
+) (*store.PersonDaysPage, error) {
+	return a.store.PersonDaysContext(ctx, request)
+}
+
+func (a *storeAPIAdapter) PersonDayContext(
+	ctx context.Context, request store.PersonDayRequest,
+) (*store.PersonDayPage, error) {
+	return a.store.PersonDayContext(ctx, request)
+}
+
+func (a *storeAPIAdapter) DayContext(
+	ctx context.Context, request store.DayRequest,
+) (*store.DayPage, error) {
+	return a.store.DayContext(ctx, request)
+}
+
+func (a *storeAPIAdapter) ListDailyNoteEntriesContext(
+	ctx context.Context, localDate string, limit, offset int,
+) ([]store.DailyNoteEntry, error) {
+	return a.store.ListDailyNoteEntriesContext(ctx, localDate, limit, offset)
+}
+
+func (a *storeAPIAdapter) CreateDailyNoteEntryContext(
+	ctx context.Context, input store.DailyNoteEntryInput,
+) (*store.DailyNoteEntry, error) {
+	return a.store.CreateDailyNoteEntryContext(ctx, input)
+}
+
+func (a *storeAPIAdapter) DeleteDailyNoteEntryContext(ctx context.Context, id int64) error {
+	return a.store.DeleteDailyNoteEntryContext(ctx, id)
+}
 
 func (a *storeAPIAdapter) ConversationExistsContext(ctx context.Context, conversationID int64) (bool, error) {
 	return a.store.ConversationExistsContext(ctx, conversationID)
@@ -914,6 +1261,88 @@ func (a *storeAPIAdapter) GetConversationWindowContext(
 	start, end *time.Time,
 ) (*store.ConversationWindow, error) {
 	return a.store.GetConversationWindowContext(ctx, conversationID, anchorID, before, after, start, end)
+}
+
+// ListChangedMessages exposes the content-change feed to the API server. The
+// daemon passes this adapter -- not *store.Store -- as ServerOptions.Store, so
+// without this method the route's optional-interface check fails and the
+// endpoint reports itself unavailable on every production request.
+func (a *storeAPIAdapter) ListChangedMessages(
+	ctx context.Context, since store.ChangedMessagesCursor, limit int,
+) (store.ChangedMessagePage, error) {
+	return a.store.ListChangedMessages(ctx, since, limit)
+}
+
+// ArchiveUIDContext exposes the archive's durable identity to the API server, which
+// binds every change-feed cursor to it so a cursor cannot be resumed against a
+// different archive. Same reason as ListChangedMessages above: the daemon
+// passes this adapter, not *store.Store, so without this method the route
+// reports itself unavailable on every production request.
+func (a *storeAPIAdapter) ArchiveUIDContext(ctx context.Context) (string, error) {
+	return a.store.ArchiveUIDContext(ctx)
+}
+
+func (a *storeAPIAdapter) SearchDocuments(
+	ctx context.Context,
+	request store.DocumentSearchRequest,
+) (store.DocumentSearchResponse, error) {
+	if err := reconcileDocumentOccurrencesForSearch(ctx, a.store); err != nil {
+		return store.DocumentSearchResponse{}, err
+	}
+	return a.store.SearchDocuments(ctx, request)
+}
+
+func (a *storeAPIAdapter) ReconcileDocumentOccurrences(ctx context.Context) error {
+	return reconcileDocumentOccurrencesForSearch(ctx, a.store)
+}
+
+func (a *storeAPIAdapter) GetDocumentIndexStatusForScope(
+	ctx context.Context,
+	profileID string,
+	extractionInputKey string,
+	allowedMediaTypes []string,
+	allowedMessageTypes []string,
+) (store.DocumentIndexStatus, error) {
+	return a.store.GetDocumentIndexStatusForScope(
+		ctx, profileID, extractionInputKey, allowedMediaTypes, allowedMessageTypes,
+	)
+}
+
+func (a *storeAPIAdapter) GetActiveDocumentExtractionRebuild(
+	ctx context.Context,
+	profileID string,
+	extractionInputKey string,
+) (store.DocumentExtractionRebuild, error) {
+	return a.store.GetActiveDocumentExtractionRebuild(ctx, profileID, extractionInputKey)
+}
+
+func (a *storeAPIAdapter) CountIncompleteDocumentExtractionRebuild(
+	ctx context.Context,
+	rebuild store.DocumentExtractionRebuild,
+	allowedMediaTypes []string,
+	allowedMessageTypes []string,
+) (int64, error) {
+	return a.store.CountIncompleteDocumentExtractionRebuild(
+		ctx, rebuild, allowedMediaTypes, allowedMessageTypes,
+	)
+}
+
+func (a *storeAPIAdapter) GetDocumentVectorTargetProfileID(ctx context.Context) (string, error) {
+	return a.store.GetDocumentVectorTargetProfileID(ctx)
+}
+
+func (a *storeAPIAdapter) GetDocumentVectorOperationsStatus(
+	ctx context.Context,
+	configured store.DocumentVectorGenerationSpec,
+	documentEgressFingerprint, queryEgressFingerprint string,
+	generationID int64,
+	afterToken string,
+	limit int,
+) (store.DocumentVectorOperationsStatus, error) {
+	return a.store.GetDocumentVectorOperationsStatus(
+		ctx, configured, documentEgressFingerprint, queryEgressFingerprint,
+		generationID, afterToken, limit,
+	)
 }
 
 func (a *storeAPIAdapter) GetStats() (*api.StoreStats, error) {
@@ -1096,6 +1525,9 @@ func emitFolderArgs(args []string, flag string, values []string) []string {
 func cliSyncSubprocessArgs(req api.CLISyncRequest) []string {
 	if req.Full {
 		args := []string{"sync-full"}
+		if req.SourceIDSet {
+			args = append(args, "--source-id", strconv.FormatInt(req.SourceID, 10))
+		}
 		if req.Query != "" {
 			args = append(args, "--query", req.Query)
 		}
@@ -1119,6 +1551,9 @@ func cliSyncSubprocessArgs(req api.CLISyncRequest) []string {
 		return args
 	}
 	args := []string{syncIncrementalCmd.Name()}
+	if req.SourceIDSet {
+		args = append(args, "--source-id", strconv.FormatInt(req.SourceID, 10))
+	}
 	args = emitFolderArgs(args, "--folder", req.Folders)
 	args = emitFolderArgs(args, "--skip-folder", req.SkipFolders)
 	if req.Email != "" {
@@ -1196,7 +1631,11 @@ func (a *storeAPIAdapter) runCLICommandWithRunner(
 		return emit(api.CLIRunEvent{Type: stream, Data: data})
 	}
 	runSubprocess := func(ctx context.Context) error {
-		return run(ctx, req.Args, req.Env, req.Cwd, emitSubprocess)
+		args := req.Args
+		if req.GrantDecided {
+			args = append(append([]string(nil), args...), "--"+addAccountGrantDecidedFlag+"=true")
+		}
+		return run(ctx, args, req.Env, req.Cwd, emitSubprocess)
 	}
 	if len(req.Args) > 0 && req.Args[0] == "repack-attachments" {
 		if !repackAttachmentsParentArgsAllowed(req.Args[1:]) {
@@ -1219,7 +1658,7 @@ func (a *storeAPIAdapter) runCLICommandWithRunner(
 		return nil
 	}
 	if !attachmentProducingCommand(req.Args) {
-		if len(req.Args) == 0 || req.Args[0] != removeAccountCommandName {
+		if !attachmentRemovalCommand(req.Args) {
 			return runSubprocess(ctx)
 		}
 		emitWarning := func(message string) error {
@@ -1244,6 +1683,29 @@ func (a *storeAPIAdapter) runCLICommandWithRunner(
 		runSubprocess,
 		emitWarning,
 	)
+}
+
+func attachmentRemovalCommand(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	if args[0] == removeAccountCommandName {
+		return true
+	}
+	if args[0] != purgeExcludedMediaCommandName {
+		return false
+	}
+	confirmed := false
+	for _, arg := range args[1:] {
+		switch arg {
+		case "--dry-run", "--dry-run=true":
+			return false
+		case purgeExcludedMediaYesFlag, "-y", purgeExcludedMediaYesFlag + "=true", "--" + purgeExcludedMediaConfirmedFlag,
+			"--" + purgeExcludedMediaConfirmedFlag + "=true":
+			confirmed = true
+		}
+	}
+	return confirmed
 }
 
 // repackAttachmentsParentArgsAllowed accepts only root logging flags that
@@ -1559,6 +2021,21 @@ func (a *storeAPIAdapter) ListAccountIdentitiesContext(
 	return a.store.ListAccountIdentitiesContext(ctx, sourceID)
 }
 
+func (a *storeAPIAdapter) ResolveAccountIdentityContext(
+	ctx context.Context,
+	sourceID int64,
+	identifier string,
+) (store.ResolvedAccountIdentity, error) {
+	return a.store.ResolveAccountIdentityContext(ctx, sourceID, identifier)
+}
+
+func (a *storeAPIAdapter) MatchMessageIdentitiesContext(
+	ctx context.Context,
+	messageIDs []int64,
+) (map[int64]store.MessageIdentityMatch, error) {
+	return a.store.MatchMessageIdentitiesContext(ctx, messageIDs)
+}
+
 func (a *storeAPIAdapter) AddAccountIdentity(sourceID int64, address, signal string) error {
 	return a.store.AddAccountIdentity(sourceID, address, signal)
 }
@@ -1583,12 +2060,80 @@ func (a *storeAPIAdapter) RemoveAccountIdentityContext(
 	return a.store.RemoveAccountIdentityContext(ctx, sourceID, address)
 }
 
+func (a *storeAPIAdapter) CountIdentityDiscoveryMessagesContext(
+	ctx context.Context,
+	sourceID int64,
+) (int64, error) {
+	return a.store.CountIdentityDiscoveryMessagesContext(ctx, sourceID)
+}
+
+func (a *storeAPIAdapter) ScanIdentityDiscoveryPageContext(
+	ctx context.Context,
+	sourceID, afterID int64,
+	limit int,
+) (store.IdentityDiscoveryPage, error) {
+	return a.store.ScanIdentityDiscoveryPageContext(ctx, sourceID, afterID, limit)
+}
+
+func (a *storeAPIAdapter) ScanIdentityObservationsForSourceMessageIDsContext(
+	ctx context.Context,
+	sourceID int64,
+	sourceMessageIDs []string,
+) ([]store.IdentityObservation, error) {
+	return a.store.ScanIdentityObservationsForSourceMessageIDsContext(ctx, sourceID, sourceMessageIDs)
+}
+
+func (a *storeAPIAdapter) AddAccountIdentitiesBatchContext(
+	ctx context.Context,
+	sourceID int64,
+	candidates []store.IdentityConfirmation,
+) ([]store.IdentityConfirmationOutcome, error) {
+	return a.store.AddAccountIdentitiesBatchContext(ctx, sourceID, candidates)
+}
+
+func (a *storeAPIAdapter) MergeConfirmedAccountIdentitySignalsContext(
+	ctx context.Context,
+	sourceID int64,
+	candidates []store.IdentityConfirmation,
+) ([]store.IdentityConfirmationOutcome, error) {
+	return a.store.MergeConfirmedAccountIdentitySignalsContext(ctx, sourceID, candidates)
+}
+
 func (a *storeAPIAdapter) LinkParticipants(participantA, participantB int64) (int64, error) {
 	return a.store.LinkParticipants(participantA, participantB)
 }
 
 func (a *storeAPIAdapter) UnlinkParticipants(participantA, participantB int64) (int64, error) {
 	return a.store.UnlinkParticipants(participantA, participantB)
+}
+
+func (a *storeAPIAdapter) IdentityRevision() (int64, error) {
+	return a.store.IdentityRevision()
+}
+
+func (a *storeAPIAdapter) ListIdentityMatchCandidatesContext(
+	ctx context.Context, states []store.IdentityMatchState, limit, offset int,
+) ([]store.IdentityMatchCandidate, error) {
+	return a.store.ListIdentityMatchCandidatesContext(ctx, states, limit, offset)
+}
+
+func (a *storeAPIAdapter) GetIdentityMatchCandidateContext(
+	ctx context.Context, candidateID int64,
+) (*store.IdentityMatchCandidate, error) {
+	return a.store.GetIdentityMatchCandidateContext(ctx, candidateID)
+}
+
+func (a *storeAPIAdapter) AcceptIdentityMatchCandidateContext(
+	ctx context.Context, candidateID int64, decidedBy string, notes *string,
+) (*store.IdentityMatchCandidate, int64, error) {
+	return a.store.AcceptIdentityMatchCandidateContext(ctx, candidateID, decidedBy, notes)
+}
+
+func (a *storeAPIAdapter) DecideIdentityMatchCandidateContext(
+	ctx context.Context, candidateID int64, state store.IdentityMatchState,
+	decidedBy string, notes *string,
+) (*store.IdentityMatchCandidate, error) {
+	return a.store.DecideIdentityMatchCandidateContext(ctx, candidateID, state, decidedBy, notes)
 }
 
 func (a *storeAPIAdapter) CreatePersonFromParticipantContext(
@@ -1599,6 +2144,61 @@ func (a *storeAPIAdapter) CreatePersonFromParticipantContext(
 
 func (a *storeAPIAdapter) GetPersonContext(ctx context.Context, id int64) (*store.Person, error) {
 	return a.store.GetPersonContext(ctx, id)
+}
+
+func (a *storeAPIAdapter) GetPersonTrackingContext(
+	ctx context.Context, id int64,
+) (*store.PersonTracking, error) {
+	return a.store.GetPersonTrackingContext(ctx, id)
+}
+
+func (a *storeAPIAdapter) SetPersonTrackingContext(
+	ctx context.Context, id int64, tracked bool,
+) (*store.PersonTracking, error) {
+	return a.store.SetPersonTrackingContext(ctx, id, tracked)
+}
+
+func (a *storeAPIAdapter) BuildPersonFactCatalogContext(
+	ctx context.Context, includeSensitive bool,
+) (personfacts.Catalog, error) {
+	return a.store.BuildPersonFactCatalogContext(ctx, includeSensitive)
+}
+
+func (a *storeAPIAdapter) ListPersonFactEvidenceContext(
+	ctx context.Context, personID int64, filter personfacts.EvidenceFilter,
+) ([]personfacts.Evidence, error) {
+	return a.store.ListPersonFactEvidenceContext(ctx, personID, filter)
+}
+
+func (a *storeAPIAdapter) ListPersonFactEvidenceStatusEventsContext(
+	ctx context.Context, personID int64, filter personfacts.EvidenceStatusFilter,
+) ([]personfacts.EvidenceStatusEvent, error) {
+	return a.store.ListPersonFactEvidenceStatusEventsContext(ctx, personID, filter)
+}
+
+func (a *storeAPIAdapter) ListPersonFactClaimsContext(
+	ctx context.Context, personID int64, filter personfacts.ClaimFilter,
+) ([]personfacts.Claim, error) {
+	return a.store.ListPersonFactClaimsContext(ctx, personID, filter)
+}
+
+func (a *storeAPIAdapter) ListPersonFactDecisionsContext(
+	ctx context.Context, personID int64, filter personfacts.DecisionFilter,
+) ([]personfacts.Decision, error) {
+	return a.store.ListPersonFactDecisionsContext(ctx, personID, filter)
+}
+
+func (a *storeAPIAdapter) ListPersonFactPinsContext(
+	ctx context.Context, personID int64,
+) ([]personfacts.PinState, error) {
+	return a.store.ListPersonFactPinsContext(ctx, personID)
+}
+
+func (a *storeAPIAdapter) SetPersonFactPinContext(
+	ctx context.Context, personID int64, target personfacts.TargetRef,
+	pinned bool, actor string,
+) (*personfacts.PinWrite, error) {
+	return a.store.SetPersonFactPinContext(ctx, personID, target, pinned, actor)
 }
 
 func (a *storeAPIAdapter) ListPersonsContext(ctx context.Context) ([]store.Person, error) {
@@ -1612,13 +2212,514 @@ func (a *storeAPIAdapter) UpdatePersonDisplayNameContext(
 }
 
 func (a *storeAPIAdapter) DeletePersonContext(ctx context.Context, id, expectedRevision int64) error {
-	return a.store.DeletePersonContext(ctx, id, expectedRevision)
+	if !a.personEnrichmentConfig.Enabled {
+		var hasHistory bool
+		if err := a.store.DB().QueryRowContext(ctx, a.store.Rebind(`SELECT EXISTS (
+			SELECT 1 FROM person_enrichment_attempts WHERE person_id = ?)`), id).Scan(&hasHistory); err != nil {
+			return fmt.Errorf("check person enrichment history for deletion: %w", err)
+		}
+		if !hasHistory {
+			return a.store.DeletePersonContext(ctx, id, expectedRevision)
+		}
+	}
+	lookup := a.lookupEnv
+	if lookup == nil {
+		lookup = os.LookupEnv
+	}
+	key, ok := lookup(a.personEnrichmentConfig.SuppressionKeyEnv)
+	if !ok || key == "" {
+		return fmt.Errorf("person enrichment suppression key environment %q is not set",
+			a.personEnrichmentConfig.SuppressionKeyEnv)
+	}
+	keyBytes := []byte(key)
+	hasher, err := personenrichment.NewSuppressionHasher(keyBytes)
+	clear(keyBytes)
+	if err != nil {
+		return fmt.Errorf("load person enrichment suppression key for deletion: %w", err)
+	}
+	configuredKeyID, err := hasher.KeyID()
+	if err != nil {
+		return fmt.Errorf("load person enrichment suppression key ID for deletion: %w", err)
+	}
+	keyIDs, err := a.store.ListPersonEnrichmentSuppressionKeyIDsContext(ctx)
+	if err != nil {
+		return fmt.Errorf("load person enrichment suppression key state for deletion: %w", err)
+	}
+	for _, keyID := range keyIDs {
+		if keyID != configuredKeyID {
+			return personenrichment.ErrSuppressionKeyMismatch
+		}
+	}
+	current, _, err := a.personEnrichmentDeletionDigests(ctx, id, hasher)
+	if err != nil {
+		return err
+	}
+	return a.store.DeletePersonWithEnrichmentSuppressionsContext(ctx,
+		store.DeletePersonEnrichmentInput{
+			PersonID: id, ExpectedRevision: expectedRevision, Actor: "api",
+			Reason: store.PersonEnrichmentSuppressionDeletion, ConfiguredKeyID: configuredKeyID,
+			CurrentIdentifiers: current,
+		})
+}
+
+func (a *storeAPIAdapter) personEnrichmentDeletionDigests(
+	ctx context.Context,
+	personID int64,
+	hasher *personenrichment.SuppressionHasher,
+) ([]store.PersonEnrichmentSuppressionInput, int64, error) {
+	person, err := a.store.GetPersonContext(ctx, personID)
+	if err != nil {
+		return nil, 0, err
+	}
+	input, err := a.store.LoadRequestInput(ctx, personenrichment.WorkLease{PersonID: person.ID})
+	if err != nil {
+		return nil, 0, fmt.Errorf("load current person enrichment identifiers for deletion: %w", err)
+	}
+	defer func() {
+		clearPersonEnrichmentCandidates(input.Names)
+		clearPersonEnrichmentCandidates(input.CurrentCompanies)
+		clearPersonEnrichmentCandidates(input.Emails)
+		clearPersonEnrichmentCandidates(input.Phones)
+		clearPersonEnrichmentCandidates(input.PublicProfileURLs)
+	}()
+	rows, err := a.store.DB().QueryContext(ctx, `
+		SELECT provider_namespace FROM person_enrichment_profiles
+		GROUP BY provider_namespace ORDER BY provider_namespace`)
+	if err != nil {
+		return nil, 0, fmt.Errorf("list persisted person enrichment namespaces for deletion: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	namespaces := make([]string, 0)
+	for rows.Next() {
+		var namespace string
+		if err := rows.Scan(&namespace); err != nil {
+			_ = rows.Close()
+			return nil, 0, fmt.Errorf("read persisted person enrichment namespace for deletion: %w", err)
+		}
+		namespaces = append(namespaces, namespace)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, 0, fmt.Errorf("close persisted person enrichment namespaces for deletion: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("iterate persisted person enrichment namespaces for deletion: %w", err)
+	}
+
+	digests := make([]store.PersonEnrichmentSuppressionInput, 0)
+	seen := make(map[string]struct{})
+	appendDigest := func(namespace string, class personenrichment.SuppressionIdentifierClass, values ...string) error {
+		normalized, normalizeErr := personenrichment.NormalizeSuppressionIdentifier(class, values)
+		for i := range values {
+			values[i] = ""
+		}
+		if normalizeErr != nil {
+			return normalizeErr
+		}
+		digest := hasher.Digest(namespace, normalized.Class, normalized.NormalizationVersion, normalized.Value)
+		normalized.Value = ""
+		key := digest.ProviderNamespace + "\x00" + string(digest.IdentifierClass) + "\x00" +
+			digest.NormalizationVersion + "\x00" + digest.KeyID + "\x00" + string(digest.Digest)
+		if _, exists := seen[key]; exists {
+			return nil
+		}
+		seen[key] = struct{}{}
+		digests = append(digests, store.PersonEnrichmentSuppressionInput{
+			ProviderNamespace: digest.ProviderNamespace, IdentifierClass: digest.IdentifierClass,
+			NormalizationVersion: digest.NormalizationVersion, KeyID: digest.KeyID,
+			Digest: digest.Digest,
+		})
+		return nil
+	}
+	for _, namespace := range namespaces {
+		for i := range input.Emails {
+			if err := appendDigest(namespace, personenrichment.SuppressionEmail, input.Emails[i].Value); err != nil {
+				return nil, 0, fmt.Errorf("normalize current email for deletion: %w", err)
+			}
+		}
+		for i := range input.Phones {
+			if err := appendDigest(namespace, personenrichment.SuppressionPhone, input.Phones[i].Value); err != nil {
+				return nil, 0, fmt.Errorf("normalize current phone for deletion: %w", err)
+			}
+		}
+		for i := range input.PublicProfileURLs {
+			if err := appendDigest(namespace, personenrichment.SuppressionPublicProfileURL,
+				input.PublicProfileURLs[i].Value); err != nil {
+				return nil, 0, fmt.Errorf("normalize current public profile URL for deletion: %w", err)
+			}
+		}
+		for i := range input.Names {
+			for j := range input.CurrentCompanies {
+				if err := appendDigest(namespace, personenrichment.SuppressionNameCompany,
+					input.Names[i].Value, input.CurrentCompanies[j].Value); err != nil {
+					return nil, 0, fmt.Errorf("normalize current name-company identity for deletion: %w", err)
+				}
+			}
+		}
+		providerIDs, loadErr := a.store.LoadProviderPersonIDs(ctx, personID, namespace)
+		if loadErr != nil {
+			return nil, 0, loadErr
+		}
+		for i := range providerIDs {
+			if err := appendDigest(namespace, personenrichment.SuppressionProviderPersonID, providerIDs[i]); err != nil {
+				clearPersonEnrichmentStrings(providerIDs)
+				return nil, 0, fmt.Errorf("normalize stored provider identity for deletion: %w", err)
+			}
+		}
+		clearPersonEnrichmentStrings(providerIDs)
+	}
+	return digests, person.Revision, nil
+}
+
+func clearPersonEnrichmentCandidates(values []personenrichment.IdentityCandidate) {
+	for i := range values {
+		values[i].Value = ""
+	}
+}
+
+func clearPersonEnrichmentStrings(values []string) {
+	for i := range values {
+		values[i] = ""
+	}
 }
 
 func (a *storeAPIAdapter) PersonForParticipantsContext(
 	ctx context.Context, participantIDs []int64,
 ) (*store.Person, error) {
 	return a.store.PersonForParticipantsContext(ctx, participantIDs)
+}
+
+func (a *storeAPIAdapter) MergePersonsContext(
+	ctx context.Context, request store.PersonMergeRequest,
+) (*store.PersonMergeResult, error) {
+	return a.store.MergePersonsContext(ctx, request)
+}
+
+func (a *storeAPIAdapter) SplitPersonMergeContext(
+	ctx context.Context, request store.PersonSplitRequest,
+) (*store.PersonSplitResult, error) {
+	return a.store.SplitPersonMergeContext(ctx, request)
+}
+
+func (a *storeAPIAdapter) ListPersonMergesPageContext(
+	ctx context.Context, personID int64, limit, offset int,
+) ([]store.PersonMergeSummary, error) {
+	return a.store.ListPersonMergesPageContext(ctx, personID, limit, offset)
+}
+
+func (a *storeAPIAdapter) GetPersonMergeContext(
+	ctx context.Context, mergeID int64,
+) (*store.PersonMergeDetail, error) {
+	return a.store.GetPersonMergeContext(ctx, mergeID)
+}
+
+func (a *storeAPIAdapter) GetPersonMergeSnapshotContext(
+	ctx context.Context, mergeID int64,
+) (*store.PersonMergeSnapshotResponse, error) {
+	return a.store.GetPersonMergeSnapshotContext(ctx, mergeID)
+}
+
+func (a *storeAPIAdapter) DecidePersonMergeCandidateContext(
+	ctx context.Context, request store.PersonMergeCandidateDecisionRequest,
+) (*store.PersonMergeCandidateDecisionResult, error) {
+	return a.store.DecidePersonMergeCandidateContext(ctx, request)
+}
+
+func (a *storeAPIAdapter) CompletePersonProfilesContext(
+	ctx context.Context, request store.PersonCompletionQuery,
+) ([]store.PersonCompletion, error) {
+	return a.store.CompletePersonProfilesContext(ctx, request)
+}
+
+func (a *storeAPIAdapter) GetPersonProfileContext(
+	ctx context.Context, personID int64,
+) (*store.PersonProfile, error) {
+	return a.store.GetPersonProfileContext(ctx, personID)
+}
+
+func (a *storeAPIAdapter) ApplyPersonProfilePatchContext(
+	ctx context.Context,
+	personID, expectedRevision int64,
+	patch store.PersonProfilePatch,
+) (*store.PersonProfile, error) {
+	return a.store.ApplyPersonProfilePatchContext(ctx, personID, expectedRevision, patch)
+}
+
+func (a *storeAPIAdapter) GetPersonProfileHistoryContext(
+	ctx context.Context, personID int64,
+) (*store.PersonProfileHistory, error) {
+	return a.store.GetPersonProfileHistoryContext(ctx, personID)
+}
+
+func (a *storeAPIAdapter) ReadPersonMediaDataContext(
+	ctx context.Context, personID, mediaID int64,
+) ([]byte, string, error) {
+	return a.store.ReadPersonMediaDataContext(ctx, personID, mediaID)
+}
+
+func (a *storeAPIAdapter) ListCommunicationServicesContext(
+	ctx context.Context, includeInactive bool,
+) ([]store.CommunicationService, error) {
+	return a.store.ListCommunicationServicesContext(ctx, includeInactive)
+}
+
+func (a *storeAPIAdapter) EnsureCommunicationServiceContext(
+	ctx context.Context, input store.CommunicationServiceInput,
+) (*store.CommunicationService, bool, error) {
+	return a.store.EnsureCommunicationServiceContext(ctx, input)
+}
+
+func (a *storeAPIAdapter) ListAttributeDefinitionsContext(
+	ctx context.Context, filter store.AttributeDefinitionFilter,
+) ([]store.AttributeDefinition, error) {
+	return a.store.ListAttributeDefinitionsContext(ctx, filter)
+}
+
+func (a *storeAPIAdapter) GetAttributeDefinitionContext(
+	ctx context.Context, id int64,
+) (*store.AttributeDefinition, error) {
+	return a.store.GetAttributeDefinitionContext(ctx, id)
+}
+
+func (a *storeAPIAdapter) GetAttributeDefinitionBySlugContext(
+	ctx context.Context, objectType store.AttributeObjectType, slug string,
+) (*store.AttributeDefinition, error) {
+	return a.store.GetAttributeDefinitionBySlugContext(ctx, objectType, slug)
+}
+
+func (a *storeAPIAdapter) CreateAttributeDefinitionContext(
+	ctx context.Context, input store.AttributeDefinitionInput,
+) (*store.AttributeDefinition, error) {
+	return a.store.CreateAttributeDefinitionContext(ctx, input)
+}
+
+func (a *storeAPIAdapter) UpdateAttributeDefinitionContext(
+	ctx context.Context, id, expectedRevision int64, update store.AttributeDefinitionUpdate,
+) (*store.AttributeDefinition, error) {
+	return a.store.UpdateAttributeDefinitionContext(ctx, id, expectedRevision, update)
+}
+
+func (a *storeAPIAdapter) DeleteAttributeDefinitionContext(
+	ctx context.Context, id, expectedRevision int64,
+) error {
+	return a.store.DeleteAttributeDefinitionContext(ctx, id, expectedRevision)
+}
+
+func (a *storeAPIAdapter) ListPersonAttributeValuesContext(
+	ctx context.Context, personID int64, query store.PersonAttributeQuery,
+) ([]store.PersonAttributeValue, error) {
+	return a.store.ListPersonAttributeValuesContext(ctx, personID, query)
+}
+
+func (a *storeAPIAdapter) SetPersonAttributeValueContext(
+	ctx context.Context, input store.PersonAttributeValueInput,
+) (*store.PersonAttributeWrite, error) {
+	return a.store.SetPersonAttributeValueContext(ctx, input)
+}
+
+func (a *storeAPIAdapter) AppendPersonNoteContext(
+	ctx context.Context, input store.PersonNoteAppendInput,
+) (*store.PersonAttributeWrite, error) {
+	return a.store.AppendPersonNoteContext(ctx, input)
+}
+
+func (a *storeAPIAdapter) SupersedePersonAttributeValueContext(
+	ctx context.Context, input store.PersonAttributeSupersedeInput,
+) (*store.PersonAttributeWrite, error) {
+	return a.store.SupersedePersonAttributeValueContext(ctx, input)
+}
+
+func (a *storeAPIAdapter) ListRelationshipTypesContext(
+	ctx context.Context,
+) ([]store.RelationshipType, error) {
+	return a.store.ListRelationshipTypesContext(ctx)
+}
+
+func (a *storeAPIAdapter) GetRelationshipTypeContext(
+	ctx context.Context, id int64,
+) (*store.RelationshipType, error) {
+	return a.store.GetRelationshipTypeContext(ctx, id)
+}
+
+func (a *storeAPIAdapter) CreateRelationshipTypeContext(
+	ctx context.Context, input store.RelationshipTypeInput,
+) (*store.RelationshipType, error) {
+	return a.store.CreateRelationshipTypeContext(ctx, input)
+}
+
+func (a *storeAPIAdapter) UpdateRelationshipTypeContext(
+	ctx context.Context, id, expectedRevision int64, update store.RelationshipTypeUpdate,
+) (*store.RelationshipType, error) {
+	return a.store.UpdateRelationshipTypeContext(ctx, id, expectedRevision, update)
+}
+
+func (a *storeAPIAdapter) DeleteRelationshipTypeContext(
+	ctx context.Context, id, expectedRevision int64,
+) error {
+	return a.store.DeleteRelationshipTypeContext(ctx, id, expectedRevision)
+}
+
+func (a *storeAPIAdapter) AddPersonRelationshipContext(
+	ctx context.Context, input store.PersonRelationshipInput,
+) (*store.PersonRelationship, error) {
+	return a.store.AddPersonRelationshipContext(ctx, input)
+}
+
+func (a *storeAPIAdapter) GetPersonRelationshipContext(
+	ctx context.Context, id int64,
+) (*store.PersonRelationship, error) {
+	return a.store.GetPersonRelationshipContext(ctx, id)
+}
+
+func (a *storeAPIAdapter) PatchPersonRelationshipContext(
+	ctx context.Context, id, expectedRevision int64, patch store.PersonRelationshipPatch, actor string,
+) (*store.PersonRelationship, error) {
+	return a.store.PatchPersonRelationshipContext(ctx, id, expectedRevision, patch, actor)
+}
+
+func (a *storeAPIAdapter) DeletePersonRelationshipContext(
+	ctx context.Context, id, expectedRevision int64,
+) error {
+	return a.store.DeletePersonRelationshipContext(ctx, id, expectedRevision)
+}
+
+func (a *storeAPIAdapter) ListPersonRelationshipsContext(
+	ctx context.Context, personID int64, opts store.PersonRelationshipListOptions,
+) ([]store.PersonRelationshipView, error) {
+	return a.store.ListPersonRelationshipsContext(ctx, personID, opts)
+}
+
+func (a *storeAPIAdapter) ListRelationshipReviewsContext(
+	ctx context.Context, opts store.RelationshipReviewListOptions,
+) ([]store.RelationshipReview, error) {
+	return a.store.ListRelationshipReviewsContext(ctx, opts)
+}
+
+func (a *storeAPIAdapter) CreateOrganizationContext(
+	ctx context.Context, input store.OrganizationInput,
+) (*store.Organization, error) {
+	return a.store.CreateOrganizationContext(ctx, input)
+}
+
+func (a *storeAPIAdapter) GetOrganizationContext(
+	ctx context.Context, id int64,
+) (*store.Organization, error) {
+	return a.store.GetOrganizationContext(ctx, id)
+}
+
+func (a *storeAPIAdapter) ListOrganizationsContext(
+	ctx context.Context, filter store.OrganizationFilter,
+) ([]store.Organization, error) {
+	return a.store.ListOrganizationsContext(ctx, filter)
+}
+
+func (a *storeAPIAdapter) CountOrganizationsContext(
+	ctx context.Context, filter store.OrganizationFilter,
+) (int64, error) {
+	return a.store.CountOrganizationsContext(ctx, filter)
+}
+
+func (a *storeAPIAdapter) ReplaceOrganizationContext(
+	ctx context.Context, id, expectedRevision int64, input store.OrganizationInput, retired bool,
+) (*store.Organization, error) {
+	return a.store.ReplaceOrganizationContext(ctx, id, expectedRevision, input, retired)
+}
+
+func (a *storeAPIAdapter) DeleteOrganizationContext(
+	ctx context.Context, id, expectedRevision int64,
+) error {
+	return a.store.DeleteOrganizationContext(ctx, id, expectedRevision)
+}
+
+func (a *storeAPIAdapter) MergeOrganizationsContext(
+	ctx context.Context, survivorID, survivorRevision, losingID, losingRevision int64,
+) (*store.Organization, error) {
+	return a.store.MergeOrganizationsContext(
+		ctx, survivorID, survivorRevision, losingID, losingRevision,
+	)
+}
+
+func (a *storeAPIAdapter) GetOrganizationProfileContext(
+	ctx context.Context, id int64, includeSuperseded bool,
+) (*store.OrganizationProfile, error) {
+	return a.store.GetOrganizationProfileContext(ctx, id, includeSuperseded)
+}
+
+func (a *storeAPIAdapter) ReplaceOrganizationProfileContext(
+	ctx context.Context, id, expectedRevision int64, input store.OrganizationProfileInput,
+) (*store.OrganizationProfile, error) {
+	return a.store.ReplaceOrganizationProfileContext(ctx, id, expectedRevision, input)
+}
+
+func (a *storeAPIAdapter) ListOrganizationAttributeValuesContext(
+	ctx context.Context, organizationID int64, query store.OrganizationAttributeQuery,
+) ([]store.OrganizationAttributeValue, error) {
+	return a.store.ListOrganizationAttributeValuesContext(ctx, organizationID, query)
+}
+
+func (a *storeAPIAdapter) SetOrganizationAttributeValueContext(
+	ctx context.Context, input store.OrganizationAttributeValueInput,
+) (*store.OrganizationAttributeWrite, error) {
+	return a.store.SetOrganizationAttributeValueContext(ctx, input)
+}
+
+func (a *storeAPIAdapter) SupersedeOrganizationAttributeValueContext(
+	ctx context.Context, input store.OrganizationAttributeSupersedeInput,
+) (*store.OrganizationAttributeWrite, error) {
+	return a.store.SupersedeOrganizationAttributeValueContext(ctx, input)
+}
+
+func (a *storeAPIAdapter) ReadOrganizationMediaDataContext(
+	ctx context.Context, organizationID, mediaID int64,
+) ([]byte, string, error) {
+	return a.store.ReadOrganizationMediaDataContext(ctx, organizationID, mediaID)
+}
+
+func (a *storeAPIAdapter) AddEmploymentContext(
+	ctx context.Context, input store.EmploymentInput,
+) (*store.Employment, error) {
+	return a.store.AddEmploymentContext(ctx, input)
+}
+
+func (a *storeAPIAdapter) GetEmploymentContext(
+	ctx context.Context, id int64,
+) (*store.Employment, error) {
+	return a.store.GetEmploymentContext(ctx, id)
+}
+
+func (a *storeAPIAdapter) UpdateEmploymentContext(
+	ctx context.Context, id, expectedRevision int64, input store.EmploymentInput,
+) (*store.Employment, error) {
+	return a.store.UpdateEmploymentContext(ctx, id, expectedRevision, input)
+}
+
+func (a *storeAPIAdapter) EndEmploymentContext(
+	ctx context.Context, id, expectedRevision int64, endDate store.PartialDate,
+) (*store.Employment, error) {
+	return a.store.EndEmploymentContext(ctx, id, expectedRevision, endDate)
+}
+
+func (a *storeAPIAdapter) SetPrimaryEmploymentContext(
+	ctx context.Context, id, expectedRevision int64,
+) (*store.Employment, error) {
+	return a.store.SetPrimaryEmploymentContext(ctx, id, expectedRevision)
+}
+
+func (a *storeAPIAdapter) DeleteEmploymentContext(
+	ctx context.Context, id, expectedRevision int64,
+) error {
+	return a.store.DeleteEmploymentContext(ctx, id, expectedRevision)
+}
+
+func (a *storeAPIAdapter) ListEmploymentsContext(
+	ctx context.Context, filter store.EmploymentFilter,
+) ([]store.Employment, error) {
+	return a.store.ListEmploymentsContext(ctx, filter)
+}
+
+func (a *storeAPIAdapter) PrimaryCurrentEmploymentContext(
+	ctx context.Context, personID int64,
+) (store.EmploymentProjection, bool, error) {
+	return a.store.PrimaryCurrentEmploymentContext(ctx, personID)
 }
 
 func (a *storeAPIAdapter) ClusterMembers(id int64) ([]int64, error) {
@@ -1661,6 +2762,194 @@ func (a *storeAPIAdapter) CountSyncRunItems(syncRunID int64, status string) (int
 
 func (a *storeAPIAdapter) ListSyncRunItems(syncRunID int64, status string, limit int) ([]store.SyncRunItem, error) {
 	return a.store.ListSyncRunItems(syncRunID, status, limit)
+}
+
+const personEnrichmentJob = "person-enrichment"
+
+type personEnrichmentScheduleWorker interface {
+	RunOnce(ctx context.Context, runID int64) (bool, error)
+}
+
+// personEnrichmentSchedule owns only wake-up ordering. Runs, attempts, retry
+// times, provider jobs, and spend remain database-owned.
+type personEnrichmentSchedule struct {
+	Store                     *store.Store
+	Worker                    personEnrichmentScheduleWorker
+	CatchUpLimit              int
+	ActiveProfileFingerprints []string
+}
+
+func (r *personEnrichmentSchedule) Wake(ctx context.Context, occurrence time.Time) error {
+	if r == nil || r.Store == nil || r.Worker == nil || occurrence.IsZero() ||
+		r.CatchUpLimit < 1 || r.CatchUpLimit > 200 {
+		return errors.New("person enrichment schedule is invalid")
+	}
+	runs := make([]personenrichment.DurableRun, 0)
+	var afterID int64
+	var afterRequestedAt time.Time
+	for {
+		page, err := r.Store.ListRunningRuns(ctx, personenrichment.RunningRunFilter{
+			AfterRequestedAt: afterRequestedAt, AfterID: afterID, Limit: 200,
+		})
+		if err != nil {
+			return fmt.Errorf("list running person enrichment runs: %w", err)
+		}
+		runs = append(runs, page...)
+		if len(page) < 200 {
+			break
+		}
+		afterID = page[len(page)-1].ID
+		afterRequestedAt = page[len(page)-1].RequestedAt
+	}
+	for _, run := range runs {
+		if err := r.drainRun(ctx, run.ID); err != nil {
+			return err
+		}
+	}
+
+	requestedAt := occurrence.UTC().Truncate(time.Minute)
+	run, _, err := r.Store.StartRun(ctx, personenrichment.RunStart{
+		Kind: "scheduled", RequestedBy: canonicalPersonEnrichmentOccurrence(requestedAt),
+		RequestedAt: requestedAt,
+	})
+	if err != nil {
+		return fmt.Errorf("start scheduled person enrichment run: %w", err)
+	}
+	if run.State != "running" {
+		return nil
+	}
+	for {
+		count, err := r.Store.EnqueueDuePersonEnrichmentContext(
+			ctx, requestedAt, r.CatchUpLimit, r.ActiveProfileFingerprints)
+		if err != nil {
+			return fmt.Errorf("catch up person enrichment work: %w", err)
+		}
+		if count < r.CatchUpLimit {
+			break
+		}
+	}
+	return r.drainRun(ctx, run.ID)
+}
+
+func (r *personEnrichmentSchedule) drainRun(ctx context.Context, runID int64) error {
+	for {
+		processed, err := r.Worker.RunOnce(ctx, runID)
+		if err != nil {
+			return fmt.Errorf("run person enrichment work for run %d: %w", runID, err)
+		}
+		if !processed {
+			break
+		}
+	}
+	err := r.Store.CompleteRun(ctx, runID, personenrichment.RunCompletion{
+		State: "", CompletedAt: time.Now().UTC(),
+	})
+	if errors.Is(err, store.ErrRunNotTerminal) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("complete person enrichment run %d: %w", runID, err)
+	}
+	return nil
+}
+
+func canonicalPersonEnrichmentOccurrence(occurrence time.Time) string {
+	return occurrence.UTC().Truncate(time.Minute).Format(time.RFC3339)
+}
+
+func registerPersonEnrichmentJob(
+	ctx context.Context,
+	sched *scheduler.Scheduler,
+	st *store.Store,
+	enrichmentConfig personenrichment.Config,
+) error {
+	if !enrichmentConfig.Enabled {
+		if st == nil {
+			return nil
+		}
+		if err := st.CancelPersonEnrichmentWorkOutsideProfilesContext(ctx, nil); err != nil {
+			return fmt.Errorf("cancel disabled person enrichment work: %w", err)
+		}
+		return nil
+	}
+	if sched == nil || st == nil {
+		return errors.New("person enrichment schedule requires scheduler and store")
+	}
+	if err := enrichmentConfig.Validate(); err != nil {
+		return err
+	}
+	suppressionKey, ok := os.LookupEnv(enrichmentConfig.SuppressionKeyEnv)
+	if !ok || suppressionKey == "" {
+		return fmt.Errorf("person enrichment suppression key environment %q is not set",
+			enrichmentConfig.SuppressionKeyEnv)
+	}
+	hasher, err := personenrichment.NewSuppressionHasher([]byte(suppressionKey))
+	if err != nil {
+		return fmt.Errorf("load person enrichment suppression key: %w", err)
+	}
+	catalog, err := st.BuildPersonFactCatalogContext(ctx, true)
+	if err != nil {
+		return fmt.Errorf("build person enrichment target catalog: %w", err)
+	}
+	factories := make(map[string]personenrichment.ProviderFactory)
+	providerConfigs := make(map[string]personenrichment.ProviderConfig)
+	activeFingerprints := make([]string, 0, len(enrichmentConfig.Providers))
+	for _, configured := range enrichmentConfig.Providers {
+		provider := configured
+		if !provider.Enabled {
+			continue
+		}
+		profile, err := provider.Profile(catalog)
+		if err != nil {
+			return fmt.Errorf("build person enrichment profile %q: %w", provider.Name, err)
+		}
+		if _, err := st.EnsurePersonEnrichmentProfile(ctx, profile); err != nil {
+			return fmt.Errorf("ensure person enrichment profile %q: %w", provider.Name, err)
+		}
+		activeFingerprints = append(activeFingerprints, profile.Fingerprint)
+		providerConfigs[provider.Name] = provider
+		switch provider.Kind {
+		case personenrichment.ProviderExa:
+			factories[provider.Name] = func(config personenrichment.ProviderConfig, credential string) (personenrichment.Provider, error) {
+				return personenrichment.NewExaProvider(config, credential, http.DefaultClient)
+			}
+		case personenrichment.ProviderSixtyfour:
+			factories[provider.Name] = func(config personenrichment.ProviderConfig, credential string) (personenrichment.Provider, error) {
+				return personenrichment.NewSixtyfourProvider(config, credential, http.DefaultClient)
+			}
+		default:
+			return fmt.Errorf("unsupported person enrichment provider kind %q", provider.Kind)
+		}
+	}
+	if len(factories) == 0 {
+		return errors.New("person enrichment has no structurally valid enabled provider")
+	}
+	if err := st.CancelPersonEnrichmentWorkOutsideProfilesContext(ctx, activeFingerprints); err != nil {
+		return fmt.Errorf("cancel unavailable person enrichment work: %w", err)
+	}
+	gate, err := personenrichment.NewEgressGate(st, st, hasher, os.LookupEnv)
+	if err != nil {
+		return fmt.Errorf("configure person enrichment egress: %w", err)
+	}
+	worker, err := personenrichment.NewWorker(st, st, *gate, factories, personenrichment.WorkerOptions{
+		Owner: "daemon-person-enrichment", LeaseDuration: enrichmentConfig.LeaseDuration,
+		RenewEvery: enrichmentConfig.LeaseDuration / 4, Clock: time.Now,
+		Jitter:          func(delay time.Duration) time.Duration { return delay },
+		ProviderConfigs: providerConfigs,
+	})
+	if err != nil {
+		return fmt.Errorf("configure person enrichment worker: %w", err)
+	}
+	runner := &personEnrichmentSchedule{
+		Store: st, Worker: worker, CatchUpLimit: min(enrichmentConfig.BatchSize, 200),
+		ActiveProfileFingerprints: activeFingerprints,
+	}
+	return sched.AddJob(scheduler.Job{
+		Name: personEnrichmentJob, Schedule: enrichmentConfig.Schedule,
+		Run: func(ctx context.Context) error {
+			return runner.Wake(ctx, time.Now())
+		},
+	})
 }
 
 // schedulerAdapter adapts scheduler.Scheduler to api.SyncScheduler.
@@ -1928,7 +3217,7 @@ func runScheduledGmailSync(ctx context.Context, email string, src *store.Source,
 	opts := sync.DefaultOptions()
 	opts.AttachmentsDir = cfg.AttachmentsDir()
 
-	syncer := sync.New(client, s, opts).WithLogger(logger)
+	syncer := newMessageSyncer(client, s, opts).WithLogger(logger)
 
 	source, err := s.GetOrCreateSource(sourceTypeGmail, email)
 	if err != nil {
@@ -1943,21 +3232,15 @@ func runScheduledGmailSync(ctx context.Context, email string, src *store.Source,
 		return nil, fmt.Errorf("post-source-create migrations: %w", err)
 	}
 
-	summary, err := syncer.Incremental(ctx, source)
-	if err != nil {
-		// Once the history baseline expires (Gmail keeps only ~7 days),
-		// every future incremental sync fails too; without a fallback the
-		// account stays stuck until someone runs sync-full by hand. The
-		// full sync is resumable and skips already-archived messages.
-		if errors.Is(err, sync.ErrHistoryExpired) {
-			logger.Warn("gmail history expired; falling back to full sync", keyEmail, email)
-			summary, err = syncer.Full(ctx, source.Identifier)
-			if err != nil {
-				return nil, fmt.Errorf("full sync fallback failed: %w", err)
-			}
-			return summary, nil
+	summary, err := syncer.IncrementalWithHistoryRecovery(ctx, source, func(resumed bool) {
+		if resumed {
+			logger.Warn("resuming interrupted Gmail history recovery", keyEmail, email)
+		} else {
+			logger.Warn("gmail history expired; reconciling complete mailbox", keyEmail, email)
 		}
-		return nil, fmt.Errorf("incremental sync failed: %w", err)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("gmail sync failed: %w", err)
 	}
 	return summary, nil
 }
@@ -1970,7 +3253,6 @@ func runScheduledGmailSync(ctx context.Context, email string, src *store.Source,
 // across processes (see syncfull.go).
 func runScheduledIMAPSync(ctx context.Context, src *store.Source, s *store.Store) (*gmail.SyncSummary, error) {
 	imapOpts := imapFolderStateOptions(s, src, false)
-	imapOpts = append(imapOpts, imapFolderStateSaveOption(s, src))
 	apiClient, err := buildAPIClient(ctx, src, nil, nil, imapOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("build IMAP client: %w", err)
@@ -1982,7 +3264,7 @@ func runScheduledIMAPSync(ctx context.Context, src *store.Source, s *store.Store
 	opts.AttachmentsDir = cfg.AttachmentsDir()
 	opts.NoResume = true
 
-	syncer := sync.New(apiClient, s, opts).WithLogger(logger)
+	syncer := newMessageSyncer(apiClient, s, opts).WithLogger(logger)
 
 	// runPostSourceCreateMigrations is keyed off Gmail-only legacy
 	// state, so it's a no-op for fresh IMAP installs; we still call it
@@ -2006,7 +3288,9 @@ func runScheduledIMAPSync(ctx context.Context, src *store.Source, s *store.Store
 	if err != nil {
 		return nil, fmt.Errorf("IMAP sync failed: %w", err)
 	}
-	saveIMAPFolderStates(s, src, apiClient, summary, 0)
+	if err := saveIMAPFolderStates(ctx, s, src, apiClient, summary, 0); err != nil {
+		return nil, fmt.Errorf("save IMAP incremental state: %w", err)
+	}
 	return summary, nil
 }
 
@@ -2036,11 +3320,16 @@ func runScheduledTeamsSync(ctx context.Context, src *store.Source, s *store.Stor
 		qps = 5
 	}
 	client := teams.NewClient("https://graph.microsoft.com/v1.0", teams.TokenFunc(tokenFn), qps)
-	opts := teams.ImportOptions{
-		Email:           email,
-		AttachmentsDir:  cfg.AttachmentsDir(),
-		IncludeChannels: true,
-	}
+	opts := scheduledTeamsImportOptions(email)
 	_, err = teams.NewImporter(s, client).Import(ctx, opts)
 	return err
+}
+
+func scheduledTeamsImportOptions(email string) teams.ImportOptions {
+	return teams.ImportOptions{
+		Email:           email,
+		AttachmentsDir:  cfg.AttachmentsDir(),
+		MediaPolicy:     cfg.Teams.MediaPolicy(email),
+		IncludeChannels: true,
+	}
 }

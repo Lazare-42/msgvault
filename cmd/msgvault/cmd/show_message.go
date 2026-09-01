@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/textutil"
 )
 
 var (
@@ -87,8 +88,6 @@ func showHTTPMessage(cmd *cobra.Command, idStr string) error {
 
 // nil error return mirrors outputMessageJSON so callers can return either
 // uniformly; text printing never fails.
-//
-//nolint:unparam // symmetry with error-returning outputMessageJSON sibling
 func outputMessageText(msg *query.MessageDetail) error {
 	// Header section
 	fmt.Println("═══════════════════════════════════════════════════════════════════════════════")
@@ -128,6 +127,9 @@ func outputMessageText(msg *query.MessageDetail) error {
 	if len(msg.Labels) > 0 {
 		fmt.Printf("Labels:  %s\n", strings.Join(msg.Labels, ", "))
 	}
+	if msg.DeletedAt != nil {
+		fmt.Printf("Deleted from source: %s\n", msg.DeletedAt.UTC().Format(time.RFC3339))
+	}
 
 	// Attachments
 	if len(msg.Attachments) > 0 {
@@ -144,9 +146,9 @@ func outputMessageText(msg *query.MessageDetail) error {
 	// Body
 	fmt.Println("\n═══════════════════════════════════════════════════════════════════════════════")
 	if msg.BodyText != "" {
-		fmt.Println(msg.BodyText)
+		fmt.Println(textutil.SanitizeTerminalMultiline(msg.BodyText))
 	} else if msg.Snippet != "" {
-		fmt.Printf("[No body text available. Snippet: %s]\n", msg.Snippet)
+		fmt.Printf("[No body text available. Snippet: %s]\n", textutil.SanitizeTerminal(msg.Snippet))
 	} else {
 		fmt.Println("[No body content available]")
 	}
@@ -211,6 +213,9 @@ func outputMessageJSON(msg *query.MessageDetail) error {
 
 	if msg.ReceivedAt != nil {
 		output["received_at"] = msg.ReceivedAt.Format(time.RFC3339)
+	}
+	if msg.DeletedAt != nil {
+		output["deleted_from_source_at"] = msg.DeletedAt.UTC().Format(time.RFC3339)
 	}
 
 	enc := json.NewEncoder(os.Stdout)

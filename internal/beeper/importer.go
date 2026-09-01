@@ -6,8 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
+	"go.kenn.io/msgvault/internal/attachmentpolicy"
+	"go.kenn.io/msgvault/internal/rederive"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -33,7 +36,19 @@ const (
 	reconcileWindow = 24 * time.Hour
 	// maxReconcilePages caps the reconciliation walk for pathologically busy chats.
 	maxReconcilePages = 50
+	// maxTailProbePages bounds scans through runs of non-content events. Hitting
+	// the bound conservatively reopens the chat so backfill can keep progressing.
+	maxTailProbePages = 20
 )
+
+// tailScanInterval throttles the completed-chat tail probe (see tailScanDue).
+// Beeper Desktop backfills a network's older history over hours-to-weeks after
+// it is linked; those messages arrive with old timestamps, so they neither
+// advance a chat's lastActivity nor fall in the reconcile window, and a chat
+// already marked done would never see them. Probing costs one request per
+// completed chat, so it runs at most daily.
+// A variable so tests can disable the throttle.
+var tailScanInterval = 24 * time.Hour
 
 // chatScope carries per-chat state through the persist call chain: the chat
 // and store IDs, the run options, and the chat's cursor state (whose
@@ -48,6 +63,18 @@ type chatScope struct {
 	cs                 *ChatState
 	membershipComplete bool
 	budgetUsed         int
+	// tailScan asks a completed chat to re-probe the oldest end of its history
+	// before settling into the incremental path (see tailScanInterval).
+	tailScan bool
+}
+
+// chatVisit records why a chat was enumerated. tailOnly means the chat would
+// have been excluded by the normal activity filter and is present solely for
+// the completed-history probe.
+type chatVisit struct {
+	Chat
+
+	tailOnly bool
 }
 
 func (cc *chatScope) limitReached() bool {
@@ -64,13 +91,38 @@ type Importer struct {
 	store  *store.Store
 	client *Client
 	res    *participantResolver
+	// obs captures the addresses Beeper exposes for each participant. It is
+	// enrichment beside the resolution ladder, never a replacement for it.
+	obs *observationRecorder
+	// matcher turns observations into reviewable identity match candidates.
+	// Only a repeated stable provider/Beeper ID resolves automatically.
+	matcher *identityMatcher
 	// lastCheckpoint throttles checkpoint flushes (see checkpointMinInterval).
 	lastCheckpoint time.Time
 }
 
 // NewImporter creates an Importer backed by the given store and Beeper client.
 func NewImporter(s *store.Store, c *Client) *Importer {
-	return &Importer{store: s, client: c, res: newParticipantResolver(s)}
+	return &Importer{
+		store:   s,
+		client:  c,
+		res:     newParticipantResolver(s),
+		obs:     newObservationRecorder(s),
+		matcher: newIdentityMatcher(s),
+	}
+}
+
+func (imp *Importer) scopedToSync(sourceID, syncID int64) *Importer {
+	scoped := *imp
+	scoped.store = imp.store.ScopedToSync(sourceID, syncID)
+	accountID := ""
+	if imp.res != nil {
+		accountID = imp.res.accountID
+	}
+	scoped.res = newParticipantResolver(scoped.store, accountID)
+	scoped.obs = newObservationRecorder(scoped.store)
+	scoped.matcher = newIdentityMatcher(scoped.store)
+	return &scoped
 }
 
 // loadResumeState rebuilds the sync state for a source: the last successful
@@ -100,6 +152,16 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 	if opts.AccountID == "" {
 		return nil, errors.New("beeper account ID required")
 	}
+	// The CLI and scheduler reuse one Importer across Beeper accounts. These
+	// caches only suppress repeated work inside one account import; carrying
+	// them into the next account can hide source-specific observations and
+	// matching work.
+	// The selected import account is authoritative for all Beeper user-ID
+	// fallback identifiers, including message senders, mentions, and
+	// reactions. Do not use the account field echoed in a remote chat payload.
+	imp.res = newParticipantResolver(imp.store, opts.AccountID)
+	imp.obs = newObservationRecorder(imp.store)
+	imp.matcher = newIdentityMatcher(imp.store)
 	src, err := imp.store.GetOrCreateSource(sourceTypeBeeper, opts.AccountID)
 	if err != nil {
 		return nil, err
@@ -117,10 +179,24 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 		state.Anchors = anchors
 	}
 
+	// Heal rows derived by an older build before syncing new ones, so an
+	// upgraded archive converges without the user knowing to run a repair.
+	// Ledger-gated, so this costs one indexed lookup on every later run.
+	rsum, ran, rerr := rederive.RunIfStale(ctx, imp.store, sourceTypeBeeper, opts.AccountID, src.ID, opts.Progress)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if ran && rsum != nil {
+		sum.BodiesRepaired = rsum.BodiesRewritten
+		sum.AttachmentsRetagged = rsum.AttachmentsTagged
+		sum.Errors += rsum.Errors
+	}
+
 	syncID, err := imp.store.StartSync(src.ID, sourceTypeBeeper)
 	if err != nil {
 		return nil, err
 	}
+	imp = imp.scopedToSync(src.ID, syncID)
 	// Failures below must ASSIGN to err (never shadow it with :=) so this
 	// defer records them on the run.
 	defer func() {
@@ -140,9 +216,24 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 	if err = imp.verifyAnchors(ctx, syncID, src.ID, state); err != nil {
 		return sum, err
 	}
+	// Accepting a match and applying its participant link are two
+	// transactions, so a crash between them can leave an accepted match
+	// unlinked. Finish those first; a contested pair must not block a sync.
+	if applied, aerr := imp.store.ApplyAcceptedIdentityMatchesContext(ctx, 0); aerr != nil {
+		sum.IdentityReplayErrors++
+		sum.Errors++
+		slog.Warn("re-applying accepted identity matches failed", "error", aerr)
+	} else if applied > 0 {
+		slog.Info("applied accepted identity matches", "count", applied)
+	}
+
+	// A tail scan must see every chat, not just recently-active ones: a chat
+	// gains backfilled history without its lastActivity moving, so the usual
+	// enumeration filter would skip exactly the chats worth probing.
+	tailScan := opts.Full || tailScanDue(state.LastTailScan, start)
 
 	reconcileCutoff := start.Add(-reconcileWindow)
-	chats, err := imp.enumerateChats(ctx, syncID, opts, state, reconcileCutoff, sum)
+	chats, err := imp.enumerateChats(ctx, syncID, opts, state, reconcileCutoff, tailScan, sum)
 	if err != nil {
 		return sum, err
 	}
@@ -153,7 +244,8 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 	maxActivity := parseWatermark(state.ListWatermark)
 	total := len(chats)
 	for idx := range chats {
-		ch := &chats[idx]
+		visit := &chats[idx]
+		ch := &visit.Chat
 		if err = ctx.Err(); err != nil {
 			return sum, err
 		}
@@ -161,7 +253,7 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 			maxActivity = ch.LastActivity
 		}
 		var convCount int64
-		convCount, err = imp.syncChat(ctx, syncID, src.ID, ch, opts, state, reconcileCutoff, sum)
+		convCount, err = imp.syncChat(ctx, syncID, src.ID, ch, opts, state, reconcileCutoff, tailScan, visit.tailOnly, sum)
 		if err != nil {
 			return sum, err
 		}
@@ -172,11 +264,20 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 		// Flush checkpoint so an interrupted run can resume from this point.
 		imp.checkpoint(syncID, state, sum)
 	}
+	if err = ctx.Err(); err != nil {
+		return sum, err
+	}
 	// Advance the discovery watermark only for fetch-clean runs: a fetch error
 	// means some chat's messages are still missing, so it must stay
 	// discoverable by the next run's lastActivityAfter filter.
 	if sum.FetchErrors == 0 && !maxActivity.IsZero() {
 		state.ListWatermark = formatWatermark(maxActivity)
+	}
+	// Record the scan only on a fetch-clean run: a run that failed partway
+	// through may not have probed every chat, and re-probing costs one request
+	// per chat rather than any lost data.
+	if tailScan && sum.FetchErrors == 0 {
+		state.LastTailScan = formatWatermark(start)
 	}
 
 	// Never complete a run under-anchored: incremental-only runs skip the
@@ -210,25 +311,22 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 // enumerateChats lists the chats this run must visit: every chat active in
 // the discovery overlap or reconciliation window (all chats on first/full
 // runs), plus any chat whose backfill is unfinished even without new activity.
-func (imp *Importer) enumerateChats(ctx context.Context, syncID int64, opts ImportOptions, state *SyncState, reconcileCutoff time.Time, sum *ImportSummary) ([]Chat, error) {
+func (imp *Importer) enumerateChats(ctx context.Context, syncID int64, opts ImportOptions, state *SyncState, reconcileCutoff time.Time, tailScan bool, sum *ImportSummary) ([]chatVisit, error) {
 	params := SearchChatsParams{AccountID: opts.AccountID}
-	if !opts.Full && state.ListWatermark != "" {
-		if wm := parseWatermark(state.ListWatermark); !wm.IsZero() {
-			// Overlap by an hour so clock skew or a mid-listing crash cannot
-			// permanently hide a chat from enumeration. Also include every chat
-			// inside the reconciliation window so in-place changes are revisited
-			// even when their LastActivity did not advance.
-			params.LastActivityAfter = wm.Add(-time.Hour)
-			if reconcileCutoff.Before(params.LastActivityAfter) {
-				params.LastActivityAfter = reconcileCutoff
-			}
-		}
+	activityCutoff := chatActivityCutoff(opts, state, reconcileCutoff)
+	if !tailScan {
+		params.LastActivityAfter = activityCutoff
 	}
-	var chats []Chat
+	var chats []chatVisit
 	seen := map[string]bool{}
 	err := imp.client.AllChats(ctx, params, func(ch Chat) error {
 		seen[ch.ID] = true
-		chats = append(chats, ch)
+		tailOnly := tailScan && !activityCutoff.IsZero() && !ch.LastActivity.After(activityCutoff)
+		if cs := state.Chats[ch.ID]; cs != nil && !cs.Done {
+			// Unfinished backfills are included independently of activity.
+			tailOnly = false
+		}
+		chats = append(chats, chatVisit{Chat: ch, tailOnly: tailOnly})
 		return nil
 	})
 	if err != nil {
@@ -256,16 +354,39 @@ func (imp *Importer) enumerateChats(ctx context.Context, syncID int64, opts Impo
 			sum.Errors++
 			continue
 		}
-		chats = append(chats, *detail)
+		chats = append(chats, chatVisit{Chat: *detail})
 	}
 	return chats, nil
+}
+
+// chatActivityCutoff returns the filter a normal incremental run would send
+// to chat discovery. Tail scans omit the API filter but retain this value to
+// distinguish active work from chats enumerated solely for probing.
+func chatActivityCutoff(opts ImportOptions, state *SyncState, reconcileCutoff time.Time) time.Time {
+	if opts.Full {
+		return time.Time{}
+	}
+	wm := parseWatermark(state.ListWatermark)
+	if wm.IsZero() {
+		return time.Time{}
+	}
+	// Overlap by an hour so clock skew or a mid-listing crash cannot hide a
+	// chat, and include the reconciliation window for in-place changes whose
+	// LastActivity did not advance.
+	cutoff := wm.Add(-time.Hour)
+	if reconcileCutoff.Before(cutoff) {
+		cutoff = reconcileCutoff
+	}
+	return cutoff
 }
 
 // syncChat ensures the conversation and its participants, then backfills or
 // incrementally extends the chat's messages. Returns the number of messages
 // processed for this chat.
-func (imp *Importer) syncChat(ctx context.Context, syncID, sourceID int64, ch *Chat, opts ImportOptions, state *SyncState, reconcileCutoff time.Time, sum *ImportSummary) (int64, error) {
-	convID, membershipComplete, err := imp.ensureConversation(ctx, syncID, sourceID, ch, sum)
+func (imp *Importer) syncChat(ctx context.Context, syncID, sourceID int64, ch *Chat, opts ImportOptions, state *SyncState, reconcileCutoff time.Time, tailScan, tailOnly bool, sum *ImportSummary) (int64, error) {
+	convID, membershipComplete, membership, err := imp.ensureConversation(
+		ctx, syncID, sourceID, ch, opts.AccountID, sum,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -274,8 +395,30 @@ func (imp *Importer) syncChat(ctx context.Context, syncID, sourceID int64, ch *C
 	cc := &chatScope{
 		chatID: ch.ID, convID: convID, sourceID: sourceID, syncID: syncID,
 		opts: opts, cs: cs, membershipComplete: membershipComplete,
+		tailScan: tailScan,
+	}
+	cc.opts.MediaConversation = attachmentpolicy.Conversation{
+		Type:             conversationType(ch.Type),
+		ParticipantCount: membership.policyCount(opts.MediaPolicy),
 	}
 	before := sum.MessagesProcessed
+
+	// Re-open a completed chat whose oldest end has grown since it was walked;
+	// clearing Done routes it back through the backfill path below.
+	if cs.Done && tailScan {
+		var reopened bool
+		reopened, err = imp.probeChatTail(ctx, cc, sum)
+		if err != nil {
+			return sum.MessagesProcessed - before, err
+		}
+		if tailOnly && !reopened && cs.Newest != "" {
+			// This quiet chat was enumerated only for the probe. With no new
+			// history, its incremental and reconciliation paths have no work.
+			// Cursorless chats still need the empty-chat recovery below.
+			imp.flushReplies(cc, sum)
+			return sum.MessagesProcessed - before, nil
+		}
+	}
 
 	// A chat that was empty when backfilled has Done set but no incremental
 	// cursor; re-walk it from scratch (cheap) so its first messages are seen.
@@ -300,17 +443,55 @@ func (imp *Importer) syncChat(ctx context.Context, syncID, sourceID int64, ch *C
 	return sum.MessagesProcessed - before, nil
 }
 
+// chatMembership is the roster media policy weighs for one chat: the
+// participant total Beeper reports, or the full participant list when no
+// total is reported. Neither is known when a truncated listing reports no
+// total and the detail fetch failed; that roster stays unresolved.
+type chatMembership struct {
+	count int
+	known bool
+}
+
+// chatMembershipOf resolves the roster from the freshest payload this run has
+// for the chat and whether that payload's participant list is complete.
+func chatMembershipOf(chat *Chat, membershipComplete bool) chatMembership {
+	if chat == nil {
+		return chatMembership{}
+	}
+	if chat.Participants.Total > 0 {
+		return chatMembership{count: chat.Participants.Total, known: true}
+	}
+	return chatMembership{count: len(chat.Participants.Items), known: membershipComplete}
+}
+
+// policyCount is the count media policy evaluates: an unresolved roster must
+// not read as a chat under a configured limit, so it fails closed there. The
+// resulting skips stay retryable, and the archived unknown marker keeps the
+// backfill closed until a run reads the roster.
+func (m chatMembership) policyCount(policy attachmentpolicy.Policy) int {
+	if !m.known && policy.MaxParticipants > 0 {
+		return policy.MaxParticipants + 1
+	}
+	return m.count
+}
+
 // ensureConversation upserts the conversation row and its membership,
 // fetching the full participant list when the search listing truncated it
-// (chat search returns at most 20 participants per chat).
-func (imp *Importer) ensureConversation(ctx context.Context, syncID, sourceID int64, ch *Chat, sum *ImportSummary) (int64, bool, error) {
+// (chat search returns at most 20 participants per chat). It archives the
+// roster media policy weighs — the reported total, or the unknown marker
+// when there is none and the list is incomplete — so backfill and purge
+// evaluate the same membership rather than the participant rows, which a
+// truncated listing undercounts.
+func (imp *Importer) ensureConversation(
+	ctx context.Context, syncID, sourceID int64, ch *Chat, accountID string, sum *ImportSummary,
+) (int64, bool, chatMembership, error) {
 	detail := ch
 	membershipComplete := !ch.Participants.HasMore
 	if ch.Participants.HasMore {
 		d, gerr := imp.client.GetChat(ctx, ch.ID)
 		if gerr != nil {
 			if ctx.Err() != nil {
-				return 0, false, ctx.Err()
+				return 0, false, chatMembership{}, ctx.Err()
 			}
 			imp.recordItem(syncID, ch.ID, "fetch", store.SyncRunItemStatusError, "beeper_fetch_error", gerr)
 			sum.FetchErrors++
@@ -320,16 +501,38 @@ func (imp *Importer) ensureConversation(ctx context.Context, syncID, sourceID in
 			membershipComplete = !d.Participants.HasMore
 		}
 	}
+	membership := chatMembershipOf(detail, membershipComplete)
 	convID, err := imp.store.EnsureConversationWithType(sourceID, ch.ID, conversationType(ch.Type), ch.Title)
 	if err != nil {
-		return 0, false, err
+		return 0, false, chatMembership{}, err
+	}
+	if membership.known {
+		err = imp.store.SetConversationMemberCount(convID, membership.count)
+	} else {
+		err = imp.store.MarkConversationMemberCountUnknown(convID)
+	}
+	if err != nil {
+		return 0, false, chatMembership{}, err
 	}
 	members := make([]store.ConversationParticipantRef, 0, len(detail.Participants.Items))
+	type resolvedMember struct {
+		participantID int64
+		user          *User
+	}
+	resolvedMembers := make([]resolvedMember, 0, len(detail.Participants.Items))
+	var bridgePrefix string
+	if membershipComplete {
+		bridgePrefix = participantBridgePrefix(detail.Participants.Items)
+	}
+	// Keep the resolver tied to the import option, not to any account value
+	// echoed by the remote chat payload. This also covers direct callers of
+	// ensureConversation that do not go through Import's cache reset.
+	imp.res.accountID = accountID
 	for i := range detail.Participants.Items {
 		p := &detail.Participants.Items[i]
 		pid, rerr := imp.res.resolveUser(&p.User)
 		if rerr != nil {
-			return 0, false, rerr
+			return 0, false, chatMembership{}, rerr
 		}
 		if pid == 0 {
 			continue
@@ -339,10 +542,11 @@ func (imp *Importer) ensureConversation(ctx context.Context, syncID, sourceID in
 			role = "admin"
 		}
 		members = append(members, store.ConversationParticipantRef{ParticipantID: pid, Role: role})
+		resolvedMembers = append(resolvedMembers, resolvedMember{participantID: pid, user: &p.User})
 	}
 	if membershipComplete {
 		if err := imp.store.ReplaceConversationParticipants(convID, members); err != nil {
-			return 0, false, err
+			return 0, false, chatMembership{}, err
 		}
 	} else {
 		for _, member := range members {
@@ -351,7 +555,141 @@ func (imp *Importer) ensureConversation(ctx context.Context, syncID, sourceID in
 			}
 		}
 	}
-	return convID, membershipComplete, nil
+	// Membership must be visible before matching. The chat participant list is
+	// the only place Beeper hands us a person's phone, email, and username
+	// together, and matching those observations gathers shared-conversation
+	// evidence immediately. Recording observations first would omit this chat
+	// from every candidate created on its first import.
+	for _, member := range resolvedMembers {
+		imp.captureObservations(
+			ctx, member.participantID, member.user, detail,
+			sourceID, accountID, bridgePrefix, sum,
+		)
+	}
+	return convID, membershipComplete, membership, nil
+}
+
+// probeChatTail searches past a completed chat's oldest cursor and clears Done
+// when it finds messages the archive has never seen, so the backfill resumes
+// into history Beeper added after the chat was first walked.
+//
+// The archive is consulted rather than just trusting a non-empty page: near the
+// beginning of history the API re-serves the tail it already returned (the same
+// misbehaviour backfillChat's recentIDWindow defends against), so a page of
+// familiar messages must leave the chat done or every scan would re-walk it.
+//
+// Best-effort except for context cancellation, which must abort the run so the
+// scan remains due. Other probe failures leave the chat completed and are not
+// counted as fetch errors: the messages they would find are ones the archive
+// has never had, so deferring them to the next scan loses nothing captured.
+func (imp *Importer) probeChatTail(ctx context.Context, cc *chatScope, sum *ImportSummary) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	cursor := cc.cs.Oldest
+	if cursor == "" {
+		return false, nil
+	}
+	recent := newRecentIDWindow(recentIDWindowPages)
+	for range maxTailProbePages {
+		page, err := imp.client.ListMessagesPage(ctx, cc.chatID, cursor, "before")
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, ctxErr
+		}
+		if err != nil || len(page.Items) == 0 {
+			return false, nil //nolint:nilerr // non-cancellation probe failures are deferred to the next scan
+		}
+		ids := make([]string, 0, len(page.Items))
+		pageIDs := make([]string, 0, len(page.Items))
+		newItems := 0
+		for i := range page.Items {
+			m := &page.Items[i]
+			pageIDs = append(pageIDs, m.ID)
+			if recent.contains(m.ID) {
+				continue
+			}
+			newItems++
+			if persistsMessageRow(m) {
+				ids = append(ids, m.ID)
+			}
+		}
+		if newItems == 0 {
+			return false, nil
+		}
+		recent.add(pageIDs)
+
+		if len(ids) > 0 {
+			archived, err := imp.store.ArchivedSourceMessageIDs(cc.sourceID, ids)
+			if err != nil {
+				sum.Errors++
+				return false, nil //nolint:nilerr // a later scan retries this best-effort archive lookup
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return false, ctxErr
+			}
+			for _, id := range ids {
+				if _, ok := archived[id]; !ok {
+					cc.cs.Done = false
+					sum.ChatsReopened++
+					return true, nil
+				}
+			}
+			return false, nil
+		}
+
+		if !page.HasMore || page.OldestCursor == "" || page.OldestCursor == cursor {
+			return false, nil
+		}
+		cursor = page.OldestCursor
+	}
+
+	// A very long event-only run is unusual. Route it through normal backfill
+	// rather than letting the probe bound hide content on every future scan.
+	cc.cs.Done = false
+	sum.ChatsReopened++
+	return true, nil
+}
+
+// captureObservations records the addresses observed on one chat participant.
+// Capture is enrichment, not archive integrity: failures are logged and
+// counted on the run, never fatal, so a hostile payload or unavailable service
+// catalog cannot stop messages being archived.
+func (imp *Importer) captureObservations(
+	ctx context.Context,
+	participantID int64,
+	u *User,
+	ch *Chat,
+	sourceID int64,
+	accountID string,
+	bridgePrefix string,
+	sum *ImportSummary,
+) {
+	results, err := imp.obs.capture(ctx, participantID, u, captureContext{
+		SourceID: sourceID, AccountID: accountID, Network: ch.Network,
+		BridgePrefix: bridgePrefix,
+	})
+	if err != nil && ctx.Err() == nil {
+		slog.Warn("beeper observation capture failed",
+			"participant_id", participantID, "beeper_user_id", u.ID, "error", err)
+		sum.Errors++
+	}
+	for _, result := range results {
+		if result.Created {
+			sum.ObservationsRecorded++
+		}
+		outcome, merr := imp.matcher.match(ctx, participantID, result)
+		if merr != nil {
+			if ctx.Err() == nil {
+				slog.Warn("beeper identity matching failed",
+					"participant_id", participantID, "beeper_user_id", u.ID, "error", merr)
+				sum.Errors++
+			}
+			continue
+		}
+		sum.IdentityAutoResolved += int64(len(outcome.AutoResolved))
+		sum.IdentityCandidates += int64(len(outcome.Suggested))
+		sum.IdentityConflicts += int64(len(outcome.Conflicts))
+	}
 }
 
 // recentIDWindow remembers the message IDs of the last few pages of a
@@ -599,7 +937,7 @@ func (imp *Importer) processMessage(ctx context.Context, cc *chatScope, m *Messa
 		sum.MessagesProcessed++
 		return nil
 	}
-	if m.IsHidden {
+	if !persistsMessageRow(m) {
 		return nil
 	}
 	err := imp.persistMessage(ctx, cc, m, sum)
@@ -607,6 +945,13 @@ func (imp *Importer) processMessage(ctx context.Context, cc *chatScope, m *Messa
 		sum.MessagesProcessed++
 	}
 	return err
+}
+
+// persistsMessageRow reports whether processMessage archives a message row.
+// Reactions update their target, deletions tombstone an existing row, and
+// hidden events are intentionally omitted.
+func persistsMessageRow(m *Message) bool {
+	return m.Type != "REACTION" && !m.IsDeleted && !m.IsHidden
 }
 
 // refreshReactionTarget re-fetches and re-persists the message a REACTION
@@ -694,7 +1039,7 @@ func (imp *Importer) persistMessage(ctx context.Context, cc *chatScope, m *Messa
 		}
 	}
 
-	if !cc.opts.NoMedia && cc.opts.AttachmentsDir != "" {
+	if len(m.Attachments) > 0 || (!cc.opts.NoMedia && cc.opts.AttachmentsDir != "") {
 		imp.persistAttachments(ctx, cc.syncID, messageID, m, cc.opts, sum)
 	}
 
@@ -825,6 +1170,17 @@ func (imp *Importer) recordItem(syncID int64, sourceMessageID, phase, status, ki
 		ErrorKind:       kind,
 		ErrorMessage:    msg,
 	})
+}
+
+// tailScanDue reports whether completed chats should be re-probed this run.
+// An unset or unparseable timestamp counts as due, so archives written before
+// tail scanning existed pick it up on their next sync.
+func tailScanDue(last string, now time.Time) bool {
+	t := parseWatermark(last)
+	if t.IsZero() {
+		return true
+	}
+	return now.Sub(t) >= tailScanInterval
 }
 
 func parseWatermark(s string) time.Time {

@@ -27,6 +27,7 @@ type tuiStyles struct {
 	modal             lipgloss.Style
 	modalTitle        lipgloss.Style
 	flash             lipgloss.Style
+	relationshipHeat  [5]lipgloss.Style
 }
 
 func newStyles(hasDarkBackground bool) tuiStyles {
@@ -39,7 +40,7 @@ func newStyles(hasDarkBackground bool) tuiStyles {
 	bgAlt := adaptiveColor("#f0f0f0", "#181818")
 	bgCursor := adaptiveColor("#e0e0e0", "#282828")
 
-	return tuiStyles{
+	result := tuiStyles{
 		// Title bar style - bold with visible background.
 		titleBar: lipgloss.NewStyle().
 			Bold(true).
@@ -102,6 +103,10 @@ func newStyles(hasDarkBackground bool) tuiStyles {
 			Italic(true).
 			Foreground(adaptiveColor("#996600", "#ffcc00")), // Amber for visibility
 	}
+	for i, hex := range [...]string{"#3d3d3d", "#6b4b16", "#9a6818", "#d18a18", "#ffb000"} {
+		result.relationshipHeat[i] = lipgloss.NewStyle().Foreground(lipgloss.Color(hex))
+	}
+	return result
 }
 
 var (
@@ -266,6 +271,9 @@ func (m Model) buildBreadcrumb() string {
 
 // buildStatsString builds the stats summary string for the header.
 func (m Model) buildStatsString() string {
+	if m.searchQuery != "" && m.searchMode == searchModeSemantic {
+		return ""
+	}
 	if m.contextStats != nil && (m.level == levelMessageList || m.level == levelDrillDown || m.searchQuery != "") {
 		// Show "+" suffix when search has more results than loaded
 		msgsSuffix := ""
@@ -311,7 +319,7 @@ func (m Model) headerView() string {
 func (m Model) aggregateTableView() string {
 	if len(m.rows) == 0 && !m.loading && !m.inlineSearchActive && m.searchQuery == "" && m.err == nil {
 		var sb strings.Builder
-		sb.WriteString(m.styles.tableHeader.Render(padRight("   "+viewTypeAbbrev(m.viewType), m.width)))
+		sb.WriteString(m.styles.tableHeader.Render(padRight(listIndicatorBlank+viewTypeAbbrev(m.viewType), m.width)))
 		sb.WriteString("\n")
 		sb.WriteString(m.styles.separator.Render(strings.Repeat("\u2500", m.width)))
 		sb.WriteString("\n")
@@ -398,7 +406,7 @@ func (m Model) aggregateTableView() string {
 		} else if isChecked {
 			selIndicator = m.styles.selectedIndicator.Render(" ✓ ")
 		} else {
-			selIndicator = "   "
+			selIndicator = listIndicatorBlank
 		}
 
 		// Pad key to fixed width first, then highlight — so ANSI codes
@@ -486,6 +494,9 @@ func (m Model) messageListView() string {
 
 	// Header row with sort indicators
 	msgSortIndicator := func(field query.MessageSortField) string {
+		if m.hasActiveSemanticSearch() {
+			return ""
+		}
 		if m.msgSortField == field {
 			if m.msgSortDirection == query.SortDesc {
 				return "↓"
@@ -546,7 +557,7 @@ func (m Model) messageListView() string {
 		} else if isChecked {
 			selIndicator = m.styles.selectedIndicator.Render(" ✓ ")
 		} else {
-			selIndicator = "   "
+			selIndicator = listIndicatorBlank
 		}
 
 		// Format date
@@ -633,8 +644,12 @@ func (m Model) messageListView() string {
 	isLoading := m.loading || m.inlineSearchLoading || m.searchLoadingMore
 	if m.inlineSearchActive {
 		modeTag := "[Fast]"
-		if m.searchMode == searchModeDeep {
+		switch m.searchMode {
+		case searchModeFast:
+		case searchModeDeep:
 			modeTag = "[Deep]"
+		case searchModeSemantic:
+			modeTag = "[Semantic: active messages only]"
 		}
 		infoContent = modeTag + "/" + m.searchInput.View()
 	} else if m.searchQuery != "" {
@@ -646,8 +661,12 @@ func (m Model) messageListView() string {
 		} else if m.searchTotalCount == -1 {
 			infoContent += fmt.Sprintf(" (%d+ results, PgDn for more)", len(m.messages))
 		}
-		if m.searchMode == searchModeDeep {
+		switch m.searchMode {
+		case searchModeFast:
+		case searchModeDeep:
 			infoContent += " [Deep]"
+		case searchModeSemantic:
+			infoContent += " [Semantic: active messages only]"
 		}
 	}
 	sb.WriteString(m.renderInfoLine(infoContent, isLoading))
@@ -713,7 +732,8 @@ func (m Model) buildDetailLines() []string {
 			fmt.Sprintf("Attachments (%d):", len(msg.Attachments)),
 		)
 		for _, att := range msg.Attachments {
-			lines = append(lines, fmt.Sprintf("  📎 %s (%s)", att.Filename, formatBytes(att.Size)))
+			filename := textutil.SanitizeTerminal(att.Filename)
+			lines = append(lines, fmt.Sprintf("  📎 %s (%s)", filename, formatBytes(att.Size)))
 		}
 	}
 
@@ -729,9 +749,7 @@ func (m Model) buildDetailLines() []string {
 	if body == "" {
 		body = "(No text content)"
 	}
-	// Strip carriage returns (CRLF -> LF) to prevent display issues
-	body = strings.ReplaceAll(body, "\r\n", "\n")
-	body = strings.ReplaceAll(body, "\r", "")
+	body = textutil.SanitizeTerminalMultiline(body)
 	bodyLines := wrapText(body, m.width-2)
 	lines = append(lines, bodyLines...)
 
@@ -904,9 +922,9 @@ func (m Model) threadView() string {
 		if isCursor {
 			selIndicator = m.styles.cursorRow.Render("▶  ")
 		} else if i%2 == 0 {
-			selIndicator = m.styles.normalRow.Render("   ")
+			selIndicator = m.styles.normalRow.Render(listIndicatorBlank)
 		} else {
-			selIndicator = m.styles.altRow.Render("   ")
+			selIndicator = m.styles.altRow.Render(listIndicatorBlank)
 		}
 
 		// Format date
@@ -993,14 +1011,14 @@ func (m Model) footerView() string {
 		keys = []string{
 			"↑/k",
 			"↓/j",
-			"Enter",
+			helpLabelEnter,
 			"g group",
 			"s sort",
 			"A acct",
 			"a msgs",
 			"d del",
 		}
-		keys = append(keys, "? help")
+		keys = append(keys, helpLabelHelp)
 		if len(m.rows) > 0 {
 			// Use TotalUnique from aggregate rows for true total count
 			totalUnique := m.rows[0].TotalUnique
@@ -1016,15 +1034,15 @@ func (m Model) footerView() string {
 		keys = []string{
 			"↑/k",
 			"↓/j",
-			"Enter",
-			"Esc",
+			helpLabelEnter,
+			helpLabelEsc,
 			"g group",
 			"s sort",
 			"A acct",
 			"a msgs",
 			"d del",
 		}
-		keys = append(keys, "? help")
+		keys = append(keys, helpLabelHelp)
 		if len(m.rows) > 0 {
 			// Use TotalUnique from aggregate rows for true total count
 			totalUnique := m.rows[0].TotalUnique
@@ -1040,13 +1058,15 @@ func (m Model) footerView() string {
 		keys = []string{
 			"↑/k",
 			"↓/j",
-			"Enter",
-			"Esc",
+			helpLabelEnter,
+			helpLabelEsc,
 			"Space",
-			"s sort",
 			"d del",
 		}
-		keys = append(keys, "/ search", "? help")
+		if !m.hasActiveSemanticSearch() {
+			keys = append(keys, "s sort")
+		}
+		keys = append(keys, "/ search", helpLabelHelp)
 		if len(m.messages) > 0 {
 			// Show position / total - use contextStats for actual total when drilled down,
 			// or global stats for All Messages view
@@ -1076,9 +1096,9 @@ func (m Model) footerView() string {
 		}
 		// Show export option if message has attachments
 		if m.messageDetail != nil && len(m.messageDetail.Attachments) > 0 {
-			keys = append(keys, "e export")
+			keys = append(keys, "e attachments")
 		}
-		keys = append(keys, "Esc back", "q quit")
+		keys = append(keys, helpLabelBack, "q quit")
 		// Show message position (N/M) in the list - reuse total from parent view
 		if len(m.messages) > 0 {
 			total := int64(len(m.messages))
@@ -1096,7 +1116,7 @@ func (m Model) footerView() string {
 		keys = []string{
 			"↑/↓ navigate",
 			"Enter view",
-			"Esc back",
+			helpLabelBack,
 			"q quit",
 		}
 		if len(m.threadMessages) > 0 {
@@ -1171,6 +1191,7 @@ var rawHelpLines = []string{
 	"",
 	"Navigation",
 	"  ↑/k, ↓/j    Move cursor up/down",
+	"  Ctrl+p/n    Move cursor up/down",
 	"  ←/h, →/l    Prev/next message (in detail view)",
 	"  PgUp/PgDn   Page up/down",
 	"  Home/End    Go to first/last",
@@ -1191,11 +1212,11 @@ var rawHelpLines = []string{
 	"  a           View all messages",
 	"",
 	"Other",
-	"  /           Search",
+	"  /           Search (Tab cycles modes in message lists)",
 	"  A           Select account",
 	"  f           Filter (attachments, deleted)",
-	"  e           Export attachments (in message view)",
-	"  m           Cycle Email/Texts/Meetings",
+	"  e           Browse attachments (in message view)",
+	"  m           Cycle Email/Texts/Meetings/People",
 	"  q           Quit",
 	"",
 	"[↑/↓] Scroll  [Any other key] Close",
@@ -1206,6 +1227,7 @@ var meetingHelpLines = []string{
 	"",
 	"Navigation",
 	"  ↑/k, ↓/j    Move cursor or scroll transcript",
+	"  Ctrl+p/n    Move cursor or scroll transcript",
 	"  ←/h, →/l    Previous/next meeting in detail",
 	"  PgUp/PgDn   Page up/down",
 	"  Home/End    Go to first/last meeting",
@@ -1219,7 +1241,7 @@ var meetingHelpLines = []string{
 	"  r           Reverse sort order",
 	"",
 	"Other",
-	"  m           Cycle Email/Texts/Meetings",
+	"  m           Cycle Email/Texts/Meetings/People",
 	"  ?           Show this help",
 	"  q           Quit",
 	"",
@@ -1228,7 +1250,48 @@ var meetingHelpLines = []string{
 	"[↑/↓] Scroll  [Any other key] Close",
 }
 
+var peopleHelpLines = []string{
+	"People Shortcuts",
+	"",
+	"Navigation",
+	"  ↑/k, ↓/j    Move selection",
+	"  PgUp/PgDn   Page up/down",
+	"  Home/End    Go to first/last contact",
+	"  Enter       Open selected contact",
+	"  Esc         Clear search or go back",
+	"  Tab         Cycle contact tabs",
+	"  Shift-Tab   Cycle contact tabs backward",
+	"",
+	"Browse & Search",
+	"  /           Search names and identifiers",
+	"  r           Retry a failed directory load",
+	"",
+	"Other",
+	"  m           Cycle Email/Texts/Meetings/People",
+	"  ?           Show this help",
+	"  q           Quit",
+	"",
+	"[↑/↓] Scroll  [Any other key] Close",
+}
+
 func (m Model) activeHelpLines() []string {
+	if m.mode == modePeople {
+		if m.peopleState.level == peopleLevelContact && m.peopleState.tab == peopleTabOverview {
+			lines := append([]string(nil), peopleHelpLines...)
+			for i, line := range lines {
+				if line == "Browse & Search" {
+					addition := []string{
+						"  [           Previous relationship year",
+						"  ]           Next relationship year",
+					}
+					lines = append(lines[:i], append(addition, lines[i:]...)...)
+					break
+				}
+			}
+			return lines
+		}
+		return peopleHelpLines
+	}
 	if m.mode == modeMeetings {
 		return meetingHelpLines
 	}
@@ -1361,14 +1424,14 @@ func (m Model) renderHelpModal() string {
 // renderExportAttachmentsModal renders the export attachments modal content.
 func (m Model) renderExportAttachmentsModal() string {
 	if m.messageDetail == nil || len(m.messageDetail.Attachments) == 0 {
-		return m.styles.modalTitle.Render("Export Attachments") + "\n\n" +
-			"No attachments to export.\n\n" +
+		return m.styles.modalTitle.Render("Attachments") + "\n\n" +
+			"No attachments available.\n\n" +
 			"[Esc] Close"
 	}
 	var sb strings.Builder
-	sb.WriteString(m.styles.modalTitle.Render("Export Attachments"))
+	sb.WriteString(m.styles.modalTitle.Render("Attachments"))
 	sb.WriteString("\n\n")
-	sb.WriteString("Select attachments to export:\n\n")
+	sb.WriteString("Choose a file to download or open:\n\n")
 	for i, att := range m.messageDetail.Attachments {
 		cursor := " "
 		if i == m.exportCursor {
@@ -1378,7 +1441,8 @@ func (m Model) renderExportAttachmentsModal() string {
 		if m.exportSelection[i] {
 			checkbox = "☑"
 		}
-		_, _ = fmt.Fprintf(&sb, "%s %s %s (%s)\n", cursor, checkbox, att.Filename, formatBytes(att.Size))
+		filename := truncateRunes(textutil.SanitizeTerminal(attachmentDisplayName(att)), 60)
+		_, _ = fmt.Fprintf(&sb, "%s %s %s (%s)\n", cursor, checkbox, filename, formatBytes(att.Size))
 	}
 	// Count selected
 	selectedCount := 0
@@ -1388,8 +1452,8 @@ func (m Model) renderExportAttachmentsModal() string {
 		}
 	}
 	_, _ = fmt.Fprintf(&sb, "\n%d of %d selected\n", selectedCount, len(m.messageDetail.Attachments))
-	sb.WriteString("\n[↑/↓] Navigate  [Space] Toggle  [a] All  [n] None\n")
-	sb.WriteString("[Enter] Export  [Esc] Cancel")
+	sb.WriteString("\n[↑/↓] Navigate  [d] Download  [o] Open\n")
+	sb.WriteString("[Space] Toggle  [a] All  [n] None  [Enter] Export zip  [Esc] Cancel")
 	return sb.String()
 }
 
@@ -1402,8 +1466,12 @@ func (m Model) renderErrorModal() string {
 
 // renderExportResultModal renders the export result modal content.
 func (m Model) renderExportResultModal() string {
-	return m.styles.modalTitle.Render("Export Complete") + "\n\n" +
-		m.modalResult + "\n\n" +
+	title := m.modalResultTitle
+	if title == "" {
+		title = "Attachment Action"
+	}
+	return m.styles.modalTitle.Render(title) + "\n\n" +
+		textutil.SanitizeTerminalMultiline(m.modalResult) + "\n\n" +
 		"Press any key to close"
 }
 

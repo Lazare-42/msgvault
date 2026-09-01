@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import { describe, expect, it, vi } from 'vitest';
 
 import { ExploreSelectionState } from '../../explore/state.svelte';
@@ -24,6 +24,8 @@ function row(index: number, overrides: Partial<EntryRow> = {}): EntryRow {
     has_attachments: false,
     deleted_from_source: false,
     message_count: 1,
+    matched_sender_identities: [],
+    matched_recipient_identities: [],
     match: {},
     ...overrides
   };
@@ -98,6 +100,47 @@ describe('EverythingTable', () => {
     expect(screen.getByRole('columnheader', { name: 'People / source' })).toBeDefined();
     expect(screen.getByRole('columnheader', { name: 'Attachments' }).textContent).toBe('⌕');
     expect(screen.getByLabelText('Email item')).toBeDefined();
+  });
+
+  it('shows identity intersections on email rows without replacing participant labels', () => {
+    render(EverythingTable, {
+      rows: [
+        row(1, {
+          participant_labels: ['Original From Header <sender@example.test>'],
+          matched_sender_identities: ['send-as@example.test'],
+          matched_recipient_identities: ['masked@example.test']
+        }),
+        row(2, {
+          message_type: 'sms',
+          matched_sender_identities: ['hidden-non-email@example.test'],
+          matched_recipient_identities: []
+        }),
+        row(3, {
+          message_type: '',
+          matched_sender_identities: ['legacy-email@example.test'],
+          matched_recipient_identities: []
+        })
+      ],
+      selection: new ExploreSelectionState()
+    });
+
+    const emailRow = screen.getByRole('row', { name: /Synthetic subject 1/ });
+    expect(within(emailRow).getByText('Original From Header <sender@example.test>')).toBeDefined();
+    expect(within(emailRow).getByText('Sent via: send-as@example.test')).toBeDefined();
+    expect(within(emailRow).getByText('Via: masked@example.test')).toBeDefined();
+    expect(screen.getByText('Sent via: legacy-email@example.test')).toBeDefined();
+    expect(screen.queryByText('Sent via: hidden-non-email@example.test')).toBeNull();
+  });
+
+  it('omits blank participant labels instead of rendering a leading comma', () => {
+    render(EverythingTable, {
+      rows: [row(1, { participant_labels: ['', 'Charlie'] })],
+      selection: new ExploreSelectionState()
+    });
+
+    const rendered = screen.getByRole('row', { name: /Synthetic subject 1/ });
+    expect(within(rendered).getByText('Charlie')).toBeDefined();
+    expect(rendered.textContent).not.toContain(', Charlie');
   });
 
   it('exposes size through the column picker without showing it initially', async () => {
@@ -351,6 +394,26 @@ describe('EverythingTable', () => {
     await fireEvent.click(screen.getByRole('button', { name: 'Retry cache check' }));
     expect(onRetry).toHaveBeenCalledOnce();
     expect(screen.queryByText('No items match this view')).toBeNull();
+  });
+
+  it('presents cache initialization as automatic recovery', () => {
+    const selection = new ExploreSelectionState();
+    render(EverythingTable, {
+      rows: [],
+      selection,
+      unavailable: {
+        error: 'analytical_cache_unavailable',
+        message: 'The analytical cache is being prepared',
+        readiness: 'building',
+        recovery_action: ''
+      }
+    });
+
+    const alert = screen.getByRole('alert');
+    expect(alert.textContent).toContain('Preparing analytical cache');
+    expect(alert.textContent).toContain('This view will refresh automatically.');
+    expect(alert.textContent).not.toContain('Rebuild it with');
+    expect(screen.queryByRole('button', { name: 'Retry cache check' })).toBeNull();
   });
 
   it('keeps loaded rows visible with an inline retry when a cursor page fails', async () => {

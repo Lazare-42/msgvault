@@ -34,6 +34,7 @@ type CatalogScope string
 
 const (
 	CatalogScopeGuildChannels  CatalogScope = "guild_channels"
+	CatalogScopeGuildMembers   CatalogScope = "guild_members"
 	CatalogScopeActiveThreads  CatalogScope = "active_threads"
 	CatalogScopePublicArchive  CatalogScope = "public_archive"
 	CatalogScopePrivateArchive CatalogScope = "private_archive"
@@ -459,8 +460,7 @@ func newCatalogIssue(scope CatalogScope, guildID, parentID string, err error) Ca
 		issue.Kind = CatalogIssueMalformedPage
 		return issue
 	}
-	var apiErr *APIError
-	if errors.As(err, &apiErr) {
+	if apiErr, ok := errors.AsType[*APIError](err); ok {
 		issue.StatusCode = apiErr.StatusCode
 		issue.DiscordCode = apiErr.Code
 		switch apiErr.StatusCode {

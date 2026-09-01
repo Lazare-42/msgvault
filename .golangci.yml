@@ -1,11 +1,15 @@
 version: "2"
 
 run:
+  go: "1.27"
   # Lint the build-tagged code, not just the untagged subset. The primary
   # build uses `fts5 sqlite_vec` (Makefile BUILD_TAGS) and the pgvector
   # backend is gated behind `pgvector`; without these tags golangci-lint
   # never compiles those files, so lint debt silently accumulates behind
   # //go:build constraints (it did — see reviews/codex-pr4-iter3.md).
+  # Wait for duplicate runners in this worktree instead of failing on the
+  # runner lock; Makefile targets scope that lock to the worktree as well.
+  allow-serial-runners: true
   build-tags:
     - fts5
     - sqlite_vec
@@ -23,7 +27,6 @@ linters:
     - bidichk
     - bodyclose
     - canonicalheader
-    - clickhouselint
     - copyloopvar
     - decorder
     - dogsled
@@ -99,7 +102,7 @@ linters:
   #   complexity (trust reviewer judgment): funlen, cyclop, gocognit, maintidx, gocyclo, nestif
   #   project misfit: depguard, mnd, gochecknoglobals, gochecknoinits, testpackage,
   #     paralleltest, tparallel, gosmopolitan, prealloc, err113, forbidigo
-  #   deprecated: gomodguard (use gomodguard_v2)
+  #   deprecated: none of the enabled linter names are deprecated
   #   pending dedicated passes: contextcheck, noctx (see follow-up PRs)
 
   settings:
@@ -134,6 +137,10 @@ linters:
       # comparisons, and rare yes/no prompts. Real candidates (source types,
       # SQL table names) recur many more times than the threshold.
       min-occurrences: 10
+
+    gomoddirectives:
+      replace-allow-list:
+        - github.com/emersion/go-imap/v2
 
     importas:
       alias:

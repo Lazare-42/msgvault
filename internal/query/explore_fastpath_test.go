@@ -268,6 +268,30 @@ func TestSearchFilesFastPathMatchesLegacy(t *testing.T) {
 		{name: "no matches", request: FileSearchRequest{
 			FilenameQuery: "does-not-exist", Page: PageSpec{Limit: 50},
 		}},
+		{name: "person listing", request: FileSearchRequest{
+			Person: &PersonFileScope{
+				ParticipantIDs: []int64{ids.alice},
+				Directions: []PersonFileDirection{
+					PersonFileFromPerson, PersonFileToPerson, PersonFileGroup,
+				},
+			},
+			Page: PageSpec{Limit: 50},
+		}},
+		{name: "person small page", request: FileSearchRequest{
+			Person: &PersonFileScope{
+				ParticipantIDs: []int64{ids.alice},
+				Directions:     []PersonFileDirection{PersonFileFromPerson},
+			},
+			Page: PageSpec{Limit: 1},
+		}},
+		{name: "person source-deleted listing", request: FileSearchRequest{
+			Explore: ExploreRequest{Context: Context{Deletion: DeletionDeleted}},
+			Person: &PersonFileScope{
+				ParticipantIDs: []int64{ids.alice},
+				Directions:     []PersonFileDirection{PersonFileFromPerson},
+			},
+			Page: PageSpec{Limit: 50},
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -288,6 +312,11 @@ func TestExploreParticipantContextKeepsLegacyPath(t *testing.T) {
 	assert.False(exploreConditionsTouchParticipantLists(ExploreRequest{
 		Context: Context{SourceIDs: []int64{1}, MessageTypes: []string{"email"}},
 	}))
+	assert.False(exploreConditionsTouchParticipantLists(ExploreRequest{
+		Context: Context{Identity: &IdentityPredicate{
+			SourceID: 1, ParticipantIDs: []int64{7}, Direction: IdentityDirectionAny,
+		}},
+	}), "identity predicates use bounded header-row existence checks, not participant lists")
 	assert.True(exploreConditionsTouchParticipantLists(ExploreRequest{
 		Context: Context{ParticipantIDs: []int64{7}},
 	}))

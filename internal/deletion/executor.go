@@ -21,6 +21,8 @@ import (
 // and treat it as a clean stop rather than an error to surface.
 var ErrManifestCancelled = errors.New("deletion manifest cancelled")
 
+var errLocalTombstone = errors.New("local tombstone write failed")
+
 // isNotFoundError checks if an error indicates the message was already deleted.
 // Treating 404 as success makes deletion idempotent.
 func isNotFoundError(err error) bool {
@@ -60,6 +62,14 @@ type Executor struct {
 	client   gmail.API
 	logger   *slog.Logger
 	progress Progress
+	sourceID int64
+}
+
+// WithSourceID scopes legacy version-1 manifests to the source selected by
+// the caller's ambiguity-checked planning step.
+func (e *Executor) WithSourceID(sourceID int64) *Executor {
+	e.sourceID = sourceID
+	return e
 }
 
 // NewExecutor creates a deletion executor.
@@ -113,7 +123,7 @@ const (
 // deleteOne attempts to delete a single message and updates the local database on success.
 // Returns resultSuccess (including 404/already-deleted), resultFailed for transient errors,
 // or resultFatal for scope errors that should halt execution.
-func (e *Executor) deleteOne(ctx context.Context, gmailID string, method Method) (deleteResult, error) {
+func (e *Executor) deleteOne(ctx context.Context, sourceID int64, gmailID string, method Method) (deleteResult, error) {
 	var err error
 	if method == MethodTrash {
 		err = e.client.TrashMessage(ctx, gmailID)
@@ -125,8 +135,9 @@ func (e *Executor) deleteOne(ctx context.Context, gmailID string, method Method)
 		if err != nil {
 			e.logger.Debug("message already deleted", "gmail_id", gmailID)
 		}
-		if markErr := e.store.MarkMessageDeletedByGmailID(method == MethodDelete, gmailID); markErr != nil {
+		if markErr := e.store.MarkMessageDeletedBySourceMessageID(sourceID, method == MethodDelete, gmailID); markErr != nil {
 			e.logger.Warn("failed to mark deleted in DB", "gmail_id", gmailID, "error", markErr)
+			return resultFailed, fmt.Errorf("%w: %w", errLocalTombstone, markErr)
 		}
 		return resultSuccess, nil
 	}
@@ -137,6 +148,20 @@ func (e *Executor) deleteOne(ctx context.Context, gmailID string, method Method)
 
 	e.logger.Warn("failed to delete message", "gmail_id", gmailID, "error", err)
 	return resultFailed, err
+}
+
+func (e *Executor) manifestSourceID(manifest *Manifest) (int64, error) {
+	if err := manifest.ValidateVersion(); err != nil {
+		return 0, err
+	}
+	if manifest.Version == 1 {
+		return e.sourceID, nil
+	}
+	source, err := e.store.GetSourceByTypeAndIdentifier(manifest.Source.Type, manifest.Source.Identifier)
+	if err != nil {
+		return 0, fmt.Errorf("resolve manifest source: %w", err)
+	}
+	return source.ID, nil
 }
 
 // manifestCancelled reports whether the manifest was cancelled by a concurrent
@@ -175,6 +200,14 @@ func (e *Executor) saveCheckpoint(manifest *Manifest, manifestID string, index, 
 		}
 		e.logger.Error("failed to save checkpoint", "error", err)
 	}
+}
+
+func (e *Executor) saveTombstoneCheckpoint(manifest *Manifest, manifestID string, index, succeeded, failed int, failedIDs, tombstoneIDs []string) {
+	if manifest.Execution == nil {
+		return
+	}
+	manifest.Execution.TombstoneIDs = tombstoneIDs
+	e.saveCheckpoint(manifest, manifestID, index, succeeded, failed, failedIDs)
 }
 
 // prepareExecution claims a manifest into in_progress/ (or resumes one
@@ -290,12 +323,17 @@ func (e *Executor) Execute(ctx context.Context, manifestID string, opts *Execute
 	if err != nil {
 		return err
 	}
+	sourceID, err := e.manifestSourceID(manifest)
+	if err != nil {
+		return fmt.Errorf("validate manifest source: %w", err)
+	}
 
 	// Determine starting point
 	startIndex := 0
 	succeeded := manifest.Execution.Succeeded
 	failed := manifest.Execution.Failed
 	failedIDs := manifest.Execution.FailedIDs
+	tombstoneIDs := slices.Clone(manifest.Execution.TombstoneIDs)
 	var retryIDs []string
 	if opts.Resume {
 		startIndex = manifest.Execution.LastProcessedIndex
@@ -325,6 +363,34 @@ func (e *Executor) Execute(ctx context.Context, manifestID string, opts *Execute
 		alreadyProcessed = succeeded
 	}
 	e.progress.OnStart(len(manifest.GmailIDs), alreadyProcessed)
+	for ti, gmailID := range tombstoneIDs {
+		select {
+		case <-ctx.Done():
+			e.saveTombstoneCheckpoint(manifest, manifestID, startIndex, succeeded, len(retryIDs), retryIDs, tombstoneIDs[ti:])
+			return ctx.Err()
+		default:
+		}
+		if e.manifestCancelled(manifestID) {
+			e.saveTombstoneCheckpoint(manifest, manifestID, startIndex, succeeded, len(retryIDs), retryIDs, tombstoneIDs[ti:])
+			return ErrManifestCancelled
+		}
+		if err := e.store.MarkMessageDeletedBySourceMessageID(sourceID, opts.Method == MethodDelete, gmailID); err != nil {
+			remaining := tombstoneIDs[ti:]
+			e.saveTombstoneCheckpoint(
+				manifest,
+				manifestID,
+				startIndex,
+				succeeded,
+				len(retryIDs),
+				retryIDs,
+				remaining,
+			)
+			return fmt.Errorf("retry local tombstone: %w", err)
+		}
+		succeeded++
+	}
+	tombstoneIDs = nil
+	manifest.Execution.TombstoneIDs = nil
 
 	// Retry previously failed IDs before continuing with remaining messages
 	for ri, gmailID := range retryIDs {
@@ -341,7 +407,7 @@ func (e *Executor) Execute(ctx context.Context, manifestID string, opts *Execute
 			return ErrManifestCancelled
 		}
 
-		result, delErr := e.deleteOne(ctx, gmailID, opts.Method)
+		result, delErr := e.deleteOne(ctx, sourceID, gmailID, opts.Method)
 		switch result {
 		case resultSuccess:
 			succeeded++
@@ -350,6 +416,19 @@ func (e *Executor) Execute(ctx context.Context, manifestID string, opts *Execute
 			e.saveCheckpoint(manifest, manifestID, startIndex, succeeded, len(remaining), remaining)
 			return fmt.Errorf("delete message: %w", delErr)
 		case resultFailed:
+			if errors.Is(delErr, errLocalTombstone) {
+				remainingRetries := slices.Concat(failedIDs, retryIDs[ri+1:])
+				e.saveTombstoneCheckpoint(
+					manifest,
+					manifestID,
+					startIndex,
+					succeeded,
+					len(remainingRetries),
+					remainingRetries,
+					append(slices.Clone(tombstoneIDs), gmailID),
+				)
+				return fmt.Errorf("delete message: %w", delErr)
+			}
 			failed++
 			failedIDs = append(failedIDs, gmailID)
 		}
@@ -371,7 +450,7 @@ func (e *Executor) Execute(ctx context.Context, manifestID string, opts *Execute
 			return ErrManifestCancelled
 		}
 
-		result, delErr := e.deleteOne(ctx, manifest.GmailIDs[i], opts.Method)
+		result, delErr := e.deleteOne(ctx, sourceID, manifest.GmailIDs[i], opts.Method)
 		switch result {
 		case resultSuccess:
 			succeeded++
@@ -379,6 +458,11 @@ func (e *Executor) Execute(ctx context.Context, manifestID string, opts *Execute
 			e.saveCheckpoint(manifest, manifestID, i, succeeded, failed, failedIDs)
 			return fmt.Errorf("delete message: %w", delErr)
 		case resultFailed:
+			if errors.Is(delErr, errLocalTombstone) {
+				remaining := append(slices.Clone(tombstoneIDs), manifest.GmailIDs[i])
+				e.saveTombstoneCheckpoint(manifest, manifestID, i+1, succeeded, failed, failedIDs, remaining)
+				return fmt.Errorf("delete message: %w", delErr)
+			}
 			failed++
 			failedIDs = append(failedIDs, manifest.GmailIDs[i])
 		}
@@ -398,6 +482,10 @@ func (e *Executor) ExecuteBatch(ctx context.Context, manifestID string) error {
 	manifest, err := e.prepareExecution(manifestID, MethodDelete)
 	if err != nil {
 		return err
+	}
+	sourceID, err := e.manifestSourceID(manifest)
+	if err != nil {
+		return fmt.Errorf("validate manifest source: %w", err)
 	}
 
 	if e.manifestCancelled(manifestID) {
@@ -422,6 +510,7 @@ func (e *Executor) ExecuteBatch(ctx context.Context, manifestID string) error {
 	succeeded := 0
 	failed := 0
 	var retryIDs []string
+	var tombstoneIDs []string
 	if manifest.Execution != nil {
 		startIndex = manifest.Execution.LastProcessedIndex
 		succeeded = manifest.Execution.Succeeded
@@ -433,6 +522,7 @@ func (e *Executor) ExecuteBatch(ctx context.Context, manifestID string) error {
 		} else {
 			failed = manifest.Execution.Failed
 		}
+		tombstoneIDs = slices.Clone(manifest.Execution.TombstoneIDs)
 	}
 
 	// Bounds check to handle corrupted manifests
@@ -459,6 +549,35 @@ func (e *Executor) ExecuteBatch(ctx context.Context, manifestID string) error {
 	e.progress.OnStart(len(manifest.GmailIDs), alreadyProcessed)
 
 	var failedIDs []string
+	// Tombstone-only retries must never issue another remote deletion.
+	for ti, gmailID := range tombstoneIDs {
+		select {
+		case <-ctx.Done():
+			e.saveTombstoneCheckpoint(manifest, manifestID, startIndex, succeeded, len(retryIDs), retryIDs, tombstoneIDs[ti:])
+			return ctx.Err()
+		default:
+		}
+		if e.manifestCancelled(manifestID) {
+			e.saveTombstoneCheckpoint(manifest, manifestID, startIndex, succeeded, len(retryIDs), retryIDs, tombstoneIDs[ti:])
+			return ErrManifestCancelled
+		}
+		if err := e.store.MarkMessageDeletedBySourceMessageID(sourceID, true, gmailID); err != nil {
+			remaining := slices.Clone(tombstoneIDs[ti:])
+			e.saveTombstoneCheckpoint(
+				manifest,
+				manifestID,
+				startIndex,
+				succeeded,
+				len(retryIDs),
+				retryIDs,
+				remaining,
+			)
+			return fmt.Errorf("retry local tombstone: %w", err)
+		}
+		succeeded++
+	}
+	tombstoneIDs = nil
+	manifest.Execution.TombstoneIDs = nil
 
 	// Retry previously failed IDs before continuing with remaining messages
 	if len(retryIDs) > 0 {
@@ -477,7 +596,7 @@ func (e *Executor) ExecuteBatch(ctx context.Context, manifestID string) error {
 				return ErrManifestCancelled
 			}
 
-			result, delErr := e.deleteOne(ctx, gmailID, MethodDelete)
+			result, delErr := e.deleteOne(ctx, sourceID, gmailID, MethodDelete)
 			switch result {
 			case resultSuccess:
 				succeeded++
@@ -486,6 +605,19 @@ func (e *Executor) ExecuteBatch(ctx context.Context, manifestID string) error {
 				e.saveCheckpoint(manifest, manifestID, startIndex, succeeded, len(remaining), remaining)
 				return fmt.Errorf("delete message: %w", delErr)
 			case resultFailed:
+				if errors.Is(delErr, errLocalTombstone) {
+					remainingRetries := slices.Concat(failedIDs, retryIDs[ri+1:])
+					e.saveTombstoneCheckpoint(
+						manifest,
+						manifestID,
+						startIndex,
+						succeeded,
+						len(remainingRetries),
+						remainingRetries,
+						append(slices.Clone(tombstoneIDs), gmailID),
+					)
+					return fmt.Errorf("delete message: %w", delErr)
+				}
 				failed++
 				failedIDs = append(failedIDs, gmailID)
 			}
@@ -535,7 +667,7 @@ func (e *Executor) ExecuteBatch(ctx context.Context, manifestID string) error {
 					return ErrManifestCancelled
 				}
 
-				result, delErr := e.deleteOne(ctx, gmailID, MethodDelete)
+				result, delErr := e.deleteOne(ctx, sourceID, gmailID, MethodDelete)
 				switch result {
 				case resultSuccess:
 					succeeded++
@@ -543,17 +675,29 @@ func (e *Executor) ExecuteBatch(ctx context.Context, manifestID string) error {
 					e.saveCheckpoint(manifest, manifestID, i+j, succeeded, failed, failedIDs)
 					return fmt.Errorf("delete message: %w", delErr)
 				case resultFailed:
+					if errors.Is(delErr, errLocalTombstone) {
+						// The remote delete succeeded for this ID, so only it needs
+						// a tombstone retry. IDs after it have not been attempted.
+						remaining := append(slices.Clone(tombstoneIDs), gmailID)
+						e.saveTombstoneCheckpoint(manifest, manifestID, i+j+1, succeeded, len(failedIDs), failedIDs, remaining)
+						return fmt.Errorf("delete message: %w", delErr)
+					}
 					failed++
 					failedIDs = append(failedIDs, gmailID)
 				}
 				e.progress.OnProgress(i+j+1, succeeded, failed)
 			}
 		} else {
-			succeeded += len(batch)
 			// Mark all as deleted in DB using batch update
-			if markErr := e.store.MarkMessagesDeletedByGmailIDBatch(batch); markErr != nil {
+			if markErr := e.store.MarkMessagesDeletedBySourceMessageIDBatch(sourceID, batch); markErr != nil {
 				e.logger.Warn("failed to mark batch as deleted in DB", "count", len(batch), "error", markErr)
+				// The remote batch is complete, so retry only its tombstones;
+				// later IDs must remain on the normal batch path.
+				remaining := append(slices.Clone(tombstoneIDs), batch...)
+				e.saveTombstoneCheckpoint(manifest, manifestID, end, succeeded, len(failedIDs), failedIDs, remaining)
+				return fmt.Errorf("mark batch deleted in DB: %w", markErr)
 			}
+			succeeded += len(batch)
 		}
 
 		e.progress.OnProgress(end, succeeded, failed)

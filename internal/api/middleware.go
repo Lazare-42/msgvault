@@ -44,19 +44,28 @@ func defaultCORSAllowedMethods() []string {
 }
 
 // defaultCORSAllowedHeaders lists the request headers cross-origin clients
-// send: If-Match carries the concurrency token for settings and saved-view
-// updates, X-Request-Id the idempotency key for task creation.
+// send: If-Match carries concurrency tokens, Idempotency-Key carries person
+// merge and split retry keys, and X-Request-Id carries task creation retry keys.
 func defaultCORSAllowedHeaders() []string {
 	return []string{
-		"Accept", "Authorization", "Content-Type", "If-Match",
-		"X-API-Key", "X-Request-Id", csrfHeaderName,
+		"Accept", "Authorization", "Content-Type", ifMatchHeaderName,
+		idempotencyKeyHeaderName, "X-API-Key", "X-Request-Id", csrfHeaderName,
 	}
 }
 
-// corsExposedHeaders is the Access-Control-Expose-Headers value: ETag is the
-// only non-safelisted response header clients read (settings and saved-view
-// concurrency tokens).
-const corsExposedHeaders = "ETag"
+// corsExposedHeaders is the Access-Control-Expose-Headers value. ETag carries
+// the primary resource concurrency token; X-New-Person-ETag carries the second
+// token created by a person split.
+const (
+	corsExposedHeaders  = etagHeaderName + ", " + newPersonETagOpenAPIHeaderName
+	etagHeaderName      = "ETag"
+	ifMatchHeaderName   = "If-Match"
+	headerParamLocation = "header"
+	pathKey             = "path"
+
+	// formatInt64 is the OpenAPI schema format for 64-bit identifiers.
+	formatInt64 = "int64"
+)
 
 // CORSMiddleware returns a middleware that handles CORS headers.
 //
@@ -295,14 +304,18 @@ func RateLimitMiddleware(
 
 			ip := clientIP(r)
 			if !limiter.Allow(ip) {
-				w.Header().Set("Content-Type", applicationJSONMediaType)
-				w.Header().Set("Retry-After", "1")
-				w.WriteHeader(http.StatusTooManyRequests)
-				_, _ = w.Write([]byte(`{"error":"rate_limit_exceeded","message":"Too many requests. Please slow down."}`))
+				writeRateLimitExceeded(w)
 				return
 			}
 
 			next.ServeHTTP(w, r)
 		})
 	}
+}
+
+func writeRateLimitExceeded(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", applicationJSONMediaType)
+	w.Header().Set("Retry-After", "1")
+	w.WriteHeader(http.StatusTooManyRequests)
+	_, _ = w.Write([]byte(`{"error":"rate_limit_exceeded","message":"Too many requests. Please slow down."}`))
 }

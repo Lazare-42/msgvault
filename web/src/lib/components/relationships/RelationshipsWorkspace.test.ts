@@ -15,6 +15,16 @@ function person(id: number, label: string) {
   };
 }
 
+function relationshipCalendar(id: number, year: number) {
+  return {
+    participant_id: id, canonical_id: id, year, timezone: 'UTC',
+    days: [{ date: `${year}-01-01`, sent: 1, received: 0, email: 1, chat: 0, meetings: 0, total: 1, modality_mask: 1, level: 'FIRST_QUARTILE' }],
+    current: { temperature: 62, rank: 4, population: 20, raw_score: 3, signals: { sent_signal: 1, received_volume: 0, meeting_signal: 0, modalities: 1 } },
+    annual: [], peak_temperature: 87, peak_year: 2018, scoring_timezone: 'UTC',
+    score_version: 1, effective_date: `${year}-08-22`, cache_revision: 'cache-rel', identity_revision: 3
+  };
+}
+
 function pathOf(request: Request): string {
   return new URL(request.url, document.baseURI).pathname;
 }
@@ -78,6 +88,53 @@ function fetchHandler(overrides: Record<string, (request: Request) => Promise<Re
   return { fetchFn, requests };
 }
 
+describe('RelationshipsWorkspace relationship calendar', () => {
+  it('shows the person heatmap above the timeline and navigates years through the controller', async () => {
+    const years: number[] = [];
+    const { fetchFn } = fetchHandler({
+      '/api/v1/participants/1': async () => Response.json({
+        ...person(1, 'Alice Example'), first_at: '2018-01-02T00:00:00Z'
+      }),
+      '/api/v1/relationships/1/timeline': async () => Response.json({
+        canonical_id: 1, identity_revision: 3, cache_revision: 'cache-rel', rows: [], total_count: 0
+      }),
+      '/api/v1/relationships/1/calendar': async (request) => {
+        const body = await request.clone().json() as { year: number };
+        years.push(body.year);
+        return Response.json(relationshipCalendar(1, body.year));
+      }
+    });
+    const props = { ...baseProps(fetchFn), target: 'cluster:1' };
+    render(RelationshipsWorkspace, { props });
+
+    await props.controller.openTarget('cluster:1', props.predicate);
+    await screen.findByText('Current 62/100');
+    const calendarSection = screen.getByRole('region', { name: 'Relationship activity calendar' });
+    const timeline = screen.getByRole('grid', { name: 'Relationship activity' });
+    expect(calendarSection.compareDocumentPosition(timeline) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Previous relationship year' }));
+    await waitFor(() => expect(years).toEqual([2026, 2025]));
+    expect(await screen.findByText('Peak 87/100 - 2018')).toBeTruthy();
+  });
+
+  it('does not render or request a calendar for domain targets', async () => {
+    const { fetchFn, requests } = fetchHandler({
+      '/api/v1/domains/example.com': async () => Response.json({
+        domain: 'example.com', activity_count: 3, file_count: 1, person_count: 2,
+        first_at: when, last_at: when, source_counts: [], cache_revision: 'cache-rel'
+      }),
+      '/api/v1/domains/example.com/timeline': async () => Response.json({ rows: [], total_count: 0 })
+    });
+    const props = { ...baseProps(fetchFn), facet: 'domains' as const, target: 'domain:example.com' };
+    render(RelationshipsWorkspace, { props });
+    await props.controller.openTarget('domain:example.com', props.predicate);
+
+    expect(screen.queryByRole('region', { name: 'Relationship activity calendar' })).toBeNull();
+    expect(requests.some((request) => pathOf(request).endsWith('/calendar'))).toBe(false);
+  });
+});
+
 describe('RelationshipsWorkspace', () => {
   it('renders the ranked list and the empty-state header with no reading pane open', async () => {
     const { fetchFn } = fetchHandler();
@@ -90,7 +147,7 @@ describe('RelationshipsWorkspace', () => {
 
   it('selecting a list row calls onTargetChange and opens it through the controller', async () => {
     const { fetchFn, requests } = fetchHandler({
-      '/api/v1/people/1': async () => Response.json(person(1, 'Alice Example')),
+      '/api/v1/participants/1': async () => Response.json(person(1, 'Alice Example')),
       '/api/v1/relationships/1/timeline': async () => Response.json({
         canonical_id: 1, identity_revision: 1, cache_revision: 'cache-rel',
         rows: [{ key: 'message:1', kind: 'email', occurred_at: when, preview: 'Preview', source_id: 1, title: 'Subject', has_attachments: false, message_count: 1 }],
@@ -103,14 +160,14 @@ describe('RelationshipsWorkspace', () => {
     await fireEvent.click((await screen.findByText('Alice Example')).closest('[role="row"]')!);
     expect(props.onTargetChange).toHaveBeenCalledWith('cluster:1');
 
-    await waitFor(() => expect(requests.some((request) => pathOf(request) === '/api/v1/people/1')).toBe(true));
+    await waitFor(() => expect(requests.some((request) => pathOf(request) === '/api/v1/participants/1')).toBe(true));
     expect(await screen.findByRole('heading', { name: 'Alice Example' })).toBeDefined();
     expect(await screen.findByText('Subject')).toBeDefined();
   });
 
   it('single-clicking a timeline row opens the conversation thread in the reading pane', async () => {
     const { fetchFn } = fetchHandler({
-      '/api/v1/people/1': async () => Response.json(person(1, 'Alice Example')),
+      '/api/v1/participants/1': async () => Response.json(person(1, 'Alice Example')),
       '/api/v1/relationships/1/timeline': async () => Response.json({
         canonical_id: 1, identity_revision: 1, cache_revision: 'cache-rel',
         rows: [{ key: 'message:1', kind: 'email', occurred_at: when, preview: 'Preview text', source_id: 1, title: 'Subject line', has_attachments: false, message_count: 1, anchor_message_id: 9, conversation_id: 70 }],
@@ -138,7 +195,7 @@ describe('RelationshipsWorkspace', () => {
   it('opens a chat_burst directly into the conversation window bounded to the local day', async () => {
     const requestedConversations: Request[] = [];
     const { fetchFn } = fetchHandler({
-      '/api/v1/people/1': async () => Response.json(person(1, 'Alice Example')),
+      '/api/v1/participants/1': async () => Response.json(person(1, 'Alice Example')),
       '/api/v1/relationships/1/timeline': async () => Response.json({
         canonical_id: 1, identity_revision: 1, cache_revision: 'cache-rel',
         rows: [{
@@ -171,11 +228,11 @@ describe('RelationshipsWorkspace', () => {
 
   it('swaps the center pane to FilesWorkspace when filesOpen is true', async () => {
     const { fetchFn } = fetchHandler({
-      '/api/v1/people/1': async () => Response.json(person(1, 'Alice Example')),
+      '/api/v1/participants/1': async () => Response.json(person(1, 'Alice Example')),
       '/api/v1/relationships/1/timeline': async () => Response.json({
         canonical_id: 1, identity_revision: 1, cache_revision: 'cache-rel', rows: [], total_count: 0
       }),
-      '/api/v1/people/1/files/search': async () => Response.json({
+      '/api/v1/participants/1/files/search': async () => Response.json({
         files: [], total_count: 0, cache_revision: 'cache-rel', search_provenance: {}
       })
     });
@@ -187,12 +244,12 @@ describe('RelationshipsWorkspace', () => {
     expect(screen.queryByRole('grid', { name: 'Relationship activity' })).toBeNull();
   });
 
-  it('debounces identity search typing into one /api/v1/people/search fetch', async () => {
+  it('debounces identity search typing into one /api/v1/participants/search fetch', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     try {
       const searchRequests: Request[] = [];
       const { fetchFn } = fetchHandler({
-        '/api/v1/people/search': async (request) => {
+        '/api/v1/participants/search': async (request) => {
           searchRequests.push(request);
           return Response.json({ rows: [], total_count: 0, cache_revision: 'cache-rel', search_provenance: {} });
         }
@@ -225,7 +282,7 @@ describe('RelationshipsWorkspace', () => {
     try {
       const searchRequests: Request[] = [];
       const { fetchFn } = fetchHandler({
-        '/api/v1/people/search': async (request) => {
+        '/api/v1/participants/search': async (request) => {
           searchRequests.push(request);
           return Response.json({ rows: [], total_count: 0, cache_revision: 'cache-rel', search_provenance: {} });
         }
@@ -253,7 +310,7 @@ describe('RelationshipsWorkspace', () => {
 
   it('clears the reading pane when the target is cleared externally, not through this component\'s own Esc handler', async () => {
     const { fetchFn } = fetchHandler({
-      '/api/v1/people/1': async () => Response.json(person(1, 'Alice Example')),
+      '/api/v1/participants/1': async () => Response.json(person(1, 'Alice Example')),
       '/api/v1/relationships/1/timeline': async () => Response.json({
         canonical_id: 1, identity_revision: 1, cache_revision: 'cache-rel',
         rows: [{ key: 'message:1', kind: 'email', occurred_at: when, preview: 'Preview', source_id: 1, title: 'Subject', has_attachments: false, message_count: 1 }],
@@ -276,7 +333,7 @@ describe('RelationshipsWorkspace', () => {
 
   it('clears the reading pane when Back/Forward jumps straight between two targets without clearing to null', async () => {
     const { fetchFn } = fetchHandler({
-      '/api/v1/people/1': async () => Response.json(person(1, 'Alice Example')),
+      '/api/v1/participants/1': async () => Response.json(person(1, 'Alice Example')),
       '/api/v1/relationships/1/timeline': async () => Response.json({
         canonical_id: 1, identity_revision: 1, cache_revision: 'cache-rel',
         rows: [{ key: 'message:1', kind: 'email', occurred_at: when, preview: 'Preview', source_id: 1, title: 'Subject', has_attachments: false, message_count: 1 }],
@@ -300,11 +357,11 @@ describe('RelationshipsWorkspace', () => {
 
   it('does not scope the embedded FilesWorkspace to the previous cluster while a fast target switch is still resolving', async () => {
     const { fetchFn } = fetchHandler({
-      '/api/v1/people/1': async () => Response.json(person(1, 'Alice Example')),
+      '/api/v1/participants/1': async () => Response.json(person(1, 'Alice Example')),
       '/api/v1/relationships/1/timeline': async () => Response.json({
         canonical_id: 1, identity_revision: 1, cache_revision: 'cache-rel', rows: [], total_count: 0
       }),
-      '/api/v1/people/1/files/search': async () => Response.json({
+      '/api/v1/participants/1/files/search': async () => Response.json({
         files: [], total_count: 0, cache_revision: 'cache-rel', search_provenance: {}
       })
     });
@@ -331,11 +388,11 @@ describe('RelationshipsWorkspace', () => {
       size_bytes: 100, content_state: 'local_content', content_available: true
     };
     const { fetchFn } = fetchHandler({
-      '/api/v1/people/1': async () => Response.json(person(1, 'Alice Example')),
+      '/api/v1/participants/1': async () => Response.json(person(1, 'Alice Example')),
       '/api/v1/relationships/1/timeline': async () => Response.json({
         canonical_id: 1, identity_revision: 1, cache_revision: 'cache-rel', rows: [], total_count: 0
       }),
-      '/api/v1/people/1/files/search': async () => Response.json({
+      '/api/v1/participants/1/files/search': async () => Response.json({
         files: [fileRow], total_count: 1, cache_revision: 'cache-rel', search_provenance: {}
       }),
       '/api/v1/files/9': async () => Response.json({
@@ -361,7 +418,7 @@ describe('RelationshipsWorkspace', () => {
 
   it('does not act on Esc while another scope (e.g. the Link identity dialog) is active, letting the Modal handle it', async () => {
     const { fetchFn } = fetchHandler({
-      '/api/v1/people/1': async () => Response.json(person(1, 'Alice Example'))
+      '/api/v1/participants/1': async () => Response.json(person(1, 'Alice Example'))
     });
     const props = { ...baseProps(fetchFn), target: 'cluster:1' };
     render(RelationshipsWorkspace, { props });
@@ -405,9 +462,9 @@ describe('RelationshipsWorkspace', () => {
     let resolveTimeline: ((response: Response) => void) | undefined;
     const filesRequests: Request[] = [];
     const { fetchFn } = fetchHandler({
-      '/api/v1/people/1': async () => Response.json(person(1, 'Alice Example')),
+      '/api/v1/participants/1': async () => Response.json(person(1, 'Alice Example')),
       '/api/v1/relationships/1/timeline': async () => new Promise<Response>((resolve) => { resolveTimeline = resolve; }),
-      '/api/v1/people/1/files/search': async (request) => {
+      '/api/v1/participants/1/files/search': async (request) => {
         filesRequests.push(request);
         return Response.json({ files: [], total_count: 0, cache_revision: 'cache-rel', search_provenance: {} });
       }
@@ -441,7 +498,7 @@ describe('RelationshipsWorkspace', () => {
 
   it('walks Esc back one layer at a time: reading pane, then the open target', async () => {
     const { fetchFn } = fetchHandler({
-      '/api/v1/people/1': async () => Response.json(person(1, 'Alice Example')),
+      '/api/v1/participants/1': async () => Response.json(person(1, 'Alice Example')),
       '/api/v1/relationships/1/timeline': async () => Response.json({
         canonical_id: 1, identity_revision: 1, cache_revision: 'cache-rel',
         rows: [{ key: 'message:1', kind: 'email', occurred_at: when, preview: 'Preview', source_id: 1, title: 'Subject', has_attachments: false, message_count: 1 }],
@@ -464,7 +521,7 @@ describe('RelationshipsWorkspace', () => {
 
   it('moves focus to the timeline, then the list, as Esc walks back each layer', async () => {
     const { fetchFn } = fetchHandler({
-      '/api/v1/people/1': async () => Response.json(person(1, 'Alice Example')),
+      '/api/v1/participants/1': async () => Response.json(person(1, 'Alice Example')),
       '/api/v1/relationships/1/timeline': async () => Response.json({
         canonical_id: 1, identity_revision: 1, cache_revision: 'cache-rel',
         rows: [{ key: 'message:1', kind: 'email', occurred_at: when, preview: 'Preview', source_id: 1, title: 'Subject', has_attachments: false, message_count: 1 }],
@@ -498,7 +555,7 @@ describe('RelationshipsWorkspace resizable rail (wide layout)', () => {
     const primary = container.querySelector('[data-pane="primary"]') as HTMLElement;
     expect(primary.style.flexBasis).toBe('300px');
 
-    const handle = screen.getByRole('button', { name: 'Resize relationship list' });
+    const handle = screen.getByRole('separator', { name: 'Resize relationship list' });
     await fireEvent.keyDown(handle, { key: 'ArrowRight' });
     expect(primary.style.flexBasis).toBe('324px');
     expect(localStorage.getItem('msgvault.relationships.list-pane.size')).toBe('324');
@@ -524,19 +581,21 @@ describe('RelationshipsWorkspace resizable rail (wide layout)', () => {
 });
 
 describe('RelationshipsWorkspace drawer (narrow layout)', () => {
-  it('is inert while closed; opening focuses the search input and traps Tab; Esc returns focus to the toggle', async () => {
+  it('is absent while closed; opening focuses the search input and traps Tab; Esc returns focus to the toggle', async () => {
     const restoreContainer = forceNarrowContainer();
     try {
       const { fetchFn } = fetchHandler();
-      render(RelationshipsWorkspace, { props: baseProps(fetchFn) });
-      await screen.findByText('Alice Example');
+      const props = baseProps(fetchFn);
+      render(RelationshipsWorkspace, { props });
+      await waitFor(() => expect(props.controller.listRows).toHaveLength(1));
 
-      const listPane = document.querySelector<HTMLElement & { inert: boolean }>('.pane-list')!;
-      expect(listPane.inert).toBe(true);
+      expect(screen.queryByRole('dialog', { name: 'Relationship search and results' })).toBeNull();
 
       const toggle = screen.getByRole('button', { name: 'Show relationship list' });
+      toggle.focus();
       await fireEvent.click(toggle);
-      expect(listPane.inert).toBe(false);
+      const drawer = screen.getByRole('dialog', { name: 'Relationship search and results' });
+      expect(await screen.findByText('Alice Example')).toBeDefined();
 
       const searchInput = screen.getByRole('searchbox', { name: 'Search people and domains' });
       await waitFor(() => expect(document.activeElement).toBe(searchInput));
@@ -544,14 +603,16 @@ describe('RelationshipsWorkspace drawer (narrow layout)', () => {
       const resultsGrid = screen.getByRole('grid', { name: 'Relationship results' });
       resultsGrid.focus();
       await fireEvent.keyDown(resultsGrid, { key: 'Tab' });
-      expect(document.activeElement).toBe(searchInput);
+      expect(drawer.contains(document.activeElement)).toBe(true);
 
-      await fireEvent.keyDown(searchInput, { key: 'Tab', shiftKey: true });
-      expect(document.activeElement).toBe(resultsGrid);
+      await fireEvent.keyDown(document.activeElement!, { key: 'Tab', shiftKey: true });
+      expect(drawer.contains(document.activeElement)).toBe(true);
 
       await fireEvent.keyDown(document.activeElement!, { key: 'Escape' });
-      expect(listPane.inert).toBe(true);
-      expect(document.activeElement).toBe(toggle);
+      await waitFor(() => {
+        expect(screen.queryByRole('dialog', { name: 'Relationship search and results' })).toBeNull();
+        expect(document.activeElement).toBe(toggle);
+      });
     } finally {
       restoreContainer();
     }
@@ -561,7 +622,7 @@ describe('RelationshipsWorkspace drawer (narrow layout)', () => {
     const restoreContainer = forceNarrowContainer();
     try {
       const { fetchFn } = fetchHandler({
-        '/api/v1/people/1': async () => Response.json(person(1, 'Alice Example')),
+        '/api/v1/participants/1': async () => Response.json(person(1, 'Alice Example')),
         '/api/v1/relationships/1/timeline': async () => Response.json({
           canonical_id: 1, identity_revision: 1, cache_revision: 'cache-rel', rows: [], total_count: 0
         })
@@ -571,11 +632,9 @@ describe('RelationshipsWorkspace drawer (narrow layout)', () => {
       await props.controller.openTarget('cluster:1', props.predicate);
       await screen.findByRole('heading', { name: 'Alice Example' });
 
-      // The drawer starts closed (selecting a row closes it), so the list
-      // pane is inert; without the fix, Esc would call .focus() on it and
-      // land nowhere real.
-      const listPane = document.querySelector<HTMLElement & { inert: boolean }>('.pane-list')!;
-      expect(listPane.inert).toBe(true);
+      // The drawer starts closed, so Kit has unmounted the list pane. Escape
+      // must restore focus to the control that can mount it again.
+      expect(screen.queryByRole('dialog', { name: 'Relationship search and results' })).toBeNull();
 
       await fireEvent.keyDown(screen.getByRole('grid', { name: 'Relationship activity' }), { key: 'Escape' });
       expect(props.onTargetChange).toHaveBeenCalledWith(null);

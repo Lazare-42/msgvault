@@ -6,6 +6,60 @@ import (
 	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
 )
 
+type DeleteAttributeDefinitionHeaders struct {
+	// IfMatch Strong ETag returned by the latest definition read
+	IfMatch string `json:"If-Match" validate:"required"`
+}
+
+func (d DeleteAttributeDefinitionHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(d))
+}
+
+type PatchAttributeDefinitionHeaders struct {
+	// IfMatch Strong ETag returned by the latest definition read
+	IfMatch string `json:"If-Match" validate:"required"`
+}
+
+func (p PatchAttributeDefinitionHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type DeleteEmploymentHeaders struct {
+	// IfMatch Strong ETag returned by the latest employment read
+	IfMatch string `json:"If-Match" validate:"required"`
+}
+
+func (d DeleteEmploymentHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(d))
+}
+
+type PatchEmploymentHeaders struct {
+	// IfMatch Strong ETag returned by the latest employment read
+	IfMatch string `json:"If-Match" validate:"required"`
+}
+
+func (p PatchEmploymentHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type EndEmploymentHeaders struct {
+	// IfMatch Strong ETag returned by the latest employment read
+	IfMatch string `json:"If-Match" validate:"required"`
+}
+
+func (e EndEmploymentHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(e))
+}
+
+type SetPrimaryEmploymentHeaders struct {
+	// IfMatch Strong ETag returned by the latest employment read
+	IfMatch string `json:"If-Match" validate:"required"`
+}
+
+func (s SetPrimaryEmploymentHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(s))
+}
+
 type CreateOrLinkMessageTaskHeaders struct {
 	// XRequestID Browser-generated retry-stable request ID
 	XRequestID string `json:"X-Request-Id" validate:"required"`
@@ -13,6 +67,42 @@ type CreateOrLinkMessageTaskHeaders struct {
 
 func (c CreateOrLinkMessageTaskHeaders) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(c))
+}
+
+type DeleteOrganizationHeaders struct {
+	// IfMatch Strong ETag returned by the latest organization read
+	IfMatch string `json:"If-Match" validate:"required"`
+}
+
+func (d DeleteOrganizationHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(d))
+}
+
+type PatchOrganizationHeaders struct {
+	// IfMatch Strong ETag returned by the latest organization read
+	IfMatch string `json:"If-Match" validate:"required"`
+}
+
+func (p PatchOrganizationHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type MergeOrganizationHeaders struct {
+	// IfMatch Strong ETag returned by the latest organization read
+	IfMatch string `json:"If-Match" validate:"required"`
+}
+
+func (m MergeOrganizationHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(m))
+}
+
+type PutOrganizationProfileHeaders struct {
+	// IfMatch Strong ETag returned by the latest organization read
+	IfMatch string `json:"If-Match" validate:"required"`
+}
+
+func (p PutOrganizationProfileHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
 }
 
 type DeletePersonHeaders struct {
@@ -30,6 +120,84 @@ type PatchPersonHeaders struct {
 }
 
 func (p PatchPersonHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type MergePersonsHeaders struct {
+	// IfMatch Exactly two comma-separated strong person revision tags, one for each profile
+	IfMatch string `json:"If-Match" validate:"required"`
+
+	// IdempotencyKey Opaque 1..128-byte retry key
+	IdempotencyKey string `json:"Idempotency-Key" validate:"required,max=128,min=1"`
+}
+
+func (m MergePersonsHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(m))
+}
+
+type PatchPersonStructuredProfileHeaders struct {
+	// IfMatch Strong ETag returned by the latest person profile read. Must be the exact single tag from that read; the RFC 7232 forms `*` and comma-separated tag lists are not supported.
+	IfMatch string `json:"If-Match" validate:"required"`
+}
+
+func (p PatchPersonStructuredProfileHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type SplitPersonMergeHeaders struct {
+	// IfMatch Strong ETag returned by the latest person profile read. Must be the exact single tag from that read; the RFC 7232 forms `*` and comma-separated tag lists are not supported.
+	IfMatch string `json:"If-Match" validate:"required"`
+
+	// IdempotencyKey Opaque 1..128-byte retry key
+	IdempotencyKey string `json:"Idempotency-Key" validate:"required,max=128,min=1"`
+}
+
+func (s SplitPersonMergeHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(s))
+}
+
+type DecidePersonMergeCandidateHeaders struct {
+	// IfMatch Strong ETag returned by the latest person profile read. Must be the exact single tag from that read; the RFC 7232 forms `*` and comma-separated tag lists are not supported.
+	IfMatch string `json:"If-Match" validate:"required"`
+}
+
+func (d DecidePersonMergeCandidateHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(d))
+}
+
+type DeletePersonRelationshipHeaders struct {
+	// IfMatch Strong ETag returned by the latest person relationship read
+	IfMatch string `json:"If-Match" validate:"required"`
+}
+
+func (d DeletePersonRelationshipHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(d))
+}
+
+type PatchPersonRelationshipHeaders struct {
+	// IfMatch Strong ETag returned by the latest person relationship read
+	IfMatch string `json:"If-Match" validate:"required"`
+}
+
+func (p PatchPersonRelationshipHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type DeleteRelationshipTypeHeaders struct {
+	// IfMatch Strong ETag returned by the latest relationship type read
+	IfMatch string `json:"If-Match" validate:"required"`
+}
+
+func (d DeleteRelationshipTypeHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(d))
+}
+
+type PatchRelationshipTypeHeaders struct {
+	// IfMatch Strong ETag returned by the latest relationship type read
+	IfMatch string `json:"If-Match" validate:"required"`
+}
+
+func (p PatchRelationshipTypeHeaders) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(p))
 }
 

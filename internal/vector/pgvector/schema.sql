@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS embeddings (
     source_char_len  INTEGER NOT NULL,
     chunk_char_start INTEGER NOT NULL DEFAULT 0,
     chunk_char_end   INTEGER NOT NULL DEFAULT 0,
+    source_basis     SMALLINT NOT NULL DEFAULT 0,
     truncated        BOOLEAN NOT NULL DEFAULT FALSE,
     dimension        INTEGER NOT NULL,
     embedding        vector NOT NULL,
@@ -62,6 +63,22 @@ CREATE TABLE IF NOT EXISTS embeddings (
 );
 CREATE INDEX IF NOT EXISTS idx_embeddings_msg ON embeddings(message_id);
 CREATE INDEX IF NOT EXISTS idx_embeddings_dim ON embeddings(dimension);
+
+-- Person embeddings are a separate corpus and never share message IDs or the
+-- message HNSW graph. Migrate creates a dimension-partial person HNSW
+-- compatibility index for the configured dimension; CreateGeneration adds
+-- one for each later generation dimension. Current person search ranks the
+-- capped curated corpus exactly instead.
+CREATE TABLE IF NOT EXISTS person_embeddings (
+    generation_id      BIGINT NOT NULL REFERENCES index_generations(id) ON DELETE CASCADE,
+    person_id          BIGINT NOT NULL,
+    published_revision TEXT NOT NULL,
+    dimension          INTEGER NOT NULL,
+    embedded_at        BIGINT NOT NULL,
+    embedding          vector,
+    PRIMARY KEY (generation_id, person_id)
+);
+DROP INDEX IF EXISTS idx_person_embeddings_dim;
 
 CREATE TABLE IF NOT EXISTS embed_runs (
     id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -86,3 +103,79 @@ CREATE TABLE IF NOT EXISTS embed_watermark (
     generation_id BIGINT PRIMARY KEY,
     watermark_id  BIGINT NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS embedding_documents (
+    generation_id      BIGINT NOT NULL REFERENCES index_generations(id) ON DELETE CASCADE,
+    document_key       TEXT NOT NULL,
+    kind               TEXT NOT NULL,
+    scope_key          TEXT NOT NULL,
+    state              TEXT NOT NULL CHECK (state IN ('current', 'tombstoned')),
+    published_revision TEXT NOT NULL,
+    source_sequence    BIGINT NOT NULL,
+    updated_at         BIGINT NOT NULL,
+    PRIMARY KEY (generation_id, document_key)
+);
+CREATE INDEX IF NOT EXISTS idx_embedding_documents_scope
+    ON embedding_documents(generation_id, scope_key, state, document_key);
+
+CREATE TABLE IF NOT EXISTS embedding_document_scopes (
+    generation_id   BIGINT NOT NULL REFERENCES index_generations(id) ON DELETE CASCADE,
+    scope_key       TEXT NOT NULL,
+    source_sequence BIGINT NOT NULL,
+    PRIMARY KEY (generation_id, scope_key)
+);
+
+CREATE TABLE IF NOT EXISTS embedding_document_members (
+    generation_id  BIGINT NOT NULL,
+    message_id     BIGINT NOT NULL,
+    document_key   TEXT NOT NULL,
+    member_ordinal INTEGER NOT NULL,
+    PRIMARY KEY (generation_id, message_id),
+    UNIQUE (generation_id, document_key, member_ordinal),
+    FOREIGN KEY (generation_id, document_key)
+        REFERENCES embedding_documents(generation_id, document_key) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_embedding_document_members_document
+    ON embedding_document_members(generation_id, document_key, member_ordinal);
+
+CREATE TABLE IF NOT EXISTS embedding_document_progress (
+    generation_id    BIGINT PRIMARY KEY REFERENCES index_generations(id) ON DELETE CASCADE,
+    change_sequence  BIGINT NOT NULL DEFAULT 0,
+    reconcile_cursor TEXT NOT NULL DEFAULT '',
+    journal_cursor   TEXT NOT NULL DEFAULT ''
+);
+-- Visual vectors share the PostgreSQL database with their authoritative
+-- publication rows but remain independently keyed by an opaque publication
+-- token. A prepared vector cannot be searched until visual_publications points
+-- current_vector_token at it.
+CREATE TABLE IF NOT EXISTS visual_vectors (
+    vector_token TEXT PRIMARY KEY,
+    dimension    INTEGER NOT NULL CHECK (dimension = 1024),
+    embedding    vector NOT NULL,
+    created_at   BIGINT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_visual_vectors_hnsw_d1024
+    ON visual_vectors
+    USING hnsw ((embedding::vector(1024)) vector_cosine_ops)
+    WHERE dimension = 1024;
+
+-- Independent attachment-document vectors. Tokens are opaque globally unique
+-- publication identities; generation IDs intentionally do not reference the
+-- message-vector index_generations table.
+CREATE TABLE IF NOT EXISTS document_vector_backend_generations (
+    generation_id BIGINT PRIMARY KEY,
+    dimension     INTEGER NOT NULL CHECK (dimension > 0),
+    UNIQUE (generation_id, dimension)
+);
+
+CREATE TABLE IF NOT EXISTS document_vector_embeddings (
+    token         TEXT PRIMARY KEY,
+    generation_id BIGINT NOT NULL,
+    dimension     INTEGER NOT NULL CHECK (dimension > 0),
+    embedding     vector NOT NULL,
+    CONSTRAINT document_vector_embeddings_generation_dimension_fkey
+        FOREIGN KEY (generation_id, dimension)
+        REFERENCES document_vector_backend_generations(generation_id, dimension)
+);
+CREATE INDEX IF NOT EXISTS idx_document_vector_embeddings_generation
+    ON document_vector_embeddings(generation_id, dimension, token);

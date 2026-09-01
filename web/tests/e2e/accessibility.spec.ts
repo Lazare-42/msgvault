@@ -1,5 +1,6 @@
 import AxeBuilder from '@axe-core/playwright';
 import { expect, test, type Page } from '@playwright/test';
+import { expectKitTheme, selectKitOption, setKitTheme } from '../kit-ui';
 import { installMixedArchive } from './fixtures/mixed-archive';
 
 async function assertNoViolations(page: Page, label: string) {
@@ -12,9 +13,29 @@ for (const theme of ['light', 'dark'] as const) {
   for (const density of ['compact', 'comfortable'] as const) {
     test(`${theme}/${density} primary workspaces and representative states have no axe violations`, async ({ page }) => {
       await installMixedArchive(page);
+      await page.unroute('**/api/v1/participants/12/files/search');
+      await page.route('**/api/v1/participants/12/files/search', async (route) => {
+        const body = route.request().postDataJSON() as { mime_families?: string[] };
+        const media = body.mime_families?.includes('image');
+        return route.fulfill({ json: {
+          files: [{
+            id: media ? 8 : 7, key: media ? 'file:8' : 'file:7', entry_key: 'message:100001',
+            message_id: 100001, conversation_id: 100001, occurred_at: '2026-01-03T12:00:00Z',
+            source_id: 1, source_type: 'synthetic', source_identifier: 'archive@example.com',
+            containing_title: 'Synthetic email', filename: media ? 'archive-photo.png' : 'archive-notes.pdf',
+            mime_type: media ? 'image/png' : 'application/pdf', mime_family: media ? 'image' : 'pdf',
+            size_bytes: 2048, content_state: 'metadata_only', content_available: false,
+            person_provenance: {
+              participant_ids: [12], roles: ['from', 'conversation_member'],
+              directions: ['from_person', 'group']
+            }
+          }],
+          total_count: 1, cache_revision: 'mixed-100k', search_provenance: {}
+        } });
+      });
       await page.goto('/');
-      await page.getByLabel('Temporary theme').selectOption(theme);
-      await page.getByLabel('Temporary density').selectOption(density);
+      await setKitTheme(page, theme);
+      await selectKitOption(page, 'Temporary density', `Density: ${density === 'compact' ? 'Compact' : 'Comfortable'}`);
 
       // The Relationships hub is the default landing workspace; walk its
       // three panes (list, timeline, reading pane) open one at a time so
@@ -29,6 +50,14 @@ for (const theme of ['light', 'dark'] as const) {
       const relationshipTimeline = page.getByRole('grid', { name: 'Relationship activity' });
       await expect(relationshipTimeline.locator('[data-row-key]').first()).toBeVisible();
       await assertNoViolations(page, `Relationships timeline ${theme}/${density}`);
+      await page.getByRole('button', { name: 'Files 1' }).click();
+      await expect(page.getByRole('grid', { name: 'Files results' }).getByText('archive-notes.pdf')).toBeVisible();
+      await assertNoViolations(page, `Person files ${theme}/${density}`);
+      await page.getByRole('radio', { name: 'Media' }).click();
+      await expect(page.getByRole('button', { name: 'Open archive-photo.png' })).toBeVisible();
+      await assertNoViolations(page, `Person media ${theme}/${density}`);
+      await page.getByRole('button', { name: 'Files 1' }).click();
+      await expect(relationshipTimeline).toBeVisible();
       await relationshipTimeline.focus();
       await page.keyboard.press('Enter');
       await expect(page.getByRole('complementary', { name: /Reading pane/ })).toBeVisible();
@@ -53,7 +82,7 @@ for (const theme of ['light', 'dark'] as const) {
 
       for (const workspace of ['Files', 'Saved Views', 'Sources', 'Deletions', 'Settings']) {
         await page.getByRole('button', { name: workspace, exact: true }).click();
-        await expect(page.getByRole('heading', { level: 1, name: workspace, exact: true })).toBeVisible();
+        await expect(page.getByRole('main', { name: workspace, exact: true })).toBeVisible();
         await assertNoViolations(page, `${workspace} ${theme}/${density}`);
         if (workspace === 'Files') {
           const files = page.getByRole('grid', { name: 'Files results' });
@@ -104,7 +133,7 @@ for (const theme of ['light', 'dark'] as const) {
       // states, not the Relationships hub, so it lands there explicitly
       // rather than relying on whatever the default landing workspace is.
       await page.goto(`/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
-      await expect(page.locator('html')).toHaveAttribute('data-theme', theme);
+      await expectKitTheme(page, theme);
       await expect(page.locator('html')).toHaveAttribute('data-density', density);
       await expect(page.getByRole('main', { name: 'Authentication' })).toBeVisible();
       await expect(page.getByLabel('API key')).toBeVisible();

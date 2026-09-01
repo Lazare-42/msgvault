@@ -2,7 +2,12 @@ package store
 
 import (
 	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"errors"
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -33,16 +38,17 @@ var embedGenStampChunkRows = 500
 // the embeddings upsert — the worker orders the steps (upsert, then
 // stamp) and relies on idempotency, see internal/vector/embed/worker.go.
 func (s *Store) ScanForEmbedding(ctx context.Context, target int64, afterID int64, limit int) ([]int64, error) {
-	return s.ScanForEmbeddingScoped(ctx, target, afterID, limit, nil)
+	return s.ScanForEmbeddingScoped(ctx, target, afterID, limit, nil, nil)
 }
 
 // ScanForEmbeddingScoped is ScanForEmbedding limited to the supplied message
-// types. An empty messageTypes slice means the full live corpus.
-func (s *Store) ScanForEmbeddingScoped(ctx context.Context, target int64, afterID int64, limit int, messageTypes []string) ([]int64, error) {
+// types and source IDs. Empty messageTypes and sourceIDs slices mean the
+// full live corpus.
+func (s *Store) ScanForEmbeddingScoped(ctx context.Context, target int64, afterID int64, limit int, messageTypes []string, sourceIDs []int64) ([]int64, error) {
 	if limit <= 0 {
 		return nil, nil
 	}
-	liveWhere, liveArgs := liveMessagesWhereWithMessageTypes(messageTypes)
+	liveWhere, liveArgs := liveMessagesWhereScoped(messageTypes, sourceIDs)
 	q := `SELECT id FROM messages
 	       WHERE (embed_gen IS NULL OR embed_gen <> ?)
 	         AND ` + liveWhere + `
@@ -123,6 +129,222 @@ func (s *Store) SetEmbedGen(ctx context.Context, ids []int64, target int64) erro
 type EmbedGenStamp struct {
 	ID           int64
 	LastModified any
+}
+
+// EmbedGenMetadataVersion is the store-owned compare-and-set token for
+// conversation metadata used by a contextual document. It intentionally does
+// not depend on internal/vector/embed, which already imports store.
+//
+// Digest is the canonical SHA-256 digest of the conversation id and title,
+// followed by each participant in participant-id order with its role, rendered
+// display name, and driver-canonical updated_at text. The encoding is kept
+// byte-compatible with embed.conversationMetadataDigest.
+type EmbedGenMetadataVersion struct {
+	ConversationID int64
+	Digest         string
+}
+
+// SetEmbedGenGroupIfUnchanged atomically stamps every member of one published
+// document. It returns false without stamping any member when a source token,
+// live membership, conversation identity, or metadata digest no longer matches
+// the assembly snapshot.
+//
+// SQLite starts with BEGIN IMMEDIATE, so a writer cannot enter between verify
+// and stamp. PostgreSQL first takes the embedding-change clock's exclusive
+// transaction lock, then locks every message and every metadata row used by
+// the digest. Persistence takes the shared clock lock before its row locks, so
+// this ordering prevents a message/conversation lock inversion. Locking the
+// conversation row also serializes membership inserts via their foreign-key
+// check, closing the phantom-member race.
+//
+// The embed_gen update fires the row-level last_modified trigger. This group
+// path restores each verified token inside the same write transaction because
+// contextual document revisions include those tokens. Without the restore,
+// the worker's own coverage bookkeeping changes the revision and an initial
+// reconciliation pays to publish the same document again. The ordinary
+// per-message stamp keeps its established row-watermark behavior.
+func (s *Store) SetEmbedGenGroupIfUnchanged(
+	ctx context.Context,
+	versions []EmbedGenStamp,
+	metadataVersion EmbedGenMetadataVersion,
+	target int64,
+) (stamped bool, retErr error) {
+	if len(versions) == 0 {
+		return false, nil
+	}
+	seen := make(map[int64]struct{}, len(versions))
+	for _, version := range versions {
+		if version.ID == 0 {
+			return false, nil
+		}
+		if _, duplicate := seen[version.ID]; duplicate {
+			return false, nil
+		}
+		seen[version.ID] = struct{}{}
+	}
+	orderedVersions := append([]EmbedGenStamp(nil), versions...)
+	sort.Slice(orderedVersions, func(i, j int) bool {
+		return orderedVersions[i].ID < orderedVersions[j].ID
+	})
+
+	conn, err := s.db.Conn(ctx)
+	if err != nil {
+		return false, fmt.Errorf("acquire embed_gen group connection: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	if _, err := conn.ExecContext(ctx, s.dialect.BeginWriteSQL()); err != nil {
+		return false, fmt.Errorf("begin embed_gen group transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if committed {
+			return
+		}
+		rollbackCtx, cancel := context.WithTimeout(
+			context.WithoutCancel(ctx), manualTransactionCleanupTimeout)
+		defer cancel()
+		if _, rollbackErr := conn.ExecContext(rollbackCtx, "ROLLBACK"); rollbackErr != nil && retErr == nil {
+			retErr = fmt.Errorf("rollback embed_gen group transaction: %w", rollbackErr)
+		}
+	}()
+	if s.IsPostgreSQL() {
+		if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_xact_lock(
+			hashtextextended('msgvault.embedding_change_clock', 0))`); err != nil {
+			return false, fmt.Errorf("lock embed_gen group journal boundary: %w", err)
+		}
+	}
+
+	lastModified := "last_modified"
+	if !s.IsPostgreSQL() {
+		lastModified = "CAST(last_modified AS TEXT)"
+	}
+	for _, version := range orderedVersions {
+		query := fmt.Sprintf(`SELECT id FROM messages
+			WHERE id = ? AND %s = ?
+			  AND deleted_at IS NULL AND deleted_from_source_at IS NULL`, lastModified)
+		args := []any{version.ID, version.LastModified}
+		if metadataVersion.ConversationID != 0 {
+			query += ` AND conversation_id = ?`
+			args = append(args, metadataVersion.ConversationID)
+		}
+		query += s.dialect.SelectForUpdate()
+		var id int64
+		err := conn.QueryRowContext(ctx, s.dialect.Rebind(query), args...).Scan(&id)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("lock embed_gen group member %d: %w", version.ID, err)
+		}
+	}
+
+	if metadataVersion.ConversationID != 0 {
+		digest, found, err := s.embedGenMetadataDigest(ctx, conn, metadataVersion.ConversationID)
+		if err != nil {
+			return false, err
+		}
+		if !found || digest != metadataVersion.Digest {
+			return false, nil
+		}
+	}
+
+	for _, version := range orderedVersions {
+		res, err := conn.ExecContext(ctx, s.dialect.Rebind(
+			`UPDATE messages SET embed_gen = ? WHERE id = ? AND last_modified = ?`),
+			target, version.ID, version.LastModified)
+		if err != nil {
+			return false, fmt.Errorf("stamp embed_gen group member %d: %w", version.ID, err)
+		}
+		matched, err := res.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("rows affected for embed_gen group member %d: %w", version.ID, err)
+		}
+		if matched != 1 {
+			return false, nil
+		}
+		restored, err := conn.ExecContext(ctx, s.dialect.Rebind(
+			`UPDATE messages SET last_modified = ? WHERE id = ? AND embed_gen = ?`),
+			version.LastModified, version.ID, target)
+		if err != nil {
+			return false, fmt.Errorf("restore embed_gen group member %d revision token: %w", version.ID, err)
+		}
+		restoredRows, err := restored.RowsAffected()
+		if err != nil {
+			return false, fmt.Errorf("rows affected restoring embed_gen group member %d revision token: %w", version.ID, err)
+		}
+		if restoredRows != 1 {
+			return false, nil
+		}
+	}
+	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
+		return false, fmt.Errorf("commit embed_gen group transaction: %w", err)
+	}
+	committed = true
+	return true, nil
+}
+
+// ParticipantRevisionSQLite and ParticipantRevisionPostgres render
+// participants.updated_at (aliased p) for the embedding metadata digest. The
+// coverage CAS here and the assembler's snapshot read must produce
+// byte-identical revisions, so both use these exact expressions. The
+// PostgreSQL form is pinned with to_char because CAST(timestamptz AS TEXT)
+// renders per-session TimeZone/DateStyle — a divergence would make the CAS
+// miss on every scope and republish forever.
+const (
+	ParticipantRevisionSQLite   = "CAST(p.updated_at AS TEXT)"
+	ParticipantRevisionPostgres = "to_char(p.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS.US')"
+)
+
+func (s *Store) embedGenMetadataDigest(
+	ctx context.Context, conn *sql.Conn, conversationID int64,
+) (string, bool, error) {
+	var id int64
+	var title string
+	err := conn.QueryRowContext(ctx, s.dialect.Rebind(
+		`SELECT id, COALESCE(title, '') FROM conversations WHERE id = ?`+
+			s.dialect.SelectForUpdate()), conversationID).Scan(&id, &title)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("lock embedding conversation %d: %w", conversationID, err)
+	}
+
+	lockClause := s.dialect.SelectForUpdate()
+	participantRevision := ParticipantRevisionSQLite
+	if lockClause != "" {
+		lockClause = " FOR UPDATE OF cp, p"
+		participantRevision = ParticipantRevisionPostgres
+	}
+	rows, err := conn.QueryContext(ctx, s.dialect.Rebind(fmt.Sprintf(`
+		SELECT cp.participant_id, COALESCE(cp.role, ''),
+		       COALESCE(NULLIF(TRIM(p.display_name), ''),
+		                NULLIF(p.email_address, ''), NULLIF(p.phone_number, ''), ''),
+		       %s
+		FROM conversation_participants cp
+		JOIN participants p ON p.id = cp.participant_id
+		WHERE cp.conversation_id = ?
+		ORDER BY cp.participant_id`+lockClause, participantRevision)), conversationID)
+	if err != nil {
+		return "", false, fmt.Errorf("lock embedding conversation participants %d: %w", conversationID, err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	h := sha256.New()
+	_, _ = fmt.Fprintf(h, "%d\x00%s\x00", id, title)
+	for rows.Next() {
+		var participantID int64
+		var role, displayName, revision string
+		if err := rows.Scan(&participantID, &role, &displayName, &revision); err != nil {
+			return "", false, fmt.Errorf("scan embedding conversation participant %d: %w", conversationID, err)
+		}
+		_, _ = fmt.Fprintf(h, "%d\x00%s\x00%s\x00%v\x00",
+			participantID, role, displayName, revision)
+	}
+	if err := rows.Err(); err != nil {
+		return "", false, fmt.Errorf("iterate embedding conversation participants %d: %w", conversationID, err)
+	}
+	return hex.EncodeToString(h.Sum(nil)), true, nil
 }
 
 // SetEmbedGenIfUnchanged stamps embed_gen = target on each message, but
@@ -250,18 +472,19 @@ func (s *Store) ResetEmbedGen(ctx context.Context, ids []int64) error {
 // activeGen == 0 means "no active/target generation"; then everything
 // live is missing and stamped is 0.
 func (s *Store) CoverageCounts(ctx context.Context, activeGen int64) (live, stamped, blank, missing int64, err error) {
-	return s.CoverageCountsScoped(ctx, activeGen, nil)
+	return s.CoverageCountsScoped(ctx, activeGen, nil, nil)
 }
 
-// CoverageCountsScoped is CoverageCounts limited to the supplied message types.
-// An empty messageTypes slice means the full live corpus.
-func (s *Store) CoverageCountsScoped(ctx context.Context, activeGen int64, messageTypes []string) (live, stamped, blank, missing int64, err error) {
-	live, err = s.countLiveMessagesScoped(ctx, messageTypes)
+// CoverageCountsScoped is CoverageCounts limited to the supplied message
+// types and source IDs. Empty messageTypes and sourceIDs slices mean the
+// full live corpus.
+func (s *Store) CoverageCountsScoped(ctx context.Context, activeGen int64, messageTypes []string, sourceIDs []int64) (live, stamped, blank, missing int64, err error) {
+	live, err = s.countLiveMessagesScoped(ctx, messageTypes, sourceIDs)
 	if err != nil {
 		return 0, 0, 0, 0, err
 	}
 	if activeGen != 0 {
-		liveWhere, liveArgs := liveMessagesWhereWithMessageTypes(messageTypes)
+		liveWhere, liveArgs := liveMessagesWhereScoped(messageTypes, sourceIDs)
 		q := `SELECT COUNT(*) FROM messages
 		       WHERE embed_gen = ? AND ` + liveWhere
 		args := append([]any{activeGen}, liveArgs...)
@@ -273,18 +496,67 @@ func (s *Store) CoverageCountsScoped(ctx context.Context, activeGen int64, messa
 	return live, stamped, 0, missing, nil
 }
 
+// EmbeddingConvergenceCounts partitions message coverage for the contextual
+// worker without changing the historical CoverageCounts contract. Contextual
+// rows are exactly live Beeper and meeting-transcript messages. Every other
+// live message type is ordinary. The three total fields always equal the sum
+// of their contextual and ordinary counterparts.
+type EmbeddingConvergenceCounts struct {
+	Live    int64
+	Stamped int64
+	Missing int64
+
+	ContextualLive    int64
+	ContextualStamped int64
+	ContextualMissing int64
+
+	OrdinaryLive    int64
+	OrdinaryStamped int64
+	OrdinaryMissing int64
+}
+
+// ContextualConvergenceCounts reports the coverage partition used by
+// contextual-generation convergence checks. activeGen == 0 stamps no row, so
+// every live row is missing in both partitions.
+func (s *Store) ContextualConvergenceCounts(ctx context.Context, activeGen int64) (EmbeddingConvergenceCounts, error) {
+	liveWhere := LiveMessagesWhere("", true)
+	query := `SELECT
+		COUNT(*),
+		COALESCE(SUM(CASE WHEN ? <> 0 AND embed_gen = ? THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN message_type IN ('beeper', 'meeting_transcript') THEN 1 ELSE 0 END), 0),
+		COALESCE(SUM(CASE WHEN message_type IN ('beeper', 'meeting_transcript')
+		                       AND ? <> 0 AND embed_gen = ? THEN 1 ELSE 0 END), 0)
+		FROM messages WHERE ` + liveWhere
+	var counts EmbeddingConvergenceCounts
+	err := s.db.QueryRowContext(ctx, s.dialect.Rebind(query),
+		activeGen, activeGen, activeGen, activeGen).Scan(
+		&counts.Live, &counts.Stamped,
+		&counts.ContextualLive, &counts.ContextualStamped,
+	)
+	if err != nil {
+		return EmbeddingConvergenceCounts{}, fmt.Errorf("count contextual embedding convergence: %w", err)
+	}
+	counts.Missing = max(counts.Live-counts.Stamped, 0)
+	counts.ContextualMissing = max(counts.ContextualLive-counts.ContextualStamped, 0)
+	counts.OrdinaryLive = max(counts.Live-counts.ContextualLive, 0)
+	counts.OrdinaryStamped = max(counts.Stamped-counts.ContextualStamped, 0)
+	counts.OrdinaryMissing = max(counts.OrdinaryLive-counts.OrdinaryStamped, 0)
+	return counts, nil
+}
+
 // MissingCount returns just the "missing" coverage figure for activeGen
 // (live messages still needing work: embed_gen IS NULL OR embed_gen <>
 // activeGen). It is a thin accessor for the scheduler/CLI activation
 // gates, which only consult the missing count; missing = live - stamped.
 func (s *Store) MissingCount(ctx context.Context, activeGen int64) (int64, error) {
-	return s.MissingCountScoped(ctx, activeGen, nil)
+	return s.MissingCountScoped(ctx, activeGen, nil, nil)
 }
 
-// MissingCountScoped is MissingCount limited to the supplied message types.
-// An empty messageTypes slice means the full live corpus.
-func (s *Store) MissingCountScoped(ctx context.Context, activeGen int64, messageTypes []string) (int64, error) {
-	live, err := s.countLiveMessagesScoped(ctx, messageTypes)
+// MissingCountScoped is MissingCount limited to the supplied message types
+// and source IDs. Empty messageTypes and sourceIDs slices mean the full
+// live corpus.
+func (s *Store) MissingCountScoped(ctx context.Context, activeGen int64, messageTypes []string, sourceIDs []int64) (int64, error) {
+	live, err := s.countLiveMessagesScoped(ctx, messageTypes, sourceIDs)
 	if err != nil {
 		return 0, err
 	}
@@ -292,7 +564,7 @@ func (s *Store) MissingCountScoped(ctx context.Context, activeGen int64, message
 		return live, nil
 	}
 	var stamped int64
-	liveWhere, liveArgs := liveMessagesWhereWithMessageTypes(messageTypes)
+	liveWhere, liveArgs := liveMessagesWhereScoped(messageTypes, sourceIDs)
 	q := `SELECT COUNT(*) FROM messages
 	       WHERE embed_gen = ? AND ` + liveWhere
 	args := append([]any{activeGen}, liveArgs...)
@@ -304,9 +576,9 @@ func (s *Store) MissingCountScoped(ctx context.Context, activeGen int64, message
 
 // countLiveMessages returns the total live-message count. Shared by
 // CoverageCounts; kept separate so the live-predicate stays in one place.
-func (s *Store) countLiveMessagesScoped(ctx context.Context, messageTypes []string) (int64, error) {
+func (s *Store) countLiveMessagesScoped(ctx context.Context, messageTypes []string, sourceIDs []int64) (int64, error) {
 	var n int64
-	liveWhere, args := liveMessagesWhereWithMessageTypes(messageTypes)
+	liveWhere, args := liveMessagesWhereScoped(messageTypes, sourceIDs)
 	q := `SELECT COUNT(*) FROM messages WHERE ` + liveWhere
 	if err := s.db.QueryRowContext(ctx, q, args...).Scan(&n); err != nil {
 		return 0, fmt.Errorf("count live messages: %w", err)
@@ -314,19 +586,30 @@ func (s *Store) countLiveMessagesScoped(ctx context.Context, messageTypes []stri
 	return n, nil
 }
 
-func liveMessagesWhereWithMessageTypes(messageTypes []string) (string, []any) {
+// liveMessagesWhereScoped builds the live-messages predicate narrowed by the
+// embed build scope: message_type IN (...) and/or source_id IN (...). Empty
+// slices leave that dimension unrestricted.
+func liveMessagesWhereScoped(messageTypes []string, sourceIDs []int64) (string, []any) {
 	where := LiveMessagesWhere("", true)
+	var args []any
 	types := normalizeMessageTypes(messageTypes)
-	if len(types) == 0 {
-		return where, nil
+	if len(types) > 0 {
+		placeholders := make([]string, len(types))
+		for i, typ := range types {
+			placeholders[i] = "?"
+			args = append(args, typ)
+		}
+		where += " AND message_type IN (" + strings.Join(placeholders, ",") + ")"
 	}
-	placeholders := make([]string, len(types))
-	args := make([]any, len(types))
-	for i, typ := range types {
-		placeholders[i] = "?"
-		args[i] = typ
+	ids := normalizeScopeSourceIDs(sourceIDs)
+	if len(ids) > 0 {
+		placeholders := make([]string, len(ids))
+		for i, id := range ids {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		where += " AND source_id IN (" + strings.Join(placeholders, ",") + ")"
 	}
-	where += " AND message_type IN (" + strings.Join(placeholders, ",") + ")"
 	return where, args
 }
 
@@ -346,6 +629,27 @@ func normalizeMessageTypes(messageTypes []string) []string {
 		}
 		seen[typ] = struct{}{}
 		out = append(out, typ)
+	}
+	return out
+}
+
+// normalizeScopeSourceIDs de-duplicates scope source IDs and drops
+// non-positive values so the IN clause binds a minimal, valid set.
+func normalizeScopeSourceIDs(sourceIDs []int64) []int64 {
+	if len(sourceIDs) == 0 {
+		return nil
+	}
+	seen := make(map[int64]struct{}, len(sourceIDs))
+	out := make([]int64, 0, len(sourceIDs))
+	for _, id := range sourceIDs {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
 	}
 	return out
 }

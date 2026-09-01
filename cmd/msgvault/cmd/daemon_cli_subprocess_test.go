@@ -3,6 +3,7 @@ package cmd
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"runtime"
@@ -23,8 +24,24 @@ func TestHelperProcess(t *testing.T) {
 	switch os.Getenv("GO_HELPER_MODE") {
 	case "exit3":
 		os.Exit(3)
+	case "stdout-stderr-ok":
+		_, _ = fmt.Fprintln(os.Stdout, "cache build detail")
+		_, _ = fmt.Fprintln(os.Stderr, "cache build warning")
+		os.Exit(0)
 	case "block":
 		select {}
+	case "spawn-blocking-child":
+		child := helperProcessCommand(context.Background(), "block")
+		if err := child.Start(); err != nil {
+			os.Exit(10)
+		}
+		pidPath := os.Getenv("GO_HELPER_CHILD_PID_PATH")
+		if err := os.WriteFile(pidPath, []byte(strconv.Itoa(child.Process.Pid)), 0o600); err != nil {
+			_ = child.Process.Kill()
+			os.Exit(11)
+		}
+		_ = child.Wait()
+		os.Exit(0)
 	default:
 		os.Exit(0)
 	}

@@ -59,6 +59,68 @@ func TestPackCatalogMalformedReferenceDoesNotBlockValidPackingOrPermitOrphanSwee
 	assert.NotNil(entry)
 }
 
+func TestMaintenancePackCatalogResolvesUnknownThumbnailSize(t *testing.T) {
+	require := require.New(t)
+	st := testutil.NewTestStore(t)
+	fx := newPackAttachmentFixture(t, st)
+	root := t.TempDir()
+	contentHash := pack.ComputeBlobID([]byte("content")).String()
+	thumbnail := []byte("thumbnail with no size column")
+	thumbnailHash := pack.ComputeBlobID(thumbnail).String()
+	thumbnailPath := thumbnailHash[:2] + "/" + thumbnailHash
+
+	fx.addAttachment(contentHash, contentHash[:2]+"/"+contentHash, len("content"))
+	fx.setThumbnail(contentHash, thumbnailHash, thumbnailPath)
+	require.NoError(os.MkdirAll(filepath.Join(root, thumbnailHash[:2]), 0o700))
+	require.NoError(os.WriteFile(filepath.Join(root, filepath.FromSlash(thumbnailPath)), thumbnail, 0o600))
+
+	candidates, err := store.NewMaintenancePackCatalog(st, root).ListUnpacked(context.Background())
+	require.NoError(err)
+	var got *packstore.Candidate
+	for i := range candidates {
+		if candidates[i].Hash.String() == thumbnailHash {
+			got = &candidates[i]
+			break
+		}
+	}
+	require.NotNil(got)
+	assert.Equal(t, int64(len(thumbnail)), got.Size)
+}
+
+func TestMaintenancePacksThumbnailFromRecordedNoncanonicalPath(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+	fx := newPackAttachmentFixture(t, st)
+	root := t.TempDir()
+	contentHash := pack.ComputeBlobID([]byte("remote content")).String()
+	thumbnail := []byte("legacy noncanonical thumbnail")
+	thumbnailHash := pack.ComputeBlobID(thumbnail).String()
+	thumbnailPath := "legacy/thumbnails/" + thumbnailHash
+
+	fx.addAttachment(contentHash, "https://cdn.example.com/content", len("remote content"))
+	fx.setThumbnail(contentHash, thumbnailHash, thumbnailPath)
+	absThumbnailPath := filepath.Join(root, filepath.FromSlash(thumbnailPath))
+	require.NoError(os.MkdirAll(filepath.Dir(absThumbnailPath), 0o700))
+	require.NoError(os.WriteFile(absThumbnailPath, thumbnail, 0o600))
+
+	layout, err := packstore.NewLayout(root, packstore.LayoutOptions{Staging: packstore.StagingSameDirectory})
+	require.NoError(err)
+	maintainer, err := packstore.NewMaintainer(
+		store.NewMaintenancePackCatalog(st, root), layout, packstore.MaintainerOptions{},
+	)
+	require.NoError(err)
+	t.Cleanup(func() { require.NoError(maintainer.Close()) })
+
+	stats, err := maintainer.Pack(context.Background(), packstore.PackOptions{})
+	require.NoError(err)
+	assert.Equal(1, stats.BlobsPacked)
+	assert.NoFileExists(absThumbnailPath)
+	entry, err := st.GetAttachmentPackEntry(thumbnailHash)
+	require.NoError(err)
+	assert.NotNil(entry)
+}
+
 type msgvaultPackHarness struct {
 	t       *testing.T
 	store   *store.Store

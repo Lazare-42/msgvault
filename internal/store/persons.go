@@ -9,12 +9,18 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"go.kenn.io/msgvault/internal/personenrichment"
 )
 
 var (
-	ErrPersonNotFound         = errors.New("person not found")
-	ErrPersonRevisionConflict = errors.New("person revision conflict")
-	ErrPersonBindingConflict  = errors.New("participant clusters belong to different persons")
+	ErrPersonNotFound                     = errors.New("person not found")
+	ErrPersonRevisionConflict             = errors.New("person revision conflict")
+	ErrPersonBindingConflict              = errors.New("participant clusters belong to different persons")
+	ErrPersonReferenced                   = errors.New("person is referenced by another profile")
+	ErrPersonCardDAVPublished             = errors.New("person has CardDAV publication state")
+	ErrPersonMergeActive                  = errors.New("person has active merge lineage")
+	ErrPersonEnrichmentDispatchInProgress = errors.New("person enrichment provider dispatch is in progress")
 )
 
 // PersonBindingConflictError reports the curated people that would be
@@ -113,6 +119,20 @@ func (s *Store) CreatePersonFromParticipantContext(
 			if err := s.bumpPersonRevisionsTx(ctx, tx, personID); err != nil {
 				return err
 			}
+			if err := s.invalidatePersonEnrichmentIdentitiesAfterRevisionTx(
+				ctx, tx, personID); err != nil {
+				return err
+			}
+		}
+		if created || bindingsChanged {
+			if _, err := s.bumpIdentityRevisionContext(ctx, tx); err != nil {
+				return err
+			}
+		}
+		if bindingsChanged {
+			if err := s.coalescePersonSweepPeopleTx(ctx, tx, []int64{personID}); err != nil {
+				return err
+			}
 		}
 		person, err = s.getPersonTx(ctx, tx, personID)
 		return err
@@ -144,6 +164,11 @@ func (s *Store) bindPersonParticipantsTx(
 		}
 		bindingsChanged = bindingsChanged || changed > 0
 	}
+	if bindingsChanged {
+		if err := s.markContactStateDirtyTx(ctx, tx, personID); err != nil {
+			return false, err
+		}
+	}
 	return bindingsChanged, nil
 }
 
@@ -151,19 +176,235 @@ func (s *Store) DeletePerson(id, expectedRevision int64) error {
 	return s.DeletePersonContext(context.Background(), id, expectedRevision)
 }
 
+// DeletePersonEnrichmentInput is the digest-only privacy boundary for person
+// deletion. CurrentIdentifiers must already have been normalized and hashed by
+// the service boundary; Store never accepts their raw values.
+type DeletePersonEnrichmentInput struct {
+	PersonID           int64
+	ExpectedRevision   int64
+	Actor              string
+	Reason             PersonEnrichmentSuppressionReason
+	ConfiguredKeyID    string
+	CurrentIdentifiers []PersonEnrichmentSuppressionInput
+}
+
 // DeletePersonContext permanently deletes a person and its participant
 // bindings under revision compare-and-swap. Deletion retires the person's
 // vCard UID forever: UIDs are random and never reused, so re-promoting the
 // same cluster afterwards creates a new person with a new UID. Returns
 // ErrPersonNotFound if no such person exists and ErrPersonRevisionConflict
-// if expectedRevision is stale.
+// if expectedRevision is stale. ErrPersonCardDAVPublished requires callers to
+// recover and explicitly unpublish remote-owned state before deletion.
 func (s *Store) DeletePersonContext(ctx context.Context, id, expectedRevision int64) error {
+	return s.DeletePersonWithEnrichmentSuppressionsContext(ctx, DeletePersonEnrichmentInput{
+		PersonID: id, ExpectedRevision: expectedRevision, Actor: "system",
+		Reason: PersonEnrichmentSuppressionDeletion,
+	})
+}
+
+// DeletePersonWithEnrichmentSuppressionsContext copies every digest recorded
+// by person-owned attempts, inserts freshly hashed current identifiers, and
+// deletes the person in one transaction. Any validation, suppression, CAS, or
+// cascade failure rolls the whole operation back; suppression rows themselves
+// deliberately have no person foreign key and survive the delete.
+func (s *Store) DeletePersonWithEnrichmentSuppressionsContext(
+	ctx context.Context,
+	input DeletePersonEnrichmentInput,
+) error {
+	if input.PersonID <= 0 || input.ExpectedRevision < 0 {
+		return errors.New("person enrichment deletion requires a positive person ID and non-negative revision")
+	}
+	input.Actor = strings.TrimSpace(input.Actor)
+	if input.Actor == "" {
+		return errors.New("person enrichment deletion actor is required")
+	}
+	switch input.Reason {
+	case PersonEnrichmentSuppressionDeletion, PersonEnrichmentSuppressionOptOut,
+		PersonEnrichmentSuppressionDataSubjectRequest:
+	default:
+		return fmt.Errorf("invalid person enrichment deletion reason %q", input.Reason)
+	}
+	if input.ConfiguredKeyID != "" && !validLowerSHA256(input.ConfiguredKeyID) {
+		return personenrichment.ErrSuppressionKeyMismatch
+	}
+	validated := make([]PersonEnrichmentSuppressionInput, len(input.CurrentIdentifiers))
+	for i := range input.CurrentIdentifiers {
+		candidate := input.CurrentIdentifiers[i]
+		candidate.Reason = input.Reason
+		candidate.Actor = input.Actor
+		var err error
+		validated[i], err = validatePersonEnrichmentSuppressionInput(candidate)
+		if err != nil {
+			return fmt.Errorf("validate current person enrichment identifier %d: %w", i, err)
+		}
+		if input.ConfiguredKeyID != "" && validated[i].KeyID != input.ConfiguredKeyID {
+			return personenrichment.ErrSuppressionKeyMismatch
+		}
+	}
+	input.CurrentIdentifiers = validated
+	// The deletion locks this person and then, through the counterpart bump,
+	// everyone they share an edge with; relationship writes bump the same
+	// rows in a different order. On PostgreSQL the two can deadlock, so a
+	// deadlock victim starts over from a clean transaction.
+	return retryContendedWriteErr(ctx, s, "delete person", func() error {
+		return s.deletePersonOnce(ctx, input)
+	})
+}
+
+func (s *Store) deletePersonOnce(ctx context.Context, input DeletePersonEnrichmentInput) error {
+	id, expectedRevision := input.PersonID, input.ExpectedRevision
 	return s.withTxContext(ctx, func(tx *loggedTx) error {
+		if err := s.lockPersonEnrichmentAuthorityMutationTx(ctx, tx); err != nil {
+			return err
+		}
 		if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
 			return err
 		}
-		var deletedID int64
+		var revision int64
 		err := tx.QueryRowContext(ctx,
+			`SELECT revision FROM persons WHERE id = ?`+s.dialect.SelectForUpdate(),
+			id).Scan(&revision)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrPersonNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("verify person %d before delete: %w", id, err)
+		}
+		if revision != expectedRevision {
+			return ErrPersonRevisionConflict
+		}
+		if err := s.forceInvalidatePersonEnrichmentTx(ctx, tx, id); err != nil {
+			return err
+		}
+		var hasCardDAVPublication bool
+		if err := tx.QueryRowContext(ctx,
+			`SELECT EXISTS (SELECT 1 FROM carddav_publications WHERE person_id = ?)`, id,
+		).Scan(&hasCardDAVPublication); err != nil {
+			return fmt.Errorf("check CardDAV publication for person %d: %w", id, err)
+		}
+		if hasCardDAVPublication {
+			return fmt.Errorf("delete person %d: %w", id, ErrPersonCardDAVPublished)
+		}
+		if input.ConfiguredKeyID != "" {
+			if err := s.validatePersonEnrichmentSuppressionKeyStateTx(
+				ctx, tx, input.ConfiguredKeyID); err != nil {
+				return err
+			}
+		}
+		suppressions := append([]PersonEnrichmentSuppressionInput(nil), input.CurrentIdentifiers...)
+		rows, err := tx.QueryContext(ctx, `
+		SELECT i.provider_namespace, i.identifier_class,
+		       i.normalization_version, i.key_id, i.digest
+		FROM person_enrichment_attempt_identifiers i
+		WHERE i.attempt_id IN (
+			SELECT id FROM person_enrichment_attempts WHERE person_id = ?
+		)
+		GROUP BY i.provider_namespace, i.identifier_class,
+		         i.normalization_version, i.key_id, i.digest`, id)
+		if err != nil {
+			return fmt.Errorf("list recorded person enrichment identifiers before delete: %w", err)
+		}
+		for rows.Next() {
+			item := PersonEnrichmentSuppressionInput{Reason: input.Reason, Actor: input.Actor}
+			if err := rows.Scan(&item.ProviderNamespace, &item.IdentifierClass,
+				&item.NormalizationVersion, &item.KeyID, &item.Digest); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("read recorded person enrichment identifier before delete: %w", err)
+			}
+			validated, err := validatePersonEnrichmentSuppressionInput(item)
+			if err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("validate recorded person enrichment identifier before delete: %w", err)
+			}
+			if input.ConfiguredKeyID != "" && validated.KeyID != input.ConfiguredKeyID {
+				_ = rows.Close()
+				return personenrichment.ErrSuppressionKeyMismatch
+			}
+			suppressions = append(suppressions, validated)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("close recorded person enrichment identifiers before delete: %w", err)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("iterate recorded person enrichment identifiers before delete: %w", err)
+		}
+		if err := s.insertPersonEnrichmentSuppressionsTx(ctx, tx, suppressions); err != nil {
+			return err
+		}
+		var references int
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*)
+			FROM person_attribute_values
+			WHERE value_record_type = 'person' AND value_record_id = ?
+			  AND person_id <> ?
+			  AND active_until IS NULL AND superseded_at IS NULL
+		`, id, id).Scan(&references); err != nil {
+			return fmt.Errorf("check references to person %d: %w", id, err)
+		}
+		if references > 0 {
+			return fmt.Errorf("delete person %d: %w", id, ErrPersonReferenced)
+		}
+		if err := tx.QueryRowContext(ctx, `
+			SELECT COUNT(*)
+			FROM organization_attribute_values
+			WHERE value_record_type = 'person' AND value_record_id = ?
+			  AND active_until IS NULL AND superseded_at IS NULL
+		`, id).Scan(&references); err != nil {
+			return fmt.Errorf("check organization references to person %d: %w", id, err)
+		}
+		if references > 0 {
+			return fmt.Errorf("delete person %d: %w", id, ErrPersonReferenced)
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*)
+			FROM person_merge_review_candidates candidate
+			WHERE candidate.state = 'pending' AND EXISTS (
+				SELECT 1 FROM person_attribute_values value
+				WHERE value.id IN (
+					candidate.survivor_value_id,
+					candidate.absorbed_value_id,
+					candidate.resolution_value_id
+				)
+				  AND value.value_record_type = 'person'
+				  AND value.value_record_id = ?
+			)`, id).Scan(&references); err != nil {
+			return fmt.Errorf("check merge-review references to person %d: %w", id, err)
+		}
+		if references > 0 {
+			return fmt.Errorf("delete person %d: %w", id, ErrPersonReferenced)
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM person_merges
+			WHERE current_person_id = ?`, id).Scan(&references); err != nil {
+			return fmt.Errorf("check active merge lineage for person %d: %w", id, err)
+		}
+		if references > 0 {
+			return fmt.Errorf("delete person %d: %w", id, ErrPersonMergeActive)
+		}
+		// A completed split releases the active lineage. Its review candidates
+		// are no longer actionable and must leave with the profile before the
+		// profile-value cascade reaches their RESTRICT references.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM person_merge_review_candidates
+			WHERE survivor_person_id = ?
+			   OR (merge_id IN (SELECT merge_record.id FROM person_merges merge_record
+					WHERE merge_record.current_person_id IS NULL)
+				AND EXISTS (SELECT 1 FROM person_attribute_values value
+					WHERE value.person_id = ? AND value.id IN (
+						person_merge_review_candidates.survivor_value_id,
+						person_merge_review_candidates.absorbed_value_id,
+						person_merge_review_candidates.resolution_value_id
+					)))`, id, id); err != nil {
+			return fmt.Errorf("delete completed merge candidates for person %d: %w", id, err)
+		}
+		if err := s.deleteIdentityMatchCandidatesForPersonTx(ctx, tx, id); err != nil {
+			return err
+		}
+		// Before the cascade: the edges this person stands at either end of
+		// and the reviews that matched them are projected onto the surviving
+		// counterpart's card, which the deletion otherwise never touches.
+		if err := s.bumpPersonDeletionCounterpartVCardProjectionsTx(ctx, tx, id); err != nil {
+			return err
+		}
+		var deletedID int64
+		err = tx.QueryRowContext(ctx,
 			`DELETE FROM persons WHERE id = ? AND revision = ? RETURNING id`,
 			id, expectedRevision).Scan(&deletedID)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -172,8 +413,30 @@ func (s *Store) DeletePersonContext(ctx context.Context, id, expectedRevision in
 		if err != nil {
 			return fmt.Errorf("delete person %d: %w", id, err)
 		}
-		return nil
+		_, err = s.bumpIdentityRevisionContext(ctx, tx)
+		return err
 	})
+}
+
+func (s *Store) deleteIdentityMatchCandidatesForPersonTx(
+	ctx context.Context, tx *loggedTx, personID int64,
+) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM identity_match_candidates
+		WHERE (left_kind = ? AND left_id = ?)
+		   OR (right_kind = ? AND right_id = ?)
+		   OR (left_kind = ? AND left_id IN (
+			SELECT id FROM person_contact_points WHERE person_id = ?
+		   ))
+		   OR (right_kind = ? AND right_id IN (
+			SELECT id FROM person_contact_points WHERE person_id = ?
+		   ))`,
+		IdentityMatchPerson, personID, IdentityMatchPerson, personID,
+		IdentityMatchContactPoint, personID,
+		IdentityMatchContactPoint, personID,
+	); err != nil {
+		return fmt.Errorf("delete identity match candidates for person %d: %w", personID, err)
+	}
+	return nil
 }
 
 func (s *Store) GetPerson(id int64) (*Person, error) {
@@ -220,6 +483,19 @@ func (s *Store) UpdatePersonDisplayNameContext(
 	ctx context.Context, id, expectedRevision int64, displayName *string,
 ) (*Person, error) {
 	displayName = normalizePersonDisplayName(displayName)
+	// The rename locks the identity row, this person, and then every
+	// relationship counterpart; relationship writes lock the same person
+	// rows in their own order. On PostgreSQL the two can deadlock, so a
+	// deadlock victim starts over from a clean transaction.
+	return retryContendedWrite(ctx, s, "update person display name",
+		func() (*Person, error) {
+			return s.updatePersonDisplayNameOnce(ctx, id, expectedRevision, displayName)
+		})
+}
+
+func (s *Store) updatePersonDisplayNameOnce(
+	ctx context.Context, id, expectedRevision int64, displayName *string,
+) (*Person, error) {
 	var person *Person
 	err := s.withTxContext(ctx, func(tx *loggedTx) error {
 		if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
@@ -228,7 +504,9 @@ func (s *Store) UpdatePersonDisplayNameContext(
 		var updatedID int64
 		err := tx.QueryRowContext(ctx, fmt.Sprintf(`
 			UPDATE persons
-			SET display_name = ?, revision = revision + 1, updated_at = %s
+			SET display_name = ?, revision = revision + 1,
+			    vcard_projection_revision = vcard_projection_revision + 1,
+			    updated_at = %s
 			WHERE id = ? AND revision = ?
 			RETURNING id
 		`, s.dialect.Now()), displayName, id, expectedRevision).Scan(&updatedID)
@@ -238,8 +516,16 @@ func (s *Store) UpdatePersonDisplayNameContext(
 		if err != nil {
 			return fmt.Errorf("update person %d: %w", id, err)
 		}
+		if err := s.bumpDisplayNameCounterpartVCardProjectionsTx(
+			ctx, tx, updatedID,
+		); err != nil {
+			return err
+		}
 		person, err = s.getPersonTx(ctx, tx, updatedID)
-		return err
+		if err != nil {
+			return err
+		}
+		return s.invalidatePersonEnrichmentIdentitiesAfterRevisionTx(ctx, tx, updatedID)
 	})
 	if err != nil {
 		return nil, err
@@ -457,26 +743,52 @@ func (s *Store) mergePersonBindingsTx(
 	if err != nil {
 		return false, err
 	}
+	if removed > 0 {
+		if err := s.markContactStateDirtyTx(ctx, tx, personID); err != nil {
+			return false, err
+		}
+	}
 	return removed > 0 || filled, nil
 }
 
+// bumpPersonRevisionsTx advances the person record's compare-and-swap token
+// after a component or binding write. Every such write also changes the
+// person's native vCard projection, so the projection revision moves in the
+// same statement — keeping the two together means a new profile-component
+// writer cannot pick up the CAS bump and silently miss the projection one.
 func (s *Store) bumpPersonRevisionsTx(ctx context.Context, tx *loggedTx, personIDs ...int64) error {
-	slices.Sort(personIDs)
-	personIDs = slices.Compact(personIDs)
-	if len(personIDs) == 0 {
+	placeholders, args := sortedIDPlaceholders(personIDs)
+	if placeholders == "" {
 		return nil
-	}
-	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(personIDs)), ",")
-	args := make([]any, len(personIDs))
-	for i, id := range personIDs {
-		args[i] = id
 	}
 	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
 		UPDATE persons
-		SET revision = revision + 1, updated_at = %s
+		SET revision = revision + 1,
+		    vcard_projection_revision = vcard_projection_revision + 1,
+		    updated_at = %s
 		WHERE id IN (%s)
 	`, s.dialect.Now(), placeholders), args...); err != nil {
 		return fmt.Errorf("bump person revisions: %w", err)
+	}
+	return nil
+}
+
+// bumpPersonRecordRevisionsTx advances only the person's enrichment/CAS
+// generation. Callers whose mutation already owns the vCard projection bump
+// use this instead of bumpPersonRevisionsTx to avoid moving that projection
+// token twice.
+func (s *Store) bumpPersonRecordRevisionsTx(
+	ctx context.Context, tx *loggedTx, personIDs ...int64,
+) error {
+	placeholders, args := sortedIDPlaceholders(personIDs)
+	if placeholders == "" {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
+		UPDATE persons SET revision = revision + 1, updated_at = %s
+		WHERE id IN (%s)
+	`, s.dialect.Now(), placeholders), args...); err != nil {
+		return fmt.Errorf("bump person record revisions: %w", err)
 	}
 	return nil
 }

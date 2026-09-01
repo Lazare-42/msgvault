@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/kit/daemon"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/store"
 )
@@ -244,6 +245,25 @@ func TestEmbeddingsRetireFailsFastWhenArchiveOwned(t *testing.T) {
 	assert.Contains(err.Error(), "msgvault daemon stop", "points at the remedy")
 }
 
+func TestEmbeddingsPruneFailsFastWhenArchiveOwned(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	dataDir := t.TempDir()
+	withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+
+	owner, err := tryAcquireWriteOwnerLock(dataDir)
+	require.NoError(err, "acquire owner lock")
+	t.Cleanup(func() { _ = owner.Close() })
+
+	cmd := &cobra.Command{Use: "prune"}
+	cmd.SetContext(context.Background())
+	err = runEmbeddingsPrune(cmd, nil)
+	require.Error(err, "embeddings prune must fail while the archive is owned")
+	assert.Contains(err.Error(), "owned", "actionable ownership error")
+	assert.Contains(err.Error(), "msgvault daemon stop", "points at the remedy")
+}
+
 func TestEmbeddingsListFailsFastWhenArchiveOwned(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(
@@ -435,4 +455,42 @@ func TestOpenHTTPStoreFailsWhenDirectWriterOwnsArchive(t *testing.T) {
 	_, _, err = OpenHTTPStore(context.Background())
 	require.Error(t, err, "OpenHTTPStore must not autostart over a direct writer")
 	assert.Contains(t, err.Error(), "write operation", "explains the contention")
+}
+
+func TestDaemonAutostartPreflight_AllowsLiveDaemonWithSkewedCreateTime(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	dataDir := t.TempDir()
+	cfg := lifecycleTestConfig(dataDir)
+
+	live, ok := processCreateTimeMillis(os.Getpid())
+	require.True(ok, "read live create time")
+
+	// The daemon's runtime record, with the one-second create-time skew
+	// produced by whole-second boot-time jitter in containerized
+	// deployments (recorded at daemon start, re-read by a later CLI run).
+	_, err := daemonRuntimeStore(dataDir).Write(daemon.RuntimeRecord{
+		PID:     os.Getpid(),
+		Network: daemon.NetworkTCP,
+		Address: "127.0.0.1:1",
+		Service: daemonService,
+		Metadata: map[string]string{
+			runtimeCreateTime: strconv.FormatInt(live+1000, 10),
+		},
+	})
+	require.NoError(err, "write runtime record")
+
+	// The daemon also holds the write-owner lock for its whole lifetime.
+	owner, err := tryAcquireWriteOwnerLock(dataDir)
+	require.NoError(err, "acquire owner lock")
+	t.Cleanup(func() { _ = owner.Close() })
+
+	require.NoError(daemonAutostartPreflight(cfg),
+		"preflight must not mistake a live daemon for a direct writer")
+
+	path, err := daemonRuntimeStore(dataDir).Path(os.Getpid())
+	require.NoError(err, "runtime record path")
+	_, statErr := os.Stat(path)
+	assert.NoError(statErr, "runtime record must survive discovery")
 }

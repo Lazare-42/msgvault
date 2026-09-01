@@ -38,16 +38,26 @@ type fakeMsg struct {
 }
 
 type fakeChat struct {
-	ID           string
-	AccountID    string
-	Network      string
-	Title        string
-	Type         string // "single" | "group"
-	LastActivity time.Time
-	Participants []map[string]any
+	ID        string
+	AccountID string
+	// SearchAccountID controls which requested account returns this chat while
+	// AccountID remains the payload value. It lets importer tests model a
+	// response whose account field is empty or inconsistent.
+	SearchAccountID string
+	Network         string
+	Title           string
+	Type            string // "single" | "group"
+	LastActivity    time.Time
+	Participants    []map[string]any
 	// ParticipantsTruncated makes the search listing report hasMore=true so
 	// the importer fetches the chat detail for the full list.
 	ParticipantsTruncated bool
+	// ParticipantListingLimit controls how many participants a truncated search
+	// result exposes. Zero keeps the historical one-participant fixture default.
+	ParticipantListingLimit int
+	// ParticipantsTotalUnknown omits the participants total from every payload,
+	// so a truncated listing carries no authoritative roster size.
+	ParticipantsTotalUnknown bool
 	// StuckHead emulates a misbehaving live API whose direction=after pages
 	// re-serve the head with a non-advancing cursor.
 	StuckHead bool
@@ -64,10 +74,25 @@ type fakeChat struct {
 type fakeBeeper struct {
 	t        *testing.T
 	pageSize int
+	// chatPageSize paginates GET /v1/chats/search (0 = one page with
+	// everything, which is what most tests want). When set, chats are served
+	// newest-activity-first like the live API.
+	chatPageSize int
 
-	mu     sync.Mutex
-	chats  []*fakeChat
-	assets map[string][]byte // asset URL (mxc://...) -> bytes served by /v1/assets/serve
+	mu sync.Mutex
+	// accounts is what GET /v1/accounts reports. Beeper omits its native
+	// platform-sdk accounts here even though their chats are served normally,
+	// so tests can register a chat without registering its account.
+	accounts []map[string]any
+	// failAccounts makes GET /v1/accounts answer 401, the way a stale token
+	// is rejected.
+	failAccounts bool
+	// failChatSearch makes GET /v1/chats/search answer 400.
+	failChatSearch bool
+	// failChatGets makes GET /v1/chats/{id} answer 400 for the listed chats.
+	failChatGets map[string]bool
+	chats        []*fakeChat
+	assets       map[string][]byte // asset URL (mxc://...) -> bytes served by /v1/assets/serve
 	// failMessageGets makes GET /v1/chats/{id}/messages/{mid} answer 400
 	// (a non-retryable transient error) for the listed message IDs.
 	failMessageGets map[string]bool
@@ -79,12 +104,16 @@ type fakeBeeper struct {
 	cancelAfterPages int
 	cancelFn         func()
 	pagesServed      int
-	reqs             []string // "PATH?QUERY" per request, in order
+	// cancelOnMessageListChatID invokes cancelFn once after serving a
+	// message-list response for the named chat.
+	cancelOnMessageListChatID string
+	reqs                      []string // "PATH?QUERY" per request, in order
 }
 
 func newFakeBeeper(t *testing.T) *fakeBeeper {
 	t.Helper()
-	return &fakeBeeper{t: t, pageSize: 20, assets: map[string][]byte{}, failMessageGets: map[string]bool{}, failMessageLists: map[string]bool{}}
+	return &fakeBeeper{t: t, pageSize: 20, assets: map[string][]byte{}, failMessageGets: map[string]bool{},
+		failMessageLists: map[string]bool{}, failChatGets: map[string]bool{}}
 }
 
 // setMessageListFailure toggles a 400 response for message-list fetches of a chat.
@@ -106,6 +135,34 @@ func (f *fakeBeeper) setAsset(url string, data []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.assets[url] = data
+}
+
+// addAccount makes an account visible to GET /v1/accounts.
+func (f *fakeBeeper) addAccount(acct map[string]any) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.accounts = append(f.accounts, acct)
+}
+
+// setAccountsFailure toggles a 401 response for the accounts endpoint.
+func (f *fakeBeeper) setAccountsFailure(fail bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failAccounts = fail
+}
+
+// setChatSearchFailure toggles a 400 response for chat searches.
+func (f *fakeBeeper) setChatSearchFailure(fail bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failChatSearch = fail
+}
+
+// setChatGetFailure toggles a 400 response for chat-detail fetches of a chat.
+func (f *fakeBeeper) setChatGetFailure(chatID string, fail bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failChatGets[chatID] = fail
 }
 
 func (f *fakeBeeper) addChat(ch *fakeChat) {
@@ -141,6 +198,22 @@ func (f *fakeBeeper) appendMsg(chatID string, m fakeMsg) {
 	require.Failf(f.t, "appendMsg failed", "unknown chat %s", chatID)
 }
 
+// prependMsgs adds messages behind a chat's existing oldest message, as Beeper
+// Desktop does when it finishes backfilling a network's older history. The
+// chat's lastActivity deliberately does not move: that is what makes the new
+// history invisible to activity-filtered enumeration and head reconciliation.
+func (f *fakeBeeper) prependMsgs(chatID string, msgs ...fakeMsg) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, ch := range f.chats {
+		if ch.ID == chatID {
+			ch.Msgs = append(append([]fakeMsg{}, msgs...), ch.Msgs...)
+			return
+		}
+	}
+	require.Failf(f.t, "prependMsgs failed", "unknown chat %s", chatID)
+}
+
 // requests returns the request log ("PATH?QUERY" entries).
 func (f *fakeBeeper) requests() []string {
 	f.mu.Lock()
@@ -152,6 +225,13 @@ func (f *fakeBeeper) resetRequests() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.reqs = nil
+}
+
+func (f *fakeBeeper) cancelMessageListFor(chatID string, cancelFn func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.cancelOnMessageListChatID = chatID
+	f.cancelFn = cancelFn
 }
 
 func (f *fakeBeeper) server() *httptest.Server {
@@ -167,6 +247,8 @@ func (f *fakeBeeper) server() *httptest.Server {
 		w.Header().Set("Content-Type", "application/json")
 		path := r.URL.Path
 		switch {
+		case path == "/v1/accounts":
+			f.writeAccounts(w)
 		case path == "/v1/assets/serve":
 			f.writeAsset(w, r)
 		case path == "/v1/chats/search":
@@ -201,9 +283,27 @@ func (f *fakeBeeper) writeAsset(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(data)
 }
 
+func (f *fakeBeeper) writeAccounts(w http.ResponseWriter) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failAccounts {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+	accounts := f.accounts
+	if accounts == nil {
+		accounts = []map[string]any{}
+	}
+	writeJSON(f.t, w, accounts)
+}
+
 func (f *fakeBeeper) writeChatSearch(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failChatSearch {
+		http.Error(w, `{"error":"transient"}`, http.StatusBadRequest)
+		return
+	}
 	q := r.URL.Query()
 	accountID := q.Get("accountIDs")
 	var after time.Time
@@ -215,24 +315,54 @@ func (f *fakeBeeper) writeChatSearch(w http.ResponseWriter, r *http.Request) {
 		}
 		after = t
 	}
-	items := []map[string]any{}
+	var matched []*fakeChat
 	for _, ch := range f.chats {
-		if accountID != "" && ch.AccountID != accountID {
+		filterAccountID := ch.AccountID
+		if ch.SearchAccountID != "" {
+			filterAccountID = ch.SearchAccountID
+		}
+		if accountID != "" && filterAccountID != accountID {
 			continue
 		}
 		if !after.IsZero() && !ch.LastActivity.After(after) {
 			continue
 		}
+		matched = append(matched, ch)
+	}
+
+	// Unpaginated by default: one page with everything, as most tests expect.
+	// With chatPageSize set, mirror the live API's newest-activity-first order
+	// and hand out an opaque cursor (here: the offset of the next page).
+	window, oldestCursor, hasMore := matched, any(nil), false
+	if f.chatPageSize > 0 {
+		sort.SliceStable(matched, func(i, j int) bool {
+			return matched[i].LastActivity.After(matched[j].LastActivity)
+		})
+		start, _ := strconv.Atoi(q.Get("cursor"))
+		start = min(max(start, 0), len(matched))
+		end := min(start+f.chatPageSize, len(matched))
+		window = matched[start:end]
+		if end < len(matched) {
+			oldestCursor, hasMore = strconv.Itoa(end), true
+		}
+	}
+
+	items := []map[string]any{}
+	for _, ch := range window {
 		items = append(items, f.chatJSON(ch, true))
 	}
 	writeJSON(f.t, w, map[string]any{
-		"items": items, "hasMore": false, "oldestCursor": nil, "newestCursor": nil,
+		"items": items, "hasMore": hasMore, "oldestCursor": oldestCursor, "newestCursor": nil,
 	})
 }
 
 func (f *fakeBeeper) writeChat(w http.ResponseWriter, chatID string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failChatGets[chatID] {
+		http.Error(w, `{"error":"transient"}`, http.StatusBadRequest)
+		return
+	}
 	for _, ch := range f.chats {
 		if ch.ID == chatID {
 			writeJSON(f.t, w, f.chatJSON(ch, false))
@@ -249,21 +379,27 @@ func (f *fakeBeeper) chatJSON(ch *fakeChat, listing bool) map[string]any {
 	parts := ch.Participants
 	hasMore := false
 	if listing && ch.ParticipantsTruncated {
-		parts = parts[:1]
+		limit := ch.ParticipantListingLimit
+		if limit <= 0 || limit > len(parts) {
+			limit = 1
+		}
+		parts = parts[:limit]
 		hasMore = true
 	}
 	if parts == nil {
 		parts = []map[string]any{}
 	}
+	participants := map[string]any{"items": parts, "hasMore": hasMore}
+	if !ch.ParticipantsTotalUnknown {
+		participants["total"] = len(ch.Participants)
+	}
 	return map[string]any{
-		"id":        ch.ID,
-		"accountID": ch.AccountID,
-		"network":   ch.Network,
-		"title":     ch.Title,
-		"type":      ch.Type,
-		"participants": map[string]any{
-			"items": parts, "hasMore": hasMore, "total": len(ch.Participants),
-		},
+		"id":           ch.ID,
+		"accountID":    ch.AccountID,
+		"network":      ch.Network,
+		"title":        ch.Title,
+		"type":         ch.Type,
+		"participants": participants,
 		"lastActivity": ch.LastActivity.UTC().Format(time.RFC3339Nano),
 		"unreadCount":  0,
 	}
@@ -275,6 +411,10 @@ func (f *fakeBeeper) writeMessages(w http.ResponseWriter, r *http.Request, chatI
 	f.pagesServed++
 	if f.cancelAfterPages > 0 && f.pagesServed == f.cancelAfterPages && f.cancelFn != nil {
 		defer f.cancelFn() // after the response is written
+	}
+	if f.cancelOnMessageListChatID == chatID && f.cancelFn != nil {
+		defer f.cancelFn() // after the response is written
+		f.cancelOnMessageListChatID = ""
 	}
 	var ch *fakeChat
 	for _, c := range f.chats {

@@ -38,6 +38,21 @@ type GetAttachmentPath struct {
 	ID int64 `json:"id"`
 }
 
+type DeleteAttributeDefinitionPath struct {
+	// ID Attribute definition ID
+	ID int64 `json:"id"`
+}
+
+type GetAttributeDefinitionPath struct {
+	// ID Attribute definition ID
+	ID int64 `json:"id"`
+}
+
+type PatchAttributeDefinitionPath struct {
+	// ID Attribute definition ID
+	ID int64 `json:"id"`
+}
+
 type UploadTokenPath struct {
 	// Email Account email address
 	Email string `json:"email" validate:"required"`
@@ -45,6 +60,54 @@ type UploadTokenPath struct {
 
 func (u UploadTokenPath) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(u))
+}
+
+type UpdateCardDAVBookRolesPath struct {
+	ID int64 `json:"id" validate:"gte=1"`
+}
+
+func (u UpdateCardDAVBookRolesPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(u))
+}
+
+type GetCardDAVConflictPath struct {
+	ID int64 `json:"id" validate:"gte=1"`
+}
+
+func (g GetCardDAVConflictPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+}
+
+type ResolveCardDAVConflictPath struct {
+	ID int64 `json:"id" validate:"gte=1"`
+}
+
+func (r ResolveCardDAVConflictPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(r))
+}
+
+type UnpublishCardDAVPersonPath struct {
+	PersonID int64 `json:"person_id" validate:"gte=1"`
+}
+
+func (u UnpublishCardDAVPersonPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(u))
+}
+
+type GetCardDAVPublicationPath struct {
+	PersonID int64 `json:"person_id" validate:"gte=1"`
+}
+
+func (g GetCardDAVPublicationPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+}
+
+type PublishCardDAVPersonPath struct {
+	PersonID int64 `json:"person_id" validate:"gte=1"`
+}
+
+func (p PublishCardDAVPersonPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
 }
 
 type DeleteCLICollectionPath struct {
@@ -77,6 +140,42 @@ func (a AddCLICollectionSourcesPath) Validate() error {
 type GetConversationPath struct {
 	// ID Conversation ID
 	ID int64 `json:"id"`
+}
+
+type DeleteDayEntryPath struct {
+	// ID Positive durable identifier
+	ID int64 `json:"id" validate:"gte=1"`
+}
+
+func (d DeleteDayEntryPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(d))
+}
+
+type GetActivityDayPath struct {
+	// Date Exact local calendar date
+	Date string `json:"date" validate:"required"`
+}
+
+func (g GetActivityDayPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+}
+
+type ListDayEntriesPath struct {
+	// Date Exact local calendar date
+	Date string `json:"date" validate:"required"`
+}
+
+func (l ListDayEntriesPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(l))
+}
+
+type CreateDayEntryPath struct {
+	// Date Exact local calendar date
+	Date string `json:"date" validate:"required"`
+}
+
+func (c CreateDayEntryPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(c))
 }
 
 type CancelDeletionPath struct {
@@ -133,6 +232,31 @@ func (g GetDomainTimelinePath) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(g))
 }
 
+type DeleteEmploymentPath struct {
+	// ID Employment ID
+	ID int64 `json:"id"`
+}
+
+type GetEmploymentPath struct {
+	// ID Employment ID
+	ID int64 `json:"id"`
+}
+
+type PatchEmploymentPath struct {
+	// ID Employment ID
+	ID int64 `json:"id"`
+}
+
+type EndEmploymentPath struct {
+	// ID Employment ID
+	ID int64 `json:"id"`
+}
+
+type SetPrimaryEmploymentPath struct {
+	// ID Employment ID
+	ID int64 `json:"id"`
+}
+
 type GetFilePath struct {
 	// ID File attachment ID
 	ID int64 `json:"id"`
@@ -140,6 +264,16 @@ type GetFilePath struct {
 
 type GetFileContentPath struct {
 	// ID File attachment ID
+	ID int64 `json:"id"`
+}
+
+type AcceptIdentityMatchCandidatePath struct {
+	// ID Identity match candidate ID
+	ID int64 `json:"id"`
+}
+
+type RejectIdentityMatchCandidatePath struct {
+	// ID Identity match candidate ID
 	ID int64 `json:"id"`
 }
 
@@ -175,23 +309,93 @@ func (u UnlinkMessageTaskPath) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(u))
 }
 
-type GetPersonPath struct {
-	// ID Durable participant ID
+type DeleteOrganizationPath struct {
+	// ID Organization ID
 	ID int64 `json:"id"`
 }
 
-type SearchPersonFilesPath struct {
-	// ID Durable participant ID
+type GetOrganizationPath struct {
+	// ID Organization ID
 	ID int64 `json:"id"`
 }
 
-type GetPersonContextSummaryPath struct {
-	// ID Durable participant ID
+type PatchOrganizationPath struct {
+	// ID Organization ID
 	ID int64 `json:"id"`
 }
 
-type GetPersonTimelinePath struct {
-	// ID Durable participant ID
+type ListOrganizationAttributesPath struct {
+	// ID Organization ID
+	ID int64 `json:"id"`
+}
+
+type SetOrganizationAttributePath struct {
+	// ID Organization ID
+	ID int64 `json:"id"`
+}
+
+type ClearOrganizationAttributePath struct {
+	// ID Organization ID
+	ID int64 `json:"id"`
+
+	// Slug Immutable attribute definition slug
+	Slug string `json:"slug" validate:"required"`
+}
+
+func (c ClearOrganizationAttributePath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(c))
+}
+
+type ListOrganizationEmploymentsPath struct {
+	// ID Organization ID
+	ID int64 `json:"id"`
+}
+
+type GetOrganizationHistoryPath struct {
+	// ID Organization ID
+	ID int64 `json:"id"`
+}
+
+type MergeOrganizationPath struct {
+	// ID Organization ID
+	ID int64 `json:"id"`
+}
+
+type PutOrganizationProfilePath struct {
+	// ID Organization ID
+	ID int64 `json:"id"`
+}
+
+type GetOrganizationProfileMediaContentPath struct {
+	// ID Organization ID
+	ID int64 `json:"id"`
+
+	// MediaID Structured organization profile media value ID
+	MediaID int64 `json:"media_id"`
+}
+
+type GetParticipantPath struct {
+	// ID Observed participant cluster member ID
+	ID int64 `json:"id"`
+}
+
+type SearchParticipantFilesPath struct {
+	// ID Observed participant cluster member ID
+	ID int64 `json:"id"`
+}
+
+type ListParticipantInboxesPath struct {
+	// ID Observed participant cluster member ID
+	ID int64 `json:"id"`
+}
+
+type GetParticipantContextSummaryPath struct {
+	// ID Observed participant cluster member ID
+	ID int64 `json:"id"`
+}
+
+type GetParticipantTimelinePath struct {
+	// ID Observed participant cluster member ID
 	ID int64 `json:"id"`
 }
 
@@ -207,6 +411,247 @@ type GetPersonProfilePath struct {
 
 type PatchPersonPath struct {
 	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type ListPersonAttributesPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type ClearPersonAttributePath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+
+	// Slug Immutable attribute definition slug
+	Slug string `json:"slug" validate:"required"`
+}
+
+func (c ClearPersonAttributePath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(c))
+}
+
+type SetPersonAttributePath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+
+	// Slug Immutable attribute definition slug
+	Slug string `json:"slug" validate:"required"`
+}
+
+func (s SetPersonAttributePath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(s))
+}
+
+type GetPersonContactStatePath struct {
+	// ID Positive durable identifier
+	ID int64 `json:"id" validate:"gte=1"`
+}
+
+func (g GetPersonContactStatePath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+}
+
+type ListPersonActivityDaysPath struct {
+	// ID Positive durable identifier
+	ID int64 `json:"id" validate:"gte=1"`
+}
+
+func (l ListPersonActivityDaysPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(l))
+}
+
+type GetPersonActivityDayPath struct {
+	// ID Positive durable identifier
+	ID int64 `json:"id" validate:"gte=1"`
+
+	// Date Exact local calendar date
+	Date string `json:"date" validate:"required"`
+}
+
+func (g GetPersonActivityDayPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+}
+
+type ListPersonEmploymentsPath struct {
+	// ID Person ID
+	ID int64 `json:"id"`
+}
+
+type ListPersonFactClaimsPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type ListPersonFactDecisionsPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type ListPersonFactEvidencePath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type ListPersonFactEvidenceStatusEventsPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type ListPersonFactPinsPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type SetPersonFactPinPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+
+	// Kind Closed person fact target kind
+	Kind SetPersonFactPinPathKind `json:"kind" validate:"required"`
+
+	// Key Exact person fact target key
+	Key string `json:"key" validate:"required"`
+}
+
+func (s SetPersonFactPinPath) Validate() error {
+	var errors runtime.ValidationErrors
+	if v, ok := any(s.Kind).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Kind", err)
+		}
+	}
+	if err := typesValidator.Var(s.Key, "required"); err != nil {
+		errors = errors.Append("Key", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type SearchPersonFilesPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type MergePersonsPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type ListPersonMergesPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type AppendPersonNotePath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type GetPersonStructuredProfilePath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type PatchPersonStructuredProfilePath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type GetPersonProfileHistoryPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type GetPersonProfileMediaContentPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+
+	// MediaID Structured person profile media value ID
+	MediaID int64 `json:"media_id"`
+}
+
+type ListPersonRelationshipsPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type SplitPersonMergePath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type GetPersonTrackingPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type SetPersonTrackingPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type DecidePersonMergeCandidatePath struct {
+	// CandidateID Person merge review candidate ID
+	CandidateID int64 `json:"candidate_id" validate:"gte=1"`
+}
+
+func (d DecidePersonMergeCandidatePath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(d))
+}
+
+type GetPersonMergePath struct {
+	// MergeID Durable person merge ID
+	MergeID int64 `json:"merge_id" validate:"gte=1"`
+}
+
+func (g GetPersonMergePath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+}
+
+type GetPersonMergeSnapshotPath struct {
+	// MergeID Durable person merge ID
+	MergeID int64 `json:"merge_id" validate:"gte=1"`
+}
+
+func (g GetPersonMergeSnapshotPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+}
+
+type DeletePersonRelationshipPath struct {
+	// ID Person relationship ID
+	ID int64 `json:"id"`
+}
+
+type GetPersonRelationshipPath struct {
+	// ID Person relationship ID
+	ID int64 `json:"id"`
+}
+
+type PatchPersonRelationshipPath struct {
+	// ID Person relationship ID
+	ID int64 `json:"id"`
+}
+
+type DeleteRelationshipTypePath struct {
+	// ID Relationship type ID
+	ID int64 `json:"id"`
+}
+
+type GetRelationshipTypePath struct {
+	// ID Relationship type ID
+	ID int64 `json:"id"`
+}
+
+type PatchRelationshipTypePath struct {
+	// ID Relationship type ID
+	ID int64 `json:"id"`
+}
+
+type GetRelationshipCalendarPath struct {
+	// ID Any member participant ID of the counterpart's identity cluster
 	ID int64 `json:"id"`
 }
 
@@ -228,6 +673,11 @@ type GetSavedViewPath struct {
 type PatchSavedViewPath struct {
 	// ID Saved View ID
 	ID int64 `json:"id"`
+}
+
+type ListSourceIdentitiesPath struct {
+	// SourceID Source ID
+	SourceID int64 `json:"source_id"`
 }
 
 type TriggerSyncPath struct {

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"sort"
 	"strings"
@@ -28,6 +29,8 @@ const sqliteDatetimeFormat = "2006-01-02 15:04:05"
 var _ vector.Backend = (*Backend)(nil)
 var _ vector.ChunkScoringBackend = (*Backend)(nil)
 var _ vector.FilteredCoverageBackend = (*Backend)(nil)
+var _ vector.ConvergedGenerationActivator = (*Backend)(nil)
+var _ vector.OrphanEmbeddingPruner = (*Backend)(nil)
 
 // Options configures how Open establishes a Backend.
 type Options struct {
@@ -81,7 +84,7 @@ func Open(ctx context.Context, opts Options) (*Backend, error) {
 		path:     opts.Path,
 		mainPath: opts.MainPath,
 		dim:      opts.Dimension,
-		scope:    vector.NewBuildScope(opts.BuildScope.MessageTypes),
+		scope:    vector.NewBuildScope(opts.BuildScope.MessageTypes, opts.BuildScope.SourceIDs),
 		readOnly: opts.ReadOnly,
 	}
 	// Orphaned-stamp reset (vectors.db-recreate safety): clear embed_gen for
@@ -152,6 +155,9 @@ func (b *Backend) Path() string { return b.path }
 // unique-index violation.
 func (b *Backend) CreateGeneration(ctx context.Context, model string, dim int, fingerprint string) (vector.GenerationID, error) {
 	if err := EnsureVectorTable(ctx, b.db, dim); err != nil {
+		return 0, err
+	}
+	if err := EnsurePersonVectorTable(ctx, b.db, dim); err != nil {
 		return 0, err
 	}
 	fp := fingerprint
@@ -290,9 +296,19 @@ func (b *Backend) hasMissingForGen(ctx context.Context, gen vector.GenerationID)
 }
 
 func (b *Backend) missingCoverageWhere(gen int64) (string, []any) {
-	where := "(embed_gen IS NULL OR embed_gen <> ?) AND " + store.LiveMessagesWhere("", true)
-	args := []any{gen}
-	if !b.scope.IsEmpty() {
+	liveWhere, liveArgs := b.liveScopeWhere()
+	return "(embed_gen IS NULL OR embed_gen <> ?) AND " + liveWhere,
+		append([]any{gen}, liveArgs...)
+}
+
+// liveScopeWhere is the predicate for live messages inside the backend's
+// build scope — the generation's embedding universe. Shared by the
+// coverage gate (missingCoverageWhere) and the empty-scope activation
+// guard so both always agree on what "in scope" means.
+func (b *Backend) liveScopeWhere() (string, []any) {
+	where := store.LiveMessagesWhere("", true)
+	args := make([]any, 0, len(b.scope.MessageTypes)+len(b.scope.SourceIDs))
+	if len(b.scope.MessageTypes) > 0 {
 		placeholders := make([]string, len(b.scope.MessageTypes))
 		for i, typ := range b.scope.MessageTypes {
 			placeholders[i] = "?"
@@ -300,7 +316,31 @@ func (b *Backend) missingCoverageWhere(gen int64) (string, []any) {
 		}
 		where += fmt.Sprintf(" AND message_type IN (%s)", strings.Join(placeholders, ","))
 	}
+	if len(b.scope.SourceIDs) > 0 {
+		placeholders := make([]string, len(b.scope.SourceIDs))
+		for i, id := range b.scope.SourceIDs {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		where += fmt.Sprintf(" AND source_id IN (%s)", strings.Join(placeholders, ","))
+	}
 	return where, args
+}
+
+// hasLiveInScope reports whether any live message falls inside the
+// backend's build scope.
+func (b *Backend) hasLiveInScope(ctx context.Context) (bool, error) {
+	where, args := b.liveScopeWhere()
+	var exists int
+	err := b.mainDB.QueryRowContext(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM messages
+			 WHERE `+where+`
+		)`, args...).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check live messages in build scope: %w", err)
+	}
+	return exists == 1, nil
 }
 
 // ActivateGeneration atomically retires the current active generation
@@ -340,6 +380,20 @@ func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationI
 		if missing {
 			return fmt.Errorf("generation %d still has messages needing embedding; run `msgvault embeddings resume` or pass --force", gen)
 		}
+		// Empty-scope guard: a source scope matching no live messages
+		// trivially satisfies the no-missing gate, so without this check
+		// every non-forced path (CLI drain, scheduler, `embeddings
+		// activate`) would swap in an empty index and retire the serving
+		// generation.
+		if len(b.scope.SourceIDs) > 0 {
+			live, err := b.hasLiveInScope(ctx)
+			if err != nil {
+				return err
+			}
+			if !live {
+				return fmt.Errorf("generation %d: %w; sync the scoped account(s) or fix [vector.embed.scope], or pass --force", gen, vector.ErrRefuseActivateEmptyScope)
+			}
+		}
 	}
 
 	now := time.Now().Unix()
@@ -377,7 +431,122 @@ func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationI
 	if n == 0 {
 		return activateGateError(ctx, tx, gen)
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	b.cleanupDocumentJournalAfterLifecycle(ctx, "activate generation")
+	return nil
+}
+
+// ActivateGenerationIfConverged coordinates the source journal predicate and
+// vector lifecycle in one SQLite transaction by opening main.db with
+// vectors.db attached. The no-op clock update takes the source writer lock, so
+// a metadata mutation cannot advance the journal between the predicate and the
+// generation flip.
+func (b *Backend) ActivateGenerationIfConverged(
+	ctx context.Context, gen vector.GenerationID, expectedSequence int64,
+) error {
+	conn, err := b.openFusedConn(ctx)
+	if err != nil {
+		return fmt.Errorf("open coordinated contextual activation: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin coordinated contextual activation: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	var state vector.GenerationState
+	if err := tx.QueryRowContext(ctx,
+		`SELECT state FROM vec.index_generations WHERE id = ?`, int64(gen)).Scan(&state); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: %d", vector.ErrUnknownGeneration, gen)
+		}
+		return fmt.Errorf("lookup generation %d: %w", gen, err)
+	}
+	if state != vector.GenerationBuilding {
+		return fmt.Errorf("generation %d not in 'building' state", gen)
+	}
+	if _, err := tx.ExecContext(ctx,
+		`UPDATE embedding_change_clock SET sequence = sequence WHERE singleton = 1`); err != nil {
+		return fmt.Errorf("lock contextual journal clock for activation: %w", err)
+	}
+	var latest, consumed int64
+	var reconcileCursor, journalCursor string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT sequence FROM embedding_change_clock WHERE singleton = 1`).Scan(&latest); err != nil {
+		return fmt.Errorf("read contextual journal clock for activation: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE vec.embedding_document_progress
+		   SET change_sequence = change_sequence
+		 WHERE generation_id = ?`, int64(gen)); err != nil {
+		return fmt.Errorf("lock contextual progress for activation: %w", err)
+	}
+	if err := tx.QueryRowContext(ctx, `
+		SELECT change_sequence, reconcile_cursor, journal_cursor
+		  FROM vec.embedding_document_progress
+		 WHERE generation_id = ?`, int64(gen)).Scan(&consumed, &reconcileCursor, &journalCursor); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: generation %d has no contextual progress", vector.ErrGenerationNotConverged, gen)
+		}
+		return fmt.Errorf("read contextual progress for activation: %w", err)
+	}
+	if latest != expectedSequence || consumed != expectedSequence ||
+		!strings.HasPrefix(reconcileCursor, "done:") || journalCursor != "" {
+		return fmt.Errorf("%w: expected journal %d, latest %d, consumed %d, reconcile %q, journal cursor %q",
+			vector.ErrGenerationNotConverged, expectedSequence, latest, consumed, reconcileCursor, journalCursor)
+	}
+	where, args := b.missingCoverageWhere(int64(gen))
+	var missing int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT EXISTS (SELECT 1 FROM messages WHERE `+where+`)`, args...).Scan(&missing); err != nil {
+		return fmt.Errorf("check contextual coverage for generation %d: %w", gen, err)
+	}
+	if missing != 0 {
+		return fmt.Errorf("%w: generation %d still has messages needing embedding", vector.ErrGenerationNotConverged, gen)
+	}
+	// Empty-scope guard, mirroring ActivateGeneration: a source scope
+	// matching no live messages trivially satisfies both the convergence
+	// and the no-missing gates, and activating would demote the serving
+	// generation in favor of an empty index. The fused connection sees the
+	// main schema, so the same live-scope predicate runs inside this
+	// transaction, before the demote.
+	if len(b.scope.SourceIDs) > 0 {
+		liveWhere, liveArgs := b.liveScopeWhere()
+		var live int
+		if err := tx.QueryRowContext(ctx,
+			`SELECT EXISTS (SELECT 1 FROM messages WHERE `+liveWhere+`)`, liveArgs...).Scan(&live); err != nil {
+			return fmt.Errorf("check live messages in build scope for generation %d: %w", gen, err)
+		}
+		if live == 0 {
+			return fmt.Errorf("generation %d: %w; sync the scoped account(s) or fix [vector.embed.scope], or pass --force", gen, vector.ErrRefuseActivateEmptyScope)
+		}
+	}
+
+	now := time.Now().Unix()
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE vec.index_generations
+		   SET state = 'retired', completed_at = COALESCE(completed_at, ?)
+		 WHERE state = 'active'`, now); err != nil {
+		return fmt.Errorf("retire previous active: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `
+		UPDATE vec.index_generations
+		   SET state = 'active', activated_at = ?, completed_at = COALESCE(completed_at, ?)
+		 WHERE id = ? AND state = 'building'`, now, now, int64(gen))
+	if err != nil {
+		return fmt.Errorf("activate: %w", err)
+	}
+	if affected, _ := res.RowsAffected(); affected == 0 {
+		return fmt.Errorf("generation %d not in 'building' state", gen)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit coordinated contextual activation: %w", err)
+	}
+	b.cleanupDocumentJournalAfterLifecycle(ctx, "activate converged generation")
+	return nil
 }
 
 // activateGateError re-reads gen inside the activation tx to return a
@@ -434,7 +603,19 @@ func (b *Backend) RetireGeneration(ctx context.Context, gen vector.GenerationID,
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit retire generation %d: %w", gen, err)
 	}
+	b.cleanupDocumentJournalAfterLifecycle(ctx, "retire generation")
 	return nil
+}
+
+// cleanupDocumentJournalAfterLifecycle runs after a lifecycle transaction has
+// committed. Cleanup is safe to retry through CleanupDocumentJournalIfUnused,
+// so a cleanup failure must not make callers believe the committed lifecycle
+// transition failed.
+func (b *Backend) cleanupDocumentJournalAfterLifecycle(ctx context.Context, operation string) {
+	if err := b.CleanupDocumentJournalIfUnused(ctx); err != nil {
+		slog.Warn("contextual journal cleanup deferred after committed lifecycle transition",
+			"operation", operation, "error", err)
+	}
 }
 
 // retireGateError re-reads gen inside the retire tx to explain why the gated
@@ -583,8 +764,8 @@ func (b *Backend) Upsert(ctx context.Context, gen vector.GenerationID, chunks []
 
 	embedInsertStmt, err := tx.PrepareContext(ctx, `INSERT INTO embeddings
 		(generation_id, message_id, chunk_index, embedded_at,
-		 source_char_len, chunk_char_start, chunk_char_end, truncated)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		 source_char_len, chunk_char_start, chunk_char_end, truncated, source_basis)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		RETURNING embedding_id`)
 	if err != nil {
 		return fmt.Errorf("prepare embeddings insert: %w", err)
@@ -607,7 +788,7 @@ func (b *Backend) Upsert(ctx context.Context, gen vector.GenerationID, chunks []
 		var embeddingID int64
 		if err := embedInsertStmt.QueryRowContext(ctx,
 			int64(gen), c.MessageID, c.ChunkIndex, now,
-			c.SourceCharLen, c.ChunkCharStart, c.ChunkCharEnd, truncFlag,
+			c.SourceCharLen, c.ChunkCharStart, c.ChunkCharEnd, truncFlag, int(c.SourceBasis),
 		).Scan(&embeddingID); err != nil {
 			return fmt.Errorf("insert embedding (msg %d chunk %d): %w", c.MessageID, c.ChunkIndex, err)
 		}
@@ -804,6 +985,9 @@ func (b *Backend) ResetWatermarkBelow(ctx context.Context, minID int64) error {
 // top-k hits (optionally intersected with a structured filter). Hits are
 // ordered by ascending distance and assigned 1-based ranks.
 func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec []float32, k int, filter vector.Filter) ([]vector.Hit, error) {
+	if err := vector.ValidateFilter(filter); err != nil {
+		return nil, err
+	}
 	if len(queryVec) == 0 {
 		return nil, errors.New("search: empty query vector")
 	}
@@ -1123,6 +1307,12 @@ func (b *Backend) dropDeletedFromSource(ctx context.Context, hits []vector.Hit) 
 func (b *Backend) filteredMessageIDs(ctx context.Context, f vector.Filter) ([]int64, error) {
 	clauses := []string{store.LiveMessagesWhere("m", true)}
 	var args []any
+	if len(f.MessageIDs) > 0 {
+		clauses = append(clauses, inClause("m.id", f.MessageIDs))
+		for _, id := range f.MessageIDs {
+			args = append(args, id)
+		}
+	}
 
 	if len(f.SourceIDs) > 0 {
 		clauses = append(clauses, inClause("m.source_id", f.SourceIDs))
@@ -1131,10 +1321,28 @@ func (b *Backend) filteredMessageIDs(ctx context.Context, f vector.Filter) ([]in
 		}
 	}
 	if len(f.MessageTypes) > 0 {
-		clauses = append(clauses, inStringClause("m.message_type", f.MessageTypes))
+		var exact []string
+		includeLegacyEmail := false
 		for _, typ := range f.MessageTypes {
-			args = append(args, typ)
+			if strings.EqualFold(typ, "email") {
+				includeLegacyEmail = true
+			} else {
+				exact = append(exact, typ)
+			}
 		}
+		var messageTypeClauses []string
+		if len(exact) > 0 {
+			messageTypeClauses = append(messageTypeClauses, inStringClause("m.message_type", exact))
+			for _, typ := range exact {
+				args = append(args, typ)
+			}
+		}
+		if includeLegacyEmail {
+			messageTypeClauses = append(messageTypeClauses,
+				"(m.message_type = ? OR m.message_type IS NULL OR m.message_type = '')")
+			args = append(args, "email")
+		}
+		clauses = append(clauses, "("+strings.Join(messageTypeClauses, " OR ")+")")
 	}
 	// Sender filters: one EXISTS per group, AND'd across groups so
 	// repeated `from:` operators each become an independent
@@ -1157,6 +1365,41 @@ func (b *Backend) filteredMessageIDs(ctx context.Context, f vector.Filter) ([]in
 				   AND mr.recipient_type = 'from'
 				   AND %s
 			)`, inRecipient))
+		for _, id := range group {
+			args = append(args, id)
+		}
+	}
+	for _, group := range f.SenderExactGroups {
+		if len(group) == 0 {
+			continue
+		}
+		direct := inClause("m.sender_id", group)
+		from := inClause("mr.participant_id", group)
+		clauses = append(clauses, fmt.Sprintf(
+			`(%s OR EXISTS (
+				SELECT 1 FROM message_recipients mr
+				 WHERE mr.message_id = m.id
+				   AND mr.recipient_type = 'from'
+				   AND %s
+			))`, direct, from))
+		for _, id := range group {
+			args = append(args, id)
+		}
+		for _, id := range group {
+			args = append(args, id)
+		}
+	}
+	for _, group := range f.RecipientAnyGroups {
+		if len(group) == 0 {
+			continue
+		}
+		clauses = append(clauses, fmt.Sprintf(
+			`EXISTS (
+				SELECT 1 FROM message_recipients mr
+				 WHERE mr.message_id = m.id
+				   AND mr.recipient_type IN ('to', 'cc', 'bcc')
+				   AND %s
+			)`, inClause("mr.participant_id", group)))
 		for _, id := range group {
 			args = append(args, id)
 		}
@@ -1327,6 +1570,111 @@ func (b *Backend) Delete(ctx context.Context, gen vector.GenerationID, messageID
 	return nil
 }
 
+// PruneOrphanEmbeddings removes every message embedding whose authoritative
+// message row has been hard-deleted. The main archive and vectors live in
+// separate SQLite files, so the maintenance transaction opens the main file
+// and attaches vectors.db on one pinned connection. Soft-deleted messages
+// remain present in main.messages and are intentionally preserved.
+func (b *Backend) PruneOrphanEmbeddings(ctx context.Context) (int64, error) {
+	if b.mainPath == "" {
+		return 0, errors.New("prune orphan embeddings requires MainPath in Options")
+	}
+	conn, err := b.openFusedConn(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("open coordinated orphan prune: %w", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin orphan prune: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	const orphanWhere = `NOT EXISTS (
+		SELECT 1 FROM messages m WHERE m.id = e.message_id
+	)`
+	var pruned int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM (
+			SELECT e.generation_id, e.message_id
+			  FROM vec.embeddings e
+			 WHERE `+orphanWhere+`
+			 GROUP BY e.generation_id, e.message_id
+		)`).Scan(&pruned); err != nil {
+		return 0, fmt.Errorf("count orphan embeddings: %w", err)
+	}
+	if pruned == 0 {
+		if err := tx.Commit(); err != nil {
+			return 0, fmt.Errorf("commit empty orphan prune: %w", err)
+		}
+		return 0, nil
+	}
+
+	rows, err := tx.QueryContext(ctx, `
+		SELECT g.dimension
+		  FROM vec.embeddings e
+		  JOIN vec.index_generations g ON g.id = e.generation_id
+		 WHERE `+orphanWhere+`
+		 GROUP BY g.dimension
+		 ORDER BY g.dimension`)
+	if err != nil {
+		return 0, fmt.Errorf("list orphan embedding dimensions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var dimensions []int
+	for rows.Next() {
+		var dimension int
+		if err := rows.Scan(&dimension); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("scan orphan embedding dimension: %w", err)
+		}
+		if dimension <= 0 {
+			_ = rows.Close()
+			return 0, fmt.Errorf("invalid orphan embedding dimension %d", dimension)
+		}
+		dimensions = append(dimensions, dimension)
+	}
+	if err := rows.Close(); err != nil {
+		return 0, fmt.Errorf("close orphan embedding dimensions: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate orphan embedding dimensions: %w", err)
+	}
+
+	for _, dimension := range dimensions {
+		vecTable := "vec." + VectorTableName(dimension)
+		if _, err := tx.ExecContext(ctx, fmt.Sprintf(`
+			DELETE FROM %s
+			 WHERE embedding_id IN (
+				SELECT e.embedding_id
+				  FROM vec.embeddings e
+				  JOIN vec.index_generations g ON g.id = e.generation_id
+				 WHERE g.dimension = ? AND %s
+			 )`, vecTable, orphanWhere), dimension); err != nil {
+			return 0, fmt.Errorf("delete orphan vectors for dimension %d: %w", dimension, err)
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM vec.embeddings AS e
+		 WHERE `+orphanWhere); err != nil {
+		return 0, fmt.Errorf("delete orphan embedding metadata: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE vec.index_generations AS g
+		   SET message_count = (
+			SELECT COUNT(DISTINCT e.message_id)
+			  FROM vec.embeddings e
+			 WHERE e.generation_id = g.id
+		   )`); err != nil {
+		return 0, fmt.Errorf("repair generation message counts: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit orphan prune: %w", err)
+	}
+	return pruned, nil
+}
+
 // Stats returns counts for the given generation. When gen == 0, counts
 // are aggregated across all generations. Returns an error wrapping
 // vector.ErrUnknownGeneration if gen != 0 and the generation does not
@@ -1459,13 +1807,21 @@ func (b *Backend) EmbeddedMessageCount(ctx context.Context, gen vector.Generatio
 		    AND embed_gen = ?
 		    AND ` + store.LiveMessagesWhere("", true)
 	args := []any{string(blob), int64(gen)}
-	if !b.scope.IsEmpty() {
+	if len(b.scope.MessageTypes) > 0 {
 		placeholders := make([]string, len(b.scope.MessageTypes))
 		for i, typ := range b.scope.MessageTypes {
 			placeholders[i] = "?"
 			args = append(args, typ)
 		}
 		where += fmt.Sprintf(" AND message_type IN (%s)", strings.Join(placeholders, ","))
+	}
+	if len(b.scope.SourceIDs) > 0 {
+		placeholders := make([]string, len(b.scope.SourceIDs))
+		for i, id := range b.scope.SourceIDs {
+			placeholders[i] = "?"
+			args = append(args, id)
+		}
+		where += fmt.Sprintf(" AND source_id IN (%s)", strings.Join(placeholders, ","))
 	}
 	var n int64
 	if err := b.mainDB.QueryRowContext(ctx,
@@ -1555,7 +1911,7 @@ func (b *Backend) ScoreMessageChunks(ctx context.Context, gen vector.GenerationI
 	vecTable := VectorTableName(dim)
 
 	q := fmt.Sprintf(`
-		SELECT e.chunk_index, e.chunk_char_start, e.chunk_char_end, v.embedding
+		SELECT e.chunk_index, e.chunk_char_start, e.chunk_char_end, e.source_basis, v.embedding
 		  FROM embeddings e
 		  JOIN %s v ON v.embedding_id = e.embedding_id
 		 WHERE v.generation_id = ?
@@ -1571,8 +1927,9 @@ func (b *Backend) ScoreMessageChunks(ctx context.Context, gen vector.GenerationI
 	var hits []vector.ChunkHit
 	for rows.Next() {
 		var idx, start, end int
+		var basis vector.SourceBasis
 		var blob []byte
-		if err := rows.Scan(&idx, &start, &end, &blob); err != nil {
+		if err := rows.Scan(&idx, &start, &end, &basis, &blob); err != nil {
 			return nil, fmt.Errorf("scan chunk row: %w", err)
 		}
 		vec, err := blobToFloat32(blob, dim)
@@ -1584,6 +1941,7 @@ func (b *Backend) ScoreMessageChunks(ctx context.Context, gen vector.GenerationI
 			ChunkIndex:     idx,
 			ChunkCharStart: start,
 			ChunkCharEnd:   end,
+			SourceBasis:    basis,
 			Score:          1.0 - dist,
 		})
 	}

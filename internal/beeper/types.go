@@ -3,6 +3,8 @@ package beeper
 import (
 	"encoding/json"
 	"time"
+
+	"go.kenn.io/msgvault/internal/attachmentpolicy"
 )
 
 // ---- Beeper Desktop API objects (see /v1/spec, "Beeper Client API") ----
@@ -12,10 +14,14 @@ type Account struct {
 	AccountID string `json:"accountID"`
 	Network   string `json:"network"` // human-friendly name; may be empty
 	User      User   `json:"user"`
+	// Discovered marks an account assembled from chat data because the
+	// accounts endpoint did not report it (see DiscoverAccounts). It is never
+	// decoded from the API.
+	Discovered bool `json:"-"`
 }
 
 // User identifies a person on a network. Only fields the importer consumes
-// are modelled; the archived raw JSON preserves everything else.
+// are modelled; Raw preserves everything else.
 type User struct {
 	ID          string `json:"id"` // Matrix-style user ID, e.g. "@signal_<uuid>:beeper.local"
 	Username    string `json:"username"`
@@ -23,6 +29,23 @@ type User struct {
 	Email       string `json:"email"`
 	FullName    string `json:"fullName"`
 	IsSelf      bool   `json:"isSelf"`
+	// Raw holds the exact original JSON for this user object, captured during
+	// decode (see UnmarshalJSON). The documented providerID field is read from
+	// it (providerNativeUserID) without modelling every network's extra field.
+	Raw json.RawMessage `json:"-"`
+}
+
+// UnmarshalJSON decodes a User while retaining the exact original bytes in
+// Raw.
+func (u *User) UnmarshalJSON(b []byte) error {
+	type alias User // avoid recursion into this method
+	var a alias
+	if err := json.Unmarshal(b, &a); err != nil {
+		return err
+	}
+	*u = User(a)
+	u.Raw = append(json.RawMessage(nil), b...)
+	return nil
 }
 
 // Participant is a chat member: a User plus membership metadata.
@@ -30,6 +53,27 @@ type Participant struct {
 	User
 
 	IsAdmin bool `json:"isAdmin"`
+}
+
+// UnmarshalJSON decodes a Participant explicitly. It cannot delegate to a
+// `type alias Participant` shim the way User and Message do: method promotion
+// from the embedded User means the alias ALSO carries User.UnmarshalJSON, so
+// json would decode only the User fields and silently drop isAdmin. Decoding
+// the membership fields separately and handing the same bytes to the User
+// decoder keeps both halves, and leaves Raw holding the whole participant
+// object (isAdmin and any unmodelled provider key included).
+func (p *Participant) UnmarshalJSON(b []byte) error {
+	var membership struct {
+		IsAdmin bool `json:"isAdmin"`
+	}
+	if err := json.Unmarshal(b, &membership); err != nil {
+		return err
+	}
+	if err := p.User.UnmarshalJSON(b); err != nil {
+		return err
+	}
+	p.IsAdmin = membership.IsAdmin
+	return nil
 }
 
 // ChatParticipants wraps the (possibly truncated) participant list of a chat.
@@ -156,12 +200,16 @@ type ImportOptions struct {
 	// AttachmentsDir is the content-addressed attachment store root. Empty
 	// disables media download (as does NoMedia).
 	AttachmentsDir string
-	// NoMedia skips attachment downloads entirely (no pending markers are
-	// written; a later --full run re-persists messages and downloads then).
+	// NoMedia skips attachment downloads and writes pending markers for a later
+	// backfill or full run.
 	NoMedia bool
-	// MaxMediaBytes caps individual attachment downloads (0 = 100 MB).
-	// Over-cap attachments leave a pending marker.
+	// MaxMediaBytes caps individual attachment downloads (0 = 100 MiB).
+	// Over-cap attachments leave a typed size-cap exclusion marker.
 	MaxMediaBytes int64
+	// MediaPolicy is the effective provider/account collection policy.
+	MediaPolicy attachmentpolicy.Policy
+	// MediaConversation is populated per chat or from archived metadata.
+	MediaConversation attachmentpolicy.Conversation
 	// Progress, if non-nil, is called after each chat with a human-readable
 	// status line. Safe to leave nil (silent mode).
 	Progress func(msg string) `json:"-"`
@@ -177,11 +225,42 @@ type ImportSummary struct {
 	// new rows.
 	MessagesAdded      int64
 	ReactionsRefreshed int64
+	// ChatsReopened counts completed chats whose backfill was resumed because
+	// Beeper had since added older history behind them (see tailScanInterval).
+	ChatsReopened int64
+	// BodiesRepaired and AttachmentsRetagged report the one-time re-derivation
+	// of rows written by an older build, run before this sync (see
+	// rederive.RunIfStale). Both are zero once an archive has caught up.
+	BodiesRepaired      int64
+	AttachmentsRetagged int64
+	// ObservationsRecorded counts participant contact observations created
+	// this run. A re-observed address creates no row, so a steady-state
+	// incremental sync reports zero.
+	ObservationsRecorded int64
+	// IdentityAutoResolved counts links a repeated stable provider/Beeper ID
+	// resolved automatically this run. IdentityCandidates counts suggestions
+	// left for review, and IdentityConflicts counts collisions recorded as
+	// conflicts. A suggestion or conflict never changes an identity cluster.
+	IdentityAutoResolved int64
+	IdentityCandidates   int64
+	IdentityConflicts    int64
+	// IdentityReplayErrors counts accepted identity matches that could not be
+	// re-applied because the participant-link store was unavailable. Contested
+	// pairs are recorded as conflicts by the store and are not counted here.
+	IdentityReplayErrors int64
 	// AttachmentsDownloaded counts media stored this run;
 	// AttachmentsPending counts failed/deferred downloads that left a
 	// retry marker (see backfill-beeper-media).
 	AttachmentsDownloaded int64
 	AttachmentsPending    int64
+	AttachmentsSkipped    int64
+	// AttachmentsOverCap is the size-specific subset of AttachmentsSkipped.
+	// AttachmentsOverCapBytes saturates while summing declared sizes or the
+	// minimum observed streamed size. AttachmentsOverCapUnknownSize is nonzero
+	// whenever that total is a lower bound rather than an exact value.
+	AttachmentsOverCap            int64
+	AttachmentsOverCapBytes       int64
+	AttachmentsOverCapUnknownSize int64
 	// FetchErrors counts Beeper API fetch failures (a subset of Errors). Any
 	// fetch failure keeps the discovery watermark from advancing so the
 	// affected chats are re-visited next run.

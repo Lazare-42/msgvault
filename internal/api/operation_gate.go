@@ -53,6 +53,7 @@ type SerialOperationGate struct {
 	holderLabel    string
 	holderSince    time.Time
 	requestWaiters int
+	requestsDone   chan struct{}
 }
 
 func NewSerialOperationGate() *SerialOperationGate {
@@ -73,15 +74,21 @@ func (g *SerialOperationGate) BeginWorkContext(ctx context.Context) (func(), boo
 func (g *SerialOperationGate) BeginRequestWorkContext(ctx context.Context, label string) (func(), bool) {
 	if g != nil {
 		g.mu.Lock()
+		if g.requestWaiters == 0 {
+			g.requestsDone = make(chan struct{})
+		}
 		g.requestWaiters++
 		g.mu.Unlock()
 		defer func() {
 			g.mu.Lock()
 			g.requestWaiters--
+			if g.requestWaiters == 0 {
+				close(g.requestsDone)
+			}
 			g.mu.Unlock()
 		}()
 	}
-	return g.BeginLabeledWorkContext(ctx, label)
+	return g.beginLabeledWorkContext(ctx, label, true)
 }
 
 // HasRequestWaiters reports whether an API request is queued on the gate.
@@ -95,6 +102,15 @@ func (g *SerialOperationGate) HasRequestWaiters() bool {
 }
 
 func (g *SerialOperationGate) BeginLabeledWorkContext(ctx context.Context, label string) (func(), bool) {
+	return g.beginLabeledWorkContext(ctx, label, false)
+}
+
+// beginLabeledWorkContext keeps background work queued while API requests are
+// waiting. The background operation runs after the request queue drains; it is
+// never reported as cancelled only because a request arrived first. Requests
+// always take priority, so background work can remain queued until the request
+// queue drains, its context is cancelled, or the gate starts draining.
+func (g *SerialOperationGate) beginLabeledWorkContext(ctx context.Context, label string, requestWork bool) (func(), bool) {
 	if g == nil {
 		return func() {}, true
 	}
@@ -105,26 +121,56 @@ func (g *SerialOperationGate) BeginLabeledWorkContext(ctx context.Context, label
 		return func() {}, false
 	}
 	sem, drainCh := g.state()
-	select {
-	case sem <- struct{}{}:
-		if ctx.Err() != nil {
-			<-sem
+	for {
+		if !requestWork {
+			g.mu.Lock()
+			requestsDone := g.requestsDone
+			waiting := g.requestWaiters > 0
+			draining := g.draining
+			g.mu.Unlock()
+			if draining {
+				return func() {}, false
+			}
+			if waiting {
+				select {
+				case <-requestsDone:
+					continue
+				case <-ctx.Done():
+					return func() {}, false
+				case <-drainCh:
+					return func() {}, false
+				}
+			}
+		}
+
+		select {
+		case sem <- struct{}{}:
+			if ctx.Err() != nil {
+				<-sem
+				return func() {}, false
+			}
+		case <-ctx.Done():
+			return func() {}, false
+		case <-drainCh:
 			return func() {}, false
 		}
+
 		g.mu.Lock()
 		if g.draining {
 			g.mu.Unlock()
 			<-sem
 			return func() {}, false
 		}
+		if !requestWork && g.requestWaiters > 0 {
+			g.mu.Unlock()
+			<-sem
+			continue
+		}
 		g.active++
 		g.holderLabel = label
 		g.holderSince = time.Now()
 		g.mu.Unlock()
-	case <-ctx.Done():
-		return func() {}, false
-	case <-drainCh:
-		return func() {}, false
+		break
 	}
 	var once sync.Once
 	return func() {
@@ -321,9 +367,10 @@ var operationGateExemptPaths = map[string]bool{
 // as explore candidate snapshots and preflight operation tokens). They use
 // POST solely because their requests are structured predicate bodies, so
 // queueing them on the operation gate would serialize pure reads behind long
-// archive mutations. Reads never needed the gate: every GET already bypasses
-// it and relies on the committed-cache revision/snapshot machinery for
-// consistency instead.
+// archive mutations. Reads never needed the gate: every GET, including
+// analytical detail routes such as participant inbox rollups, already
+// bypasses it and relies on the committed-cache revision/snapshot machinery
+// for consistency instead.
 //
 // The classification stays deny-by-default: a POST route not listed here
 // still gates. TestReadOnlyPostRoutePatternsMatchExplorationRoutes keeps this
@@ -331,29 +378,38 @@ var operationGateExemptPaths = map[string]bool{
 // registerSearchCoverageRoute (the OpenAPI "Exploration" tag), so a new
 // analytical route forces a conscious classification decision here.
 //
-// The remote-image proxy is the one non-Exploration entry: it is POST only
-// so the session CSRF middleware treats it as an unsafe method (same-origin
-// plus X-Csrf-Token), and its handler touches no archive state at all — it
-// performs one SSRF-validated outbound fetch — so it must stay available
+// The remote-image proxy and CardDAV account test are the non-Exploration
+// entries. Both perform SSRF-validated outbound reads without changing
+// archive or persistent configuration state, so they must stay available
 // while a long archive operation holds the gate.
+const cardDAVAccountTestPath = "/api/v1/carddav/account/test"
+
 var readOnlyPostRoutePatterns = []string{
 	remoteImagePath,
+	cardDAVAccountTestPath,
 	"/api/v1/explore",
 	"/api/v1/explore/groups",
 	"/api/v1/explore/preflight",
 	"/api/v1/explore/match-counts",
 	"/api/v1/explore/files",
 	"/api/v1/files/search",
+	// Visual attachment search reads the committed vector index and calls
+	// the embedding provider; it mutates nothing, and gating it would hold
+	// pure reads (and the mutation gate) hostage to provider latency.
+	"/api/v1/search/attachments/visual",
 	"/api/v1/files/groups",
-	"/api/v1/people/search",
-	"/api/v1/people/{id}/summary",
-	"/api/v1/people/{id}/timeline",
+	"/api/v1/participants/completions",
+	"/api/v1/participants/search",
+	"/api/v1/participants/{id}/summary",
+	"/api/v1/participants/{id}/timeline",
+	"/api/v1/participants/{id}/files/search",
 	"/api/v1/people/{id}/files/search",
 	"/api/v1/domains/search",
 	"/api/v1/domains/{domain}/summary",
 	"/api/v1/domains/{domain}/timeline",
 	"/api/v1/domains/{domain}/files/search",
 	"/api/v1/relationships",
+	"/api/v1/relationships/{id}/calendar",
 	"/api/v1/relationships/{id}/timeline",
 	"/api/v1/search/coverage",
 }
@@ -408,10 +464,12 @@ func operationGateRequest(r *http.Request) (bool, string, error) {
 // cliRunReadOnlyCommands are proxied CLI commands that only read. Keys are
 // the leading command-path words of CLIRunRequest args (flags follow them).
 var cliRunReadOnlyCommands = map[string]bool{
-	"logs":            true,
-	"list-deletions":  true,
-	"show-deletion":   true,
-	"embeddings list": true,
+	"logs":             true,
+	"list-deletions":   true,
+	"show-deletion":    true,
+	"embeddings list":  true,
+	"documents search": true,
+	"documents status": true,
 }
 
 // cliRunSelfGatedCommands are proxied CLI commands that acquire the
@@ -458,6 +516,7 @@ func cliRunGateDecision(r *http.Request) (label string, skip bool, err error) {
 var cliRunCommandGroups = map[string]bool{
 	"embeddings": true,
 	"backup":     true,
+	"documents":  true,
 }
 
 // cliRunCommandWords extracts the command path from proxied args. Positional

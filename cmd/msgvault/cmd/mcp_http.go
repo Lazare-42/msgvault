@@ -9,6 +9,7 @@ import (
 	"syscall"
 
 	"github.com/spf13/cobra"
+	mcpserver "go.kenn.io/msgvault/internal/mcp"
 )
 
 var mcpSSEAddr string
@@ -82,7 +83,9 @@ Example Claude Desktop config (with port-forward):
 		}()
 
 		fmt.Fprintf(os.Stderr, "Starting MCP HTTP server on %s\n", mcpSSEAddr)
-		return serveMCPHTTPWithOptions(ctx, opts, mcpSSEAddr, mcpSSEAPIKey)
+		return serveMCPHTTPWithOptions(ctx, opts, mcpserver.HTTPOptions{
+			Addr: mcpSSEAddr, APIKey: mcpSSEAPIKey, AllowWrites: true,
+		})
 	},
 }
 

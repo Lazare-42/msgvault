@@ -19,6 +19,21 @@ import (
 // offsets up to a few hours never land in the future.
 var tsBase = time.Now().Add(-25 * time.Hour).UTC().Truncate(time.Second)
 
+func TestImporterScopesParticipantResolver(t *testing.T) {
+	requirements := require.New(t)
+	st := testutil.NewTestStore(t)
+	source, err := st.GetOrCreateSource(sourceTypeSlack, "team-a:user-a")
+	requirements.NoError(err)
+	runID, err := st.StartSync(source.ID, sourceTypeSlack)
+	requirements.NoError(err)
+	scoped := NewImporter(st, nil, "team-a").scopedToSync(source.ID, runID)
+	_, err = st.StartSync(source.ID, sourceTypeSlack)
+	requirements.NoError(err)
+
+	_, err = scoped.res.resolveID("user-a")
+	requirements.ErrorIs(err, store.ErrSyncRunSuperseded)
+}
+
 // ts renders a Slack ts for offset minutes after tsBase.
 func ts(minutes int) string {
 	return strconv.FormatInt(tsBase.Add(time.Duration(minutes)*time.Minute).Unix(), 10) + ".000100"
@@ -1637,25 +1652,57 @@ func TestAttachmentRowFailureFailsRun(t *testing.T) {
 			"url_private": "https://files.slack.com/files-pri/T01-F_HELD/h.png",
 			"permalink":   "https://testers.slack.com/files/F_HELD"}}})
 	f.mu.Unlock()
-	_, err = st.DB().Exec(`DROP TABLE attachments`)
-	require.NoError(err)
+	releaseFailure := installAttachmentInsertFailure(t, st)
 
 	imp.now = func() time.Time { return time.Now().Add(time.Minute) }
 	_, err = imp.Import(context.Background(), opts)
 	require.Error(err, "a failed attachment row write must fail the run — the marker was never durable")
 
-	// Heal: the dropped table also lost its migration-created unique index,
-	// so clear that marker before the idempotent re-init (a test-only
-	// artifact of injecting failure via DROP TABLE).
-	_, err = st.DB().Exec(st.Rebind(`DELETE FROM applied_migrations WHERE name = ?`), "attachments_content_hash_unique_index")
-	require.NoError(err)
-	require.NoError(st.InitSchema())
+	releaseFailure()
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 	var marker int
 	require.NoError(st.DB().QueryRow(st.Rebind(
 		`SELECT COUNT(*) FROM attachments WHERE source_attachment_id = ?`), "slack:F_HELD").Scan(&marker))
 	require.Equal(1, marker, "the healed run must persist the (pending) attachment row exactly once")
+}
+
+// installAttachmentInsertFailure makes the real database reject attachment
+// inserts until the returned function removes the trigger.
+func installAttachmentInsertFailure(t *testing.T, st *store.Store) func() {
+	t.Helper()
+	require := require.New(t)
+
+	if st.IsPostgreSQL() {
+		_, err := st.DB().Exec(`CREATE FUNCTION fail_slack_attachment_insert()
+			RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN
+				RAISE EXCEPTION 'forced attachment insert failure';
+			END;
+			$$`)
+		require.NoError(err)
+		_, err = st.DB().Exec(`CREATE TRIGGER fail_slack_attachment_insert
+			BEFORE INSERT ON attachments
+			FOR EACH ROW EXECUTE FUNCTION fail_slack_attachment_insert()`)
+		require.NoError(err)
+		return func() {
+			_, err := st.DB().Exec(`DROP TRIGGER IF EXISTS fail_slack_attachment_insert ON attachments`)
+			require.NoError(err)
+			_, err = st.DB().Exec(`DROP FUNCTION IF EXISTS fail_slack_attachment_insert()`)
+			require.NoError(err)
+		}
+	}
+
+	_, err := st.DB().Exec(`CREATE TRIGGER fail_slack_attachment_insert
+		BEFORE INSERT ON attachments
+		FOR EACH ROW BEGIN
+			SELECT RAISE(ABORT, 'forced attachment insert failure');
+		END`)
+	require.NoError(err)
+	return func() {
+		_, err := st.DB().Exec(`DROP TRIGGER IF EXISTS fail_slack_attachment_insert`)
+		require.NoError(err)
+	}
 }
 
 func TestMembershipFetchFailureMarksRunPartial(t *testing.T) {

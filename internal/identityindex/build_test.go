@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"go.kenn.io/msgvault/internal/duckdbutil"
 
@@ -71,6 +73,60 @@ func TestBuildPublishesFourRelationshipDatasets(t *testing.T) {
 		"non-chat domain fan-out includes conversation-only domains")
 }
 
+func TestBuildChunksRelationshipActivityByOccurrenceYear(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	root, db := writeRelationshipBaseFixture(t, false)
+	replaceRelationshipParquet(t, db, root, "messages", `
+		SELECT * FROM (VALUES
+			(100::BIGINT, 1::BIGINT, 'm-100'::VARCHAR, 10::BIGINT,
+			 'Earlier'::VARCHAR, ''::VARCHAR, TIMESTAMP '2025-12-31 10:30:00',
+			 50::BIGINT, true, 1::INTEGER, NULL::TIMESTAMP,
+			 1::BIGINT, NULL::BIGINT, 'email'::VARCHAR, false, 2025::INTEGER, 12::INTEGER),
+			(101::BIGINT, 1::BIGINT, 'm-101'::VARCHAR, 10::BIGINT,
+			 'Later'::VARCHAR, ''::VARCHAR, TIMESTAMP '2026-01-01 10:30:00',
+			 50::BIGINT, false, 0::INTEGER, NULL::TIMESTAMP,
+			 1::BIGINT, NULL::BIGINT, 'email'::VARCHAR, false, 2026::INTEGER, 1::INTEGER)
+		) AS t(id, source_id, source_message_id, conversation_id, subject,
+			snippet, sent_at, size_estimate, has_attachments, attachment_count,
+			deleted_from_source_at, sender_id, owner_participant_id, message_type, is_from_me, year, month)`)
+
+	recordingDB := &relationshipActivityCopyRecorder{sqlExecutor: db}
+	activityProgressCalls := 0
+	_, err := Build(context.Background(), recordingDB, BuildOptions{
+		Mode:           ModeFull,
+		StagedBaseRoot: root,
+		OutputRoot:     root,
+		Progress: func(dataset string, _ time.Duration) {
+			if dataset == DatasetActivity {
+				activityProgressCalls++
+			}
+		},
+	})
+	requirements.NoError(err)
+
+	assertions.Equal(2, recordingDB.activityCopies)
+	assertions.Equal(1, activityProgressCalls)
+	for _, year := range []int64{2025, 2026} {
+		shard := filepath.Join(
+			root,
+			DatasetActivity,
+			fmt.Sprintf("occurred_year=%d", year),
+			"data_0.parquet",
+		)
+		assertions.FileExists(shard)
+
+		var minYear, maxYear int64
+		requirements.NoError(db.QueryRow(`
+			SELECT min(occurred_year), max(occurred_year)
+			FROM read_parquet(?, hive_partitioning=false)
+		`, shard).Scan(&minYear, &maxYear))
+		assertions.Equal(year, minYear)
+		assertions.Equal(year, maxYear)
+	}
+	assertions.Equal(int64(5), relationshipParquetCount(t, db, root, DatasetActivity))
+}
+
 func TestBuildEmptyArchivePublishesSchemaCorrectActivityShard(t *testing.T) {
 	requirements := require.New(t)
 	assertions := assert.New(t)
@@ -107,15 +163,15 @@ func TestLogicalChatReductionKeepsParticipantlessNewestMessage(t *testing.T) {
 			(100::BIGINT, 1::BIGINT, 'm-100'::VARCHAR, 10::BIGINT,
 			 'Earlier'::VARCHAR, ''::VARCHAR, TIMESTAMP '2026-07-20 10:30:00',
 			 10::BIGINT, false, 1::INTEGER, NULL::TIMESTAMP,
-			 2::BIGINT, 'chat'::VARCHAR, false, 2026::INTEGER, 7::INTEGER),
+			 2::BIGINT, NULL::BIGINT, 'chat'::VARCHAR, false, 2026::INTEGER, 7::INTEGER),
 			(101::BIGINT, 1::BIGINT, 'm-101'::VARCHAR, 10::BIGINT,
 			 'Later without participants'::VARCHAR, ''::VARCHAR,
 			 TIMESTAMP '2026-07-21 10:30:00',
 			 10::BIGINT, false, 2::INTEGER, NULL::TIMESTAMP,
-			 NULL::BIGINT, 'chat'::VARCHAR, true, 2026::INTEGER, 7::INTEGER)
+			 NULL::BIGINT, NULL::BIGINT, 'chat'::VARCHAR, true, 2026::INTEGER, 7::INTEGER)
 		) AS t(id, source_id, source_message_id, conversation_id, subject,
 			snippet, sent_at, size_estimate, has_attachments, attachment_count,
-			deleted_from_source_at, sender_id, message_type, is_from_me, year, month)`)
+			deleted_from_source_at, sender_id, owner_participant_id, message_type, is_from_me, year, month)`)
 	replaceRelationshipParquet(t, db, root, "message_recipients", `
 		SELECT * FROM (VALUES
 			(100::BIGINT, 2::BIGINT, 'from'::VARCHAR, 'Bob'::VARCHAR),
@@ -180,6 +236,12 @@ func TestBuildIncrementalWritesActivityDeltaAndRebuildsCompactPopulation(t *test
 	requirements.NoError(err)
 
 	assertions.Equal(int64(3), relationshipParquetCount(t, db, stagedRoot, DatasetActivity))
+	assertions.FileExists(filepath.Join(
+		stagedRoot,
+		DatasetActivity,
+		"occurred_year=2027",
+		"data_0.parquet",
+	))
 	assertions.Equal(int64(2), result.Stats.TotalMessages)
 	var activityCount int64
 	requirements.NoError(db.QueryRow(`
@@ -224,6 +286,103 @@ func TestBuildIndexOnlyUsesCommittedBaseWithStagedIdentityDimensions(t *testing.
 	assertions.Equal(int64(3), relationshipParquetCount(t, db, stagedRoot, DatasetActivity))
 }
 
+func TestBuildPeopleDirectoryPublishesTypedCompletionPrimitives(t *testing.T) {
+	root, db := writeRelationshipBaseFixture(t, false)
+	_, err := Build(context.Background(), db, BuildOptions{
+		Mode: ModeFull, StagedBaseRoot: root, OutputRoot: root,
+	})
+	require.NoError(t, err)
+
+	var primitivesJSON string
+	err = db.QueryRow(`
+		SELECT CAST(to_json(search_primitives) AS VARCHAR)
+		FROM read_parquet(?) WHERE canonical_id = 2
+	`, relationshipParquetGlob(root, DatasetPeople)).Scan(&primitivesJSON)
+	require.NoError(t, err)
+	assert.JSONEq(t, `[
+		{"kind":"email","match_value":"bob@example.net","display_value":"bob@example.net","source":"observed","participant_id":2},
+		{"kind":"email","match_value":"bob@example.net","display_value":"Bob Home","source":"email","participant_id":2},
+		{"kind":"name","match_value":"bob alias","display_value":"Bob Alias","source":"observed","participant_id":3},
+		{"kind":"email","match_value":"alias@example.net","display_value":"alias@example.net","source":"observed","participant_id":3},
+		{"kind":"username","match_value":"bob-chat","display_value":"Bob Chat","source":"chat","participant_id":3}
+	]`, primitivesJSON)
+}
+
+func TestBuildPeoplePublishesMessageGrainRelationshipTemperatures(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	root, db := writeRelationshipBaseFixture(t, false)
+	replaceRelationshipParquet(t, db, root, "messages", `
+		SELECT * FROM (VALUES
+			(100::BIGINT, 1::BIGINT, 'm-100'::VARCHAR, 10::BIGINT,
+			 'Sent'::VARCHAR, ''::VARCHAR, TIMESTAMP '2026-07-20 10:30:00',
+			 10::BIGINT, false, 0::INTEGER, NULL::TIMESTAMP,
+			 1::BIGINT, 1::BIGINT, 'email'::VARCHAR, true, 2026::INTEGER, 7::INTEGER),
+			(101::BIGINT, 1::BIGINT, 'm-101'::VARCHAR, 10::BIGINT,
+			 'Received'::VARCHAR, ''::VARCHAR, TIMESTAMP '2026-07-21 10:30:00',
+			 10::BIGINT, false, 0::INTEGER, NULL::TIMESTAMP,
+			 2::BIGINT, 1::BIGINT, 'email'::VARCHAR, false, 2026::INTEGER, 7::INTEGER)
+		) AS t(id, source_id, source_message_id, conversation_id, subject,
+			snippet, sent_at, size_estimate, has_attachments, attachment_count,
+			deleted_from_source_at, sender_id, owner_participant_id, message_type, is_from_me, year, month)`)
+	replaceRelationshipParquet(t, db, root, "message_recipients", `
+		SELECT * FROM (VALUES
+			(100::BIGINT, 1::BIGINT, 'from'::VARCHAR, 'Owner'::VARCHAR),
+			(100::BIGINT, 2::BIGINT, 'to'::VARCHAR, 'Bob'::VARCHAR),
+			(100::BIGINT, 3::BIGINT, 'cc'::VARCHAR, 'Bob Alias'::VARCHAR),
+			(101::BIGINT, 2::BIGINT, 'from'::VARCHAR, 'Bob'::VARCHAR),
+			(101::BIGINT, 1::BIGINT, 'to'::VARCHAR, 'Owner'::VARCHAR)
+		) AS t(message_id, participant_id, recipient_type, display_name)`)
+
+	effectiveAt := time.Date(2026, time.July, 22, 12, 34, 56, 0, time.UTC)
+	_, err := Build(context.Background(), db, BuildOptions{
+		Mode: ModeFull, StagedBaseRoot: root, OutputRoot: root,
+		EffectiveAt: effectiveAt,
+	})
+	require.NoError(err)
+
+	var current, peak, peakYear, scoreVersion, annualTemperature int
+	var rank, population, annualRank, annualPopulation int64
+	var rawScore, annualRaw, sentSignal, receivedVolume float64
+	var effectiveDate, effectiveTimestamp time.Time
+	err = db.QueryRow(`
+		SELECT p.current_temperature, p.current_temperature_rank,
+		       p.current_temperature_population, p.current_raw_score,
+		       p.temperature_effective_date, p.temperature_effective_at,
+		       p.temperature_score_version,
+		       p.peak_temperature, p.peak_year,
+		       annual.item.temperature, annual.item.rank, annual.item.population,
+		       annual.item.raw_score, annual.item.sent_signal,
+		       annual.item.received_volume
+		FROM read_parquet(?) p,
+		     unnest(p.annual_temperatures) AS annual(item)
+		WHERE p.canonical_id = 2 AND annual.item.year = 2026
+	`, relationshipParquetGlob(root, DatasetPeople)).Scan(
+		&current, &rank, &population, &rawScore, &effectiveDate, &effectiveTimestamp, &scoreVersion,
+		&peak, &peakYear, &annualTemperature, &annualRank, &annualPopulation,
+		&annualRaw, &sentSignal, &receivedVolume,
+	)
+	require.NoError(err)
+	assert.Equal(100, current)
+	assert.Equal(int64(1), rank)
+	assert.Equal(int64(1), population)
+	currentSent := RelationshipDayWeight(2) * math.Log(2)
+	currentReceived := RelationshipDayWeight(1)
+	assert.InDelta(2*currentSent+math.Log1p(currentReceived), rawScore, 1e-9)
+	assert.Equal(effectiveAt.Truncate(24*time.Hour), effectiveDate)
+	assert.Equal(effectiveAt, effectiveTimestamp)
+	assert.Equal(RelationshipScoreVersion, scoreVersion)
+	assert.Equal(100, peak)
+	assert.Equal(2026, peakYear)
+	assert.Equal(100, annualTemperature)
+	assert.Equal(int64(1), annualRank)
+	assert.Equal(int64(1), annualPopulation)
+	assert.InDelta(3*math.Log(2), annualRaw, 1e-9)
+	assert.InDelta(math.Log(2), sentSignal, 1e-9,
+		"linked aliases on one message must count once")
+	assert.InDelta(1.0, receivedVolume, 0)
+}
+
 func TestValidateRejectsDuplicateActivityGrain(t *testing.T) {
 	root, db := writeRelationshipBaseFixture(t, false)
 	_, err := Build(context.Background(), db, BuildOptions{
@@ -249,6 +408,26 @@ func TestValidateRejectsDuplicateActivityGrain(t *testing.T) {
 	require.ErrorContains(t, err, "duplicate message/canonical/domain keys")
 }
 
+func TestValidateRejectsInvalidRelationshipTemperatureSummary(t *testing.T) {
+	root, db := writeRelationshipBaseFixture(t, false)
+	_, err := Build(context.Background(), db, BuildOptions{
+		Mode: ModeFull, StagedBaseRoot: root, OutputRoot: root,
+	})
+	require.NoError(t, err)
+
+	oldRoot := moveRelationshipDatasetAside(t, root, DatasetPeople)
+	source := quoteSQLString(relationshipParquetGlob(oldRoot, DatasetPeople))
+	writeRelationshipParquet(t, db, root, DatasetPeople, `
+		SELECT * REPLACE (101::INTEGER AS current_temperature)
+		FROM read_parquet('`+source+`')`)
+
+	err = Validate(context.Background(), db, ValidationOptions{
+		OutputRoot:             root,
+		RequiredOutputDatasets: RequiredDatasets,
+	})
+	require.ErrorContains(t, err, "invalid relationship temperature summary")
+}
+
 func writeRelationshipBaseFixture(t *testing.T, empty bool) (string, *sql.DB) {
 	t.Helper()
 	root := t.TempDir()
@@ -268,11 +447,11 @@ func writeRelationshipBaseFixture(t *testing.T, empty bool) (string, *sql.DB) {
 			(100::BIGINT, 1::BIGINT, 'm-100'::VARCHAR, 10::BIGINT,
 			 'Subject'::VARCHAR, 'Preview'::VARCHAR,
 			 TIMESTAMP '2026-07-20 10:30:00', 50::BIGINT, true,
-			 1::INTEGER, NULL::TIMESTAMP, 1::BIGINT, 'email'::VARCHAR,
+			 1::INTEGER, NULL::TIMESTAMP, 1::BIGINT, NULL::BIGINT, 'email'::VARCHAR,
 			 false, 2026::INTEGER, 7::INTEGER)
 		) AS t(id, source_id, source_message_id, conversation_id, subject,
 			snippet, sent_at, size_estimate, has_attachments, attachment_count,
-			deleted_from_source_at, sender_id, message_type, is_from_me, year, month)`+where)
+			deleted_from_source_at, sender_id, owner_participant_id, message_type, is_from_me, year, month)`+where)
 	writeRelationshipParquet(t, db, root, "sources", `
 		SELECT * FROM (VALUES
 			(1::BIGINT, 'owner@example.com'::VARCHAR, 'gmail'::VARCHAR)
@@ -330,12 +509,12 @@ func rewriteRelationshipFixtureIDs(
 		SELECT * FROM (VALUES
 			(%d::BIGINT, 1::BIGINT, 'm-%d'::VARCHAR, %d::BIGINT,
 			 'Subject'::VARCHAR, 'Preview'::VARCHAR,
-			 TIMESTAMP '2026-07-21 10:30:00', 50::BIGINT, true,
-			 1::INTEGER, NULL::TIMESTAMP, 1::BIGINT, 'email'::VARCHAR,
-			 false, 2026::INTEGER, 7::INTEGER)
+			 TIMESTAMP '2027-07-21 10:30:00', 50::BIGINT, true,
+			 1::INTEGER, NULL::TIMESTAMP, 1::BIGINT, NULL::BIGINT, 'email'::VARCHAR,
+			 false, 2027::INTEGER, 7::INTEGER)
 		) AS t(id, source_id, source_message_id, conversation_id, subject,
 			snippet, sent_at, size_estimate, has_attachments, attachment_count,
-			deleted_from_source_at, sender_id, message_type, is_from_me, year, month)`,
+			deleted_from_source_at, sender_id, owner_participant_id, message_type, is_from_me, year, month)`,
 		messageID, messageID, conversationID))
 	replaceRelationshipParquet(t, db, root, "conversations", fmt.Sprintf(`
 		SELECT * FROM (VALUES
@@ -359,6 +538,23 @@ func rewriteRelationshipFixtureIDs(
 			(2::BIGINT, %d::BIGINT, 12::BIGINT, 'file.txt'::VARCHAR, 'text/plain'::VARCHAR)
 		) AS t(attachment_id, message_id, size, filename, mime_type)`,
 		messageID))
+}
+
+type relationshipActivityCopyRecorder struct {
+	sqlExecutor
+
+	activityCopies int
+}
+
+func (r *relationshipActivityCopyRecorder) ExecContext(
+	ctx context.Context,
+	query string,
+	args ...any,
+) (sql.Result, error) {
+	if strings.Contains(query, "PARTITION_BY (occurred_year)") {
+		r.activityCopies++
+	}
+	return r.sqlExecutor.ExecContext(ctx, query, args...)
 }
 
 func replaceRelationshipParquet(

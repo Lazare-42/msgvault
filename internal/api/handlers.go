@@ -19,6 +19,7 @@ import (
 
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonclient"
+	"go.kenn.io/msgvault/internal/deletion"
 	msgexport "go.kenn.io/msgvault/internal/export"
 	"go.kenn.io/msgvault/internal/fileutil"
 	"go.kenn.io/msgvault/internal/query"
@@ -31,6 +32,8 @@ import (
 	"go.kenn.io/msgvault/internal/vector/hybrid"
 	"golang.org/x/oauth2"
 )
+
+const textViewConversationsValue = "conversations"
 
 // maxPageSize is the hard upper bound for any paginated endpoint.
 const maxPageSize = 500
@@ -56,6 +59,20 @@ type StatsResponse struct {
 	DatabaseSize          int64             `json:"database_size_bytes"`
 	VectorSearch          *vector.StatsView `json:"vector_search,omitempty"`
 	VectorStatus          string            `json:"vector_status,omitempty"`
+	// VectorTextStatus reports the TEXT vector lane specifically. A
+	// multimodal-only daemon is vector-"ready" without serving semantic
+	// message search, so text-tool registration must consult this field,
+	// not the shared subsystem status.
+	VectorTextStatus string `json:"vector_text_status,omitempty"`
+	// VectorTextMessageTypes reports the configured message-type scope of the
+	// text vector index. An empty list means the index is not restricted by
+	// message type.
+	VectorTextMessageTypes []string `json:"vector_text_message_types,omitempty"`
+	// VectorVisualStatus reports the multimodal lane the same way, so a
+	// one-time capability probe during asynchronous init can distinguish
+	// "still initializing" from "not configured" instead of permanently
+	// omitting the visual tool after a transient 503.
+	VectorVisualStatus string `json:"vector_visual_status,omitempty"`
 }
 
 // APIMessage is an alias for store.APIMessage — single source of truth for
@@ -155,9 +172,9 @@ type OperationHealth struct {
 	StartedAt *time.Time `json:"started_at,omitempty"`
 }
 
-// Analytics engine modes reported by /health. The daemon chooses its engine
-// once at startup, so this reflects what aggregate endpoints actually use
-// for the daemon's lifetime — not what a fresh daemon would choose now.
+// Analytics engine modes reported by /health. The daemon can transition from
+// its startup engine when background cache initialization completes, so this
+// reflects the engine that aggregate endpoints use now.
 // AnalyticsModeSQLFallback distinguishes live SQL forced by a missing or
 // unusable cache from live SQL chosen deliberately (engine = "sql",
 // PostgreSQL backends).
@@ -166,6 +183,10 @@ const (
 	AnalyticsModeSQL         = "sql"
 	AnalyticsModeSQLFallback = "sql-fallback"
 	AnalyticsModePostgres    = "postgres"
+	// AnalyticsModeInitializing reports that a required DuckDB cache is being
+	// built or opened in the background. Analytics routes remain unavailable
+	// until the initializer installs the engine.
+	AnalyticsModeInitializing = "initializing"
 )
 
 const (
@@ -177,10 +198,15 @@ type HealthResponse struct {
 	Status    string           `json:"status"`
 	Vector    *VectorHealth    `json:"vector,omitempty"`
 	Operation *OperationHealth `json:"operation,omitempty"`
-	// AnalyticsEngine is the analytics mode the daemon selected at startup
-	// (one of the AnalyticsMode constants). Empty when the server was built
-	// without one (tests, embedded uses).
+	// AnalyticsEngine is the current analytics mode (one of the AnalyticsMode
+	// constants). It can change when background cache initialization installs a
+	// new engine. Empty when the server was built without one (tests, embedded
+	// uses).
 	AnalyticsEngine string `json:"analytics_engine,omitempty"`
+	// APISchemaVersion reports the daemon's APISchemaVersion on authenticated
+	// /api/v1/health so remote CLI clients can refuse a major-version mismatch
+	// before issuing commands. Omitted on the public unauthenticated /health.
+	APISchemaVersion string `json:"api_schema_version,omitempty"`
 }
 
 type MessageListResponse struct {
@@ -208,7 +234,8 @@ type FilteredMessagesResponse struct {
 }
 
 type GmailIDsResponse struct {
-	GmailIDs []string `json:"gmail_ids"`
+	GmailIDs []string               `json:"gmail_ids"`
+	Targets  []query.DeletionTarget `json:"targets,omitempty"`
 }
 
 type DeepSearchResponse struct {
@@ -260,6 +287,7 @@ type MessageDetail struct {
 
 	Body     string `json:"body"`
 	BodyHTML string `json:"body_html,omitempty"`
+	IsFromMe bool   `json:"is_from_me,omitempty"`
 	// BodyOmitted marks a conversation-window message whose body was left
 	// out to keep the response within the cumulative inline-body budget.
 	// The snippet is still present; fetch the full body via
@@ -458,29 +486,28 @@ func messageDetailFromQuery(qMsg *query.MessageDetail) MessageDetail {
 	}
 
 	return MessageDetail{
-		MessageSummary: MessageSummary{
-			ID:              qMsg.ID,
-			SourceID:        qMsg.SourceID,
-			SourceMessageID: qMsg.SourceMessageID,
-			ConversationID:  qMsg.ConversationID,
-			Subject:         qMsg.Subject,
-			MessageType:     qMsg.MessageType,
-			From:            from,
-			FromEmail:       fromEmail,
-			FromName:        fromName,
-			To:              toAddrs,
-			Cc:              ccAddrs,
-			Bcc:             bccAddrs,
-			SentAt:          qMsg.SentAt.UTC().Format(time.RFC3339),
-			DeletedAt:       formatDeletedAt(qMsg.DeletedAt),
-			Snippet:         qMsg.Snippet,
-			Labels:          labels,
-			HasAttach:       qMsg.HasAttachments,
-			SizeBytes:       qMsg.SizeEstimate,
-		},
-		Body:        body,
-		BodyHTML:    qMsg.BodyHTML,
-		Attachments: attachments,
+		ID:              qMsg.ID,
+		SourceID:        qMsg.SourceID,
+		SourceMessageID: qMsg.SourceMessageID,
+		ConversationID:  qMsg.ConversationID,
+		Subject:         qMsg.Subject,
+		MessageType:     qMsg.MessageType,
+		From:            from,
+		FromEmail:       fromEmail,
+		FromName:        fromName,
+		To:              toAddrs,
+		Cc:              ccAddrs,
+		Bcc:             bccAddrs,
+		SentAt:          qMsg.SentAt.UTC().Format(time.RFC3339),
+		DeletedAt:       formatDeletedAt(qMsg.DeletedAt),
+		Snippet:         qMsg.Snippet,
+		Labels:          labels,
+		HasAttach:       qMsg.HasAttachments,
+		SizeBytes:       qMsg.SizeEstimate,
+		IsFromMe:        qMsg.IsFromMe,
+		Body:            body,
+		BodyHTML:        qMsg.BodyHTML,
+		Attachments:     attachments,
 	}
 }
 
@@ -544,9 +571,34 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 
 	resp := statsResponseFromStore(stats)
 	resp.VectorSearch = vs
-	s.refreshVectorStatusIfStale(r.Context())
+	s.refreshVectorStatus(r.Context())
 	if status, _ := s.VectorStatus(); status != VectorStatusDisabled {
 		resp.VectorStatus = string(status)
+		// Per-lane statuses mirror the shared status only for lanes the
+		// configuration actually enables (the daemon passes cfg.Vector at
+		// construction, so this holds during initialization too). Blanket
+		// mirroring advertised visual tools on text-only deployments and
+		// vice versa.
+		_, _, vectorCfg := s.vectorComponents()
+		resp.VectorTextStatus = string(VectorStatusDisabled)
+		if vectorCfg.Enabled {
+			resp.VectorTextStatus = string(status)
+			resp.VectorTextMessageTypes = slices.Clone(vectorCfg.Embed.Scope.BuildScope().MessageTypes)
+		}
+		resp.VectorVisualStatus = string(VectorStatusDisabled)
+		if vectorCfg.Multimodal.Enabled {
+			resp.VectorVisualStatus = string(status)
+			// Visual init can fail while text search stays healthy: the
+			// shared status settles ready with no visual runtime installed.
+			// Report the lane's own failure instead of mirroring ready.
+			s.vectorMu.RLock()
+			visualInstalled := s.visualSearch != nil
+			s.vectorMu.RUnlock()
+			if !visualInstalled &&
+				(status == VectorStatusReady || status == VectorStatusStale) {
+				resp.VectorVisualStatus = string(VectorStatusError)
+			}
+		}
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -614,8 +666,8 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if s.engine != nil {
-		qMsg, err := s.engine.GetMessage(r.Context(), id)
+	if engine := s.queryEngineForContext(r.Context()); engine != nil {
+		qMsg, err := engine.GetMessage(r.Context(), id)
 		switch {
 		case err != nil && !isEngineUnsupported(err):
 			s.logger.Error("failed to get message via engine", "id", id, "error", err)
@@ -656,6 +708,7 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 		MessageSummary: toMessageSummary(*msg),
 		Body:           msg.Body,
 		BodyHTML:       msg.BodyHTML,
+		IsFromMe:       msg.IsFromMe,
 	}
 
 	attachments := make([]AttachmentInfo, 0, len(msg.Attachments))
@@ -725,6 +778,11 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if mode == "vector" || mode == exploreSearchModeHybrid {
+		structuredFilter, err := parseMessageFilter(requestWithoutParams(r, "message_type", "offset"))
+		if err != nil {
+			s.rejectBadParam(w, err)
+			return
+		}
 		page, _, err := queryInt(r, "page")
 		if err != nil {
 			s.rejectBadParam(w, err)
@@ -773,13 +831,21 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 				pageSize = maxPage - offset
 			}
 		}
-		s.handleHybridSearch(w, r, query, parsedQuery, mode, explain, offset, pageSize, includeMatches, minScore, scope)
+		s.handleHybridSearch(
+			w, r, query, parsedQuery, structuredFilter,
+			mode, explain, offset, pageSize, includeMatches, minScore, scope,
+		)
 		return
 	}
 
 	if mode != "fts" {
 		writeError(w, http.StatusBadRequest, "invalid_mode",
 			fmt.Sprintf("mode must be one of fts|vector|hybrid, got %q", mode))
+		return
+	}
+	if param, ok := firstPresentQueryParam(r, semanticSearchStructuredFilterParamNames); ok {
+		writeError(w, http.StatusBadRequest, "unsupported_filter_mode",
+			fmt.Sprintf("query parameter %q is only supported when mode=vector or mode=hybrid", param))
 		return
 	}
 
@@ -856,13 +922,37 @@ func parseSearchQueryRequest(r *http.Request, query string) *search.Query {
 	return parsed
 }
 
+var semanticSearchStructuredFilterParamNames = []string{
+	"sender",
+	recipientParam,
+	"domain",
+	"label",
+	"time_period",
+	"time_granularity",
+	"source_id",
+	"attachments_only",
+	"after",
+	"before",
+}
+
+func firstPresentQueryParam(r *http.Request, names []string) (string, bool) {
+	values := r.URL.Query()
+	for _, name := range names {
+		if _, ok := values[name]; ok {
+			return name, true
+		}
+	}
+	return "", false
+}
+
 // handleHybridSearch runs vector or hybrid search via the configured
 // hybrid engine. Returns 503 when the engine is not configured or the
 // index is stale/building; otherwise returns RRF-ranked hits hydrated
 // through the message store.
 func (s *Server) handleHybridSearch(
 	w http.ResponseWriter, r *http.Request,
-	q string, parsed *search.Query, mode string, explain bool,
+	q string, parsed *search.Query, structuredFilter query.MessageFilter,
+	mode string, explain bool,
 	offset, pageSize int, includeMatches bool, minScore float64,
 	scope cliScope,
 ) {
@@ -872,6 +962,9 @@ func (s *Server) handleHybridSearch(
 		return
 	}
 	ctx := r.Context()
+	if !s.vectorSearchPreflight(ctx, w) {
+		return
+	}
 	start := time.Now()
 
 	freeText := strings.Join(parsed.TextTerms, " ")
@@ -891,7 +984,7 @@ func (s *Server) handleHybridSearch(
 		subjectTerms = append(subjectTerms, strings.ToLower(t))
 	}
 
-	filter, err := hybridEngine.BuildFilter(ctx, parsed)
+	filter, err := hybridEngine.BuildFilter(ctx, parsed, structuredFilter)
 	if err != nil {
 		s.logger.Error("build hybrid filter failed", "query", q, "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "filter resolution failed")
@@ -919,7 +1012,7 @@ func (s *Server) handleHybridSearch(
 				"vector search is not configured")
 		case errors.Is(err, vector.ErrIndexStale):
 			writeError(w, http.StatusServiceUnavailable, "index_stale",
-				"the vector index does not match the configured model; run `msgvault embeddings build --full-rebuild`")
+				"the vector index does not match configured embedding settings; align [vector.embed.scope] accounts for an existing account-scoped index, or run `msgvault embeddings build --full-rebuild`")
 		case errors.Is(err, vector.ErrIndexBuilding):
 			writeError(w, http.StatusServiceUnavailable, "index_building",
 				"the initial vector index is still being built")
@@ -1056,7 +1149,7 @@ func (s *Server) enrichHybridMatches(
 }
 
 func embeddingBodyText(msg *APIMessage) string {
-	body := embed.BodyTextForEmbedding(msg.BodyText, msg.BodyHTML)
+	body := embed.HydrationBodyText(msg.MessageType, msg.BodyText, msg.BodyHTML)
 	if body == "" {
 		// Preserve compatibility with MessageStore implementations that only
 		// populate the legacy selected Body field.
@@ -1069,6 +1162,9 @@ func (s *Server) handleSimilarSearch(w http.ResponseWriter, r *http.Request) {
 	_, backend, vectorCfg := s.vectorComponents()
 	if backend == nil {
 		s.writeVectorUnavailable(w)
+		return
+	}
+	if !s.vectorSearchPreflight(r.Context(), w) {
 		return
 	}
 	if s.store == nil {
@@ -1233,7 +1329,7 @@ func (s *Server) writeVectorSearchError(w http.ResponseWriter, err error, operat
 			"vector search is not configured")
 	case errors.Is(err, vector.ErrIndexStale):
 		writeError(w, http.StatusServiceUnavailable, "index_stale",
-			"the vector index does not match the configured model; run `msgvault embeddings build --full-rebuild`")
+			"the vector index does not match configured embedding settings; align [vector.embed.scope] accounts for an existing account-scoped index, or run `msgvault embeddings build --full-rebuild`")
 	case errors.Is(err, vector.ErrIndexBuilding):
 		writeError(w, http.StatusServiceUnavailable, "index_building",
 			"the initial vector index is still being built")
@@ -1262,8 +1358,8 @@ func (s *Server) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 
 	// Build source ID lookup from the engine (database sources table).
 	sourceIDs := make(map[string]int64)
-	if s.engine != nil {
-		if engineAccounts, err := s.engine.ListAccounts(r.Context()); err == nil {
+	if engine := s.queryEngineForContext(r.Context()); engine != nil {
+		if engineAccounts, err := engine.ListAccounts(r.Context()); err == nil {
 			for _, ea := range engineAccounts {
 				sourceIDs[ea.Identifier] = ea.ID
 			}
@@ -1814,7 +1910,10 @@ type QueryRequest struct {
 	SQL string `json:"sql"`
 }
 
-var errSQLQueryEngineUnavailable = errors.New("SQL query requires DuckDB engine (analytics cache may not be built)")
+// ErrSQLQueryEngineUnavailable is returned when a raw SQL request has no
+// analytics engine. Callers outside the API package use this sentinel so the
+// handler can preserve its 503 engine-unavailable response.
+var ErrSQLQueryEngineUnavailable = errors.New("SQL query requires DuckDB engine (analytics cache may not be built)")
 
 // handleQuery executes a raw SQL query against DuckDB views.
 // POST /api/v1/query.
@@ -1843,10 +1942,10 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.runSQLQuery(r.Context(), req.SQL)
 	if err != nil {
-		if errors.Is(err, errSQLQueryEngineUnavailable) {
+		if errors.Is(err, ErrSQLQueryEngineUnavailable) {
 			writeError(w, http.StatusServiceUnavailable,
 				"engine_unavailable",
-				errSQLQueryEngineUnavailable.Error())
+				ErrSQLQueryEngineUnavailable.Error())
 			return
 		}
 		if s.writeIfContextError(w, err) {
@@ -1864,14 +1963,25 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) runSQLQuery(ctx context.Context, sql string) (*query.QueryResult, error) {
+	if s.analyticsInitializingForContext(ctx) {
+		return nil, ErrSQLQueryEngineUnavailable
+	}
 	if s.sqlQueryRunner != nil {
 		return s.sqlQueryRunner(ctx, sql)
 	}
-	querier, ok := s.engine.(query.SQLQuerier)
+	querier, ok := s.queryEngineForContext(ctx).(query.SQLQuerier)
 	if !ok {
-		return nil, errSQLQueryEngineUnavailable
+		return nil, ErrSQLQueryEngineUnavailable
 	}
 	return querier.QuerySQL(ctx, sql)
+}
+
+func (s *Server) writeIfAnalyticsInitializing(ctx context.Context, w http.ResponseWriter) bool {
+	if !s.analyticsInitializingForContext(ctx) {
+		return false
+	}
+	writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Analytics engine is initializing")
+	return true
 }
 
 // ============================================================================
@@ -1934,6 +2044,7 @@ type TextConversationRow struct {
 }
 
 type TextConversationsResponse struct {
+	CacheRevision string                `json:"cache_revision"`
 	Count         int                   `json:"count"`
 	HasMore       bool                  `json:"has_more"`
 	Offset        int                   `json:"offset"`
@@ -1942,6 +2053,15 @@ type TextConversationsResponse struct {
 }
 
 type TextMessagesResponse struct {
+	CacheRevision string                 `json:"cache_revision"`
+	Count         int                    `json:"count"`
+	HasMore       bool                   `json:"has_more"`
+	Offset        int                    `json:"offset"`
+	Limit         int                    `json:"limit"`
+	Messages      []query.MessageSummary `json:"messages"`
+}
+
+type TextSearchResponse struct {
 	Count    int                    `json:"count"`
 	HasMore  bool                   `json:"has_more"`
 	Offset   int                    `json:"offset"`
@@ -1952,8 +2072,10 @@ type TextMessagesResponse struct {
 // aggregateViewTypes are the accepted view_type values, surfaced in 400 messages.
 var aggregateViewTypes = []string{
 	"senders", "sender_names", "recipients", "recipient_names",
-	"domains", "labels", "time", //nolint:goconst // "labels" here names a view_type enum value, not the Parquet dataset test fixtures also spell "labels"; a shared constant would blur two unrelated concepts
+	"domains", aggregateViewLabels, "time",
 }
+
+const aggregateViewLabels = "labels"
 
 // parseViewType parses a view type string into query.ViewType.
 func parseViewType(s string) (query.ViewType, bool) {
@@ -1968,7 +2090,7 @@ func parseViewType(s string) (query.ViewType, bool) {
 		return query.ViewRecipientNames, true
 	case "domains":
 		return query.ViewDomains, true
-	case "labels":
+	case aggregateViewLabels:
 		return query.ViewLabels, true
 	case "time":
 		return query.ViewTime, true
@@ -1991,7 +2113,7 @@ func viewTypeString(v query.ViewType) string {
 	case query.ViewDomains:
 		return "domains"
 	case query.ViewLabels:
-		return "labels"
+		return aggregateViewLabels
 	case query.ViewTime:
 		return "time"
 	default:
@@ -2002,7 +2124,7 @@ func viewTypeString(v query.ViewType) string {
 // Accepted values for enum query parameters, surfaced in 400 messages.
 var (
 	aggregateSortFields = []string{"count", "size", "attachment_size", "name"}
-	messageSortFields   = []string{"date", "size", "subject"}
+	messageSortFields   = []string{activityDateField, "size", "subject"}
 	textSortFields      = []string{"last_message", "count", "name"}
 	sortDirections      = []string{"asc", apiSortDirectionDesc}
 	timeGranularities   = []string{"year", "month", "day"}
@@ -2052,7 +2174,7 @@ func parseTimeGranularity(s string) (query.TimeGranularity, bool) {
 
 func parseTextViewType(s string) (query.TextViewType, bool) {
 	switch strings.ToLower(s) {
-	case "conversations":
+	case textViewConversationsValue:
 		return query.TextViewConversations, true
 	case "contacts":
 		return query.TextViewContacts, true
@@ -2060,7 +2182,7 @@ func parseTextViewType(s string) (query.TextViewType, bool) {
 		return query.TextViewContactNames, true
 	case "sources":
 		return query.TextViewSources, true
-	case "labels":
+	case aggregateViewLabels:
 		return query.TextViewLabels, true
 	case "time":
 		return query.TextViewTime, true
@@ -2072,7 +2194,7 @@ func parseTextViewType(s string) (query.TextViewType, bool) {
 func textViewTypeString(v query.TextViewType) string {
 	switch v {
 	case query.TextViewConversations:
-		return "conversations"
+		return textViewConversationsValue
 	case query.TextViewContacts:
 		return "contacts"
 	case query.TextViewContactNames:
@@ -2080,7 +2202,7 @@ func textViewTypeString(v query.TextViewType) string {
 	case query.TextViewSources:
 		return "sources"
 	case query.TextViewLabels:
-		return "labels"
+		return aggregateViewLabels
 	case query.TextViewTime:
 		return "time"
 	default:
@@ -2188,13 +2310,17 @@ func parseMessageFilter(r *http.Request) (query.MessageFilter, error) {
 
 	filter.Sender = r.URL.Query().Get("sender")
 	filter.SenderName = r.URL.Query().Get("sender_name")
-	filter.Recipient = r.URL.Query().Get("recipient")
+	filter.Recipient = r.URL.Query().Get(recipientParam)
 	filter.RecipientName = r.URL.Query().Get("recipient_name")
 	filter.Domain = r.URL.Query().Get("domain")
 	filter.Label = r.URL.Query().Get("label")
 	filter.MessageType = r.URL.Query().Get("message_type")
 
 	if v := r.URL.Query().Get("time_period"); v != "" {
+		if _, _, ok := query.ParseTimePeriodBounds(v); !ok {
+			return filter, newParamError("time_period",
+				fmt.Sprintf("query parameter %q must be YYYY, YYYY-MM, or YYYY-MM-DD, got %q", "time_period", v))
+		}
 		filter.TimeRange.Period = v
 	}
 	if v := r.URL.Query().Get("time_granularity"); v != "" {
@@ -2264,7 +2390,7 @@ func parseMessageFilter(r *http.Request) (query.MessageFilter, error) {
 	// Sorting
 	if v := r.URL.Query().Get("sort"); v != "" {
 		switch strings.ToLower(v) {
-		case "date":
+		case activityDateField:
 			filter.Sorting.Field = query.MessageSortByDate
 		case "size":
 			filter.Sorting.Field = query.MessageSortBySize
@@ -2296,6 +2422,16 @@ func parseTextFilter(r *http.Request) (query.TextFilter, error) {
 		return filter, err
 	} else if ok {
 		filter.SourceID = &id
+	}
+	if ids, ok, err := queryInt64s(r, "participant_id"); err != nil {
+		return filter, err
+	} else if ok {
+		for _, id := range ids {
+			if id <= 0 {
+				return filter, newParamError("participant_id", "query parameter \"participant_id\" must contain only positive integers")
+			}
+		}
+		filter.ParticipantIDs = ids
 	}
 	if v := r.URL.Query().Get("time_period"); v != "" {
 		filter.TimeRange.Period = v
@@ -2430,17 +2566,29 @@ func toTextConversationRow(row query.ConversationRow) TextConversationRow {
 	}
 }
 
-func (s *Server) textEngine(w http.ResponseWriter) (query.TextEngine, bool) {
-	if s.engine == nil {
+func (s *Server) textEngine(ctx context.Context, w http.ResponseWriter) (query.TextEngine, bool) {
+	engine := s.queryEngineForContext(ctx)
+	if engine == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
 		return nil, false
 	}
-	textEngine, ok := s.engine.(query.TextEngine)
+	textEngine, ok := engine.(query.TextEngine)
 	if !ok {
 		writeError(w, http.StatusServiceUnavailable, "text_engine_unavailable", "Text query engine not available")
 		return nil, false
 	}
 	return textEngine, true
+}
+
+func (s *Server) textSnapshotReader(
+	textEngine query.TextEngine, w http.ResponseWriter,
+) (query.TextSnapshotReader, bool) {
+	reader, ok := textEngine.(query.TextSnapshotReader)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "text_snapshot_unavailable", "Text snapshot revision is not available")
+		return nil, false
+	}
+	return reader, true
 }
 
 // toTotalStatsResponse converts query.TotalStats to JSON format.
@@ -2539,7 +2687,11 @@ func formatDeletedAt(deletedAt *time.Time) string {
 // handleAggregates returns aggregate data for a view type.
 // GET /api/v1/aggregates?view_type=senders&sort=count&direction=desc&limit=100.
 func (s *Server) handleAggregates(w http.ResponseWriter, r *http.Request) {
-	if s.engine == nil {
+	if s.writeIfAnalyticsInitializing(r.Context(), w) {
+		return
+	}
+	engine := s.queryEngineForContext(r.Context())
+	if engine == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
 		return
 	}
@@ -2561,7 +2713,7 @@ func (s *Server) handleAggregates(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := s.engine.Aggregate(r.Context(), viewType, opts)
+	rows, err := engine.Aggregate(r.Context(), viewType, opts)
 	if err != nil {
 		if s.writeIfContextError(w, err) {
 			return
@@ -2585,7 +2737,11 @@ func (s *Server) handleAggregates(w http.ResponseWriter, r *http.Request) {
 // handleSubAggregates returns sub-aggregate data after drill-down.
 // GET /api/v1/aggregates/sub?view_type=labels&sender=foo@example.com.
 func (s *Server) handleSubAggregates(w http.ResponseWriter, r *http.Request) {
-	if s.engine == nil {
+	if s.writeIfAnalyticsInitializing(r.Context(), w) {
+		return
+	}
+	engine := s.queryEngineForContext(r.Context())
+	if engine == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
 		return
 	}
@@ -2619,7 +2775,7 @@ func (s *Server) handleSubAggregates(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := s.engine.SubAggregate(r.Context(), filter, viewType, opts)
+	rows, err := engine.SubAggregate(r.Context(), filter, viewType, opts)
 	if err != nil {
 		if s.writeIfContextError(w, err) {
 			return
@@ -2643,7 +2799,8 @@ func (s *Server) handleSubAggregates(w http.ResponseWriter, r *http.Request) {
 // handleFilteredMessages returns a filtered list of messages.
 // GET /api/v1/messages/filter?sender=foo@example.com&offset=0&limit=500.
 func (s *Server) handleFilteredMessages(w http.ResponseWriter, r *http.Request) {
-	if s.engine == nil {
+	engine := s.queryEngineForContext(r.Context())
+	if engine == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
 		return
 	}
@@ -2667,7 +2824,7 @@ func (s *Server) handleFilteredMessages(w http.ResponseWriter, r *http.Request) 
 	requestLimit := filter.Pagination.Limit
 	filter.Pagination.Limit = requestLimit + 1
 
-	messages, err := s.engine.ListMessages(r.Context(), filter)
+	messages, err := engine.ListMessages(r.Context(), filter)
 	if err != nil {
 		if s.writeIfContextError(w, err) {
 			return
@@ -2696,8 +2853,284 @@ func (s *Server) handleFilteredMessages(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
+// defaultChangesPageSize is the feed's page size when the caller asks for none.
+// maxPageSize caps it.
+const defaultChangesPageSize = 100
+
+// changesTimeLayout serialises every timestamp in the feed, the watermark
+// inside a cursor included: RFC3339Nano, not this package's usual RFC3339,
+// because a cursor truncated to whole seconds resumes below the page it was
+// handed.
+const changesTimeLayout = time.RFC3339Nano
+
+// ChangedMessageJSON is one row of the feed. Every field is an identity field,
+// the watermark, or a `messages` column the content_changed_at triggers cover
+// (see store.MessagesContentColumns); child-table data the watermark cannot see
+// — labels, recipients, per-attachment rows, raw MIME — is deliberately absent.
+// Rows are snapshots, never patches; `omitempty` is load-bearing because a field
+// without it is `required` in the schema, and the generated client rejects an
+// empty one.
+//
+// Every timestamp carries `format:"date-time"` so generated clients expose
+// typed instants rather than strings.
+type ChangedMessageJSON struct {
+	ID                  int64   `json:"id"`
+	SourceID            int64   `json:"source_id"`
+	SourceMessageID     string  `json:"source_message_id,omitempty"`
+	ConversationID      int64   `json:"conversation_id"`
+	MessageType         string  `json:"message_type,omitempty"`
+	Subject             string  `json:"subject,omitempty"`
+	Snippet             string  `json:"snippet,omitempty"`
+	SentAt              *string `json:"sent_at,omitempty" format:"date-time"`
+	ReceivedAt          *string `json:"received_at,omitempty" format:"date-time"`
+	InternalDate        *string `json:"internal_date,omitempty" format:"date-time"`
+	SizeEstimate        int64   `json:"size_estimate"`
+	HasAttachments      bool    `json:"has_attachments"`
+	AttachmentCount     int     `json:"attachment_count"`
+	DeletedAt           *string `json:"deleted_at,omitempty" format:"date-time"`
+	DeletedFromSourceAt *string `json:"deleted_from_source_at,omitempty" format:"date-time"`
+	ContentChangedAt    string  `json:"content_changed_at" format:"date-time"`
+}
+
+// ChangesResponse is one page of the content-change feed. NextCursor is the
+// position to send back; an empty page echoes the requested cursor, so a
+// caught-up consumer can poll forever without replaying the archive — the
+// exception being a cursor above the database clock (see handleMessageChanges).
+// It is never empty, so it needs no `omitempty` to satisfy the generated
+// client's validator; Messages is `nullable:"false"` because the handler always
+// allocates the slice. CompleteThrough is a bound, never a cursor: while
+// HasMore is true it stands above rows this page did not carry, so a consumer
+// that resumes from it instead of NextCursor skips them.
+//
+// CompleteThrough is nullable because "no commit bound has been established"
+// is a state, not a timestamp.
+type ChangesResponse struct {
+	Messages        []ChangedMessageJSON `json:"messages" nullable:"false"`
+	Count           int                  `json:"count"`
+	HasMore         bool                 `json:"has_more"`
+	NextCursor      string               `json:"next_cursor" doc:"Opaque cursor for the next request. Always present and never empty. Store it and send it back as the cursor parameter; do not parse, construct, compare, or order it — its contents may change without notice"`
+	ServerTime      string               `json:"server_time" format:"date-time"`
+	CompleteThrough *string              `json:"complete_through" format:"date-time" nullable:"true" doc:"Instant the feed is complete through: every change committed strictly below it is reachable from this page's cursor. Null means no commit bound has been established yet; keep polling"`
+}
+
+// handleMessageChanges returns messages whose content changed strictly after
+// the position the cursor encodes, in (content_changed_at, id) order.
+// GET /api/v1/messages/changes?cursor=<next_cursor of the previous page>&limit=100.
+func (s *Server) handleMessageChanges(w http.ResponseWriter, r *http.Request) {
+	// Shape-validated before any capability check: a typo is a 400 on every
+	// backend. Which archive the cursor belongs to needs the store and is
+	// checked below, once the archive can be identified.
+	position, err := queryChangesCursor(r)
+	if err != nil {
+		s.rejectBadParam(w, err)
+		return
+	}
+	limit, ok, err := queryInt(r, "limit")
+	if err != nil {
+		s.rejectBadParam(w, err)
+		return
+	}
+	// The store reads no clock for a non-positive limit, so clamp before calling.
+	if !ok || limit <= 0 {
+		limit = defaultChangesPageSize
+	}
+	if limit > maxPageSize {
+		limit = maxPageSize
+	}
+
+	// Every cursor is a position in ONE archive, so the feed cannot read or issue
+	// one without knowing which archive this is. A store that cannot say gets the
+	// same defined refusal as one that cannot serve the feed: an unbound cursor
+	// is the silent-loss mode the binding exists to prevent, so there is no
+	// fallback.
+	identifier, ok := s.store.(ArchiveIdentifier)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "feature_unavailable",
+			"The configured store cannot identify its archive, so the message change "+
+				"feed cannot issue a resumable cursor")
+		return
+	}
+	archiveUID, err := identifier.ArchiveUIDContext(r.Context())
+	if err != nil {
+		if s.writeIfContextError(w, err) {
+			return
+		}
+		s.logger.Error("archive identity unavailable for the change feed", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error",
+			"Archive identity is unavailable, so the message change feed cannot issue a cursor")
+		return
+	}
+	if err := position.boundTo(archiveUID); err != nil {
+		s.rejectBadParam(w, err)
+		return
+	}
+	since := position.cursor
+
+	lister, ok := s.store.(ChangedMessageLister)
+	if !ok {
+		writeError(w, http.StatusServiceUnavailable, "feature_unavailable",
+			"The configured store cannot serve the message change feed")
+		return
+	}
+
+	// One extra row decides has_more without a count == limit false positive.
+	page, err := lister.ListChangedMessages(r.Context(), since, limit+1)
+	if err != nil {
+		if s.writeIfContextError(w, err) {
+			return
+		}
+		s.logger.Error("changed messages query failed", "error", err)
+		writeError(w, http.StatusInternalServerError, "internal_error", "Message change query failed")
+		return
+	}
+
+	rows := page.Messages
+	hasMore := len(rows) > limit
+	if hasMore {
+		rows = rows[:limit]
+	}
+
+	messages := make([]ChangedMessageJSON, len(rows))
+	for i, m := range rows {
+		messages[i] = toChangedMessageJSON(m)
+	}
+
+	next := since
+	switch {
+	case len(rows) > 0:
+		last := rows[len(rows)-1]
+		next = store.ChangedMessagesAfter(last.ContentChangedAt, last.ID)
+	case since.At().After(page.ServerTime) && !page.CompleteThrough.IsZero():
+		// A cursor above the database clock is unsatisfiable — the page query stops
+		// strictly below the clock — so echoing it back would wedge the consumer on
+		// 200 / count=0 / has_more=false forever. Recovery lands on the COMMIT
+		// BOUND, not on the clock: an in-flight writer's stamped but uncommitted row
+		// sits between the two, and a cursor at the clock would never deliver it.
+		// The bound is by construction below every write it can see; the writes it
+		// cannot see, and the backward clock step this clamp cannot repair, are in
+		// the exception list docs/api-server.md's delivery contract enumerates,
+		// which this comment deliberately does not restate. A server with no bound
+		// yet has no safe target, so the guard above leaves such a cursor echoed —
+		// the one case where the published cursor can stand above server_time, and
+		// docs/api-server.md says so.
+		//
+		// The recovery position is the START of the bound instant, not a pair
+		// carrying an id tiebreak: the tiebreak the caller sent belonged to a
+		// different instant, and no replacement VALUE would do, because every
+		// int64 is a legal message id and the store's tiebreak is strict (see
+		// store.ChangedMessagesCursor). A tiebreak of 0 here dropped the rows
+		// stamped exactly at the bound whose ids were 0 or below.
+		next = store.ChangedMessagesFrom(page.CompleteThrough)
+	}
+
+	s.logIfChangeFeedStalled(page.ServerTime, page.CompleteThrough)
+	var completeThrough *string
+	if !page.CompleteThrough.IsZero() {
+		formatted := page.CompleteThrough.UTC().Format(changesTimeLayout)
+		completeThrough = &formatted
+	}
+
+	writeJSON(w, http.StatusOK, ChangesResponse{
+		Messages:        messages,
+		Count:           len(messages),
+		HasMore:         hasMore,
+		NextCursor:      encodeChangesCursor(archiveUID, next),
+		ServerTime:      page.ServerTime.UTC().Format(changesTimeLayout),
+		CompleteThrough: completeThrough,
+	})
+}
+
+// changesStallThreshold is how far complete_through may fall behind server_time
+// before the feed is stalled rather than merely lagging; a healthy gap is
+// milliseconds. What it measures differs by backend — see the WARN's cause.
+const changesStallThreshold = time.Minute
+
+// changesStallLogInterval throttles the stall WARN, which consumers would
+// otherwise re-trigger on every poll for as long as the condition lasts.
+const changesStallLogInterval = time.Minute
+
+// logIfChangeFeedStalled reports a change feed that has stopped advancing. A
+// stalled feed is an operator problem — some connection is holding a write
+// transaction open — and the operator is reading logs, not someone else's
+// polling responses. A zero complete_through is instead no bound established
+// yet; it gets its own cause and no lag figure, because serverTime.Sub(zero)
+// saturates time.Duration at 2562047h47m16.854775807s — which Round(time.Second)
+// cannot shorten — reading as a broken clock rather than a young server.
+func (s *Server) logIfChangeFeedStalled(serverTime, completeThrough time.Time) {
+	if completeThrough.IsZero() {
+		if s.claimChangesStallLog() {
+			s.logger.Warn("message change feed is not advancing",
+				"lag", "unknown",
+				"complete_through", "none",
+				"server_time", serverTime.UTC().Format(changesTimeLayout),
+				"cause", "no commit bound has been established yet: a write transaction "+
+					"has been open on every attempt since this server started, so the "+
+					"feed cannot say that anything has committed")
+		}
+		return
+	}
+	lag := serverTime.Sub(completeThrough)
+	if lag < changesStallThreshold {
+		return
+	}
+	if !s.claimChangesStallLog() {
+		return
+	}
+	s.logger.Warn("message change feed is not advancing",
+		"lag", lag.Round(time.Second).String(),
+		"complete_through", completeThrough.UTC().Format(changesTimeLayout),
+		"server_time", serverTime.UTC().Format(changesTimeLayout),
+		"cause", "a write transaction on the message table is open and the feed "+
+			"cannot publish past the instant it began. On PostgreSQL the lag is "+
+			"that transaction's own age. On SQLite the transaction's start is "+
+			"unknowable, so the lag is the age of the last proof that the database "+
+			"was quiescent: a writer that started a moment ago reports the whole "+
+			"gap since that proof, including time in which nothing polled this feed")
+}
+
+// claimChangesStallLog reports whether this observation is the one that logs.
+func (s *Server) claimChangesStallLog() bool {
+	now := time.Now()
+	last := s.changesStallLoggedAt.Load()
+	if last != 0 && now.Sub(time.Unix(0, last)) < changesStallLogInterval {
+		return false
+	}
+	return s.changesStallLoggedAt.CompareAndSwap(last, now.UnixNano())
+}
+
+func toChangedMessageJSON(m store.ChangedMessage) ChangedMessageJSON {
+	return ChangedMessageJSON{
+		ID:                  m.ID,
+		SourceID:            m.SourceID,
+		SourceMessageID:     m.SourceMessageID,
+		ConversationID:      m.ConversationID,
+		MessageType:         m.MessageType,
+		Subject:             m.Subject,
+		Snippet:             m.Snippet,
+		SentAt:              changesTimePtr(m.SentAt),
+		ReceivedAt:          changesTimePtr(m.ReceivedAt),
+		InternalDate:        changesTimePtr(m.InternalDate),
+		SizeEstimate:        m.SizeEstimate,
+		HasAttachments:      m.HasAttachments,
+		AttachmentCount:     m.AttachmentCount,
+		DeletedAt:           changesTimePtr(m.DeletedAt),
+		DeletedFromSourceAt: changesTimePtr(m.DeletedFromSourceAt),
+		ContentChangedAt:    m.ContentChangedAt.UTC().Format(changesTimeLayout),
+	}
+}
+
+// changesTimePtr formats an optional timestamp, preserving null over an epoch.
+func changesTimePtr(value *time.Time) *string {
+	if value == nil {
+		return nil
+	}
+	formatted := value.UTC().Format(changesTimeLayout)
+	return &formatted
+}
+
 func (s *Server) handleGmailIDsByFilter(w http.ResponseWriter, r *http.Request) {
-	if s.engine == nil {
+	engine := s.queryEngineForContext(r.Context())
+	if engine == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
 		return
 	}
@@ -2707,21 +3140,23 @@ func (s *Server) handleGmailIDsByFilter(w http.ResponseWriter, r *http.Request) 
 		s.rejectBadParam(w, err)
 		return
 	}
-	ids, err := s.engine.GetGmailIDsByFilter(r.Context(), filter)
+	targets, err := engine.GetDeletionTargetsByFilter(r.Context(), filter)
 	if err != nil {
 		s.logger.Error("gmail id filter query failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Gmail ID query failed")
 		return
 	}
-	if ids == nil {
-		ids = []string{}
+	if targets == nil {
+		targets = []query.DeletionTarget{}
 	}
-
-	writeJSON(w, http.StatusOK, GmailIDsResponse{GmailIDs: ids})
+	writeJSON(w, http.StatusOK, GmailIDsResponse{
+		GmailIDs: deletion.SourceMessageIDs(targets), Targets: targets,
+	})
 }
 
 func (s *Server) handleGetAttachment(w http.ResponseWriter, r *http.Request) {
-	if s.engine == nil {
+	engine := s.queryEngineForContext(r.Context())
+	if engine == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
 		return
 	}
@@ -2733,7 +3168,7 @@ func (s *Server) handleGetAttachment(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	att, err := s.engine.GetAttachment(r.Context(), id)
+	att, err := engine.GetAttachment(r.Context(), id)
 	if err != nil {
 		s.logger.Error("failed to get attachment", "id", id, "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to retrieve attachment")
@@ -2758,7 +3193,8 @@ func (s *Server) handleGetAttachment(w http.ResponseWriter, r *http.Request) {
 // SHA-256 content hash. The /content suffix keeps this binary response distinct
 // from GET /attachments/{id}, which returns attachment metadata as JSON.
 func (s *Server) handleGetAttachmentContent(w http.ResponseWriter, r *http.Request) {
-	if s.engine == nil {
+	engine := s.queryEngineForContext(r.Context())
+	if engine == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
 		return
 	}
@@ -2770,7 +3206,7 @@ func (s *Server) handleGetAttachmentContent(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	attachments, err := s.engine.GetAttachmentsByHash(r.Context(), hash)
+	attachments, err := engine.GetAttachmentsByHash(r.Context(), hash)
 	if err != nil {
 		s.logger.Error("failed to look up attachment by hash", "error", err, "hash", hash)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Failed to look up attachment")
@@ -2929,7 +3365,8 @@ func contentDisposition(filename string) string {
 }
 
 func (s *Server) handleSearchByDomains(w http.ResponseWriter, r *http.Request) {
-	if s.engine == nil {
+	engine := s.queryEngineForContext(r.Context())
+	if engine == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
 		return
 	}
@@ -2953,7 +3390,7 @@ func (s *Server) handleSearchByDomains(w http.ResponseWriter, r *http.Request) {
 	}
 
 	requestLimit := filter.Pagination.Limit
-	messages, err := s.engine.SearchByDomains(
+	messages, err := engine.SearchByDomains(
 		r.Context(),
 		domains,
 		filter.After,
@@ -3003,7 +3440,11 @@ func parseDomainValues(values []string) []string {
 // handleTotalStats returns detailed stats with optional filters.
 // GET /api/v1/stats/total?source_id=1&attachments_only=true.
 func (s *Server) handleTotalStats(w http.ResponseWriter, r *http.Request) {
-	if s.engine == nil {
+	if s.writeIfAnalyticsInitializing(r.Context(), w) {
+		return
+	}
+	engine := s.queryEngineForContext(r.Context())
+	if engine == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
 		return
 	}
@@ -3057,7 +3498,7 @@ func (s *Server) handleTotalStats(w http.ResponseWriter, r *http.Request) {
 		opts.GroupBy = viewType
 	}
 
-	stats, err := s.engine.GetTotalStats(r.Context(), opts)
+	stats, err := engine.GetTotalStats(r.Context(), opts)
 	if err != nil {
 		if s.writeIfContextError(w, err) {
 			return
@@ -3091,7 +3532,8 @@ func normalizeSourceIDs(ids []int64) []int64 {
 // handleFastSearch performs fast metadata search (subject, sender, recipient).
 // GET /api/v1/search/fast?q=invoice&offset=0&limit=100.
 func (s *Server) handleFastSearch(w http.ResponseWriter, r *http.Request) {
-	if s.engine == nil {
+	engine := s.queryEngineForContext(r.Context())
+	if engine == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
 		return
 	}
@@ -3155,7 +3597,7 @@ func (s *Server) handleFastSearch(w http.ResponseWriter, r *http.Request) {
 		limit = maxPageSize
 	}
 
-	result, err := s.engine.SearchFastWithStats(r.Context(), q, queryStr, filter, statsGroupBy, limit, offset)
+	result, err := engine.SearchFastWithStats(r.Context(), q, queryStr, filter, statsGroupBy, limit, offset)
 	if err != nil {
 		if s.writeIfContextError(w, err) {
 			return
@@ -3183,7 +3625,8 @@ func (s *Server) handleFastSearch(w http.ResponseWriter, r *http.Request) {
 // search when scope=body is requested.
 // GET /api/v1/search/deep?q=invoice&scope=body&offset=0&limit=100&source_id=1&hide_deleted=true.
 func (s *Server) handleDeepSearch(w http.ResponseWriter, r *http.Request) {
-	if s.engine == nil {
+	engine := s.queryEngineForContext(r.Context())
+	if engine == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
 		return
 	}
@@ -3241,11 +3684,18 @@ func (s *Server) handleDeepSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	merged := query.MergeFilterIntoQuery(q, filter)
+	if filter.HideDeletedFromSource {
+		merged.DeletionScope = search.DeletionScopeActive
+	} else {
+		// Preserve the pre-2.12 deep-search contract: omitted or false
+		// hide_deleted includes retained source-deleted messages.
+		merged.DeletionScope = search.DeletionScopeAny
+	}
 
 	// Fetch one extra row to determine has_more accurately.
 	var messages []query.MessageSummary
 	if scope == "body" {
-		bodySearcher, ok := s.engine.(query.MessageBodySearcher)
+		bodySearcher, ok := engine.(query.MessageBodySearcher)
 		if !ok {
 			writeError(w, http.StatusNotImplemented, "body_search_unavailable",
 				"Query engine does not support exact message body search")
@@ -3253,7 +3703,7 @@ func (s *Server) handleDeepSearch(w http.ResponseWriter, r *http.Request) {
 		}
 		messages, err = bodySearcher.SearchMessageBodies(r.Context(), merged, limit+1, offset)
 	} else {
-		messages, err = s.engine.Search(r.Context(), merged, limit+1, offset)
+		messages, err = engine.Search(r.Context(), merged, limit+1, offset)
 	}
 	if err != nil {
 		if s.writeIfContextError(w, err) {
@@ -3303,7 +3753,11 @@ func (s *Server) handleDeepSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTextConversations(w http.ResponseWriter, r *http.Request) {
-	textEngine, ok := s.textEngine(w)
+	textEngine, ok := s.textEngine(r.Context(), w)
+	if !ok {
+		return
+	}
+	snapshotReader, ok := s.textSnapshotReader(textEngine, w)
 	if !ok {
 		return
 	}
@@ -3322,7 +3776,9 @@ func (s *Server) handleTextConversations(w http.ResponseWriter, r *http.Request)
 
 	requestLimit := filter.Pagination.Limit
 	filter.Pagination.Limit = requestLimit + 1
-	rows, err := textEngine.ListConversations(r.Context(), filter)
+	rows, cacheRevision, err := snapshotReader.ListConversationsSnapshot(
+		r.Context(), filter,
+	)
 	if err != nil {
 		if s.writeIfContextError(w, err) {
 			return
@@ -3343,6 +3799,7 @@ func (s *Server) handleTextConversations(w http.ResponseWriter, r *http.Request)
 	}
 
 	writeJSON(w, http.StatusOK, TextConversationsResponse{
+		CacheRevision: cacheRevision,
 		Count:         len(conversations),
 		HasMore:       hasMore,
 		Offset:        filter.Pagination.Offset,
@@ -3352,7 +3809,7 @@ func (s *Server) handleTextConversations(w http.ResponseWriter, r *http.Request)
 }
 
 func (s *Server) handleTextAggregates(w http.ResponseWriter, r *http.Request) {
-	textEngine, ok := s.textEngine(w)
+	textEngine, ok := s.textEngine(r.Context(), w)
 	if !ok {
 		return
 	}
@@ -3395,7 +3852,11 @@ func (s *Server) handleTextAggregates(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTextConversationMessages(w http.ResponseWriter, r *http.Request) {
-	textEngine, ok := s.textEngine(w)
+	textEngine, ok := s.textEngine(r.Context(), w)
+	if !ok {
+		return
+	}
+	snapshotReader, ok := s.textSnapshotReader(textEngine, w)
 	if !ok {
 		return
 	}
@@ -3412,6 +3873,7 @@ func (s *Server) handleTextConversationMessages(w http.ResponseWriter, r *http.R
 		s.rejectBadParam(w, err)
 		return
 	}
+	filter.SearchQuery = r.URL.Query().Get("search_query")
 	if filter.Pagination.Limit <= 0 {
 		filter.Pagination.Limit = maxPageSize
 	}
@@ -3421,7 +3883,9 @@ func (s *Server) handleTextConversationMessages(w http.ResponseWriter, r *http.R
 
 	requestLimit := filter.Pagination.Limit
 	filter.Pagination.Limit = requestLimit + 1
-	messages, err := textEngine.ListConversationMessages(r.Context(), conversationID, filter)
+	messages, cacheRevision, err := snapshotReader.ListConversationMessagesSnapshot(
+		r.Context(), conversationID, filter,
+	)
 	if err != nil {
 		if s.writeIfContextError(w, err) {
 			return
@@ -3440,16 +3904,17 @@ func (s *Server) handleTextConversationMessages(w http.ResponseWriter, r *http.R
 	}
 
 	writeJSON(w, http.StatusOK, TextMessagesResponse{
-		Count:    len(messages),
-		HasMore:  hasMore,
-		Offset:   filter.Pagination.Offset,
-		Limit:    requestLimit,
-		Messages: messages,
+		CacheRevision: cacheRevision,
+		Count:         len(messages),
+		HasMore:       hasMore,
+		Offset:        filter.Pagination.Offset,
+		Limit:         requestLimit,
+		Messages:      messages,
 	})
 }
 
 func (s *Server) handleTextSearch(w http.ResponseWriter, r *http.Request) {
-	textEngine, ok := s.textEngine(w)
+	textEngine, ok := s.textEngine(r.Context(), w)
 	if !ok {
 		return
 	}
@@ -3498,7 +3963,7 @@ func (s *Server) handleTextSearch(w http.ResponseWriter, r *http.Request) {
 		messages = []query.MessageSummary{}
 	}
 
-	writeJSON(w, http.StatusOK, TextMessagesResponse{
+	writeJSON(w, http.StatusOK, TextSearchResponse{
 		Count:    len(messages),
 		HasMore:  hasMore,
 		Offset:   offset,
@@ -3508,7 +3973,7 @@ func (s *Server) handleTextSearch(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleTextStats(w http.ResponseWriter, r *http.Request) {
-	textEngine, ok := s.textEngine(w)
+	textEngine, ok := s.textEngine(r.Context(), w)
 	if !ok {
 		return
 	}
@@ -3553,7 +4018,8 @@ type archivedMessageRawReader interface {
 // query parameter so values containing `/` (legal per RFC 5322) round-trip
 // without ambiguity in the routing layer.
 func (s *Server) handleMessageInline(w http.ResponseWriter, r *http.Request) {
-	if s.engine == nil {
+	engine := s.queryEngineForContext(r.Context())
+	if engine == nil {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
 		return
 	}
@@ -3575,7 +4041,7 @@ func (s *Server) handleMessageInline(w http.ResponseWriter, r *http.Request) {
 		if reader, ok := s.store.(archivedMessageRawReader); ok {
 			return reader.GetArchivedMessageRaw(ctx, id)
 		}
-		return s.engine.GetMessageRaw(ctx, id)
+		return engine.GetMessageRaw(ctx, id)
 	}
 
 	entry, err := s.inlineCache.parsed(r.Context(), id, loadRaw)
