@@ -225,14 +225,18 @@ Website Content Crawler: ~$0.50 - $5.00 per 1,000 pages.
 
 ### Relevant Actors for Niche Company Discovery
 
-#### 1. LinkedIn Company Scraper (`curious_coder/linkedin-company-scraper`)
+#### 1. LinkedIn Company Scraper
+
+Actor: `curious_coder/linkedin-company-scraper`
 - **What it does:** Extracts company data from LinkedIn company pages (name, address, phone, website, employee count, industry, specialties)
 - **Input:** `urls` array of LinkedIn company URLs, `minDelay`, `maxDelay`
 - **URL format:** `https://www.linkedin.com/company/microsoft` or numeric IDs
 - **Pricing:** $10.00/month subscription + platform usage
 - **API ID:** `curious_coder~linkedin-company-scraper`
 
-#### 2. LinkedIn Sales Navigator Scraper (`curious_coder/linkedin-sales-navigator-search-scraper`)
+#### 2. LinkedIn Sales Navigator Scraper
+
+Actor: `curious_coder/linkedin-sales-navigator-search-scraper`
 - **What it does:** Extracts data from Sales Navigator people and company search results (email, social media, website, job titles)
 - **Input:** Sales Navigator search parameters/URLs
 - **Output:** Lead/prospect data with emails, social profiles, company websites
@@ -240,14 +244,18 @@ Website Content Crawler: ~$0.50 - $5.00 per 1,000 pages.
 - **Note:** Requires LinkedIn Sales Navigator account; uses random delays for anti-detection
 - **API ID:** `curious_coder~linkedin-sales-navigator-search-scraper`
 
-#### 3. Google Maps Scraper (`compass/crawler-google-places`)
+#### 3. Google Maps Scraper
+
+Actor: `compass/crawler-google-places`
 - **What it does:** Extracts business data from Google Maps (names, addresses, websites, phone numbers, ratings, reviews, categories, opening hours)
 - **Input:** Google Maps URLs OR search term + location combinations
 - **Pricing:** Pay-per-event model (~$0.002 per place for detailed data)
 - **Tip:** Multiple similar search terms increase results but also runtime
 - **API ID:** `compass~crawler-google-places`
 
-#### 4. Website Content Crawler (`apify/website-content-crawler`)
+#### 4. Website Content Crawler
+
+Actor: `apify/website-content-crawler`
 - **What it does:** Crawls websites and extracts text content in plain text, Markdown, or HTML (designed for LLM/RAG pipelines)
 - **Input:** `startUrls` (array), `crawlerType` (playwright:adaptive, playwright:firefox, cheerio, jsdom, playwright:chrome)
 - **Output:** JSON/CSV with page content in chosen format
