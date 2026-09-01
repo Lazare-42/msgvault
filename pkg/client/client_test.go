@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
+	"time"
 
 	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
 	"github.com/stretchr/testify/assert"
@@ -36,12 +38,239 @@ func TestGeneratedSavedViewStateRoundTripsCanonicalDefinition(t *testing.T) {
 	assert.JSONEq(t, want, string(got))
 }
 
+func TestGeneratedPersonMergeRequiredResponseExposesProfiles(t *testing.T) {
+	requirements := require.New(t)
+	now := time.Date(2026, time.August, 22, 12, 0, 0, 0, time.UTC)
+	payload, err := json.Marshal(generated.PersonMergeRequiredError{
+		ErrorData: "person_merge_required",
+		Message:   "These identities belong to different profiles",
+		Profiles: []generated.PersonMergeProfile{{
+			Etag: `"person-7-rev-3"`,
+			Person: generated.Person{
+				ID: 7, Revision: 3, VcardUID: "person-7",
+				ParticipantIds: []int64{11}, CreatedAt: now, UpdatedAt: now,
+			},
+		}},
+	})
+	requirements.NoError(err)
+
+	var response generated.LinkIdentityParticipantsErrorResponse
+	requirements.NoError(json.Unmarshal(payload, &response))
+	conflict := response.LinkIdentityParticipants_ErrorResponse_AnyOf
+	requirements.NotNil(conflict)
+	requirements.True(conflict.IsA())
+	requirements.Len(conflict.A.Profiles, 1)
+	assert.Equal(t, int64(7), conflict.A.Profiles[0].Person.ID)
+}
+
+func TestGeneratedEmploymentSourceConstantsRemainAssignable(t *testing.T) {
+	var source = generated.User
+	assert.Equal(t, generated.EmploymentBodySource("user"), source)
+}
+
+func TestGeneratedPersonFileGalleryContract(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	request := generated.PersonFileSearchHTTPRequest{
+		Directions: []generated.PersonFileSearchHTTPRequestDirections{
+			generated.PersonFileSearchHTTPRequestDirectionsFromPerson,
+			generated.PersonFileSearchHTTPRequestDirectionsGroup,
+		},
+		Predicate: generated.ExploreHTTPRequest{},
+		Sort:      generated.FileSearchSort{Field: "occurred_at", Direction: "desc"},
+	}
+	requirements.NoError(request.Validate())
+
+	provenance := generated.PersonFileProvenance{
+		Directions:     []generated.PersonFileProvenanceDirections{generated.FromPerson, generated.Group},
+		ParticipantIds: []int64{17, 42},
+		Roles:          []generated.PersonFileProvenanceRoles{generated.From, generated.ConversationMember},
+	}
+	requirements.NoError(provenance.Validate())
+
+	encoded, err := json.Marshal(struct {
+		Request    generated.PersonFileSearchHTTPRequest `json:"request"`
+		Provenance generated.PersonFileProvenance        `json:"provenance"`
+	}{Request: request, Provenance: provenance})
+	requirements.NoError(err)
+	assertions.JSONEq(`{
+		"request": {
+			"directions": ["from_person", "group"],
+			"predicate": {},
+			"sort": {"field": "occurred_at", "direction": "desc"}
+		},
+		"provenance": {
+			"directions": ["from_person", "group"],
+			"participant_ids": [17, 42],
+			"roles": ["from", "conversation_member"]
+		}
+	}`, string(encoded))
+}
+
 func TestGeneratedPatchPersonCanClearDisplayName(t *testing.T) {
 	body := generated.PatchPersonBody{DisplayName: nil}
 	require.NoError(t, body.Validate())
 	encoded, err := json.Marshal(body)
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"display_name":null}`, string(encoded))
+}
+
+func TestGeneratedPersonMergeRoundTrip(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(http.MethodPost, r.Method)
+		assert.Equal("/api/v1/people/7/merge", r.URL.Path)
+		assert.Equal(`"person-7-r3", "person-9-r2"`, r.Header.Get("If-Match"))
+		assert.Equal("generated-client-merge", r.Header.Get("Idempotency-Key"))
+		var body generated.MergePersonRequest
+		if !assert.NoError(json.NewDecoder(r.Body).Decode(&body)) {
+			http.Error(w, "invalid merge request", http.StatusBadRequest)
+			return
+		}
+		assert.Equal(int64(9), body.AbsorbedPersonID)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("ETag", `"person-7-r4"`)
+		_, _ = w.Write([]byte(`{
+			"person":{
+				"id":7,"vcard_uid":"survivor-uid","revision":4,
+				"participant_ids":[70,90],
+				"created_at":"2026-08-19T00:00:00Z",
+				"updated_at":"2026-08-19T00:01:00Z"
+			},
+			"merge":{
+				"id":12,"survivor_person_id":7,"absorbed_person_id":9,
+				"current_person_id":7,"survivor_vcard_uid":"survivor-uid",
+				"absorbed_vcard_uid":"absorbed-uid",
+				"survivor_revision_before":3,"absorbed_revision_before":2,
+				"survivor_revision_after":4,"actor":"user",
+				"snapshot_version":1,
+				"snapshot_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				"created_at":"2026-08-19T00:01:00Z"
+			},
+			"review_candidates":[{
+				"id":21,"merge_id":12,"person_id":7,"definition_id":4,
+				"survivor_value_id":31,"absorbed_value_id":32,"state":"pending",
+				"created_at":"2026-08-19T00:01:00Z"
+			}],
+			"identity_revision":42,
+			"cache_state":"ready"
+		}`))
+	}))
+	t.Cleanup(server.Close)
+	client, err := New(server.URL)
+	require.NoError(err)
+
+	response, err := client.MergePersonsWithResponse(
+		context.Background(), &generated.MergePersonsRequestOptions{
+			PathParams: &generated.MergePersonsPath{ID: 7},
+			Header: &generated.MergePersonsHeaders{
+				IfMatch:        `"person-7-r3", "person-9-r2"`,
+				IdempotencyKey: "generated-client-merge",
+			},
+			Body: &generated.MergePersonsBody{AbsorbedPersonID: 9},
+		},
+	)
+	require.NoError(err)
+	require.NotNil(response.JSON200)
+	assert.Equal(int64(7), response.JSON200.Person.ID)
+	assert.Equal(int64(12), response.JSON200.Merge.ID)
+	assert.Equal(int64(42), response.JSON200.IdentityRevision)
+	assert.Equal(generated.PersonMergeResultCacheStateReady, response.JSON200.CacheState)
+	require.Len(response.JSON200.ReviewCandidates, 1)
+	assert.Equal(int64(21), response.JSON200.ReviewCandidates[0].ID)
+	require.NotNil(response.Headers200)
+	assert.Equal(`"person-7-r4"`, response.Headers200.ETag)
+}
+
+func TestGeneratedPersonMergeSnapshotPreservesArbitraryJSON(t *testing.T) {
+	want := `{
+		"version":1,
+		"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"snapshot":{"persons":[{"id":7}],"rows":{"person_names":[1,2]}}
+	}`
+	var snapshot generated.PersonMergeSnapshotResponse
+	require.NoError(t, json.Unmarshal([]byte(want), &snapshot))
+	encoded, err := json.Marshal(snapshot)
+	require.NoError(t, err)
+	assert.JSONEq(t, want, string(encoded))
+}
+
+func TestGeneratedDailyNotePersonIDsRequirePositiveValues(t *testing.T) {
+	require.NoError(t, (generated.CreateDailyNoteEntryRequest{
+		Body:      "note",
+		PersonIds: []int64{1},
+	}).Validate())
+	require.Error(t, (generated.CreateDailyNoteEntryRequest{
+		Body:      "note",
+		PersonIds: []int64{0},
+	}).Validate())
+	require.Error(t, (generated.CreateDailyNoteEntryRequest{
+		Body:      "note",
+		PersonIds: []int64{-1},
+	}).Validate())
+}
+
+func TestGeneratedSourceIdentitiesPreserveRequiredEmptyArrays(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	emptyCatalog := generated.SourceIdentitiesResponse{
+		SourceID: 7, Account: "account@example.test", Identities: []generated.SourceIdentityResponse{},
+	}
+	encoded, err := json.Marshal(emptyCatalog)
+	requirements.NoError(err)
+	assertions.JSONEq(`{"source_id":7,"account":"account@example.test","identities":[]}`, string(encoded))
+
+	identity := generated.SourceIdentityResponse{
+		Identifier: "Alias@Example.test", Signals: []string{},
+		ConfirmedAt: time.Date(2026, 8, 3, 7, 0, 0, 0, time.UTC),
+	}
+	encoded, err = json.Marshal(identity)
+	requirements.NoError(err)
+	assertions.JSONEq(
+		`{"identifier":"Alias@Example.test","signals":[],"confirmed_at":"2026-08-03T07:00:00Z"}`,
+		string(encoded),
+	)
+}
+
+func TestCreateCommunicationServiceAcceptsIdempotentOKResponse(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(http.MethodPost, r.Method)
+		assert.Equal("/api/v1/communication-services", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+			"id":42,
+			"slug":"example-chat",
+			"display_label":"Example Chat",
+			"aliases":[],
+			"scope_policy":"none",
+			"normalization":"lower",
+			"normalization_version":1,
+			"is_system":false,
+			"is_active":true,
+			"created_at":"2026-08-09T00:00:00Z",
+			"updated_at":"2026-08-09T00:00:00Z"
+		}`))
+	}))
+	t.Cleanup(server.Close)
+	c, err := New(server.URL)
+	require.NoError(err)
+
+	service, err := c.CreateCommunicationService(
+		context.Background(), &generated.CreateCommunicationServiceRequestOptions{
+			Body: &generated.CreateCommunicationServiceBody{
+				Slug: "example-chat", DisplayLabel: "Example Chat",
+				ScopePolicy:   generated.CreateCommunicationServiceRequestScopePolicyNone,
+				Normalization: generated.CreateCommunicationServiceRequestNormalizationLower,
+			},
+		},
+	)
+	require.NoError(err)
+	require.NotNil(service)
+	assert.Equal("example-chat", service.Slug)
 }
 
 func TestGeneratedEnumNamesPreserveSavedViewCompatibilityAndQualifyExploration(t *testing.T) {
@@ -54,6 +283,7 @@ func TestGeneratedEnumNamesPreserveSavedViewCompatibilityAndQualifyExploration(t
 	assertions.Equal(generated.Table, generated.SavedViewStateEnvelopePresentation("table"))
 	assertions.Equal(generated.Timeline, generated.SavedViewStateEnvelopePresentation("timeline"))
 	assertions.Equal(generated.ExploreFilterDimensionAfter, generated.ExploreFilterDimension("after"))
+	assertions.Equal(generated.ExploreFilterDimensionIdentity, generated.ExploreFilterDimension("identity"))
 	assertions.Equal(generated.ExploreGroupSortDirectionAsc, generated.ExploreGroupSortDirection("asc"))
 	assertions.Equal(generated.ExploreGroupDimensionSource, generated.ExploreGroupDimension("source"))
 	assertions.Equal(generated.ExploreGroupsHTTPRequestSearchModeFullText, generated.ExploreGroupsHTTPRequestSearchMode("full_text"))
@@ -123,6 +353,406 @@ func TestGeneratedFileMetadataRequiresPresenceButAcceptsEmptyLegacyStrings(t *te
 		missingMIME.MimeType = nil
 		requirements.Error(missingMIME.Validate(), "missing required MIME type")
 	})
+
+	t.Run("person search row", func(t *testing.T) {
+		assertions := assert.New(t)
+		requirements := require.New(t)
+		var present generated.PersonFileSearchRow
+		requirements.NoError(json.Unmarshal([]byte(
+			`{"containing_title":"item","content_state":"metadata_only","entry_key":"message:1","filename":"","key":"file:1","mime_family":"other","mime_type":"","occurred_at":"2026-07-19T12:00:00Z","person_provenance":{"directions":["to_person"],"participant_ids":[1],"roles":["to"]},"source_identifier":"archive@example.com","source_type":"synthetic"}`,
+		), &present))
+		requirements.NotNil(present.Filename)
+		requirements.NotNil(present.MimeType)
+		assertions.Empty(*present.Filename)
+		assertions.Empty(*present.MimeType)
+		requirements.NoError(present.Validate(), "present empty strings are legitimate legacy metadata")
+
+		missingFilename := present
+		missingFilename.Filename = nil
+		requirements.Error(missingFilename.Validate(), "missing required filename")
+		missingMIME := present
+		missingMIME.MimeType = nil
+		requirements.Error(missingMIME.Validate(), "missing required MIME type")
+	})
+}
+
+func TestGeneratedPersonFactEvidenceRequiresPresenceButAcceptsEmptyStrings(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	const payload = `{
+		"id":1,"evidence_key":"public:1","source_class":"public_web",
+		"directness":"direct","authority":"first_party","source_ref":"",
+		"source_url":"https://example.test/profile","subject_ref":"",
+		"excerpt":"","content_sha256":"","source_version":"",
+		"event_time":"2026-08-24T12:00:00Z","recorded_time":"2026-08-24T12:00:00Z",
+		"identity_score":10,"supported":true,"created_at":"2026-08-24T12:00:00Z",
+		"latest_status":{"id":2,"generation_id":3,"evidence_key":"public:1",
+			"source_version":"","supported":true,"reason":"observed",
+			"created_at":"2026-08-24T12:00:00Z"}
+	}`
+	var public generated.PersonFactEvidence
+	requirements.NoError(json.Unmarshal([]byte(payload), &public))
+	requirements.NotNil(public.SourceRef)
+	requirements.NotNil(public.ContentSha256)
+	requirements.NotNil(public.SourceVersion)
+	requirements.NotNil(public.SubjectRef)
+	requirements.NotNil(public.Excerpt)
+	requirements.NotNil(public.LatestStatus)
+	requirements.NotNil(public.LatestStatus.SourceVersion)
+	assertions.Empty(*public.SourceRef)
+	assertions.Empty(*public.ContentSha256)
+	assertions.Empty(*public.SourceVersion)
+	assertions.Empty(*public.LatestStatus.SourceVersion)
+	assertions.Empty(*public.SubjectRef)
+	assertions.Empty(*public.Excerpt)
+	requirements.NoError(public.Validate())
+	requirements.NoError(public.LatestStatus.Validate())
+
+	archive := public
+	archive.SourceClass = "archive"
+	empty := ""
+	archive.SourceURL = &empty
+	requirements.NoError(archive.Validate(), "archive evidence may omit a source URL value")
+
+	missing := public
+	missing.SourceRef = nil
+	requirements.Error(missing.Validate(), "required source_ref must still be present")
+	missing = public
+	missing.SubjectRef = nil
+	requirements.Error(missing.Validate(), "required subject_ref must still be present")
+	missing = public
+	missing.Excerpt = nil
+	requirements.Error(missing.Validate(), "required excerpt must still be present")
+	missingStatus := *public.LatestStatus
+	missingStatus.SourceVersion = nil
+	requirements.Error(missingStatus.Validate(), "required status source_version must still be present")
+}
+
+// TestGeneratedChangesResponseAcceptsTheFeedsOrdinaryPages holds the
+// content-change feed to the same "required means present, not non-empty"
+// distinction the file-metadata models above are held to.
+//
+// A row of that feed omits every column it has nothing to say about: a live
+// message carries no deletion timestamps, and a chat message carries no subject,
+// snippet, or platform id. Declaring any of those required in the OpenAPI
+// document makes this validator reject them — required here means non-nil AND
+// non-empty — so the published client would refuse the server's ordinary
+// successful responses. next_cursor is the other side of that rule: the server
+// publishes one on every page, empty ones included, so it can be required.
+func TestGeneratedChangesResponseAcceptsTheFeedsOrdinaryPages(t *testing.T) {
+	const liveEmail = `{
+		"messages":[{
+			"id":918,
+			"source_id":1,
+			"source_message_id":"18f2c9d0a1b3",
+			"conversation_id":44,
+			"message_type":"email",
+			"subject":"Q4 planning",
+			"snippet":"Here's the draft for Q4...",
+			"sent_at":"2026-03-01T10:00:00Z",
+			"size_estimate":8412,
+			"has_attachments":false,
+			"attachment_count":0,
+			"content_changed_at":"2026-07-26T10:00:00.731123Z"
+		}],
+		"count":1,
+		"has_more":false,
+		"next_cursor":"1.eyJ0IjoiMjAyNi0wNy0yNlQxMDowMDowMC43MzExMjNaIiwiaSI6OTE4fQ",
+		"server_time":"2026-07-26T10:00:03.114500Z",
+		"complete_through":"2026-07-26T10:00:03.114488Z"
+	}`
+
+	t.Run("live message omits every unset timestamp", func(t *testing.T) {
+		assertions := assert.New(t)
+		requirements := require.New(t)
+		var page generated.ChangesResponse
+		requirements.NoError(json.Unmarshal([]byte(liveEmail), &page))
+		requirements.NoError(page.Validate(),
+			"a message that was never deleted and has no platform timestamps is the "+
+				"common case, not an error")
+		requirements.Len(page.Messages, 1)
+		row := page.Messages[0]
+		assertions.Nil(row.ReceivedAt, "received_at")
+		assertions.Nil(row.InternalDate, "internal_date")
+		assertions.Nil(row.DeletedAt, "deleted_at")
+		assertions.Nil(row.DeletedFromSourceAt, "deleted_from_source_at")
+	})
+
+	t.Run("chat message omits subject, snippet, and platform id", func(t *testing.T) {
+		assertions := assert.New(t)
+		requirements := require.New(t)
+		var page generated.ChangesResponse
+		requirements.NoError(json.Unmarshal([]byte(`{
+			"messages":[{
+				"id":7,
+				"source_id":2,
+				"conversation_id":9,
+				"message_type":"imessage",
+				"size_estimate":0,
+				"has_attachments":false,
+				"attachment_count":0,
+				"content_changed_at":"2026-07-26T10:00:00.731123Z"
+			}],
+			"count":1,
+			"has_more":false,
+			"next_cursor":"1.eyJ0IjoiMjAyNi0wNy0yNlQxMDowMDowMC43MzExMjNaIiwiaSI6N30",
+			"server_time":"2026-07-26T10:00:03.114500Z",
+			"complete_through":"2026-07-26T10:00:03.114488Z"
+		}`), &page))
+		requirements.NoError(page.Validate(),
+			"chat platforms carry no subject and the store COALESCEs a missing "+
+				"platform id to the empty string")
+		requirements.Len(page.Messages, 1)
+		row := page.Messages[0]
+		assertions.Nil(row.Subject, "subject")
+		assertions.Nil(row.Snippet, "snippet")
+		assertions.Nil(row.SourceMessageID, "source_message_id")
+	})
+
+	t.Run("empty archive page still carries a cursor", func(t *testing.T) {
+		assertions := assert.New(t)
+		requirements := require.New(t)
+		const emptyArchive = `{
+			"messages":[],
+			"count":0,
+			"has_more":false,
+			"next_cursor":"1.eyJ0IjoiMDAwMS0wMS0wMVQwMDowMDowMFoiLCJpIjowfQ",
+			"server_time":"2026-07-26T10:00:03.114500Z",
+			"complete_through":"2026-07-26T10:00:03.114488Z"
+		}`
+		var page generated.ChangesResponse
+		requirements.NoError(json.Unmarshal([]byte(emptyArchive), &page))
+		requirements.NoError(page.Validate(),
+			"a first poll of an empty archive has no last row, but it still hands "+
+				"back the position the caller is standing at")
+		assertions.Empty(page.Messages, "messages")
+		assertions.NotEmpty(page.NextCursor, "next_cursor")
+
+		page.NextCursor = ""
+		requirements.Error(page.Validate(),
+			"next_cursor is what a consumer sends back; a page without one leaves it "+
+				"nothing to hold its place with, so required must mean non-empty here")
+	})
+
+	t.Run("a missing watermark is still rejected", func(t *testing.T) {
+		requirements := require.New(t)
+		var page generated.ChangesResponse
+		requirements.NoError(json.Unmarshal([]byte(liveEmail), &page))
+		requirements.Len(page.Messages, 1)
+		page.Messages[0].ContentChangedAt = time.Time{}
+		requirements.Error(page.Validate(),
+			"content_changed_at is the row's watermark: it is what the feed orders "+
+				"by, so loosening the other fields must not loosen this one")
+		page.Messages[0].ContentChangedAt = time.Date(
+			2026, 7, 26, 10, 0, 0, 731123000, time.UTC)
+		page.ServerTime = time.Time{}
+		requirements.Error(page.Validate(),
+			"server_time is always a database clock reading")
+		page.ServerTime = time.Date(2026, 7, 26, 10, 0, 3, 114500000, time.UTC)
+		page.CompleteThrough = nil
+		requirements.NoError(page.Validate(),
+			"a nil complete_through represents the valid no-bound state")
+	})
+
+	t.Run("timestamps are typed and no bound is nullable", func(t *testing.T) {
+		requirements := require.New(t)
+		assertions := assert.New(t)
+
+		var noBoundYet generated.ChangesResponse
+		requirements.NoError(json.Unmarshal([]byte(`{
+			"messages":[],
+			"count":0,
+			"has_more":false,
+			"next_cursor":"1.eyJ0IjoiMDAwMS0wMS0wMVQwMDowMDowMFoiLCJpIjowfQ",
+			"server_time":"2026-07-26T10:00:03.114500Z",
+			"complete_through":null
+		}`), &noBoundYet))
+		requirements.NoError(noBoundYet.Validate(),
+			"a server with no commit bound must still decode and validate")
+		assertions.Nil(noBoundYet.CompleteThrough)
+	})
+}
+
+// TestListChangedMessagesRoundTripsTheCursorVerbatim covers the half of the
+// change feed's client contract the response-model test above cannot reach: that
+// the generated client builds the request the server accepts, and that the
+// cursor survives the trip out through the generated query parameters byte for
+// byte.
+//
+// The cursor is opaque, so the client has no way to repair one it damaged: a
+// token altered on the way out is not a cursor this server issued and comes back
+// 400, and one silently dropped restarts the consumer at the beginning of the
+// archive. Neither shows up in the response model — only in the query string. So
+// this walks the loop a consumer walks, taking next_cursor from one page and
+// sending it as the next request, and asserts on what the client actually put on
+// the wire.
+func TestListChangedMessagesRoundTripsTheCursorVerbatim(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	const watermark = "2026-07-26T10:00:00.731123Z"
+	// An opaque token shaped like the ones the server issues, carrying the
+	// sub-second watermark above and the id below. It is NOT one this server
+	// would accept — it names no archive, and today's server rejects a cursor
+	// that does not — which costs this test nothing: what it exercises is the
+	// generated client's query-parameter round trip, and what matters is that
+	// this exact string comes back off the wire.
+	const cursor = "1.eyJ0IjoiMjAyNi0wNy0yNlQxMDowMDowMC43MzExMjNaIiwiaSI6OTE4fQ"
+
+	var gotMethod, gotPath string
+	var gotQuery url.Values
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath, gotQuery = r.Method, r.URL.Path, r.URL.Query()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{
+			"messages":[{
+				"id":918,
+				"source_id":1,
+				"conversation_id":44,
+				"message_type":"email",
+				"subject":"Q4 planning",
+				"size_estimate":8412,
+				"has_attachments":false,
+				"attachment_count":0,
+				"content_changed_at":%q
+			}],
+			"count":1,
+			"has_more":false,
+			"next_cursor":%q,
+			"server_time":"2026-07-26T10:00:03.114500Z",
+			"complete_through":"2026-07-26T10:00:03.114488Z"
+		}`, watermark, cursor)
+	}))
+	t.Cleanup(server.Close)
+
+	c, err := New(server.URL)
+	require.NoError(err, "New")
+
+	// First poll: a consumer with no cursor yet. Sending cursor= would be a
+	// different request than omitting it, so the client must omit.
+	limit := int64(100)
+	first, err := c.ListChangedMessages(context.Background(), &generated.ListChangedMessagesRequestOptions{
+		Query: &generated.ListChangedMessagesQuery{Limit: &limit},
+	})
+	require.NoError(err, "ListChangedMessages first poll")
+	assert.Equal(http.MethodGet, gotMethod, "method")
+	assert.Equal("/api/v1/messages/changes", gotPath, "path")
+	assert.Equal("100", gotQuery.Get("limit"), "limit query")
+	assert.NotContains(gotQuery, "cursor", "an absent cursor must not be sent as an empty one")
+
+	require.NotNil(first, "first page")
+	assert.Equal(cursor, first.NextCursor, "the cursor must decode exactly as published")
+	require.Len(first.Messages, 1, "messages")
+	wantWatermark, err := time.Parse(time.RFC3339Nano, watermark)
+	require.NoError(err)
+	assert.Equal(wantWatermark, first.Messages[0].ContentChangedAt, "the row's watermark")
+
+	// Second poll: the response fed straight back, exactly as the docs tell a
+	// consumer to do it.
+	second, err := c.ListChangedMessages(context.Background(), &generated.ListChangedMessagesRequestOptions{
+		Query: &generated.ListChangedMessagesQuery{
+			Cursor: &first.NextCursor,
+			Limit:  &limit,
+		},
+	})
+	require.NoError(err, "ListChangedMessages second poll")
+	assert.Equal(cursor, gotQuery.Get("cursor"),
+		"the cursor reached the wire altered: a token this server did not issue is "+
+			"rejected, so a consumer that sends it back can no longer resume at all")
+	assert.Equal("100", gotQuery.Get("limit"), "limit query")
+	require.NotNil(second, "second page")
+}
+
+// TestListChangedMessagesDecodesTheDocumentedErrors covers the half of the
+// contract the success paths cannot: the responses a consumer has to act on
+// differently from one another.
+//
+// The feed answers 400 for a cursor it cannot use, 401 without a usable key,
+// 429 when the caller has outrun the rate limiter, 500 when the watermark query
+// fails, and 503 where the configured store cannot serve the feed at all. Only
+// the first is recoverable, and only by restarting the sync from the beginning
+// of the archive, so a consumer has to tell it apart from the ones it should
+// retry — which means reading the `error` code out of the body. A generated
+// client that models only 200 and 500 hands back an opaque status and leaves
+// every consumer to decode the body by hand, so the codes are pinned here
+// against the client the repository actually ships.
+//
+// 429 matters most to this endpoint of all of them: a consumer of an
+// invalidation feed polls, and polling is what the limiter exists to catch.
+func TestListChangedMessagesDecodesTheDocumentedErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		status  int
+		code    string
+		message string
+		body    func(*generated.ListChangedMessagesResp) *generated.ErrorResponse
+	}{
+		{
+			name:    "an unusable cursor",
+			status:  http.StatusBadRequest,
+			code:    "invalid_cursor",
+			message: "cursor was issued for a different archive",
+			body:    func(r *generated.ListChangedMessagesResp) *generated.ErrorResponse { return r.JSON400 },
+		},
+		{
+			name:    "a missing or rejected key",
+			status:  http.StatusUnauthorized,
+			code:    "unauthorized",
+			message: "API key required",
+			body:    func(r *generated.ListChangedMessagesResp) *generated.ErrorResponse { return r.JSON401 },
+		},
+		{
+			name:    "a caller that has outrun the rate limiter",
+			status:  http.StatusTooManyRequests,
+			code:    "rate_limit_exceeded",
+			message: "Too many requests. Please slow down.",
+			body:    func(r *generated.ListChangedMessagesResp) *generated.ErrorResponse { return r.JSON429 },
+		},
+		{
+			name:    "a watermark query that failed",
+			status:  http.StatusInternalServerError,
+			code:    "internal_error",
+			message: "Message change query failed",
+			body:    func(r *generated.ListChangedMessagesResp) *generated.ErrorResponse { return r.JSON500 },
+		},
+		{
+			name:    "a store that cannot serve the feed",
+			status:  http.StatusServiceUnavailable,
+			code:    "feature_unavailable",
+			message: "The configured store cannot serve the message change feed",
+			body:    func(r *generated.ListChangedMessagesResp) *generated.ErrorResponse { return r.JSON503 },
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = fmt.Fprintf(w, `{"error":%q,"message":%q}`, tc.code, tc.message)
+			}))
+			t.Cleanup(server.Close)
+
+			c, err := New(server.URL)
+			require.NoError(err, "New")
+
+			resp, err := c.ListChangedMessagesWithResponse(
+				context.Background(), &generated.ListChangedMessagesRequestOptions{})
+			require.Error(err, "an error status must be reported as an error")
+			require.NotNil(resp, "the response is what carries the decoded body")
+			assert.Equal(tc.status, resp.StatusCode, "status code")
+
+			decoded := tc.body(resp)
+			require.NotNilf(decoded, "the client must decode the %d body: without it a "+
+				"consumer cannot tell a cursor it must abandon from a condition it should "+
+				"retry", tc.status)
+			assert.Equal(tc.code, decoded.ErrorData,
+				"the error code is what a consumer branches on")
+			require.NotNil(decoded.Message, "message")
+			assert.Equal(tc.message, *decoded.Message, "message")
+		})
+	}
 }
 
 func TestGeneratedGetAttachmentContentReturnsBinaryBytes(t *testing.T) {
@@ -311,7 +941,7 @@ func TestCreatePersonAcceptsIdempotentOK(t *testing.T) {
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(http.MethodPost, r.Method, "method")
-		assert.Equal("/api/v1/persons", r.URL.Path, "path")
+		assert.Equal("/api/v1/people", r.URL.Path, "path")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"id": 7,

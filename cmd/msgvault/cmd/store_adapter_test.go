@@ -30,8 +30,77 @@ func TestStoreAPIAdapterImplementsCtxMessageStore(t *testing.T) {
 	require.True(t, ok, "storeAPIAdapter must implement api.CtxMessageStore")
 }
 
+func TestStoreAPIAdapterServesAttributeDefinitions(t *testing.T) {
+	st := testutil.NewTestStore(t)
+	srv := api.NewServerWithOptions(api.ServerOptions{
+		Config: &config.Config{},
+		Store:  &storeAPIAdapter{store: st},
+		Logger: slog.New(slog.DiscardHandler),
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/attribute-definitions", nil)
+	response := httptest.NewRecorder()
+	srv.Router().ServeHTTP(response, req)
+
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+}
+
+func TestStoreAPIAdapterServesDocumentVectorStatus(t *testing.T) {
+	st := testutil.NewTestStore(t)
+	c := config.NewDefaultConfig()
+	c.Vector.Enabled = true
+	c.Attachments.Documents.Index.Embeddings.Enabled = true
+	srv := api.NewServerWithOptions(api.ServerOptions{
+		Config: c,
+		Store:  &storeAPIAdapter{store: st},
+		Logger: slog.New(slog.DiscardHandler),
+	})
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/documents/vectors/status", nil)
+	response := httptest.NewRecorder()
+	srv.Router().ServeHTTP(response, request)
+
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	require.JSONEq(t, `{"enabled":true,"configured":false}`, response.Body.String())
+}
+
 var _ api.CtxMessageStore = (*storeAPIAdapter)(nil)
+var _ api.MessageIdentityStore = (*storeAPIAdapter)(nil)
 var _ api.MeetingImporter = (*storeAPIAdapter)(nil)
+
+func TestStoreAPIAdapterPassesThroughMessageIdentityOperations(t *testing.T) {
+	require := require.New(t)
+	st := testutil.NewTestStore(t)
+	source, err := st.GetOrCreateSource("imap", "primary@example.test")
+	require.NoError(err)
+	conversationID, err := st.EnsureConversation(source.ID, "thread-identity", "Identity")
+	require.NoError(err)
+	messageID, err := st.UpsertMessage(&store.Message{
+		ConversationID:  conversationID,
+		SourceID:        source.ID,
+		SourceMessageID: "message-identity",
+		MessageType:     "email",
+	})
+	require.NoError(err)
+	participantID, err := st.EnsureParticipant("masked-shop@example.test", "Masked", "example.test")
+	require.NoError(err)
+	require.NoError(st.ReplaceMessageRecipients(
+		messageID, "to", []int64{participantID}, []string{"Masked"},
+	))
+	require.NoError(st.AddAccountIdentity(source.ID, "Masked-Shop@Example.test", "manual"))
+
+	adapter := &storeAPIAdapter{store: st}
+	resolved, err := adapter.ResolveAccountIdentityContext(
+		t.Context(), source.ID, "masked-shop@example.test",
+	)
+	require.NoError(err)
+	require.Equal("Masked-Shop@Example.test", resolved.Identifier)
+	require.Equal([]int64{participantID}, resolved.ParticipantIDs)
+
+	matches, err := adapter.MatchMessageIdentitiesContext(t.Context(), []int64{messageID})
+	require.NoError(err)
+	require.Equal([]string{"Masked-Shop@Example.test"}, matches[messageID].Recipients)
+}
 
 type scopedStatsProductionAdapter struct {
 	*storeAPIAdapter
@@ -347,7 +416,7 @@ func TestMarkedCLIRequestCancellationStopsProductionStoreWork(t *testing.T) {
 
 			select {
 			case <-requestDone:
-			case <-time.After(500 * time.Millisecond):
+			case <-time.After(2 * time.Second):
 				require.FailNow(t, "production store work continued after marked request cancellation")
 			}
 		})

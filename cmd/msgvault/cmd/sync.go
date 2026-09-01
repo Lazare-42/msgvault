@@ -34,8 +34,8 @@ UIDVALIDITY/UIDNEXT high water marks are available.
 If no email is specified, syncs all accounts that have credentials configured.
 Accounts without tokens or history IDs are skipped.
 
-If history is too old (Gmail returns 404), automatically falls back to a full
-sync, which is resumable and skips already-archived messages.
+If history is too old (Gmail returns 404), automatically reconciles the complete
+mailbox, preserving archived content while repairing source-deletion metadata.
 
 Examples:
   msgvault sync                 # Sync all accounts
@@ -50,6 +50,10 @@ Examples:
 }
 
 func runSyncIncrementalLocal(cmd *cobra.Command, args []string) error {
+	selector, selectorSet, err := syncSourceSelector(cmd, args)
+	if err != nil {
+		return usageErr(cmd, err)
+	}
 	s, cleanup, err := openWritableStoreAndInit()
 	if err != nil {
 		return err
@@ -86,12 +90,12 @@ func runSyncIncrementalLocal(cmd *cobra.Command, args []string) error {
 	var imapTargets []*store.Source
 	var syncErrors []string
 
-	if len(args) == 1 {
+	if selectorSet {
 		// Resolve all sources for the identifier and route
 		// each by type, same as sync-full.
-		allMatches, lookupErr := s.GetSourcesByIdentifierOrDisplayName(args[0])
+		allMatches, legacy, lookupErr := resolveSyncSources(s, selector)
 		if lookupErr != nil {
-			return fmt.Errorf("look up source: %w", lookupErr)
+			return lookupErr
 		}
 		for _, src := range allMatches {
 			switch src.SourceType {
@@ -103,10 +107,12 @@ func runSyncIncrementalLocal(cmd *cobra.Command, args []string) error {
 		}
 		if len(gmailTargets) == 0 && len(imapTargets) == 0 {
 			if len(allMatches) > 0 {
-				return fmt.Errorf("account %q exists but its source type cannot be synced (only gmail and imap are supported)", args[0])
+				return fmt.Errorf("%s exists but its source type cannot be synced (only gmail and imap are supported)", syncSelectorLabel(selector))
 			}
-			// Not in DB — assume Gmail (legacy behaviour)
-			gmailTargets = []syncTarget{{email: args[0]}}
+			if legacy {
+				// Token not in DB — assume Gmail (legacy behaviour).
+				gmailTargets = []syncTarget{{email: selector.Account}}
+			}
 		}
 	} else {
 		// Discover all sources.
@@ -255,7 +261,7 @@ func runIncrementalSync(ctx context.Context, s *store.Store, getOAuthMgr func(st
 	opts.AttachmentsDir = cfg.AttachmentsDir()
 
 	// Create syncer with progress reporter
-	syncer := sync.New(client, s, opts).
+	syncer := newMessageSyncer(client, s, opts).
 		WithLogger(logger).
 		WithProgress(&CLIProgress{})
 
@@ -264,21 +270,19 @@ func runIncrementalSync(ctx context.Context, s *store.Store, getOAuthMgr func(st
 	fmt.Printf("Starting incremental sync for %s\n", email)
 	fmt.Printf("Last history ID: %s\n", source.SyncCursor.String)
 
-	summary, err := syncer.Incremental(ctx, source)
+	summary, err := syncer.IncrementalWithHistoryRecovery(ctx, source, func(resumed bool) {
+		if resumed {
+			fmt.Println("Resuming complete mailbox reconciliation after interruption.")
+		} else {
+			fmt.Println("History ID has expired (Gmail keeps only ~7 days of history).")
+			fmt.Println("Reconciling the complete mailbox; already-archived messages are skipped.")
+		}
+		fmt.Println()
+	})
 	if err != nil {
 		if ctx.Err() != nil {
 			fmt.Println("\nSync interrupted. Run again to resume.")
 			return nil
-		}
-		// The history baseline is gone (Gmail keeps only ~7 days), so an
-		// incremental sync can never succeed again for this account. Fall
-		// back to a full sync instead of telling the user to run one:
-		// it is resumable and skips already-archived messages.
-		if errors.Is(err, sync.ErrHistoryExpired) {
-			fmt.Println("History ID has expired (Gmail keeps only ~7 days of history).")
-			fmt.Println("Falling back to a full sync; already-archived messages are skipped.")
-			fmt.Println()
-			return runFullSync(ctx, s, getOAuthMgr, source)
 		}
 		return fmt.Errorf("sync failed: %w", err)
 	}
@@ -305,6 +309,7 @@ func runIncrementalSync(ctx context.Context, s *store.Store, getOAuthMgr func(st
 }
 
 func init() {
+	syncIncrementalCmd.Flags().Int64("source-id", 0, "Exact source ID to sync")
 	syncIncrementalCmd.Flags().StringArrayVar(&syncFolders, "folder", []string{}, "IMAP folder to scan (repeatable)")
 	syncIncrementalCmd.Flags().StringArrayVar(&syncSkipFolders, "skip-folder", []string{}, "IMAP folder to skip (repeatable)")
 	rootCmd.AddCommand(syncIncrementalCmd)

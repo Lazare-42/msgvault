@@ -3,6 +3,7 @@ package imap
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"slices"
@@ -130,9 +131,40 @@ func (c *Client) applyFetchResults(
 		// Return a non-nil stub with empty Raw so the caller treats this as a
 		// skip, not a fetch error.
 		msgID := compositeID(mailbox, msgBuf.UID)
-		var rfc822MessageID string
-		if c.seenRFC822IDs != nil || c.msgIDToLabels != nil {
-			rfc822MessageID = rawMIMEMessageID(rawMIME)
+		rfc822MessageID := rawMIMEMessageID(rawMIME)
+		canonicalSourceMessageID := ""
+		var rawSHA256 [32]byte
+		if rfc822MessageID == "" && c.preferredRawSourceIDs != nil {
+			rawSHA256 = sha256.Sum256(rawMIME)
+			if mailbox == c.allMailFolder {
+				// A canonical-mailbox UID is its own durable identity. Raw
+				// matching is only a fallback for copies in secondary mailboxes;
+				// using it here would collapse distinct byte-identical messages.
+				canonicalSourceMessageID = msgID
+				if canonical, exists := c.preferredRawSourceIDs[rawSHA256]; !exists {
+					c.preferredRawSourceIDs[rawSHA256] = msgID
+				} else if canonical != msgID {
+					// An empty value marks a digest shared by distinct canonical
+					// messages. Secondary copies cannot safely choose either one.
+					c.preferredRawSourceIDs[rawSHA256] = ""
+				}
+			} else {
+				priorState, sameMailboxEpoch := c.priorFolderStates[mailbox]
+				if sameMailboxEpoch && priorState.UIDValidity == c.selectedUIDValidity {
+					canonicalSourceMessageID = c.sourceMessageAliases[msgID]
+				}
+				if canonicalSourceMessageID == "" {
+					canonicalSourceMessageID = c.preferredRawSourceIDs[rawSHA256]
+				}
+			}
+		}
+		c.recordMembershipLocked(
+			mailbox, msgBuf.UID, canonicalSourceMessageID, rfc822MessageID,
+			rawSHA256, msgBuf.RFC822Size, msgBuf.Flags)
+		if canonicalSourceMessageID != "" && canonicalSourceMessageID != msgID {
+			results[idx].Message = &gmailapi.RawMessage{ID: msgID}
+			results[idx].Err = nil
+			continue
 		}
 		if c.seenRFC822IDs != nil &&
 			rfc822MessageID != "" {
@@ -391,6 +423,9 @@ func (c *Client) applyLabelFetchResults(
 		results[idx].LabelIDs = mergeFlagLabels(
 			c.labelsForMessage(mailbox, rfc822MessageID), flagLabels)
 		results[idx].FlagLabels = flagLabels
+		c.recordMembershipLocked(
+			mailbox, msgBuf.UID, "", rfc822MessageID, [32]byte{}, 0, msgBuf.Flags)
+		results[idx].LabelIDs = c.labelsForMessage(mailbox, rfc822MessageID)
 		results[idx].RFC822MessageID = rfc822MessageID
 		results[idx].Err = nil
 	}
@@ -669,4 +704,11 @@ func (c *Client) IsPreferredSourceMessageID(messageID string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.allMailFolder != "" && mailbox == c.allMailFolder
+}
+
+// DefersAuthoritativeLabelReconciliation reports that complete IMAP mailbox
+// labels are committed by the post-sync mailbox-delta transaction. Syncer may
+// still merge labels for filtered or otherwise incomplete snapshots.
+func (c *Client) DefersAuthoritativeLabelReconciliation() bool {
+	return true
 }

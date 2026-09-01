@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,7 +15,10 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 )
 
-const settingsPath = "/api/v1/settings"
+const (
+	settingsPath         = "/api/v1/settings"
+	settingsGroupSources = "sources"
+)
 
 // SecretSettingState is the only representation of a secret returned to a
 // browser. The configured value never crosses the API boundary.
@@ -79,9 +83,10 @@ type settingDefinition struct {
 	// editing config.toml on the daemon host. Used for values that select
 	// daemon-side resources (such as environment variable names) which a
 	// remote session must never control.
-	localOnly bool
-	secret    func(*config.Config) bool
-	read      func(*config.Config) any
+	localOnly    bool
+	secret       func(*config.Config) bool
+	serverSecret func(context.Context, *Server, *config.Config) bool
+	read         func(*config.Config) any
 }
 
 var settingsCatalog = []settingDefinition{
@@ -99,22 +104,59 @@ var settingsCatalog = []settingDefinition{
 	stringSetting("vector.backend", "search", []string{"sqlite-vec", "pgvector"}, func(c *config.Config) string { return c.Vector.Backend }),
 	stringSetting("vector.db_path", "search", nil, func(c *config.Config) string { return c.Vector.DBPath }),
 	boolSetting("vector.skip_extension_create", "search", func(c *config.Config) bool { return c.Vector.SkipExtensionCreate }),
+	stringSetting("vector.embeddings.api_format", "search", []string{"openai", "voyage-contextual"}, func(c *config.Config) string {
+		return string(c.Vector.Embeddings.EffectiveAPIFormat())
+	}),
 	testableStringSetting("vector.embeddings.endpoint", "search", func(c *config.Config) string { return c.Vector.Embeddings.Endpoint }),
 	localOnlyStringSetting("vector.embeddings.api_key_env", "search", func(c *config.Config) string { return c.Vector.Embeddings.APIKeyEnv }),
 	stringSetting("vector.embeddings.model", "search", nil, func(c *config.Config) string { return c.Vector.Embeddings.Model }),
+	stringSetting("vector.embeddings.document_prefix", "search", nil, func(c *config.Config) string { return c.Vector.Embeddings.DocumentPrefix }),
+	stringSetting("vector.embeddings.query_prefix", "search", nil, func(c *config.Config) string { return c.Vector.Embeddings.QueryPrefix }),
 	intSetting("vector.embeddings.dimension", "search", func(c *config.Config) int { return c.Vector.Embeddings.Dimension }),
 	intSetting("vector.embeddings.batch_size", "search", func(c *config.Config) int { return c.Vector.Embeddings.BatchSize }),
 	intSetting("vector.embeddings.max_retries", "search", func(c *config.Config) int { return c.Vector.Embeddings.MaxRetries }),
 	intSetting("vector.embeddings.max_input_chars", "search", func(c *config.Config) int { return c.Vector.Embeddings.MaxInputChars }),
 	intSetting("vector.embeddings.eta_window", "search", func(c *config.Config) int { return c.Vector.Embeddings.ETAWindow }),
+	boolSetting("vector.people.enabled", "search", func(c *config.Config) bool { return c.Vector.People.Enabled }),
+	stringSetting("vector.people.retention_posture", "search", nil, func(c *config.Config) string {
+		return c.Vector.People.RetentionPosture
+	}),
+	stringSetting("vector.people.training_posture", "search", nil, func(c *config.Config) string {
+		return c.Vector.People.TrainingPosture
+	}),
 	stringSetting("vector.embed.schedule.cron", "search", nil, func(c *config.Config) string { return c.Vector.Embed.Schedule.Cron }),
 	boolSetting("vector.embed.schedule.run_after_sync", "search", func(c *config.Config) bool { return c.Vector.Embed.Schedule.RunAfterSync }),
 	stringArraySetting("vector.embed.scope.message_types", "search", func(c *config.Config) []string { return c.Vector.Embed.Scope.MessageTypes }),
+	stringArraySetting("vector.embed.scope.accounts", "search", func(c *config.Config) []string { return c.Vector.Embed.Scope.Accounts }),
+	boolSetting("vector.multimodal.enabled", "search", func(c *config.Config) bool { return c.Vector.Multimodal.Enabled }),
+	stringSetting("vector.multimodal.provider", "search", []string{"voyage"}, func(c *config.Config) string { return c.Vector.Multimodal.Provider }),
+	testableStringSetting("vector.multimodal.endpoint", "search", func(c *config.Config) string { return c.Vector.Multimodal.Endpoint }),
+	localOnlyStringSetting("vector.multimodal.api_key_env", "search", func(c *config.Config) string { return c.Vector.Multimodal.APIKeyEnv }),
+	localOnlyStringSetting("vector.multimodal.capabilities_file", "search", func(c *config.Config) string { return c.Vector.Multimodal.CapabilitiesFile }),
+	stringSetting("vector.multimodal.model", "search", []string{"voyage-multimodal-3.5"}, func(c *config.Config) string { return c.Vector.Multimodal.Model }),
+	intSetting("vector.multimodal.dimension", "search", func(c *config.Config) int { return c.Vector.Multimodal.Dimension }),
+	intSetting("vector.multimodal.max_context_chars", "search", func(c *config.Config) int { return c.Vector.Multimodal.MaxContextChars }),
+	// Configured (default-resolved) values, NOT the runtime-gated helpers:
+	// those return false whenever the lane is disabled, which would show
+	// default-enabled consent options as off and then silently activate
+	// them when only the parent switch is turned on.
+	boolSetting("vector.multimodal.include_images", "search", func(c *config.Config) bool { return c.Vector.Multimodal.ConfiguredImages() }),
+	boolSetting("vector.multimodal.include_animated_gifs", "search", func(c *config.Config) bool { return c.Vector.Multimodal.ConfiguredAnimatedGIFs() }),
+	boolSetting("vector.multimodal.include_video", "search", func(c *config.Config) bool { return c.Vector.Multimodal.ConfiguredVideo() }),
+	boolSetting("vector.multimodal.allow_image_queries", "search", func(c *config.Config) bool { return c.Vector.Multimodal.ConfiguredImageQueries() }),
+	stringArraySetting("vector.multimodal.scope.message_types", "search", func(c *config.Config) []string { return c.Vector.Multimodal.Scope.MessageTypes }),
+	stringSetting("vector.multimodal.schedule.cron", "search", nil, func(c *config.Config) string { return c.Vector.Multimodal.Schedule.Cron }),
+	boolSetting("vector.multimodal.schedule.run_after_sync", "search", func(c *config.Config) bool { return c.Vector.Multimodal.Schedule.RunAfterSync }),
 	intSetting("vector.search.rrf_k", "search", func(c *config.Config) int { return c.Vector.Search.RRFK }),
 	intSetting("vector.search.k_per_signal", "search", func(c *config.Config) int { return c.Vector.Search.KPerSignal }),
 	numberSetting("vector.search.subject_boost", "search", func(c *config.Config) float64 { return c.Vector.Search.SubjectBoost }),
-	boolSetting("beeper.enabled", "sources", func(c *config.Config) bool { return c.Beeper.Enabled }),
-	stringSetting("beeper.schedule", "sources", nil, func(c *config.Config) string { return c.Beeper.Schedule }),
+	boolSetting("beeper.enabled", settingsGroupSources, func(c *config.Config) bool { return c.Beeper.Enabled }),
+	stringSetting("beeper.schedule", settingsGroupSources, nil, func(c *config.Config) string { return c.Beeper.Schedule }),
+	readOnlyStringSetting("carddav.base_url", settingsGroupSources, func(c *config.Config) string { return c.CardDAV.BaseURL }),
+	readOnlyStringSetting("carddav.username", settingsGroupSources, func(c *config.Config) string { return c.CardDAV.Username }),
+	readOnlyStringSetting("carddav.schedule", settingsGroupSources, func(c *config.Config) string { return c.CardDAV.Schedule }),
+	readOnlyBoolSetting("carddav.enabled", settingsGroupSources, func(c *config.Config) bool { return c.CardDAV.Enabled }),
+	readOnlyCardDAVSecretSetting(),
 	boolSetting("integrations.tasks.enabled", "integrations", func(c *config.Config) bool { return c.Integrations.Tasks.Enabled }),
 	testableStringSetting("integrations.tasks.endpoint", "integrations", func(c *config.Config) string { return c.Integrations.Tasks.Endpoint }),
 	secretSetting("integrations.tasks.api_key", "integrations", func(c *config.Config) bool { return c.Integrations.Tasks.APIKey != "" }),
@@ -129,8 +171,8 @@ func (s *Server) registerSettingsRoutes(api huma.API) {
 
 	patch := rawAPIV1Operation("patchSettings", http.MethodPatch, "/settings", "Update browser-managed settings")
 	patch.Parameters = append(patch.Parameters, &huma.Param{
-		Name:        "If-Match",
-		In:          "header",
+		Name:        ifMatchHeaderName,
+		In:          headerParamLocation,
 		Description: "Strong ETag returned by the latest settings read",
 		Required:    true,
 		Schema:      &huma.Schema{Type: huma.TypeString},
@@ -152,7 +194,7 @@ func (s *Server) registerSettingsRoutes(api huma.API) {
 
 func addSettingsETagHeader(response *huma.Response) {
 	response.Headers = map[string]*huma.Param{
-		"ETag": {
+		etagHeaderName: {
 			Description: "Strong content hash for optimistic concurrency",
 			Schema:      &huma.Schema{Type: huma.TypeString},
 		},
@@ -173,6 +215,26 @@ func localOnlyStringSetting(key, group string, read func(*config.Config) string)
 	definition := stringSetting(key, group, nil, read)
 	definition.localOnly = true
 	return definition
+}
+
+func readOnlyStringSetting(key, group string, read func(*config.Config) string) settingDefinition {
+	return localOnlyStringSetting(key, group, read)
+}
+
+func readOnlyBoolSetting(key, group string, read func(*config.Config) bool) settingDefinition {
+	definition := boolSetting(key, group, read)
+	definition.localOnly = true
+	return definition
+}
+
+func readOnlyCardDAVSecretSetting() settingDefinition {
+	return settingDefinition{
+		key: "carddav.password", group: settingsGroupSources, kind: "secret", localOnly: true,
+		serverSecret: func(ctx context.Context, s *Server, c *config.Config) bool {
+			return s != nil && s.cardDAV != nil &&
+				s.cardDAV.passwordConfigured(ctx, c.CardDAV.BaseURL, c.CardDAV.Username)
+		},
+	}
 }
 
 func intSetting(key, group string, read func(*config.Config) int) settingDefinition {
@@ -203,19 +265,19 @@ func settingsDefinitionByKey() map[string]settingDefinition {
 	return result
 }
 
-func (s *Server) handleGetSettings(w http.ResponseWriter, _ *http.Request) {
+func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 	snapshot, cfg, err := s.readPersistedSettings()
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "settings_read_failed", err.Error())
 		return
 	}
-	w.Header().Set("ETag", snapshot.ETag)
+	w.Header().Set(etagHeaderName, snapshot.ETag)
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, buildSettingsResponse(cfg, s.settingsPendingRestart.Load()))
+	writeJSON(w, http.StatusOK, s.buildSettingsResponse(r.Context(), cfg, s.settingsPendingRestart.Load()))
 }
 
 func (s *Server) handlePatchSettings(w http.ResponseWriter, r *http.Request) {
-	ifMatches := r.Header.Values("If-Match")
+	ifMatches := r.Header.Values(ifMatchHeaderName)
 	if len(ifMatches) != 1 || strings.TrimSpace(ifMatches[0]) == "" {
 		writeError(w, http.StatusPreconditionRequired, "if_match_required", "If-Match is required")
 		return
@@ -284,9 +346,9 @@ func (s *Server) handlePatchSettings(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "settings_read_failed", err.Error())
 		return
 	}
-	w.Header().Set("ETag", snapshot.ETag)
+	w.Header().Set(etagHeaderName, snapshot.ETag)
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, buildSettingsResponse(loaded, true))
+	writeJSON(w, http.StatusOK, s.buildSettingsResponse(r.Context(), loaded, true))
 }
 
 func (s *Server) readPersistedSettings() (config.ConfigFile, *config.Config, error) {
@@ -304,7 +366,7 @@ func (s *Server) readPersistedSettings() (config.ConfigFile, *config.Config, err
 	return snapshot, loaded, nil
 }
 
-func buildSettingsResponse(cfg *config.Config, pendingRestart bool) SettingsResponse {
+func (s *Server) buildSettingsResponse(ctx context.Context, cfg *config.Config, pendingRestart bool) SettingsResponse {
 	settings := make([]Setting, 0, len(settingsCatalog))
 	for _, definition := range settingsCatalog {
 		setting := Setting{
@@ -316,7 +378,9 @@ func buildSettingsResponse(cfg *config.Config, pendingRestart bool) SettingsResp
 			Testable:        definition.testable,
 			ReadOnly:        definition.localOnly,
 		}
-		if definition.secret != nil {
+		if definition.serverSecret != nil {
+			setting.Secret = &SecretSettingState{Configured: definition.serverSecret(ctx, s, cfg)}
+		} else if definition.secret != nil {
 			setting.Secret = &SecretSettingState{Configured: definition.secret(cfg)}
 		} else {
 			setting.Value = settingValue(definition.kind, definition.read(cfg))
@@ -350,6 +414,12 @@ var credentialBindings = []credentialBinding{
 		credentialKey:   "vector.embeddings.api_key_env",
 		currentEndpoint: func(c *config.Config) string { return c.Vector.Embeddings.Endpoint },
 		credentialSet:   func(c *config.Config) bool { return c.Vector.Embeddings.APIKeyEnv != "" },
+	},
+	{
+		endpointKey:     "vector.multimodal.endpoint",
+		credentialKey:   "vector.multimodal.api_key_env",
+		currentEndpoint: func(c *config.Config) string { return c.Vector.Multimodal.Endpoint },
+		credentialSet:   func(c *config.Config) bool { return c.Vector.Multimodal.APIKeyEnv != "" },
 	},
 }
 

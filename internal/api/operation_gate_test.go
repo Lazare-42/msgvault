@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/personenrichment"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/query/querytest"
 	"go.kenn.io/msgvault/internal/store"
@@ -218,6 +219,35 @@ func TestOperationGateMiddlewareStillGatesMutatingCLIRun(t *testing.T) {
 	assert.Equal(1, done, "done calls")
 }
 
+func TestOperationGateMiddlewareStillGatesMutatingDocumentCommands(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"build", `{"args":["documents","build","--capabilities","manifest.json"]}`},
+		{"consent", `{"args":["documents","consent-mistral","--yes"]}`},
+		{"retry", `{"args":["documents","retry","--hash","abc"]}`},
+		{"retire", `{"args":["documents","retire","profile","--yes"]}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gate := &recordingOperationGate{allow: true}
+			handler := operationGateMiddleware(gate, nil)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusNoContent)
+			}))
+
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/run", strings.NewReader(tc.body))
+			resp := httptest.NewRecorder()
+			handler.ServeHTTP(resp, req)
+
+			assert.Equal(t, http.StatusNoContent, resp.Code)
+			begin, done := gate.counts()
+			assert.Equal(t, 1, begin)
+			assert.Equal(t, 1, done)
+		})
+	}
+}
+
 func TestOperationGateMiddlewareGatesMessageExport(t *testing.T) {
 	assert := assert.New(t)
 	gate := &recordingOperationGate{allow: true}
@@ -302,6 +332,172 @@ func TestOperationGateMiddlewareStopsWaitingWhenRequestContextCancels(t *testing
 	default:
 	}
 	assert.Equal(http.StatusServiceUnavailable, resp.Code, "status")
+}
+
+type parkedContext struct {
+	context.Context
+
+	parked chan struct{}
+	once   sync.Once
+}
+
+func (c *parkedContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.parked) })
+	return c.Context.Done()
+}
+
+func waitForParkedContext(t *testing.T, parked <-chan struct{}, work string) {
+	t.Helper()
+	select {
+	case <-parked:
+	case <-time.After(time.Second):
+		require.FailNowf(t, "operation gate wait timed out", "%s did not park on the operation gate", work)
+	}
+}
+
+func TestServerBackgroundOperationGateStopsWhenContextCancelsBehindRequest(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	gate := NewSerialOperationGate()
+	srv := &Server{operationGate: gate}
+	activeRelease, ok := gate.BeginLabeledWorkContext(context.Background(), "active work")
+	require.True(ok, "hold gate")
+	requestCtx, requestCancel := context.WithCancel(context.Background())
+	requestParked := make(chan struct{})
+	requestResult := make(chan bool, 1)
+	go func() {
+		release, acquired := gate.BeginRequestWorkContext(&parkedContext{
+			Context: requestCtx,
+			parked:  requestParked,
+		}, "queued request")
+		if acquired {
+			release()
+		}
+		requestResult <- acquired
+	}()
+	waitForParkedContext(t, requestParked, "request")
+
+	backgroundCtx, backgroundCancel := context.WithCancel(context.Background())
+	backgroundParked := make(chan struct{})
+	backgroundResult := make(chan bool, 1)
+	go func() {
+		release, acquired := srv.beginBackgroundOperationGateWork(&parkedContext{
+			Context: backgroundCtx,
+			parked:  backgroundParked,
+		}, "background work")
+		if acquired {
+			release()
+		}
+		backgroundResult <- acquired
+	}()
+	waitForParkedContext(t, backgroundParked, "background work")
+
+	backgroundCancel()
+	select {
+	case acquired := <-backgroundResult:
+		assert.False(acquired, "parked background work must escape after context cancellation")
+	case <-time.After(time.Second):
+		require.FailNow("background acquisition did not return after context cancellation")
+	}
+
+	requestCancel()
+	select {
+	case acquired := <-requestResult:
+		assert.False(acquired, "request cleanup should release its waiter")
+	case <-time.After(time.Second):
+		require.FailNow("request waiter did not clean up")
+	}
+	activeRelease()
+	assert.False(gate.HasRequestWaiters(), "request waiter must be removed after cancellation")
+}
+
+func TestServerBackgroundOperationGateStopsWhenDrainStartsBehindRequest(t *testing.T) {
+	tests := []struct {
+		name       string
+		startDrain func(*SerialOperationGate) <-chan error
+	}{
+		{
+			name: "StartDrain",
+			startDrain: func(gate *SerialOperationGate) <-chan error {
+				gate.StartDrain()
+				return nil
+			},
+		},
+		{
+			name: "Drain",
+			startDrain: func(gate *SerialOperationGate) <-chan error {
+				done := make(chan error, 1)
+				go func() { done <- gate.Drain(context.Background()) }()
+				return done
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+
+			gate := NewSerialOperationGate()
+			srv := &Server{operationGate: gate}
+			activeRelease, ok := gate.BeginLabeledWorkContext(context.Background(), "active work")
+			require.True(ok, "hold gate")
+			requestCtx, requestCancel := context.WithCancel(context.Background())
+			requestParked := make(chan struct{})
+			requestResult := make(chan bool, 1)
+			go func() {
+				release, acquired := gate.BeginRequestWorkContext(&parkedContext{
+					Context: requestCtx,
+					parked:  requestParked,
+				}, "queued request")
+				if acquired {
+					release()
+				}
+				requestResult <- acquired
+			}()
+			waitForParkedContext(t, requestParked, "request")
+
+			backgroundCtx := context.Background()
+			backgroundParked := make(chan struct{})
+			backgroundResult := make(chan bool, 1)
+			go func() {
+				release, acquired := srv.beginBackgroundOperationGateWork(&parkedContext{
+					Context: backgroundCtx,
+					parked:  backgroundParked,
+				}, "background work")
+				if acquired {
+					release()
+				}
+				backgroundResult <- acquired
+			}()
+			waitForParkedContext(t, backgroundParked, "background work")
+
+			drainDone := tt.startDrain(gate)
+			select {
+			case acquired := <-backgroundResult:
+				assert.False(acquired, "parked background work must escape when drain starts")
+			case <-time.After(time.Second):
+				require.FailNow("background acquisition did not return after drain started")
+			}
+			select {
+			case acquired := <-requestResult:
+				assert.False(acquired, "queued request must be rejected during drain")
+			case <-time.After(time.Second):
+				require.FailNow("request waiter did not return after drain started")
+			}
+
+			requestCancel()
+			activeRelease()
+			if drainDone != nil {
+				select {
+				case err := <-drainDone:
+					require.NoError(err, "drain")
+				case <-time.After(time.Second):
+					require.FailNow("drain did not finish after active work released")
+				}
+			}
+		})
+	}
 }
 
 func TestSerialOperationGateDrainRejectsQueuedWorkAndWaitsForActive(t *testing.T) {
@@ -392,6 +588,8 @@ func TestOperationGateMiddlewareSkipsReadOnlyCLIRunCommands(t *testing.T) {
 		body string
 	}{
 		{"embeddings list", `{"args":["embeddings","list"]}`},
+		{"documents search", `{"args":["documents","search","shipping damage"]}`},
+		{"documents status", `{"args":["documents","status","--capabilities","manifest.json"]}`},
 		{"list-deletions", `{"args":["list-deletions"]}`},
 		{"show-deletion with id", `{"args":["show-deletion","batch-123"]}`},
 	}
@@ -474,15 +672,17 @@ func TestOperationGateMiddlewareSkipsReadOnlyAnalyticalPosts(t *testing.T) {
 		"/api/v1/explore/files",
 		"/api/v1/files/search",
 		"/api/v1/files/groups",
-		"/api/v1/people/search",
-		"/api/v1/people/7/summary",
-		"/api/v1/people/7/timeline",
+		"/api/v1/participants/search",
+		"/api/v1/participants/7/summary",
+		"/api/v1/participants/7/timeline",
+		"/api/v1/participants/7/files/search",
 		"/api/v1/people/7/files/search",
 		"/api/v1/domains/search",
 		"/api/v1/domains/example.com/summary",
 		"/api/v1/domains/example.com/timeline",
 		"/api/v1/domains/example.com/files/search",
 		"/api/v1/relationships",
+		"/api/v1/relationships/7/calendar",
 		"/api/v1/relationships/7/timeline",
 		"/api/v1/search/coverage",
 	}
@@ -508,14 +708,40 @@ func TestOperationGateMiddlewareSkipsReadOnlyAnalyticalPosts(t *testing.T) {
 	}
 }
 
+func TestOperationGateMiddlewareSkipsCardDAVAccountTestWhileGateHeld(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	oldLimit := operationGateWaitLimit
+	operationGateWaitLimit = 20 * time.Millisecond
+	t.Cleanup(func() { operationGateWaitLimit = oldLimit })
+
+	gate := NewSerialOperationGate()
+	release, ok := gate.BeginLabeledWorkContext(context.Background(), "msgvault sync")
+	require.True(ok, "occupy operation gate")
+	defer release()
+
+	called := false
+	handler := operationGateMiddleware(gate, nil)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	req := httptest.NewRequest(http.MethodPost, cardDAVAccountTestPath, strings.NewReader(`{}`))
+	resp := httptest.NewRecorder()
+	handler.ServeHTTP(resp, req)
+
+	assert.True(called, "CardDAV connection test should bypass the held operation gate")
+	assert.Equal(http.StatusNoContent, resp.Code, "status")
+}
+
 // TestReadOnlyPostRoutePatternsMatchExplorationRoutes pins the gate's
 // read-only POST table to the registered analytical routes: every POST
 // operation tagged "Exploration" (registerExploreRoute and the search
 // coverage route) must be classified read-only, and the table must not
-// carry stale entries for routes that no longer exist. The remote-image
-// proxy is the one pinned non-Exploration entry — POST purely for the CSRF
-// unsafe-method machinery, reading no archive state — and it must remain a
-// registered POST route for its table entry to stay valid.
+// carry stale entries for routes that no longer exist. The remote-image proxy,
+// CardDAV account test, and participant completion endpoint are the pinned
+// non-Exploration entries. All three must remain registered POST routes for
+// their table entries to stay valid.
 func TestReadOnlyPostRoutePatternsMatchExplorationRoutes(t *testing.T) {
 	require := require.New(t)
 	doc := OpenAPIDocument()
@@ -523,8 +749,16 @@ func TestReadOnlyPostRoutePatternsMatchExplorationRoutes(t *testing.T) {
 	require.NotNil(remoteImage, "remote-image proxy route must exist")
 	require.NotNil(remoteImage.Post, "remote-image proxy must be registered as POST")
 	require.Nil(remoteImage.Get, "remote-image proxy must not be reachable via GET")
+	cardDAVAccountTest := doc.Paths[cardDAVAccountTestPath]
+	require.NotNil(cardDAVAccountTest, "CardDAV account test route must exist")
+	require.NotNil(cardDAVAccountTest.Post, "CardDAV account test must be registered as POST")
+	require.Nil(cardDAVAccountTest.Get, "CardDAV account test must not be reachable via GET")
+	completionPath := "/api/v1/participants/completions"
+	completion := doc.Paths[completionPath]
+	require.NotNil(completion, "participant completion route must exist")
+	require.NotNil(completion.Post, "participant completion must be registered as POST")
 
-	expected := []string{remoteImagePath}
+	expected := []string{remoteImagePath, cardDAVAccountTestPath, completionPath}
 	for path, item := range doc.Paths {
 		if item.Post != nil && slices.Contains(item.Post.Tags, "Exploration") {
 			expected = append(expected, path)
@@ -535,7 +769,8 @@ func TestReadOnlyPostRoutePatternsMatchExplorationRoutes(t *testing.T) {
 	slices.Sort(table)
 	assert.Equal(t, expected, table,
 		"readOnlyPostRoutePatterns must match the POST routes tagged Exploration plus the "+
-			"remote-image proxy; classify new analytical routes consciously in operation_gate.go")
+			"pinned read-only POST routes; classify new analytical routes consciously in "+
+			"operation_gate.go")
 }
 
 // gateAnalyticsEngine backs the read-only analytical routes with minimal
@@ -600,8 +835,16 @@ func (e *gateAnalyticsEngine) RelationshipTimeline(context.Context, query.Relati
 	return &query.RelationshipTimelineResponse{}, nil
 }
 
+func (e *gateAnalyticsEngine) RelationshipCalendar(context.Context, query.RelationshipCalendarRequest) (*query.RelationshipCalendarResponse, error) {
+	return &query.RelationshipCalendarResponse{}, nil
+}
+
 func (e *gateAnalyticsEngine) ResolveCanonicalParticipant(_ context.Context, id int64) (int64, error) {
 	return id, nil
+}
+
+func (e *gateAnalyticsEngine) ListPersonInboxes(context.Context, query.PersonInboxRequest) (*query.PersonInboxResponse, error) {
+	return &query.PersonInboxResponse{Rows: []query.PersonInboxRow{}, CacheRevision: "rev"}, nil
 }
 
 func (e *gateAnalyticsEngine) SearchFiles(context.Context, query.FileSearchRequest) (*query.FileSearchResponse, error) {
@@ -651,9 +894,9 @@ func TestServerReadOnlyAnalyticalPostsBypassHeldOperationGate(t *testing.T) {
 	readOnly := []string{
 		"/api/v1/explore",
 		"/api/v1/relationships",
-		"/api/v1/people/search",
+		"/api/v1/participants/search",
 		"/api/v1/files/search",
-		"/api/v1/people/7/summary",
+		"/api/v1/participants/7/summary",
 	}
 	for _, path := range readOnly {
 		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
@@ -672,6 +915,26 @@ func TestServerReadOnlyAnalyticalPostsBypassHeldOperationGate(t *testing.T) {
 	require.NoError(json.Unmarshal(resp.Body.Bytes(), &errResp), "decode error envelope")
 	assert.Equal("operation_in_progress", errResp.Error, "error code")
 	assert.Contains(errResp.Message, "msgvault embeddings build", "message names the holder")
+}
+
+func TestServerParticipantInboxesBypassesHeldOperationGate(t *testing.T) {
+	gate := NewSerialOperationGate()
+	release, ok := gate.BeginLabeledWorkContext(context.Background(), "msgvault embeddings build")
+	require.True(t, ok, "occupy gate")
+	defer release()
+
+	srv := NewServerWithOptions(ServerOptions{
+		Config:        &config.Config{Server: config.ServerConfig{APIPort: 8080}},
+		Store:         &gateFilesStore{mockStore: &mockStore{}},
+		Engine:        &gateAnalyticsEngine{MockEngine: &querytest.MockEngine{}},
+		Logger:        testLogger(),
+		OperationGate: gate,
+	})
+	response := httptest.NewRecorder()
+	srv.Router().ServeHTTP(response, httptest.NewRequest(
+		http.MethodGet, "/api/v1/participants/7/inboxes", nil))
+
+	assert.Equal(t, http.StatusOK, response.Code, response.Body.String())
 }
 
 func TestOperationGateMiddlewareNamesHolderWhenBusy(t *testing.T) {
@@ -772,6 +1035,69 @@ func TestSerialOperationGateCountsRequestWaiters(t *testing.T) {
 	assert.False(gate.HasRequestWaiters(), "waiter count returns to zero")
 }
 
+func TestSerialOperationGatePrioritizesQueuedRequestOverBackgroundWork(t *testing.T) {
+	require := require.New(t)
+
+	gate := NewSerialOperationGate()
+	releaseActive, ok := gate.BeginLabeledWorkContext(context.Background(), "first scheduled sync")
+	require.True(ok, "occupy gate")
+	t.Cleanup(releaseActive)
+
+	type acquisition struct {
+		release func()
+		ok      bool
+	}
+	requestAcquired := make(chan acquisition, 1)
+	go func() {
+		release, acquired := gate.BeginRequestWorkContext(context.Background(), "meeting import")
+		requestAcquired <- acquisition{release: release, ok: acquired}
+	}()
+	require.Eventually(gate.HasRequestWaiters, time.Second, time.Millisecond,
+		"request must register before the next background admission")
+
+	backgroundAcquired := make(chan acquisition, 1)
+	go func() {
+		release, acquired := gate.BeginLabeledWorkContext(context.Background(), "manual sync")
+		backgroundAcquired <- acquisition{release: release, ok: acquired}
+	}()
+
+	select {
+	case result := <-backgroundAcquired:
+		if result.ok {
+			result.release()
+		}
+		require.FailNow("background work returned while the gate was held", "ok=%v", result.ok)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	releaseActive()
+	var request acquisition
+	select {
+	case request = <-requestAcquired:
+		require.True(request.ok, "queued request must acquire after active work releases")
+	case <-time.After(time.Second):
+		require.FailNow("queued request did not acquire after active work released")
+	}
+	select {
+	case result := <-backgroundAcquired:
+		if result.ok {
+			result.release()
+		}
+		require.FailNow("background work acquired before the request released", "ok=%v", result.ok)
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	request.release()
+	select {
+	case background := <-backgroundAcquired:
+		require.True(background.ok, "background work waits and then acquires")
+		background.release()
+	case <-time.After(time.Second):
+		require.FailNow("background work did not acquire after the request released")
+	}
+	require.False(gate.HasRequestWaiters(), "request waiter drains")
+}
+
 func TestBeginLabeledOperationGateWorkCountsAsRequestWaiter(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -807,14 +1133,25 @@ func TestCLIRunEnvAllowedPermitsConfiguredAPIKeyEnv(t *testing.T) {
 	assert := assert.New(t)
 	srv := &Server{cfg: &config.Config{}}
 	srv.cfg.Vector.Embeddings.APIKeyEnv = "MSGVAULT_EMBED_API_KEY"
+	srv.cfg.Attachments.Documents.APIKeyEnv = "MSGVAULT_DOCUMENT_API_KEY"
+	srv.cfg.People.Enrichment.SuppressionKeyEnv = "MSGVAULT_ENRICHMENT_SUPPRESSION_KEY"
+	srv.cfg.People.Enrichment.Providers = []personenrichment.ProviderConfig{{
+		APIKeyEnv: "MSGVAULT_EXA_API_KEY",
+	}}
 
 	assert.True(srv.cliRunEnvAllowed("MSGVAULT_IMAP_PASSWORD"), "static allowlist entry")
-	assert.True(srv.cliRunEnvAllowed("MSGVAULT_EMBED_API_KEY"), "configured api_key_env")
+	assert.True(srv.cliRunEnvAllowed("MSGVAULT_EMBED_API_KEY"), "configured embedding api_key_env")
+	assert.True(srv.cliRunEnvAllowed("MSGVAULT_DOCUMENT_API_KEY"), "configured document api_key_env")
+	assert.True(srv.cliRunEnvAllowed("MSGVAULT_ENRICHMENT_SUPPRESSION_KEY"),
+		"configured enrichment suppression key")
+	assert.True(srv.cliRunEnvAllowed("MSGVAULT_EXA_API_KEY"), "configured enrichment provider key")
 	assert.False(srv.cliRunEnvAllowed("PATH"), "arbitrary env stays rejected")
 
 	unconfigured := &Server{cfg: &config.Config{}}
 	assert.False(unconfigured.cliRunEnvAllowed("MSGVAULT_EMBED_API_KEY"),
 		"key env rejected when not configured")
+	assert.False(unconfigured.cliRunEnvAllowed("MSGVAULT_DOCUMENT_API_KEY"),
+		"document key env rejected when not configured")
 }
 
 func healthResponseForServer(t *testing.T, srv *Server) HealthResponse {

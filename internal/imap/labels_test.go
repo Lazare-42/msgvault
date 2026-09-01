@@ -201,3 +201,7 @@ func TestMergeFlagLabels(t *testing.T) {
 		})
 	}
 }
+func TestSystemRoleForMailboxTrustsSpecialUseNotName(t *testing.T) {
+	assert.Equal(t, "sent", systemRoleForMailbox([]imap.MailboxAttr{imap.MailboxAttrSent}))
+	assert.Empty(t, systemRoleForMailbox(nil), "a folder name is not part of role classification")
+}

@@ -7,8 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
@@ -36,6 +39,8 @@ type CLICacheStats = cacheops.CacheStats
 type CLISyncRequest struct {
 	Full        bool
 	Email       string
+	SourceID    int64
+	SourceIDSet bool
 	Query       string
 	NoResume    bool
 	Before      string
@@ -53,9 +58,10 @@ type CLIVerifyRequest struct {
 }
 
 type CLIRunRequest struct {
-	Args []string          `json:"args"`
-	Env  map[string]string `json:"env,omitempty"`
-	Cwd  string            `json:"cwd,omitempty"`
+	Args         []string          `json:"args"`
+	Env          map[string]string `json:"env,omitempty"`
+	Cwd          string            `json:"cwd,omitempty"`
+	GrantDecided bool              `json:"-"`
 }
 
 type CLIAddCalendarPlanRequest struct {
@@ -93,6 +99,7 @@ type CLIDeleteStagedPlanRequest struct {
 	DryRun              bool   `json:"dry_run,omitempty"`
 	List                bool   `json:"list,omitempty"`
 	Account             string `json:"account,omitempty"`
+	SourceID            *int64 `json:"source_id,omitempty"`
 	RemoteDeleteEnabled bool   `json:"remote_delete_enabled,omitempty"`
 }
 
@@ -103,6 +110,7 @@ type CLIDeleteStagedPlan struct {
 	ConfirmationMode          string   `json:"confirmation_mode,omitempty"`
 	PlannedBatchIDs           []string `json:"planned_batch_ids,omitempty"`
 	PlanFingerprint           string   `json:"plan_fingerprint,omitempty"`
+	ResolvedSourceID          *int64   `json:"resolved_source_id,omitempty"`
 	NeedsScopeEscalation      bool     `json:"needs_scope_escalation,omitempty"`
 	ScopeEscalationHeadline   string   `json:"scope_escalation_headline,omitempty"`
 	ScopeEscalationBodyLines  []string `json:"scope_escalation_body_lines,omitempty"`
@@ -149,12 +157,13 @@ type CLIInitDB struct {
 }
 
 type CLISearchRequest struct {
-	Query        string
-	Account      string
-	Collection   string
-	MessageTypes []string
-	Limit        int
-	Offset       int
+	Query         string
+	Account       string
+	Collection    string
+	DeletionScope string
+	MessageTypes  []string
+	Limit         int
+	Offset        int
 }
 
 type CLISearch struct {
@@ -175,6 +184,7 @@ type CLIHybridSearchRequest struct {
 	Account        string
 	Collection     string
 	MessageTypes   []string
+	Filter         query.MessageFilter
 	Mode           string
 	Limit          int
 	Offset         int
@@ -201,6 +211,7 @@ type CLIHybridGeneration struct {
 }
 
 type CLIHybridSearchResult struct {
+	Message          query.MessageSummary
 	ID               int64
 	Subject          string
 	FromEmail        string
@@ -294,13 +305,25 @@ type CLIIdentityRow struct {
 type CLIIdentitiesRequest struct {
 	Account     string
 	Collection  string
+	SourceID    int64
+	SourceIDSet bool
 	PrimaryOnly bool
 }
 
+type CLIIdentitySourceSelector = identityops.SourceSelector
 type CLIIdentityAddRequest = identityops.AddRequest
 type CLIIdentityAddResult = identityops.AddResult
 type CLIIdentityRemoveRequest = identityops.RemoveRequest
 type CLIIdentityRemoveResult = identityops.RemoveResult
+type CLIIdentityImportRequest = identityops.ImportRequest
+type CLIIdentityImportResult = identityops.ImportResult
+
+func optionalCLIIdentitySourceID(sourceID int64, isSet bool) *int64 {
+	if sourceID == 0 && !isSet {
+		return nil
+	}
+	return &sourceID
+}
 
 type CLIDeleteDedupedRequest struct {
 	BatchIDs           []string
@@ -386,12 +409,18 @@ func (c *Client) RunCLISync(
 	req CLISyncRequest,
 	output func(stream, data string) error,
 ) error {
+	if req.SourceIDSet {
+		if err := c.requireSourceIDSyncCapability(ctx); err != nil {
+			return err
+		}
+	}
 	path := "/api/v1/cli/sync"
 	if req.Full {
 		path = "/api/v1/cli/sync-full"
 		return c.runCLIStream(ctx, path, "sync", &generated.SyncFullCLIRequestOptions{
 			Query: &generated.SyncFullCLIQuery{
 				Email:      optionalString(req.Email),
+				SourceID:   optionalCLIIdentitySourceID(req.SourceID, req.SourceIDSet),
 				Query:      optionalString(req.Query),
 				Noresume:   optionalBool(req.NoResume),
 				Before:     optionalString(req.Before),
@@ -405,10 +434,84 @@ func (c *Client) RunCLISync(
 	return c.runCLIStream(ctx, path, "sync", &generated.SyncCLIRequestOptions{
 		Query: &generated.SyncCLIQuery{
 			Email:      optionalString(req.Email),
+			SourceID:   optionalCLIIdentitySourceID(req.SourceID, req.SourceIDSet),
 			Folder:     req.Folders,
 			SkipFolder: req.SkipFolders,
 		},
 	}, output)
+}
+
+const (
+	sourceIDSyncMinAPISchemaVersion   = "2.4.0"
+	searchDeletionMinAPISchemaVersion = "2.12.0"
+)
+
+func (c *Client) requireSourceIDSyncCapability(ctx context.Context) error {
+	version, err := c.daemonAPISchemaVersion(ctx)
+	if err != nil {
+		return fmt.Errorf("check daemon source-ID sync capability: %w", err)
+	}
+	if !apiSchemaVersionAtLeast(version, sourceIDSyncMinAPISchemaVersion) {
+		return fmt.Errorf(
+			"source-ID sync requires daemon API schema %s or newer (daemon reports %q)",
+			sourceIDSyncMinAPISchemaVersion, version,
+		)
+	}
+	return nil
+}
+
+func (c *Client) daemonAPISchemaVersion(ctx context.Context) (string, error) {
+	resp, err := APIResponse(c, func(client *apiclient.Client) (*generated.GetHealthResp, error) {
+		return client.GetHealthWithResponse(ctx)
+	})
+	if err != nil {
+		return "", err
+	}
+	version := ""
+	if resp.JSON200 != nil && resp.JSON200.APISchemaVersion != nil {
+		version = *resp.JSON200.APISchemaVersion
+	}
+	return version, nil
+}
+
+// SupportsAPISchemaVersion reports whether the daemon implements at least the
+// requested additive HTTP contract. Missing and malformed versions fail
+// closed, as do health-probe errors.
+func (c *Client) SupportsAPISchemaVersion(ctx context.Context, minimum string) (bool, error) {
+	version, err := c.daemonAPISchemaVersion(ctx)
+	if err != nil {
+		return false, err
+	}
+	return apiSchemaVersionAtLeast(version, minimum), nil
+}
+
+func apiSchemaVersionAtLeast(version, minimum string) bool {
+	parse := func(raw string) ([3]int, bool) {
+		var parsed [3]int
+		parts := strings.Split(raw, ".")
+		if len(parts) != len(parsed) {
+			return parsed, false
+		}
+		for i, part := range parts {
+			value, err := strconv.Atoi(part)
+			if err != nil || value < 0 {
+				return parsed, false
+			}
+			parsed[i] = value
+		}
+		return parsed, true
+	}
+	got, gotOK := parse(version)
+	want, wantOK := parse(minimum)
+	if !gotOK || !wantOK {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return got[i] > want[i]
+		}
+	}
+	return true
 }
 
 func (c *Client) RunCLIVerify(
@@ -439,8 +542,77 @@ func (c *Client) RunCLICommand(
 	req CLIRunRequest,
 	output func(stream, data string) error,
 ) error {
+	if req.GrantDecided {
+		if c.localDaemonToken == "" {
+			return errors.New("grant preflight proof is unavailable for this daemon")
+		}
+		ctx = context.WithValue(ctx, grantDecisionContextKey{}, true)
+	}
 	body := generated.RunCLIBody{Args: req.Args, Env: req.Env, Cwd: optionalString(req.Cwd)}
 	return c.runCLIStream(ctx, "/api/v1/cli/run", "run", &generated.RunCLIRequestOptions{Body: &body}, output)
+}
+
+func (c *Client) DiscoverCLIIdentities(
+	ctx context.Context,
+	req identityops.DiscoverRequest,
+	onEvent func(identityops.DiscoverEvent) error,
+) error {
+	resp, err := c.openCLIStream(
+		ctx,
+		"/api/v1/cli/identities/discover",
+		&generated.DiscoverCLIIdentitiesRequestOptions{Body: cliIdentityDiscoverBodyFromRequest(req)},
+	)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	seenResult := false
+	decoder := json.NewDecoder(resp.Body)
+	for {
+		var generatedEvent generated.DiscoverEvent
+		err := decoder.Decode(&generatedEvent)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("decode CLI identity discovery stream: %w", err)
+		}
+		event := cliIdentityDiscoverEventFromGenerated(generatedEvent)
+		switch event.Type {
+		case "progress":
+			if seenResult {
+				return errors.New("identity discovery progress arrived after result")
+			}
+		case "result":
+			if seenResult {
+				return errors.New("identity discovery stream returned multiple results")
+			}
+			if event.Result == nil {
+				return errors.New("identity discovery result event has no result")
+			}
+			seenResult = true
+		case "error":
+			if seenResult {
+				return errors.New("identity discovery error arrived after result")
+			}
+			if event.Error == nil || event.Error.Code == "" || event.Error.Message == "" {
+				return errors.New("identity discovery error event is malformed")
+			}
+			return event.Error
+		default:
+			return fmt.Errorf("unknown identity discovery event type %q", event.Type)
+		}
+		if onEvent != nil {
+			if err := onEvent(event); err != nil {
+				return err
+			}
+		}
+	}
+	if !seenResult {
+		return errors.New("identity discovery stream ended without result")
+	}
+	return nil
 }
 
 func (c *Client) PlanCLIAddCalendar(
@@ -486,6 +658,7 @@ func (c *Client) PlanCLIDeleteStaged(
 ) (*CLIDeleteStagedPlan, error) {
 	body := generated.PlanCLIDeleteStagedBody{
 		Account:             optionalString(req.Account),
+		SourceID:            req.SourceID,
 		BatchID:             optionalString(req.BatchID),
 		DryRun:              optionalBool(req.DryRun),
 		List:                optionalBool(req.List),
@@ -508,6 +681,18 @@ func (c *Client) CreateCLIDeletionManifest(
 ) (*CLIDeletionManifestResult, error) {
 	if manifest == nil {
 		return nil, errors.New("missing deletion manifest")
+	}
+	if manifest.Version == 2 {
+		version, err := c.daemonAPISchemaVersion(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("check daemon deletion manifest capability: %w", err)
+		}
+		if !apiSchemaVersionAtLeast(version, sourceIDSyncMinAPISchemaVersion) {
+			return nil, fmt.Errorf(
+				"version-2 deletion manifests require daemon API schema %s or newer (daemon reports %q)",
+				sourceIDSyncMinAPISchemaVersion, version,
+			)
+		}
 	}
 	body := cliDeletionManifestToGenerated(manifest)
 	resp, err := CLIResponse(c, func(client *apiclient.Client) (*generated.CreateCLIDeletionManifestResp, error) {
@@ -633,15 +818,28 @@ func (c *Client) GetCLIStats(
 }
 
 func (c *Client) GetCLISearch(ctx context.Context, req CLISearchRequest) (*CLISearch, error) {
+	if req.DeletionScope != "" {
+		version, err := c.daemonAPISchemaVersion(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("check daemon search deletion-scope capability: %w", err)
+		}
+		if !apiSchemaVersionAtLeast(version, searchDeletionMinAPISchemaVersion) {
+			return nil, fmt.Errorf(
+				"search deletion scope requires daemon API schema %s or newer (daemon reports %q)",
+				searchDeletionMinAPISchemaVersion, version,
+			)
+		}
+	}
 	resp, err := APIResponse(c, func(client *apiclient.Client) (*generated.SearchCLIResp, error) {
 		return client.SearchCLIWithResponse(ctx, &generated.SearchCLIRequestOptions{
 			Query: &generated.SearchCLIQuery{
-				Q:           req.Query,
-				Account:     optionalString(req.Account),
-				Collection:  optionalString(req.Collection),
-				MessageType: optionalMessageTypes(req.MessageTypes),
-				Limit:       optionalPositiveInt64(req.Limit),
-				Offset:      optionalPositiveInt64(req.Offset),
+				Q:             req.Query,
+				Account:       optionalString(req.Account),
+				Collection:    optionalString(req.Collection),
+				DeletionScope: optionalString(req.DeletionScope),
+				MessageType:   optionalMessageTypes(req.MessageTypes),
+				Limit:         optionalPositiveInt64(req.Limit),
+				Offset:        optionalPositiveInt64(req.Offset),
 			},
 		})
 	})
@@ -658,16 +856,26 @@ func (c *Client) GetCLIHybridSearch(
 	resp, err := APIResponse(c, func(client *apiclient.Client) (*generated.SearchMessagesResp, error) {
 		return client.SearchMessagesWithResponse(ctx, &generated.SearchMessagesRequestOptions{
 			Query: &generated.SearchMessagesQuery{
-				Q:              req.Query,
-				Mode:           optionalString(req.Mode),
-				Explain:        optionalBool(true),
-				Account:        optionalString(req.Account),
-				Collection:     optionalString(req.Collection),
-				MessageType:    optionalMessageTypes(req.MessageTypes),
-				PageSize:       optionalPositiveInt64(req.Limit),
-				Offset:         optionalPositiveInt64(req.Offset),
-				IncludeMatches: optionalBool(req.IncludeMatches),
-				MinScore:       optionalFloat32(req.MinScore),
+				Q:               req.Query,
+				Mode:            optionalString(req.Mode),
+				Explain:         optionalBool(true),
+				Account:         optionalString(req.Account),
+				Collection:      optionalString(req.Collection),
+				MessageType:     optionalMessageTypes(req.MessageTypes),
+				PageSize:        optionalPositiveInt64(req.Limit),
+				Offset:          optionalPositiveInt64(req.Offset),
+				IncludeMatches:  optionalBool(req.IncludeMatches),
+				MinScore:        optionalFloat32(req.MinScore),
+				Sender:          optionalString(req.Filter.Sender),
+				Recipient:       optionalString(req.Filter.Recipient),
+				Domain:          optionalString(req.Filter.Domain),
+				Label:           optionalString(req.Filter.Label),
+				TimePeriod:      optionalString(req.Filter.TimeRange.Period),
+				TimeGranularity: optionalString(timeGranularityToString(req.Filter.TimeRange.Granularity)),
+				SourceID:        req.Filter.SourceID,
+				AttachmentsOnly: optionalBool(req.Filter.WithAttachmentsOnly),
+				After:           optionalTimeRFC3339(req.Filter.After),
+				Before:          optionalTimeRFC3339(req.Filter.Before),
 			},
 		})
 	})
@@ -736,10 +944,23 @@ func (c *Client) UpdateCLIAccount(
 	ctx context.Context,
 	req CLIAccountUpdateRequest,
 ) (*CLIAccountUpdateResult, error) {
+	var account, email *string
+	if req.Account != "" {
+		account = &req.Account
+	}
+	if req.Email != "" {
+		email = &req.Email
+	}
+	var sourceID *int64
+	if req.SourceIDSet || req.SourceID != 0 {
+		sourceID = &req.SourceID
+	}
 	resp, err := CLIResponse(c, func(client *apiclient.Client) (*generated.UpdateCLIAccountResp, error) {
 		return client.UpdateCLIAccountWithResponse(ctx, &generated.UpdateCLIAccountRequestOptions{
 			Body: &generated.UpdateCLIAccountBody{
-				Email:       req.Email,
+				Account:     account,
+				Email:       email,
+				SourceID:    sourceID,
 				DisplayName: req.DisplayName,
 			},
 		})
@@ -855,6 +1076,7 @@ func (c *Client) GetCLIIdentities(
 			Query: &generated.ListCLIIdentitiesQuery{
 				Account:     optionalString(req.Account),
 				Collection:  optionalString(req.Collection),
+				SourceID:    optionalCLIIdentitySourceID(req.SourceID, req.SourceIDSet),
 				PrimaryOnly: optionalBool(req.PrimaryOnly),
 			},
 		})
@@ -872,7 +1094,8 @@ func (c *Client) AddCLIIdentity(
 	resp, err := CLIResponse(c, func(client *apiclient.Client) (*generated.AddCLIIdentityResp, error) {
 		return client.AddCLIIdentityWithResponse(ctx, &generated.AddCLIIdentityRequestOptions{
 			Body: &generated.AddCLIIdentityBody{
-				Account:    req.Account,
+				Account:    optionalString(req.Account),
+				SourceID:   optionalCLIIdentitySourceID(req.SourceID, req.SourceID != 0),
 				Identifier: req.Identifier,
 				Signal:     req.Signal,
 			},
@@ -884,6 +1107,21 @@ func (c *Client) AddCLIIdentity(
 	return cliIdentityAddResultFromGenerated(resp.JSON200), nil
 }
 
+func (c *Client) ImportCLIIdentities(
+	ctx context.Context,
+	req CLIIdentityImportRequest,
+) (*CLIIdentityImportResult, error) {
+	resp, err := CLIResponse(c, func(client *apiclient.Client) (*generated.ImportCLIIdentitiesResp, error) {
+		return client.ImportCLIIdentitiesWithResponse(ctx, &generated.ImportCLIIdentitiesRequestOptions{
+			Body: cliIdentityImportBodyFromRequest(req),
+		})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return cliIdentityImportResultFromGenerated(resp.JSON200), nil
+}
+
 func (c *Client) RemoveCLIIdentity(
 	ctx context.Context,
 	req CLIIdentityRemoveRequest,
@@ -891,7 +1129,8 @@ func (c *Client) RemoveCLIIdentity(
 	resp, err := CLIResponse(c, func(client *apiclient.Client) (*generated.RemoveCLIIdentityResp, error) {
 		return client.RemoveCLIIdentityWithResponse(ctx, &generated.RemoveCLIIdentityRequestOptions{
 			Body: &generated.RemoveCLIIdentityBody{
-				Account:    req.Account,
+				Account:    optionalString(req.Account),
+				SourceID:   optionalCLIIdentitySourceID(req.SourceID, req.SourceID != 0),
 				Identifier: req.Identifier,
 			},
 		})
@@ -1033,11 +1272,17 @@ func handleCLIMessageRawNotFound(resp *generated.GetCLIMessageRawResp, id string
 }
 
 func (c *Client) GetCLIAttachment(ctx context.Context, contentHash string) ([]byte, error) {
-	resp, err := APIResponse(c, func(client *apiclient.Client) (*generated.GetCLIAttachmentResp, error) {
-		return client.GetCLIAttachmentWithResponse(ctx, &generated.GetCLIAttachmentRequestOptions{
-			Query: &generated.GetCLIAttachmentQuery{ContentHash: contentHash},
-		})
-	})
+	resp, err := APIResponseWithNotFound(
+		c,
+		func(client *apiclient.Client) (*generated.GetCLIAttachmentResp, error) {
+			return client.GetCLIAttachmentWithResponse(ctx, &generated.GetCLIAttachmentRequestOptions{
+				Query: &generated.GetCLIAttachmentQuery{ContentHash: contentHash},
+			})
+		},
+		func(*generated.GetCLIAttachmentResp) error {
+			return fmt.Errorf("attachment %s: %w", contentHash, fs.ErrNotExist)
+		},
+	)
 	if err != nil {
 		return nil, err
 	}

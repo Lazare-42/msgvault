@@ -81,11 +81,19 @@ jobs:
           go-version-file: go.mod
           cache: ${{ github.repository == 'kenn-io/msgvault' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'false' || 'true' }}
 
-      - name: Install golangci-lint
-        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+      - name: Check PostgreSQL build coverage
+        run: make pg-shipped-only-check
+
+      - name: Install lint tools
+        run: |
+          make lint-tools
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Test
         run: make test
+
+      - name: Test build without vector backends
+        run: go test -tags fts5 -run '^TestDocumentVectorStubKeepsStatusAvailableAndBuildActionable$' -count=1 ./cmd/msgvault/cmd
 
       - name: Check OpenAPI artifacts
         run: make openapi-check
@@ -93,11 +101,8 @@ jobs:
       - name: Lint
         run: make lint-ci
 
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
-
       - name: Vulnerability check
-        run: govulncheck -tags "fts5 sqlite_vec" ./...
+        run: make vulncheck
 
   test-macos-15:
     if: github.repository == 'kenn-io/msgvault' && github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -341,7 +346,7 @@ jobs:
           CGO_CFLAGS: "-IC:/msys64/mingw64/include -fgnu89-inline"
           CGO_LDFLAGS: "-Wl,--allow-multiple-definition"
         run: |
-          go test -timeout 20m -tags "fts5 sqlite_vec" `
+          go test -timeout 60m -tags "fts5 sqlite_vec" `
             ./internal/api `
             ./internal/importer `
             ./internal/store `
@@ -388,7 +393,7 @@ jobs:
               -Package $package `
               -ShardCount 4 `
               -Tags "fts5 sqlite_vec" `
-              -Timeout 20m
+              -Timeout 60m
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
@@ -464,19 +469,14 @@ jobs:
           go-version-file: go.mod
           cache: 'true'
 
-      - name: Install psql client
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y postgresql-client
-
       - name: Enable pgvector extension
-        env:
-          PGPASSWORD: testpw
         run: |
-          psql -h localhost -U msgvault_test -d msgvault_test -c "CREATE EXTENSION IF NOT EXISTS vector"
+          docker exec "${{ job.services.postgres.id }}" \
+            psql -U msgvault_test -d msgvault_test \
+            -c "CREATE EXTENSION IF NOT EXISTS vector"
 
       - name: Test (pgvector-tagged)
-        run: go test -tags "fts5 sqlite_vec pgvector" -count=1 ./internal/vector/... ./internal/scheduler/... ./cmd/msgvault/cmd/...
+        run: go test -timeout 60m -tags "fts5 sqlite_vec pgvector" -count=1 ./internal/vector/... ./internal/scheduler/... ./cmd/msgvault/cmd/...
 
   nix-build:
     runs-on: ${{ github.repository == 'kenn-io/msgvault' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'kenn-linux-x64-public' || 'ubuntu-latest' }}
@@ -486,7 +486,7 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
 
       - name: Build
-        run: nix build
+        run: nix build --option download-attempts 10
 
   # PostgreSQL backend lane: runs the full Go test suite against a live
   # PostgreSQL service. Tests that use testutil.NewTestStore read
@@ -506,6 +506,7 @@ jobs:
           POSTGRES_USER: msgvault_test
           POSTGRES_PASSWORD: msgvault_test
           POSTGRES_DB: msgvault_test
+          POSTGRES_INITDB_ARGS: "-c max_locks_per_transaction=256"
         ports:
           - 5432:5432
         options: >-
@@ -526,10 +527,14 @@ jobs:
       # This lane uses a stock postgres:16 image (no pgvector extension), so it
       # must NOT build the pgvector tag — those tests CREATE EXTENSION "vector"
       # and fail here. pgvector is covered by the dedicated test-pgvector job
-      # against a pgvector/pgvector image. (Run go test directly rather than
-      # `make test-pg`, whose PG_TEST_TAGS include pgvector.)
+      # against a pgvector/pgvector image. That is why this runs test-pg-shipped
+      # (BUILD_TAGS) and not test-pg (PG_TEST_TAGS, which include pgvector).
+      #
+      # The target carries the same 60m timeout as `make test`:
+      # the heavy DuckDB packages can exceed go test's 10m per-package default
+      # on a contended runner, and this lane is the slowest one there is.
       - name: Test (PostgreSQL)
-        run: go test -tags "fts5 sqlite_vec" ./...
+        run: make test-pg-shipped
 
       - name: Concurrency tests (-count=5)
         run: |

@@ -43,6 +43,8 @@ describe('Explore URL state', () => {
       fileSort: { field: 'filename', direction: 'asc' },
       fileFilenameQuery: 'invoice',
       fileMIMEFamilies: ['pdf', 'image'],
+	  personFilePresentation: 'media',
+	  personFileDirections: ['from_person', 'group'],
 	  identityQuery: 'Shared Name',
 	  identitySort: { field: 'display_label', direction: 'asc' },
 	  analysisTarget: 'person:42',
@@ -62,6 +64,75 @@ describe('Explore URL state', () => {
     };
 
     expect(parseExploreURLState(serializeExploreURLState(state))).toEqual(state);
+  });
+
+  it('restores an identity facet tuple from the URL', () => {
+    const state: ExploreURLState = {
+      ...defaultExploreURLState,
+      workspace: 'everything',
+      filters: [
+        { dimension: 'source', values: ['42'] },
+        { dimension: 'identity', values: ['42', 'archive@example.com', 'sender'] }
+      ]
+    };
+
+    expect(parseExploreURLState(serializeExploreURLState(state)).filters).toEqual(state.filters);
+  });
+
+  it('drops identity when its single parent source changes or is removed', () => {
+    const withChangedSource = parseExploreURLState(serializeExploreURLState({
+      ...defaultExploreURLState,
+      filters: [
+        { dimension: 'source', values: ['15'] },
+        { dimension: 'identity', values: ['14', 'archive@example.com', 'sender'] }
+      ]
+    }));
+    const withoutSource = parseExploreURLState(serializeExploreURLState({
+      ...defaultExploreURLState,
+      filters: [{ dimension: 'identity', values: ['14', 'archive@example.com', 'recipient'] }]
+    }));
+
+    expect(withChangedSource.filters).toEqual([{ dimension: 'source', values: ['15'] }]);
+    expect(withoutSource.filters).toEqual([]);
+  });
+
+  it.each([
+    [
+      'a nonnumeric parent source',
+      [
+        { dimension: 'source', values: ['abc'] },
+        { dimension: 'identity', values: ['abc', 'archive@example.com', 'sender'] }
+      ]
+    ],
+    [
+      'an empty identifier',
+      [
+        { dimension: 'source', values: ['14'] },
+        { dimension: 'identity', values: ['14', '', 'recipient'] }
+      ]
+    ],
+    [
+      'an invalid direction',
+      [
+        { dimension: 'source', values: ['14'] },
+        { dimension: 'identity', values: ['14', 'archive@example.com', 'sideways'] }
+      ]
+    ],
+    [
+      'duplicate identity filters',
+      [
+        { dimension: 'source', values: ['14'] },
+        { dimension: 'identity', values: ['14', 'first@example.com', 'any'] },
+        { dimension: 'identity', values: ['14', 'second@example.com', 'sender'] }
+      ]
+    ]
+  ])('drops identity URL state with %s', (_description, malformedFilters) => {
+    const restored = parseExploreURLState(serializeExploreURLState({
+      ...defaultExploreURLState,
+      filters: malformedFilters
+    } as ExploreURLState));
+
+    expect(restored.filters.some((filter) => filter.dimension === 'identity')).toBe(false);
   });
 
   it('normalizes legacy unpinned inspector states to pinned', () => {
@@ -152,6 +223,24 @@ describe('Explore URL state', () => {
     expect(restored.query).toBe('canonical terms');
     expect(restored.fileFilenameQuery).toBe('');
     expect(restored.fileMIMEFamilies).toEqual([]);
+  });
+
+  it('normalizes restorable person gallery controls into stable finite values', () => {
+    const restored = parseExploreURLState(serializeExploreURLState({
+      ...defaultExploreURLState,
+      personFilePresentation: 'media',
+      personFileDirections: ['group', 'from_person', 'group']
+    }));
+    expect(restored.personFilePresentation).toBe('media');
+    expect(restored.personFileDirections).toEqual(['from_person', 'group']);
+
+    const malformed = parseExploreURLState(serializeExploreURLState({
+      ...defaultExploreURLState,
+      personFilePresentation: 'cards',
+      personFileDirections: ['bogus']
+    } as unknown as ExploreURLState));
+    expect(malformed.personFilePresentation).toBe('files');
+    expect(malformed.personFileDirections).toEqual(['from_person']);
   });
 
   it('drops malformed namespaced attachment authority instead of treating it as an entry key', () => {

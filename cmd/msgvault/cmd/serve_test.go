@@ -26,11 +26,233 @@ import (
 	"go.kenn.io/msgvault/internal/discord"
 	imaplib "go.kenn.io/msgvault/internal/imap"
 	"go.kenn.io/msgvault/internal/oauth"
+	"go.kenn.io/msgvault/internal/personenrichment"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
+
+func TestStoreAPIAdapterDeletePersonSuppressesCurrentIdentifiers(t *testing.T) {
+	require := require.New(t)
+	f := storetest.New(t)
+	participantID := f.EnsureParticipant("Delete.Person@Example.test", "Delete Person", "example.test")
+	person, _, err := f.Store.CreatePersonFromParticipantContext(t.Context(), participantID)
+	require.NoError(err)
+	_, profile, _ := scheduleWorkerProfile(t, f, "deletion-provider", "TEST_DELETE_PROVIDER_KEY")
+	key := strings.Repeat("d", 32)
+	_, err = f.Store.SetPersonTrackingContext(t.Context(), person.ID, true)
+	require.NoError(err)
+	_, _, err = f.Store.GrantPersonEnrichmentConsent(t.Context(), profile.Fingerprint, "test")
+	require.NoError(err)
+	_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
+		`UPDATE participants SET display_name = NULL WHERE id = ?`), participantID)
+	require.NoError(err)
+	displayName := "Delete Profile"
+	person, err = f.Store.UpdatePersonDisplayNameContext(
+		t.Context(), person.ID, person.Revision, &displayName)
+	require.NoError(err)
+	organization, err := f.Store.CreateOrganizationContext(t.Context(), store.OrganizationInput{
+		Name: "Example Labs", Kind: store.OrganizationKindCompany,
+	})
+	require.NoError(err)
+	_, err = f.Store.AddEmploymentContext(t.Context(), store.EmploymentInput{
+		PersonID: person.ID, OrganizationID: organization.ID,
+		IsCurrent: new(true), IsPrimary: new(true), Source: store.ProvenanceUser,
+	})
+	require.NoError(err)
+	person, err = f.Store.GetPersonContext(t.Context(), person.ID)
+	require.NoError(err)
+	now := time.Date(2026, 8, 27, 12, 0, 0, 0, time.UTC)
+	run, _, err := f.Store.StartRun(t.Context(), personenrichment.RunStart{
+		Kind: "manual", RequestedBy: "disabled-deletion-history", RequestedAt: now,
+	})
+	require.NoError(err)
+	require.NoError(f.Store.PutPersonEnrichmentWorkContext(t.Context(), store.PersonEnrichmentWorkInput{
+		PersonID: person.ID, ProfileFingerprint: profile.Fingerprint,
+		Trigger: personenrichment.Trigger{Kind: personenrichment.TriggerManual, Generation: "manual:disabled-delete"},
+		DueAt:   now,
+	}))
+	lease, err := f.Store.ClaimWork(t.Context(), personenrichment.ClaimOptions{
+		RunID: run.ID, Owner: "disabled-deletion-worker", ProviderName: profile.Name,
+		Now: now, LeaseDuration: time.Minute,
+	})
+	require.NoError(err)
+	require.NotNil(lease)
+	hasher, err := personenrichment.NewSuppressionHasher([]byte(key))
+	require.NoError(err)
+	oldDigest := hasher.Digest(profile.ProviderNamespace, personenrichment.SuppressionEmail,
+		personenrichment.EmailNormalizationV1, "old-delete@example.test")
+	_, _, err = f.Store.BeginAttempt(t.Context(), lease.Token, personenrichment.AttemptStart{
+		RunID: run.ID, PersonID: person.ID, ProfileFingerprint: profile.Fingerprint,
+		PayloadHash: strings.Repeat("a", 64), RequestHash: strings.Repeat("b", 64),
+		PersonRevision: person.Revision, Trigger: lease.Trigger,
+		CheckedIdentifiers: []personenrichment.SuppressionDigest{oldDigest},
+	})
+	require.NoError(err)
+	adapter := &storeAPIAdapter{
+		store: f.Store,
+		personEnrichmentConfig: personenrichment.Config{
+			Enabled: false, SuppressionKeyEnv: "TEST_DELETE_SUPPRESSION_KEY",
+		},
+		lookupEnv: func(name string) (string, bool) {
+			assert.Equal(t, "TEST_DELETE_SUPPRESSION_KEY", name)
+			return key, true
+		},
+	}
+
+	require.NoError(adapter.DeletePersonContext(t.Context(), person.ID, person.Revision))
+	digest := hasher.Digest(profile.ProviderNamespace, personenrichment.SuppressionEmail,
+		personenrichment.EmailNormalizationV1, "delete.person@example.test")
+	found, err := f.Store.HasPersonEnrichmentSuppressionContext(t.Context(), digest)
+	require.NoError(err)
+	assert.True(t, found)
+	nameCompany, err := personenrichment.NormalizeSuppressionIdentifier(
+		personenrichment.SuppressionNameCompany, []string{"Delete Profile", "Example Labs"})
+	require.NoError(err)
+	digest = hasher.Digest(profile.ProviderNamespace, nameCompany.Class,
+		nameCompany.NormalizationVersion, nameCompany.Value)
+	found, err = f.Store.HasPersonEnrichmentSuppressionContext(t.Context(), digest)
+	require.NoError(err)
+	assert.True(t, found)
+}
+
+func TestStoreAPIAdapterDeletePersonWithoutEnrichmentHistoryNeedsNoSuppressionKey(t *testing.T) {
+	f := storetest.New(t)
+	participantID := f.EnsureParticipant("unenriched-delete@example.test", "Unenriched Delete", "example.test")
+	person, _, err := f.Store.CreatePersonFromParticipantContext(t.Context(), participantID)
+	require.NoError(t, err)
+	adapter := &storeAPIAdapter{
+		store: f.Store,
+		personEnrichmentConfig: personenrichment.Config{
+			Enabled: false, SuppressionKeyEnv: "TEST_UNUSED_SUPPRESSION_KEY",
+		},
+		lookupEnv: func(string) (string, bool) {
+			require.FailNow(t, "deleting a person without enrichment history must not load a suppression key")
+			return "", false
+		},
+	}
+
+	require.NoError(t, adapter.DeletePersonContext(t.Context(), person.ID, person.Revision))
+	_, err = f.Store.GetPersonContext(t.Context(), person.ID)
+	require.ErrorIs(t, err, store.ErrPersonNotFound)
+}
+
+func TestStoreAPIAdapterDeletePersonFailsClosedWithoutMatchingSuppressionKey(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*testing.T, *storetest.Fixture, personenrichment.ProviderProfile)
+		key   func(string) (string, bool)
+	}{
+		{
+			name: "missing key",
+			key:  func(string) (string, bool) { return "", false },
+		},
+		{
+			name: "mismatched durable key",
+			setup: func(t *testing.T, f *storetest.Fixture, profile personenrichment.ProviderProfile) {
+				t.Helper()
+				hasher, err := personenrichment.NewSuppressionHasher(bytes.Repeat([]byte{'o'}, 32))
+				require.NoError(t, err)
+				digest := hasher.Digest(profile.ProviderNamespace, personenrichment.SuppressionEmail,
+					personenrichment.EmailNormalizationV1, "other@example.test")
+				require.NoError(t, f.Store.InsertPersonEnrichmentSuppressionsContext(t.Context(),
+					[]store.PersonEnrichmentSuppressionInput{{
+						ProviderNamespace: digest.ProviderNamespace, IdentifierClass: digest.IdentifierClass,
+						NormalizationVersion: digest.NormalizationVersion, KeyID: digest.KeyID,
+						Digest: digest.Digest, Reason: store.PersonEnrichmentSuppressionOptOut, Actor: "test",
+					}}))
+			},
+			key: func(string) (string, bool) { return strings.Repeat("n", 32), true },
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			f := storetest.New(t)
+			participantID := f.EnsureParticipant("closed@example.test", "Closed Person", "example.test")
+			person, _, err := f.Store.CreatePersonFromParticipantContext(t.Context(), participantID)
+			require.NoError(t, err)
+			_, profile, _ := scheduleWorkerProfile(t, f, "closed-provider", "TEST_CLOSED_PROVIDER_KEY")
+			if test.setup != nil {
+				test.setup(t, f, profile)
+			}
+			adapter := &storeAPIAdapter{
+				store: f.Store,
+				personEnrichmentConfig: personenrichment.Config{
+					Enabled: true, SuppressionKeyEnv: "TEST_CLOSED_SUPPRESSION_KEY",
+				},
+				lookupEnv: test.key,
+			}
+			err = adapter.DeletePersonContext(t.Context(), person.ID, person.Revision)
+			require.Error(t, err)
+			_, getErr := f.Store.GetPersonContext(t.Context(), person.ID)
+			require.NoError(t, getErr)
+		})
+	}
+}
+
+func TestStoreAPIAdapterDeletePersonRejectsRecordedAttemptKeyMismatch(t *testing.T) {
+	require := require.New(t)
+	f := storetest.New(t)
+	participantID := f.EnsureParticipant("attempt-key@example.test", "Attempt Key", "example.test")
+	person, _, err := f.Store.CreatePersonFromParticipantContext(t.Context(), participantID)
+	require.NoError(err)
+	_, err = f.Store.SetPersonTrackingContext(t.Context(), person.ID, true)
+	require.NoError(err)
+	_, profile, _ := scheduleWorkerProfile(t, f, "attempt-key-provider", "TEST_ATTEMPT_PROVIDER_KEY")
+	now := time.Date(2026, 8, 23, 22, 0, 0, 0, time.UTC)
+	_, _, err = f.Store.GrantPersonEnrichmentConsent(t.Context(), profile.Fingerprint, "test")
+	require.NoError(err)
+	run, _, err := f.Store.StartRun(t.Context(), personenrichment.RunStart{
+		Kind: "manual", RequestedBy: "attempt-key-run", RequestedAt: now,
+	})
+	require.NoError(err)
+	require.NoError(f.Store.PutPersonEnrichmentWorkContext(t.Context(), store.PersonEnrichmentWorkInput{
+		PersonID: person.ID, ProfileFingerprint: profile.Fingerprint,
+		Trigger: personenrichment.Trigger{Kind: personenrichment.TriggerManual, Generation: "manual:attempt-key"},
+		DueAt:   now,
+	}))
+	lease, err := f.Store.ClaimWork(t.Context(), personenrichment.ClaimOptions{
+		RunID: run.ID, Owner: "attempt-key-worker", ProviderName: profile.Name,
+		Now: now, LeaseDuration: time.Minute,
+	})
+	require.NoError(err)
+	require.NotNil(lease)
+	oldHasher, err := personenrichment.NewSuppressionHasher(bytes.Repeat([]byte{'o'}, 32))
+	require.NoError(err)
+	oldDigest := oldHasher.Digest(profile.ProviderNamespace, personenrichment.SuppressionEmail,
+		personenrichment.EmailNormalizationV1, "attempt-key@example.test")
+	_, _, err = f.Store.BeginAttempt(t.Context(), lease.Token, personenrichment.AttemptStart{
+		RunID: run.ID, PersonID: person.ID, ProfileFingerprint: profile.Fingerprint,
+		PayloadHash: strings.Repeat("a", 64), RequestHash: strings.Repeat("b", 64),
+		PersonRevision: person.Revision, Trigger: lease.Trigger,
+		CheckedIdentifiers: []personenrichment.SuppressionDigest{oldDigest},
+	})
+	require.NoError(err)
+	adapter := &storeAPIAdapter{
+		store: f.Store,
+		personEnrichmentConfig: personenrichment.Config{
+			Enabled: true, SuppressionKeyEnv: "TEST_DELETE_SUPPRESSION_KEY",
+		},
+		lookupEnv: func(string) (string, bool) { return strings.Repeat("n", 32), true },
+	}
+	err = adapter.DeletePersonContext(t.Context(), person.ID, person.Revision)
+	require.ErrorIs(err, personenrichment.ErrSuppressionKeyMismatch)
+	_, err = f.Store.GetPersonContext(t.Context(), person.ID)
+	require.NoError(err)
+	attempts, err := f.Store.ListPersonEnrichmentAttemptsContext(t.Context(),
+		store.PersonEnrichmentAttemptFilter{PersonID: person.ID, Limit: 10})
+	require.NoError(err)
+	assert.NotEmpty(t, attempts)
+}
+
+// serveLifecycleTestTimeout bounds waits for daemon-startup milestones (API
+// seam entered, analytics build started, health ready). Every use is a
+// positive wait, so the value only stretches the failure path — passing runs
+// are unaffected. It must absorb a full InitSchema on the slowest CI
+// environment: the sharded Windows runner has been observed taking over two
+// minutes to execute schema.sql under filesystem load.
+const serveLifecycleTestTimeout = 180 * time.Second
 
 func TestServeConfigParsing(t *testing.T) {
 	require := require.New(t)
@@ -148,7 +370,7 @@ func TestRunServeStartsReadOnlyWithoutOAuthConfig(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	cmd := &cobra.Command{Use: "serve"}
+	cmd := &cobra.Command{Use: serveCmd.Use}
 	cmd.SetContext(ctx)
 	errCh := make(chan error, 1)
 	go func() {
@@ -166,6 +388,62 @@ func TestRunServeStartsReadOnlyWithoutOAuthConfig(t *testing.T) {
 	}
 }
 
+func TestRunServeImmediateCancellationWaitsForAPIStart(t *testing.T) {
+	require := require.New(t)
+	oldCfg := cfg
+	dataDir := t.TempDir()
+	c := lifecycleTestConfig(dataDir)
+	c.Server.APIPort = freeTCPPort(t)
+	c.Vector.Enabled = false
+	c.Analytics.Engine = config.AnalyticsEngineSQL
+	cfg = c
+	t.Cleanup(func() { cfg = oldCfg })
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	oldStart := startServeAPIServer
+	startServeAPIServer = func(server *api.Server, listener net.Listener) error {
+		close(started)
+		<-release
+		return server.StartOnListener(listener)
+	}
+	t.Cleanup(func() {
+		startServeAPIServer = oldStart
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	cmd := &cobra.Command{Use: "serve"}
+	cmd.SetContext(ctx)
+	errCh := make(chan error, 1)
+	go func() { errCh <- runServe(cmd, nil) }()
+
+	select {
+	case <-started:
+	case <-time.After(serveLifecycleTestTimeout):
+		require.FailNow("API startup seam was not entered")
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		require.FailNow("runServe returned before listener-start barrier", "error: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case err := <-errCh:
+		require.NoError(err, "runServe")
+	case <-time.After(10 * time.Second):
+		require.FailNow("runServe did not stop after listener startup was released")
+	}
+}
+
 func TestRunServeAutoSelectsAPIPortWhenUnconfigured(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -178,7 +456,7 @@ func TestRunServeAutoSelectsAPIPortWhenUnconfigured(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	cmd := &cobra.Command{Use: "serve"}
+	cmd := &cobra.Command{Use: serveCmd.Use}
 	cmd.SetContext(ctx)
 	errCh := make(chan error, 1)
 	serveDone := make(chan struct{})
@@ -197,7 +475,10 @@ func TestRunServeAutoSelectsAPIPortWhenUnconfigured(t *testing.T) {
 
 	// Discover the auto-selected port the same way clients do: through the
 	// daemon runtime record, not the configured port (which is 0).
-	rt, ready, err := waitForDaemonRuntime(ctx, dataDir, 15*time.Second, daemonRuntimeReady, errCh)
+	// A fresh Windows runner can need more than 15 seconds to initialize the
+	// full schema while the CLI package shards compete for CPU and disk I/O.
+	// This test checks port discovery, not startup performance.
+	rt, ready, err := waitForDaemonRuntime(ctx, dataDir, 45*time.Second, daemonRuntimeReady, errCh)
 	require.NoError(err, "wait for daemon runtime record")
 	require.True(ready, "daemon runtime record did not become ready")
 	assert.NotZero(rt.Port, "runtime record must record the bound ephemeral port")
@@ -213,6 +494,234 @@ func TestRunServeAutoSelectsAPIPortWhenUnconfigured(t *testing.T) {
 	case err := <-errCh:
 		require.NoError(err, "runServe")
 	case <-time.After(5 * time.Second):
+		require.FailNow("runServe did not stop after context cancellation")
+	}
+}
+
+func TestRunServeServesHealthWhileAnalyticsBuildBlocked(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	oldCfg := cfg
+	dataDir := t.TempDir()
+	c := lifecycleTestConfig(dataDir)
+	c.Server.APIPort = freeTCPPort(t)
+	c.Analytics.Engine = config.AnalyticsEngineAuto
+	c.Analytics.AutoBuildCache = true
+	c.Vector.Enabled = false
+	cfg = c
+	t.Cleanup(func() { cfg = oldCfg })
+
+	buildStarted := make(chan struct{})
+	stubBuildCacheSubprocess(t, func(ctx context.Context, _ bool) error {
+		close(buildStarted)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	t.Cleanup(cancel)
+	cmd := &cobra.Command{Use: "serve"}
+	cmd.SetContext(ctx)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- runServe(cmd, nil)
+	}()
+
+	select {
+	case <-buildStarted:
+	case err := <-errCh:
+		require.NoError(err, "runServe exited before analytics build was blocked")
+	case <-time.After(serveLifecycleTestTimeout):
+		require.FailNow("analytics cache build did not start")
+	}
+	waitForServeHealthBounded(t, c.Server.APIPort, errCh)
+
+	healthClient := &http.Client{Timeout: time.Second}
+	resp, err := healthClient.Get(fmt.Sprintf("http://127.0.0.1:%d/health", c.Server.APIPort))
+	require.NoError(err, "GET /health")
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(http.StatusOK, resp.StatusCode)
+	var health api.HealthResponse
+	require.NoError(json.NewDecoder(resp.Body).Decode(&health))
+	assert.Equal(api.AnalyticsModeSQLFallback, health.AnalyticsEngine,
+		"auto mode must report live-SQL fallback while cache initialization is blocked")
+
+	aggregateResp, err := healthClient.Get(fmt.Sprintf(
+		"http://127.0.0.1:%d/api/v1/aggregates?view_type=senders",
+		c.Server.APIPort,
+	))
+	require.NoError(err, "GET aggregate through SQL fallback")
+	defer func() { _ = aggregateResp.Body.Close() }()
+	assert.Equal(http.StatusOK, aggregateResp.StatusCode,
+		"read-only aggregate must bypass the cache-build mutation gate")
+	var aggregates api.AggregateResponse
+	require.NoError(json.NewDecoder(aggregateResp.Body).Decode(&aggregates))
+
+	cancel()
+	select {
+	case err := <-errCh:
+		require.NoError(err, "runServe")
+	case <-time.After(10 * time.Second):
+		require.FailNow("runServe did not stop after context cancellation")
+	}
+}
+
+func TestRunServeDuckDBReportsInitializingWithoutSQLFallback(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	oldCfg := cfg
+	dataDir := t.TempDir()
+	c := lifecycleTestConfig(dataDir)
+	c.Server.APIPort = freeTCPPort(t)
+	c.Analytics.Engine = config.AnalyticsEngineDuckDB
+	c.Analytics.AutoBuildCache = true
+	c.Vector.Enabled = false
+	cfg = c
+	t.Cleanup(func() { cfg = oldCfg })
+
+	buildStarted := make(chan struct{})
+	stubBuildCacheSubprocess(t, func(ctx context.Context, _ bool) error {
+		close(buildStarted)
+		<-ctx.Done()
+		return ctx.Err()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	t.Cleanup(cancel)
+	cmd := &cobra.Command{Use: serveCmd.Use}
+	cmd.SetContext(ctx)
+	errCh := make(chan error, 1)
+	go func() { errCh <- runServe(cmd, nil) }()
+
+	select {
+	case <-buildStarted:
+	case err := <-errCh:
+		require.NoError(err, "runServe exited before analytics build was blocked")
+	case <-time.After(serveLifecycleTestTimeout):
+		require.FailNow("analytics cache build did not start")
+	}
+	waitForServeHealthBounded(t, c.Server.APIPort, errCh)
+
+	healthClient := &http.Client{Timeout: time.Second}
+	resp, err := healthClient.Get(fmt.Sprintf("http://127.0.0.1:%d/health", c.Server.APIPort))
+	require.NoError(err, "GET /health")
+	var health api.HealthResponse
+	require.NoError(json.NewDecoder(resp.Body).Decode(&health))
+	_ = resp.Body.Close()
+	assert.Equal(api.AnalyticsModeInitializing, health.AnalyticsEngine)
+
+	resp, err = healthClient.Get(fmt.Sprintf(
+		"http://127.0.0.1:%d/api/v1/messages/filter?limit=1",
+		c.Server.APIPort,
+	))
+	require.NoError(err, "GET general archive route")
+	assert.Equal(http.StatusOK, resp.StatusCode,
+		"SQLite-backed detail routes must remain available while DuckDB initializes")
+	_ = resp.Body.Close()
+
+	resp, err = healthClient.Get(fmt.Sprintf(
+		"http://127.0.0.1:%d/api/v1/text/conversations",
+		c.Server.APIPort,
+	))
+	require.NoError(err, "GET text conversations")
+	assert.Equal(http.StatusOK, resp.StatusCode,
+		"SQLite-backed text routes must remain available while DuckDB initializes")
+	_ = resp.Body.Close()
+
+	resp, err = healthClient.Get(fmt.Sprintf("http://127.0.0.1:%d/api/v1/aggregates?view_type=senders", c.Server.APIPort))
+	require.NoError(err, "GET analytics route")
+	assert.Equal(http.StatusServiceUnavailable, resp.StatusCode)
+	_ = resp.Body.Close()
+
+	resp, err = healthClient.Post(
+		fmt.Sprintf("http://127.0.0.1:%d/api/v1/query", c.Server.APIPort),
+		"application/json",
+		strings.NewReader(`{"sql":"SELECT 1"}`),
+	)
+	require.NoError(err, "POST SQL query")
+	assert.Equal(http.StatusServiceUnavailable, resp.StatusCode,
+		"initializing DuckDB must report SQL engine unavailable")
+	_ = resp.Body.Close()
+
+	cancel()
+	select {
+	case err := <-errCh:
+		require.NoError(err, "runServe")
+	case <-time.After(10 * time.Second):
+		require.FailNow("runServe did not stop after context cancellation")
+	}
+}
+
+func TestRunServeAutoSwitchesToDuckDBAfterBackgroundBuild(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	oldCfg := cfg
+	dataDir := t.TempDir()
+	c := lifecycleTestConfig(dataDir)
+	c.Server.APIPort = freeTCPPort(t)
+	c.Analytics.Engine = config.AnalyticsEngineAuto
+	c.Analytics.AutoBuildCache = true
+	c.Vector.Enabled = false
+	cfg = c
+	t.Cleanup(func() { cfg = oldCfg })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	t.Cleanup(cancel)
+
+	buildStarted := make(chan struct{})
+	releaseBuild := make(chan struct{})
+	stubBuildCacheSubprocess(t, func(ctx context.Context, fullRebuild bool) error {
+		close(buildStarted)
+		select {
+		case <-releaseBuild:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		_, err := buildCache(c.DatabaseDSN(), c.AnalyticsDir(), fullRebuild)
+		return err
+	})
+
+	cmd := &cobra.Command{Use: serveCmd.Use}
+	cmd.SetContext(ctx)
+	errCh := make(chan error, 1)
+	go func() { errCh <- runServe(cmd, nil) }()
+
+	select {
+	case <-buildStarted:
+	case err := <-errCh:
+		require.NoError(err, "runServe exited before analytics build was blocked")
+	case <-time.After(serveLifecycleTestTimeout):
+		require.FailNow("analytics cache build did not start")
+	}
+	waitForServeHealthBounded(t, c.Server.APIPort, errCh)
+
+	healthClient := &http.Client{Timeout: time.Second}
+	readAnalyticsMode := func() string {
+		resp, err := healthClient.Get(fmt.Sprintf("http://127.0.0.1:%d/health", c.Server.APIPort))
+		if err != nil {
+			return ""
+		}
+		defer func() { _ = resp.Body.Close() }()
+		var health api.HealthResponse
+		if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&health) != nil {
+			return ""
+		}
+		return health.AnalyticsEngine
+	}
+	assert.Equal(api.AnalyticsModeSQLFallback, readAnalyticsMode())
+
+	close(releaseBuild)
+	assert.Eventually(func() bool {
+		return readAnalyticsMode() == api.AnalyticsModeDuckDB
+	}, 10*time.Second, 25*time.Millisecond, "auto mode should switch to DuckDB after cache build")
+
+	cancel()
+	select {
+	case err := <-errCh:
+		require.NoError(err, "runServe")
+	case <-time.After(10 * time.Second):
 		require.FailNow("runServe did not stop after context cancellation")
 	}
 }
@@ -326,7 +835,7 @@ func freeTCPPort(t *testing.T) int {
 func waitForServeHealth(t *testing.T, port int, errCh <-chan error) {
 	t.Helper()
 	url := fmt.Sprintf("http://127.0.0.1:%d/health", port)
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(serveLifecycleTestTimeout)
 	for time.Now().Before(deadline) {
 		select {
 		case err := <-errCh:
@@ -335,6 +844,30 @@ func waitForServeHealth(t *testing.T, port int, errCh <-chan error) {
 		default:
 		}
 		resp, err := http.Get(url) //nolint:gosec // local test server
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	require.FailNow(t, "serve health endpoint did not become ready")
+}
+
+func waitForServeHealthBounded(t *testing.T, port int, errCh <-chan error) {
+	t.Helper()
+	client := &http.Client{Timeout: 100 * time.Millisecond}
+	url := fmt.Sprintf("http://127.0.0.1:%d/health", port)
+	deadline := time.Now().Add(serveLifecycleTestTimeout)
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-errCh:
+			require.NoError(t, err, "runServe exited before health was ready")
+			require.FailNow(t, "runServe exited before health was ready")
+		default:
+		}
+		resp, err := client.Get(url)
 		if err == nil {
 			_ = resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
@@ -388,12 +921,15 @@ func TestOpenDaemonAnalyticsEngineForceSQLSkipsCacheBuild(t *testing.T) {
 		return nil
 	})
 
-	engine, mode, err := openDaemonAnalyticsEngine(context.Background(), c, s)
+	engine, mode, outcome, err := openDaemonAnalyticsEngine(
+		context.Background(), c, s, startupCacheBuildIntentNone,
+	)
 	require.NoError(err, "openDaemonAnalyticsEngine")
 	defer func() { _ = engine.Close() }()
 
 	assert.IsType(&query.SQLiteEngine{}, engine)
 	assert.Equal(api.AnalyticsModeSQL, mode, "engine=sql is a deliberate live-SQL choice")
+	assert.Equal(startupCacheBuildOutcomeNone, outcome, "no explicit intent has no outcome")
 }
 
 func TestOpenDaemonAnalyticsEngineSkipsCacheBuildWhenDisabled(t *testing.T) {
@@ -407,12 +943,59 @@ func TestOpenDaemonAnalyticsEngineSkipsCacheBuildWhenDisabled(t *testing.T) {
 		return nil
 	})
 
-	engine, mode, err := openDaemonAnalyticsEngine(context.Background(), c, s)
+	engine, mode, outcome, err := openDaemonAnalyticsEngine(
+		context.Background(), c, s, startupCacheBuildIntentNone,
+	)
 	require.NoError(err, "openDaemonAnalyticsEngine")
 	defer func() { _ = engine.Close() }()
 
 	assert.IsType(&query.SQLiteEngine{}, engine)
 	assert.Equal(api.AnalyticsModeSQLFallback, mode, "auto mode without a cache is a fallback")
+	assert.Equal(startupCacheBuildOutcomeNone, outcome, "no explicit intent has no outcome")
+}
+
+func TestOpenDaemonAnalyticsEngineWarnsWhenDuckDBRefreshDisabled(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	c, s := openTestDaemonAnalyticsStore(t)
+	c.Analytics.Engine = config.AnalyticsEngineAuto
+	c.Analytics.AutoBuildCache = false
+	_, err := buildCache(c.DatabaseDSN(), c.AnalyticsDir(), true)
+	require.NoError(err, "build ready analytics cache")
+	staleness := cacheNeedsBuild(c.DatabaseDSN(), c.AnalyticsDir())
+	require.False(staleness.NeedsBuild, "test cache must be ready: %+v", staleness)
+	var logs bytes.Buffer
+	oldLogger := logger
+	logger = slog.New(slog.NewTextHandler(&logs, nil))
+	t.Cleanup(func() { logger = oldLogger })
+
+	engine, mode, outcome, err := openDaemonAnalyticsEngine(
+		context.Background(), c, s, startupCacheBuildIntentNone,
+	)
+	require.NoError(err, "openDaemonAnalyticsEngine")
+	defer func() { _ = engine.Close() }()
+
+	assert.IsType(&query.DuckDBEngine{}, engine,
+		"auto mode must keep using a usable cache")
+	assert.Equal(api.AnalyticsModeDuckDB, mode,
+		"usable cache selects DuckDB even when automatic refresh is disabled")
+	assert.Equal(startupCacheBuildOutcomeNone, outcome, "no explicit intent has no outcome")
+	assert.Contains(logs.String(),
+		"automatic analytics cache refresh disabled",
+		"startup warning explains the live-SQL opt-out")
+	assert.Contains(logs.String(),
+		"auto_build_cache=false",
+		"startup warning records the disabled setting")
+}
+
+func TestDaemonCacheRefreshErrorReportsDaemonCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	subprocessErr := errors.New("signal: killed")
+
+	require.ErrorIs(t, daemonCacheRefreshError(ctx, subprocessErr), context.Canceled)
+	assert.Same(t, subprocessErr, daemonCacheRefreshError(context.Background(), subprocessErr))
+	assert.NoError(t, daemonCacheRefreshError(ctx, nil))
 }
 
 func TestOpenDaemonAnalyticsEngineAutoBuildsCacheAtStartup(t *testing.T) {
@@ -437,13 +1020,16 @@ func TestOpenDaemonAnalyticsEngineAutoBuildsCacheAtStartup(t *testing.T) {
 		return err
 	})
 
-	engine, mode, err := openDaemonAnalyticsEngine(context.Background(), c, s)
+	engine, mode, outcome, err := openDaemonAnalyticsEngine(
+		context.Background(), c, s, startupCacheBuildIntentNone,
+	)
 	require.NoError(err, "openDaemonAnalyticsEngine")
 	defer func() { _ = engine.Close() }()
 
 	assert.Equal(1, builds, "a stale cache must be built synchronously at startup")
 	assert.Equal(api.AnalyticsModeDuckDB, mode,
 		"the daemon must serve DuckDB over the fresh cache, not live-SQL fallback")
+	assert.Equal(startupCacheBuildOutcomeNone, outcome, "automatic builds have no explicit outcome")
 }
 
 func TestDaemonDuckDBEnginesUseIsolatedSpillDirectories(t *testing.T) {
@@ -481,17 +1067,26 @@ func TestOpenDaemonAnalyticsEngineAutoFallsBackWhenStartupBuildFails(t *testing.
 	c, s := openTestDaemonAnalyticsStore(t)
 	c.Analytics.Engine = config.AnalyticsEngineAuto
 	c.Analytics.AutoBuildCache = true
+	var logs bytes.Buffer
+	oldLogger := logger
+	logger = slog.New(slog.NewTextHandler(&logs, nil))
+	t.Cleanup(func() { logger = oldLogger })
 	stubBuildCacheSubprocess(t, func(context.Context, bool) error {
 		return errors.New("simulated build failure")
 	})
 
-	engine, mode, err := openDaemonAnalyticsEngine(context.Background(), c, s)
+	engine, mode, outcome, err := openDaemonAnalyticsEngine(
+		context.Background(), c, s, startupCacheBuildIntentNone,
+	)
 	require.NoError(err, "a failed auto-mode build must not fail daemon startup")
 	defer func() { _ = engine.Close() }()
 
 	assert.IsType(&query.SQLiteEngine{}, engine)
 	assert.Equal(api.AnalyticsModeSQLFallback, mode,
 		"a failed build falls back to live SQL for engine=auto")
+	assert.Equal(startupCacheBuildOutcomeNone, outcome, "automatic failures have no explicit outcome")
+	assert.Contains(logs.String(), `msg="daemon startup step failed"`)
+	assert.Contains(logs.String(), "step=build_analytics_cache")
 }
 
 func TestOpenDaemonAnalyticsEngineDuckDBRequiresCacheBuild(t *testing.T) {
@@ -504,13 +1099,200 @@ func TestOpenDaemonAnalyticsEngineDuckDBRequiresCacheBuild(t *testing.T) {
 		return sentinel
 	})
 
-	engine, _, err := openDaemonAnalyticsEngine(context.Background(), c, s)
+	engine, _, outcome, err := openDaemonAnalyticsEngine(
+		context.Background(), c, s, startupCacheBuildIntentNone,
+	)
 	if engine != nil {
 		_ = engine.Close()
 	}
 
 	require.Error(err, "duckdb mode should fail when the required cache build fails")
 	require.ErrorIs(err, sentinel, "error")
+	require.Equal(startupCacheBuildOutcomeNone, outcome, "automatic failure has no explicit outcome")
+}
+
+func TestOpenDaemonAnalyticsEngineExplicitIntentOverridesDisabledAutoBuild(t *testing.T) {
+	assert := assert.New(t)
+
+	c, s := openTestDaemonAnalyticsStore(t)
+	c.Analytics.Engine = config.AnalyticsEngineAuto
+	c.Analytics.AutoBuildCache = false
+	builds := 0
+	stubStartupCacheBuild(t, func(_ context.Context, intent startupCacheBuildIntent) error {
+		builds++
+		assert.Equal(startupCacheBuildIntentDefault, intent)
+		_, err := buildCacheAuto(c.DatabaseDSN(), c.AnalyticsDir())
+		return err
+	})
+
+	engine, mode, outcome, err := openDaemonAnalyticsEngine(
+		context.Background(), c, s, startupCacheBuildIntentDefault,
+	)
+	require.NoError(t, err)
+	defer func() { _ = engine.Close() }()
+
+	assert.Equal(1, builds)
+	assert.Equal(api.AnalyticsModeDuckDB, mode)
+	assert.Equal(startupCacheBuildOutcomeFulfilled, outcome)
+}
+
+func TestOpenDaemonAnalyticsEngineExplicitFullBuildRunsWhenCacheIsFresh(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	c, s := openTestDaemonAnalyticsStore(t)
+	_, err := buildCache(c.DatabaseDSN(), c.AnalyticsDir(), true)
+	require.NoError(err)
+	builds := 0
+	stubStartupCacheBuild(t, func(_ context.Context, intent startupCacheBuildIntent) error {
+		builds++
+		assert.Equal(startupCacheBuildIntentFull, intent)
+		_, buildErr := buildCache(c.DatabaseDSN(), c.AnalyticsDir(), true)
+		return buildErr
+	})
+
+	engine, mode, outcome, err := openDaemonAnalyticsEngine(
+		context.Background(), c, s, startupCacheBuildIntentFull,
+	)
+	require.NoError(err)
+	defer func() { _ = engine.Close() }()
+
+	assert.Equal(1, builds)
+	assert.Equal(api.AnalyticsModeDuckDB, mode)
+	assert.Equal(startupCacheBuildOutcomeFulfilled, outcome)
+}
+
+func TestOpenDaemonAnalyticsEngineExplicitFailureKeepsAutoFallback(t *testing.T) {
+	assert := assert.New(t)
+
+	c, s := openTestDaemonAnalyticsStore(t)
+	c.Analytics.Engine = config.AnalyticsEngineAuto
+	stubStartupCacheBuild(t, func(context.Context, startupCacheBuildIntent) error {
+		return errors.New("simulated explicit build failure")
+	})
+
+	engine, mode, outcome, err := openDaemonAnalyticsEngine(
+		context.Background(), c, s, startupCacheBuildIntentDefault,
+	)
+	require.NoError(t, err)
+	defer func() { _ = engine.Close() }()
+
+	assert.IsType(&query.SQLiteEngine{}, engine)
+	assert.Equal(api.AnalyticsModeSQLFallback, mode)
+	assert.Equal(startupCacheBuildOutcomeFailed, outcome)
+}
+
+func TestOpenDaemonAnalyticsEngineExplicitSuccessWithoutUsableCacheIsFailed(t *testing.T) {
+	assert := assert.New(t)
+
+	c, s := openTestDaemonAnalyticsStore(t)
+	c.Analytics.Engine = config.AnalyticsEngineAuto
+	stubStartupCacheBuild(t, func(context.Context, startupCacheBuildIntent) error {
+		return nil
+	})
+
+	engine, mode, outcome, err := openDaemonAnalyticsEngine(
+		context.Background(), c, s, startupCacheBuildIntentDefault,
+	)
+	require.NoError(t, err)
+	defer func() { _ = engine.Close() }()
+
+	assert.IsType(&query.SQLiteEngine{}, engine)
+	assert.Equal(api.AnalyticsModeSQLFallback, mode)
+	assert.Equal(startupCacheBuildOutcomeFailed, outcome,
+		"a successful child exit does not fulfill intent without a usable cache")
+}
+
+func TestOpenDaemonAnalyticsEngineExplicitFullFailureDoesNotReuseOldCache(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	c, s := openTestDaemonAnalyticsStore(t)
+	c.Analytics.Engine = config.AnalyticsEngineAuto
+	_, err := buildCache(c.DatabaseDSN(), c.AnalyticsDir(), true)
+	require.NoError(err)
+	stubStartupCacheBuild(t, func(context.Context, startupCacheBuildIntent) error {
+		return errors.New("simulated full rebuild failure")
+	})
+
+	engine, mode, outcome, err := openDaemonAnalyticsEngine(
+		context.Background(), c, s, startupCacheBuildIntentFull,
+	)
+	require.NoError(err)
+	defer func() { _ = engine.Close() }()
+
+	assert.IsType(&query.SQLiteEngine{}, engine)
+	assert.Equal(api.AnalyticsModeSQLFallback, mode,
+		"explicit auto-mode failure must preserve the documented live-SQL fallback")
+	assert.Equal(startupCacheBuildOutcomeFailed, outcome)
+}
+
+func TestOpenDaemonAnalyticsEngineExplicitDuckDBOpenFailureMarksIntentFailed(t *testing.T) {
+	assert := assert.New(t)
+
+	c, s := openTestDaemonAnalyticsStore(t)
+	c.Analytics.Engine = config.AnalyticsEngineAuto
+	stubStartupCacheBuild(t, func(context.Context, startupCacheBuildIntent) error {
+		_, err := buildCache(c.DatabaseDSN(), c.AnalyticsDir(), true)
+		return err
+	})
+	sentinel := errors.New("simulated DuckDB open failure")
+	oldOpen := openDaemonDuckDBEngineForRun
+	openDaemonDuckDBEngineForRun = func(*config.Config, *store.Store) (*query.DuckDBEngine, error) {
+		return nil, sentinel
+	}
+	t.Cleanup(func() { openDaemonDuckDBEngineForRun = oldOpen })
+
+	engine, mode, outcome, err := openDaemonAnalyticsEngine(
+		context.Background(), c, s, startupCacheBuildIntentDefault,
+	)
+	require.NoError(t, err, "auto mode must preserve live-SQL fallback")
+	defer func() { _ = engine.Close() }()
+
+	assert.IsType(&query.SQLiteEngine{}, engine)
+	assert.Equal(api.AnalyticsModeSQLFallback, mode)
+	assert.Equal(startupCacheBuildOutcomeFailed, outcome,
+		"the CLI must not claim the daemon is using a cache it could not open")
+}
+
+func TestOpenDaemonAnalyticsEngineSQLLeavesExplicitIntentUnconsumed(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	c, s := openTestDaemonAnalyticsStore(t)
+	c.Analytics.Engine = config.AnalyticsEngineSQL
+	stubStartupCacheBuild(t, func(context.Context, startupCacheBuildIntent) error {
+		require.FailNow("SQL engine must leave cache intent for the HTTP path")
+		return nil
+	})
+
+	engine, mode, outcome, err := openDaemonAnalyticsEngine(
+		context.Background(), c, s, startupCacheBuildIntentDefault,
+	)
+	require.NoError(err)
+	defer func() { _ = engine.Close() }()
+
+	assert.Equal(api.AnalyticsModeSQL, mode)
+	assert.Equal(startupCacheBuildOutcomeUnconsumed, outcome)
+}
+
+func TestOpenDaemonAnalyticsEngineExplicitDuckDBFailureIsFatal(t *testing.T) {
+	c, s := openTestDaemonAnalyticsStore(t)
+	c.Analytics.Engine = config.AnalyticsEngineDuckDB
+	sentinel := errors.New("explicit build failed")
+	stubStartupCacheBuild(t, func(context.Context, startupCacheBuildIntent) error {
+		return sentinel
+	})
+
+	engine, _, outcome, err := openDaemonAnalyticsEngine(
+		context.Background(), c, s, startupCacheBuildIntentDefault,
+	)
+	if engine != nil {
+		_ = engine.Close()
+	}
+
+	require.ErrorIs(t, err, sentinel)
+	assert.Equal(t, startupCacheBuildOutcomeFatal, outcome)
 }
 
 func openTestDaemonAnalyticsStore(t *testing.T) (*config.Config, *store.Store) {
@@ -531,6 +1313,16 @@ func stubBuildCacheSubprocess(
 	old := buildCacheSubprocessForRun
 	buildCacheSubprocessForRun = fn
 	t.Cleanup(func() { buildCacheSubprocessForRun = old })
+}
+
+func stubStartupCacheBuild(
+	t *testing.T,
+	fn func(context.Context, startupCacheBuildIntent) error,
+) {
+	t.Helper()
+	old := buildStartupCacheSubprocessForRun
+	buildStartupCacheSubprocessForRun = fn
+	t.Cleanup(func() { buildStartupCacheSubprocessForRun = old })
 }
 
 func TestStoreAPIAdapterServesSourceStatus(t *testing.T) {
@@ -667,6 +1459,17 @@ func TestCLISyncSubprocessArgsIncrementalIncludesFolderFilters(t *testing.T) {
 	)
 }
 
+func TestCLISyncSubprocessArgsIncludesExactSourceID(t *testing.T) {
+	assert.Equal(t,
+		[]string{"sync", "--source-id", "42"},
+		cliSyncSubprocessArgs(api.CLISyncRequest{SourceID: 42, SourceIDSet: true}),
+	)
+	assert.Equal(t,
+		[]string{"sync-full", "--source-id", "42"},
+		cliSyncSubprocessArgs(api.CLISyncRequest{Full: true, SourceID: 42, SourceIDSet: true}),
+	)
+}
+
 func TestStoreAPIAdapterRunCLICommandPacksOnlyAllowlistedSuccess(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -739,6 +1542,36 @@ func TestStoreAPIAdapterRunCLICommandPacksOnlyAllowlistedSuccess(t *testing.T) {
 	}
 }
 
+func TestStoreAPIAdapterAppendsServerOwnedGrantDecision(t *testing.T) {
+	adapter := &storeAPIAdapter{}
+	req := api.CLIRunRequest{
+		Args:         []string{"add-account", "user@example.com", "--readonly"},
+		GrantDecided: true,
+	}
+	var gotArgs []string
+
+	err := adapter.runCLICommandWithRunner(
+		context.Background(), req, nil,
+		func(
+			_ context.Context,
+			args []string,
+			_ map[string]string,
+			_ string,
+			_ func(string, string) error,
+		) error {
+			gotArgs = args
+			return nil
+		},
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		"add-account", "user@example.com", "--readonly", "--grant-decided=true",
+	}, gotArgs)
+	assert.Equal(t, []string{"add-account", "user@example.com", "--readonly"}, req.Args,
+		"server injection must not mutate caller-owned args")
+}
+
 func TestStoreAPIAdapterInterceptsExplicitRepackInDaemonParent(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -766,6 +1599,24 @@ func TestStoreAPIAdapterInterceptsExplicitRepackInDaemonParent(t *testing.T) {
 	require.Len(events, 1)
 	assert.Equal("stdout", events[0].Type)
 	assert.Contains(events[0].Data, "removed 1 old pack(s)")
+}
+
+func TestStoreAPIAdapterRejectsExplicitRepackInLooseAttachmentMode(t *testing.T) {
+	f := newAttachmentMaintenanceFixture(t)
+	f.maintenance.packCreationEnabled = false
+	adapter := &storeAPIAdapter{store: f.store, attachmentMaintenance: f.maintenance}
+
+	err := adapter.runCLICommandWithRunner(
+		context.Background(), api.CLIRunRequest{Args: []string{"repack-attachments"}},
+		nil,
+		func(context.Context, []string, map[string]string, string, func(string, string) error) error {
+			require.FailNow(t, "disabled repack must never spawn a child process")
+			return nil
+		},
+	)
+
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "[data].loose_attachments")
 }
 
 func TestStoreAPIAdapterExplicitRepackAcceptsLoggingPassthroughFlags(t *testing.T) {
@@ -816,11 +1667,16 @@ func TestRepackAttachmentsParentArgsAllowed(t *testing.T) {
 func TestStoreAPIAdapterRepackAfterSuccessfulRemovalOnly(t *testing.T) {
 	tests := []struct {
 		name           string
+		args           []string
 		predecessorErr error
 		wantRemoved    bool
 	}{
-		{name: "successful removal", wantRemoved: true},
-		{name: "failed removal", predecessorErr: errors.New("remove failed")},
+		{name: "successful account removal", args: []string{"remove-account", "alice@example.com", "--yes"}, wantRemoved: true},
+		{name: "failed account removal", args: []string{"remove-account", "alice@example.com", "--yes"}, predecessorErr: errors.New("remove failed")},
+		{name: "successful excluded media purge", args: []string{"purge-excluded-media", "--yes"}, wantRemoved: true},
+		{name: "dry run is not a removal", args: []string{"purge-excluded-media", "--dry-run"}},
+		{name: "unconfirmed purge is not a removal", args: []string{"purge-excluded-media"}},
+		{name: "failed excluded media purge", args: []string{"purge-excluded-media", "--yes"}, predecessorErr: errors.New("purge failed")},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -833,7 +1689,7 @@ func TestStoreAPIAdapterRepackAfterSuccessfulRemovalOnly(t *testing.T) {
 
 			err := adapter.runCLICommandWithRunner(
 				context.Background(),
-				api.CLIRunRequest{Args: []string{"remove-account", "alice@example.com", "--yes"}},
+				api.CLIRunRequest{Args: tt.args},
 				nil,
 				func(context.Context, []string, map[string]string, string, func(string, string) error) error {
 					runnerCalls++
@@ -1323,6 +2179,26 @@ func TestFindScheduledSyncSources(t *testing.T) {
 	got, err = findScheduledSyncSources(s, "Shared Guild")
 	require.NoError(err, "do not resolve Discord source by display name")
 	assert.Empty(got, "duplicate guild display names must not select an arbitrary source")
+}
+
+func TestScheduledTeamsImportOptionsApplyMediaPolicy(t *testing.T) {
+	oldConfig := cfg
+	t.Cleanup(func() { cfg = oldConfig })
+	enabled := true
+	cfg = &config.Config{
+		Data: config.DataConfig{DataDir: t.TempDir()},
+		Teams: config.TeamsConfig{
+			MediaScope: "direct",
+			AccountsConfig: map[string]config.MediaAccountConfig{
+				"user@example.com": {Media: &enabled, MaxMediaMB: 7},
+			},
+		},
+	}
+
+	opts := scheduledTeamsImportOptions("user@example.com")
+	assert.Equal(t, cfg.Teams.MediaPolicy("user@example.com"), opts.MediaPolicy)
+	assert.Equal(t, cfg.AttachmentsDir(), opts.AttachmentsDir)
+	assert.True(t, opts.IncludeChannels)
 }
 
 func TestRunScheduledSyncUsesSharedDiscordImporterAndRebuildsOnce(t *testing.T) {

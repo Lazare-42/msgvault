@@ -3,6 +3,8 @@ package daemonclient
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"go.kenn.io/msgvault/internal/store"
@@ -34,22 +36,84 @@ func (c *Client) GetStats() (*store.Stats, error) {
 // detail rather than the tool silently going missing. Older daemons that omit
 // `vector_status` fall back to the `vector_search.enabled` flag.
 func (c *Client) VectorSearchAvailable(ctx context.Context) (bool, error) {
+	stats, err := c.vectorSearchStats(ctx)
+	if err != nil {
+		return false, err
+	}
+	return vectorSearchAvailable(stats), nil
+}
+
+// VectorSearchAvailableForMessageType reports whether the daemon's text-vector
+// lane can serve searches for messageType. An empty advertised scope means the
+// text index covers every message type.
+func (c *Client) VectorSearchAvailableForMessageType(ctx context.Context, messageType string) (bool, error) {
+	stats, err := c.vectorSearchStats(ctx)
+	if err != nil {
+		return false, err
+	}
+	if !vectorSearchAvailable(stats) {
+		return false, nil
+	}
+	if len(stats.VectorTextMessageTypes) == 0 {
+		return true, nil
+	}
+	messageType = strings.TrimSpace(messageType)
+	return slices.ContainsFunc(stats.VectorTextMessageTypes, func(indexedType string) bool {
+		return strings.EqualFold(strings.TrimSpace(indexedType), messageType)
+	}), nil
+}
+
+func (c *Client) vectorSearchStats(ctx context.Context) (*generated.StatsResponse, error) {
 	resp, err := APIResponse(c, func(client *apiclient.Client) (*generated.GetStatsResp, error) {
 		return client.GetStatsWithResponse(ctx)
 	})
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	if resp == nil || resp.JSON200 == nil {
-		return false, nil
+		return &generated.StatsResponse{}, nil
 	}
-	if status := resp.JSON200.VectorStatus; status != nil && *status != "" {
-		return *status != vectorStatusDisabled, nil
+	return resp.JSON200, nil
+}
+
+func vectorSearchAvailable(stats *generated.StatsResponse) bool {
+	if stats == nil {
+		return false
 	}
-	if resp.JSON200.VectorSearch == nil {
-		return false, nil
+	// Newer daemons report the text lane separately: a multimodal-only
+	// daemon is vector-"ready" without serving semantic message search, so
+	// the shared status must not enable text-vector tools there.
+	if textStatus := stats.VectorTextStatus; textStatus != nil && *textStatus != "" {
+		return *textStatus != vectorStatusDisabled
 	}
-	return resp.JSON200.VectorSearch.Enabled, nil
+	if status := stats.VectorStatus; status != nil && *status != "" {
+		return *status != vectorStatusDisabled
+	}
+	if stats.VectorSearch == nil {
+		return false
+	}
+	return stats.VectorSearch.Enabled
+}
+
+// VisualSearchAvailable reports whether the daemon's multimodal lane is
+// configured — including still-initializing — so the MCP catalog can register
+// the visual tool without a one-time readiness probe permanently omitting it
+// after a transient 503 during asynchronous vector init. Older daemons omit
+// the lane field; callers fall back to probing the visual status endpoint.
+func (c *Client) VisualSearchAvailable(ctx context.Context) (bool, bool, error) {
+	resp, err := APIResponse(c, func(client *apiclient.Client) (*generated.GetStatsResp, error) {
+		return client.GetStatsWithResponse(ctx)
+	})
+	if err != nil {
+		return false, false, err
+	}
+	if resp == nil || resp.JSON200 == nil {
+		return false, false, nil
+	}
+	if visualStatus := resp.JSON200.VectorVisualStatus; visualStatus != nil && *visualStatus != "" {
+		return *visualStatus != vectorStatusDisabled, true, nil
+	}
+	return false, false, nil
 }
 
 // vectorStatusDisabled mirrors api.VectorStatusDisabled. It is duplicated here

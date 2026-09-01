@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/peoplesweep"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
@@ -20,10 +22,15 @@ func TestPersonPromoteGetListUpdateAndRevisionConflict(t *testing.T) {
 	alias := f.EnsureParticipant("alice+alias@example.com", "alice", "example.com")
 	_, err := f.Store.LinkParticipants(alice, alias)
 	require.NoError(err)
+	revisionBeforePromotion, err := f.Store.IdentityRevision()
+	require.NoError(err)
 
 	created, wasCreated, err := f.Store.CreatePersonFromParticipant(alias)
 	require.NoError(err)
 	assert.True(wasCreated)
+	revisionAfterPromotion, err := f.Store.IdentityRevision()
+	require.NoError(err)
+	assert.Equal(revisionBeforePromotion+1, revisionAfterPromotion)
 	assert.Positive(created.ID)
 	assert.Regexp(`^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$`, created.VCardUID)
 	assert.Nil(created.DisplayName)
@@ -33,6 +40,9 @@ func TestPersonPromoteGetListUpdateAndRevisionConflict(t *testing.T) {
 	promotedAgain, wasCreated, err := f.Store.CreatePersonFromParticipant(alice)
 	require.NoError(err)
 	assert.False(wasCreated)
+	revisionAfterRepromotion, err := f.Store.IdentityRevision()
+	require.NoError(err)
+	assert.Equal(revisionAfterPromotion, revisionAfterRepromotion)
 	assert.Equal(created.ID, promotedAgain.ID)
 	assert.Equal(created.VCardUID, promotedAgain.VCardUID)
 
@@ -161,6 +171,37 @@ func TestLinkWithoutPersonsBindsNothing(t *testing.T) {
 	assert.Empty(persons)
 }
 
+func TestRepromotionThatFillsBindingBumpsIdentityRevisionOnce(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	f := storetest.New(t)
+	participantID := f.EnsureParticipant(
+		"promotion-fill@example.com", "Promotion Fill", "example.com")
+	aliasID := f.EnsureParticipant(
+		"promotion-fill-alias@example.com", "Promotion Fill Alias", "example.com")
+	person, created, err := f.Store.CreatePersonFromParticipant(participantID)
+	require.NoError(err)
+	require.True(created)
+
+	// Simulate a pre-chokepoint archive where the cluster edge exists but its
+	// newly connected member was never carried into person_participants.
+	_, err = f.Store.DB().Exec(f.Store.Rebind(`
+		INSERT INTO participant_links (participant_a, participant_b) VALUES (?, ?)
+	`), participantID, aliasID)
+	require.NoError(err)
+	revisionBefore, err := f.Store.IdentityRevision()
+	require.NoError(err)
+
+	promoted, wasCreated, err := f.Store.CreatePersonFromParticipant(aliasID)
+	require.NoError(err)
+	assert.False(wasCreated)
+	assert.Equal(person.ID, promoted.ID)
+	assert.Equal([]int64{participantID, aliasID}, promoted.ParticipantIDs)
+	revisionAfter, err := f.Store.IdentityRevision()
+	require.NoError(err)
+	assert.Equal(revisionBefore+1, revisionAfter)
+}
+
 func TestPersonIdentitySurvivesLinkUnlinkChurn(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -243,13 +284,21 @@ func TestDeletePersonRetiresProfileAndUnblocksLinking(t *testing.T) {
 	require.NoError(err)
 	bobPerson, _, err := f.Store.CreatePersonFromParticipant(bob)
 	require.NoError(err)
+	revisionBeforeFailedDeletes, err := f.Store.IdentityRevision()
+	require.NoError(err)
 
 	err = f.Store.DeletePerson(bobPerson.ID, bobPerson.Revision+1)
 	require.ErrorIs(err, store.ErrPersonRevisionConflict)
 	err = f.Store.DeletePerson(bobPerson.ID+1000, 1)
 	require.ErrorIs(err, store.ErrPersonNotFound)
+	revisionAfterFailedDeletes, err := f.Store.IdentityRevision()
+	require.NoError(err)
+	assert.Equal(revisionBeforeFailedDeletes, revisionAfterFailedDeletes)
 
 	require.NoError(f.Store.DeletePerson(bobPerson.ID, bobPerson.Revision))
+	revisionAfterDelete, err := f.Store.IdentityRevision()
+	require.NoError(err)
+	assert.Equal(revisionBeforeFailedDeletes+1, revisionAfterDelete)
 	_, err = f.Store.GetPerson(bobPerson.ID)
 	require.ErrorIs(err, store.ErrPersonNotFound)
 
@@ -289,6 +338,114 @@ func TestMergeFillsPersonAcrossCombinedCluster(t *testing.T) {
 	assert.Equal(person.VCardUID, got.VCardUID)
 	assert.Equal([]int64{winner, sibling}, got.ParticipantIDs)
 	assert.Greater(got.Revision, person.Revision)
+}
+
+func TestPersonMergeInvalidatesSweep(t *testing.T) {
+	t.Run("participant merge", func(t *testing.T) {
+		checks := assert.New(t)
+		requirements := require.New(t)
+		f := storetest.New(t)
+		absorbed := f.EnsureParticipant(
+			"merge-absorbed@example.test", "Absorbed", "example.test")
+		survivor := f.EnsureParticipant(
+			"merge-survivor@example.test", "Survivor", "example.test")
+		messageID := f.CreateMessage("person-sweep-participant-merge")
+		_, err := f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
+			`UPDATE messages SET sender_id = ? WHERE id = ?`), absorbed, messageID)
+		requirements.NoError(err)
+		person, _, err := f.Store.CreatePersonFromParticipant(absorbed)
+		requirements.NoError(err)
+		_, err = f.Store.SetPersonTrackingContext(t.Context(), person.ID, true)
+		requirements.NoError(err)
+		deletePersonSweepWork(t, f.Store, person.ID)
+		before := latestPersonSweepSequence(t, f.Store)
+
+		requirements.NoError(f.Store.MergeParticipants(absorbed, survivor))
+		changes := personSweepChangesAfter(t, f.Store, person.ID, before)
+		requirements.NotEmpty(changes)
+		checks.Contains(archiveEffects(changes),
+			peoplesweep.EvidenceEffectIdentityReassigned)
+		rows, dirtyThrough := personSweepWorkState(t, f.Store, person.ID)
+		checks.Equal(1, rows)
+		checks.Equal(changes[len(changes)-1].Sequence, dirtyThrough)
+	})
+
+	t.Run("identity split", func(t *testing.T) {
+		checks := assert.New(t)
+		requirements := require.New(t)
+		f := storetest.New(t)
+		alice := f.EnsureParticipant("split-alice@example.test", "Alice", "example.test")
+		alias := f.EnsureParticipant("split-alias@example.test", "Alias", "example.test")
+		_, err := f.Store.LinkParticipants(alice, alias)
+		requirements.NoError(err)
+		person, _, err := f.Store.CreatePersonFromParticipant(alice)
+		requirements.NoError(err)
+		messageID := f.CreateMessage("person-sweep-identity-split")
+		_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
+			`UPDATE messages SET sender_id = ?, sent_at = ? WHERE id = ?`), alias,
+			time.Date(2026, 8, 23, 12, 0, 0, 0, time.UTC), messageID)
+		requirements.NoError(err)
+		_, err = f.Store.SetPersonTrackingContext(t.Context(), person.ID, true)
+		requirements.NoError(err)
+		deletePersonSweepWork(t, f.Store, person.ID)
+		before := latestPersonSweepSequence(t, f.Store)
+
+		_, err = f.Store.UnlinkParticipants(alice, alias)
+		requirements.NoError(err)
+		changes := personSweepChangesAfter(t, f.Store, person.ID, before)
+		requirements.NotEmpty(changes)
+		checks.Contains(archiveEffects(changes),
+			peoplesweep.EvidenceEffectIdentityReassigned)
+		checks.Equal(messageID, changes[len(changes)-1].MessageID)
+		rows, dirtyThrough := personSweepWorkState(t, f.Store, person.ID)
+		checks.Equal(1, rows)
+		checks.Equal(changes[len(changes)-1].Sequence, dirtyThrough)
+	})
+}
+
+func TestUntrackedPersonIdentityMutationDoesNotPublishSweep(t *testing.T) {
+	t.Run("participant merge", func(t *testing.T) {
+		checks := assert.New(t)
+		requirements := require.New(t)
+		f := storetest.New(t)
+		absorbed := f.EnsureParticipant(
+			"untracked-merge-absorbed@example.test", "Absorbed", "example.test")
+		survivor := f.EnsureParticipant(
+			"untracked-merge-survivor@example.test", "Survivor", "example.test")
+		messageID := f.CreateMessage("untracked-person-sweep-participant-merge")
+		_, err := f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
+			`UPDATE messages SET sender_id = ? WHERE id = ?`), absorbed, messageID)
+		requirements.NoError(err)
+		person, _, err := f.Store.CreatePersonFromParticipant(absorbed)
+		requirements.NoError(err)
+		before := latestPersonSweepSequence(t, f.Store)
+
+		requirements.NoError(f.Store.MergeParticipants(absorbed, survivor))
+		checks.Equal(before, latestPersonSweepSequence(t, f.Store))
+		checks.Empty(personSweepChangesAfter(t, f.Store, person.ID, 0))
+	})
+
+	t.Run("identity link", func(t *testing.T) {
+		checks := assert.New(t)
+		requirements := require.New(t)
+		f := storetest.New(t)
+		alice := f.EnsureParticipant(
+			"untracked-link-alice@example.test", "Alice", "example.test")
+		alias := f.EnsureParticipant(
+			"untracked-link-alias@example.test", "Alias", "example.test")
+		person, _, err := f.Store.CreatePersonFromParticipant(alice)
+		requirements.NoError(err)
+		messageID := f.CreateMessage("untracked-person-sweep-identity-link")
+		_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
+			`UPDATE messages SET sender_id = ? WHERE id = ?`), alias, messageID)
+		requirements.NoError(err)
+		before := latestPersonSweepSequence(t, f.Store)
+
+		_, err = f.Store.LinkParticipants(alice, alias)
+		requirements.NoError(err)
+		checks.Equal(before, latestPersonSweepSequence(t, f.Store))
+		checks.Empty(personSweepChangesAfter(t, f.Store, person.ID, 0))
+	})
 }
 
 func TestPersonForParticipants(t *testing.T) {

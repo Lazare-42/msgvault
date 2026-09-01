@@ -84,9 +84,9 @@ type Engine interface {
 	SearchFastWithStats(ctx context.Context, query *search.Query, queryStr string,
 		filter MessageFilter, statsGroupBy ViewType, limit, offset int) (*SearchFastResult, error)
 
-	// GetGmailIDsByFilter returns Gmail message IDs (source_message_id) matching a filter.
-	// This is useful for batch operations like staging messages for deletion.
-	GetGmailIDsByFilter(ctx context.Context, filter MessageFilter) ([]string, error)
+	// GetDeletionTargetsByFilter returns deletion candidates without losing
+	// their source provenance.
+	GetDeletionTargetsByFilter(ctx context.Context, filter MessageFilter) ([]DeletionTarget, error)
 
 	// SearchByDomains returns messages where any participant (from, to, cc, or bcc)
 	// belongs to one of the given domains.
@@ -100,6 +100,40 @@ type Engine interface {
 
 	// Close releases any resources held by the engine.
 	Close() error
+}
+
+// SemanticMessageSearcher is an optional engine capability for ranked
+// natural-language message search. It stays separate from Engine so local and
+// test engines that do not have a configured vector backend keep working.
+type SemanticMessageSearcher interface {
+	SearchSemanticMessages(ctx context.Context, request SemanticMessageSearchRequest) (*SemanticMessageSearchResult, error)
+}
+
+// SemanticMessageSearchSupportsFilter reports whether semantic message search
+// can preserve every structured scope in filter.
+func SemanticMessageSearchSupportsFilter(filter MessageFilter) bool {
+	return filter.SourceIDs == nil &&
+		filter.SenderName == "" &&
+		filter.RecipientName == "" &&
+		filter.ConversationID == nil &&
+		!filter.HasEmptyTargets()
+}
+
+// SemanticMessageSearchRequest carries the current TUI scope into hybrid
+// search. Filter retains the exact source ID and every representable
+// drill-down, date, message-type, and attachment constraint.
+type SemanticMessageSearchRequest struct {
+	Query  string
+	Filter MessageFilter
+	Limit  int
+	Offset int
+}
+
+// SemanticMessageSearchResult preserves ranking order and reports whether the
+// bounded vector ranking window contains another page.
+type SemanticMessageSearchResult struct {
+	Messages []MessageSummary
+	HasMore  bool
 }
 
 // Explorer is intentionally separate from Engine: only the committed
@@ -135,6 +169,13 @@ type PeopleAnalyzer interface {
 	SearchDomains(ctx context.Context, request DomainSearchRequest) (*DomainSearchResponse, error)
 	GetDomain(ctx context.Context, domain string, analyticalContext Context) (*DomainSummary, error)
 	GetDomainSummary(ctx context.Context, domain string, explore ExploreRequest) (*DomainSearchResponse, error)
+}
+
+// PeopleInboxAnalyzer is separate from Engine so participant inbox rollups
+// can only be served from the committed canonical relationship cache.
+type PeopleInboxAnalyzer interface {
+	ListPersonInboxes(ctx context.Context, request PersonInboxRequest) (*PersonInboxResponse, error)
+	ResolveCanonicalParticipant(ctx context.Context, participantID int64) (int64, error)
 }
 
 // MessageBodySearcher is an optional capability for exact full-text search of

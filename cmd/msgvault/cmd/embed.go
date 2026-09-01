@@ -12,6 +12,8 @@ var (
 	embedFullRebuild            bool
 	embedYes                    bool
 	embedBackstop               bool
+	embedAccounts               []string
+	embedCollections            []string
 	embeddingsRetireYes         bool
 	embeddingsRetireForceActive bool
 	embeddingsActivateForce     bool
@@ -27,7 +29,7 @@ var embeddingsCmd = &cobra.Command{
 
 var embeddingsBuildCmd = newEmbeddingsBuildCmd("build")
 var embeddingsResumeCmd = &cobra.Command{
-	Use:   "resume",
+	Use:   cmdUseResume,
 	Short: "Resume or top up the current vector embedding generation",
 	Long: `Resume or top up the current vector embedding generation.
 If a matching generation is building, this embeds any messages still
@@ -55,6 +57,12 @@ var embeddingsActivateCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE:  runEmbeddingsActivateCommand,
 }
+var embeddingsPruneCmd = &cobra.Command{
+	Use:   "prune",
+	Short: "Remove embeddings for hard-deleted messages",
+	Args:  cobra.NoArgs,
+	RunE:  runEmbeddingsPruneCommand,
+}
 var embedCmd = newEmbeddingsBuildCmd("build-embeddings")
 
 func newEmbeddingsBuildCmd(use string) *cobra.Command {
@@ -76,6 +84,10 @@ to point at a running OpenAI-compatible endpoint.`,
 	cmd.Flags().BoolVar(&embedYes, "yes", false, "Skip confirmation prompts")
 	cmd.Flags().BoolVar(&embedBackstop, "backstop", false,
 		"Full-scan pass that ignores the per-generation watermark, catching any straggler messages the incremental scan skipped (idempotent)")
+	cmd.Flags().StringArrayVar(&embedAccounts, "account", nil,
+		"Limit embedding to this account (repeatable); overrides [vector.embed.scope] accounts for this run")
+	cmd.Flags().StringArrayVar(&embedCollections, "collection", nil,
+		"Limit embedding to this collection's accounts (repeatable); overrides [vector.embed.scope] accounts for this run")
 	return cmd
 }
 
@@ -146,15 +158,20 @@ func init() {
 	embedCmd.Deprecated = "use 'msgvault embeddings build' instead"
 	embeddingsResumeCmd.Flags().BoolVar(&embedBackstop, "backstop", false,
 		"Full-scan pass that ignores the per-generation watermark, catching any straggler messages the incremental scan skipped (idempotent)")
+	embeddingsResumeCmd.Flags().StringArrayVar(&embedAccounts, "account", nil,
+		"Limit embedding to this account (repeatable); overrides [vector.embed.scope] accounts for this run")
+	embeddingsResumeCmd.Flags().StringArrayVar(&embedCollections, "collection", nil,
+		"Limit embedding to this collection's accounts (repeatable); overrides [vector.embed.scope] accounts for this run")
 	embeddingsRetireCmd.Flags().BoolVar(&embeddingsRetireYes, "yes", false, "Skip confirmation prompt")
 	embeddingsRetireCmd.Flags().BoolVar(&embeddingsRetireForceActive, "force-active", false, "Allow retiring the active generation")
 	embeddingsActivateCmd.Flags().BoolVar(&embeddingsActivateYes, "yes", false, "Skip confirmation prompt")
-	embeddingsActivateCmd.Flags().BoolVar(&embeddingsActivateForce, "force", false, "Allow activation while messages still need embedding, or with a fingerprint mismatch")
+	embeddingsActivateCmd.Flags().BoolVar(&embeddingsActivateForce, "force", false, "Allow activation despite incomplete message or person coverage, or a fingerprint mismatch")
 	embeddingsCmd.AddCommand(embeddingsBuildCmd)
 	embeddingsCmd.AddCommand(embeddingsResumeCmd)
 	embeddingsCmd.AddCommand(embeddingsListCmd)
 	embeddingsCmd.AddCommand(embeddingsRetireCmd)
 	embeddingsCmd.AddCommand(embeddingsActivateCmd)
+	embeddingsCmd.AddCommand(embeddingsPruneCmd)
 	rootCmd.AddCommand(embeddingsCmd)
 	rootCmd.AddCommand(embedCmd)
 }

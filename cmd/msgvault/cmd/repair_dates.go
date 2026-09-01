@@ -146,9 +146,22 @@ func runRepairDatesLocal(
 		return err
 	}
 
-	ledger.Status = "applied"
 	appliedAt := time.Now().UTC()
 	ledger.AppliedAt = &appliedAt
+	if err := st.MarkAllContactStateDirtyContext(ctx); err != nil {
+		ledger.Status = "applied-invalidation-failed"
+		ledger.Error = err.Error()
+		if ledgerErr := writeDateRepairLedger(ledgerPath, ledger); ledgerErr != nil {
+			err = errors.Join(
+				err,
+				fmt.Errorf("record contact-state invalidation failure in audit ledger: %w",
+					ledgerErr),
+			)
+		}
+		return dateRepairContactInvalidationError(err)
+	}
+
+	ledger.Status = "applied"
 	if err := writeDateRepairLedger(ledgerPath, ledger); err != nil {
 		return dateRepairPostApplyRecoveryError(
 			"audit ledger finalization failed",
@@ -164,6 +177,7 @@ func runRepairDatesLocal(
 			true,
 			false,
 			publishLockHeld,
+			analyticsBuilderOverrides(cfg.Analytics),
 		); err != nil {
 			ledger.Status = "applied-cache-failed"
 			ledger.Error = err.Error()
@@ -239,6 +253,15 @@ func dateRepairCacheRefreshError(err error) error {
 	return dateRepairPostApplyRecoveryError("analytics cache refresh failed", err)
 }
 
+func dateRepairContactInvalidationError(err error) error {
+	return fmt.Errorf(
+		"date repairs applied, but contact state invalidation failed; "+
+			"keep the repair ledger and run a full activity/contact-state rebuild "+
+			"before relying on contact dates: %w",
+		err,
+	)
+}
+
 func dateRepairPostApplyRecoveryError(problem string, err error) error {
 	return fmt.Errorf(
 		"date repairs applied, but %s; "+
@@ -299,13 +322,11 @@ func scanAndPlanDateRepairs(
 			continue
 		}
 		plan.repairs = append(plan.repairs, plannedDateRepair{
-			MessageDateRepair: store.MessageDateRepair{
-				ID:                     candidate.ID,
-				SentAt:                 resolved,
-				ExpectedLastModifiedAt: candidate.LastModifiedAt,
-			},
-			source:    source,
-			oldSentAt: candidate.SentAt,
+			ID:                     candidate.ID,
+			SentAt:                 resolved,
+			ExpectedLastModifiedAt: candidate.LastModifiedAt,
+			source:                 source,
+			oldSentAt:              candidate.SentAt,
 		})
 	}
 	return plan, nil

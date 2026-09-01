@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -551,6 +552,103 @@ func TestStore_EnsureLabelsBatch_CrossRename(t *testing.T) {
 	f.AssertMessageHasLabel(msg2, l2ID)
 }
 
+func TestStore_EnsureLabelsBatch_PersistsClearsAndCrossRenamesSystemRole(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := storetest.New(t)
+
+	initial := map[string]store.LabelInfo{
+		"L1": {Name: "Envoyes", Type: "system", SystemRole: store.LabelSystemRoleSent},
+		"L2": {Name: "Archive", Type: "system"},
+	}
+	ids, err := f.Store.EnsureLabelsBatch(f.Source.ID, initial)
+	require.NoError(err, "initial label refresh")
+
+	var role string
+	require.NoError(f.Store.DB().QueryRow(
+		f.Store.Rebind("SELECT system_role FROM labels WHERE id = ?"), ids["L1"],
+	).Scan(&role), "read persisted role")
+	assert.Equal(store.LabelSystemRoleSent, role, "L1 role")
+
+	// The roles must follow canonical label IDs through a cross-rename, not names.
+	swapped := map[string]store.LabelInfo{
+		"L1": {Name: "Archive", Type: "system"},
+		"L2": {Name: "Envoyes", Type: "system", SystemRole: store.LabelSystemRoleSent},
+	}
+	_, err = f.Store.EnsureLabelsBatch(f.Source.ID, swapped)
+	require.NoError(err, "cross-rename label refresh")
+
+	var l1Role, l2Role sql.NullString
+	require.NoError(f.Store.DB().QueryRow(
+		f.Store.Rebind("SELECT system_role FROM labels WHERE id = ?"), ids["L1"],
+	).Scan(&l1Role), "read cleared role")
+	require.NoError(f.Store.DB().QueryRow(
+		f.Store.Rebind("SELECT system_role FROM labels WHERE id = ?"), ids["L2"],
+	).Scan(&l2Role), "read moved role")
+	assert.False(l1Role.Valid, "L1 role must clear when canonical metadata no longer marks it sent")
+	assert.Equal(store.LabelSystemRoleSent, l2Role.String, "L2 role")
+
+	_, err = f.Store.EnsureLabelsBatch(f.Source.ID, map[string]store.LabelInfo{
+		"L2": {Name: "Envoyes", Type: "system"},
+	})
+	require.NoError(err, "repeated refresh clears stale role")
+	require.NoError(f.Store.DB().QueryRow(
+		f.Store.Rebind("SELECT system_role FROM labels WHERE id = ?"), ids["L2"],
+	).Scan(&l2Role), "read repeatedly cleared role")
+	assert.False(l2Role.Valid, "repeated refresh must clear stale role")
+}
+
+func TestStore_InitSchemaAddsLabelRoleWithoutRewritingLegacyRows(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	dbPath := filepath.Join(t.TempDir(), "legacy-labels.db")
+	st, err := store.Open(dbPath)
+	require.NoError(err, "open store")
+	t.Cleanup(func() { _ = st.Close() })
+
+	_, err = st.DB().Exec(`
+		CREATE TABLE labels (
+			id INTEGER PRIMARY KEY,
+			source_id INTEGER,
+			source_label_id TEXT,
+			name TEXT NOT NULL,
+			label_type TEXT,
+			color TEXT,
+			UNIQUE(source_id, name)
+		)
+	`)
+	require.NoError(err, "create legacy labels")
+	_, err = st.DB().Exec(`
+		INSERT INTO labels (source_id, source_label_id, name, label_type)
+		VALUES (1, 'SENT', 'Envoyes', 'system')
+	`)
+	require.NoError(err, "insert legacy label")
+
+	require.NoError(st.InitSchema(), "migrate legacy labels")
+
+	var role sql.NullString
+	require.NoError(st.DB().QueryRow(
+		"SELECT system_role FROM labels WHERE source_label_id = 'SENT'",
+	).Scan(&role), "read migrated legacy label")
+	assert.False(role.Valid, "migration must not classify or rewrite existing labels")
+
+	indexCount := func(name string) int {
+		var count int
+		require.NoError(st.DB().QueryRow(
+			"SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?", name,
+		).Scan(&count), "read index: "+name)
+		return count
+	}
+	assert.Equal(0, indexCount("idx_labels_source_system_role"),
+		"unreachable index must not be created: labels is only ever queried via its PK join")
+	assert.Equal(0, indexCount("idx_messages_source_id"),
+		"SQLite-redundant composite index must not be created: id is the rowid alias")
+	assert.Equal(1, indexCount("idx_participants_email_lower"),
+		"participant email lower expression index")
+	assert.Equal(1, indexCount("idx_participant_identifiers_value_lower"),
+		"participant identifier value lower expression index")
+}
+
 func TestStore_MessageLabels(t *testing.T) {
 	f := storetest.New(t)
 
@@ -820,6 +918,53 @@ func TestStore_MarkMessagesDeletedByGmailIDBatch(t *testing.T) {
 	// Empty batch should be a no-op
 	err = f.Store.MarkMessagesDeletedByGmailIDBatch(nil)
 	require.NoError(err, "MarkMessagesDeletedByGmailIDBatch(nil)")
+}
+
+func TestStore_SourceScopedRemoteIDDeletion(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	f := storetest.New(t)
+	other, err := f.Store.GetOrCreateSource("gmail", "other@example.invalid")
+	require.NoError(err)
+	otherConversationID, err := f.Store.EnsureConversation(other.ID, "other-thread", "Other")
+	require.NoError(err)
+
+	const remoteID = "shared-remote-id"
+	firstID := f.CreateMessage(remoteID)
+	secondID := storetest.NewMessage(other.ID, otherConversationID).WithSourceMessageID(remoteID).Create(t, f.Store)
+
+	require.NoError(f.Store.MarkMessageDeletedBySourceMessageID(f.Source.ID, false, remoteID))
+	var firstDeleted, secondDeleted sql.NullTime
+	require.NoError(f.Store.DB().QueryRow(
+		f.Store.Rebind(`SELECT deleted_from_source_at FROM messages WHERE id = ?`), firstID,
+	).Scan(&firstDeleted))
+	require.NoError(f.Store.DB().QueryRow(
+		f.Store.Rebind(`SELECT deleted_from_source_at FROM messages WHERE id = ?`), secondID,
+	).Scan(&secondDeleted))
+	assert.True(firstDeleted.Valid)
+	assert.False(secondDeleted.Valid)
+
+	require.NoError(f.Store.MarkMessagesDeletedBySourceMessageIDBatch(other.ID, []string{remoteID}))
+	require.NoError(f.Store.DB().QueryRow(
+		f.Store.Rebind(`SELECT deleted_from_source_at FROM messages WHERE id = ?`), secondID,
+	).Scan(&secondDeleted))
+	assert.True(secondDeleted.Valid)
+
+	require.NoError(f.Store.MarkMessageDeletedBySourceMessageID(f.Source.ID, true, remoteID))
+	var count int
+	require.NoError(f.Store.DB().QueryRow(
+		f.Store.Rebind(`SELECT COUNT(*) FROM messages WHERE id = ?`), firstID,
+	).Scan(&count))
+	assert.Equal(1, count)
+	require.NoError(f.Store.DB().QueryRow(
+		f.Store.Rebind(`SELECT deleted_from_source_at FROM messages WHERE id = ?`), firstID,
+	).Scan(&firstDeleted))
+	assert.True(firstDeleted.Valid)
+	require.NoError(f.Store.DB().QueryRow(
+		f.Store.Rebind(`SELECT COUNT(*) FROM messages WHERE id = ?`), secondID,
+	).Scan(&count))
+	assert.Equal(1, count)
 }
 
 func TestStore_GetMessageRaw_NotFound(t *testing.T) {
@@ -1093,15 +1238,18 @@ func TestStore_GetStats_ClosedDB(t *testing.T) {
 }
 
 func TestStore_GetStats_MissingTable(t *testing.T) {
+	require := require.New(t)
 	st := testutil.NewTestStore(t)
 
 	// Drop a table to simulate missing table scenario
-	_, err := st.DB().Exec("DROP TABLE IF EXISTS attachments")
-	require.NoError(t, err, "DROP TABLE attachments")
+	_, err := st.DB().Exec("DROP TABLE IF EXISTS document_occurrences")
+	require.NoError(err, "DROP TABLE document_occurrences")
+	_, err = st.DB().Exec("DROP TABLE IF EXISTS attachments")
+	require.NoError(err, "DROP TABLE attachments")
 
 	// GetStats should ignore missing tables and return partial stats
 	stats, err := st.GetStats()
-	require.NoError(t, err, "GetStats() with missing table")
+	require.NoError(err, "GetStats() with missing table")
 
 	// AttachmentCount should be 0 (table missing, ignored)
 	assert.Equal(t, int64(0), stats.AttachmentCount, "AttachmentCount (missing table)")
@@ -1640,6 +1788,26 @@ func TestStore_RekeyMessageSourceIDRequiresExpectedID(t *testing.T) {
 	assert.Equal("msgvault-invalidated:1", sourceMessageID)
 }
 
+func TestStore_RekeyMessageSourceIDReportsScopedWrite(t *testing.T) {
+	requirements := require.New(t)
+	checks := assert.New(t)
+	f := storetest.New(t)
+	messageID := f.CreateMessage("INBOX|1")
+	syncID := f.StartSync()
+	scoped := f.Store.ScopedToSync(f.Source.ID, syncID)
+
+	changed, err := scoped.RekeyMessageSourceID(
+		messageID,
+		"INBOX|1",
+		"msgvault-invalidated:1",
+	)
+	requirements.NoError(err)
+	checks.True(changed)
+	sourceMessageID, err := f.Store.GetMessageSourceID(messageID)
+	requirements.NoError(err)
+	checks.Equal("msgvault-invalidated:1", sourceMessageID)
+}
+
 func TestStore_RemoveMessageLabels(t *testing.T) {
 	require := require.New(t)
 	f := storetest.New(t)
@@ -1952,6 +2120,51 @@ func TestStore_PersistMessage_Upsert(t *testing.T) {
 
 	bodyText, _ := f.GetMessageBody(msgID1)
 	assert.Equal("updated body", bodyText.String, "body_text")
+}
+
+func TestStore_PersistMessageSerializesSQLiteWritersBeforePriorStateRead(t *testing.T) {
+	testutil.SkipIfPostgres(t, "exercises SQLite WAL snapshot upgrades")
+	require := require.New(t)
+	f := storetest.New(t)
+	f.Store.DB().SetMaxOpenConns(2)
+	f.Store.DB().SetMaxIdleConns(2)
+
+	base := storetest.NewMessage(f.Source.ID, f.ConvID).
+		WithSourceMessageID("persist-concurrent").
+		WithSubject("seed").
+		Build()
+	_, err := f.Store.PersistMessage(&store.MessagePersistData{
+		Message:  base,
+		BodyText: sql.NullString{String: "seed body", Valid: true},
+	})
+	require.NoError(err, "seed message")
+
+	for iteration := range 50 {
+		start := make(chan struct{})
+		errs := make(chan error, 2)
+		for writer := range 2 {
+			go func() {
+				<-start
+				message := *base
+				message.Subject = sql.NullString{
+					String: fmt.Sprintf("iteration-%d-writer-%d", iteration, writer),
+					Valid:  true,
+				}
+				_, persistErr := f.Store.PersistMessage(&store.MessagePersistData{
+					Message: &message,
+					BodyText: sql.NullString{
+						String: fmt.Sprintf("body-%d-%d", iteration, writer),
+						Valid:  true,
+					},
+				})
+				errs <- persistErr
+			}()
+		}
+		close(start)
+		for writer := range 2 {
+			require.NoError(<-errs, "iteration %d writer %d", iteration, writer)
+		}
+	}
 }
 
 func TestStore_PersistMessageClearsEmbedGenWhenEmbeddingInputsChange(t *testing.T) {

@@ -14,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"go.kenn.io/msgvault/internal/vector"
 )
 
 // ErrPermanent4xx marks a non-retryable HTTP 4xx response from the
@@ -21,7 +23,7 @@ import (
 // it; the error message still carries the status code and a bounded
 // response body. 429 (rate-limited) and 5xx are NOT wrapped — they
 // flow through the retry loop as transient errors.
-var ErrPermanent4xx = errors.New("embed: non-retryable 4xx response")
+var ErrPermanent4xx = vector.ErrPermanent4xx
 
 // Config controls an embeddings Client. The zero value is not usable; callers
 // must set Endpoint, Model, and Dimension at a minimum.
@@ -33,6 +35,10 @@ type Config struct {
 	APIKey string
 	// Model is the model name passed in the request body.
 	Model string
+	// DocumentPrefix is prepended to every document chunk before it is sent.
+	DocumentPrefix string
+	// QueryPrefix is prepended to every query before it is sent.
+	QueryPrefix string
 	// Dimension is the expected vector dimension. Responses whose vectors
 	// differ are rejected with an error.
 	Dimension int
@@ -42,6 +48,12 @@ type Config struct {
 	// call. Defaults to 3 when zero. Only transient errors (5xx, network)
 	// are retried; 4xx responses fail immediately.
 	MaxRetries int
+	// BeforeRequest reauthorizes each concrete HTTP attempt. A returned error
+	// is propagated without retrying. Nil leaves the client ungated.
+	BeforeRequest BeforeRequestFunc
+	// RejectRedirects prevents provider responses from replaying embedding input
+	// to another URL. BeforeRequest clients always reject redirects as well.
+	RejectRedirects bool
 }
 
 // Client calls an OpenAI-compatible /v1/embeddings endpoint.
@@ -58,7 +70,7 @@ func NewClient(cfg Config) *Client {
 	if cfg.MaxRetries == 0 {
 		cfg.MaxRetries = 3
 	}
-	return &Client{cfg: cfg, http: &http.Client{Timeout: cfg.Timeout}}
+	return &Client{cfg: cfg, http: newHTTPClient(cfg.Timeout, cfg.BeforeRequest, cfg.RejectRedirects)}
 }
 
 // embeddingRequest is the JSON body sent to the server.
@@ -76,7 +88,8 @@ type embeddingResponse struct {
 	Model string `json:"model"`
 }
 
-// Embed returns one vector per input, in input order. Empty input is a no-op
+// Embed embeds document chunks and returns one vector per input, in input order.
+// DocumentPrefix is applied independently to every input. Empty input is a no-op
 // and returns (nil, nil) without making an HTTP call. Every returned vector
 // is verified to match cfg.Dimension. Transient errors — 5xx responses, 429
 // Too Many Requests, network failures, and body-read / decode hiccups — are
@@ -84,6 +97,10 @@ type embeddingResponse struct {
 // 429 response's Retry-After header (when present and parseable) overrides
 // the backoff for that attempt. Other 4xx responses fail immediately.
 func (c *Client) Embed(ctx context.Context, inputs []string) ([][]float32, error) {
+	return c.embed(ctx, prependPrefix(inputs, c.cfg.DocumentPrefix))
+}
+
+func (c *Client) embed(ctx context.Context, inputs []string) ([][]float32, error) {
 	if len(inputs) == 0 {
 		return nil, nil
 	}
@@ -139,6 +156,55 @@ func (c *Client) Embed(ctx context.Context, inputs []string) ([][]float32, error
 	return nil, fmt.Errorf("embed: giving up after %d attempts: %w", c.cfg.MaxRetries, lastErr)
 }
 
+// EmbedQuery embeds one query and returns its single vector.
+func (c *Client) EmbedQuery(ctx context.Context, text string) ([]float32, error) {
+	vecs, err := c.embed(ctx, prependPrefix([]string{text}, c.cfg.QueryPrefix))
+	if err != nil {
+		return nil, err
+	}
+	if len(vecs) != 1 {
+		return nil, fmt.Errorf("%w: embed query expected exactly one vector, got %d", vector.ErrInvalidProviderShape, len(vecs))
+	}
+	return vecs[0], nil
+}
+
+// EmbedDocuments flattens document chunks for the OpenAI-compatible request,
+// then restores the original document boundaries without changing chunk order.
+func (c *Client) EmbedDocuments(ctx context.Context, documents []DocumentInput) ([][][]float32, error) {
+	var inputs []string
+	for _, document := range documents {
+		inputs = append(inputs, document.Chunks...)
+	}
+
+	vecs, err := c.embed(ctx, prependPrefix(inputs, c.cfg.DocumentPrefix))
+	if err != nil {
+		return nil, err
+	}
+	if len(vecs) != len(inputs) {
+		return nil, fmt.Errorf("%w: embed documents expected %d vectors, got %d", vector.ErrInvalidProviderShape, len(inputs), len(vecs))
+	}
+
+	documentVecs := make([][][]float32, len(documents))
+	offset := 0
+	for i, document := range documents {
+		next := offset + len(document.Chunks)
+		documentVecs[i] = vecs[offset:next]
+		offset = next
+	}
+	return documentVecs, nil
+}
+
+func prependPrefix(inputs []string, prefix string) []string {
+	if prefix == "" || len(inputs) == 0 {
+		return inputs
+	}
+	prefixed := make([]string, len(inputs))
+	for i, input := range inputs {
+		prefixed[i] = prefix + input
+	}
+	return prefixed
+}
+
 // doOnce performs a single HTTP request. A returned *retryError signals the
 // caller that the error is transient and the call should be retried.
 // The want parameter is the expected number of vectors (= number of inputs).
@@ -154,10 +220,16 @@ func (c *Client) doOnce(ctx context.Context, body []byte, want int) ([][]float32
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
+		if authorizationErr := beforeRequestCause(err); authorizationErr != nil {
+			return nil, authorizationErr
+		}
 		return nil, &retryError{err: fmt.Errorf("http do: %w", err)}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	if resp.StatusCode >= http.StatusMultipleChoices && resp.StatusCode < http.StatusBadRequest {
+		return nil, ErrEmbeddingProviderRedirect
+	}
 	if resp.StatusCode == http.StatusTooManyRequests {
 		// 429 is a transient rate-limit signal. Honor Retry-After
 		// when the server provides it so we don't thrash.
@@ -193,20 +265,23 @@ func (c *Client) doOnce(ctx context.Context, body []byte, want int) ([][]float32
 		// succeed rather than failing the whole batch.
 		return nil, &retryError{err: fmt.Errorf("decode response: %w", err)}
 	}
+	if len(r.Data) != want {
+		return nil, fmt.Errorf("%w: embed response count mismatch: got %d, expected %d", vector.ErrInvalidProviderShape, len(r.Data), want)
+	}
 	vecs := make([][]float32, want)
 	for _, d := range r.Data {
 		if d.Index < 0 || d.Index >= want {
-			return nil, fmt.Errorf("embed: invalid index %d (len=%d)", d.Index, want)
+			return nil, fmt.Errorf("%w: embed invalid index %d (len=%d)", vector.ErrInvalidProviderShape, d.Index, want)
 		}
 		if len(d.Embedding) != c.cfg.Dimension {
-			return nil, fmt.Errorf("embed: dimension mismatch: got %d, configured %d",
-				len(d.Embedding), c.cfg.Dimension)
+			return nil, fmt.Errorf("%w: embed dimension mismatch: got %d, configured %d",
+				vector.ErrInvalidProviderVector, len(d.Embedding), c.cfg.Dimension)
 		}
 		vecs[d.Index] = d.Embedding
 	}
 	for i, v := range vecs {
 		if v == nil {
-			return nil, fmt.Errorf("embed: missing embedding at index %d", i)
+			return nil, fmt.Errorf("%w: embed missing embedding at index %d", vector.ErrInvalidProviderShape, i)
 		}
 	}
 	return vecs, nil

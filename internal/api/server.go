@@ -12,14 +12,18 @@ import (
 	"net/http"
 	"net/http/pprof"
 	"net/netip"
+	"os"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"go.kenn.io/msgvault/internal/apiprotocol"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/daemonauth"
+	"go.kenn.io/msgvault/internal/provideridentity"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/search"
@@ -27,7 +31,9 @@ import (
 	"go.kenn.io/msgvault/internal/taskclient"
 	"go.kenn.io/msgvault/internal/tasklinks"
 	"go.kenn.io/msgvault/internal/vector"
+	vectordocument "go.kenn.io/msgvault/internal/vector/document"
 	"go.kenn.io/msgvault/internal/vector/hybrid"
+	"go.kenn.io/msgvault/internal/vector/visual"
 	webapp "go.kenn.io/msgvault/internal/web"
 )
 
@@ -39,6 +45,14 @@ type MessageStore interface {
 	GetMessagesSummariesByIDs(ids []int64) ([]APIMessage, error)
 	SearchMessages(query string, offset, limit int) ([]APIMessage, int64, error)
 	SearchMessagesQuery(q *search.Query, offset, limit int) ([]APIMessage, int64, error)
+}
+
+// MessageIdentityStore is the optional source-identity extension used by
+// analytical filters and response hydration. Production stores implement it;
+// keeping it separate preserves lightweight MessageStore test doubles.
+type MessageIdentityStore interface {
+	ResolveAccountIdentityContext(ctx context.Context, sourceID int64, identifier string) (store.ResolvedAccountIdentity, error)
+	MatchMessageIdentitiesContext(ctx context.Context, messageIDs []int64) (map[int64]store.MessageIdentityMatch, error)
 }
 
 type TaskLinkOperations interface {
@@ -107,6 +121,51 @@ func (s *Server) getMessagesSummariesByIDs(ctx context.Context, ids []int64) ([]
 	return s.store.GetMessagesSummariesByIDs(ids)
 }
 
+// ChangedMessageLister is an optional extension of MessageStore for stores that
+// can serve the content-change feed. Optional rather than part of MessageStore
+// because the feed needs the content_changed_at triggers and a commit-bound
+// reading, which only a store sitting on the migrated schema has: anything else
+// implementing MessageStore — the package's own test doubles today — leaves the
+// method off and the route answers 503 feature_unavailable rather than inventing
+// a watermark.
+type ChangedMessageLister interface {
+	ListChangedMessages(
+		ctx context.Context, since store.ChangedMessagesCursor, limit int,
+	) (store.ChangedMessagePage, error)
+}
+
+// The store implementation must satisfy the optional interface. This guards the
+// store side of the contract only: the daemon passes cmd.storeAPIAdapter, not
+// *store.Store, so the assertion that actually protects the production route is
+// the one beside that adapter in cmd/msgvault/cmd/serve.go, which is a non-test
+// file and so fails the build rather than a test run. An end-to-end test drives
+// the route through the adapter in cmd/msgvault/cmd/changes_api_e2e_test.go.
+var _ ChangedMessageLister = (*store.Store)(nil)
+
+// ArchiveIdentifier is an optional extension of MessageStore for stores that
+// can report the durable identity of the archive behind them.
+//
+// Separate from ChangedMessageLister, and asserted separately, because the two
+// are different capabilities: listing changed rows needs the migrated schema,
+// while identifying the archive needs archive_metadata. The change feed happens
+// to need both — its cursor carries an archive-local message id, so a cursor is
+// only meaningful in the archive that issued it and has to name it — but
+// widening ChangedMessageLister to carry the lookup would make every future
+// implementer of the feed also implement identity, and would put the answer to
+// "which archive is this" behind the feed.
+//
+// The same 503 feature_unavailable as ChangedMessageLister: a store that cannot
+// say which archive it is cannot issue a cursor anyone can safely resume from,
+// and an unbound cursor is the failure the binding exists to prevent.
+type ArchiveIdentifier interface {
+	ArchiveUIDContext(ctx context.Context) (string, error)
+}
+
+// The store implementation must satisfy the optional interface. As with
+// ChangedMessageLister, the assertion that protects the production route is the
+// one beside cmd.storeAPIAdapter in cmd/msgvault/cmd/serve.go.
+var _ ArchiveIdentifier = (*store.Store)(nil)
+
 // SourceStatusStore defines the source/sync read operations used by the
 // source status endpoint.
 type SourceStatusStore interface {
@@ -164,16 +223,27 @@ type OCRStore interface {
 	SearchOCR(context.Context, string, int) ([]store.OCRSearchHit, error)
 }
 
+type fastmailIdentityInventory = provideridentity.Inventory
+
+type analyticsEngineState struct {
+	engine                        query.Engine
+	mode                          string
+	analyticsInitializationActive bool
+}
+
+type analyticsEngineContextKey struct{}
+
 // Server represents the HTTP API server.
 type Server struct {
 	cfg            *config.Config
 	store          MessageStore
+	analyticsState atomic.Pointer[analyticsEngineState]
 	savedViewStore SavedViewStore
-	engine         query.Engine // Query engine for aggregates and TUI support
 	sqlQueryRunner SQLQueryRunner
 	shutdownToken  string
 	shutdownFunc   func()
 	scheduler      SyncScheduler
+	cardDAV        *CardDAVController
 	logger         *slog.Logger
 	requestTimeout time.Duration
 	// readTimeout is the ordinary connection read ceiling used by http.Server.
@@ -188,16 +258,25 @@ type Server struct {
 	inProgressThreshold time.Duration
 	inProgressInterval  time.Duration
 	daemonVersion       string
-	analyticsMode       string
 	// lexicalCandidateCap overrides query.MaxExploreCandidateMessageIDs in
 	// resolveExploreSearch. Tests shrink it to exercise cap behavior without
 	// building 10k-row fixtures; zero means the production cap.
 	lexicalCandidateCap int
 	router              http.Handler
-	server              *http.Server
-	rateLimiter         *RateLimiter
-	idleTracker         *IdleTracker
-	operationGate       OperationGate
+	// serverMu protects the HTTP server pointer and listener-start state. The
+	// daemon starts Serve in a goroutine while shutdown can begin from a
+	// cancelled root context, so Shutdown must not race the assignment below.
+	serverMu                  sync.RWMutex
+	server                    *http.Server
+	started                   chan struct{}
+	startErr                  error
+	startOnce                 sync.Once
+	rateLimiter               *RateLimiter
+	changesRateLimiter        *RateLimiter
+	documentSearchRateLimiter *RateLimiter
+	visualCoverageRateLimiter *RateLimiter
+	idleTracker               *IdleTracker
+	operationGate             OperationGate
 	// ftsIndexComplete memoizes that the FTS index is fully populated so
 	// handleCLISearch stops probing on every request. NeedsFTSBackfill runs an
 	// anti-join that scans every message when the index is complete (the
@@ -214,6 +293,11 @@ type Server struct {
 	// can report it. See ensureCLISearchIndexAsync.
 	ftsEnsureRunning atomic.Bool
 	ftsIndexState    atomic.Value
+	// changesStallLoggedAt throttles the WARN handleMessageChanges emits when
+	// the content-change feed is held back by a long-lived write transaction.
+	// Unix nanoseconds of the last such line, so a consumer polling once a
+	// second cannot turn one stuck connection into a log flood.
+	changesStallLoggedAt atomic.Int64
 	// ftsRebuildGen is a seqlock-style generation for index rebuilds:
 	// handleCLIRebuildFTS bumps it to odd on entry and back to even on
 	// return. The ensure worker's completeness probe runs outside the
@@ -239,12 +323,43 @@ type Server struct {
 	// vectorMu guards the vector subsystem state: the daemon installs
 	// hybridEngine/backend/vectorCfg from a background init goroutine
 	// after the server is already handling requests.
-	vectorMu     sync.RWMutex
-	hybridEngine *hybrid.Engine
-	vectorCfg    vector.Config
-	backend      vector.Backend
-	vectorStatus VectorStatus
-	vectorErr    string
+	vectorMu           sync.RWMutex
+	hybridEngine       *hybrid.Engine
+	vectorCfg          vector.Config
+	backend            vector.Backend
+	personSearchEngine PersonSearchEngine
+	visualSearch       *visual.SearchService
+	visualBuild        func(context.Context) error
+	visualRun          func(context.Context) error
+	visualRetry        func(context.Context, int64, string) error
+	visualStatus       func(context.Context, bool) (visual.Status, error)
+	// visualCoverageScan serializes the archive-wide coverage scan behind
+	// GET /multimodal/status?coverage=1.
+	visualCoverageScan sync.Mutex
+	visualRetire       func(context.Context) error
+	vectorStatus       VectorStatus
+	vectorErr          string
+	// vectorStaleLatch pins a stale status that refreshVectorStatusIfStale
+	// must not clear: set when the durable embedding scope drifts from the
+	// scope the installed components were initialized with. The active
+	// generation still matches the STARTUP fingerprint in that state, so
+	// the ordinary refresh would flip straight back to ready. Only a
+	// successful reinit (SetVectorFeatures) clears the latch.
+	vectorStaleLatch bool
+	documentSearchMu sync.RWMutex
+	documentSearch   *vectordocument.SearchService
+	// vectorScopeCheck re-resolves the durable embedding scope on the
+	// vector-search preflight path (throttled by vectorScopeNextCheck) so
+	// drift is detected even when no embed job ever runs. Wired by the
+	// daemon; see SetVectorScopeCheck.
+	vectorScopeCheck     func(ctx context.Context) (string, error)
+	vectorScopeNextCheck time.Time
+	// vectorFreshNextCheck throttles maybeRefreshVectorFreshness, the
+	// ready→stale counterpart of refreshVectorStatusIfStale: a
+	// daemon-proxied one-off scoped build can activate a generation whose
+	// fingerprint no longer matches the installed configuration without
+	// any config change, and nothing else re-validates a ready status.
+	vectorFreshNextCheck time.Time
 	// backupFreeze tracks the single active backup freeze window opened via
 	// POST /api/v1/backup/freeze/begin. See backup_freeze.go.
 	backupFreeze backupFreezeState
@@ -273,9 +388,10 @@ type Server struct {
 	clock func() time.Time
 	// taskIntegrationProbe performs server-side discovery and capability
 	// validation. It is never exposed to the browser with its credentials.
-	taskIntegrationProbe TaskIntegrationProbe
-	taskLinkOperations   TaskLinkOperations
-	taskIdentityResolver TaskIdentityResolver
+	taskIntegrationProbe     TaskIntegrationProbe
+	taskLinkOperations       TaskLinkOperations
+	taskIdentityResolver     TaskIdentityResolver
+	fastmailInventoryFactory provideridentity.Factory
 	// listenerBound is set true once StartOnListener binds a real listener
 	// (the sole production serve path). It stays false for direct-handler unit
 	// tests that drive s.Router() without starting a listener, leaving the
@@ -305,6 +421,7 @@ const (
 	// analytics while still bounding a pathological query.
 	QueryEndpointTimeout = 120 * time.Second
 	queryEndpointPath    = "/api/v1/query"
+	DaemonIdentityPath   = "/api/daemon/identity"
 	DaemonShutdownPath   = "/api/daemon/shutdown"
 	defaultBindAddr      = "127.0.0.1"
 	// inProgressLogThreshold is how long a request may run before the logger
@@ -315,7 +432,9 @@ const (
 	inProgressLogInterval  = 30 * time.Second
 	// DaemonShutdownTokenHeader is an HTTP header name, not a credential.
 	// #nosec G101
-	DaemonShutdownTokenHeader = "X-Msgvault-Daemon-Token"
+	DaemonShutdownTokenHeader     = apiprotocol.DaemonRuntimeTokenHeader
+	DaemonIdentityChallengeHeader = "X-Msgvault-Daemon-Challenge"
+	DaemonIdentityProofHeader     = "X-Msgvault-Daemon-Proof"
 )
 
 // ServerOptions configures the API server.
@@ -333,12 +452,17 @@ type ServerOptions struct {
 	HybridEngine   *hybrid.Engine
 	VectorCfg      vector.Config
 	Backend        vector.Backend
+	// PersonSearchEngine is the optional semantic people service.
+	PersonSearchEngine PersonSearchEngine
 	// VectorStatus is the initial vector subsystem status. Zero value
 	// derives it: ready when Backend is non-nil, disabled otherwise. The
 	// serve daemon passes VectorStatusInitializing and installs the
 	// components later via SetVectorFeatures.
-	VectorStatus  VectorStatus
-	Scheduler     SyncScheduler
+	VectorStatus VectorStatus
+	Scheduler    SyncScheduler
+	// CardDAV owns the single configured CardDAV service used by HTTP, CLI,
+	// and scheduled synchronization.
+	CardDAV       *CardDAVController
 	Logger        *slog.Logger
 	IdleTracker   *IdleTracker
 	OperationGate OperationGate
@@ -357,11 +481,16 @@ type ServerOptions struct {
 	// DaemonVersion is returned by the unauthenticated kit-compatible
 	// /api/ping endpoint used for local daemon discovery. Empty is allowed.
 	DaemonVersion string
-	// AnalyticsMode is the analytics engine the daemon selected at startup
-	// (an AnalyticsMode constant), reported by /health so clients can tell
-	// whether aggregate views run on the cache or live SQL. Empty omits the
-	// field.
+	// AnalyticsMode is the analytics engine the daemon selected initially (an
+	// AnalyticsMode constant), reported by /health so clients can tell whether
+	// aggregate views run on the cache or live SQL. The daemon may replace the
+	// engine and mode at runtime. Empty omits the field.
 	AnalyticsMode string
+	// AnalyticsInitializationActive reports that cache selection, build, or
+	// open work is already scheduled. Set it before the listener is exposed so
+	// the first request cannot mistake active initialization for a terminal
+	// SQL fallback.
+	AnalyticsInitializationActive bool
 	// SPAHandler overrides the embedded browser application handler. Nil uses
 	// internal/web.Handler and is the production default. Tests may inject a
 	// handler built over an in-memory filesystem.
@@ -371,6 +500,9 @@ type ServerOptions struct {
 	TaskIntegrationProbe TaskIntegrationProbe
 	TaskLinkOperations   TaskLinkOperations
 	TaskIdentityResolver TaskIdentityResolver
+	// FastmailInventoryFactory is the provider-read seam used by identity
+	// discovery. Nil constructs the production JMAP client.
+	FastmailInventoryFactory provideridentity.Factory
 }
 
 // NewServer creates a new API server.
@@ -393,42 +525,52 @@ func NewServerWithOptions(opts ServerOptions) *Server {
 	if taskProbe == nil {
 		taskProbe = taskclient.Evaluate
 	}
+	fastmailInventoryFactory := opts.FastmailInventoryFactory
+	if fastmailInventoryFactory == nil {
+		fastmailInventoryFactory = provideridentity.NewFastmailInventory
+	}
 	s := &Server{
-		cfg:                  opts.Config,
-		store:                opts.Store,
-		savedViewStore:       opts.SavedViewStore,
-		engine:               opts.Engine,
-		sqlQueryRunner:       opts.SQLQueryRunner,
-		shutdownToken:        opts.ShutdownToken,
-		shutdownFunc:         opts.ShutdownFunc,
-		hybridEngine:         opts.HybridEngine,
-		vectorCfg:            opts.VectorCfg,
-		backend:              opts.Backend,
-		scheduler:            opts.Scheduler,
-		logger:               opts.Logger,
-		requestTimeout:       timeout,
-		readTimeout:          daemonReadTimeout,
-		queryTimeout:         QueryEndpointTimeout,
-		inProgressThreshold:  inProgressLogThreshold,
-		inProgressInterval:   inProgressLogInterval,
-		daemonVersion:        opts.DaemonVersion,
-		analyticsMode:        opts.AnalyticsMode,
-		idleTracker:          opts.IdleTracker,
-		operationGate:        opts.OperationGate,
-		blobStore:            opts.BlobStore,
-		remoteImages:         newRemoteImageFetcher(),
-		inlineCache:          newInlineParseCache(inlineCacheMaxEntries, inlineCacheMaxBytes),
-		spaHandler:           opts.SPAHandler,
-		sessions:             newSessionStore(defaultSessionTTL),
-		exploreState:         newExploreServerState(time.Now),
-		exploreCursorKey:     newExploreCursorKey(),
-		trustedProxies:       trustedProxyPrefixes(opts.Config.Server.TrustedProxies),
-		settingsConfigEditor: config.EditConfigFile,
-		taskIntegrationProbe: taskProbe,
-		taskLinkOperations:   opts.TaskLinkOperations,
-		taskIdentityResolver: opts.TaskIdentityResolver,
+		cfg:                      opts.Config,
+		store:                    opts.Store,
+		savedViewStore:           opts.SavedViewStore,
+		sqlQueryRunner:           opts.SQLQueryRunner,
+		shutdownToken:            opts.ShutdownToken,
+		shutdownFunc:             opts.ShutdownFunc,
+		hybridEngine:             opts.HybridEngine,
+		vectorCfg:                opts.VectorCfg,
+		backend:                  opts.Backend,
+		personSearchEngine:       opts.PersonSearchEngine,
+		scheduler:                opts.Scheduler,
+		cardDAV:                  opts.CardDAV,
+		logger:                   opts.Logger,
+		requestTimeout:           timeout,
+		readTimeout:              daemonReadTimeout,
+		queryTimeout:             QueryEndpointTimeout,
+		inProgressThreshold:      inProgressLogThreshold,
+		inProgressInterval:       inProgressLogInterval,
+		daemonVersion:            opts.DaemonVersion,
+		idleTracker:              opts.IdleTracker,
+		operationGate:            opts.OperationGate,
+		blobStore:                opts.BlobStore,
+		remoteImages:             newRemoteImageFetcher(),
+		inlineCache:              newInlineParseCache(inlineCacheMaxEntries, inlineCacheMaxBytes),
+		spaHandler:               opts.SPAHandler,
+		sessions:                 newSessionStore(defaultSessionTTL),
+		exploreState:             newExploreServerState(time.Now),
+		exploreCursorKey:         newExploreCursorKey(),
+		trustedProxies:           trustedProxyPrefixes(opts.Config.Server.TrustedProxies),
+		settingsConfigEditor:     config.EditConfigFile,
+		taskIntegrationProbe:     taskProbe,
+		taskLinkOperations:       opts.TaskLinkOperations,
+		taskIdentityResolver:     opts.TaskIdentityResolver,
+		fastmailInventoryFactory: fastmailInventoryFactory,
+		started:                  make(chan struct{}),
 	}
 	s.ocrStore = opts.OCRStore
+	s.analyticsState.Store(&analyticsEngineState{
+		engine: opts.Engine, mode: opts.AnalyticsMode,
+		analyticsInitializationActive: opts.AnalyticsInitializationActive,
+	})
 	if s.taskIdentityResolver == nil {
 		s.taskIdentityResolver = s.resolveTaskMessageIdentity
 	}
@@ -449,6 +591,17 @@ func NewServerWithOptions(opts ServerOptions) *Server {
 
 // setupRouter configures the Huma API router and standard HTTP middleware.
 func (s *Server) setupRouter() http.Handler {
+	// Most trusted local traffic bypasses the general limiter, but the change
+	// feed takes SQLite's writer lock and therefore has its own non-bypassable
+	// budget.
+	s.rateLimiter = NewRateLimiter(10, 20)
+	s.changesRateLimiter = NewRateLimiter(
+		changeFeedRequestsPerSecond, changeFeedRequestBurst)
+	s.documentSearchRateLimiter = NewRateLimiter(
+		documentSearchRequestsPerSecond, documentSearchRequestBurst)
+	s.visualCoverageRateLimiter = NewRateLimiter(
+		visualCoverageScansPerSecond, visualCoverageScanBurst)
+
 	mux := http.NewServeMux()
 	api := s.setupHumaAPI(mux)
 	apiV1 := s.setupAPIV1Group(api)
@@ -480,14 +633,12 @@ func (s *Server) setupRouter() http.Handler {
 			"Access-Control-Allow-Credentials; list exact origins in cors_origins to allow credentialed CORS")
 	}
 
-	// Rate limiting (10 req/sec with burst of 20)
-	s.rateLimiter = NewRateLimiter(10, 20)
-
 	// Request security classification and CSRF checks sit inside rate limiting
 	// but outside the operation gate, so rejected browser mutations never wait
 	// on or observe archive work. The gate still checks API auth itself so
 	// unauthenticated requests do not register as waiters.
 	var h http.Handler = mux
+	h = s.analyticsEngineMiddleware(h)
 	h = operationGateMiddleware(s.operationGate, s.apiRequestAuthorized)(h)
 	h = s.csrfMiddleware(h)
 	h = s.requestSecurityMiddleware(h)
@@ -540,9 +691,55 @@ func (s *Server) Start() error {
 	addr := net.JoinHostPort(bindAddr, strconv.Itoa(s.cfg.Server.APIPort))
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return fmt.Errorf("listen %s: %w", addr, err)
+		listenErr := fmt.Errorf("listen %s: %w", addr, err)
+		s.signalStarted(listenErr)
+		return listenErr
 	}
 	return s.StartOnListener(ln)
+}
+
+// WaitStarted waits until StartOnListener has installed the HTTP server and
+// listener metadata, or until startup reports an error. A cancelled context
+// only cancels the wait; callers that close the reserved listener must wait
+// again without cancellation before releasing resources used by startup.
+func (s *Server) WaitStarted(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.serverMu.Lock()
+	started := s.started
+	if started == nil {
+		started = make(chan struct{})
+		s.started = started
+	}
+	s.serverMu.Unlock()
+
+	select {
+	case <-started:
+		s.serverMu.RLock()
+		err := s.startErr
+		s.serverMu.RUnlock()
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Server) signalStarted(err error) {
+	s.serverMu.Lock()
+	started := s.started
+	if started == nil {
+		started = make(chan struct{})
+		s.started = started
+	}
+	s.serverMu.Unlock()
+
+	s.startOnce.Do(func() {
+		s.serverMu.Lock()
+		s.startErr = err
+		s.serverMu.Unlock()
+		close(started)
+	})
 }
 
 // StartOnListener serves HTTP requests on an already-bound listener. The serve
@@ -550,10 +747,13 @@ func (s *Server) Start() error {
 // startup work begins.
 func (s *Server) StartOnListener(ln net.Listener) error {
 	if ln == nil {
-		return errors.New("nil listener")
+		err := errors.New("nil listener")
+		s.signalStarted(err)
+		return err
 	}
 	if err := s.cfg.Server.ValidateSecure(); err != nil {
 		_ = ln.Close()
+		s.signalStarted(err)
 		return err
 	}
 
@@ -561,27 +761,30 @@ func (s *Server) StartOnListener(ln net.Listener) error {
 		s.logger.Warn("API server running without authentication — set [server] api_key in config.toml")
 	}
 
-	if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok {
-		s.listenPort = tcpAddr.Port
-	}
-	s.listenerBound = true
-
 	// WriteTimeout must comfortably exceed the request-context timeout;
 	// otherwise a request whose context deadline equals the server
 	// WriteTimeout could lose the race and have its TCP connection torn down
 	// before the structured error response reaches the client.
 	writeBudget := max(s.requestTimeout, DaemonLongRequestTimeout)
 	writeTimeout := writeBudget + 5*time.Second
-	s.server = &http.Server{
+	server := &http.Server{
 		Addr:         ln.Addr().String(),
 		Handler:      s.router,
 		ReadTimeout:  s.readTimeout,
 		WriteTimeout: writeTimeout,
 		IdleTimeout:  120 * time.Second,
 	}
+	s.serverMu.Lock()
+	if tcpAddr, ok := ln.Addr().(*net.TCPAddr); ok {
+		s.listenPort = tcpAddr.Port
+	}
+	s.listenerBound = true
+	s.server = server
+	s.serverMu.Unlock()
+	s.signalStarted(nil)
 
 	s.logger.Info("starting API server", "addr", ln.Addr().String())
-	return s.server.Serve(ln)
+	return server.Serve(ln)
 }
 
 // Shutdown gracefully shuts down the server.
@@ -589,19 +792,164 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if s.rateLimiter != nil {
 		s.rateLimiter.Close()
 	}
+	if s.changesRateLimiter != nil {
+		s.changesRateLimiter.Close()
+	}
+	if s.documentSearchRateLimiter != nil {
+		s.documentSearchRateLimiter.Close()
+	}
+	if s.visualCoverageRateLimiter != nil {
+		s.visualCoverageRateLimiter.Close()
+	}
 	if s.sessions != nil {
 		s.sessions.Close()
 	}
-	if s.server == nil {
+	s.serverMu.RLock()
+	server := s.server
+	s.serverMu.RUnlock()
+	if server == nil {
 		return nil
 	}
 	s.logger.Info("shutting down API server")
-	return s.server.Shutdown(ctx)
+	return server.Shutdown(ctx)
 }
 
 // Router returns the HTTP router for testing.
 func (s *Server) Router() http.Handler {
 	return s.router
+}
+
+// analyticsEngineMiddleware snapshots the immutable engine/mode pair into the
+// request context. A runtime swap is one atomic pointer store, so it never
+// waits for a request and each request keeps one consistent view.
+func (s *Server) analyticsEngineMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		state := s.analyticsState.Load()
+		ctx := context.WithValue(r.Context(), analyticsEngineContextKey{}, state)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func (s *Server) analyticsStateForContext(ctx context.Context) *analyticsEngineState {
+	if ctx != nil {
+		if state, ok := ctx.Value(analyticsEngineContextKey{}).(*analyticsEngineState); ok && state != nil {
+			return state
+		}
+	}
+	return s.currentAnalyticsState()
+}
+
+func (s *Server) currentAnalyticsState() *analyticsEngineState {
+	return s.analyticsState.Load()
+}
+
+func (s *Server) queryEngineForContext(ctx context.Context) query.Engine {
+	state := s.analyticsStateForContext(ctx)
+	if state == nil {
+		return nil
+	}
+	return state.engine
+}
+
+func (s *Server) analyticsModeForContext(ctx context.Context) string {
+	state := s.analyticsStateForContext(ctx)
+	if state == nil {
+		return ""
+	}
+	return state.mode
+}
+
+func (s *Server) analyticsInitializingForContext(ctx context.Context) bool {
+	return s.analyticsModeForContext(ctx) == AnalyticsModeInitializing
+}
+
+func (s *Server) analyticsCacheInitializingForContext(ctx context.Context) bool {
+	state := s.analyticsStateForContext(ctx)
+	return state != nil && (state.mode == AnalyticsModeInitializing || state.analyticsInitializationActive)
+}
+
+// QueryEngine returns the analytics engine currently serving API queries.
+// The daemon uses it when a request must follow a runtime engine swap.
+func (s *Server) QueryEngine() query.Engine {
+	state := s.currentAnalyticsState()
+	if state == nil {
+		return nil
+	}
+	return state.engine
+}
+
+// QueryEngineForRequest returns the engine snapshot carried by a routed
+// request context. Callbacks invoked by handlers use it to stay on the same
+// engine even if background initialization installs a new state.
+func (s *Server) QueryEngineForRequest(ctx context.Context) query.Engine {
+	return s.queryEngineForContext(ctx)
+}
+
+// AnalyticsMode returns the analytics mode currently reported by health
+// endpoints. The engine and mode come from one immutable state snapshot.
+func (s *Server) AnalyticsMode() string {
+	state := s.currentAnalyticsState()
+	if state == nil {
+		return ""
+	}
+	return state.mode
+}
+
+// SetAnalyticsEngine installs an engine and its matching health mode as one
+// state transition. It deliberately does not close the previous engine:
+// daemon-owned engines remain live until HTTP shutdown and background workers
+// have stopped.
+func (s *Server) SetAnalyticsEngine(engine query.Engine, mode string) {
+	for {
+		current := s.currentAnalyticsState()
+		next := &analyticsEngineState{engine: engine, mode: mode}
+		if current != nil {
+			next.analyticsInitializationActive = current.analyticsInitializationActive
+		}
+		if s.analyticsState.CompareAndSwap(current, next) {
+			return
+		}
+	}
+}
+
+// SetAnalyticsInitializationActive reports whether the daemon is still
+// selecting, building, or opening the analytical cache. It is separate from
+// AnalyticsMode because auto mode keeps serving SQL-backed routes while that
+// work runs.
+func (s *Server) SetAnalyticsInitializationActive(active bool) {
+	for {
+		current := s.currentAnalyticsState()
+		next := &analyticsEngineState{analyticsInitializationActive: active}
+		if current != nil {
+			next.engine = current.engine
+			next.mode = current.mode
+		}
+		if s.analyticsState.CompareAndSwap(current, next) {
+			return
+		}
+	}
+}
+
+// AnalyticsInitializationActive reports whether background cache
+// initialization is still in progress.
+func (s *Server) AnalyticsInitializationActive() bool {
+	state := s.currentAnalyticsState()
+	return state != nil && state.analyticsInitializationActive
+}
+
+// CloseAnalyticsEngine closes and clears the current engine after the daemon
+// has shut down HTTP handling. If HTTP shutdown fails, the daemon skips this
+// call so a late request cannot use an engine while it is being closed.
+func (s *Server) CloseAnalyticsEngine() error {
+	state := s.analyticsState.Swap(&analyticsEngineState{})
+	var engine query.Engine
+	if state != nil {
+		engine = state.engine
+	}
+	if engine == nil {
+		return nil
+	}
+	return engine.Close()
 }
 
 func (s *Server) requestUsesCLITimeoutPolicy(r *http.Request) bool {
@@ -666,6 +1014,10 @@ func (s *Server) timeoutMiddleware(next http.Handler) http.Handler {
 			serveMeetingImportWithReadDeadline(w, r, next)
 			return
 		}
+		if cardDAVRequestNeedsProtectiveCeiling(r) {
+			serveWithProtectiveRequestDeadline(w, r, next)
+			return
+		}
 		if s.requestUsesCLITimeoutPolicy(r) {
 			if cliRequestNeedsProtectiveCeiling(r) {
 				serveWithProtectiveRequestDeadline(w, r, next)
@@ -686,6 +1038,24 @@ func (s *Server) timeoutMiddleware(next http.Handler) http.Handler {
 	})
 }
 
+// cardDAVRequestNeedsProtectiveCeiling identifies routes that may perform
+// upstream CardDAV requests. Their client has its own five-minute operation
+// budget, so the ordinary one-minute API timeout must not preempt it.
+func cardDAVRequestNeedsProtectiveCeiling(r *http.Request) bool {
+	switch r.Method + " " + r.URL.Path {
+	case "POST /api/v1/carddav/account/test",
+		"PUT /api/v1/carddav/account",
+		"POST /api/v1/carddav/sync":
+		return true
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/v1/carddav/publications/") {
+		return r.Method == http.MethodPost || r.Method == http.MethodDelete
+	}
+	return r.Method == http.MethodPost &&
+		strings.HasPrefix(r.URL.Path, "/api/v1/carddav/conflicts/") &&
+		strings.HasSuffix(r.URL.Path, "/resolve")
+}
+
 // cliRequestNeedsProtectiveCeiling identifies marked CLI routes whose
 // production work still includes a filesystem, planner, or synchronous cache
 // phase that cannot be interrupted at every point. They get the generous
@@ -704,7 +1074,8 @@ func cliRequestNeedsProtectiveCeiling(r *http.Request) bool {
 		"GET /api/v1/cli/search",
 		"POST /api/v1/cli/deduplicate/plan",
 		"POST /api/v1/cli/identities",
-		"DELETE /api/v1/cli/identities":
+		"DELETE /api/v1/cli/identities",
+		"POST /api/v1/cli/identities/import":
 		return true
 	default:
 		return false
@@ -729,8 +1100,10 @@ func (s *Server) requestTimeoutForPath(path string) (time.Duration, bool) {
 func isLongDaemonRequest(path string) bool {
 	switch path {
 	case "/api/v1/cli/build-cache",
+		"/api/v1/carddav/sync",
 		"/api/v1/cli/deduplicate/plan",
 		meetingImportEndpointPath,
+		"/api/v1/cli/identities/discover",
 		"/api/v1/cli/rebuild-fts",
 		"/api/v1/cli/repair-encoding",
 		"/api/v1/cli/run",
@@ -759,7 +1132,7 @@ func (s *Server) loggerMiddleware(next http.Handler) http.Handler {
 			stopWatch()
 			s.logger.Info("http request",
 				"method", r.Method,
-				"path", r.URL.Path,
+				pathKey, r.URL.Path,
 				"status", ww.Status(),
 				"bytes", ww.BytesWritten(),
 				"duration", time.Since(start),
@@ -793,7 +1166,7 @@ func (s *Server) watchInProgressRequest(r *http.Request, start time.Time) func()
 			case <-timer.C:
 				s.logger.Warn("http request in progress",
 					"method", method,
-					"path", path,
+					pathKey, path,
 					"request_id", requestID,
 					"elapsed", time.Since(start),
 				)
@@ -815,7 +1188,7 @@ func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
 			if recovered := recover(); recovered != nil {
 				s.logger.Error("panic serving request",
 					"panic", recovered,
-					"path", r.URL.Path,
+					pathKey, r.URL.Path,
 					"request_id", requestIDFromContext(r.Context()),
 				)
 				if !ww.WroteHeader() {
@@ -925,7 +1298,7 @@ func (s *Server) loopbackRateLimitExempt(r *http.Request) bool {
 
 func (s *Server) logUnauthorizedAPIRequest(r *http.Request) {
 	s.logger.Warn("unauthorized API request",
-		"path", r.URL.Path,
+		pathKey, r.URL.Path,
 		"remote_addr", r.RemoteAddr,
 	)
 }
@@ -949,26 +1322,47 @@ func (s *Server) handleDaemonShutdown(w http.ResponseWriter, r *http.Request) {
 	go s.shutdownFunc()
 }
 
-// handleHealth returns a simple health check response.
+func (s *Server) handleDaemonIdentity(w http.ResponseWriter, r *http.Request) {
+	if s.shutdownToken == "" {
+		writeError(w, http.StatusNotFound, "identity_unavailable", "Daemon identity proof is not available")
+		return
+	}
+	proof, err := daemonauth.Proof(
+		s.shutdownToken,
+		r.Header.Get(DaemonIdentityChallengeHeader),
+		os.Getpid(),
+	)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_challenge", "Invalid daemon identity challenge")
+		return
+	}
+	w.Header().Set(DaemonIdentityProofHeader, proof)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleHealth returns a simple health check response. It is served
+// unauthenticated, so the vector view carries no detail message — init and
+// drift details can name configured account identifiers.
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
-	s.refreshVectorStatusIfStale(r.Context())
+	s.refreshVectorStatus(r.Context())
 	writeJSON(w, http.StatusOK, HealthResponse{
 		Status:          "ok",
-		Vector:          s.vectorHealth(),
+		Vector:          s.vectorHealthPublic(),
 		Operation:       s.operationBusyHealth(),
-		AnalyticsEngine: s.analyticsMode,
+		AnalyticsEngine: s.analyticsModeForContext(r.Context()),
 	})
 }
 
 // handleAuthenticatedHealth returns health details that are safe behind the
 // API-key boundary.
 func (s *Server) handleAuthenticatedHealth(w http.ResponseWriter, r *http.Request) {
-	s.refreshVectorStatusIfStale(r.Context())
+	s.refreshVectorStatus(r.Context())
 	writeJSON(w, http.StatusOK, HealthResponse{
-		Status:          "ok",
-		Vector:          s.vectorHealth(),
-		Operation:       s.operationHealth(),
-		AnalyticsEngine: s.analyticsMode,
+		Status:           "ok",
+		Vector:           s.vectorHealth(),
+		Operation:        s.operationHealth(),
+		AnalyticsEngine:  s.analyticsModeForContext(r.Context()),
+		APISchemaVersion: APISchemaVersion,
 	})
 }
 

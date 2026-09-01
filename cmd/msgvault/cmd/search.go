@@ -15,20 +15,22 @@ import (
 )
 
 var (
-	searchLimit        int
-	searchOffset       int
-	searchJSON         bool
-	searchAccount      string
-	searchCollection   string
-	searchMode         string
-	searchExplain      bool
-	searchMessageTypes []string
+	searchLimit         int
+	searchOffset        int
+	searchJSON          bool
+	searchAccount       string
+	searchCollection    string
+	searchMode          string
+	searchExplain       bool
+	searchDeletionScope string
+	searchMessageTypes  []string
 )
 
 var searchCmd = &cobra.Command{
 	Use:   "search <query>",
 	Short: "Search messages using Gmail-like query syntax",
-	Long: `Search your email archive using Gmail-like query syntax.
+	Long: `Search your archive using Gmail-like query syntax. Email, chat, and
+meeting records are all searchable; use message_type: to narrow to one of them.
 
 Uses the configured remote server when [remote].url is set; otherwise uses
 the local daemon for FTS search. Use --local to use the local daemon even
@@ -69,6 +71,16 @@ Examples:
 		// Validate mode before any scope work so we fail fast on a typo.
 		if searchMode != "fts" && searchMode != "vector" && searchMode != "hybrid" {
 			return usageErr(cmd, fmt.Errorf("invalid --mode: %q (want fts|vector|hybrid)", searchMode))
+		}
+		if searchDeletionScope != "active" && searchDeletionScope != "deleted" && searchDeletionScope != "any" {
+			return usageErr(cmd, fmt.Errorf(
+				"invalid --deletion-scope: %q (want active|deleted|any)", searchDeletionScope))
+		}
+		if searchMode != "fts" && searchDeletionScope != "active" {
+			return usageErr(cmd, fmt.Errorf(
+				"--deletion-scope=%s is only supported with --mode=fts; vector and hybrid indexes cover active messages only",
+				searchDeletionScope,
+			))
 		}
 
 		// Validate --message-type against the known set, like --mode, so a
@@ -155,13 +167,22 @@ func runHTTPSearch(cmd *cobra.Command, queryStr string) error {
 	)
 	started := time.Now()
 
+	// Only send an explicitly requested scope: the daemon's default is
+	// already active-only, and a scoped request makes the client require
+	// API schema 2.12.0, which would break default searches against older
+	// daemons.
+	deletionScope := ""
+	if cmd.Flags().Changed("deletion-scope") {
+		deletionScope = searchDeletionScope
+	}
 	resp, err := s.GetCLISearch(cmd.Context(), daemonclient.CLISearchRequest{
-		Query:        queryStr,
-		Account:      searchAccount,
-		Collection:   searchCollection,
-		MessageTypes: searchMessageTypes,
-		Limit:        searchLimit,
-		Offset:       searchOffset,
+		Query:         queryStr,
+		Account:       searchAccount,
+		Collection:    searchCollection,
+		MessageTypes:  searchMessageTypes,
+		DeletionScope: deletionScope,
+		Limit:         searchLimit,
+		Offset:        searchOffset,
 	})
 	stopStatus()
 	if err != nil {
@@ -220,8 +241,6 @@ func runHTTPSearch(cmd *cobra.Command, queryStr string) error {
 
 // nil error return mirrors outputSearchResultsJSON so callers can return
 // either uniformly; tabwriter output never fails.
-//
-//nolint:unparam // symmetry with error-returning outputSearchResultsJSON sibling
 func outputSearchResultsTable(results []query.MessageSummary) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(w, "ID\tDATE\tFROM\tSUBJECT\tSIZE")
@@ -267,6 +286,9 @@ func outputSearchResultsJSON(results []query.MessageSummary) error {
 			"attachment_count":       msg.AttachmentCount,
 			"labels":                 msg.Labels,
 		}
+		if msg.DeletedAt != nil {
+			output[i]["deleted_from_source_at"] = msg.DeletedAt.UTC().Format(time.RFC3339)
+		}
 	}
 
 	return printJSON(output)
@@ -283,6 +305,8 @@ func init() {
 	searchCmd.MarkFlagsMutuallyExclusive("account", "collection")
 	searchCmd.Flags().StringVar(&searchMode, "mode", "fts", "Search mode: fts|vector|hybrid")
 	searchCmd.Flags().BoolVar(&searchExplain, "explain", false, "Include per-signal scores in output (hybrid/vector modes)")
+	searchCmd.Flags().StringVar(&searchDeletionScope, "deletion-scope", "active",
+		"Source deletion scope: active|deleted|any (FTS mode only)")
 	searchCmd.Flags().StringSliceVar(&searchMessageTypes, "message-type", nil,
 		"Limit results to message type(s), e.g. email, sms, calendar_event, meeting_transcript")
 }

@@ -1,8 +1,14 @@
 package imap
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"net"
+	"strconv"
+	"strings"
 	"testing"
 
 	imapapi "github.com/emersion/go-imap/v2"
@@ -84,12 +90,161 @@ func TestMessageIDHeaderFetchOptionsAvoidsRawMessageBody(t *testing.T) {
 	opts := messageIDHeaderFetchOptions()
 
 	assert.True(opts.UID)
+	assert.True(opts.Flags)
 	assert.False(opts.InternalDate)
 	assert.False(opts.RFC822Size)
 	require.Len(opts.BodySection, 1)
 	assert.True(opts.BodySection[0].Peek)
 	assert.Equal(imapapi.PartSpecifierHeader, opts.BodySection[0].Specifier)
 	assert.Equal([]string{"Message-ID"}, opts.BodySection[0].HeaderFields)
+}
+
+func TestRawBatchFetchRecordsMembershipBeforeDedup(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	addr, user := testutil.StartIMAPMemServerWithSpecialUse(
+		t,
+		map[string]int{"All Mail": 0, "Archive": 0},
+		map[string][]imapapi.MailboxAttr{"All Mail": {imapapi.MailboxAttrAll}},
+	)
+	const messageID = "membership-dedup@example.com"
+	testutil.AppendIMAPMessageWithMessageID(t, user, "All Mail", messageID)
+	testutil.AppendIMAPMessageWithMessageID(t, user, "Archive", messageID)
+	client := newTestClient(t, addr)
+	require.ElementsMatch([]string{"All Mail|1", "Archive|1"}, listAllMessages(t, client))
+
+	client.mu.Lock()
+	client.observedMemberships = nil
+	var uidSet imapapi.UIDSet
+	uidSet.AddNum(1)
+	allMailSelectErr := client.selectMailbox("All Mail")
+	var allMailStoreErr error
+	if allMailSelectErr == nil {
+		_, allMailStoreErr = client.conn.Store(uidSet, &imapapi.StoreFlags{
+			Op: imapapi.StoreFlagsSet, Flags: []imapapi.Flag{imapapi.FlagSeen},
+		}, nil).Collect()
+	}
+	archiveSelectErr := client.selectMailbox("Archive")
+	var archiveStoreErr error
+	if archiveSelectErr == nil {
+		_, archiveStoreErr = client.conn.Store(uidSet, &imapapi.StoreFlags{
+			Op: imapapi.StoreFlagsSet, Flags: []imapapi.Flag{imapapi.FlagFlagged},
+		}, nil).Collect()
+	}
+	client.mu.Unlock()
+	require.NoError(allMailSelectErr)
+	require.NoError(allMailStoreErr)
+	require.NoError(archiveSelectErr)
+	require.NoError(archiveStoreErr)
+	results, err := client.GetMessagesRawBatchWithErrors(
+		context.Background(), []string{"All Mail|1", "Archive|1"})
+	require.NoError(err)
+	require.Len(results, 2)
+	require.NotNil(results[0].Message)
+	require.NotNil(results[1].Message)
+	assert.NotEmpty(results[0].Message.Raw)
+	assert.Empty(results[1].Message.Raw, "the overlapping copy is returned as a duplicate stub")
+
+	observed := client.ObservedMemberships()
+	require.Len(observed, 2, "both raw FETCH results must be recorded before deduplication")
+	assert.Equal("All Mail", observed[0].Mailbox)
+	assert.NotZero(observed[0].UIDValidity)
+	assert.Equal(uint32(1), observed[0].UID)
+	assert.Equal("All Mail|1", observed[0].SourceMessageID)
+	assert.Equal(messageID, observed[0].RFC822MessageID)
+	assert.Equal([]string{"\\Seen"}, observed[0].Flags)
+	assert.Equal("Archive", observed[1].Mailbox)
+	assert.NotZero(observed[1].UIDValidity)
+	assert.Equal(uint32(1), observed[1].UID)
+	assert.Equal("Archive|1", observed[1].SourceMessageID)
+	assert.Equal(messageID, observed[1].RFC822MessageID)
+	assert.Equal([]string{"\\Flagged"}, observed[1].Flags)
+}
+
+func TestRawBatchFetchDoesNotRequestMalformedEnvelope(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	raw := []byte("Message-ID: <tencent-914@example.test>\r\nSubject: archived message\r\n\r\nbody")
+	addr, fetchCommand := startMalformedEnvelopeIMAPServer(t, raw)
+	host, portText, err := net.SplitHostPort(addr)
+	require.NoError(err)
+	port, err := strconv.Atoi(portText)
+	require.NoError(err)
+	client := NewClient(&Config{
+		Host:     host,
+		Port:     port,
+		Username: testutil.IMAPTestUsername,
+	}, testutil.IMAPTestPassword)
+	t.Cleanup(func() { _ = client.Close() })
+
+	results, err := client.GetMessagesRawBatchWithErrors(
+		t.Context(), []string{"INBOX|914"})
+
+	require.NoError(err)
+	require.Len(results, 1)
+	require.NoError(results[0].Err)
+	require.NotNil(results[0].Message)
+	assert.Equal(raw, results[0].Message.Raw)
+	assert.NotContains(<-fetchCommand, "ENVELOPE")
+}
+
+func TestLabelOnlyFetchRecordsCanonicalMembershipFlags(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	addr, user := testutil.StartIMAPMemServer(t, map[string]int{"INBOX": 0})
+	const messageID = "label-membership@example.com"
+	testutil.AppendIMAPMessageWithMessageID(t, user, "INBOX", messageID)
+	client := newTestClient(t, addr)
+	require.Equal([]string{"INBOX|1"}, listAllMessages(t, client))
+
+	client.mu.Lock()
+	client.observedMemberships = nil
+	selectErr := client.selectMailbox("INBOX")
+	var uidSet imapapi.UIDSet
+	uidSet.AddNum(1)
+	var storeErr error
+	if selectErr == nil {
+		_, storeErr = client.conn.Store(uidSet, &imapapi.StoreFlags{
+			Op:    imapapi.StoreFlagsSet,
+			Flags: []imapapi.Flag{imapapi.FlagSeen, imapapi.FlagFlagged, "$Forwarded"},
+		}, nil).Collect()
+	}
+	client.mu.Unlock()
+	require.NoError(selectErr)
+	require.NoError(storeErr)
+
+	results, err := client.GetMessageLabelsBatch(context.Background(), []string{"INBOX|1"})
+	require.NoError(err)
+	require.Len(results, 1)
+	require.NoError(results[0].Err)
+
+	observed := client.ObservedMemberships()
+	require.Len(observed, 1)
+	assert.Equal(MembershipObservation{
+		Mailbox:         "INBOX",
+		UIDValidity:     observed[0].UIDValidity,
+		UID:             1,
+		SourceMessageID: "INBOX|1",
+		RFC822MessageID: messageID,
+		Flags:           []string{"$Forwarded", "\\Flagged", "\\Seen"},
+	}, observed[0])
+	assert.NotZero(observed[0].UIDValidity)
+}
+
+func TestObservedMembershipsReturnsDefensiveCopy(t *testing.T) {
+	client := &Client{observedMemberships: []MembershipObservation{{
+		Mailbox: "INBOX", UID: 1, Flags: []string{"\\Seen"},
+	}}}
+
+	first := client.ObservedMemberships()
+	first[0].Mailbox = "mutated"
+	first[0].Flags[0] = "mutated"
+	first = append(first, MembershipObservation{Mailbox: "extra"})
+	assert.Len(t, first, 2)
+
+	assert.Equal(t, []MembershipObservation{{
+		Mailbox: "INBOX", UID: 1, Flags: []string{"\\Seen"},
+	}}, client.ObservedMemberships())
 }
 
 func TestGetMessageLabelsBatchPreservesPerMessageMissingUID(t *testing.T) {
@@ -649,4 +804,57 @@ func fetchMessageBufferWithoutEnvelope(raw []byte) *imapclient.FetchMessageBuffe
 			{Bytes: raw},
 		},
 	}
+}
+
+func startMalformedEnvelopeIMAPServer(t *testing.T, raw []byte) (string, <-chan string) {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = listener.Close() })
+
+	fetchCommand := make(chan string, 1)
+	go func() {
+		conn, acceptErr := listener.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = io.WriteString(conn, "* OK [CAPABILITY IMAP4rev1] synthetic server ready\r\n")
+		reader := bufio.NewReader(conn)
+		for {
+			line, readErr := reader.ReadString('\n')
+			if readErr != nil {
+				return
+			}
+			line = strings.TrimSpace(line)
+			tag, command, _ := strings.Cut(line, " ")
+			upper := strings.ToUpper(command)
+			switch {
+			case strings.HasPrefix(upper, "LOGIN"):
+				_, _ = fmt.Fprintf(conn, "%s OK LOGIN completed\r\n", tag)
+			case strings.HasPrefix(upper, "SELECT"):
+				_, _ = io.WriteString(conn,
+					"* FLAGS (\\Seen)\r\n* 1 EXISTS\r\n* OK [UIDVALIDITY 1]\r\n* OK [UIDNEXT 915]\r\n")
+				_, _ = fmt.Fprintf(conn, "%s OK [READ-WRITE] SELECT completed\r\n", tag)
+			case strings.HasPrefix(upper, "UID FETCH"):
+				fetchCommand <- upper
+				if strings.Contains(upper, "ENVELOPE") {
+					_, _ = io.WriteString(conn, "* 1 FETCH (UID 914 ENVELOPE BROKEN)\r\n")
+				} else {
+					_, _ = fmt.Fprintf(conn,
+						"* 1 FETCH (UID 914 FLAGS () INTERNALDATE \"01-Jan-2026 00:00:00 +0000\" RFC822.SIZE %d BODY[] {%d}\r\n",
+						len(raw), len(raw))
+					_, _ = conn.Write(raw)
+					_, _ = io.WriteString(conn, ")\r\n")
+				}
+				_, _ = fmt.Fprintf(conn, "%s OK UID FETCH completed\r\n", tag)
+			case strings.HasPrefix(upper, "LOGOUT"):
+				_, _ = fmt.Fprintf(conn, "* BYE closing\r\n%s OK LOGOUT completed\r\n", tag)
+				return
+			default:
+				_, _ = fmt.Fprintf(conn, "%s BAD unsupported synthetic command\r\n", tag)
+			}
+		}
+	}()
+	return listener.Addr().String(), fetchCommand
 }

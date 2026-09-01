@@ -154,7 +154,12 @@ func finishImessageImport(s *store.Store) error {
 		// staleness check, so the standard rebuildCacheAfterWrite would skip.
 		// Force a full rebuild so conversations.parquet and
 		// participants.parquet are re-exported and the TUI sees the new names.
-		if _, err := buildCache(dbPath, cfg.AnalyticsDir(), true); err != nil {
+		if _, err := buildCache(
+			dbPath,
+			cfg.AnalyticsDir(),
+			true,
+			analyticsBuilderOverrides(cfg.Analytics),
+		); err != nil {
 			return fmt.Errorf("refresh analytics cache: %w", err)
 		}
 		return nil
@@ -351,7 +356,7 @@ func resolveImessageSource(s *store.Store) (*store.Source, error) {
 	if err == nil && len(sources) > 0 {
 		var best *store.Source
 		for _, src := range sources {
-			if src.Identifier != "local" {
+			if src.Identifier != localValue {
 				if best == nil || src.ID > best.ID {
 					best = src
 				}
@@ -362,7 +367,7 @@ func resolveImessageSource(s *store.Store) (*store.Source, error) {
 		}
 		return sources[0], nil
 	}
-	return s.GetOrCreateSource("apple_messages", "local")
+	return s.GetOrCreateSource("apple_messages", localValue)
 }
 
 func init() {

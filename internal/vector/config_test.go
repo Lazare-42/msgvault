@@ -67,11 +67,31 @@ func TestConfig_Validate(t *testing.T) {
 		{"Hostless", func(c *Config) { c.Embeddings.Endpoint = "http:///v1" }, "endpoint"},
 		{"HTTPS_OK", func(c *Config) { c.Embeddings.Endpoint = "https://host:8080/v1" }, ""},
 		{"PgvectorBackend_OK", func(c *Config) { c.Backend = "pgvector" }, ""},
+		{"OpenAIAPIFormat_OK", func(c *Config) { c.Embeddings.APIFormat = APIFormatOpenAI }, ""},
+		{"VoyageContextualAPIFormat_OK", func(c *Config) {
+			c.Embeddings.APIFormat = APIFormatVoyageContextual
+			c.Embeddings.Model = "voyage-context-4"
+		}, ""},
+		{"VoyageContextualModelMismatch", func(c *Config) {
+			c.Embeddings.APIFormat = APIFormatVoyageContextual
+			c.Embeddings.Model = "another-model"
+		}, "voyage-context-4"},
+		{"UnknownAPIFormat", func(c *Config) { c.Embeddings.APIFormat = "mystery" }, "api_format"},
 		{"ZeroDim", func(c *Config) { c.Embeddings.Dimension = 0 }, "dimension"},
 		{"NegativeDim", func(c *Config) { c.Embeddings.Dimension = -1 }, "dimension"},
 		{"UnknownBackend", func(c *Config) { c.Backend = "mystery" }, "backend"},
 		{"ZeroBatch", func(c *Config) { c.Embeddings.BatchSize = 0 }, "batch_size"},
 		{"MissingModel", func(c *Config) { c.Embeddings.Model = "" }, "model"},
+		{"DocumentPrefixTooLarge", func(c *Config) {
+			c.Embeddings.DocumentPrefix = strings.Repeat("x", maxEmbeddingTaskPrefixUTF8Bytes+1)
+		}, "document_prefix"},
+		{"QueryPrefixTooLarge", func(c *Config) {
+			c.Embeddings.QueryPrefix = strings.Repeat("x", maxEmbeddingTaskPrefixUTF8Bytes+1)
+		}, "query_prefix"},
+		{"PrefixLimitOK", func(c *Config) {
+			c.Embeddings.DocumentPrefix = strings.Repeat("x", maxEmbeddingTaskPrefixUTF8Bytes)
+			c.Embeddings.QueryPrefix = strings.Repeat("x", maxEmbeddingTaskPrefixUTF8Bytes)
+		}, ""},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -282,6 +302,33 @@ func TestEmbeddingsConfig_ETAWindowExplicit(t *testing.T) {
 	require.Equal(t, 25, c.Embeddings.ETAWindow, "ETAWindow explicit")
 }
 
+// TestEmbeddingsConfig_APIFormatDefaultsToOpenAI catches a zero-value
+// configuration selecting no usable embedding request contract.
+func TestEmbeddingsConfig_APIFormatDefaultsToOpenAI(t *testing.T) {
+	cfg := Config{}
+	cfg.ApplyDefaults()
+	assert.Equal(t, APIFormatOpenAI, cfg.Embeddings.EffectiveAPIFormat())
+}
+
+// TestGenerationFingerprint_ChangesForVoyageContextual catches contextual
+// vectors being mixed into an existing OpenAI-compatible generation.
+func TestGenerationFingerprint_ChangesForVoyageContextual(t *testing.T) {
+	openAI := validConfig()
+	contextual := openAI
+	contextual.Embeddings.APIFormat = APIFormatVoyageContextual
+	assert.NotEqual(t, openAI.GenerationFingerprint(), contextual.GenerationFingerprint())
+	assert.Contains(t, contextual.GenerationFingerprint(), fmt.Sprintf(":v%d", contextPolicyVersion))
+}
+
+// TestGenerationFingerprint_ExplicitOpenAIPreservesLegacyBytes catches an
+// explicit OpenAI mode unnecessarily staling an existing default generation.
+func TestGenerationFingerprint_ExplicitOpenAIPreservesLegacyBytes(t *testing.T) {
+	implicit := validConfig()
+	explicit := implicit
+	explicit.Embeddings.APIFormat = APIFormatOpenAI
+	assert.Equal(t, implicit.GenerationFingerprint(), explicit.GenerationFingerprint())
+}
+
 // TestSearchConfig_PointerSemantics_FromTOML rounds out the
 // pointer-semantic guarantee at the TOML decode layer: omitted →
 // nil → ApplyDefaults fills 50; explicit 0 → preserved; explicit
@@ -418,6 +465,48 @@ func TestConfig_GenerationFingerprint_IncludesMaxInputChars(t *testing.T) {
 		"GenerationFingerprint should change when MaxInputChars goes 6000→0")
 }
 
+func TestConfig_GenerationFingerprint_IncludesEmbeddingPrefixes(t *testing.T) {
+	check := assert.New(t)
+	const base = `
+[embeddings]
+model = "nomic-embed-text"
+dimension = 768
+max_input_chars = 2000
+`
+	decode := func(t *testing.T, suffix string) Config {
+		t.Helper()
+		var cfg Config
+		_, err := toml.Decode(base+suffix, &cfg)
+		require.NoError(t, err)
+		return cfg
+	}
+
+	unprefixed := decode(t, "")
+	documentPrefixed := decode(t, `document_prefix = "search_document: "`)
+	queryPrefixed := decode(t, `query_prefix = "search_query: "`)
+	bothPrefixed := decode(t, `
+document_prefix = "search_document: "
+query_prefix = "search_query: "
+`)
+
+	check.NotEqual(unprefixed.GenerationFingerprint(), documentPrefixed.GenerationFingerprint())
+	check.NotEqual(unprefixed.GenerationFingerprint(), queryPrefixed.GenerationFingerprint())
+	check.NotEqual(documentPrefixed.GenerationFingerprint(), bothPrefixed.GenerationFingerprint())
+	check.NotEqual(queryPrefixed.GenerationFingerprint(), bothPrefixed.GenerationFingerprint())
+}
+
+func TestConfig_GenerationFingerprint_EmbeddingPrefixEncodingIsUnambiguous(t *testing.T) {
+	left := Config{Embeddings: EmbeddingsConfig{
+		Model: "m", Dimension: 8, MaxInputChars: 2000,
+		DocumentPrefix: "a\x1fb", QueryPrefix: "c",
+	}}
+	right := left
+	right.Embeddings.DocumentPrefix = "a"
+	right.Embeddings.QueryPrefix = "b\x1fc"
+
+	assert.NotEqual(t, left.GenerationFingerprint(), right.GenerationFingerprint())
+}
+
 // TestConfig_GenerationFingerprint_IncludesEmbedPolicyVersion pins the
 // trailing :e<embedPolicyVersion> segment. The embed worker switched
 // from one-vector-per-message-with-truncation to N-vectors-per-message-
@@ -447,4 +536,203 @@ func TestConfig_GenerationFingerprint_IncludesEmbedScope(t *testing.T) {
 		"GenerationFingerprint should change when embedding is scoped")
 	assert.Contains(t, scoped.GenerationFingerprint(), ":smt-mms,sms",
 		"scope fingerprint should normalize and sort message types")
+}
+
+// TestConfig_GenerationFingerprint_IncludesEmbedScopeSources pins the account
+// dimension: resolved source IDs fold into the generation fingerprint, so an
+// account-scoped build never shares a generation with a full-corpus one.
+func TestConfig_GenerationFingerprint_IncludesEmbedScopeSources(t *testing.T) {
+	base := Config{
+		Embeddings: EmbeddingsConfig{Model: "m", Dimension: 8, MaxInputChars: 6000},
+	}
+	baseline := base.GenerationFingerprint()
+
+	scoped := base
+	scoped.Embed.Scope.SourceIDs = []int64{7, 3, 7}
+
+	assert.NotEqual(t, baseline, scoped.GenerationFingerprint(),
+		"GenerationFingerprint should change when embedding is scoped to accounts")
+	assert.Contains(t, scoped.GenerationFingerprint(), ":ssrc-3,7",
+		"scope fingerprint should normalize and sort source IDs")
+
+	combined := base
+	combined.Embed.Scope.MessageTypes = []string{"email"}
+	combined.Embed.Scope.SourceIDs = []int64{3}
+	assert.Contains(t, combined.GenerationFingerprint(), ":smt-email:src-3",
+		"message types and source IDs compose in one scope fingerprint")
+}
+
+func TestConfig_MultimodalEnabledWithoutTextVectors(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	var cfg Config
+	_, err := toml.Decode(`[multimodal]
+enabled = true
+provider = "voyage"
+model = "voyage-multimodal-3.5"
+dimension = 1024
+`, &cfg)
+	require.NoError(err)
+	cfg.ApplyDefaults()
+
+	assert.False(cfg.Enabled)
+	assert.True(cfg.AnyLaneEnabled())
+	require.NoError(cfg.Validate())
+	assert.True(cfg.Multimodal.ImagesEnabled())
+	assert.True(cfg.Multimodal.VideoEnabled())
+	assert.True(cfg.Multimodal.ImageQueriesEnabled())
+	assert.False(cfg.Multimodal.AnimatedGIFsEnabled(),
+		"animated GIF stays opt-in; probed authority is still required at runtime")
+}
+
+func TestMultimodalDefaultsPreserveExplicitOptOuts(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	var cfg Config
+	_, err := toml.Decode(`[multimodal]
+enabled = true
+include_images = false
+include_video = true
+allow_image_queries = false
+`, &cfg)
+	require.NoError(err)
+	cfg.ApplyDefaults()
+
+	assert.False(cfg.Multimodal.ImagesEnabled())
+	assert.True(cfg.Multimodal.VideoEnabled())
+	assert.False(cfg.Multimodal.ImageQueriesEnabled())
+	assert.Equal("voyage", cfg.Multimodal.Provider)
+	assert.Equal("https://api.voyageai.com/v1", cfg.Multimodal.Endpoint)
+	assert.Equal("VOYAGE_API_KEY", cfg.Multimodal.APIKeyEnv)
+	assert.Equal("voyage-multimodal-3.5", cfg.Multimodal.Model)
+	assert.Equal(1024, cfg.Multimodal.Dimension)
+	assert.Equal(4000, cfg.Multimodal.MaxContextChars)
+}
+
+func TestMultimodalValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*Config)
+		wantErr string
+	}{
+		{name: "valid"},
+		{name: "provider", mutate: func(c *Config) { c.Multimodal.Provider = "other" }, wantErr: "provider"},
+		{name: "endpoint", mutate: func(c *Config) { c.Multimodal.Endpoint = "file:///tmp/provider" }, wantErr: "endpoint"},
+		{name: "proxy endpoint", mutate: func(c *Config) { c.Multimodal.Endpoint = "https://proxy.example.test/v1" }, wantErr: "pinned provider endpoint"},
+		{name: "model", mutate: func(c *Config) { c.Multimodal.Model = "voyage-4-large" }, wantErr: "model"},
+		{name: "dimension", mutate: func(c *Config) { c.Multimodal.Dimension = 768 }, wantErr: "dimension"},
+		{name: "context cap", mutate: func(c *Config) { c.Multimodal.MaxContextChars = -1 }, wantErr: "max_context_chars"},
+		{name: "key env", mutate: func(c *Config) { c.Multimodal.APIKeyEnv = "BAD-NAME" }, wantErr: "api_key_env"},
+		{name: "no document media", mutate: func(c *Config) {
+			c.Multimodal.IncludeImages = new(false)
+			c.Multimodal.IncludeAnimatedGIFs = new(false)
+			c.Multimodal.IncludeVideo = new(false)
+		}, wantErr: "media type"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := Config{Multimodal: MultimodalConfig{Enabled: true}}
+			cfg.ApplyDefaults()
+			if tt.mutate != nil {
+				tt.mutate(&cfg)
+			}
+			err := cfg.Validate()
+			if tt.wantErr == "" {
+				require.NoError(t, err)
+				return
+			}
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tt.wantErr)
+		})
+	}
+}
+
+func TestMultimodalFingerprintChangesForPolicyAndScope(t *testing.T) {
+	base := Config{Multimodal: MultimodalConfig{Enabled: true}}
+	base.ApplyDefaults()
+	baseline := base.MultimodalGenerationFingerprint()
+	require.NotEmpty(t, baseline)
+
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+	}{
+		{name: "endpoint", mutate: func(c *Config) { c.Multimodal.Endpoint = "https://voyage.example.test/v1" }},
+		{name: "model", mutate: func(c *Config) { c.Multimodal.Model = "replacement-model" }},
+		{name: "dimension", mutate: func(c *Config) { c.Multimodal.Dimension = 2048 }},
+		{name: "context", mutate: func(c *Config) { c.Multimodal.MaxContextChars++ }},
+		{name: "images", mutate: func(c *Config) { c.Multimodal.IncludeImages = new(false) }},
+		{name: "video", mutate: func(c *Config) { c.Multimodal.IncludeVideo = new(false) }},
+		{name: "image queries", mutate: func(c *Config) { c.Multimodal.AllowImageQueries = new(false) }},
+		{name: "scope", mutate: func(c *Config) { c.Multimodal.Scope.MessageTypes = []string{"MMS", "beeper"} }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			changed := base
+			tt.mutate(&changed)
+			assert.NotEqual(t, baseline, changed.MultimodalGenerationFingerprint())
+		})
+	}
+
+	equivalentEndpoint := base
+	equivalentEndpoint.Multimodal.Endpoint = "HTTPS://API.VOYAGEAI.COM/v1/"
+	assert.Equal(t, baseline, equivalentEndpoint.MultimodalGenerationFingerprint(),
+		"endpoint identity should normalize scheme, host, and trailing slash")
+
+	operationalOnly := base
+	operationalOnly.Multimodal.APIKeyEnv = "ROTATED_VOYAGE_KEY"
+	operationalOnly.Multimodal.Schedule.Cron = "*/5 * * * *"
+	operationalOnly.Multimodal.Schedule.RunAfterSync = true
+	assert.Equal(t, baseline, operationalOnly.MultimodalGenerationFingerprint(),
+		"credentials and scheduling do not change model input policy")
+}
+
+func TestVoyageKeyDoesNotEnableMultimodal(t *testing.T) {
+	assert := assert.New(t)
+	t.Setenv("VOYAGE_API_KEY", "synthetic-key")
+	var cfg Config
+	cfg.ApplyDefaults()
+
+	assert.NotEmpty(cfg.Multimodal.APIKey())
+	assert.False(cfg.Multimodal.Enabled)
+	assert.False(cfg.AnyLaneEnabled())
+	assert.False(cfg.Multimodal.ImagesEnabled())
+}
+
+func TestMultimodalValidateCoversDisabledLaneForProbe(t *testing.T) {
+	require := require.New(t)
+	var cfg Config
+	// The probe runs before the lane is enabled, so Config.Validate skips
+	// these settings. The exported MultimodalConfig.Validate must still
+	// refuse a foreign destination, keeping its credential off Voyage.
+	_, err := toml.Decode(`[multimodal]
+enabled = false
+endpoint = "https://gateway.internal.example/v1"
+api_key_env = "INTERNAL_GATEWAY_KEY"
+`, &cfg)
+	require.NoError(err)
+	cfg.ApplyDefaults()
+	require.NoError(cfg.Validate(), "disabled lanes stay out of Config.Validate")
+	err = cfg.Multimodal.Validate()
+	require.Error(err)
+	require.Contains(err.Error(), "pinned provider endpoint")
+}
+
+func TestMultimodalRejectsAnimatedGIFsWithoutImages(t *testing.T) {
+	require := require.New(t)
+	var cfg Config
+	// The runtime media policy only admits animated media when still images
+	// are enabled; an animated-only lane would reject every attachment yet
+	// still validate and activate.
+	_, err := toml.Decode(`[multimodal]
+enabled = true
+include_images = false
+include_video = false
+include_animated_gifs = true
+`, &cfg)
+	require.NoError(err)
+	cfg.ApplyDefaults()
+	err = cfg.Validate()
+	require.Error(err)
+	require.Contains(err.Error(), "include_animated_gifs")
 }

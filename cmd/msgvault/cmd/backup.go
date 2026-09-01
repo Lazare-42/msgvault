@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"text/tabwriter"
@@ -52,6 +54,11 @@ var (
 	// at all (the daemon-proxied subprocess can't detect the real terminal).
 	backupCreateProgress string
 )
+
+// backupRestoreAfterDaemonPreflight is a narrow test barrier for exercising
+// ownership races between the early diagnostic check and Kit's authoritative
+// target coordination. Production leaves it nil.
+var backupRestoreAfterDaemonPreflight func()
 
 var backupCmd = &cobra.Command{
 	Use:   "backup",
@@ -146,7 +153,7 @@ func printBackupSnapshots(w io.Writer, snapshots []*backup.Manifest) error {
 		return nil
 	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "SNAPSHOT\tCREATED\tMESSAGES\tBYTES ADDED\tTAG")
+	_, _ = fmt.Fprintln(tw, "SNAPSHOT\tCREATED\tMESSAGES\tDOCUMENT TEXT\tBYTES ADDED\tTAG")
 	for _, m := range snapshots {
 		tag := m.Options.Tag
 		if tag == "" {
@@ -156,8 +163,12 @@ func printBackupSnapshots(w io.Writer, snapshots []*backup.Manifest) error {
 		if err != nil {
 			return fmt.Errorf("snapshot %s: parsing manifest stats: %w", m.SnapshotID, err)
 		}
-		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\n",
-			m.SnapshotID, m.CreatedAt, formatCount(st.Messages), formatSize(m.BytesAdded), tag)
+		documentText := "no"
+		if backupapp.ManifestContainsDocumentPlaintext(m) {
+			documentText = "normalized plaintext"
+		}
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			m.SnapshotID, m.CreatedAt, formatCount(st.Messages), documentText, formatSize(m.BytesAdded), tag)
 	}
 	if err := tw.Flush(); err != nil {
 		return fmt.Errorf("write backup list output: %w", err)
@@ -223,41 +234,422 @@ func runBackupRestore(cmd *cobra.Command, args []string) error {
 	if err := refuseRestoreIntoLiveDaemonHome(backupRestoreTarget); err != nil {
 		return err
 	}
+	if backupRestoreAfterDaemonPreflight != nil {
+		backupRestoreAfterDaemonPreflight()
+	}
+	targetCoordinator, coordinatedTarget, err := backupRestoreTargetCoordinator(
+		backupRestoreTarget, backupRestoreOverwrite,
+	)
+	if err != nil {
+		return err
+	}
+	var targetCoordinatorOption backup.RestoreTargetCoordinator
+	if targetCoordinator != nil {
+		targetCoordinatorOption = targetCoordinator
+	}
 	var snapshotID string
 	if len(args) > 0 {
 		snapshotID = args[0]
 	}
 	renderer := newBackupProgressRenderer(cmd.OutOrStdout(), progressModeAuto)
 	defer renderer.finish()
+	looseAttachments := backupRestoreLooseAttachments || cfg.Data.LooseAttachments
 	res, err := backup.Restore(cmd.Context(), r, backupapp.New(Version), backup.RestoreOptions{
 		SnapshotID:         snapshotID,
 		TargetDir:          backupRestoreTarget,
-		Overwrite:          backupRestoreOverwrite,
+		Overwrite:          backupRestoreOverwrite || coordinatedTarget,
 		Jobs:               backupRestoreJobs,
 		ForceUnlock:        backupRestoreForceUnlock,
 		SkipIntegrityCheck: !backupRestoreIntegrityCheck,
 		Progress:           renderer.handle,
-		PackedContent:      backupRestorePackedContentTarget(backupRestoreLooseAttachments),
+		PackedContent:      backupRestorePackedContentTarget(looseAttachments),
+		TargetCoordinator:  targetCoordinatorOption,
+		AuxiliaryTarget:    backupapp.NewDocumentAuxiliaryTarget(),
+		BeforePublication:  backupapp.InvalidateRestoredDocumentVectors,
 	})
 	if err != nil {
 		return fmt.Errorf("restoring snapshot: %w", err)
 	}
-	if backupRestoreLooseAttachments {
-		if err := clearRestoredPackMetadata(res.DBPath); err != nil {
-			return err
+	return printBackupRestoreSummary(cmd.OutOrStdout(), backupRestoreTarget, res, looseAttachments)
+}
+
+func removeSQLiteVectorBackendPath(path string) error {
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("backup restore: open vector backend directory for reset: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	return removeSQLiteVectorBackend(root, filepath.Base(path))
+}
+
+func removeSQLiteVectorBackend(root *os.Root, name string) error {
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+		fileName := name + suffix
+		if err := root.Remove(fileName); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("backup restore: remove excluded vector backend %s: %w", fileName, err)
 		}
 	}
-	return printBackupRestoreSummary(cmd.OutOrStdout(), backupRestoreTarget, res, backupRestoreLooseAttachments)
+	return nil
 }
 
 func backupRestorePackedContentTarget(loose bool) backup.PackedContentTarget {
+	limits := packstore.DefaultLimits()
 	if loose {
-		return nil
+		// Every real pack exceeds one byte, so Kit restores every selected
+		// attachment loose and atomically replaces staged pack authority with
+		// an empty catalog before publishing the database.
+		limits.PackBytes = 1
 	}
-	return backupapp.NewPackedRestoreTarget(packstore.DefaultLimits())
+	return backupapp.NewPackedRestoreTarget(limits)
 }
 
-func printBackupRestoreSummary(w io.Writer, target string, res *backup.RestoreResult, explicitLoose bool) error {
+func backupRestoreTargetCoordinator(
+	target string,
+	overwrite bool,
+) (*daemonRestoreTargetCoordinator, bool, error) {
+	if cfg == nil || target == "" || cfg.Data.DataDir == "" {
+		return nil, false, nil
+	}
+	databasePath := ""
+	configuredVectorPath := ""
+	if !store.IsPostgresURL(cfg.DatabaseDSN()) {
+		var err error
+		databasePath, err = cfg.DatabasePath()
+		if err != nil {
+			return nil, false, fmt.Errorf("backup restore: resolving configured database: %w", err)
+		}
+		configuredVectorPath = cfg.Vector.DBPath
+		if configuredVectorPath == "" {
+			configuredVectorPath = filepath.Join(cfg.Data.DataDir, "vectors.db")
+		}
+	}
+	coordinator := &daemonRestoreTargetCoordinator{
+		dataDir:              cfg.Data.DataDir,
+		databasePath:         databasePath,
+		configuredVectorPath: configuredVectorPath,
+		target:               target,
+		overwrite:            overwrite,
+	}
+	mayNeedCoordination, err := restorePathsMayBeEquivalent(target, cfg.Data.DataDir)
+	if err != nil {
+		return nil, false, fmt.Errorf("backup restore: compare target with configured data directory: %w", err)
+	}
+	if !mayNeedCoordination && databasePath != "" {
+		restoredDatabasePath := filepath.Join(target, backupapp.New(Version).DBFileName())
+		mayNeedCoordination, err = restorePathsMayBeEquivalent(restoredDatabasePath, databasePath)
+		if err != nil {
+			return nil, false, fmt.Errorf("backup restore: compare target database with configured database: %w", err)
+		}
+	}
+	if !mayNeedCoordination {
+		if overwrite {
+			return coordinator, false, nil
+		}
+		return nil, false, nil
+	}
+	if overwrite && configuredVectorPath != "" {
+		restoredDatabasePath := filepath.Join(target, backupapp.New(Version).DBFileName())
+		matchesDatabase, err := restorePathsMayBeEquivalent(configuredVectorPath, restoredDatabasePath)
+		if err != nil {
+			return nil, false, fmt.Errorf(
+				"backup restore: compare vector database with restored archive database: %w",
+				err,
+			)
+		}
+		if matchesDatabase {
+			return nil, false, errors.New(
+				"backup restore: vector database path resolves to the restored archive database",
+			)
+		}
+	}
+	return coordinator, true, nil
+}
+
+type daemonRestoreTargetCoordinator struct {
+	dataDir              string
+	databasePath         string
+	configuredVectorPath string
+	target               string
+	overwrite            bool
+}
+
+type pinnedRestoreTargetKind uint8
+
+const (
+	pinnedRestoreTargetUnrelated pinnedRestoreTargetKind = iota
+	pinnedRestoreTargetDataDir
+	pinnedRestoreTargetDatabaseDir
+)
+
+func (c *daemonRestoreTargetCoordinator) AcquireRestoreTarget(
+	ctx context.Context,
+	root *os.Root,
+) (backup.RestoreTargetLease, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	targetKind, err := c.classifyPinnedRestoreTarget(root)
+	if err != nil {
+		return nil, err
+	}
+	lease, err := c.newRestoreTargetLease(root, targetKind)
+	if err != nil {
+		return nil, err
+	}
+	if targetKind == pinnedRestoreTargetUnrelated {
+		if err := c.validateRestoreTargetContents(root, false); err != nil {
+			return nil, err
+		}
+		return lease, nil
+	}
+
+	lockRoot := root
+	closeLockRoot := false
+	if targetKind != pinnedRestoreTargetDataDir {
+		if err := os.MkdirAll(c.dataDir, 0o700); err != nil {
+			return nil, fmt.Errorf("create configured data directory for restore exclusion: %w", err)
+		}
+		lockRoot, err = os.OpenRoot(c.dataDir)
+		if err != nil {
+			return nil, fmt.Errorf("pin configured data directory for restore exclusion: %w", err)
+		}
+		closeLockRoot = true
+		defer func() {
+			if closeLockRoot {
+				_ = lockRoot.Close()
+			}
+		}()
+	}
+	for _, name := range []string{daemonOwnerLockFile, writeOwnerLockFile} {
+		lockFile, err := lockRoot.OpenFile(name, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			return nil, fmt.Errorf("create restore exclusion lock %s: %w", name, err)
+		}
+		if err := lockFile.Close(); err != nil {
+			return nil, fmt.Errorf("close restore exclusion lock file %s: %w", name, err)
+		}
+	}
+	// Match daemon startup's global lock order so restore cannot deadlock
+	// against another process that needs both ownership protocols.
+	lease.daemonOwner, err = tryAcquireDaemonOwnerLock(c.dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("acquire daemon exclusion for restore: %w", err)
+	}
+	success := false
+	defer func() {
+		if !success {
+			_ = lease.Release()
+		}
+	}()
+	lease.writeOwner, err = tryAcquireWriteOwnerLock(c.dataDir)
+	if err != nil {
+		return nil, fmt.Errorf("acquire direct-writer exclusion for restore: %w", err)
+	}
+	locks := []struct {
+		name string
+		path string
+	}{
+		{name: daemonOwnerLockFile, path: daemonOwnerLockPath(c.dataDir)},
+		{name: writeOwnerLockFile, path: writeOwnerLockPath(c.dataDir)},
+	}
+	for _, lock := range locks {
+		rootLockInfo, statErr := lockRoot.Stat(lock.name)
+		if statErr != nil {
+			return nil, fmt.Errorf("inspect pinned restore exclusion lock %s: %w", lock.name, statErr)
+		}
+		pathLockInfo, statErr := os.Stat(lock.path)
+		if statErr != nil {
+			return nil, fmt.Errorf("inspect configured restore exclusion lock %s: %w", lock.path, statErr)
+		}
+		if !os.SameFile(rootLockInfo, pathLockInfo) {
+			return nil, fmt.Errorf(
+				"configured archive home changed while acquiring restore exclusion lock %s",
+				lock.name,
+			)
+		}
+	}
+	if closeLockRoot {
+		if err := lockRoot.Close(); err != nil {
+			return nil, fmt.Errorf("close configured data-directory root after lock verification: %w", err)
+		}
+		closeLockRoot = false
+	}
+	if err := c.validateRestoreTargetContents(root, targetKind == pinnedRestoreTargetDataDir); err != nil {
+		return nil, err
+	}
+	success = true
+	return lease, nil
+}
+
+func (c *daemonRestoreTargetCoordinator) newRestoreTargetLease(
+	root *os.Root,
+	targetKind pinnedRestoreTargetKind,
+) (*daemonRestoreTargetLease, error) {
+	databaseFileName := backupapp.New(Version).DBFileName()
+	databaseFile, err := root.Open(databaseFileName)
+	databaseExisted := err == nil
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("inspect database before restore publication: %w", err)
+	}
+	var databaseInfo fs.FileInfo
+	if databaseExisted {
+		databaseInfo, err = databaseFile.Stat()
+		closeErr := databaseFile.Close()
+		if err != nil {
+			return nil, errors.Join(
+				fmt.Errorf("inspect database before restore publication: %w", err),
+				closeErr,
+			)
+		}
+		if closeErr != nil {
+			return nil, fmt.Errorf("close database after restore inspection: %w", closeErr)
+		}
+	}
+	lease := &daemonRestoreTargetLease{
+		targetRoot:        root,
+		databaseFileName:  databaseFileName,
+		databaseInfo:      databaseInfo,
+		databaseExisted:   databaseExisted,
+		resetTargetVector: c.overwrite,
+	}
+	if c.overwrite && targetKind != pinnedRestoreTargetUnrelated {
+		lease.configuredVectorPath = c.configuredVectorPath
+	}
+	return lease, nil
+}
+
+func (c *daemonRestoreTargetCoordinator) classifyPinnedRestoreTarget(
+	root *os.Root,
+) (pinnedRestoreTargetKind, error) {
+	rootInfo, err := root.Stat(".")
+	if err != nil {
+		return pinnedRestoreTargetUnrelated, fmt.Errorf("inspect pinned restore target: %w", err)
+	}
+	dataDirInfo, err := os.Stat(c.dataDir)
+	if err == nil {
+		if os.SameFile(rootInfo, dataDirInfo) {
+			return pinnedRestoreTargetDataDir, nil
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return pinnedRestoreTargetUnrelated, fmt.Errorf("inspect configured data directory: %w", err)
+	}
+	if c.databasePath == "" {
+		return pinnedRestoreTargetUnrelated, nil
+	}
+
+	dbFileName := backupapp.New(Version).DBFileName()
+	rootDBInfo, rootDBErr := root.Stat(dbFileName)
+	configuredDBInfo, configuredDBErr := os.Stat(c.databasePath)
+	if rootDBErr == nil && configuredDBErr == nil && os.SameFile(rootDBInfo, configuredDBInfo) {
+		return pinnedRestoreTargetDatabaseDir, nil
+	}
+	if rootDBErr != nil && !errors.Is(rootDBErr, os.ErrNotExist) {
+		return pinnedRestoreTargetUnrelated, fmt.Errorf("inspect database in pinned restore target: %w", rootDBErr)
+	}
+	if configuredDBErr != nil && !errors.Is(configuredDBErr, os.ErrNotExist) {
+		return pinnedRestoreTargetUnrelated, fmt.Errorf("inspect configured database: %w", configuredDBErr)
+	}
+
+	databaseParentInfo, err := os.Stat(filepath.Dir(c.databasePath))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return pinnedRestoreTargetUnrelated, nil
+		}
+		return pinnedRestoreTargetUnrelated, fmt.Errorf("inspect configured database directory: %w", err)
+	}
+	if os.SameFile(rootInfo, databaseParentInfo) &&
+		strings.EqualFold(dbFileName, filepath.Base(c.databasePath)) {
+		return pinnedRestoreTargetDatabaseDir, nil
+	}
+	return pinnedRestoreTargetUnrelated, nil
+}
+
+func (c *daemonRestoreTargetCoordinator) validateRestoreTargetContents(
+	root *os.Root,
+	allowLockFiles bool,
+) error {
+	if c.overwrite {
+		return nil
+	}
+	entries, err := fs.ReadDir(root.FS(), ".")
+	if err != nil {
+		return fmt.Errorf("inspect coordinated restore target: %w", err)
+	}
+	for _, entry := range entries {
+		if allowLockFiles && (entry.Name() == daemonOwnerLockFile || entry.Name() == writeOwnerLockFile) {
+			continue
+		}
+		return fmt.Errorf(
+			"restore target %s is not empty (use --overwrite to restore into it anyway)",
+			c.target,
+		)
+	}
+	return nil
+}
+
+type daemonRestoreTargetLease struct {
+	daemonOwner          *daemonOwnerLock
+	writeOwner           *writeOwnerLock
+	targetRoot           *os.Root
+	databaseFileName     string
+	databaseInfo         fs.FileInfo
+	databaseExisted      bool
+	resetTargetVector    bool
+	configuredVectorPath string
+}
+
+func (l *daemonRestoreTargetLease) Release() error {
+	if l == nil {
+		return nil
+	}
+	writeOwner := l.writeOwner
+	daemonOwner := l.daemonOwner
+	targetRoot := l.targetRoot
+	l.writeOwner = nil
+	l.daemonOwner = nil
+	l.targetRoot = nil
+	cleanupErr := l.removePublishedVectorBackends(targetRoot)
+	writeErr := writeOwner.Close()
+	daemonErr := daemonOwner.Close()
+	return errors.Join(cleanupErr, writeErr, daemonErr)
+}
+
+func (l *daemonRestoreTargetLease) removePublishedVectorBackends(root *os.Root) error {
+	if root == nil || !l.resetTargetVector {
+		return nil
+	}
+	currentInfo, err := root.Stat(l.databaseFileName)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect database after restore publication: %w", err)
+	}
+	if l.databaseExisted && os.SameFile(l.databaseInfo, currentInfo) {
+		return nil
+	}
+	if l.configuredVectorPath != "" {
+		configuredInfo, statErr := os.Stat(l.configuredVectorPath)
+		if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+			return fmt.Errorf("inspect configured vector database before restore cleanup: %w", statErr)
+		}
+		if statErr == nil && os.SameFile(configuredInfo, currentInfo) {
+			return errors.New(
+				"backup restore: vector database path resolves to the restored archive database",
+			)
+		}
+	}
+	cleanupErr := removeSQLiteVectorBackend(root, "vectors.db")
+	if l.configuredVectorPath != "" {
+		cleanupErr = errors.Join(cleanupErr, removeSQLiteVectorBackendPath(l.configuredVectorPath))
+	}
+	return cleanupErr
+}
+
+func printBackupRestoreSummary(w io.Writer, target string, res *backup.RestoreResult, looseOnly bool) error {
 	if res == nil {
 		return errors.New("backup restore result is nil")
 	}
@@ -285,9 +677,9 @@ func printBackupRestoreSummary(w io.Writer, target string, res *backup.RestoreRe
 		lines = append(lines, "Pack fallbacks: "+strings.Join(parts, ", ")+"\n")
 	}
 	if res.LooseAttachmentBlobs > 0 {
-		if explicitLoose {
+		if looseOnly {
 			lines = append(lines,
-				"Pack metadata cleared: attachments were restored as loose files by request; 'msgvault pack-attachments' will pack eligible blobs\n")
+				"Pack metadata cleared: attachments were restored as loose files\n")
 		} else {
 			lines = append(lines, fmt.Sprintf(
 				"%d attachment blob(s) remain loose; 'msgvault pack-attachments' can pack eligible blobs later\n",
@@ -310,55 +702,22 @@ func printBackupRestoreSummary(w io.Writer, target string, res *backup.RestoreRe
 	return nil
 }
 
-// clearRestoredPackMetadata opens the just-restored database and deletes all
-// attachment_pack_index/attachment_packs rows for an explicit
-// --loose-attachments restore. Kit's nil packed target materializes attachment
-// blobs as loose files only, so metadata carried in the restored DB would point
-// at packs that do not exist: reads of previously packed blobs would fail, and
-// worse, a later pack-attachments run would not re-pack those "already indexed"
-// hashes while its sweep deleted their restored loose files. Clearing the two
-// tables yields the fully-unpacked vault the user requested.
-//
-// The snapshot may predate the pack tables; ClearAttachmentPackMetadata checks
-// for them and does nothing when absent, avoiding unrelated schema migrations
-// after restore verification has already completed. dbPath comes from the restore
-// result and is always a SQLite file under the target directory, never the
-// configured live archive (or PostgreSQL).
-func clearRestoredPackMetadata(dbPath string) error {
-	st, err := store.Open(dbPath)
-	if err != nil {
-		return fmt.Errorf("open restored database %s: %w", dbPath, err)
-	}
-	defer func() { _ = st.Close() }()
-	if err := st.ClearAttachmentPackMetadata(); err != nil {
-		return fmt.Errorf("clear restored pack metadata: %w", err)
-	}
-	return nil
-}
-
 // refuseRestoreIntoLiveDaemonHome rejects a restore target that is the
 // configured archive home while a daemon is running there — the daemon owns
 // that SQLite database, and writing under it would corrupt a live archive
-// (docs/architecture/backup-format.md, Restore). Any responding daemon
-// counts, including one whose API version is incompatible with this client
-// (left running across an upgrade or downgrade) — it owns the database all
-// the same. A stopped daemon's home is still non-empty and so requires
-// --overwrite like any other directory. Target and home are compared as
-// filesystem objects, not path strings, so a case-variant or symlinked
-// spelling of the home is refused too.
+// (docs/architecture/backup-format.md, Restore). Any responding daemon or
+// held daemon ownership lease counts, including a daemon whose API version or
+// process identity this client cannot verify — it owns the database all the
+// same. A stopped daemon's home is still non-empty and so requires --overwrite
+// like any other directory. Target and home are compared as filesystem
+// objects, not path strings, so a case-variant or symlinked spelling of the
+// home is refused too.
 func refuseRestoreIntoLiveDaemonHome(target string) error {
-	if cfg == nil || target == "" || cfg.Data.DataDir == "" {
-		return nil
-	}
-	targetAbs, err := filepath.Abs(target)
+	configuredHome, err := restoreTargetsConfiguredArchive(target)
 	if err != nil {
-		return fmt.Errorf("backup restore: resolving target %q: %w", target, err)
+		return err
 	}
-	homeAbs, err := filepath.Abs(cfg.Data.DataDir)
-	if err != nil {
-		return fmt.Errorf("backup restore: resolving data dir %q: %w", cfg.Data.DataDir, err)
-	}
-	if targetAbs != homeAbs && !sameExistingPath(targetAbs, homeAbs) {
+	if !configuredHome {
 		return nil
 	}
 	if rt := findAnyDaemonRuntime(cfg.Data.DataDir); rt != nil {
@@ -366,7 +725,103 @@ func refuseRestoreIntoLiveDaemonHome(target string) error {
 			"backup restore: target %s is the live archive home of a running daemon; stop the daemon first (msgvault daemon stop) or restore elsewhere",
 			target)
 	}
+	ownershipHeld, err := daemonOwnerLockHeld(cfg.Data.DataDir)
+	if err != nil {
+		return fmt.Errorf("backup restore: inspect daemon ownership: %w", err)
+	}
+	if ownershipHeld {
+		return fmt.Errorf(
+			"backup restore: target %s is the live archive home of a running daemon; stop the daemon first (msgvault daemon stop) or restore elsewhere",
+			target)
+	}
 	return nil
+}
+
+func restoreTargetsConfiguredArchive(target string) (bool, error) {
+	if cfg == nil || target == "" || cfg.Data.DataDir == "" {
+		return false, nil
+	}
+	dataDirMatch, err := restorePathsEquivalent(target, cfg.Data.DataDir)
+	if err != nil {
+		return false, fmt.Errorf("backup restore: compare target with configured data directory: %w", err)
+	}
+	if dataDirMatch || store.IsPostgresURL(cfg.DatabaseDSN()) {
+		return dataDirMatch, nil
+	}
+	databasePath, err := cfg.DatabasePath()
+	if err != nil {
+		return false, fmt.Errorf("backup restore: resolving configured database: %w", err)
+	}
+	restoredDatabasePath := filepath.Join(target, backupapp.New(Version).DBFileName())
+	databaseMatch, err := restorePathsEquivalent(restoredDatabasePath, databasePath)
+	if err != nil {
+		return false, fmt.Errorf("backup restore: compare target database with configured database: %w", err)
+	}
+	return databaseMatch, nil
+}
+
+func restorePathsEquivalent(a, b string) (bool, error) {
+	aCanonical, bCanonical, err := canonicalRestorePaths(a, b)
+	if err != nil {
+		return false, err
+	}
+	return aCanonical == bCanonical || sameExistingPath(aCanonical, bCanonical), nil
+}
+
+func restorePathsMayBeEquivalent(a, b string) (bool, error) {
+	aCanonical, bCanonical, err := canonicalRestorePaths(a, b)
+	if err != nil {
+		return false, err
+	}
+	return aCanonical == bCanonical ||
+		sameExistingPath(aCanonical, bCanonical) ||
+		strings.EqualFold(aCanonical, bCanonical), nil
+}
+
+func canonicalRestorePaths(a, b string) (string, string, error) {
+	aCanonical, err := canonicalPathThroughExistingAncestor(a)
+	if err != nil {
+		return "", "", fmt.Errorf("resolving %q: %w", a, err)
+	}
+	bCanonical, err := canonicalPathThroughExistingAncestor(b)
+	if err != nil {
+		return "", "", fmt.Errorf("resolving %q: %w", b, err)
+	}
+	return aCanonical, bCanonical, nil
+}
+
+// canonicalPathThroughExistingAncestor resolves symlinks in the deepest
+// existing ancestor of path, then appends the still-missing suffix. Unlike
+// filepath.EvalSymlinks on the complete path, this identifies equivalent
+// future archive locations before restore creates their leaf directories.
+func canonicalPathThroughExistingAncestor(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	existing := abs
+	var missing []string
+	for {
+		if _, err := os.Stat(existing); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(existing)
+		if parent == existing {
+			return "", fmt.Errorf("no existing ancestor for %q", path)
+		}
+		missing = append(missing, filepath.Base(existing))
+		existing = parent
+	}
+	canonical, err := filepath.EvalSymlinks(existing)
+	if err != nil {
+		return "", err
+	}
+	for _, component := range slices.Backward(missing) {
+		canonical = filepath.Join(canonical, component)
+	}
+	return canonical, nil
 }
 
 // sameExistingPath reports whether a and b name the same existing filesystem

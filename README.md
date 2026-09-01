@@ -5,7 +5,7 @@
 <h1 align="center">msgvault</h1>
 
 <p align="center">
-  <a href="https://go.dev"><img src="https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go" alt="Go 1.26+"></a>
+  <a href="https://go.dev"><img src="https://img.shields.io/badge/Go-1.27+-00ADD8?logo=go" alt="Go 1.27+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT"></a>
   <a href="https://msgvault.io"><img src="https://img.shields.io/badge/Docs-msgvault.io-blue" alt="Docs"></a>
   <a href="https://discord.gg/fDnmxB8Wkq"><img src="https://img.shields.io/badge/Discord-Join-5865F2?logo=discord&amp;logoColor=white" alt="Discord"></a>
@@ -19,14 +19,14 @@
 
 > **Alpha software.** APIs, storage format, and CLI flags may change without notice. Back up your data.
 
-Archive a lifetime of email. Analytics and search in milliseconds, entirely offline.
+Archive a lifetime of email, messages, meetings. Analytics and search in milliseconds, entirely offline.
 
 ## Why msgvault?
 
 Your messages are yours. Decades of correspondence, attachments, and history shouldn't be locked behind a web interface or an API. By default, msgvault downloads a complete local copy and then everything runs offline. Search, analytics, and the MCP server all work against your msgvault archive with no mailbox network access required. If you configure a remote deployment, the archive lives on your own server rather than a hosted msgvault service.
 
-Currently supports Gmail, Google Calendar, Microsoft Teams, Discord, Granola,
-Circleback, Beeper Desktop, and IMAP sync, plus offline imports from MBOX
+Currently supports Gmail, Google Calendar, Microsoft Teams, Discord, Slack, CardDAV,
+Granola, Circleback, Beeper Desktop, and IMAP sync, plus offline imports from MBOX
 exports, Apple Mail (`.emlx`) directories, PST archives, and common chat/text
 export formats.
 
@@ -36,9 +36,11 @@ export formats.
 - **Google Calendar sync**: archive events, organizers, and attendees; searchable alongside email
 - **Microsoft Teams sync**: archive delegated Graph chats, channels, replies, and inline media with `message_type = teams`
 - **Discord sync**: archive guild channels, threads, forum posts, and attachments through a read-only bot with `message_type = discord`
+- **Slack sync**: archive joined channels, group DMs, direct messages, threads, reactions, and files with `message_type = slack`
 - **Meeting notes**: sync Granola and Circleback notes and transcripts, then browse them in the TUI
-- **Beeper Desktop sync**: archive chats and media from every network bridged through Beeper's local API
+- **Beeper Desktop sync**: archive chats and media from every network connected to Beeper, including iMessage, through its local API
 - **IMAP sync**: archive mail from any standard IMAP server
+- **CardDAV contacts**: pull address books, explicitly publish curated people, and resolve conflicts without losing remote card data
 - **Incremental backup snapshots**: verifiable `msgvault backup` repositories for the SQLite archive and attachments
 - **MBOX / Apple Mail / PST import**: import email from local export formats
 - **First-party web UI**: dense, keyboard-driven search, grouping, people/domain, file, source, and deletion workspaces served directly by the daemon
@@ -72,7 +74,7 @@ powershell -ExecutionPolicy ByPass -c "irm https://msgvault.io/install.ps1 | iex
 
 The installer detects your OS and architecture, downloads the latest release from [GitHub Releases](https://github.com/kenn-io/msgvault/releases), verifies the SHA-256 checksum, and installs the binary. You can review the script ([bash](https://msgvault.io/install.sh), [PowerShell](https://msgvault.io/install.ps1)) before running, or download a release binary directly from GitHub.
 
-To build from source instead (requires **Go 1.26+**, **Bun 1.3.14+**, and a
+To build from source instead (requires **Go 1.27+**, **Bun 1.3.14+**, and a
 C/C++ compiler for CGO and to statically link DuckDB):
 
 ```bash
@@ -121,6 +123,9 @@ available with `msgvault tui`.
 | `add-teams EMAIL` | Authorize delegated Microsoft Graph access for Teams |
 | `sync-teams EMAIL` | Sync Microsoft Teams chats and channels |
 | `add-discord` / `sync-discord` | Register a read-only bot and sync Discord guild channels and threads |
+| `add-slack` / `sync-slack` | Register and archive a Slack workspace, including threads and media |
+| `add-carddav` / `sync-carddav` | Discover and sync a CardDAV account; passwords are read from stdin, never argv |
+| `carddav` | Manage address-book roles and resolve retained conflicts |
 | `export-messages` | Stream a bounded, provider-neutral archive window as versioned JSONL |
 | `export-discord` | Temporary compatibility export for bounded Discord history |
 | `backfill-discord-media` | Retry incomplete Discord attachment downloads |
@@ -136,7 +141,11 @@ available with `msgvault tui`.
 | `show-message ID` | View full message details (`--json` for machine output) |
 | `mcp` | Start the MCP server for AI assistant integration |
 | `skills install` | Install bundled agent skills for search, attachments, and analytics |
-| `serve` | Run the API/scheduler or manage the background daemon (`start`, `status`, `stop`, `restart`) |
+| `identity` | Manage and discover source-scoped identifiers that mean “me” |
+| `person` | Manage durable person profiles and typed attributes |
+| `attribute-definition` | Manage portable metadata-defined profile fields |
+| `daemon` | Manage the local background daemon (`start`, `status`, `stop`, `restart`) |
+| `serve` | Run the Web UI, API, and scheduler in the foreground |
 | `stats` | Show archive statistics |
 | `list-accounts` | List synced email accounts |
 | `verify EMAIL` | Verify archive integrity against Gmail |
@@ -150,7 +159,9 @@ available with `msgvault tui`.
 | `repair-dates` | Report or repair missing and implausible email sent dates |
 | `list-senders` / `list-domains` / `list-labels` | Explore metadata |
 
-See the [CLI Reference](https://msgvault.io/cli-reference/) for full details.
+See the [CLI Reference](https://msgvault.io/cli-reference/) for full details
+and [People, Profiles, and Source Identities](https://msgvault.io/usage/people/)
+for the identity and profile model.
 
 ## Vector Search
 
@@ -277,6 +288,24 @@ See the [Discord guide](https://msgvault.io/usage/discord/) for bot permissions,
 credential bindings, channel filters, scheduling, consistency limits, and
 media backfill.
 
+### Beeper
+
+Archive every chat network bridged through Beeper Desktop (WhatsApp, Signal,
+Telegram, iMessage, Facebook Messenger, Instagram, Android SMS, Google
+Messages, Google Chat, Google Voice, GroupMe, IRC, LINE, LinkedIn, Matrix,
+Reddit, Tumblr, Twilio, X, Slack, and Discord) via its local read-only
+API — each connected network account becomes its own msgvault source:
+
+```bash
+msgvault add-beeper
+msgvault sync-beeper                # first run backfills, later runs are incremental
+msgvault backfill-beeper-media      # retry pending attachment downloads
+msgvault search "incident review" --message-type beeper
+```
+
+See the [Beeper guide](https://msgvault.io/usage/beeper/) for token setup,
+per-network sources, what gets archived, scheduling, and media backfill.
+
 ### Backup Snapshots
 
 Create an append-only backup repository, take incremental snapshots, and verify
@@ -333,7 +362,17 @@ client_secrets = "/path/to/client_secret.json"
 
 [sync]
 rate_limit_qps = 5
+
+[carddav]
+base_url = "https://contacts.example/dav"
+username = "alice"
+enabled = true
+schedule = "0 */6 * * *"
 ```
+
+Run `msgvault add-carddav <base-url> <username>` instead of placing the
+password in this file. Msgvault validates discovery first, then stores the
+password in an owner-only token file below `~/.msgvault/tokens/`.
 
 See the [Configuration Guide](https://msgvault.io/configuration/) for all options.
 

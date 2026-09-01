@@ -26,9 +26,12 @@ and can be used directly:
 }
 
 var (
-	subsetOutput          string
-	subsetRows            int
-	subsetIncludeIdentity bool
+	subsetOutput                string
+	subsetRows                  int
+	subsetIncludeIdentity       bool
+	subsetIncludeAttributes     bool
+	subsetIncludeProfiles       bool
+	subsetIncludeVCardResources bool
 )
 
 func init() {
@@ -42,9 +45,21 @@ func init() {
 	)
 	createSubsetCmd.Flags().BoolVar(
 		&subsetIncludeIdentity, "include-identity", false,
-		"copy full identity clusters and person profiles for included "+
-			"participants; exposes identifiers (emails, phone numbers) of "+
+		"copy full identity clusters for included participants; exposes "+
+			"identifiers (emails, phone numbers) of "+
 			"linked identities that have no messages in the subset",
+	)
+	createSubsetCmd.Flags().BoolVar(
+		&subsetIncludeAttributes, "include-attributes", false,
+		"copy person and organization attribute definitions and all current/history values; may expose sensitive values and provenance metadata",
+	)
+	createSubsetCmd.Flags().BoolVar(
+		&subsetIncludeProfiles, "include-profiles", false,
+		"copy structured profile values, history, media, contact observations, relationships, employment history with referenced organizations (their profiles, contacts, and media), and provenance; may expose sensitive personal data",
+	)
+	createSubsetCmd.Flags().BoolVar(
+		&subsetIncludeVCardResources, "include-vcard-resources", false,
+		"copy included people's complete native vCard bodies and retired-UID aliases; requires --include-profiles; a body is opaque and may carry custom properties and RELATED entries naming people outside the subset",
 	)
 	_ = createSubsetCmd.MarkFlagRequired("output")
 	_ = createSubsetCmd.MarkFlagRequired("rows")
@@ -58,6 +73,10 @@ func runCreateSubset(cmd *cobra.Command, args []string) error {
 
 	if subsetRows <= 0 {
 		return usageErr(cmd, errors.New("--rows must be a positive integer"))
+	}
+	if subsetIncludeVCardResources && !subsetIncludeProfiles {
+		return usageErr(cmd, errors.New(
+			"--include-vcard-resources requires --include-profiles"))
 	}
 
 	srcDBPath := cfg.DatabaseDSN()
@@ -89,8 +108,31 @@ func runCreateSubset(cmd *cobra.Command, args []string) error {
 	fmt.Fprintf(os.Stderr,
 		"Copying %d messages from %s...\n", subsetRows, srcDBPath,
 	)
+	if subsetIncludeAttributes {
+		fmt.Fprintln(os.Stderr,
+			"WARNING: --include-attributes copies every included person's and referenced organization's current and historical attribute values, including sensitive content, provenance references, and actor metadata.")
+	}
+	if subsetIncludeProfiles {
+		fmt.Fprintln(os.Stderr,
+			"WARNING: --include-profiles copies every included person's current and historical structured profile values, media, contact observations, relationships, and provenance metadata, plus their employment history and the referenced organizations' profiles, contacts, and media.")
+	}
+	if subsetIncludeVCardResources {
+		warning := "WARNING: --include-vcard-resources copies every included person's complete native vCard bodies and retired-UID aliases. A body is copied whole and stays opaque, so it may carry custom properties and RELATED entries naming people outside the subset."
+		if subsetIncludeAttributes {
+			warning += " Complete merge packets are also copied when their dependency closure is present; packets retain immutable merge-time values even after later redaction."
+		} else {
+			warning += " Merge packets require --include-attributes and will be reported as omitted."
+		}
+		fmt.Fprintln(os.Stderr, warning)
+	}
 
-	result, err := store.CopySubset(srcDBPath, dstDir, subsetRows, subsetIncludeIdentity)
+	result, err := store.CopySubsetWithOptions(srcDBPath, dstDir, subsetRows,
+		store.CopySubsetOptions{
+			IncludeIdentity:       subsetIncludeIdentity,
+			IncludeAttributes:     subsetIncludeAttributes,
+			IncludeProfiles:       subsetIncludeProfiles,
+			IncludeVCardResources: subsetIncludeVCardResources,
+		})
 	if err != nil {
 		return fmt.Errorf("create subset: %w", err)
 	}
@@ -103,6 +145,14 @@ func runCreateSubset(cmd *cobra.Command, args []string) error {
 	fmt.Printf("Conversations: %d\n", result.Conversations)
 	fmt.Printf("Participants:  %d\n", result.Participants)
 	fmt.Printf("Labels:        %d\n", result.Labels)
+	if subsetIncludeProfiles {
+		fmt.Printf("Organizations: %d\n", result.Organizations)
+		fmt.Printf("Employments:   %d\n", result.Employments)
+	}
+	if result.PersonMergePackets > 0 || result.OmittedPersonMergePackets > 0 {
+		fmt.Printf("Merge packets: %d copied, %d omitted\n",
+			result.PersonMergePackets, result.OmittedPersonMergePackets)
+	}
 	fmt.Printf("Database size: %s\n", formatSize(result.DBSize))
 
 	if int64(subsetRows) > result.Messages {

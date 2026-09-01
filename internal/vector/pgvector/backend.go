@@ -11,6 +11,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
 	"time"
@@ -24,6 +25,8 @@ import (
 var _ vector.Backend = (*Backend)(nil)
 var _ vector.ChunkScoringBackend = (*Backend)(nil)
 var _ vector.FilteredCoverageBackend = (*Backend)(nil)
+var _ vector.ConvergedGenerationActivator = (*Backend)(nil)
+var _ vector.OrphanEmbeddingPruner = (*Backend)(nil)
 
 // annOverFetchFactor multiplies k for the inner ANN scan so that after
 // GROUP BY dedup across multi-chunk messages, at least k distinct
@@ -93,7 +96,7 @@ func Open(ctx context.Context, opts Options) (*Backend, error) {
 	}
 	b := &Backend{
 		db:    opts.DB,
-		scope: vector.NewBuildScope(opts.BuildScope.MessageTypes),
+		scope: vector.NewBuildScope(opts.BuildScope.MessageTypes, opts.BuildScope.SourceIDs),
 	}
 	if !opts.SkipMigrate {
 		// serve / build / search: full migrate incl. CREATE EXTENSION (the
@@ -169,6 +172,9 @@ func (b *Backend) DB() *sql.DB { return b.db }
 // vector.ErrBuildingInProgress.
 func (b *Backend) CreateGeneration(ctx context.Context, model string, dim int, fingerprint string) (vector.GenerationID, error) {
 	if err := EnsureVectorIndex(ctx, b.db, dim); err != nil {
+		return 0, err
+	}
+	if err := EnsurePersonVectorIndex(ctx, b.db, dim); err != nil {
 		return 0, err
 	}
 	fp := fingerprint
@@ -262,21 +268,61 @@ func isUniqueViolation(err error) bool {
 // ActivateGeneration (in-tx, single-DB on PG) and Stats. The $N ordinal
 // of the generation id is supplied by the caller.
 func (b *Backend) missingForGenExistsClause(genArg string, firstScopeArg int) (string, []any) {
+	where, args := b.missingForGenWhere(genArg, firstScopeArg)
+	return fmt.Sprintf(`EXISTS (
+		SELECT 1 FROM messages
+		 WHERE %s
+	)`, where), args
+}
+
+// missingForGenWhere is the scope-aware predicate for messages that still
+// need embedding for a generation. Keep Stats and ActivateGeneration on this
+// shared predicate so source-scoped generations never report the full corpus
+// as pending.
+func (b *Backend) missingForGenWhere(genArg string, firstScopeArg int) (string, []any) {
+	where, args := b.liveScopeWhere(firstScopeArg)
+	return fmt.Sprintf("(embed_gen IS NULL OR embed_gen <> %s) AND %s", genArg, where), args
+}
+
+// liveScopeWhere is the predicate for live messages inside the backend's
+// build scope — the generation's embedding universe. Shared by the
+// coverage gate (missingForGenWhere) and the empty-scope activation guard
+// so both always agree on what "in scope" means. Scope placeholders are
+// numbered from firstScopeArg.
+func (b *Backend) liveScopeWhere(firstScopeArg int) (string, []any) {
 	where := store.LiveMessagesWhere("", true)
-	args := make([]any, 0, len(b.scope.MessageTypes))
-	if !b.scope.IsEmpty() {
+	args := make([]any, 0, len(b.scope.MessageTypes)+len(b.scope.SourceIDs))
+	nextArg := firstScopeArg
+	if len(b.scope.MessageTypes) > 0 {
 		placeholders := make([]string, len(b.scope.MessageTypes))
 		for i, typ := range b.scope.MessageTypes {
-			placeholders[i] = "$" + strconv.Itoa(firstScopeArg+i)
+			placeholders[i] = "$" + strconv.Itoa(nextArg)
+			nextArg++
 			args = append(args, typ)
 		}
 		where += fmt.Sprintf(" AND message_type IN (%s)", strings.Join(placeholders, ","))
 	}
+	if len(b.scope.SourceIDs) > 0 {
+		placeholders := make([]string, len(b.scope.SourceIDs))
+		for i, id := range b.scope.SourceIDs {
+			placeholders[i] = "$" + strconv.Itoa(nextArg)
+			nextArg++
+			args = append(args, id)
+		}
+		where += fmt.Sprintf(" AND source_id IN (%s)", strings.Join(placeholders, ","))
+	}
+	return where, args
+}
+
+// liveInScopeExistsClause is the empty-scope activation guard predicate:
+// true when at least one live message falls inside the backend's build
+// scope. Scope placeholders are numbered from firstScopeArg.
+func (b *Backend) liveInScopeExistsClause(firstScopeArg int) (string, []any) {
+	where, args := b.liveScopeWhere(firstScopeArg)
 	return fmt.Sprintf(`EXISTS (
 		SELECT 1 FROM messages
-		 WHERE (embed_gen IS NULL OR embed_gen <> %s)
-		   AND %s
-	)`, genArg, where), args
+		 WHERE %s
+	)`, where), args
 }
 
 // ActivateGeneration atomically retires the current active generation
@@ -292,6 +338,18 @@ func (b *Backend) missingForGenExistsClause(genArg string, firstScopeArg int) (s
 // generation-clean. This intentionally differs from sqlitevec, whose
 // vec0 PARTITION KEY isolates retired rows so it can retain them.
 func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationID, force bool) error {
+	return b.activateGeneration(ctx, gen, force, nil)
+}
+
+func (b *Backend) ActivateGenerationIfConverged(
+	ctx context.Context, gen vector.GenerationID, expectedSequence int64,
+) error {
+	return b.activateGeneration(ctx, gen, false, &expectedSequence)
+}
+
+func (b *Backend) activateGeneration(
+	ctx context.Context, gen vector.GenerationID, force bool, expectedSequence *int64,
+) error {
 	now := time.Now().Unix()
 	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -308,6 +366,59 @@ func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationI
 	// the first statement in the tx to cover every subsequent DELETE.
 	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = 0"); err != nil {
 		return fmt.Errorf("disable statement_timeout for activate: %w", err)
+	}
+	if expectedSequence != nil {
+		// Every source-mutation statement takes the shared form of this advisory
+		// lock before it can lock rows. The exclusive form makes the journal clock
+		// and source snapshot a stable activation boundary without serializing
+		// ordinary writers with each other.
+		if _, err := tx.ExecContext(ctx,
+			`SELECT pg_advisory_xact_lock(
+			     hashtextextended('msgvault.embedding_change_clock', 0))`); err != nil {
+			return fmt.Errorf("lock contextual source mutations for activation: %w", err)
+		}
+		var latest int64
+		if err := tx.QueryRowContext(ctx,
+			`SELECT sequence FROM embedding_change_clock WHERE singleton = 1 FOR UPDATE`).Scan(&latest); err != nil {
+			return fmt.Errorf("lock contextual journal clock for activation: %w", err)
+		}
+		var consumed int64
+		var reconcileCursor, journalCursor string
+		if err := tx.QueryRowContext(ctx, `
+			SELECT change_sequence, reconcile_cursor, journal_cursor
+			  FROM embedding_document_progress
+			 WHERE generation_id = $1
+			 FOR UPDATE`, int64(gen)).Scan(&consumed, &reconcileCursor, &journalCursor); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return fmt.Errorf("%w: generation %d has no contextual progress", vector.ErrGenerationNotConverged, gen)
+			}
+			return fmt.Errorf("read contextual progress for activation: %w", err)
+		}
+		if latest != *expectedSequence || consumed != *expectedSequence ||
+			!strings.HasPrefix(reconcileCursor, "done:") || journalCursor != "" {
+			return fmt.Errorf("%w: expected journal %d, latest %d, consumed %d, reconcile %q, journal cursor %q",
+				vector.ErrGenerationNotConverged, *expectedSequence, latest, consumed, reconcileCursor, journalCursor)
+		}
+	}
+
+	// Deterministic empty-scope gate BEFORE the demote: the demote path
+	// below deletes the previous active generation's embeddings, which is
+	// corpus-sized. The rollback keeps the data safe, but the scheduler
+	// retries activation every tick (an empty scope trivially satisfies
+	// its missing==0 gate), so checking after the DELETE would turn each
+	// retry into a corpus-sized DELETE + rollback of lock and WAL churn.
+	// The gated promote below re-asserts the same predicate atomically to
+	// cover a message vanishing between this read and the flip.
+	if !force && len(b.scope.SourceIDs) > 0 {
+		var live bool
+		liveClause, liveArgs := b.liveInScopeExistsClause(1)
+		if err := tx.QueryRowContext(ctx,
+			`SELECT `+liveClause, liveArgs...).Scan(&live); err != nil {
+			return fmt.Errorf("check live messages in build scope for generation %d: %w", gen, err)
+		}
+		if !live {
+			return refuseActivateEmptyScopeError(gen)
+		}
 	}
 
 	// Demote the current active generation and capture its id in a single
@@ -330,6 +441,10 @@ func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationI
 			`DELETE FROM embeddings WHERE generation_id = $1`, demoted.Int64); err != nil {
 			return fmt.Errorf("delete retired generation %d embeddings: %w", demoted.Int64, err)
 		}
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM person_embeddings WHERE generation_id = $1`, demoted.Int64); err != nil {
+			return fmt.Errorf("delete retired generation %d person embeddings: %w", demoted.Int64, err)
+		}
 	}
 	// The promote re-checks the coverage gate IN the same tx as the flip
 	// (unless force): refuse to activate while any live message still needs
@@ -342,12 +457,20 @@ func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationI
 	// (missing==0) is the real gate.
 	missingClause, missingArgs := b.missingForGenExistsClause("$3", 5)
 	args := append([]any{now, now, int64(gen), force}, missingArgs...)
-	res, err := tx.ExecContext(ctx,
-		`UPDATE index_generations
+	promote := `UPDATE index_generations
 		    SET state = 'active', activated_at = $1, completed_at = COALESCE(completed_at, $2)
 		  WHERE id = $3 AND state = 'building'
-		    AND ($4 OR NOT `+missingClause+`)`,
-		args...)
+		    AND ($4 OR NOT ` + missingClause + `)`
+	// Empty-scope guard: a source scope matching no live messages trivially
+	// satisfies the no-missing gate, so the promote additionally requires at
+	// least one live in-scope message (unless force). Folded into the gated
+	// UPDATE so it is atomic with the state flip, like the coverage gate.
+	if len(b.scope.SourceIDs) > 0 {
+		liveClause, liveArgs := b.liveInScopeExistsClause(5 + len(missingArgs))
+		promote += ` AND ($4 OR ` + liveClause + `)`
+		args = append(args, liveArgs...)
+	}
+	res, err := tx.ExecContext(ctx, promote, args...)
 	if err != nil {
 		return fmt.Errorf("activate: %w", err)
 	}
@@ -358,6 +481,7 @@ func (b *Backend) ActivateGeneration(ctx context.Context, gen vector.GenerationI
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit activate generation %d: %w", gen, err)
 	}
+	b.cleanupDocumentJournalAfterLifecycle(ctx, "activate generation")
 	return nil
 }
 
@@ -391,11 +515,29 @@ func (b *Backend) activateGateError(ctx context.Context, tx *sql.Tx, gen vector.
 	if missing && !force {
 		return fmt.Errorf("generation %d still has messages needing embedding; run `msgvault embeddings resume` or pass --force", gen)
 	}
+	if !force && len(b.scope.SourceIDs) > 0 {
+		var live bool
+		liveClause, liveArgs := b.liveInScopeExistsClause(1)
+		if err := tx.QueryRowContext(ctx,
+			`SELECT `+liveClause, liveArgs...).Scan(&live); err != nil {
+			return fmt.Errorf("check live messages in build scope for generation %d: %w", gen, err)
+		}
+		if !live {
+			return refuseActivateEmptyScopeError(gen)
+		}
+	}
 	// Gen reads as building with full coverage yet the gated UPDATE still
 	// matched no rows: a concurrent transaction must have flipped its state
 	// between the promote and this re-read. Surface it rather than reporting a
 	// phantom gate.
 	return fmt.Errorf("activate generation %d: gated promote affected no rows (state=%q)", gen, state)
+}
+
+// refuseActivateEmptyScopeError is the shared refusal for a source scope
+// matching no live messages, returned by both the pre-demote gate and the
+// gated-promote fallback so the two report identically.
+func refuseActivateEmptyScopeError(gen vector.GenerationID) error {
+	return fmt.Errorf("generation %d: %w; sync the scoped account(s) or fix [vector.embed.scope], or pass --force", gen, vector.ErrRefuseActivateEmptyScope)
 }
 
 // RetireGeneration marks the given generation as retired and DELETEs its
@@ -453,11 +595,27 @@ func (b *Backend) RetireGeneration(ctx context.Context, gen vector.GenerationID,
 		`DELETE FROM embeddings WHERE generation_id = $1`, int64(gen)); err != nil {
 		return fmt.Errorf("delete retired generation %d embeddings: %w", gen, err)
 	}
+	if _, err := tx.ExecContext(ctx,
+		`DELETE FROM person_embeddings WHERE generation_id = $1`, int64(gen)); err != nil {
+		return fmt.Errorf("delete retired generation %d person embeddings: %w", gen, err)
+	}
 	// Scan-and-fill has no per-generation queue to reap.
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit retire generation %d: %w", gen, err)
 	}
+	b.cleanupDocumentJournalAfterLifecycle(ctx, "retire generation")
 	return nil
+}
+
+// cleanupDocumentJournalAfterLifecycle runs after a lifecycle transaction has
+// committed. Cleanup is safe to retry through CleanupDocumentJournalIfUnused,
+// so a cleanup failure must not make callers believe the committed lifecycle
+// transition failed.
+func (b *Backend) cleanupDocumentJournalAfterLifecycle(ctx context.Context, operation string) {
+	if err := b.CleanupDocumentJournalIfUnused(ctx); err != nil {
+		slog.Warn("contextual journal cleanup deferred after committed lifecycle transition",
+			"operation", operation, "error", err)
+	}
 }
 
 // retireGateError re-reads gen inside the retire tx to explain why the gated
@@ -604,8 +762,8 @@ func (b *Backend) Upsert(ctx context.Context, gen vector.GenerationID, chunks []
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO embeddings
 		  (generation_id, message_id, chunk_index, embedded_at, source_char_len,
-		   chunk_char_start, chunk_char_end, truncated, dimension, embedding)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::vector)`)
+		   chunk_char_start, chunk_char_end, truncated, dimension, embedding, source_basis)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::vector, $11)`)
 	if err != nil {
 		return fmt.Errorf("prepare embeddings insert: %w", err)
 	}
@@ -615,7 +773,7 @@ func (b *Backend) Upsert(ctx context.Context, gen vector.GenerationID, chunks []
 		if _, err := stmt.ExecContext(ctx,
 			int64(gen), c.MessageID, c.ChunkIndex, now, c.SourceCharLen,
 			c.ChunkCharStart, c.ChunkCharEnd, c.Truncated, dim,
-			vectorLiteral(c.Vector),
+			vectorLiteral(c.Vector), int(c.SourceBasis),
 		); err != nil {
 			return fmt.Errorf("insert embedding for msg %d chunk %d: %w", c.MessageID, c.ChunkIndex, err)
 		}
@@ -834,6 +992,9 @@ func (b *Backend) ResetWatermarkBelow(ctx context.Context, minID int64) error {
 // hits are emitted with Score = 1 - distance to align with the
 // sqlitevec convention.
 func (b *Backend) Search(ctx context.Context, gen vector.GenerationID, queryVec []float32, k int, filter vector.Filter) ([]vector.Hit, error) {
+	if err := vector.ValidateFilter(filter); err != nil {
+		return nil, err
+	}
 	if len(queryVec) == 0 {
 		return nil, errors.New("search: empty query vector")
 	}
@@ -1167,6 +1328,76 @@ func (b *Backend) Delete(ctx context.Context, gen vector.GenerationID, messageID
 	return nil
 }
 
+// PruneOrphanEmbeddings removes message embeddings whose authoritative
+// message row has been hard-deleted. Generation row locks serialize pruning
+// with the backend's other embedding writers, so embeddings and message_count
+// are repaired atomically without racing an upsert or retirement.
+func (b *Backend) PruneOrphanEmbeddings(ctx context.Context) (int64, error) {
+	tx, err := b.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin orphan prune: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	// The count, delete, and count repair below are corpus-wide maintenance.
+	// Disable the pool's 30-second statement timeout for this transaction so
+	// a large accumulated orphan set can complete. SET LOCAL resets when the
+	// transaction commits or rolls back.
+	if _, err := tx.ExecContext(ctx, "SET LOCAL statement_timeout = 0"); err != nil {
+		return 0, fmt.Errorf("disable statement_timeout for orphan prune: %w", err)
+	}
+
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id FROM index_generations ORDER BY id FOR UPDATE`)
+	if err != nil {
+		return 0, fmt.Errorf("lock generations for orphan prune: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var generationID int64
+		if err := rows.Scan(&generationID); err != nil {
+			_ = rows.Close()
+			return 0, fmt.Errorf("scan locked generation: %w", err)
+		}
+	}
+	if err := rows.Close(); err != nil {
+		return 0, fmt.Errorf("close locked generations: %w", err)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate locked generations: %w", err)
+	}
+
+	var pruned int64
+	if err := tx.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM (
+			SELECT e.generation_id, e.message_id
+			  FROM embeddings e
+			 WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = e.message_id)
+			 GROUP BY e.generation_id, e.message_id
+		) orphan_embeddings`).Scan(&pruned); err != nil {
+		return 0, fmt.Errorf("count orphan embeddings: %w", err)
+	}
+	if pruned > 0 {
+		if _, err := tx.ExecContext(ctx, `
+			DELETE FROM embeddings e
+			 WHERE NOT EXISTS (SELECT 1 FROM messages m WHERE m.id = e.message_id)`); err != nil {
+			return 0, fmt.Errorf("delete orphan embeddings: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `
+			UPDATE index_generations g
+			   SET message_count = (
+				SELECT COUNT(DISTINCT e.message_id)
+				  FROM embeddings e
+				 WHERE e.generation_id = g.id
+			   )`); err != nil {
+			return 0, fmt.Errorf("repair generation message counts: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit orphan prune: %w", err)
+	}
+	return pruned, nil
+}
+
 // Stats returns counts for the given generation. When gen == 0,
 // counts are aggregated across all generations. StorageBytes is the
 // total size of the embeddings table (pg_total_relation_size) — a
@@ -1208,11 +1439,11 @@ func (b *Backend) Stats(ctx context.Context, gen vector.GenerationID) (vector.St
 	// generation, so it reports 0 — the StatsView consumer sums per-gen
 	// pending across the active/building generations anyway.
 	if gen != 0 {
+		pendingWhere, pendingArgs := b.missingForGenWhere("$1", 2)
+		pendingArgs = append([]any{int64(gen)}, pendingArgs...)
 		if err := b.db.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM messages
-			  WHERE (embed_gen IS NULL OR embed_gen <> $1)
-			    AND `+store.LiveMessagesWhere("", true),
-			int64(gen)).Scan(&s.PendingCount); err != nil {
+			`SELECT COUNT(*) FROM messages WHERE `+pendingWhere,
+			pendingArgs...).Scan(&s.PendingCount); err != nil {
 			return s, fmt.Errorf("count missing: %w", err)
 		}
 	}
@@ -1253,13 +1484,24 @@ func (b *Backend) EmbeddedMessageCount(ctx context.Context, gen vector.Generatio
 		    AND m.embed_gen = $1
 		    AND ` + store.LiveMessagesWhere("m", true)
 	args := []any{int64(gen)}
-	if !b.scope.IsEmpty() {
+	nextArg := 2
+	if len(b.scope.MessageTypes) > 0 {
 		placeholders := make([]string, len(b.scope.MessageTypes))
 		for i, typ := range b.scope.MessageTypes {
-			placeholders[i] = "$" + strconv.Itoa(2+i)
+			placeholders[i] = "$" + strconv.Itoa(nextArg)
+			nextArg++
 			args = append(args, typ)
 		}
 		where += fmt.Sprintf(" AND m.message_type IN (%s)", strings.Join(placeholders, ","))
+	}
+	if len(b.scope.SourceIDs) > 0 {
+		placeholders := make([]string, len(b.scope.SourceIDs))
+		for i, id := range b.scope.SourceIDs {
+			placeholders[i] = "$" + strconv.Itoa(nextArg)
+			nextArg++
+			args = append(args, id)
+		}
+		where += fmt.Sprintf(" AND m.source_id IN (%s)", strings.Join(placeholders, ","))
 	}
 	var n int64
 	if err := b.db.QueryRowContext(ctx,
@@ -1317,7 +1559,7 @@ func (b *Backend) ScoreMessageChunks(ctx context.Context, gen vector.GenerationI
 	}
 
 	stmt := fmt.Sprintf(`
-		SELECT chunk_index, chunk_char_start, chunk_char_end,
+		SELECT chunk_index, chunk_char_start, chunk_char_end, source_basis,
 		       (embedding::vector(%d)) <=> $3::vector AS distance
 		  FROM embeddings
 		 WHERE generation_id = $1 AND message_id = $2
@@ -1332,14 +1574,16 @@ func (b *Backend) ScoreMessageChunks(ctx context.Context, gen vector.GenerationI
 	var hits []vector.ChunkHit
 	for rows.Next() {
 		var idx, start, end int
+		var basis vector.SourceBasis
 		var dist float64
-		if err := rows.Scan(&idx, &start, &end, &dist); err != nil {
+		if err := rows.Scan(&idx, &start, &end, &basis, &dist); err != nil {
 			return nil, fmt.Errorf("scan chunk row: %w", err)
 		}
 		hits = append(hits, vector.ChunkHit{
 			ChunkIndex:     idx,
 			ChunkCharStart: start,
 			ChunkCharEnd:   end,
+			SourceBasis:    basis,
 			Score:          1.0 - dist,
 		})
 	}

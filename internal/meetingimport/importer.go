@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"go.kenn.io/msgvault/internal/meetingidentity"
@@ -34,12 +35,23 @@ type Hooks struct {
 }
 
 type Importer struct {
-	store *store.Store
-	hooks Hooks
+	store  *store.Store
+	hooks  Hooks
+	logger *slog.Logger
+
+	beforeCheckpointForTest func()
 }
 
 func NewImporter(s *store.Store, hooks Hooks) *Importer {
-	return &Importer{store: s, hooks: hooks}
+	return &Importer{store: s, hooks: hooks, logger: slog.Default()}
+}
+
+// WithLogger sets the logger used for best-effort post-import work.
+func (i *Importer) WithLogger(logger *slog.Logger) *Importer {
+	if logger != nil {
+		i.logger = logger
+	}
+	return i
 }
 
 func (i *Importer) Import(ctx context.Context, req Request) (result Result, retErr error) {
@@ -94,6 +106,9 @@ func (i *Importer) Import(ctx context.Context, req Request) (result Result, retE
 	if err != nil {
 		return result, fmt.Errorf("start meeting import sync: %w", err)
 	}
+	scoped := *i
+	scoped.store = i.store.ScopedToSync(source.ID, syncID)
+	i = &scoped
 	checkpoint := &store.Checkpoint{}
 	defer func() {
 		if retErr == nil {
@@ -134,6 +149,9 @@ func (i *Importer) Import(ctx context.Context, req Request) (result Result, retE
 					return result, err
 				}
 				checkpoint.MessagesProcessed = 1
+				if i.beforeCheckpointForTest != nil {
+					i.beforeCheckpointForTest()
+				}
 				if err := i.store.UpdateSyncCheckpointContext(ctx, syncID, checkpoint); err != nil {
 					return result, fmt.Errorf("checkpoint meeting import sync: %w", err)
 				}
@@ -143,12 +161,8 @@ func (i *Importer) Import(ctx context.Context, req Request) (result Result, retE
 				if err := i.store.CompleteSyncContext(ctx, syncID, ""); err != nil {
 					return result, fmt.Errorf("complete meeting import sync: %w", err)
 				}
-				if i.hooks.RefreshCache != nil {
-					cacheLabel := SourceType + ":" + snapshot.SourceIdentifier
-					if err := i.hooks.RefreshCache(ctx, cacheLabel); err != nil {
-						return result, fmt.Errorf("refresh meeting analytics cache: %w", err)
-					}
-				}
+				i.refreshCache(ctx, SourceType+":"+snapshot.SourceIdentifier,
+					source.ID, snapshot.SourceMessageID)
 				return result, nil
 			}
 		}
@@ -268,6 +282,9 @@ func (i *Importer) Import(ctx context.Context, req Request) (result Result, retE
 		checkpoint.MessagesUpdated = 1
 	}
 
+	if i.beforeCheckpointForTest != nil {
+		i.beforeCheckpointForTest()
+	}
 	if err := i.store.UpdateSyncCheckpointContext(ctx, syncID, checkpoint); err != nil {
 		return result, fmt.Errorf("checkpoint meeting import sync: %w", err)
 	}
@@ -277,13 +294,31 @@ func (i *Importer) Import(ctx context.Context, req Request) (result Result, retE
 	if err := i.store.CompleteSyncContext(ctx, syncID, ""); err != nil {
 		return result, fmt.Errorf("complete meeting import sync: %w", err)
 	}
-	if i.hooks.RefreshCache != nil {
-		cacheLabel := SourceType + ":" + snapshot.SourceIdentifier
-		if err := i.hooks.RefreshCache(ctx, cacheLabel); err != nil {
-			return result, fmt.Errorf("refresh meeting analytics cache: %w", err)
-		}
-	}
+	i.refreshCache(ctx, SourceType+":"+snapshot.SourceIdentifier,
+		source.ID, snapshot.SourceMessageID)
 	return result, nil
+}
+
+func (i *Importer) refreshCache(ctx context.Context, label string, sourceID int64, sourceMessageID string) {
+	if i.hooks.RefreshCache == nil {
+		return
+	}
+	// The import has completed successfully before this best-effort hook runs.
+	if err := i.hooks.RefreshCache(ctx, label); err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
+		logger := i.logger
+		if logger == nil {
+			logger = slog.Default()
+		}
+		logger.Error("meeting analytics cache refresh failed",
+			"source", label,
+			"source_id", sourceID,
+			"source_message_id", sourceMessageID,
+			"error", err,
+		)
+	}
 }
 
 func emailDomain(email string) string {

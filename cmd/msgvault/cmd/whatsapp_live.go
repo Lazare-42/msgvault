@@ -14,7 +14,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/mark3labs/mcp-go/server"
 	"github.com/skip2/go-qrcode"
 	"github.com/spf13/cobra"
 	mcpserver "go.kenn.io/msgvault/internal/mcp"
@@ -184,10 +183,7 @@ func init() {
 }
 
 func serveWhatsAppLiveHTTP(ctx context.Context, addr string, st *store.Store, service *whatsapplive.Service, transport *whatsapplive.WhatsmeowTransport, opts mcpserver.ServeOptions, pairingToken string, basePath string, apiToken string) error {
-	mcpHandler := server.NewStreamableHTTPServer(
-		mcpserver.BuildMCPServer(opts),
-		server.WithHeartbeatInterval(30*time.Second),
-	)
+	mcpHandler := mcpserver.NewStreamableHTTPHandler(opts, true)
 	pairing := &whatsappPairingHandler{
 		ctx:          ctx,
 		service:      service,

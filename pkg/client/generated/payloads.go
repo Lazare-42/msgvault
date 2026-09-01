@@ -6,9 +6,23 @@ type LoginSessionBody = SessionLoginRequest
 
 type AddAccountBody = AddAccountRequest
 
+type CreateAttributeDefinitionBody = CreateAttributeDefinitionRequest
+
+type PatchAttributeDefinitionBody = PatchAttributeDefinitionRequest
+
 type UploadTokenBody = TokenUploadRequest
 
 type EndBackupFreezeBody = BackupFreezeEndRequest
+
+type SaveCardDAVAccountBody = CardDAVAccountRequest
+
+type TestCardDAVAccountBody = CardDAVAccountRequest
+
+type UpdateCardDAVBookRolesBody = CardDAVBookRolesRequest
+
+type ResolveCardDAVConflictBody = CardDAVResolveRequest
+
+type SyncCardDAVBody = CardDAVSyncRequest
 
 type UpdateCLIAccountBody = UpdateRequest
 
@@ -36,9 +50,17 @@ type RemoveCLIIdentityBody = RemoveRequest
 
 type AddCLIIdentityBody = AddRequest
 
+type DiscoverCLIIdentitiesBody = DiscoverRequest
+
+type ImportCLIIdentitiesBody = ImportRequest
+
 type RunCLIBody = CLIRunRequest
 
+type CreateCommunicationServiceBody = CreateCommunicationServiceRequest
+
 type GetRemoteImageBody = RemoteImageRequest
+
+type CreateDayEntryBody = CreateDailyNoteEntryRequest
 
 type StageDeletionBody = StageDeletionRequest
 
@@ -49,6 +71,10 @@ type SearchDomainFilesBody = FileSearchHTTPRequest
 type GetDomainContextSummaryBody = ExploreHTTPRequest
 
 type GetDomainTimelineBody = ExploreHTTPRequest
+
+type CreateEmploymentBody = EmploymentBody
+
+type PatchEmploymentBody = EmploymentBody
 
 type ExploreBody = ExploreHTTPRequest
 
@@ -68,33 +94,83 @@ type SearchAttachmentTextBody = OcrSearchRequest
 
 type LinkIdentityParticipantsBody = IdentityLinkRequest
 
+type AcceptIdentityMatchCandidateBody = DecideIdentityMatchRequest
+
+type RejectIdentityMatchCandidateBody = DecideIdentityMatchRequest
+
 type UnlinkIdentityParticipantsBody = IdentityLinkRequest
 
 type ImportMeetingBody = MeetingImportRequest
 
 type CreateOrLinkMessageTaskBody = TaskLinkMutationRequest
 
-type SearchPeopleBody = IdentitySearchHTTPRequest
+type StartVisualAttachmentBuildBody = VisualBuildRequest
 
-type SearchPersonFilesBody = FileSearchHTTPRequest
+type RetireVisualAttachmentGenerationBody = VisualRetireRequest
 
-type GetPersonContextSummaryBody = ExploreHTTPRequest
+type RetryVisualAttachmentOwnerBody = VisualRetryRequest
 
-type GetPersonTimelineBody = ExploreHTTPRequest
+type CreateOrganizationBody = OrganizationCreateBody
+
+type PatchOrganizationBody = OrganizationBody
+
+type PutOrganizationProfileBody = OrganizationProfileBody
+
+type CompleteParticipantsBody = ParticipantCompletionHTTPRequest
+
+type SearchParticipantsBody = IdentitySearchHTTPRequest
+
+type SearchParticipantFilesBody = PersonFileSearchHTTPRequest
+
+type GetParticipantContextSummaryBody = ExploreHTTPRequest
+
+type GetParticipantTimelineBody = ExploreHTTPRequest
 
 type CreatePersonBody = CreatePersonRequest
 
+type SearchPeopleBody = PersonSearchRequest
+
 type PatchPersonBody = PatchPersonRequest
+
+type SetPersonAttributeBody = SetPersonAttributeRequest
+
+type SetPersonFactPinBody = SetPersonFactPinRequest
+
+type SearchPersonFilesBody = PersonFileSearchHTTPRequest
+
+type MergePersonsBody = MergePersonRequest
+
+type AppendPersonNoteBody = AppendPersonNoteRequest
+
+type PatchPersonStructuredProfileBody = PersonProfilePatchRequest
+
+type SplitPersonMergeBody = SplitPersonRequest
+
+type SetPersonTrackingBody = PutPersonTrackingRequest
+
+type DecidePersonMergeCandidateBody = DecidePersonMergeCandidateRequest
+
+type CreatePersonRelationshipBody = CreatePersonRelationshipRequest
+
+type PatchPersonRelationshipBody = PatchPersonRelationshipRequest
 
 type RunQueryBody = QueryRequest
 
+type CreateRelationshipTypeBody = CreateRelationshipTypeRequest
+
+type PatchRelationshipTypeBody = PatchRelationshipTypeRequest
+
 type ListRelationshipsBody = RelationshipsHTTPRequest
+
+type GetRelationshipCalendarBody = RelationshipCalendarHTTPRequest
 
 type GetRelationshipTimelineBody = RelationshipTimelineHTTPRequest
 
 type CreateSavedViewBody = CreateSavedViewRequest
 
 type PatchSavedViewBody = PatchSavedViewRequest
+
+type SearchVisualAttachmentsBody = VisualTextSearchRequest
 
 type GetSearchCoverageBody = SearchCoverageRequest
 

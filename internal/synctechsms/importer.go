@@ -1,6 +1,7 @@
 package synctechsms
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -40,19 +41,28 @@ func (i *Importer) ImportPath(path string) (ImportSummary, error) {
 	if err != nil {
 		return ImportSummary{}, fmt.Errorf("start sync: %w", err)
 	}
+	scoped := *i
+	scoped.store = i.store.ScopedToSync(src.ID, syncID)
+	i = &scoped
 	summary, importErr := i.ImportPathIntoSource(src.ID, path)
 	if importErr != nil {
 		_ = i.store.FailSync(syncID, importErr.Error())
 		return summary, importErr
 	}
 	total := int64(summary.SMSImported + summary.MMSImported + summary.CallsImported)
-	_ = i.store.UpdateSyncCheckpoint(syncID, &store.Checkpoint{
+	if err := i.store.UpdateSyncCheckpoint(syncID, &store.Checkpoint{
 		MessagesProcessed: total,
 		MessagesAdded:     total,
-	})
-	_ = i.store.CompleteSync(syncID, "")
+	}); err != nil {
+		_ = i.store.FailSync(syncID, err.Error())
+		return summary, fmt.Errorf("update sync checkpoint: %w", err)
+	}
 	if err := i.store.RecomputeConversationStats(src.ID); err != nil {
+		_ = i.store.FailSync(syncID, err.Error())
 		return summary, fmt.Errorf("recompute conversation stats: %w", err)
+	}
+	if err := i.store.CompleteSync(syncID, ""); err != nil {
+		return summary, fmt.Errorf("complete sync: %w", err)
 	}
 	return summary, nil
 }
@@ -463,7 +473,16 @@ func (i *Importer) importMMSAttachments(sourceID int64, sourceMessageID string, 
 		if err != nil {
 			return count, fmt.Errorf("store MMS attachment: %w", err)
 		}
-		if err := i.store.UpsertAttachment(messageID, filename, part.ContentType, storagePath, att.ContentHash, len(part.Data)); err != nil {
+		if err := i.store.UpsertAttachmentRecord(context.Background(), messageID, store.AttachmentWrite{
+			Filename:      filename,
+			MIMEType:      part.ContentType,
+			StoragePath:   storagePath,
+			ContentHash:   att.ContentHash,
+			Size:          int64(len(part.Data)),
+			Role:          store.AttachmentRoleStandalone,
+			RoleSource:    store.AttachmentRoleSourceImporterSemantics,
+			SourcePartKey: fmt.Sprintf("synctech:mms:%d", idx),
+		}); err != nil {
 			return count, fmt.Errorf("upsert attachment: %w", err)
 		}
 		count++

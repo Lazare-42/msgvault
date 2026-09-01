@@ -16,6 +16,8 @@ import (
 	"go.kenn.io/msgvault/internal/googledocs"
 	mcpserver "go.kenn.io/msgvault/internal/mcp"
 	"go.kenn.io/msgvault/internal/oauth"
+	"go.kenn.io/msgvault/internal/vector/visual"
+	"go.kenn.io/msgvault/pkg/client/generated"
 	"google.golang.org/api/docs/v1"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/option"
@@ -25,6 +27,8 @@ var mcpForceSQL bool
 var mcpNoSQLiteScanner bool
 var mcpHTTPAddr string
 var mcpHTTPAllowInsecure bool
+var mcpHTTPAllowWrites bool
+var mcpAllowProfileWrites bool
 var serveMCPHTTPWithOptions = mcpserver.ServeHTTPWithOptions
 
 var mcpCmd = &cobra.Command{
@@ -36,6 +40,9 @@ This allows Claude Desktop (or any MCP client) to query your email archive
 using tools like search_metadata, search_message_bodies, semantic_search_messages,
 get_message, list_messages, get_stats, aggregate, stage_deletion, and draft
 management (list, create, update, send, delete drafts).
+This allows Claude Desktop (or any MCP client) to query your archive
+using tools like search_metadata, search_message_bodies, search_document_attachments, semantic_search_messages, get_message, list_messages, get_stats,
+aggregate, and stage_deletion.
 
 Add to Claude Desktop config:
   {
@@ -69,6 +76,7 @@ Add to Claude Desktop config:
 		// write tools are simply not exposed.
 		opts.GmailFactory = buildGmailFactory(ctx, st)
 		opts.GoogleDocsFactory = buildGoogleDocsFactory()
+		opts.AllowProfileWrites = mcpAllowProfileWrites
 
 		if mcpHTTPAddr != "" {
 			normalized, err := normalizeMCPHTTPAddr(
@@ -79,20 +87,33 @@ Add to Claude Desktop config:
 			if err != nil {
 				return usageErr(cmd, err)
 			}
-			return serveMCPHTTPWithOptions(ctx, opts, normalized, cfg.Server.APIKey)
+			return serveMCPHTTPWithOptions(ctx, opts, mcpserver.HTTPOptions{
+				Addr:        normalized,
+				APIKey:      cfg.Server.APIKey,
+				AllowWrites: mcpHTTPAllowWrites,
+			})
 		}
 		return mcpserver.ServeWithOptions(ctx, opts)
 	},
 }
 
 func daemonMCPServeOptions(ctx context.Context, st *daemonclient.Client) (mcpserver.ServeOptions, error) {
+	engine := daemonclient.NewEngineAdapter(st)
 	opts := mcpserver.ServeOptions{
-		Engine:           daemonclient.NewEngineAdapter(st),
-		AttachmentsDir:   cfg.AttachmentsDir(),
-		AttachmentReader: st,
-		ManifestSaver:    daemonMCPManifestSaver{client: st},
-		OCR:              st,
-		DataDir:          cfg.Data.DataDir,
+		Engine:             engine,
+		AttachmentsDir:     cfg.AttachmentsDir(),
+		AttachmentReader:   st,
+		ManifestSaver:      daemonMCPManifestSaver{client: st},
+		DocumentSearcher:   st,
+		PersonFileSearcher: daemonMCPPersonFileSearcher{client: st},
+		OCR:                st,
+		DataDir:            cfg.Data.DataDir,
+	}
+	compatible, capabilityErr := st.SupportsAPISchemaVersion(ctx, peopleMinAPISchemaVersion)
+	if capabilityErr != nil {
+		logger.Warn("people tools disabled because the daemon capability probe failed", "error", capabilityErr)
+	} else if compatible {
+		opts.PeopleBackend = daemonclient.NewPeopleBrowser(engine)
 	}
 
 	vectorAvailable, err := st.VectorSearchAvailable(ctx)
@@ -103,7 +124,46 @@ func daemonMCPServeOptions(ctx context.Context, st *daemonclient.Client) (mcpser
 		opts.HybridSearcher = daemonMCPHybridSearcher{client: st}
 		opts.SimilarSearcher = daemonMCPSimilarSearcher{client: st}
 	}
+	// The daemon owns the multimodal lane; a remote-only MCP client's local
+	// config says nothing about it, so availability is probed, not assumed.
+	// The stats lane field distinguishes configured (including still
+	// initializing) from disabled, so a transient 503 during asynchronous
+	// vector init cannot permanently omit the tool — per-request errors
+	// report readiness instead. Older daemons lack the field; fall back to
+	// the visual status endpoint answering at all.
+	visualAvailable, laneReported, visualErr := st.VisualSearchAvailable(ctx)
+	if visualErr == nil && !laneReported {
+		_, statusErr := st.VisualStatus(ctx)
+		visualAvailable = statusErr == nil
+	}
+	if visualErr == nil && visualAvailable {
+		opts.VisualSearcher = daemonMCPVisualSearcher{client: st}
+	}
 	return opts, nil
+}
+
+type daemonMCPPersonFileSearcher struct{ client *daemonclient.Client }
+
+func (s daemonMCPPersonFileSearcher) SearchPersonFiles(
+	ctx context.Context,
+	request mcpserver.PersonFileSearchRequest,
+) (generated.PersonFileSearchHTTPResponse, error) {
+	return s.client.SearchPersonFiles(ctx, daemonclient.PersonFileSearchOptions{
+		PersonID: request.PersonID, Directions: request.Directions,
+		After: request.After, Before: request.Before, Filename: request.Filename,
+		MIMEFamilies: request.MIMEFamilies, Limit: request.Limit, Cursor: request.Cursor,
+	})
+}
+
+type daemonMCPVisualSearcher struct{ client *daemonclient.Client }
+
+func (s daemonMCPVisualSearcher) SearchVisualAttachments(ctx context.Context, request mcpserver.VisualSearchRequest) (*visual.SearchResponse, error) {
+	return s.client.SearchVisualAttachmentsFiltered(ctx, daemonclient.VisualSearchOptions{
+		Text: request.Text, Image: request.Image, Limit: request.Limit, Cursor: request.Cursor,
+		SenderPersonID: request.SenderPersonID, SourceID: request.SourceID, MessageID: request.MessageID,
+		PersonID: request.PersonID, ParticipantID: request.ParticipantID, Directions: request.Directions,
+		Filename: request.Filename, MIMEPrefix: request.MIMEPrefix, After: request.After, Before: request.Before,
+	})
 }
 
 type daemonMCPHybridSearcher struct {
@@ -367,6 +427,14 @@ func init() {
 			"Any configured key still requires bearer authentication. Without a "+
 			"key, any reachable client can read your archive; only set this behind "+
 			"a trusted network boundary or authenticating reverse proxy.")
+	mcpCmd.Flags().BoolVar(&mcpHTTPAllowWrites, "http-allow-writes", false,
+		"Expose write-class MCP tools over HTTP. This permits attachment exports, "+
+			"deletion manifests, and profile writes separately enabled with "+
+			"--allow-profile-writes; enable it only for trusted, authenticated clients.")
+	mcpCmd.Flags().BoolVar(&mcpAllowProfileWrites, "allow-profile-writes", false,
+		"Expose person promotion and private Notes writes. Model tool calls "+
+			"can persist profile data, so enable this only for sessions where the user "+
+			"has explicitly authorized profile writes.")
 	_ = mcpCmd.Flags().MarkDeprecated("force-sql", "deprecated in 0.17.0; set [analytics].engine = \"sql\" in config.toml")
 	_ = mcpCmd.Flags().MarkDeprecated("no-sqlite-scanner", "deprecated in 0.17.0; cache engine selection is daemon-managed; use [analytics].engine = \"sql\" for live SQL")
 	_ = mcpCmd.Flags().MarkHidden("force-sql")

@@ -7,11 +7,25 @@ import (
 	"encoding/hex"
 	"fmt"
 	"html"
+	stdmime "mime"
+	"net/mail"
 	"regexp"
 	"strings"
 	"time"
 
-	"github.com/jhillyerd/enmime"
+	"github.com/jhillyerd/enmime/v2"
+	"github.com/jhillyerd/enmime/v2/mediatype"
+)
+
+const (
+	defaultContentType     = "text/plain"
+	fallbackContentType    = "application/octet-stream"
+	malformedContentType   = "application/x-msgvault-malformed"
+	maxRecoveryHeaderBytes = 256 * 1024
+)
+
+var envelopeParser = enmime.NewParser(
+	enmime.SetCustomParseMediaType(parseMediaTypeLenient),
 )
 
 // Message represents a parsed email message.
@@ -49,6 +63,8 @@ type Attachment struct {
 	Filename    string
 	ContentType string
 	ContentID   string
+	Disposition string
+	PartKey     string
 	Size        int
 	ContentHash string // SHA-256 of content
 	Content     []byte
@@ -57,9 +73,18 @@ type Attachment struct {
 
 // Parse parses raw MIME data into a Message.
 func Parse(raw []byte) (*Message, error) {
-	env, err := enmime.ReadEnvelope(bytes.NewReader(raw))
+	root, err := envelopeParser.ReadParts(bytes.NewReader(raw))
+	if err != nil {
+		return nil, fmt.Errorf("read MIME envelope: Failed to ReadParts: %w", err)
+	}
+	normalizeMalformedContentTypes(root)
+
+	env, err := envelopeParser.EnvelopeFromPart(root)
 	if err != nil {
 		return nil, fmt.Errorf("read MIME envelope: %w", err)
+	}
+	if err := env.GatherNestedErrors(); err != nil {
+		return nil, fmt.Errorf("read MIME envelope: gather nested errors: %w", err)
 	}
 
 	msg := &Message{
@@ -97,6 +122,7 @@ func Parse(raw []byte) (*Message, error) {
 	// explicit Content-Disposition: attachment
 	msg.Attachments = append(msg.Attachments, processParts(env.Attachments, false)...)
 	msg.Attachments = append(msg.Attachments, processParts(env.Inlines, true)...)
+	msg.Attachments = append(msg.Attachments, processMalformedOtherParts(env.OtherParts)...)
 
 	// Collect any parsing errors
 	for _, e := range env.Errors {
@@ -106,11 +132,247 @@ func Parse(raw []byte) (*Message, error) {
 	return msg, nil
 }
 
+// ParseWithRecovery parses a message and salvages its top-level headers when
+// malformed MIME structure prevents full envelope parsing. Body content and
+// attachments remain unavailable after a fatal parse error.
+func ParseWithRecovery(raw []byte, fallbackSubject string) (*Message, error) {
+	msg, err := Parse(raw)
+	if err == nil {
+		return msg, nil
+	}
+
+	msg = salvageHeaders(raw)
+	if msg.Subject == "" {
+		msg.Subject = fallbackSubject
+	}
+	errMsg, _, _ := strings.Cut(err.Error(), "\n")
+	msg.BodyText = fmt.Sprintf(
+		"[MIME parsing failed: %s]\n\nRaw MIME data is preserved in message_raw table.",
+		errMsg,
+	)
+	return msg, err
+}
+
+func salvageHeaders(raw []byte) *Message {
+	headers := tokenizeHeaders(raw)
+	msg := &Message{
+		Subject:       decodeHeader(firstHeader(headers, "subject")),
+		ReceivedDates: ParseReceivedChain(headers["received"]),
+		MessageID:     strings.ToValidUTF8(firstHeader(headers, "message-id"), "\uFFFD"),
+		InReplyTo:     strings.ToValidUTF8(firstHeader(headers, "in-reply-to"), "\uFFFD"),
+	}
+
+	if dateHeader := firstHeader(headers, "date"); dateHeader != "" {
+		msg.RawDateHeader = dateHeader
+		msg.Date = parseDate(dateHeader)
+	}
+	msg.From = parseSalvagedAddressList(joinHeaders(headers, "from"))
+	msg.To = parseSalvagedAddressList(joinHeaders(headers, "to"))
+	msg.Cc = parseSalvagedAddressList(joinHeaders(headers, "cc"))
+	msg.Bcc = parseSalvagedAddressList(joinHeaders(headers, "bcc"))
+	msg.ReplyTo = parseSalvagedAddressList(joinHeaders(headers, "reply-to"))
+	msg.References = parseReferences(strings.ToValidUTF8(
+		firstHeader(headers, "references"), "\uFFFD",
+	))
+	return msg
+}
+
+func tokenizeHeaders(raw []byte) map[string][]string {
+	truncated := len(raw) > maxRecoveryHeaderBytes
+	if truncated {
+		raw = raw[:maxRecoveryHeaderBytes]
+	}
+
+	type header struct {
+		name  string
+		value []byte
+	}
+
+	var parsed []header
+	current := -1
+	for len(raw) > 0 {
+		lineEnd := bytes.IndexByte(raw, '\n')
+		var line []byte
+		if lineEnd < 0 {
+			if truncated {
+				break
+			}
+			line, raw = raw, nil
+		} else {
+			line, raw = raw[:lineEnd], raw[lineEnd+1:]
+		}
+		line = bytes.TrimSuffix(line, []byte{'\r'})
+		if len(bytes.TrimSpace(line)) == 0 {
+			break
+		}
+
+		if line[0] == ' ' || line[0] == '\t' {
+			if current >= 0 {
+				parsed[current].value = append(parsed[current].value, ' ')
+				parsed[current].value = append(parsed[current].value, bytes.TrimSpace(line)...)
+			}
+			continue
+		}
+
+		colon := bytes.IndexByte(line, ':')
+		if colon <= 0 || !validHeaderName(line[:colon]) {
+			current = -1
+			continue
+		}
+		current = len(parsed)
+		parsed = append(parsed, header{
+			name:  strings.ToLower(string(line[:colon])),
+			value: append([]byte(nil), bytes.TrimSpace(line[colon+1:])...),
+		})
+	}
+
+	headers := make(map[string][]string)
+	for _, header := range parsed {
+		headers[header.name] = append(headers[header.name], string(header.value))
+	}
+	return headers
+}
+
+func validHeaderName(name []byte) bool {
+	for _, b := range name {
+		if b < 33 || b > 126 || b == ':' {
+			return false
+		}
+	}
+	return len(name) > 0
+}
+
+func firstHeader(headers map[string][]string, name string) string {
+	values := headers[name]
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
+}
+
+func joinHeaders(headers map[string][]string, name string) string {
+	return strings.Join(headers[name], ", ")
+}
+
+func decodeHeader(value string) string {
+	decoded, err := new(stdmime.WordDecoder).DecodeHeader(value)
+	if err != nil {
+		return value
+	}
+	return decoded
+}
+
+func parseSalvagedAddressList(value string) []Address {
+	if value == "" {
+		return nil
+	}
+	list, err := mail.ParseAddressList(value)
+	if err != nil {
+		return fallbackAddressList(value)
+	}
+
+	addresses := make([]Address, 0, len(list))
+	for _, addr := range list {
+		if addr.Address == "" {
+			continue
+		}
+		email := strings.ToLower(addr.Address)
+		addresses = append(addresses, Address{
+			Name:   addr.Name,
+			Email:  email,
+			Domain: extractDomain(email),
+		})
+	}
+	return addresses
+}
+
+func parseMediaTypeLenient(value string) (
+	mediaType string,
+	params map[string]string,
+	invalidParams []string,
+	err error,
+) {
+	mediaType, params, invalidParams, err = mediatype.Parse(value)
+	if err == nil {
+		return mediaType, params, invalidParams, nil
+	}
+
+	params = salvageMediaTypeParams(value)
+	if looksLikeMultipart(value) {
+		return "", nil, nil, fmt.Errorf("parse media type: %w", err)
+	}
+	delete(params, "boundary")
+
+	return malformedContentType, params, nil, nil
+}
+
+func salvageMediaTypeParams(value string) map[string]string {
+	separator := strings.IndexByte(value, ';')
+	if separator < 0 {
+		return nil
+	}
+
+	_, params, _, err := mediatype.Parse(fallbackContentType + value[separator:])
+	if err != nil {
+		return nil
+	}
+	return params
+}
+
+func looksLikeMultipart(value string) bool {
+	baseType, _, _ := strings.Cut(value, ";")
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(baseType)), "multipart")
+}
+
+// normalizeMalformedContentTypes applies the RFC 2045 default after enmime has
+// parsed the headers that can identify a binary part. Keep the sentinel for
+// those parts so EnvelopeFromPart does not select them as a text body.
+func normalizeMalformedContentTypes(root *enmime.Part) {
+	parts := root.BreadthMatchAll(func(*enmime.Part) bool { return true })
+	for _, part := range parts {
+		if part.Disposition == malformedContentType {
+			part.Disposition = ""
+		}
+		if part.ContentType != malformedContentType {
+			continue
+		}
+
+		recoveredType := fallbackContentType
+		if part.Disposition == "" && part.FileName == "" && part.ContentID == "" {
+			recoveredType = defaultContentType
+			part.ContentType = defaultContentType
+		}
+
+		part.Errors = append(part.Errors, &enmime.Error{
+			Name:   enmime.ErrorMalformedHeader,
+			Detail: "invalid Content-Type treated as " + recoveredType,
+		})
+	}
+}
+
+// processMalformedOtherParts recovers malformed binary parts that enmime did
+// not classify from Content-Disposition. A filename identifies an attachment,
+// while a Content-ID identifies an inline resource. Neither changes the
+// sender's original disposition metadata.
+func processMalformedOtherParts(parts []*enmime.Part) []Attachment {
+	var result []Attachment
+	for _, part := range parts {
+		if part.ContentType != malformedContentType {
+			continue
+		}
+		if part.FileName == "" && part.ContentID == "" {
+			continue
+		}
+		result = append(result, makeAttachment(part, part.ContentID != ""))
+	}
+	return result
+}
+
 // parseAddressList parses an address header using enmime's AddressList method.
 func parseAddressList(env *enmime.Envelope, header string) []Address {
 	list, err := env.AddressList(header)
 	if err != nil || list == nil {
-		return nil
+		return fallbackAddressList(env.GetHeader(header))
 	}
 
 	addresses := make([]Address, 0, len(list))
@@ -125,6 +387,132 @@ func parseAddressList(env *enmime.Envelope, header string) []Address {
 		})
 	}
 	return addresses
+}
+
+// fallbackAddressList keeps address tokens when one malformed token causes
+// enmime to reject an otherwise useful address list. A malformed recipient
+// must not hide the valid recipients that share its header.
+func fallbackAddressList(value string) []Address {
+	var addresses []Address
+	for _, token := range splitAddressTokens(value) {
+		for _, email := range emailAddressTokenRe.FindAllString(stripAddressDecorations(token), -1) {
+			email = strings.ToLower(email)
+			addresses = append(addresses, Address{
+				Email:  email,
+				Domain: extractDomain(email),
+			})
+		}
+	}
+	return addresses
+}
+
+// splitAddressTokens splits an address header at commas that are outside
+// quoted strings, comments, and angle-bracket addresses.
+func splitAddressTokens(value string) []string {
+	var tokens []string
+	start := 0
+	quoted := false
+	escaped := false
+	commentDepth := 0
+	angleDepth := 0
+
+	for i, r := range value {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if quoted {
+			switch r {
+			case '\\':
+				escaped = true
+			case '"':
+				quoted = false
+			}
+			continue
+		}
+		if commentDepth > 0 {
+			switch r {
+			case '\\':
+				escaped = true
+			case '(':
+				commentDepth++
+			case ')':
+				commentDepth--
+			}
+			continue
+		}
+
+		switch r {
+		case '"':
+			quoted = true
+		case '(':
+			commentDepth = 1
+		case '<':
+			angleDepth++
+		case '>':
+			if angleDepth > 0 {
+				angleDepth--
+			}
+		case ',':
+			if angleDepth == 0 {
+				tokens = append(tokens, value[start:i])
+				start = i + 1
+			}
+		}
+	}
+
+	return append(tokens, value[start:])
+}
+
+// stripAddressDecorations removes quoted display names and comments before
+// salvage scans a single address token. Email-like text in either region is
+// descriptive text, not a recipient address.
+func stripAddressDecorations(value string) string {
+	var stripped strings.Builder
+	stripped.Grow(len(value))
+	quoted := false
+	escaped := false
+	commentDepth := 0
+
+	for _, r := range value {
+		if escaped {
+			escaped = false
+			continue
+		}
+		if quoted {
+			switch r {
+			case '\\':
+				escaped = true
+			case '"':
+				quoted = false
+			}
+			continue
+		}
+		if commentDepth > 0 {
+			switch r {
+			case '\\':
+				escaped = true
+			case '(':
+				commentDepth++
+			case ')':
+				commentDepth--
+			}
+			continue
+		}
+
+		switch r {
+		case '"':
+			quoted = true
+			stripped.WriteByte(' ')
+		case '(':
+			commentDepth = 1
+			stripped.WriteByte(' ')
+		default:
+			stripped.WriteRune(r)
+		}
+	}
+
+	return stripped.String()
 }
 
 // extractDomain extracts the domain from an email address.
@@ -181,11 +569,22 @@ func processParts(parts []*enmime.Part, isInline bool) []Attachment {
 func makeAttachment(part *enmime.Part, isInline bool) Attachment {
 	content := part.Content
 	hash := sha256.Sum256(content)
+	disposition := strings.ToLower(strings.TrimSpace(part.Disposition))
+	contentType := part.ContentType
+	if contentType == malformedContentType {
+		contentType = fallbackContentType
+	}
+	partKey := ""
+	if part.PartID != "" {
+		partKey = "mime:" + part.PartID
+	}
 
 	return Attachment{
 		Filename:    part.FileName,
-		ContentType: part.ContentType,
+		ContentType: contentType,
 		ContentID:   part.ContentID,
+		Disposition: disposition,
+		PartKey:     partKey,
 		Size:        len(content),
 		ContentHash: hex.EncodeToString(hash[:]),
 		Content:     content,
@@ -232,6 +631,8 @@ var dateFormats = []string{
 
 // numericOffsetRe matches numeric timezone offsets like +0000, -0700, +00:00, -07:00.
 var numericOffsetRe = regexp.MustCompile(`[+-]\d{2}:?\d{2}`)
+
+var emailAddressTokenRe = regexp.MustCompile("[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+")
 
 // hasNumericOffset returns true if the string contains a numeric timezone offset or Z (UTC).
 // Named timezones like "MST" have platform-dependent behavior in Go's time.Parse,

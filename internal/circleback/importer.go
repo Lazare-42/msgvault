@@ -221,6 +221,14 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 		return nil, err
 	}
 	sum := &ImportSummary{SourceID: src.ID}
+	if err := imp.store.AddAccountIdentityContext(
+		ctx,
+		src.ID,
+		opts.AccountEmail,
+		"account-email",
+	); err != nil {
+		return nil, fmt.Errorf("confirm Circleback account identity: %w", err)
+	}
 	accountIdentities, err := meetingidentity.ForSource(imp.store, src.ID, opts.AccountEmail)
 	if err != nil {
 		return nil, err
@@ -234,6 +242,9 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 	if err != nil {
 		return nil, err
 	}
+	scoped := *imp
+	scoped.store = imp.store.ScopedToSync(src.ID, syncID)
+	imp = &scoped
 	var hardErrors []error
 	defer func() {
 		if err != nil {

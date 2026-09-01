@@ -104,8 +104,8 @@ func (s *Server) handleSessionLogin(w http.ResponseWriter, r *http.Request) {
 	https := requestUsesHTTPS(r)
 	// Secure follows the verified connection scheme; plain HTTP support is an
 	// explicit deployment mode surfaced by PlainHTTPWarning.
-	//nolint:gosec // Host-only, HttpOnly, and Strict are fixed below; Secure is connection-dependent.
-	http.SetCookie(w, &http.Cookie{
+
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure follows the verified request scheme; plain HTTP is an explicit supported mode.
 		Name:     sessionCookieName,
 		Value:    id,
 		Path:     "/",
@@ -131,8 +131,8 @@ func (s *Server) handleSessionLogout(w http.ResponseWriter, r *http.Request) {
 	if cookie, err := r.Cookie(sessionCookieName); err == nil {
 		s.sessions.delete(cookie.Value)
 	}
-	//nolint:gosec // Expiration mirrors the connection-dependent flags of the session cookie being cleared.
-	http.SetCookie(w, &http.Cookie{
+
+	http.SetCookie(w, &http.Cookie{ //nolint:gosec // Secure follows the verified request scheme; plain HTTP is an explicit supported mode.
 		Name:     sessionCookieName,
 		Value:    "",
 		Path:     "/",

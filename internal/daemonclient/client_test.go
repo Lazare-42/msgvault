@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -15,10 +17,295 @@ import (
 	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/propagation"
 
 	"go.kenn.io/msgvault/internal/apiprotocol"
+	"go.kenn.io/msgvault/internal/identityops"
+	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/pkg/client/generated"
 )
+
+func TestMCPDaemonAPIErrorPreservesMachineCodeAndVectorSemantics(t *testing.T) {
+	tests := []struct {
+		code     string
+		status   int
+		sentinel error
+	}{
+		{code: "vector_not_enabled", status: http.StatusServiceUnavailable, sentinel: vector.ErrNotEnabled},
+		{code: "index_stale", status: http.StatusServiceUnavailable, sentinel: vector.ErrIndexStale},
+		{code: "index_building", status: http.StatusServiceUnavailable, sentinel: vector.ErrIndexBuilding},
+		{code: "embedding_timeout", status: http.StatusServiceUnavailable, sentinel: vector.ErrEmbeddingTimeout},
+		{code: "index_scope_mismatch", status: http.StatusBadRequest, sentinel: vector.ErrIndexScopeMismatch},
+	}
+
+	for _, test := range tests {
+		t.Run(test.code, func(t *testing.T) {
+			checks := assert.New(t)
+			must := require.New(t)
+			message := "daemon message for " + test.code
+			body, err := json.Marshal(map[string]string{"error": test.code, "message": message})
+			must.NoError(err)
+			response := &http.Response{StatusCode: test.status, Body: io.NopCloser(strings.NewReader(string(body)))}
+
+			err = HandleErrorResponse(response)
+			must.EqualError(err, fmt.Sprintf("API error (%d): %s", test.status, message))
+			var coded interface{ APIErrorCode() string }
+			must.ErrorAs(err, &coded)
+			checks.Equal(test.code, coded.APIErrorCode())
+			checks.ErrorIs(err, test.sentinel)
+		})
+	}
+
+	t.Run("unknown code stays typed but is not a vector sentinel", func(t *testing.T) {
+		checks := assert.New(t)
+		must := require.New(t)
+		response := &http.Response{
+			StatusCode: http.StatusInternalServerError,
+			Body: io.NopCloser(strings.NewReader(
+				`{"error":"private_backend_failure","message":"sanitized daemon message"}`,
+			)),
+		}
+
+		err := HandleErrorResponse(response)
+		must.EqualError(err, "API error (500): sanitized daemon message")
+		var coded interface{ APIErrorCode() string }
+		must.ErrorAs(err, &coded)
+		checks.Equal("private_backend_failure", coded.APIErrorCode())
+		must.NotErrorIs(err, vector.ErrNotEnabled)
+		must.NotErrorIs(err, vector.ErrIndexStale)
+		must.NotErrorIs(err, vector.ErrIndexBuilding)
+		must.NotErrorIs(err, vector.ErrEmbeddingTimeout)
+		must.NotErrorIs(err, vector.ErrIndexScopeMismatch)
+	})
+}
+
+func TestMCPTracePropagationDaemonClientInjectsW3CHeaders(t *testing.T) {
+	checks := assert.New(t)
+	must := require.New(t)
+	const (
+		traceParent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+		traceState  = "vendor=value"
+		baggage     = "tenant=test"
+	)
+
+	headers := make(chan http.Header, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		headers <- r.Header.Clone()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+	client, err := New(Config{
+		URL:           server.URL,
+		AllowInsecure: true,
+		HTTPClient:    server.Client(),
+	})
+	must.NoError(err)
+
+	carrier := propagation.HeaderCarrier(http.Header{
+		"Traceparent": []string{traceParent},
+		"Tracestate":  []string{traceState},
+		"Baggage":     []string{baggage},
+	})
+	ctx := propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{},
+		propagation.Baggage{},
+	).Extract(context.Background(), carrier)
+	response, err := client.DoGeneratedRequestWithContext(
+		ctx,
+		http.MethodGet,
+		"/trace",
+		&generated.RunCLIRequestOptions{},
+	)
+	must.NoError(err)
+	must.NotNil(response)
+	must.NoError(response.Body.Close())
+
+	got := <-headers
+	checks.Equal(traceParent, got.Get("Traceparent"))
+	checks.Equal(traceState, got.Get("Tracestate"))
+	checks.Equal(baggage, got.Get("Baggage"))
+}
+
+func TestCLIIdentityDiscoverProviderStreamsConvertedEventsAndRequest(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertions.Equal(http.MethodPost, r.Method)
+		assertions.Equal("/api/v1/cli/identities/discover", r.URL.Path)
+		var req identityops.DiscoverRequest
+		if !assertions.NoError(json.NewDecoder(r.Body).Decode(&req), "decode discovery request") {
+			http.Error(w, "bad discovery request", http.StatusBadRequest)
+			return
+		}
+		assertions.Equal(identityops.SourceSelector{SourceID: 14}, req.SourceSelector)
+		assertions.True(req.Apply)
+		assertions.True(req.Provider)
+		assertions.Equal([]string{"weak@example.test"}, req.Confirm)
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, err := w.Write([]byte(
+			`{"type":"progress","progress":{"done":2,"total":2,"candidates":1}}` + "\n" +
+				`{"type":"result","result":{"account":"primary@example.test","source_id":14,"source_type":"imap","scanned_messages":2,"candidates":[{"identifier":"alias@example.test","normalized_identifier":"alias@example.test","classification":"strong","already_confirmed":false,"signals":["provider-alias"],"provider_states":["disabled","enabled"],"sent_message_count":0,"received_message_count":0,"first_seen_at":"0001-01-01T00:00:00Z","last_seen_at":"0001-01-01T00:00:00Z"}],"rejected":[],"applied":[]}}` + "\n",
+		))
+		assertions.NoError(err)
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := New(Config{URL: srv.URL, AllowInsecure: true})
+	requirements.NoError(err)
+	var events []identityops.DiscoverEvent
+	err = client.DiscoverCLIIdentities(t.Context(), identityops.DiscoverRequest{
+		SourceID: 14,
+		Apply:    true,
+		Provider: true,
+		Confirm:  []string{"weak@example.test"},
+	}, func(event identityops.DiscoverEvent) error {
+		events = append(events, event)
+		return nil
+	})
+
+	requirements.NoError(err)
+	requirements.Len(events, 2)
+	assertions.Equal("progress", events[0].Type)
+	requirements.NotNil(events[0].Progress)
+	assertions.Equal(int64(2), events[0].Progress.Done)
+	assertions.Equal("result", events[1].Type)
+	requirements.NotNil(events[1].Result)
+	assertions.Equal(int64(14), events[1].Result.SourceID)
+	encoded, err := json.Marshal(events[1].Result.Candidates[0])
+	requirements.NoError(err)
+	var reported struct {
+		ProviderStates []string `json:"provider_states"`
+	}
+	requirements.NoError(json.Unmarshal(encoded, &reported))
+	assertions.Equal([]string{"disabled", "enabled"}, reported.ProviderStates,
+		"generated-client conversion must retain provider state metadata")
+}
+
+func TestCLIIdentityDiscoverRejectsStreamWithoutResult(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, err := w.Write([]byte(
+			`{"type":"progress","progress":{"done":1,"total":2,"candidates":1}}` + "\n",
+		))
+		assert.NoError(t, err)
+	}))
+	t.Cleanup(srv.Close)
+	client, err := New(Config{URL: srv.URL, AllowInsecure: true})
+	require.NoError(t, err)
+
+	err = client.DiscoverCLIIdentities(t.Context(), identityops.DiscoverRequest{
+		SourceID: 14,
+	}, nil)
+
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "without result")
+}
+
+func TestCLIIdentityDiscoverConsumesSanitizedTerminalError(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	const secret = "provider-token-private-value"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, err := w.Write([]byte(
+			`{"type":"progress","progress":{"done":1,"total":2,"candidates":1}}` + "\n" +
+				`{"type":"error","error":{"code":"internal_error","message":"Failed to discover identities"}}` + "\n",
+		))
+		assertions.NoError(err)
+	}))
+	t.Cleanup(srv.Close)
+	client, err := New(Config{URL: srv.URL, AllowInsecure: true})
+	requirements.NoError(err)
+
+	var events []identityops.DiscoverEvent
+	err = client.DiscoverCLIIdentities(t.Context(), identityops.DiscoverRequest{
+		SourceID: 14,
+	}, func(event identityops.DiscoverEvent) error {
+		events = append(events, event)
+		return nil
+	})
+
+	requirements.Error(err)
+	requirements.ErrorContains(err, "Failed to discover identities")
+	assertions.NotContains(err.Error(), secret)
+	var discoverErr *identityops.DiscoverError
+	requirements.ErrorAs(err, &discoverErr)
+	assertions.Equal("internal_error", discoverErr.Code)
+	assertions.Equal("Failed to discover identities", discoverErr.Message)
+	requirements.Len(events, 1)
+	assertions.Equal("progress", events[0].Type)
+}
+
+func TestCLIIdentityImportSendsParsedEntriesAndConvertsResult(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assertions.Equal(http.MethodPost, r.Method)
+		assertions.Equal("/api/v1/cli/identities/import", r.URL.Path)
+		var raw map[string]json.RawMessage
+		if !assertions.NoError(json.NewDecoder(r.Body).Decode(&raw), "decode import request") {
+			http.Error(w, "bad import request", http.StatusBadRequest)
+			return
+		}
+		assertions.NotContains(raw, "file")
+		assertions.NotContains(raw, "data")
+		encoded, err := json.Marshal(raw)
+		if !assertions.NoError(err) {
+			http.Error(w, "encode import request", http.StatusInternalServerError)
+			return
+		}
+		var req identityops.ImportRequest
+		if !assertions.NoError(json.Unmarshal(encoded, &req)) {
+			http.Error(w, "decode import request", http.StatusBadRequest)
+			return
+		}
+		assertions.Empty(req.Account)
+		assertions.Equal(int64(14), req.SourceID)
+		assertions.Equal("bulk-import", req.Signal)
+		assertions.True(req.Apply)
+		assertions.Equal([]identityops.ImportEntry{{
+			Identifier: "alias@example.test", State: "disabled",
+		}}, req.Entries)
+
+		w.Header().Set("Content-Type", "application/json")
+		assertions.NoError(json.NewEncoder(w).Encode(identityops.ImportResult{
+			Account:  "primary@example.test",
+			SourceID: 14,
+			Signal:   "bulk-import",
+			Candidates: []identityops.Candidate{{
+				Identifier:           "alias@example.test",
+				NormalizedIdentifier: "alias@example.test",
+				Classification:       "strong",
+				Signals:              []string{"bulk-import"},
+				ProviderStates:       []string{"disabled"},
+			}},
+			Applied: []store.IdentityConfirmationOutcome{{
+				Identifier: "alias@example.test", Added: true, Signals: []string{"bulk-import"},
+			}},
+		}))
+	}))
+	t.Cleanup(srv.Close)
+
+	client, err := New(Config{URL: srv.URL, AllowInsecure: true})
+	requirements.NoError(err)
+	result, err := client.ImportCLIIdentities(t.Context(), identityops.ImportRequest{
+		SourceID: 14,
+		Entries: []identityops.ImportEntry{{
+			Identifier: "alias@example.test", State: "disabled",
+		}},
+		Signal: "bulk-import",
+		Apply:  true,
+	})
+
+	requirements.NoError(err)
+	requirements.NotNil(result)
+	assertions.Equal("primary@example.test", result.Account)
+	assertions.Equal([]string{"disabled"}, result.Candidates[0].ProviderStates)
+	assertions.Equal([]store.IdentityConfirmationOutcome{{
+		Identifier: "alias@example.test", Added: true, Signals: []string{"bulk-import"},
+	}}, result.Applied)
+}
 
 func TestNewRejectsHTTPWithoutAllowInsecure(t *testing.T) {
 	_, err := New(Config{URL: "http://nas:8080", APIKey: "key"})

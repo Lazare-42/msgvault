@@ -61,10 +61,11 @@ msgvault add-account <email> --oauth-app <name>
 | `--headless` | Show instructions for headless server setup |
 | `--oauth-app` | Use a named OAuth app from `[oauth.apps.<name>]` in config |
 | `--force` | Delete existing token and re-authorize |
+| `--readonly` | Request Gmail read-only access instead of read + write. Refused if the account already holds write access — see [OAuth Setup](/guides/oauth-setup/#read-only-access) |
 | `--display-name` | Set a display name for the account |
 | `--no-default-identity` | Do not auto-confirm the email address as this account's "me" identity |
 
-If `[oauth].service_account_key` or `[oauth.apps.<name>].service_account_key` is configured, `add-account` authorizes via Google service account domain-wide delegation instead of browser OAuth. Service-account accounts do not use `--headless` or `--force`.
+If `[oauth].service_account_key` or `[oauth.apps.<name>].service_account_key` is configured, `add-account` authorizes via Google service account domain-wide delegation instead of browser OAuth. Service-account accounts do not use `--headless`, `--force`, or `--readonly`; their scope comes from the domain-wide delegation grant in the Admin Console.
 
 ---
 
@@ -193,10 +194,12 @@ rules.
 
 ## sync-full
 
-Download all messages from a Gmail or IMAP account. When called without an email argument, syncs all configured syncable accounts.
+Download all messages from a Gmail or IMAP account. The optional account can
+be an identifier or display name. When it is omitted, the command syncs all
+configured syncable accounts.
 
 ```bash
-msgvault sync-full [email] [flags]
+msgvault sync-full [account] [flags]
 ```
 
 | Flag | Description |
@@ -208,7 +211,11 @@ msgvault sync-full [email] [flags]
 | `--noresume` | Ignore checkpoints, start fresh |
 | `--folder NAME` | Scan this IMAP folder (repeatable) |
 | `--skip-folder NAME` | Skip this IMAP folder (repeatable) |
+| `--source-id ID` | Sync exactly one source by numeric ID; mutually exclusive with the account argument |
 | `--verbose` | Detailed progress output |
+
+An account token can select more than one matching source. Use `--source-id`
+when Gmail and IMAP, or two other sources, share the same identifier.
 
 The CLI sends the sync request to the configured remote server or local daemon
 and streams the daemon's stdout/stderr back to the terminal. This keeps local
@@ -219,16 +226,17 @@ SQLite writer beside `msgvault serve`.
 
 ## sync
 
-Sync new and changed messages. Gmail accounts use the Gmail History API; IMAP accounts perform a mailbox scan and skip messages already in the database. When called without an email argument, syncs all accounts that have completed an initial full sync.
+Sync new and changed messages. Gmail accounts use the Gmail History API; IMAP accounts perform a mailbox scan and skip messages already in the database. The optional account can be an identifier or display name. When it is omitted, the command syncs all accounts that have completed an initial full sync.
 
 ```bash
-msgvault sync [email] [flags]
+msgvault sync [account] [flags]
 ```
 
 | Flag | Description |
 |---|---|
 | `--folder NAME` | Scan this IMAP folder (repeatable) |
 | `--skip-folder NAME` | Skip this IMAP folder (repeatable) |
+| `--source-id ID` | Sync exactly one source by numeric ID; mutually exclusive with the account argument |
 
 The CLI sends the incremental sync request to the configured remote server or
 local daemon and streams the daemon's stdout/stderr back to the terminal. The
@@ -455,7 +463,7 @@ the source message has since been deleted. See
 
 ## add-beeper
 
-Register the chat accounts bridged through a locally running
+Register the chat accounts connected to a locally running
 [Beeper Desktop](/usage/beeper/) as `beeper` sources, one per network.
 
 ```bash
@@ -469,6 +477,10 @@ minted in Beeper Desktop (Settings → Developer). The token is stored at
 `tokens/beeper.json`. Accounts filtered out by `[beeper].accounts` /
 `exclude_accounts` in `config.toml` are skipped.
 
+Networks Beeper serves natively instead of bridging — iMessage — are absent
+from its accounts API, so they are found from chat data and reported as *found
+via chats*. Re-run the command after connecting a network in Beeper Desktop.
+
 | Flag | Default | Description |
 |---|---|---|
 | `--token-file` | | Read the access token from a file instead of prompting |
@@ -481,7 +493,7 @@ After adding, sync with `msgvault sync-beeper`.
 ## sync-beeper
 
 Sync chats from Beeper Desktop for every registered Beeper account (all
-bridged networks). The first run backfills full locally-available history and
+connected networks). The first run backfills full locally-available history and
 is resumable; later runs are incremental. Per-account failures do not stop the
 run: remaining accounts still sync, the analytics cache is rebuilt for the
 successful ones, and the command exits non-zero listing the failures. Without
@@ -985,6 +997,9 @@ rerun as new loose content arrives. Bounded packing also runs after successful
 attachment-producing operations and during scheduled maintenance; this command
 processes the complete eligible backlog immediately.
 
+With `[data].loose_attachments = true`, automatic packing is disabled and this
+command refuses to run.
+
 ---
 
 ## repack-attachments
@@ -998,6 +1013,8 @@ msgvault repack-attachments
 Repack always runs through the selected daemon so it can atomically replace
 live blob mappings, retire shared readers, and remove old pack files. It is
 safe to retry after interruption or a Windows file-sharing error.
+It refuses to run when `[data].loose_attachments = true` because repacking
+creates replacement pack files.
 
 ---
 
@@ -1034,6 +1051,7 @@ msgvault search <query> [flags]
 | `--account` | Limit results to a specific account |
 | `--collection` | Limit results to all member accounts of a collection |
 | `--message-type` | Limit results to one or more message types, e.g. `email`, `teams`, `discord`, `calendar_event`, `sms` |
+| `--deletion-scope` | Source-deletion scope: `active` (default), `deleted`, or `any`. Non-active scopes require `--mode fts`. |
 | `--mode` | Search mode: `fts` (default), `vector`, or `hybrid`. `vector` and `hybrid` require vector search to be configured. |
 | `--explain` | Include per-signal scores (RRF, BM25, vector) in the output. Only applies to `--mode vector` and `--mode hybrid`. |
 
@@ -1043,7 +1061,41 @@ Ordinary aggregate views and statistics still default to email-only; use
 `--message-type` (or `message_type:` in the query) when you need an explicit
 search scope.
 
-`--mode vector` and `--mode hybrid` require at least one free-text term in the query (filter-only queries use `--mode fts`). They do not support pagination (`--offset` is rejected), so bump `--limit` to retrieve a larger candidate pool instead. See [Searching](/usage/searching/) for the operator reference and [Vector Search](/usage/vector-search/) for semantic setup.
+`--mode vector` and `--mode hybrid` require at least one free-text term in the query (filter-only queries use `--mode fts`). They do not support pagination (`--offset` is rejected) or non-active deletion scopes because the vector index covers active messages only. Bump `--limit` to retrieve a larger candidate pool instead. See [Searching](/usage/searching/) for the operator reference and [Vector Search](/usage/vector-search/) for semantic setup.
+
+---
+
+## documents
+
+Manage hosted extraction and local full-text indexing for standalone document
+attachments. Provider operations require a private authenticated capability
+manifest and exact recorded consent; local search and removal operations do
+not contact the provider.
+
+```bash
+msgvault documents probe-mistral --fixtures <private-dir> [--validate-only]
+msgvault documents consent-mistral --capabilities <manifest> [--yes]
+msgvault documents build --capabilities <manifest> [--limit N] [--full-rebuild] [--yes]
+msgvault documents resume --capabilities <manifest> [--limit N] [--yes]
+msgvault documents search <query> [flags]
+msgvault documents status --capabilities <manifest> [--json]
+msgvault documents retry --capabilities <manifest> --hash <sha256>
+msgvault documents retire <profile-id> [--yes]
+msgvault documents purge-derived --hash <sha256> [--yes]
+```
+
+`probe-mistral --validate-only` checks the complete synthetic fixture set
+without credentials or network access. An authenticated probe writes the
+manifest to stdout. Run consent and build commands once without `--yes` to
+review their disclosure and preflight.
+
+`documents search` accepts `--source-id`, `--message-type`, `--attachment-id`,
+`--message-id`, `-n`/`--limit`, `--cursor`, and `--json`. Its cursor is opaque
+and bound to a stable index revision; restart pagination after a stale-cursor
+error.
+
+See [Document Attachment Indexing](/usage/document-indexing/) for fixture
+generation, configuration, privacy boundaries, scheduling, and recovery.
 
 ---
 
@@ -1208,10 +1260,12 @@ Manage the confirmed "me" identifiers for each account.
 The identity subcommands use the configured remote server or local daemon by default. `--local` uses the local daemon even when a remote is configured.
 
 ```bash
-msgvault identity list [flags]
-msgvault identity show <account> [flags]
-msgvault identity add <account> <identifier> [flags]
-msgvault identity remove <account> <identifier>
+msgvault identity list [--account <account> | --collection <name> | --source-id <id>]
+msgvault identity show [<account>] [--source-id <id>]
+msgvault identity add [<account>] <identifier> [--source-id <id>]
+msgvault identity remove [<account>] <identifier> [--source-id <id>]
+msgvault identity discover [<account>] [--source-id <id>] [--apply]
+msgvault identity import [<account>] [--source-id <id>] (--file <path> | --stdin)
 ```
 
 | Command | Description |
@@ -1220,13 +1274,126 @@ msgvault identity remove <account> <identifier>
 | `identity show <account>` | Show one account's identity in detail |
 | `identity add <account> <identifier>` | Add a confirmed identifier |
 | `identity remove <account> <identifier>` | Remove a confirmed identifier |
+| `identity discover <account>` | Preview archived source evidence; `--apply` confirms strong candidates |
+| `identity import <account>` | Preview or apply source-scoped identifiers from text or JSON |
 
 | Flag | Applies to | Description |
 |---|---|---|
 | `--account` | `list` | Restrict to a single account |
 | `--collection` | `list` | Restrict to all member accounts of a collection |
-| `--json` | `list`, `show` | Output as JSON |
+| `--source-id` | all subcommands | Select one source unambiguously by numeric ID; mutually exclusive with an account argument or `list` scope |
+| `--json` | `list`, `show`, `discover`, `import` | Output structured JSON; discovery also suppresses progress |
 | `--signal` | `add` | Evidence signal name (default `manual`) |
+| `--apply` | `discover` | After the complete preview scan, confirm strong evidence |
+| `--provider` | `discover` | Include the source's configured `[[fastmail]]` alias inventory |
+| `--confirm <address>` | `discover` | Explicitly confirm one weak candidate; repeatable and requires `--apply` |
+| `--file <path>` / `--stdin` | `import` | Read a text or JSON identity list from exactly one input |
+| `--signal` | `import` | Evidence signal recorded for imported identities (default `manual`) |
+| `--apply` | `import` | Confirm every validated imported identity; without it the command only previews |
+
+Email sync enriches identities already confirmed for the source with strong
+sender evidence from trusted Sent metadata; it does not confirm first-time
+aliases. Review candidates with `msgvault identity discover` and apply strong
+candidates with `msgvault identity discover --apply`. Recipient-only evidence
+stays review-only. See [People, Profiles, and Source Identities](/usage/people/)
+for classifications, Fastmail inventory, and import formats.
+
+---
+
+## person
+
+Manage durable person profiles and their typed, historized attributes. A
+profile is created only by explicit promotion of an observed participant's
+identity cluster.
+
+```bash
+msgvault person promote <participant-id>
+msgvault person list [--json]
+msgvault person get <person-id> [--json]
+msgvault person set-display-name <person-id> <display-name> [--json]
+msgvault person set-display-name <person-id> --clear [--json]
+msgvault person delete <person-id>
+msgvault person merge <survivor-id> <absorbed-id> [flags]
+msgvault person split <source-person-id> [flags]
+msgvault person merge-history <person-id> [--json]
+msgvault person merge-show <merge-id> [--snapshot] [--json]
+msgvault person merge-candidate <candidate-id> [flags]
+
+msgvault person attributes list <person-id> [--slug <slug>] [--history] [--json]
+msgvault person attributes set <person-id> <slug> (--value <scalar> | --value-json <json|@path|->) [flags]
+msgvault person attributes clear <person-id> <slug> [flags]
+```
+
+`promote` is idempotent. `set-display-name` preserves the profile's stable ID
+and vCard UID. `delete` permanently retires that UID and removes the profile's
+participant bindings. A person with active merge lineage cannot be deleted
+until that lineage is fully split.
+
+`merge` keeps the survivor's ID and vCard UID, moves the absorbed profile into
+it, and records a reversible merge packet. Profiles with active CardDAV
+publication are rejected. `split` creates a new person and UID; repeat
+`--participant` to select multiple absorbed lineages, or omit it for a merge
+whose absorbed profile had no participants.
+
+| Merge flag | Applies to | Description |
+|---|---|---|
+| `--survivor-revision <n>` | `merge` | Required expected revision of the surviving person |
+| `--absorbed-revision <n>` | `merge` | Required expected revision of the absorbed person |
+| `--idempotency-key <key>` | `merge`, `split` | Required retry key; reusing it with a different request is rejected |
+| `--merge-id <id>` | `split` | Required merge record to reverse |
+| `--participant <id>` | `split` | Absorbed participant lineage to move; repeat as needed |
+| `--revision <n>` | `split`, `merge-candidate` | Required expected revision of the current person |
+| `--person-id <id>` | `merge-candidate` | Person that owns the review candidate |
+| `--decision <accepted\|rejected>` | `merge-candidate` | Resolve a conflicting single-value attribute |
+| `--snapshot` | `merge-show` | Read and verify the immutable merge snapshot |
+| `--json` | all merge commands | Output structured JSON |
+
+Exact splits restore the pre-merge profiles when their lineage and referenced
+rows remain available. For partial splits, use `--json` to inspect ambiguous or
+unrestored rows. Complete merge packets retain merge-time profile values even
+after later redaction and require the strongest profile-data options when
+copied into a subset. See [People, Profiles, and Source Identities](/usage/people/#merge-duplicate-profiles-and-reverse-a-merge)
+for the workflow and lifecycle boundaries.
+
+| Attribute flag | Applies to | Description |
+|---|---|---|
+| `--slug <slug>` | `list` | Restrict output to one definition |
+| `--history` | `list` | Include superseded values instead of current values only |
+| `--value <scalar>` | `set` | Coerce text, integer, real, boolean, date, or timestamp input to the definition's type |
+| `--value-json <json\|@path\|->` | `set` | Supply a structured typed-value envelope |
+| `--ordinal <n>` | `set`, `clear` | Address one slot of a multi-valued definition |
+| `--source <name>` | `set` | Provenance: `user`, `carddav_import`, `vcard_import`, `archive_observation`, `extraction`, `enrichment`, or `system` |
+| `--source-ref <value>` | `set` | Resource or message reference that produced the value |
+| `--confidence <0..1>` | `set` | Confidence for a derived or suggested value |
+| `--actor <value>` | `set` | Actor recorded with the value |
+| `--expected-value-id <id>` | `set`, `clear` | Compare-and-swap guard for the current value |
+| `--dry-run` | `set`, `clear` | Validate and preview without writing |
+| `--json` | `list`, `set`, `clear` | Output structured JSON |
+
+Setting or clearing a value closes the current history row rather than deleting
+it. See [People, Profiles, and Source Identities](/usage/people/) for the
+shipped definitions and complete workflow.
+
+---
+
+## attribute-definition
+
+Manage portable field metadata. Definitions add no runtime database columns;
+their universal IDs and slugs remain stable while labels and descriptions may
+change.
+
+```bash
+msgvault attribute-definition list [--object-type person|organization] [--include-hidden] [--json]
+msgvault attribute-definition get <definition-id> [--json]
+msgvault attribute-definition create --definition <json|@path|-> [--dry-run] [--json]
+msgvault attribute-definition rename <definition-id> [--label <text>] [--description <text> | --clear-description] [--json]
+msgvault attribute-definition delete <definition-id>
+```
+
+`create --dry-run` performs local structural validation but cannot detect a
+conflict with definitions already stored by the daemon. `rename` does not
+change the immutable slug or universal ID. Deletion is limited to user-created,
+deletable definitions that have no stored values.
 
 ---
 
@@ -1412,8 +1579,15 @@ msgvault embeddings build [flags]
 |---|---|
 | `--full-rebuild` | Create a new index generation and rebuild from scratch. The new generation is activated atomically once coverage reaches zero. Same-model rebuilds keep serving the previous active generation in the meantime, but active-generation top-ups are frozen until activation; model or dimension changes return `index_stale` for vector/hybrid search until the new generation activates. |
 | `--yes` | Skip the confirmation prompt that `--full-rebuild` otherwise requires. |
+| `--account <identifier>` | Limit embedding to this account, by identifier or display name — numeric source IDs are rejected (repeatable). Overrides `[vector.embed.scope] accounts` for this run; configured `message_types` still apply. After activating this one-off scope, add the equivalent accounts to config and restart the daemon before searching. |
+| `--collection <name>` | Limit embedding to this collection's accounts (repeatable). Can be combined with `--account`; the scope is the union. This is a one-run override; persist the resolved accounts in config before restarting the daemon. |
 
-Without `--full-rebuild`, the command is incremental: it resumes any in-flight rebuild that matches the configured model, otherwise scans for live messages still missing coverage in the active generation, then exits. Safe to schedule via cron (or let `msgvault serve` do it via `[vector.embed.schedule]`).
+Without `--full-rebuild`, the command is incremental: it resumes any in-flight rebuild that matches the configured embedding settings, otherwise scans for live messages still missing coverage in the active generation, then exits. Safe to schedule via cron (or let `msgvault serve` do it via `[vector.embed.schedule]`).
+
+The account scope is part of the generation fingerprint, so building with a
+different `--account`/`--collection` set than the active generation requires
+`--full-rebuild`, exactly like changing the model. See
+[Scoped Generations](/usage/vector-search/#scoped-generations).
 
 ### embeddings resume
 
@@ -1421,7 +1595,7 @@ Without `--full-rebuild`, the command is incremental: it resumes any in-flight r
 msgvault embeddings resume
 ```
 
-Continue embedding work and finish the current generation. If a generation matching the configured model is building, this embeds its remaining rows and activates it once coverage reaches zero; otherwise it tops up the active generation. Equivalent to `msgvault embeddings build` with no flags, but never starts a full rebuild.
+Continue embedding work and finish the current generation. If a generation matching the configured embedding settings is building, this embeds its remaining rows and activates it once coverage reaches zero; otherwise it tops up the active generation. Equivalent to `msgvault embeddings build` with no flags, but never starts a full rebuild. Accepts the same `--account`/`--collection` scope flags as `embeddings build`.
 
 ### embeddings list
 
@@ -1643,12 +1817,16 @@ Update account settings through the configured remote server or local daemon.
 Use `--local` to force the local daemon when a remote is configured.
 
 ```bash
-msgvault update-account <email> [flags]
+msgvault update-account [account] [flags]
 ```
 
 | Flag | Description |
 |---|---|
 | `--display-name` | Set a display name for the account |
+| `--source-id ID` | Update exactly one source by numeric ID; mutually exclusive with the account argument |
+
+The account argument accepts an identifier or a unique display name. Supply
+either an account or `--source-id`.
 
 ---
 
@@ -1657,14 +1835,18 @@ msgvault update-account <email> [flags]
 Remove an account or source and all its archived data from the selected msgvault archive. Deletes messages, labels, sync state, credentials no longer shared by another source, and attachment files unique to this source. This is irreversible but does not touch the remote provider.
 
 ```bash
-msgvault remove-account <email> [flags]
+msgvault remove-account [account] [flags]
 msgvault remove-account 123456789012345678 --type discord
+msgvault remove-account --source-id 42
 ```
 
 | Flag | Description |
 |---|---|
 | `-y`, `--yes` | Skip the confirmation prompt (and allow removal when an active sync is in progress) |
 | `--type` | Source type to remove when the same identifier exists across source types (`gmail`, `imap`, `mbox`, `discord`, etc.) |
+| `--source-id ID` | Remove exactly one source by numeric ID; mutually exclusive with the account argument and `--type` |
+
+The account argument accepts an identifier or a unique display name.
 
 Attachment files are only deleted when no other account references the same
 content hash. A Discord bot token is preserved while another registered guild
@@ -1722,7 +1904,8 @@ msgvault delete-staged [batch-id] [flags]
 | `--permanent` | Permanently delete through the Gmail batch API instead of moving to trash |
 | `--dry-run` | Show what would be deleted without deleting |
 | `-l`, `--list` | List staged deletion batches |
-| `--account` | Filter to a specific account |
+| `--account` | Filter to one source by identifier or unique display name |
+| `--source-id ID` | Filter to exactly one source by numeric ID; mutually exclusive with `--account` |
 
 Execution requires `MSGVAULT_ENABLE_REMOTE_DELETE=1`. `--list` and `--dry-run` work without the gate. `--permanent` and `--yes` are mutually exclusive because permanent deletion always requires the destructive confirmation prompt.
 

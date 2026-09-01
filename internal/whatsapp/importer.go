@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -16,8 +15,7 @@ import (
 	"go.kenn.io/msgvault/internal/store"
 )
 
-// Importer handles importing WhatsApp messages from a decrypted msgstore.db
-// into the msgvault store.
+// Importer handles importing WhatsApp messages into the msgvault store.
 type Importer struct {
 	store    *store.Store
 	progress ImportProgress
@@ -34,26 +32,27 @@ func NewImporter(s *store.Store, progress ImportProgress) *Importer {
 	}
 }
 
-// Import performs the full WhatsApp import from a decrypted msgstore.db.
+// Import detects the WhatsApp database schema and imports its messages.
 func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOptions) (*ImportSummary, error) {
 	startTime := time.Now()
 	summary := &ImportSummary{}
 
-	// Open WhatsApp DB read-only.
-	// Use file: URI to safely handle paths containing '?' or other special characters.
-	dsn := (&url.URL{
-		Scheme:   "file",
-		OmitHost: true,
-		Path:     waDBPath,
-		RawQuery: "mode=ro&_journal_mode=WAL&_busy_timeout=5000",
-	}).String()
-	waDB, err := sql.Open("sqlite3", dsn)
+	waDB, err := openReadOnlyDatabase(ctx, waDBPath)
 	if err != nil {
 		return nil, fmt.Errorf("open whatsapp db: %w", err)
 	}
 	defer func() { _ = waDB.Close() }()
 
-	// Verify it's a valid WhatsApp DB.
+	kind, err := detectDatabaseKind(waDB)
+	if err != nil {
+		return nil, err
+	}
+	if kind == databaseKindApple {
+		return imp.importApple(ctx, waDB, waDBPath, opts)
+	}
+
+	// Keep the detailed Android schema checks for compatibility with the
+	// existing importer error handling.
 	if err := verifyWhatsAppDB(waDB); err != nil {
 		return nil, err
 	}
@@ -74,6 +73,9 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 	if err != nil {
 		return nil, fmt.Errorf("start sync: %w", err)
 	}
+	scoped := *imp
+	scoped.store = imp.store.ScopedToSync(source.ID, syncID)
+	imp = &scoped
 
 	// Ensure we complete/fail the sync run on exit.
 	var syncErr error
@@ -362,7 +364,7 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 					summary.AttachmentsFound++
 					mediaType := mapMediaType(waMsg.MessageType)
 
-					storagePath, contentHash := imp.handleMediaFile(media, opts)
+					storagePath, contentHash, storedSize := imp.handleMediaFile(media, opts)
 					if storagePath != "" {
 						summary.MediaCopied++
 					}
@@ -377,16 +379,28 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 						filename = filepath.Base(media.FilePath.String)
 					}
 
-					size := 0
-					if media.FileSize.Valid {
-						size = int(media.FileSize.Int64)
+					size := int64(0)
+					if storagePath != "" {
+						size = storedSize
+					} else if media.FileSize.Valid {
+						size = media.FileSize.Int64
 					}
 
 					// Only insert attachment row when we have actual content.
 					// Without --media-dir, storagePath and contentHash are both
 					// empty; inserting would create broken records.
 					if storagePath != "" || contentHash != "" {
-						err := imp.store.UpsertAttachment(messageID, filename, mimeType, storagePath, contentHash, size)
+						role := store.AttachmentRoleStandalone
+						roleSource := store.AttachmentRoleSourceImporterSemantics
+						if mediaType == "sticker" {
+							role = store.AttachmentRoleSticker
+							roleSource = store.AttachmentRoleSourceProviderExplicit
+						}
+						err := imp.store.UpsertAttachmentRecord(ctx, messageID, store.AttachmentWrite{
+							Filename: filename, MIMEType: mimeType, StoragePath: storagePath,
+							ContentHash: contentHash, Size: size, MediaType: mediaType,
+							Role: role, RoleSource: roleSource, SourcePartKey: "whatsapp:media",
+						})
 						if err != nil {
 							summary.Errors++
 							imp.progress.OnError(fmt.Errorf("upsert attachment for message %s: %w", waMsg.KeyID, err))
@@ -402,30 +416,34 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 							messageID,
 						).Scan(&existingCount)
 						if existingCount == 0 {
-							// has_attachments is BOOLEAN on PG; bind a Go
-							// bool through the rebind layer so the driver
-							// emits the right literal for each backend.
-							_, _ = imp.store.DB().Exec(
-								imp.store.Rebind("UPDATE messages SET has_attachments = ?, attachment_count = ? WHERE id = ?"),
-								false, 0, messageID)
+							_ = imp.store.RecomputeMessageAttachmentStats(messageID)
 						}
 					}
 
 					// Store media metadata in the attachments table is done above.
 					// For extra metadata (width, height, duration, media_type),
-					// update via a direct SQL call since UpsertAttachment doesn't have those fields.
+					// update via a direct SQL call for provider dimensions and duration.
 					if mediaType != "" || (media.Width.Valid && media.Width.Int64 > 0) {
-						imp.updateAttachmentMetadata(messageID, contentHash, mediaType, media)
+						if err := imp.updateAttachmentMetadata(ctx, messageID, contentHash, mediaType, media); err != nil {
+							syncErr = err
+							return nil, fmt.Errorf("update attachment metadata: %w", err)
+						}
 					}
 				}
 
 				// Handle quoted/reply messages.
 				if quoted, ok := quotedMap[waMsg.RowID]; ok {
 					if replyToMsgID, found := keyIDToMsgID[quoted.QuotedKeyID]; found {
-						imp.setReplyTo(messageID, replyToMsgID)
+						if err := imp.setReplyTo(ctx, messageID, replyToMsgID); err != nil {
+							syncErr = err
+							return nil, fmt.Errorf("link reply: %w", err)
+						}
 					} else if dbMsgID, lookupErr := imp.lookupMessageByKeyID(source.ID, quoted.QuotedKeyID); lookupErr == nil && dbMsgID > 0 {
 						// Found in DB from a previous import run or another chat.
-						imp.setReplyTo(messageID, dbMsgID)
+						if err := imp.setReplyTo(ctx, messageID, dbMsgID); err != nil {
+							syncErr = err
+							return nil, fmt.Errorf("link reply: %w", err)
+						}
 					}
 				}
 
@@ -529,10 +547,11 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 }
 
 // handleMediaFile attempts to find and copy a media file to content-addressed storage.
-// Returns (storagePath, contentHash). Both empty if file not found.
-func (imp *Importer) handleMediaFile(media waMedia, opts ImportOptions) (string, string) {
+// Returns (storagePath, contentHash, storedSize). All are empty or zero if the
+// file is not found.
+func (imp *Importer) handleMediaFile(media waMedia, opts ImportOptions) (string, string, int64) {
 	if opts.MediaDir == "" || opts.AttachmentsDir == "" || !media.FilePath.Valid || media.FilePath.String == "" {
-		return "", ""
+		return "", "", 0
 	}
 
 	mediaDir := opts.MediaDir
@@ -554,18 +573,18 @@ func (imp *Importer) handleMediaFile(media waMedia, opts ImportOptions) (string,
 	fullPath := filepath.Join(mediaDir, relPath)
 	absMediaDir, err := filepath.Abs(mediaDir)
 	if err != nil {
-		return "", ""
+		return "", "", 0
 	}
 	absFullPath, err := filepath.Abs(fullPath)
 	if err != nil {
-		return "", ""
+		return "", "", 0
 	}
 	if !strings.HasPrefix(absFullPath, absMediaDir+string(filepath.Separator)) && absFullPath != absMediaDir {
 		// Path escapes mediaDir — fall back to base filename only.
 		fullPath = filepath.Join(mediaDir, filepath.Base(relPath))
 		absFullPath, _ = filepath.Abs(fullPath)
 		if !strings.HasPrefix(absFullPath, absMediaDir+string(filepath.Separator)) {
-			return "", ""
+			return "", "", 0
 		}
 	}
 
@@ -576,7 +595,7 @@ func (imp *Importer) handleMediaFile(media waMedia, opts ImportOptions) (string,
 		fullPath = filepath.Join(mediaDir, filepath.Base(relPath))
 		info, err = os.Stat(fullPath)
 		if err != nil {
-			return "", ""
+			return "", "", 0
 		}
 	}
 
@@ -586,21 +605,23 @@ func (imp *Importer) handleMediaFile(media waMedia, opts ImportOptions) (string,
 		maxSize = 100 * 1024 * 1024 // 100MB default
 	}
 	if info.Size() > maxSize {
-		return "", ""
+		return "", "", 0
 	}
 
-	relStoragePath, contentHash, _, err := export.StoreAttachmentFromPath(
+	relStoragePath, contentHash, storedSize, err := export.StoreAttachmentFromPath(
 		opts.AttachmentsDir, fullPath, maxSize)
 	if err != nil {
 		// contentHash is non-empty when hashing succeeded but storage failed;
 		// callers use it to attach metadata to the unstored attachment row.
-		return "", contentHash
+		return "", contentHash, 0
 	}
-	return relStoragePath, contentHash
+	return relStoragePath, contentHash, storedSize
 }
 
 // updateAttachmentMetadata updates media-specific metadata on an attachment record.
-func (imp *Importer) updateAttachmentMetadata(messageID int64, contentHash, mediaType string, media waMedia) {
+func (imp *Importer) updateAttachmentMetadata(
+	ctx context.Context, messageID int64, contentHash, mediaType string, media waMedia,
+) error {
 	var width, height, durationMS sql.NullInt64
 	if media.Width.Valid && media.Width.Int64 > 0 {
 		width = media.Width
@@ -613,10 +634,8 @@ func (imp *Importer) updateAttachmentMetadata(messageID int64, contentHash, medi
 		durationMS = sql.NullInt64{Int64: media.MediaDuration.Int64 * 1000, Valid: true}
 	}
 
-	_, _ = imp.store.DB().Exec(imp.store.Rebind(`
-		UPDATE attachments SET media_type = ?, width = ?, height = ?, duration_ms = ?
-		WHERE message_id = ? AND (content_hash = ? OR content_hash IS NULL)
-	`), mediaType, width, height, durationMS, messageID, contentHash)
+	return imp.store.UpdateAttachmentMediaMetadataContext(
+		ctx, messageID, contentHash, mediaType, width, height, durationMS)
 }
 
 // lookupMessageByKeyID looks up a previously imported message by its WhatsApp key_id.
@@ -634,10 +653,8 @@ func (imp *Importer) lookupMessageByKeyID(sourceID int64, keyID string) (int64, 
 }
 
 // setReplyTo sets the reply_to_message_id on a message.
-func (imp *Importer) setReplyTo(messageID, replyToID int64) {
-	_, _ = imp.store.DB().Exec(imp.store.Rebind(`
-		UPDATE messages SET reply_to_message_id = ? WHERE id = ?
-	`), replyToID, messageID)
+func (imp *Importer) setReplyTo(ctx context.Context, messageID, replyToID int64) error {
+	return imp.store.SetMessageReplyContext(ctx, messageID, replyToID)
 }
 
 // verifyWhatsAppDB checks that the database looks like a WhatsApp msgstore.db.

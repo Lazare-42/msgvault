@@ -19,23 +19,18 @@
 
   export type ReadingPaneStatus = 'ready' | 'loading' | 'missing' | 'error' | 'unavailable';
 
-  /** Rows archived before message types existed carry a blank message_type
-   * and count as email, matching the server's task-link gate
-   * (store.IsEmailMessageType). */
-  function isEmailMessageType(messageType: string): boolean {
-    return messageType === '' || messageType === 'email';
-  }
 </script>
 
 <script lang="ts">
-  import { Button } from '@kenn-io/kit-ui';
+  import { Button, EmptyState } from '@kenn-io/kit-ui';
   import { onDestroy, untrack } from 'svelte';
 
   import type { APIClient } from '../../api/client';
   import { createExploreAPI } from '../../explore/api';
   import { filtersForGroup } from '../../explore/group-context';
   import type { ExploreCacheUnavailable, ExploreFileFact, ExploreFilter } from '../../explore/models';
-  import EmptyState from '../common/EmptyState.svelte';
+  import { isEmailMessageType } from '../../explore/models';
+  import IdentityBadge from '../explore/IdentityBadge.svelte';
   import TaskLinks from '../tasks/TaskLinks.svelte';
   import AttachmentRail from './AttachmentRail.svelte';
   import ConversationView from './ConversationView.svelte';
@@ -217,6 +212,12 @@
     <div class="pane-heading">
       <strong class="pane-title">{title}</strong>
       {#if metaStrip}<span class="pane-meta" data-mono>{metaStrip}</span>{/if}
+      {#if selection?.kind === 'entry' && isEmailMessageType(selection.row.message_type)}
+        <IdentityBadge
+          senderIdentities={selection.row.matched_sender_identities}
+          recipientIdentities={selection.row.matched_recipient_identities}
+        />
+      {/if}
     </div>
     <div class="pane-actions">
       {#if showTasks}
@@ -269,12 +270,12 @@
             {unavailable.message} Rebuild the cache with <code>{unavailable.recovery_action}</code>.
           </p>
         {:else}
-          <EmptyState
-            glyph="envelope"
-            label="Nothing to read here"
-            hint={statusMessage || 'The selected result is no longer available in this context.'}
-            role="alert"
-          />
+          <div role={status === 'error' || status === 'missing' ? 'alert' : undefined}>
+            <EmptyState
+              title="Nothing to read here"
+              description={statusMessage || 'The selected result is no longer available in this context.'}
+            />
+          </div>
         {/if}
       </section>
     {:else if selection.kind === 'entry'}

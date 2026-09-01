@@ -1,5 +1,21 @@
 # CLAUDE.md
 
+@CONSTITUTION.md
+
+## Feature Discovery
+
+For uncertain new features, use these rules as a reasoning checkpoint.
+Do not create a design document merely to satisfy them.
+
+- Start from the concrete user outcome and inspect the nearest real artifact or production path with safe, reversible checks.
+- For local archives and importers, inspect schemas and aggregate metadata before recommending external services or indirect workflows.
+  Do not display personal content or identifiers unless explicitly needed and authorized.
+- Keep verified source capabilities, current msgvault support, workaround dependencies and trust costs, and unverified assumptions separate.
+- Prefer the smallest bounded end-to-end vertical slice through the relevant production path.
+  Treat only conditions blocking the next reversible step as prerequisites.
+- When the user asks to contribute upstream and the contribution is uncertain, prefer a focused draft PR linked to the motivating issue.
+  Defer unrelated hardening until evidence or feedback makes it necessary.
+
 ## General Workflow
 
 When a task involves multiple steps (e.g., implement + commit + PR), complete ALL steps in sequence without stopping. If creating a branch, committing, and opening a PR, finish the entire chain.
@@ -165,8 +181,21 @@ See `docs/internal/PG_STATUS.md` for the current implementation state and
 follow-up work.
 
 **Test env**: `MSGVAULT_TEST_DB=postgres://...` runs PostgreSQL-backed
-tests (`make test-pg`). pgvector tests require a PostgreSQL instance
-with the `vector` extension and the `pgvector` build tag.
+tests. pgvector tests require a PostgreSQL instance with the `vector`
+extension and the `pgvector` build tag.
+
+There are two PostgreSQL configurations to cover: the pgvector build
+(`make test-pg`) and the shipped build, which has no pgvector tag
+(`make test-pg-shipped`). Run `make test-pg-both` rather than both of those —
+the tag changes the test binary of only the packages listed in
+`PG_SHIPPED_ONLY_PKGS` in the Makefile, so the second full run would reprove
+the first. Fixtures build their schemas in concurrent
+batches (`internal/testutil/pg_warm_pool.go`) rather than one at a time: a
+fixture that finds the buffer empty builds several and the next few claim
+theirs for free. All of that happens inside the claiming fixture's own setup —
+the pool runs no background work, so it can never issue a statement while a
+test body is running. Each schema is still private to its test, still built by
+the same `InitSchema()` path, and still dropped on cleanup.
 
 ## Parquet Analytics
 
@@ -221,6 +250,15 @@ Sync is **read-only** - no modifications to Gmail.
 
 Never use real people's names, email addresses, or identifiers in test fixtures. Use obviously synthetic names: `alice`, `bob`, `Test User`, `user@example.com`. Before committing test data, verify no real PII is present.
 
+Exception: the provenance-documented Enron web UI fixture stored on the
+`docs-fixtures` orphan branch and its derived documentation screenshots may
+retain authentic names, addresses, and message text. This is a narrowly scoped
+public-research-data exception for the real-importer documentation smoke path;
+it does not permit copying those identities into ordinary tests or fixtures.
+The fixture manifest and README must record source provenance, attribution,
+the completed message-by-message sensitive-content review, and the reviewed
+artifact digest before publication.
+
 ## Go Development
 
 After making any Go code changes, always run `go fmt ./...` and `go vet ./...` before committing. Stage ALL resulting changes, including formatting-only files.
@@ -243,6 +281,13 @@ Do not add bash tests that grep shell scripts, workflows, config files, or docs
 for expected implementation text. Those checks are usually tautological. Use
 real execution, parser/tool-native validation, or a documented manual release
 check instead.
+
+### Timing and liveness tests
+
+Use timeouts only to bound a wait for observable behavior.
+
+- **Bad:** Require ten polls in one second.
+- **Good:** Wait up to 30 seconds for the cursor to advance.
 
 **Mapping rule:**
 - `require.X` — halts the test on failure (replaces what was `t.Fatalf` / `t.Fatal`). Use for setup operations or when subsequent assertions would be meaningless on failure.
@@ -284,7 +329,9 @@ automatically:
 ```bash
 make install-hooks             # Install pre-commit hook via prek
 make test                      # Run tests (SQLite default)
-make test-pg                   # Run PostgreSQL-backed tests with MSGVAULT_TEST_DB set
+make test-pg-both              # Both PostgreSQL configurations, needs MSGVAULT_TEST_DB
+make test-pg                   # PostgreSQL, pgvector build only
+make test-pg-shipped           # PostgreSQL, shipped build only
 make fmt                       # Format code (go fmt)
 make lint                      # Run linter (auto-fix)
 make lint-ci                   # Run linter (CI, no auto-fix)

@@ -237,6 +237,7 @@ func NewDuckDBEngine(analyticsDir string, sqlitePath string, sqliteDB *sql.DB, o
 		{datasetParticipants, "phone_number"},
 		{datasetMessages, "attachment_count"},
 		{datasetMessages, "sender_id"},
+		{datasetMessages, "owner_participant_id"},
 		{datasetMessages, messageTypeDimension},
 		{datasetConversations, "title"},
 		{datasetConversations, "conversation_type"},
@@ -581,7 +582,8 @@ func (e *DuckDBEngine) currentCacheFingerprint() string {
 // integer/boolean columns as VARCHAR, causing type mismatch errors in JOINs
 // and COALESCE expressions.
 //
-// Optional columns (phone_number, attachment_count, sender_id, message_type)
+// Optional columns (phone_number, attachment_count, sender_id,
+// owner_participant_id, message_type)
 // are handled gracefully: if the Parquet file predates their addition, they
 // are synthesised with sensible defaults instead of causing a binder error.
 // Every caller holds the shared cache read lock (via acquireQuerySlot or
@@ -609,6 +611,11 @@ func (e *DuckDBEngine) parquetCTEs() string {
 		msgReplace = append(msgReplace, "TRY_CAST(sender_id AS BIGINT) AS sender_id")
 	} else {
 		msgExtra = append(msgExtra, "NULL::BIGINT AS sender_id")
+	}
+	if e.hasCol(datasetMessages, "owner_participant_id") {
+		msgReplace = append(msgReplace, "TRY_CAST(owner_participant_id AS BIGINT) AS owner_participant_id")
+	} else {
+		msgExtra = append(msgExtra, "NULL::BIGINT AS owner_participant_id")
 	}
 	if e.hasCol(datasetMessages, messageTypeDimension) {
 		msgReplace = append(msgReplace, "COALESCE(CAST(message_type AS VARCHAR), '') AS message_type")
@@ -727,6 +734,12 @@ func (e *DuckDBEngine) parquetCTEs() string {
 		),
 		conv AS (
 			%s
+		),
+		cp AS (
+			SELECT
+				CAST(conversation_id AS BIGINT) AS conversation_id,
+				CAST(participant_id AS BIGINT) AS participant_id
+			FROM read_parquet('%s')
 		)
 		`, msgCTE,
 		e.parquetPath("message_recipients"),
@@ -735,7 +748,8 @@ func (e *DuckDBEngine) parquetCTEs() string {
 		e.parquetPath("message_labels"),
 		e.parquetPath("attachments"),
 		srcCTE,
-		convCTE)
+		convCTE,
+		e.parquetPath(datasetConversationParticipants))
 }
 
 // duckDBMessageTypeCondition builds a message_type predicate for the parquet
@@ -2019,9 +2033,7 @@ func (e *DuckDBEngine) Search(ctx context.Context, q *search.Query, limit, offse
 	var args []any
 	var joins []string
 
-	// Exclude rows soft-deleted by deduplicate; gate source-deleted on
-	// q.HideDeleted via the helper.
-	conditions = append(conditions, store.LiveMessagesWhere("m", q.HideDeleted))
+	conditions = append(conditions, searchMessageVisibilityWhere("m", q))
 
 	// From filter
 	if len(q.FromAddrs) > 0 {
@@ -2227,16 +2239,16 @@ func (e *DuckDBEngine) SearchByDomains(ctx context.Context, domains []string, af
 	return nil, errors.New("SearchByDomains requires SQLite engine (participant data not in Parquet cache)")
 }
 
-func (e *DuckDBEngine) GetGmailIDsByFilter(ctx context.Context, filter MessageFilter) ([]string, error) {
+func (e *DuckDBEngine) GetDeletionTargetsByFilter(ctx context.Context, filter MessageFilter) ([]DeletionTarget, error) {
 	// Delegate to SQLite for authoritative deletion status.
 	// Parquet cache may be stale if deletions occurred after the last build.
 	if e.sqliteEngine != nil {
-		return e.sqliteEngine.GetGmailIDsByFilter(ctx, filter)
+		return e.sqliteEngine.GetDeletionTargetsByFilter(ctx, filter)
 	}
 
 	// Fall back to Parquet if no SQLite engine available (shouldn't happen in practice)
 	if e.analyticsDir == "" {
-		return nil, errors.New("GetGmailIDsByFilter requires SQLite or Parquet data")
+		return nil, errors.New("GetDeletionTargetsByFilter requires SQLite or Parquet data")
 	}
 	release, err := e.acquireCacheRead(ctx)
 	if err != nil {
@@ -2363,7 +2375,7 @@ func (e *DuckDBEngine) GetGmailIDsByFilter(ctx context.Context, filter MessageFi
 
 	if filter.TimeRange.Period != "" {
 		granularity := inferTimeGranularity(filter.TimeRange.Granularity, filter.TimeRange.Period)
-		// GetGmailIDsByFilter uses strftime for time filtering (no year/month columns)
+		// GetDeletionTargetsByFilter uses strftime for time filtering (no year/month columns)
 		var te string
 		switch granularity {
 		case TimeYear:
@@ -2389,7 +2401,7 @@ func (e *DuckDBEngine) GetGmailIDsByFilter(ctx context.Context, filter MessageFi
 	// Build query — JOIN src to scope to Gmail sources authoritatively.
 	query := fmt.Sprintf(`
 		WITH %s
-		SELECT msg.source_message_id
+		SELECT msg.id, msg.source_id, COALESCE(src.source_type, 'gmail'), src.account_email, msg.source_message_id
 		FROM msg
 		JOIN src ON src.id = msg.source_id AND COALESCE(src.source_type, 'gmail') = 'gmail'
 		WHERE %s
@@ -2404,25 +2416,19 @@ func (e *DuckDBEngine) GetGmailIDsByFilter(ctx context.Context, filter MessageFi
 
 	rows, err := e.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("get gmail ids: %w", err)
+		return nil, fmt.Errorf("get deletion targets: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
-	return collectGmailIDs(rows)
+	return collectDeletionTargets(rows)
 }
 
-// GetGmailIDsByMessageIDs returns Gmail message IDs for internal message
-// IDs, enforcing the same live-message and Gmail-source constraints as
-// GetGmailIDsByFilter. Non-qualifying IDs are silently dropped. The
-// lookup is chunked so large explicit selections stay under
-// bind-parameter limits.
-func (e *DuckDBEngine) GetGmailIDsByMessageIDs(ctx context.Context, ids []int64) ([]string, error) {
-	// Delegate to SQLite for authoritative deletion status.
+func (e *DuckDBEngine) GetDeletionTargetsByMessageIDs(ctx context.Context, ids []int64) ([]DeletionTarget, error) {
 	if e.sqliteEngine != nil {
-		return e.sqliteEngine.GetGmailIDsByMessageIDs(ctx, ids)
+		return e.sqliteEngine.GetDeletionTargetsByMessageIDs(ctx, ids)
 	}
 	if e.analyticsDir == "" {
-		return nil, errors.New("GetGmailIDsByMessageIDs requires SQLite or Parquet data")
+		return nil, errors.New("GetDeletionTargetsByMessageIDs requires SQLite or Parquet data")
 	}
 	if len(ids) == 0 {
 		return nil, nil
@@ -2432,83 +2438,29 @@ func (e *DuckDBEngine) GetGmailIDsByMessageIDs(ctx context.Context, ids []int64)
 		return nil, err
 	}
 	defer release()
-	return gmailIDsByMessageIDsChunked(ctx, ids, e.gmailIDsForMessageIDChunk)
+	return deletionTargetsByMessageIDsChunked(ctx, ids, e.deletionTargetsForMessageIDChunk)
 }
 
-func (e *DuckDBEngine) gmailIDsForMessageIDChunk(ctx context.Context, ids []int64) ([]gmailIDRow, error) {
+func (e *DuckDBEngine) deletionTargetsForMessageIDChunk(ctx context.Context, ids []int64) ([]deletionTargetRow, error) {
 	placeholders := make([]string, len(ids))
 	args := make([]any, len(ids))
 	for i, id := range ids {
 		placeholders[i] = "?"
 		args[i] = id
 	}
-	query := fmt.Sprintf(`
+	q := fmt.Sprintf(`
 		WITH %s
-		SELECT msg.source_message_id, msg.sent_at, msg.id
+		SELECT msg.id, msg.source_id, COALESCE(src.source_type, 'gmail'), src.account_email,
+		       msg.source_message_id, msg.sent_at
 		FROM msg
 		JOIN src ON src.id = msg.source_id AND COALESCE(src.source_type, 'gmail') = 'gmail'
 		WHERE %s AND msg.id IN (%s)
 	`, e.parquetCTEs(), store.LiveMessagesWhere("msg", true), strings.Join(placeholders, ","))
-
-	rows, err := e.db.QueryContext(ctx, query, args...)
+	rows, err := e.db.QueryContext(ctx, q, args...)
 	if err != nil {
-		return nil, fmt.Errorf("get gmail ids by message ids: %w", err)
+		return nil, fmt.Errorf("get deletion targets by message ids: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
-
-	return collectGmailIDRows(rows)
-}
-
-// GetAccountsByGmailIDs returns the distinct Gmail account identifiers
-// owning live messages with the given Gmail IDs, sorted ascending. See
-// the SQLite implementation for the deletion-staging rationale and the
-// chunking that keeps large selections under bind-parameter limits.
-func (e *DuckDBEngine) GetAccountsByGmailIDs(ctx context.Context, gmailIDs []string) ([]string, error) {
-	// Delegate to SQLite for authoritative deletion status.
-	if e.sqliteEngine != nil {
-		return e.sqliteEngine.GetAccountsByGmailIDs(ctx, gmailIDs)
-	}
-	if e.analyticsDir == "" {
-		return nil, errors.New("GetAccountsByGmailIDs requires SQLite or Parquet data")
-	}
-	if len(gmailIDs) == 0 {
-		return nil, nil
-	}
-	release, err := e.acquireCacheRead(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer release()
-	return accountsByGmailIDsChunked(ctx, gmailIDs, e.accountsForGmailIDChunk)
-}
-
-func (e *DuckDBEngine) accountsForGmailIDChunk(ctx context.Context, gmailIDs []string) ([]string, error) {
-	placeholders := make([]string, len(gmailIDs))
-	args := make([]any, len(gmailIDs))
-	for i, id := range gmailIDs {
-		placeholders[i] = "?"
-		args[i] = id
-	}
-	// The Parquet sources dataset exposes the account identifier as
-	// account_email (see build-cache ETL).
-	query := fmt.Sprintf(`
-		WITH %s
-		SELECT src.account_email
-		FROM src
-		WHERE COALESCE(src.source_type, 'gmail') = 'gmail' AND EXISTS (
-			SELECT 1 FROM msg
-			WHERE msg.source_id = src.id AND %s AND msg.source_message_id IN (%s)
-		)
-		ORDER BY src.account_email
-	`, e.parquetCTEs(), store.LiveMessagesWhere("msg", true), strings.Join(placeholders, ","))
-
-	rows, err := e.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, fmt.Errorf("get accounts by gmail ids: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	return collectGmailIDs(rows)
+	return collectDeletionTargetRows(rows)
 }
 
 // RequiredParquetDirs lists the analytics subdirectories that must each

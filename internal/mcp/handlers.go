@@ -3,12 +3,11 @@ package mcp
 import (
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"math"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,20 +15,25 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/skip2/go-qrcode"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/export"
 	"go.kenn.io/msgvault/internal/gmail"
 	"go.kenn.io/msgvault/internal/googledocs"
+	"go.kenn.io/msgvault/internal/peoplebrowser"
+	"go.kenn.io/msgvault/internal/personscope"
+	personresolver "go.kenn.io/msgvault/internal/personscope/resolver"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/chunkmatch"
+	vectordocument "go.kenn.io/msgvault/internal/vector/document"
 	"go.kenn.io/msgvault/internal/vector/embed"
 	"go.kenn.io/msgvault/internal/vector/hybrid"
+	"go.kenn.io/msgvault/internal/vector/visual"
 	whatsapplive "go.kenn.io/msgvault/internal/whatsapp/live"
+	"go.kenn.io/msgvault/pkg/client/generated"
 )
 
 const (
@@ -38,11 +42,30 @@ const (
 	defaultSearchLimit     = 20
 	// searchContextChars is the max byte length of each matches[] snippet in
 	// search_message_bodies and search_in_message.
-	searchContextChars = 300
-	defaultBodyChars   = 2000
-	bodyFormatAuto     = "auto"
-	bodyFormatText     = "text"
-	bodyFormatHTML     = "html"
+	searchContextChars   = 300
+	defaultBodyChars     = 2000
+	bodyFormatAuto       = "auto"
+	bodyFormatText       = "text"
+	bodyFormatHTML       = "html"
+	toolArgQuery         = "query"
+	toolArgLimit         = "limit"
+	toolArgCursor        = "cursor"
+	toolArgPersonID      = "person_id"
+	toolArgParticipantID = "participant_id"
+	toolArgMode          = "mode"
+	toolArgMessageID     = "message_id"
+	toolArgAfter         = "after"
+	toolArgBefore        = "before"
+	toolArgAccount       = "account"
+	toolArgOffset        = "offset"
+	toolArgMinScore      = "min_score"
+	toolArgMaxChars      = "max_chars"
+	toolArgAttachmentID  = "attachment_id"
+	toolArgDestination   = "destination"
+	toolArgFrom          = "from"
+	toolArgGroupBy       = "group_by"
+	toolArgDomains       = "domains"
+	toolArgSender        = "sender"
 	// maxBodyChars caps the body slice returned by get_message regardless of what
 	// the caller requests via max_chars. Prevents a single tool call from flooding
 	// the context window; callers page forward using offset.
@@ -102,7 +125,7 @@ func newPaginatedResponseNoTotal[T any](data []T, offset int, hasMore bool) pagi
 }
 
 func searchLimitArg(args map[string]any) int {
-	limit := limitArg(args, "limit", defaultSearchLimit)
+	limit := limitArg(args, toolArgLimit, defaultSearchLimit)
 	if limit <= 0 {
 		return defaultSearchLimit
 	}
@@ -117,27 +140,253 @@ func listLimitArg(args map[string]any) int {
 }
 
 type handlers struct {
-	engine            query.Engine
-	attachmentsDir    string
-	attachmentReader  AttachmentReader
-	manifestSaver     DeletionManifestSaver
-	hybridSearcher    HybridSearcher
-	similarSearcher   SimilarSearcher
-	dataDir           string
-	gmailFactory      GmailClientFactory
-	whatsAppFactory   WhatsAppClientFactory
-	whatsAppLoginURL  string
-	googleDocsFactory GoogleDocsClientFactory
-	ocr               OCRClient
+	engine             query.Engine
+	attachmentsDir     string
+	attachmentReader   AttachmentReader
+	manifestSaver      DeletionManifestSaver
+	hybridSearcher     HybridSearcher
+	similarSearcher    SimilarSearcher
+	dataDir            string
+	gmailFactory       GmailClientFactory
+	whatsAppFactory    WhatsAppClientFactory
+	whatsAppLoginURL   string
+	googleDocsFactory  GoogleDocsClientFactory
+	ocr                OCRClient
+	documentSearcher   DocumentSearcher
+	personFileSearcher PersonFileSearcher
+	peopleBackend      peoplebrowser.Backend
 
 	// Optional vector-search wiring. When hybridEngine is nil, the
 	// search_message_bodies handler rejects mode=vector and mode=hybrid with
 	// a vector_not_enabled error. backend is additionally required by
 	// the find_similar_messages handler to load seed vectors and
 	// resolve the active generation.
-	hybridEngine *hybrid.Engine
-	vectorCfg    vector.Config
-	backend      vector.Backend
+	hybridEngine   *hybrid.Engine
+	vectorCfg      vector.Config
+	backend        vector.Backend
+	visualSearcher VisualSearcher
+}
+
+type VisualSearcher interface {
+	SearchVisualAttachments(ctx context.Context, request VisualSearchRequest) (*visual.SearchResponse, error)
+}
+
+type VisualSearchRequest struct {
+	Text           string
+	Image          []byte
+	Limit          int
+	Cursor         string
+	SenderPersonID int64
+	PersonID       int64
+	ParticipantID  int64
+	Directions     []personscope.Direction
+	SourceID       int64
+	MessageID      int64
+	Filename       string
+	MIMEPrefix     string
+	After, Before  *time.Time
+}
+
+func (h *handlers) searchVisualAttachments(ctx context.Context, req toolRequest) (*toolResult, error) {
+	if h.visualSearcher == nil {
+		return toolErrorResult("visual_search_not_ready: visual attachment search is unavailable"), nil
+	}
+	args := req.GetArguments()
+	text, _ := args[bodyFormatText].(string)
+	imageBase64, _ := args["image_base64"].(string)
+	if (strings.TrimSpace(text) == "") == (imageBase64 == "") {
+		return toolErrorResult("invalid_visual_query: provide exactly one of text or image_base64"), nil
+	}
+	limit := 20
+	if raw, ok := args[toolArgLimit].(float64); ok {
+		if raw < 1 || raw > 100 || raw != math.Trunc(raw) {
+			return toolErrorResult("invalid_limit: limit must be between 1 and 100"), nil
+		}
+		limit = int(raw)
+	}
+	senderPersonID := int64(0)
+	if raw, ok := args["sender_person_id"].(float64); ok {
+		if raw < 1 || raw > math.MaxInt64 || raw != math.Trunc(raw) {
+			return toolErrorResult("invalid_sender_person_id: sender_person_id must be positive"), nil
+		}
+		senderPersonID = int64(raw)
+	}
+	parsePositiveID := func(name string) (int64, *toolResult) {
+		raw, exists := args[name].(float64)
+		if !exists {
+			return 0, nil
+		}
+		if raw < 1 || raw > math.MaxInt64 || raw != math.Trunc(raw) {
+			return 0, toolErrorResult("invalid_" + name + ": " + name + " must be positive")
+		}
+		return int64(raw), nil
+	}
+	sourceID, toolErr := parsePositiveID("source_id")
+	if toolErr != nil {
+		return toolErr, nil
+	}
+	messageID, toolErr := parsePositiveID(toolArgMessageID)
+	if toolErr != nil {
+		return toolErr, nil
+	}
+	personID, toolErr := parsePositiveID(toolArgPersonID)
+	if toolErr != nil {
+		return toolErr, nil
+	}
+	participantID, toolErr := parsePositiveID(toolArgParticipantID)
+	if toolErr != nil {
+		return toolErr, nil
+	}
+	rawDirections, err := stringArrayArg(args, "directions")
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	var directions []personscope.Direction
+	if len(rawDirections) > 0 {
+		directions = make([]personscope.Direction, len(rawDirections))
+		for i, raw := range rawDirections {
+			directions[i] = personscope.Direction(raw)
+		}
+		if _, _, err := personresolver.NormalizeDirections(directions); err != nil {
+			return toolErrorResult(err.Error()), nil
+		}
+	}
+	if senderPersonID > 0 && (personID > 0 || participantID > 0 || len(directions) > 0) {
+		return toolErrorResult("sender_person_id cannot be combined with person_id, participant_id, or directions"), nil
+	}
+	if personID > 0 && participantID > 0 {
+		return toolErrorResult("person_id and participant_id are mutually exclusive"), nil
+	}
+	if len(directions) > 0 && personID == 0 && participantID == 0 {
+		return toolErrorResult("directions require person_id or participant_id"), nil
+	}
+	cursor, _ := args[toolArgCursor].(string)
+	filename, _ := args["filename"].(string)
+	mimePrefix, _ := args["mime_prefix"].(string)
+	after, err := getDateArg(args, toolArgAfter)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	before, err := getDateArg(args, toolArgBefore)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	if after != nil && before != nil && !after.Before(*before) {
+		return toolErrorResult("invalid date range: after must be before before"), nil
+	}
+	var image []byte
+	if imageBase64 != "" {
+		decoded, err := base64.StdEncoding.DecodeString(imageBase64)
+		if err != nil || int64(len(decoded)) > visual.MaxQueryImageBytes {
+			return toolErrorResult("invalid_visual_query: image_base64 is invalid or too large"), nil //nolint:nilerr // MCP tool errors are successful protocol responses.
+		}
+		image = decoded
+	}
+	response, err := h.visualSearcher.SearchVisualAttachments(ctx, VisualSearchRequest{
+		Text: text, Image: image, Limit: limit, Cursor: cursor, SenderPersonID: senderPersonID,
+		PersonID: personID, ParticipantID: participantID, Directions: directions,
+		SourceID: sourceID, MessageID: messageID, Filename: filename, MIMEPrefix: mimePrefix,
+		After: after, Before: before,
+	})
+	if err != nil {
+		return toolErrorResult("visual_search_failed: " + err.Error()), nil //nolint:nilerr // MCP tool errors are successful protocol responses.
+	}
+	return jsonResult(response)
+}
+
+// DocumentSearcher runs the dedicated extracted-document retrieval contract.
+// Daemon-backed MCP supplies an HTTP client implementation, keeping this MCP
+// process out of the archive database.
+type DocumentSearcher interface {
+	SearchDocuments(ctx context.Context, request store.DocumentSearchRequest) (store.DocumentSearchResponse, error)
+}
+
+type PersonFileSearcher interface {
+	SearchPersonFiles(ctx context.Context, request PersonFileSearchRequest) (generated.PersonFileSearchHTTPResponse, error)
+}
+
+type PersonFileSearchRequest struct {
+	PersonID     int64
+	Directions   []personscope.Direction
+	After        *time.Time
+	Before       *time.Time
+	Filename     string
+	MIMEFamilies []query.FileMIMEFamily
+	Limit        int
+	Cursor       string
+}
+
+func (h *handlers) searchPersonFiles(ctx context.Context, req toolRequest) (*toolResult, error) {
+	if h.personFileSearcher == nil {
+		return toolErrorResult("person_file_search_unavailable: person file search is not configured"), nil
+	}
+	args := req.GetArguments()
+	personID, err := getIDArg(args, toolArgPersonID)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	rawDirections, err := stringArrayArg(args, "directions")
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	var directions []personscope.Direction
+	if len(rawDirections) > 0 {
+		directions = make([]personscope.Direction, len(rawDirections))
+	}
+	for i, raw := range rawDirections {
+		directions[i] = personscope.Direction(raw)
+	}
+	normalizedDirections, _, err := personresolver.NormalizeDirections(directions)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	if len(directions) > 0 {
+		directions = normalizedDirections
+	}
+	after, err := getDateArg(args, toolArgAfter)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	before, err := getDateArg(args, toolArgBefore)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	if after != nil && before != nil && !after.Before(*before) {
+		return toolErrorResult("invalid date range: after must be before before"), nil
+	}
+	rawFamilies, err := stringArrayArg(args, "mime_families")
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	families := make([]query.FileMIMEFamily, len(rawFamilies))
+	for i, raw := range rawFamilies {
+		family := query.FileMIMEFamily(strings.ToLower(strings.TrimSpace(raw)))
+		switch family {
+		case query.FileMIMEImage, query.FileMIMEPDF, query.FileMIMEAudio, query.FileMIMEVideo,
+			query.FileMIMEText, query.FileMIMEDocument, query.FileMIMEArchive, query.FileMIMEOther:
+			families[i] = family
+		default:
+			return toolErrorResult(fmt.Sprintf("unknown file MIME family %q", raw)), nil
+		}
+	}
+	limit := 100
+	if _, found := args[toolArgLimit]; found {
+		parsed, parseErr := positiveInt64Arg(args, toolArgLimit)
+		if parseErr != nil || parsed > 100 {
+			return toolErrorResult("limit must be an integer between 1 and 100"), nil //nolint:nilerr // MCP tool errors are successful protocol responses.
+		}
+		limit = int(parsed)
+	}
+	filename, _ := args["filename"].(string)
+	cursor, _ := args[toolArgCursor].(string)
+	response, err := h.personFileSearcher.SearchPersonFiles(ctx, PersonFileSearchRequest{
+		PersonID: personID, Directions: directions, After: after, Before: before,
+		Filename: strings.TrimSpace(filename), MIMEFamilies: families, Limit: limit, Cursor: cursor,
+	})
+	if err != nil {
+		return toolErrorResult("person file search failed: " + err.Error()), nil //nolint:nilerr // MCP tool errors are successful protocol responses.
+	}
+	return jsonResult(response)
 }
 
 // AttachmentReader fetches content-addressed attachment bytes. It is optional:
@@ -154,49 +403,70 @@ type OCRClient interface {
 	RequestOCR(context.Context, string, string) (*store.OCRResult, error)
 }
 
-func (h *handlers) getOCRStatus(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	status, err := h.ocr.OCRStatus(ctx)
+// readAttachmentFile loads a content-addressed attachment for draft uploads.
+func (h *handlers) readAttachmentFile(contentHash string) ([]byte, error) {
+	filePath, err := export.StoragePath(h.attachmentsDir, contentHash)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("get OCR status: %v", err)), nil
+		return nil, errors.New("attachment has invalid content hash")
 	}
-	return structuredJSONResult(status)
+	f, err := os.Open(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("attachment file not available: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	data, err := io.ReadAll(io.LimitReader(f, maxAttachmentSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("attachment file not available: %w", err)
+	}
+	if int64(len(data)) > maxAttachmentSize {
+		return nil, fmt.Errorf("attachment too large: %d bytes (max %d)", len(data), maxAttachmentSize)
+	}
+	return data, nil
 }
 
-func (h *handlers) searchAttachmentText(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) getOCRStatus(ctx context.Context, _ toolRequest) (*toolResult, error) {
+	status, err := h.ocr.OCRStatus(ctx)
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("get OCR status: %v", err)), nil
+	}
+	return jsonResult(status)
+}
+
+func (h *handlers) searchAttachmentText(ctx context.Context, request toolRequest) (*toolResult, error) {
 	args := request.GetArguments()
 	query, _ := args["query"].(string)
 	if strings.TrimSpace(query) == "" {
-		return mcp.NewToolResultError("query is required"), nil
+		return toolErrorResult("query is required"), nil
 	}
 	hits, err := h.ocr.SearchOCR(ctx, query, limitArg(args, "limit", 20))
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("search attachment text: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("search attachment text: %v", err)), nil
 	}
-	return structuredJSONResult(hits)
+	return jsonArrayResult("results", hits)
 }
 
-func (h *handlers) getAttachmentText(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) getAttachmentText(ctx context.Context, request toolRequest) (*toolResult, error) {
 	hash, _ := request.GetArguments()["content_hash"].(string)
 	if strings.TrimSpace(hash) == "" {
-		return mcp.NewToolResultError("content_hash is required"), nil
+		return toolErrorResult("content_hash is required"), nil
 	}
 	result, err := h.ocr.GetOCRResult(ctx, hash, true)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("get attachment text: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("get attachment text: %v", err)), nil
 	}
-	return structuredJSONResult(result)
+	return jsonResult(result)
 }
 
-func (h *handlers) requestAttachmentText(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) requestAttachmentText(ctx context.Context, request toolRequest) (*toolResult, error) {
 	hash, _ := request.GetArguments()["content_hash"].(string)
 	if strings.TrimSpace(hash) == "" {
-		return mcp.NewToolResultError("content_hash is required"), nil
+		return toolErrorResult("content_hash is required"), nil
 	}
 	result, err := h.ocr.RequestOCR(ctx, hash, "")
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("request attachment text: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("request attachment text: %v", err)), nil
 	}
-	return structuredJSONResult(result)
+	return jsonResult(result)
 }
 
 // DeletionManifestSaver persists staged deletion manifests. It is optional:
@@ -266,36 +536,114 @@ type SimilarSearchResult struct {
 	Messages      []query.MessageSummary
 }
 
+type expectedHandlerError struct {
+	message string
+}
+
+func (e *expectedHandlerError) Error() string { return e.message }
+
+type daemonAPIErrorCoder interface {
+	APIErrorCode() string
+}
+
+func translateDaemonRequestError(err error) *toolResult {
+	var coded daemonAPIErrorCoder
+	if !errors.As(err, &coded) {
+		return nil
+	}
+
+	var message string
+	switch coded.APIErrorCode() {
+	case "invalid_query":
+		message = "invalid_query: search query is invalid"
+	case "invalid_account":
+		message = "invalid_account: account filter is invalid"
+	case "account_not_found":
+		message = "account_not_found: requested account was not found"
+	case "pagination_unsupported":
+		message = "pagination_unsupported: this search mode does not support the requested page"
+	case "pagination_limit":
+		message = "pagination_limit: requested offset exceeds the available search window"
+	case "invalid_limit":
+		message = "invalid_limit: result limit is invalid"
+	case "body_search_unavailable":
+		message = "body_search_unavailable: exact message body search is unavailable"
+	case "body_search_index_unavailable":
+		message = "body_search_index_unavailable: message body search index is unavailable"
+	case "invalid_message_id":
+		message = "invalid_message_id: seed message ID is invalid"
+	default:
+		return nil
+	}
+	return toolErrorResult(message)
+}
+
+func dependencyError(operation string, err error) (*toolResult, error) {
+	if expected, ok := errors.AsType[*expectedHandlerError](err); ok {
+		return toolErrorResult(expected.message), nil
+	}
+	if result := translateVectorErr(err); result != nil {
+		return result, nil
+	}
+	if result := translateDaemonRequestError(err); result != nil {
+		return result, nil
+	}
+	return nil, newInternalError(operation, err)
+}
+
+func messageLookupError(operation string, err error) (*toolResult, error) {
+	if errors.Is(err, os.ErrNotExist) || err.Error() == "not found" {
+		return toolErrorResult("message not found"), nil
+	}
+	return dependencyError(operation, err)
+}
+
+func bodySearchError(err error) (*toolResult, error) {
+	switch {
+	case errors.Is(err, query.ErrMessageBodySearchUnavailable):
+		return toolErrorResult("search failed: exact message body search is unavailable"), nil
+	case errors.Is(err, query.ErrMessageBodySearchIndexStale):
+		return toolErrorResult("search failed: message body search index layout is stale"), nil
+	case errors.Is(err, query.ErrMessageBodySearchInvalidQuery):
+		return toolErrorResult("search failed: invalid message body search query"), nil
+	default:
+		if result := translateDaemonRequestError(err); result != nil {
+			return result, nil
+		}
+		return nil, newInternalError("search message bodies", err)
+	}
+}
+
 // translateVectorErr maps well-known vector sentinel errors to MCP tool
 // error results. Returns nil if the error is not a known sentinel
 // (callers should wrap it themselves).
-func translateVectorErr(err error) *mcp.CallToolResult {
+func translateVectorErr(err error) *toolResult {
 	switch {
 	case errors.Is(err, vector.ErrNotEnabled):
-		return mcp.NewToolResultError(
+		return toolErrorResult(
 			"vector_not_enabled: vector search is not configured",
 		)
 	case errors.Is(err, vector.ErrIndexStale):
-		return mcp.NewToolResultError(
-			"index_stale: the vector index does not match the configured model; " +
-				"run `msgvault embeddings build --full-rebuild`",
+		return toolErrorResult(
+			"index_stale: the vector index does not match configured embedding settings; " +
+				"align [vector.embed.scope] accounts for an existing account-scoped index, or run `msgvault embeddings build --full-rebuild`",
 		)
 	case errors.Is(err, vector.ErrIndexBuilding):
-		return mcp.NewToolResultError(
+		return toolErrorResult(
 			"index_building: the initial vector index is still being built",
 		)
 	case errors.Is(err, vector.ErrIndexScopeMismatch):
-		return mcp.NewToolResultError(
+		return toolErrorResult(
 			"index_scope_mismatch: the vector index scope does not cover this query; " +
 				"add a matching message_type filter or rebuild embeddings for the requested scope",
 		)
 	case errors.Is(err, vector.ErrNoActiveGeneration):
-		return mcp.NewToolResultError(
+		return toolErrorResult(
 			"no_active_generation: vector search has no active index yet; " +
 				"run `msgvault embeddings build` to build one",
 		)
 	case errors.Is(err, vector.ErrEmbeddingTimeout):
-		return mcp.NewToolResultError(
+		return toolErrorResult(
 			"embedding_timeout: the embedding endpoint did not respond in time; " +
 				"retry, or raise [vector.embeddings].timeout in config",
 		)
@@ -341,14 +689,22 @@ func (h *handlers) getAccountID(ctx context.Context, account string) (*int64, er
 	}
 	accounts, err := h.engine.ListAccounts(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list accounts: %w", err)
+		return nil, newInternalError("list accounts", err)
 	}
+	var matched *int64
 	for _, acc := range accounts {
 		if acc.Identifier == account {
-			return &acc.ID, nil
+			if matched != nil {
+				return nil, &expectedHandlerError{message: "account matches multiple sources: " + account}
+			}
+			id := acc.ID
+			matched = &id
 		}
 	}
-	return nil, fmt.Errorf("account not found: %s", account)
+	if matched != nil {
+		return matched, nil
+	}
+	return nil, &expectedHandlerError{message: "account not found: " + account}
 }
 
 // getIDArg extracts a required positive integer ID from the arguments map.
@@ -374,60 +730,6 @@ func getDateArg(args map[string]any, key string) (*time.Time, error) {
 		return nil, fmt.Errorf("invalid %s date %q: expected YYYY-MM-DD", key, v)
 	}
 	return &t, nil
-}
-
-func (h *handlers) readAttachment(ctx context.Context, contentHash string) ([]byte, error) {
-	if h.attachmentReader != nil {
-		return h.readAttachmentFromReader(ctx, contentHash)
-	}
-	return h.readAttachmentFile(contentHash)
-}
-
-func (h *handlers) readAttachmentFromReader(ctx context.Context, contentHash string) ([]byte, error) {
-	if err := export.ValidateContentHash(contentHash); err != nil {
-		return nil, errors.New("attachment has invalid content hash")
-	}
-	data, err := h.attachmentReader.ReadAttachment(ctx, contentHash)
-	if err != nil {
-		return nil, fmt.Errorf("attachment file not available: %w", err)
-	}
-	if int64(len(data)) > maxAttachmentSize {
-		return nil, fmt.Errorf("attachment too large: %d bytes (max %d)", len(data), maxAttachmentSize)
-	}
-	return data, nil
-}
-
-// readAttachmentFile reads the content-addressed attachment file after
-// validating the hash and checking size limits.
-func (h *handlers) readAttachmentFile(contentHash string) ([]byte, error) {
-	filePath, err := export.StoragePath(h.attachmentsDir, contentHash)
-	if err != nil {
-		return nil, errors.New("attachment has invalid content hash")
-	}
-
-	f, err := os.Open(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("attachment file not available: %w", err)
-	}
-	defer func() { _ = f.Close() }()
-
-	info, err := f.Stat()
-	if err != nil {
-		return nil, fmt.Errorf("attachment file not available: %w", err)
-	}
-	if info.Size() > maxAttachmentSize {
-		return nil, fmt.Errorf("attachment too large: %d bytes (max %d)", info.Size(), maxAttachmentSize)
-	}
-
-	data, err := io.ReadAll(io.LimitReader(f, maxAttachmentSize+1))
-	if err != nil {
-		return nil, fmt.Errorf("attachment file not available: %w", err)
-	}
-	if int64(len(data)) > maxAttachmentSize {
-		return nil, fmt.Errorf("attachment too large: %d bytes (max %d)", len(data), maxAttachmentSize)
-	}
-
-	return data, nil
 }
 
 // searchMessageItem carries a message summary plus body match excerpts.
@@ -495,15 +797,15 @@ func (h *handlers) resolveDraftAttachments(ctx context.Context, args map[string]
 // searchMessages preserves the legacy combined search tool while clients
 // migrate to the split tools. An omitted mode retains metadata-search
 // semantics; vector and hybrid modes delegate to semantic_search_messages.
-func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	mode, _ := req.GetArguments()["mode"].(string)
+func (h *handlers) searchMessages(ctx context.Context, req toolRequest) (*toolResult, error) {
+	mode, _ := req.GetArguments()[toolArgMode].(string)
 	switch mode {
 	case "":
 		return h.searchMetadata(ctx, req)
 	case searchModeVector, searchModeHybrid:
 		return h.semanticSearchMessages(ctx, req)
 	default:
-		return mcp.NewToolResultError(
+		return toolErrorResult(
 			fmt.Sprintf("invalid mode %q: must be %s or %s (or omit for metadata search)", mode, searchModeVector, searchModeHybrid),
 		), nil
 	}
@@ -512,29 +814,29 @@ func (h *handlers) searchMessages(ctx context.Context, req mcp.CallToolRequest) 
 // searchMetadata searches message metadata only (subject, sender, recipients,
 // labels, dates). Use search_message_bodies for full-body keyword, vector, or
 // hybrid search.
-func (h *handlers) searchMetadata(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) searchMetadata(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	queryStr, _ := args["query"].(string)
+	queryStr, _ := args[toolArgQuery].(string)
 	if queryStr == "" {
-		return mcp.NewToolResultError("query parameter is required"), nil
+		return toolErrorResult("query parameter is required"), nil
 	}
 
 	q := search.Parse(queryStr)
 	if err := q.Err(); err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	if msg := unsupportedSearchOperatorMessage(q); msg != "" {
-		return mcp.NewToolResultError(msg), nil
+		return toolErrorResult(msg), nil
 	}
 
 	limit := searchLimitArg(args)
-	offset := limitArg(args, "offset", 0)
+	offset := limitArg(args, toolArgOffset, 0)
 
-	account, _ := args["account"].(string)
+	account, _ := args[toolArgAccount].(string)
 	sourceID, err := h.getAccountID(ctx, account)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return dependencyError("resolve metadata-search account", err)
 	}
 
 	if sourceID != nil {
@@ -545,15 +847,131 @@ func (h *handlers) searchMetadata(ctx context.Context, req mcp.CallToolRequest) 
 
 	results, err := h.engine.SearchFast(ctx, q, filter, limit, offset)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
+		return nil, newInternalError("search metadata", err)
 	}
 
 	totalMatched, err := h.engine.SearchFastCount(ctx, q, filter)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("search count failed: %v", err)), nil
+		return nil, newInternalError("count metadata search", err)
 	}
 
-	return jsonResult(newPaginatedResponse(results, totalMatched, offset))
+	return jsonResult(searchMetadataResponse(newPaginatedResponse(results, totalMatched, offset)))
+}
+
+func (h *handlers) searchDocuments(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+	queryText, _ := args[toolArgQuery].(string)
+	if strings.TrimSpace(queryText) == "" {
+		return toolErrorResult("query parameter is required"), nil
+	}
+	if h.documentSearcher == nil {
+		return toolErrorResult("document_search_unavailable: document attachment search is not configured"), nil
+	}
+	sourceIDs, err := positiveInt64ArrayArg(args, "source_ids")
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	messageTypes, err := stringArrayArg(args, "message_types")
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	attachmentID, err := positiveInt64Arg(args, toolArgAttachmentID)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	messageID, err := positiveInt64Arg(args, toolArgMessageID)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	personID, err := positiveInt64Arg(args, toolArgPersonID)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	participantID, err := positiveInt64Arg(args, toolArgParticipantID)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	if personID > 0 && participantID > 0 {
+		return toolErrorResult("person_id and participant_id are mutually exclusive"), nil
+	}
+	rawDirections, err := stringArrayArg(args, "directions")
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	if len(rawDirections) > 0 && personID == 0 && participantID == 0 {
+		return toolErrorResult("directions require person_id or participant_id"), nil
+	}
+	var directions []personscope.Direction
+	if len(rawDirections) > 0 {
+		directions = make([]personscope.Direction, len(rawDirections))
+		for i, raw := range rawDirections {
+			directions[i] = personscope.Direction(raw)
+		}
+		if _, _, err := personresolver.NormalizeDirections(directions); err != nil {
+			return toolErrorResult(err.Error()), nil
+		}
+	}
+	after, err := getDateArg(args, toolArgAfter)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	before, err := getDateArg(args, toolArgBefore)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	if after != nil && before != nil && !after.Before(*before) {
+		return toolErrorResult("invalid date range: after must be before before"), nil
+	}
+	limit := 20
+	if _, found := args[toolArgLimit]; found {
+		parsedLimit, parseErr := positiveInt64Arg(args, toolArgLimit)
+		if parseErr != nil {
+			return toolErrorResult(parseErr.Error()), nil
+		}
+		if parsedLimit > 100 {
+			return toolErrorResult("limit must be an integer between 1 and 100"), nil
+		}
+		limit = int(parsedLimit)
+	}
+	cursor, _ := args[toolArgCursor].(string)
+	mode, _ := args[toolArgMode].(string)
+	parsedMode := vectordocument.SearchModeAuto
+	if mode != "" {
+		parsed, parseErr := vectordocument.ParseSearchMode(mode)
+		if parseErr != nil {
+			return toolErrorResult(parseErr.Error()), nil
+		}
+		parsedMode = parsed
+		mode = string(parsed)
+	}
+	candidateLimit := 0
+	if _, found := args["candidate_limit"]; found {
+		parsed, parseErr := positiveInt64Arg(args, "candidate_limit")
+		if parseErr != nil {
+			return toolErrorResult(parseErr.Error()), nil
+		}
+		maxCandidateLimit := store.MaxLexicalDocumentSearchCandidateLimit
+		if parsedMode == vectordocument.SearchModeSemantic || parsedMode == vectordocument.SearchModeHybrid {
+			maxCandidateLimit = store.MaxDocumentSearchCandidateLimit
+		}
+		if parsed > int64(maxCandidateLimit) {
+			return toolErrorResult(fmt.Sprintf(
+				"candidate_limit must be an integer between 1 and %d for this mode", maxCandidateLimit,
+			)), nil
+		}
+		candidateLimit = int(parsed)
+	}
+	response, err := h.documentSearcher.SearchDocuments(ctx, store.DocumentSearchRequest{
+		Query: queryText, SourceIDs: sourceIDs, MessageTypes: messageTypes,
+		AttachmentID: attachmentID, MessageID: messageID,
+		PersonID: personID, ParticipantID: participantID, Directions: directions,
+		After: after, Before: before, PageSize: limit, Cursor: cursor,
+		SearchMode: mode, CandidateLimit: candidateLimit,
+	})
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("document search failed: %v", err)), nil
+	}
+	return jsonResult(response)
 }
 
 func unsupportedSearchOperatorMessage(q *search.Query) string {
@@ -582,15 +1000,15 @@ func unsupportedSearchOperatorMessage(q *search.Query) string {
 // It returns messages whose body matches the query, plus matches — short
 // excerpts centered on each matched term. Requires at least one free-text term
 // for keyword mode; use search_metadata for filter-only queries.
-func (h *handlers) searchMessageBodies(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) searchMessageBodies(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	queryStr, _ := args["query"].(string)
+	queryStr, _ := args[toolArgQuery].(string)
 	if queryStr == "" {
-		return mcp.NewToolResultError("query parameter is required"), nil
+		return toolErrorResult("query parameter is required"), nil
 	}
 
-	mode, _ := args["mode"].(string)
+	mode, _ := args[toolArgMode].(string)
 	if mode == "" {
 		mode = searchModeKeyword
 	}
@@ -598,30 +1016,30 @@ func (h *handlers) searchMessageBodies(ctx context.Context, req mcp.CallToolRequ
 	switch mode {
 	case searchModeKeyword:
 	case searchModeVector, searchModeHybrid:
-		return mcp.NewToolResultError(
+		return toolErrorResult(
 			fmt.Sprintf("invalid mode %q: search_message_bodies is keyword-only; use semantic_search_messages for vector or hybrid search", mode),
 		), nil
 	default:
-		return mcp.NewToolResultError(
+		return toolErrorResult(
 			fmt.Sprintf("invalid mode %q: search_message_bodies only supports keyword search; use semantic_search_messages for vector or hybrid search", mode),
 		), nil
 	}
 
 	q := search.Parse(queryStr)
 	if err := q.Err(); err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	if msg := unsupportedSearchOperatorMessage(q); msg != "" {
-		return mcp.NewToolResultError(msg), nil
+		return toolErrorResult(msg), nil
 	}
 
 	limit := searchLimitArg(args)
-	offset := limitArg(args, "offset", 0)
+	offset := limitArg(args, toolArgOffset, 0)
 
-	account, _ := args["account"].(string)
+	account, _ := args[toolArgAccount].(string)
 	sourceID, err := h.getAccountID(ctx, account)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return dependencyError("resolve body-search account", err)
 	}
 
 	if sourceID != nil {
@@ -629,7 +1047,7 @@ func (h *handlers) searchMessageBodies(ctx context.Context, req mcp.CallToolRequ
 	}
 
 	if len(q.TextTerms) == 0 {
-		return mcp.NewToolResultError(
+		return toolErrorResult(
 			"search_message_bodies requires at least one free-text term (bare word or quoted phrase); " +
 				"Gmail operators such as from: or subject: are metadata filters and do not count — " +
 				"use search_metadata for filter-only queries",
@@ -638,11 +1056,11 @@ func (h *handlers) searchMessageBodies(ctx context.Context, req mcp.CallToolRequ
 
 	bodySearcher, ok := h.engine.(query.MessageBodySearcher)
 	if !ok {
-		return mcp.NewToolResultError("search_message_bodies is unavailable: the query engine does not support exact body-only search"), nil
+		return toolErrorResult("search_message_bodies is unavailable: the query engine does not support exact body-only search"), nil
 	}
 	results, err := bodySearcher.SearchMessageBodies(ctx, q, limit+1, offset)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
+		return bodySearchError(err)
 	}
 
 	hasMore := len(results) > limit
@@ -660,7 +1078,7 @@ func (h *handlers) searchMessageBodies(ctx context.Context, req mcp.CallToolRequ
 			item.Matches = nil
 			item.MatchesTruncated = true
 		default:
-			return mcp.NewToolResultError(fmt.Sprintf(
+			return toolErrorResult(fmt.Sprintf(
 				"body context unavailable for message %d: search backend returned no context", r.ID,
 			)), nil
 		}
@@ -678,22 +1096,22 @@ func (h *handlers) searchMessageBodies(ctx context.Context, req mcp.CallToolRequ
 // rejected. Vector availability, the free-text requirement, and index
 // staleness are all enforced by the shared searchMessageBodiesHybrid path,
 // which returns vector_not_enabled when vector search is not configured.
-func (h *handlers) semanticSearchMessages(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) semanticSearchMessages(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	queryStr, _ := args["query"].(string)
+	queryStr, _ := args[toolArgQuery].(string)
 	if queryStr == "" {
-		return mcp.NewToolResultError("query parameter is required"), nil
+		return toolErrorResult("query parameter is required"), nil
 	}
 
-	mode, _ := args["mode"].(string)
+	mode, _ := args[toolArgMode].(string)
 	if mode == "" {
 		mode = searchModeHybrid
 	}
 	switch mode {
 	case searchModeVector, searchModeHybrid:
 	default:
-		return mcp.NewToolResultError(
+		return toolErrorResult(
 			fmt.Sprintf("invalid mode %q: must be %s or %s (default %s); use search_message_bodies for keyword search",
 				mode, searchModeVector, searchModeHybrid, searchModeHybrid),
 		), nil
@@ -702,10 +1120,10 @@ func (h *handlers) semanticSearchMessages(ctx context.Context, req mcp.CallToolR
 
 	q := search.Parse(queryStr)
 	if err := q.Err(); err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	if msg := unsupportedSearchOperatorMessage(q); msg != "" {
-		return mcp.NewToolResultError(msg), nil
+		return toolErrorResult(msg), nil
 	}
 
 	return h.searchMessageBodiesHybrid(ctx, args, queryStr, q, mode, explain)
@@ -754,25 +1172,25 @@ type searchMessageBodiesResponse struct {
 func (h *handlers) searchMessageBodiesHybrid(
 	ctx context.Context, args map[string]any,
 	queryStr string, parsed *search.Query, mode string, explain bool,
-) (*mcp.CallToolResult, error) {
+) (*toolResult, error) {
 	if h.hybridSearcher != nil {
 		return h.searchMessageBodiesHybridViaSearcher(ctx, args, queryStr, parsed, mode, explain)
 	}
 	if h.hybridEngine == nil {
-		return mcp.NewToolResultError(
+		return toolErrorResult(
 			"vector_not_enabled: vector search is not configured on this server",
 		), nil
 	}
 
 	// Resolve account filter to a source ID for the structured Filter.
-	account, _ := args["account"].(string)
+	account, _ := args[toolArgAccount].(string)
 	sourceID, err := h.getAccountID(ctx, account)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return dependencyError("resolve semantic-search account", err)
 	}
 
 	limit := searchLimitArg(args)
-	offset := limitArg(args, "offset", 0)
+	offset := limitArg(args, toolArgOffset, 0)
 
 	freeText := strings.Join(parsed.TextTerms, " ")
 
@@ -780,7 +1198,7 @@ func (h *handlers) searchMessageBodiesHybrid(
 	// queries have no query vector to rank by. Callers that want pure
 	// structured filtering should omit mode (metadata search).
 	if freeText == "" {
-		return mcp.NewToolResultError(
+		return toolErrorResult(
 			"missing_free_text: mode=" + mode +
 				" requires at least one free-text term; use search_metadata for filter-only queries",
 		), nil
@@ -793,7 +1211,7 @@ func (h *handlers) searchMessageBodiesHybrid(
 
 	filter, err := h.hybridEngine.BuildFilter(ctx, parsed)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("filter resolution failed: %v", err)), nil
+		return nil, newInternalError("build semantic-search filter", err)
 	}
 	if sourceID != nil {
 		filter.SourceIDs = []int64{*sourceID}
@@ -806,7 +1224,7 @@ func (h *handlers) searchMessageBodiesHybrid(
 	hitMaxPageCap := false
 	if maxPage > 0 {
 		if offset >= maxPage {
-			return mcp.NewToolResultError(fmt.Sprintf(
+			return toolErrorResult(fmt.Sprintf(
 				"pagination_limit: offset %d exceeds hybrid ranking window (max %d); "+
 					"use search_metadata or search_message_bodies for deeper pagination",
 				offset, maxPage,
@@ -829,10 +1247,7 @@ func (h *handlers) searchMessageBodiesHybrid(
 
 	hits, meta, err := h.hybridEngine.Search(ctx, req)
 	if err != nil {
-		if r := translateVectorErr(err); r != nil {
-			return r, nil
-		}
-		return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
+		return dependencyError("search semantic index", err)
 	}
 
 	// Bulk-hydrate hits in one round-trip instead of looping
@@ -845,10 +1260,7 @@ func (h *handlers) searchMessageBodiesHybrid(
 	}
 	summaries, err := h.engine.GetMessageSummariesByIDs(ctx, hitIDs)
 	if err != nil {
-		fmt.Fprintf(os.Stderr,
-			"mcp: hydrate hybrid hits failed: ids=%d error=%v\n",
-			len(hitIDs), err)
-		summaries = nil
+		return nil, newInternalError("hydrate semantic-search results", err)
 	}
 	byID := make(map[int64]query.MessageSummary, len(summaries))
 	for _, s := range summaries {
@@ -886,8 +1298,10 @@ func (h *handlers) searchMessageBodiesHybrid(
 		page = items[offset:end]
 	}
 
-	minScore := floatArg(args, "min_score", 0)
-	h.attachVectorChunkMatches(ctx, meta.Generation.ID, meta.QueryVector, page, minScore)
+	minScore := floatArg(args, toolArgMinScore, 0)
+	if err := h.attachVectorChunkMatches(ctx, meta.Generation.ID, meta.QueryVector, page, minScore); err != nil {
+		return nil, err
+	}
 
 	nextPageServable := maxPage == 0 || requestedEnd < maxPage
 	hasMore := false
@@ -916,19 +1330,19 @@ func (h *handlers) searchMessageBodiesHybrid(
 func (h *handlers) searchMessageBodiesHybridViaSearcher(
 	ctx context.Context, args map[string]any,
 	queryStr string, parsed *search.Query, mode string, explain bool,
-) (*mcp.CallToolResult, error) {
+) (*toolResult, error) {
 	limit := searchLimitArg(args)
-	offset := limitArg(args, "offset", 0)
+	offset := limitArg(args, toolArgOffset, 0)
 
 	freeText := strings.Join(parsed.TextTerms, " ")
 	if freeText == "" {
-		return mcp.NewToolResultError(
+		return toolErrorResult(
 			"missing_free_text: mode=" + mode +
 				" requires at least one free-text term; use search_metadata for filter-only queries",
 		), nil
 	}
 
-	account, _ := args["account"].(string)
+	account, _ := args[toolArgAccount].(string)
 	result, err := h.hybridSearcher.SearchHybrid(ctx, HybridSearchRequest{
 		Query:          queryStr,
 		Mode:           mode,
@@ -936,10 +1350,10 @@ func (h *handlers) searchMessageBodiesHybridViaSearcher(
 		Limit:          limit,
 		Offset:         offset,
 		IncludeMatches: true,
-		MinScore:       floatArg(args, "min_score", 0),
+		MinScore:       floatArg(args, toolArgMinScore, 0),
 	})
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
+		return dependencyError("search daemon semantic index", err)
 	}
 	if result == nil {
 		result = &HybridSearchResult{}
@@ -955,10 +1369,7 @@ func (h *handlers) searchMessageBodiesHybridViaSearcher(
 	}
 	summaries, err := h.engine.GetMessageSummariesByIDs(ctx, hitIDs)
 	if err != nil {
-		fmt.Fprintf(os.Stderr,
-			"mcp: hydrate daemon hybrid hits failed: ids=%d error=%v\n",
-			len(hitIDs), err)
-		summaries = nil
+		return nil, newInternalError("hydrate daemon semantic-search results", err)
 	}
 	byID := make(map[int64]query.MessageSummary, len(summaries))
 	for _, s := range summaries {
@@ -1017,61 +1428,49 @@ type similarMessagesResponse struct {
 // message using the active vector index. The seed is excluded from
 // results. Structured filters (account, after, before, has_attachment)
 // are applied at the backend level.
-func (h *handlers) findSimilarMessages(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) findSimilarMessages(ctx context.Context, req toolRequest) (*toolResult, error) {
 	if h.similarSearcher != nil {
 		return h.findSimilarMessagesViaSearcher(ctx, req)
 	}
 	if h.backend == nil {
-		return mcp.NewToolResultError(
+		return toolErrorResult(
 			"vector_not_enabled: vector search is not configured on this server",
 		), nil
 	}
 	args := req.GetArguments()
 
-	seedID, err := getIDArg(args, "message_id")
+	seedID, err := getIDArg(args, toolArgMessageID)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 
-	limit := limitArg(args, "limit", 20)
+	limit := similarLimitArg(args)
 	if maxPage := h.vectorCfg.Search.MaxPageSizeHybridClamp(); maxPage > 0 && limit > maxPage {
 		limit = maxPage
 	}
 
 	filter, err := h.filterFromFindSimilarArgs(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return dependencyError("build similar-message filter", err)
 	}
 
 	active, err := vector.ResolveActiveForFingerprint(ctx, h.backend, h.vectorCfg.GenerationFingerprint())
 	if err != nil {
-		if r := translateVectorErr(err); r != nil {
-			return r, nil
-		}
-		return mcp.NewToolResultError(fmt.Sprintf("active generation: %v", err)), nil
+		return dependencyError("resolve active vector generation", err)
 	}
 	if err := hybrid.ValidateBuildScope(h.vectorCfg.Embed.Scope.BuildScope(), filter); err != nil {
-		if r := translateVectorErr(err); r != nil {
-			return r, nil
-		}
-		return mcp.NewToolResultError(err.Error()), nil
+		return dependencyError("validate vector index scope", err)
 	}
 
 	seed, err := h.backend.LoadVector(ctx, seedID)
 	if err != nil {
-		if r := translateVectorErr(err); r != nil {
-			return r, nil
-		}
-		return mcp.NewToolResultError(fmt.Sprintf("load seed vector: %v", err)), nil
+		return dependencyError("load seed vector", err)
 	}
 
 	// +1 so we can drop the seed itself from results without coming up short.
 	hits, err := h.backend.Search(ctx, active.ID, seed, limit+1, filter)
 	if err != nil {
-		if r := translateVectorErr(err); r != nil {
-			return r, nil
-		}
-		return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
+		return dependencyError("search similar-message vectors", err)
 	}
 
 	// Bulk-hydrate keeping rank order. Drop the seed first so the +1
@@ -1089,10 +1488,7 @@ func (h *handlers) findSimilarMessages(ctx context.Context, req mcp.CallToolRequ
 	}
 	summaries, err := h.engine.GetMessageSummariesByIDs(ctx, wantIDs)
 	if err != nil {
-		fmt.Fprintf(os.Stderr,
-			"mcp: hydrate similar hits failed: ids=%d error=%v\n",
-			len(wantIDs), err)
-		summaries = nil
+		return nil, newInternalError("hydrate similar-message results", err)
 	}
 	byID := make(map[int64]query.MessageSummary, len(summaries))
 	for _, s := range summaries {
@@ -1119,27 +1515,27 @@ func (h *handlers) findSimilarMessages(ctx context.Context, req mcp.CallToolRequ
 	})
 }
 
-func (h *handlers) findSimilarMessagesViaSearcher(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) findSimilarMessagesViaSearcher(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	seedID, err := getIDArg(args, "message_id")
+	seedID, err := getIDArg(args, toolArgMessageID)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 
-	limit := limitArg(args, "limit", 20)
-	if limit < 1 {
-		limit = 20
+	limit := similarLimitArg(args)
+	if maxPage := h.vectorCfg.Search.MaxPageSizeHybridClamp(); maxPage > 0 && limit > maxPage {
+		limit = maxPage
 	}
-	account, _ := args["account"].(string)
+	account, _ := args[toolArgAccount].(string)
 	messageType, _ := args["message_type"].(string)
-	after, err := getDateArg(args, "after")
+	after, err := getDateArg(args, toolArgAfter)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
-	before, err := getDateArg(args, "before")
+	before, err := getDateArg(args, toolArgBefore)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	var hasAttachment *bool
 	if v, ok := args["has_attachment"].(bool); ok {
@@ -1156,7 +1552,7 @@ func (h *handlers) findSimilarMessagesViaSearcher(ctx context.Context, req mcp.C
 		HasAttachment: hasAttachment,
 	})
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("find similar failed: %v", err)), nil
+		return dependencyError("search daemon similar messages", err)
 	}
 	if result == nil {
 		result = &SimilarSearchResult{SeedMessageID: seedID}
@@ -1182,7 +1578,7 @@ func (h *handlers) findSimilarMessagesViaSearcher(ctx context.Context, req mcp.C
 func (h *handlers) filterFromFindSimilarArgs(ctx context.Context, args map[string]any) (vector.Filter, error) {
 	var f vector.Filter
 
-	account, _ := args["account"].(string)
+	account, _ := args[toolArgAccount].(string)
 	srcID, err := h.getAccountID(ctx, account)
 	if err != nil {
 		return f, err
@@ -1191,23 +1587,23 @@ func (h *handlers) filterFromFindSimilarArgs(ctx context.Context, args map[strin
 		f.SourceIDs = []int64{*srcID}
 	}
 	if messageType, _ := args["message_type"].(string); messageType != "" {
-		f.MessageTypes = vector.NewBuildScope([]string{messageType}).MessageTypes
+		f.MessageTypes = vector.NewBuildScope([]string{messageType}, nil).MessageTypes
 	}
 
 	if v, ok := args["has_attachment"].(bool); ok && v {
 		tr := true
 		f.HasAttachment = &tr
 	}
-	after, err := getDateArg(args, "after")
+	after, err := getDateArg(args, toolArgAfter)
 	if err != nil {
-		return f, err
+		return f, &expectedHandlerError{message: err.Error()}
 	}
 	if after != nil {
 		f.After = after
 	}
-	before, err := getDateArg(args, "before")
+	before, err := getDateArg(args, toolArgBefore)
 	if err != nil {
-		return f, err
+		return f, &expectedHandlerError{message: err.Error()}
 	}
 	if before != nil {
 		f.Before = before
@@ -1328,23 +1724,23 @@ type getMessageResponse struct {
 	Attachments          []query.AttachmentInfo `json:"attachments"`
 }
 
-func (h *handlers) getMessage(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) getMessage(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
 	id, err := getIDArg(args, "id")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 
 	msg, err := h.engine.GetMessage(ctx, id)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("message not found: %v", err)), nil
+		return messageLookupError("load message", err)
 	}
 	if msg == nil {
-		return mcp.NewToolResultError("message not found"), nil
+		return toolErrorResult("message not found"), nil
 	}
 
-	maxChars := intArg(args, "max_chars", defaultBodyChars)
+	maxChars := intArg(args, toolArgMaxChars, defaultBodyChars)
 	if maxChars <= 0 {
 		maxChars = defaultBodyChars
 	} else if maxChars > maxBodyChars {
@@ -1369,7 +1765,7 @@ func (h *handlers) getMessage(ctx context.Context, req mcp.CallToolRequest) (*mc
 		fullBody = msg.BodyHTML
 		bodyFormat = bodyFormatHTML
 	default:
-		return mcp.NewToolResultError("body_format must be one of auto, text, html"), nil
+		return toolErrorResult("body_format must be one of auto, text, html"), nil
 	}
 	bodyLen := len(fullBody)
 
@@ -1382,7 +1778,7 @@ func (h *handlers) getMessage(ctx context.Context, req mcp.CallToolRequest) (*mc
 		// clamping to body boundaries.
 		start, end = contextWindow(bodyLen, centerAt, 0, maxChars)
 	} else {
-		start = min(intArg(args, "offset", 0), bodyLen)
+		start = min(intArg(args, toolArgOffset, 0), bodyLen)
 		end = min(start+maxChars, bodyLen)
 	}
 
@@ -1429,27 +1825,31 @@ func (h *handlers) attachVectorChunkMatches(
 	queryVec []float32,
 	items []searchMessageItem,
 	minScore float64,
-) {
+) error {
 	scorer, ok := h.backend.(vector.ChunkScoringBackend)
 	if !ok || len(queryVec) == 0 || len(items) == 0 {
-		return
+		return nil
 	}
 	for i := range items {
 		msg, err := h.engine.GetMessage(ctx, items[i].ID)
-		if err != nil || msg == nil {
+		if err != nil {
+			return newInternalError("load message for semantic match context", err)
+		}
+		if msg == nil {
 			continue
 		}
 		chunkHits, err := scorer.ScoreMessageChunks(ctx, genID, msg.ID, queryVec)
 		if err != nil {
-			continue
+			return newInternalError("score semantic match chunks", err)
 		}
 		matches, truncated := chunkmatch.Build(
-			msg.Subject, embed.BodyTextForEmbedding(msg.BodyText, msg.BodyHTML), h.vectorCfg, chunkHits,
+			msg.Subject, embed.HydrationBodyText(msg.MessageType, msg.BodyText, msg.BodyHTML), h.vectorCfg, chunkHits,
 			minScore, maxContextSnippets, searchContextChars,
 		)
 		items[i].Matches = messageMatchesFromChunks(matches)
 		items[i].MatchesTruncated = truncated
 	}
+	return nil
 }
 
 func (h *handlers) vectorMatchesInMessage(
@@ -1458,57 +1858,51 @@ func (h *handlers) vectorMatchesInMessage(
 	queryStr string,
 	minScore float64,
 	limit, offset int,
-) (*mcp.CallToolResult, error) {
+) (*toolResult, error) {
 	if h.hybridEngine == nil || h.backend == nil {
-		return mcp.NewToolResultError(
+		return toolErrorResult(
 			"vector_not_enabled: vector search is not configured on this server",
 		), nil
 	}
 	scorer, ok := h.backend.(vector.ChunkScoringBackend)
 	if !ok {
-		return mcp.NewToolResultError(
+		return toolErrorResult(
 			"vector_not_enabled: chunk scoring is not available on this backend",
 		), nil
 	}
 
 	active, err := vector.ResolveActiveForFingerprint(ctx, h.backend, h.vectorCfg.GenerationFingerprint())
 	if err != nil {
-		if r := translateVectorErr(err); r != nil {
-			return r, nil
-		}
-		return mcp.NewToolResultError(fmt.Sprintf("vector index: %v", err)), nil
+		return dependencyError("resolve vector index for message search", err)
 	}
 
 	queryVec, err := h.hybridEngine.EmbedQuery(ctx, queryStr)
 	if err != nil {
-		if r := translateVectorErr(err); r != nil {
-			return r, nil
-		}
-		return mcp.NewToolResultError(fmt.Sprintf("embed query: %v", err)), nil
+		return dependencyError("embed message-search query", err)
 	}
 
 	msg, err := h.engine.GetMessage(ctx, messageID)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("message not found: %v", err)), nil
+		return messageLookupError("load message for vector search", err)
 	}
 	if msg == nil {
-		return mcp.NewToolResultError("message not found"), nil
+		return toolErrorResult("message not found"), nil
 	}
 
 	chunkHits, err := scorer.ScoreMessageChunks(ctx, active.ID, messageID, queryVec)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("score chunks: %v", err)), nil
+		return dependencyError("score message chunks", err)
 	}
 
 	chunkMatches, _ := chunkmatch.Build(
-		msg.Subject, embed.BodyTextForEmbedding(msg.BodyText, msg.BodyHTML), h.vectorCfg, chunkHits,
+		msg.Subject, embed.HydrationBodyText(msg.MessageType, msg.BodyText, msg.BodyHTML), h.vectorCfg, chunkHits,
 		minScore, len(chunkHits), searchContextChars,
 	)
 	allMatches := messageMatchesFromChunks(chunkMatches)
 
 	total := int64(len(allMatches))
 	if offset >= len(allMatches) {
-		return jsonResult(newPaginatedResponse([]messageMatch{}, total, offset))
+		return jsonResult(searchInMessageResponse(newPaginatedResponse([]messageMatch{}, total, offset)))
 	}
 	end := min(offset+limit, len(allMatches))
 	page := allMatches[offset:end]
@@ -1516,53 +1910,53 @@ func (h *handlers) vectorMatchesInMessage(
 	if len(page) > limit {
 		page = page[:limit]
 	}
-	return jsonResult(newPaginatedResponse(page, total, offset))
+	return jsonResult(searchInMessageResponse(newPaginatedResponse(page, total, offset)))
 }
 
-func (h *handlers) searchInMessage(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) searchInMessage(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
 	id, err := getIDArg(args, "id")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 
-	queryStr, _ := args["query"].(string)
+	queryStr, _ := args[toolArgQuery].(string)
 	queryStr = strings.TrimSpace(queryStr)
 	if queryStr == "" {
-		return mcp.NewToolResultError("query parameter is required"), nil
+		return toolErrorResult("query parameter is required"), nil
 	}
 
-	mode, _ := args["mode"].(string)
-	limit := limitArg(args, "limit", 10)
-	offset := limitArg(args, "offset", 0)
+	mode, _ := args[toolArgMode].(string)
+	limit := limitArg(args, toolArgLimit, 10)
+	offset := limitArg(args, toolArgOffset, 0)
 
 	switch mode {
 	case "", "keyword":
 		// default: literal term search
 	case searchModeVector:
-		return h.vectorMatchesInMessage(ctx, id, queryStr, floatArg(args, "min_score", 0), limit, offset)
+		return h.vectorMatchesInMessage(ctx, id, queryStr, floatArg(args, toolArgMinScore, 0), limit, offset)
 	default:
-		return mcp.NewToolResultError(
+		return toolErrorResult(
 			fmt.Sprintf("invalid mode %q: must be keyword (default) or %s", mode, searchModeVector),
 		), nil
 	}
 
 	msg, err := h.engine.GetMessage(ctx, id)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("message not found: %v", err)), nil
+		return messageLookupError("load message for keyword search", err)
 	}
 	if msg == nil {
-		return mcp.NewToolResultError("message not found"), nil
+		return toolErrorResult("message not found"), nil
 	}
 
 	allMatches := findTermMatches(msg.BodyText, queryStr)
 	total := int64(len(allMatches))
 	if offset >= len(allMatches) {
-		return jsonResult(newPaginatedResponse([]messageMatch{}, total, offset))
+		return jsonResult(searchInMessageResponse(newPaginatedResponse([]messageMatch{}, total, offset)))
 	}
 	end := min(offset+limit, len(allMatches))
-	return jsonResult(newPaginatedResponse(allMatches[offset:end], total, offset))
+	return jsonResult(searchInMessageResponse(newPaginatedResponse(allMatches[offset:end], total, offset)))
 }
 
 func findTermMatches(body, term string) []messageMatch {
@@ -1595,114 +1989,86 @@ func findTermMatches(body, term string) []messageMatch {
 
 const maxAttachmentSize = 50 * 1024 * 1024 // 50MB
 
-func (h *handlers) getAttachment(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-	args := req.GetArguments()
-
-	id, err := getIDArg(args, "attachment_id")
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
-	att, err := h.engine.GetAttachment(ctx, id)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("get attachment failed: %v", err)), nil
-	}
-	if att == nil {
-		return mcp.NewToolResultError("attachment not found"), nil
-	}
-
-	if h.attachmentReader == nil && h.attachmentsDir == "" {
-		return mcp.NewToolResultError("attachments directory not configured"), nil
-	}
-
-	if att.Size > maxAttachmentSize {
-		return mcp.NewToolResultError(fmt.Sprintf("attachment too large: %d bytes (max %d)", att.Size, maxAttachmentSize)), nil
-	}
-
-	data, err := h.readAttachment(ctx, att.ContentHash)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-
-	mimeType := att.MimeType
-	if mimeType == "" {
-		mimeType = "application/octet-stream"
-	}
-
-	metaObj := struct {
-		Filename string `json:"filename"`
-		MimeType string `json:"mime_type"`
-		Size     int64  `json:"size"`
-	}{
-		Filename: att.Filename,
-		MimeType: mimeType,
-		Size:     att.Size,
-	}
-	metaJSON, err := json.Marshal(metaObj)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("marshal metadata: %v", err)), nil
-	}
-
-	return &mcp.CallToolResult{
-		Content: []mcp.Content{
-			mcp.TextContent{
-				Type: "text",
-				Text: string(metaJSON),
-			},
-			mcp.EmbeddedResource{
-				Type: "resource",
-				Resource: mcp.BlobResourceContents{
-					URI:      fmt.Sprintf("attachment:///%d/%s", att.ID, url.PathEscape(att.Filename)),
-					MIMEType: mimeType,
-					Blob:     base64.StdEncoding.EncodeToString(data),
-				},
-			},
-		},
-	}, nil
+type attachmentExportFile interface {
+	Write(data []byte) (int, error)
+	Close() error
 }
 
-func (h *handlers) exportAttachment(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+var createAttachmentExportFile = func(path string, mode os.FileMode) (attachmentExportFile, string, error) {
+	return export.CreateExclusiveFile(path, mode)
+}
+
+func (h *handlers) getAttachment(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	id, err := getIDArg(args, "attachment_id")
+	id, err := getIDArg(args, toolArgAttachmentID)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 
-	att, err := h.engine.GetAttachment(ctx, id)
+	payload, err := h.attachmentService().load(ctx, id)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("get attachment failed: %v", err)), nil
+		if unavailable, ok := errors.AsType[*attachmentUnavailableError](err); ok {
+			return toolErrorResult(unavailable.message), nil
+		}
+		return nil, err
 	}
-	if att == nil {
-		return mcp.NewToolResultError("attachment not found"), nil
-	}
+	att := payload.metadata
 
-	if h.attachmentReader == nil && h.attachmentsDir == "" {
-		return mcp.NewToolResultError("attachments directory not configured"), nil
+	metaObj := getAttachmentResponse{
+		Filename: att.Filename,
+		MIMEType: payload.mimeType,
+		Size:     att.Size,
 	}
-
-	if att.Size > maxAttachmentSize {
-		return mcp.NewToolResultError(fmt.Sprintf("attachment too large: %d bytes (max %d)", att.Size, maxAttachmentSize)), nil
-	}
-
-	data, err := h.readAttachment(ctx, att.ContentHash)
+	result, err := jsonResult(metaObj)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return nil, err
 	}
+	result.embeddedResource = &embeddedResource{
+		uri:      attachmentResourceURI(att.ID),
+		mimeType: payload.mimeType,
+		blob:     base64.StdEncoding.EncodeToString(payload.data),
+	}
+	return result, nil
+}
+
+func (h *handlers) exportAttachment(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+
+	id, err := getIDArg(args, toolArgAttachmentID)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+
+	payload, err := h.attachmentService().load(ctx, id)
+	if err != nil {
+		if unavailable, ok := errors.AsType[*attachmentUnavailableError](err); ok {
+			return toolErrorResult(unavailable.message), nil
+		}
+		return nil, err
+	}
+	att := payload.metadata
+	data := payload.data
 
 	// Determine destination directory.
-	destDir, _ := args["destination"].(string)
+	destDir, _ := args[toolArgDestination].(string)
 	if destDir == "" {
 		home, err := os.UserHomeDir()
 		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("cannot determine home directory: %v", err)), nil
+			return nil, newInternalError("resolve export home directory", err)
 		}
 		destDir = filepath.Join(home, "Downloads")
 	}
 
 	info, err := os.Stat(destDir)
-	if err != nil || !info.IsDir() {
-		return mcp.NewToolResultError("destination directory does not exist: " + destDir), nil //nolint:nilerr // MCP convention: tool errors flow via ToolResultError, not Go error
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return toolErrorResult("destination directory does not exist: " + destDir), nil
+		}
+		return nil, newInternalError("inspect attachment export destination", err)
+	}
+	if !info.IsDir() {
+		return toolErrorResult("destination directory does not exist: " + destDir), nil
 	}
 
 	// Sanitize and deduplicate filename.
@@ -1710,26 +2076,22 @@ func (h *handlers) exportAttachment(ctx context.Context, req mcp.CallToolRequest
 	if filename == "" || filename == "." {
 		filename = att.ContentHash
 	}
-	f, outPath, err := export.CreateExclusiveFile(filepath.Join(destDir, filename), 0600)
+	f, outPath, err := createAttachmentExportFile(filepath.Join(destDir, filename), 0600)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("write failed: %v", err)), nil
+		return nil, newInternalError("create attachment export", err)
 	}
 	_, writeErr := f.Write(data)
 	closeErr := f.Close()
 	if writeErr != nil {
 		_ = os.Remove(outPath)
-		return mcp.NewToolResultError(fmt.Sprintf("write failed: %v", writeErr)), nil
+		return nil, newInternalError("write attachment export", writeErr)
 	}
 	if closeErr != nil {
 		_ = os.Remove(outPath)
-		return mcp.NewToolResultError(fmt.Sprintf("write failed: %v", closeErr)), nil
+		return nil, newInternalError("close attachment export", closeErr)
 	}
 
-	resp := struct {
-		Path     string `json:"path"`
-		Filename string `json:"filename"`
-		Size     int64  `json:"size"`
-	}{
+	resp := exportAttachmentResponse{
 		Path:     outPath,
 		Filename: filepath.Base(outPath),
 		Size:     int64(len(data)),
@@ -1737,25 +2099,25 @@ func (h *handlers) exportAttachment(ctx context.Context, req mcp.CallToolRequest
 	return jsonResult(resp)
 }
 
-func (h *handlers) listMessages(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) listMessages(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
 	// Look up account filter
-	account, _ := args["account"].(string)
+	account, _ := args[toolArgAccount].(string)
 	sourceID, err := h.getAccountID(ctx, account)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return dependencyError("resolve message-list account", err)
 	}
 
 	filter := query.MessageFilter{
 		SourceID: sourceID,
 		Pagination: query.Pagination{
 			Limit:  listLimitArg(args) + 1,
-			Offset: limitArg(args, "offset", 0),
+			Offset: limitArg(args, toolArgOffset, 0),
 		},
 	}
 
-	if v, ok := args["from"].(string); ok && v != "" {
+	if v, ok := args[toolArgFrom].(string); ok && v != "" {
 		// If it looks like an email address, filter by email; otherwise by display name.
 		if strings.Contains(v, "@") || strings.HasPrefix(v, "+") {
 			filter.Sender = v
@@ -1772,11 +2134,11 @@ func (h *handlers) listMessages(ctx context.Context, req mcp.CallToolRequest) (*
 	if v, ok := args["has_attachment"].(bool); ok && v {
 		filter.WithAttachmentsOnly = true
 	}
-	if filter.After, err = getDateArg(args, "after"); err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+	if filter.After, err = getDateArg(args, toolArgAfter); err != nil {
+		return toolErrorResult(err.Error()), nil
 	}
-	if filter.Before, err = getDateArg(args, "before"); err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+	if filter.Before, err = getDateArg(args, toolArgBefore); err != nil {
+		return toolErrorResult(err.Error()), nil
 	}
 	if v, ok := args["conversation_id"].(float64); ok && v != 0 {
 		v2 := int64(v)
@@ -1785,7 +2147,7 @@ func (h *handlers) listMessages(ctx context.Context, req mcp.CallToolRequest) (*
 
 	results, err := h.engine.ListMessages(ctx, filter)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("list failed: %v", err)), nil
+		return nil, newInternalError("list messages", err)
 	}
 
 	pageLimit := listLimitArg(args)
@@ -1795,13 +2157,7 @@ func (h *handlers) listMessages(ctx context.Context, req mcp.CallToolRequest) (*
 		results = results[:pageLimit]
 	}
 
-	if full, _ := args["full"].(bool); full {
-		return jsonResult(newPaginatedResponseNoTotal(results, offset, hasMore))
-	}
-
-	// Compact summaries are the default for MCP to keep common mailbox lookups
-	// cheap in both tokens and latency.
-	return jsonResult(newPaginatedResponseNoTotal(compactMessageSummaries(results), offset, hasMore))
+	return jsonResult(listMessagesResponse(newPaginatedResponseNoTotal(results, offset, hasMore)))
 }
 
 // getStatsResponse is the JSON body returned by the get_stats MCP tool.
@@ -1813,22 +2169,20 @@ type getStatsResponse struct {
 	VectorSearch *vector.StatsView   `json:"vector_search,omitempty"`
 }
 
-func (h *handlers) getStats(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) getStats(ctx context.Context, _ toolRequest) (*toolResult, error) {
 	stats, err := h.engine.GetTotalStats(ctx, query.StatsOptions{})
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("stats failed: %v", err)), nil
+		return nil, newInternalError("load archive statistics", err)
 	}
 
 	accounts, err := h.engine.ListAccounts(ctx)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("accounts failed: %v", err)), nil
+		return nil, newInternalError("list archive accounts", err)
 	}
 
-	// Vector stats are best-effort: partial failures are logged here but
-	// still attached to the response so callers see whatever succeeded.
 	vs, vsErr := vector.CollectStats(ctx, h.backend)
 	if vsErr != nil {
-		fmt.Fprintf(os.Stderr, "mcp: vector stats failed: %v\n", vsErr)
+		slog.Warn("MCP vector statistics are incomplete", "error", vsErr)
 	}
 
 	return jsonResult(getStatsResponse{
@@ -1838,52 +2192,52 @@ func (h *handlers) getStats(ctx context.Context, _ mcp.CallToolRequest) (*mcp.Ca
 	})
 }
 
-func (h *handlers) aggregate(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) aggregate(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	groupBy, _ := args["group_by"].(string)
+	groupBy, _ := args[toolArgGroupBy].(string)
 	if groupBy == "" {
-		return mcp.NewToolResultError("group_by parameter is required"), nil
+		return toolErrorResult("group_by parameter is required"), nil
 	}
 
 	// Look up account filter
-	account, _ := args["account"].(string)
+	account, _ := args[toolArgAccount].(string)
 	sourceID, err := h.getAccountID(ctx, account)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return dependencyError("resolve aggregate account", err)
 	}
 
 	opts := query.AggregateOptions{
 		SourceID: sourceID,
-		Limit:    limitArg(args, "limit", 50),
+		Limit:    limitArg(args, toolArgLimit, 50),
 	}
 
-	if opts.After, err = getDateArg(args, "after"); err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+	if opts.After, err = getDateArg(args, toolArgAfter); err != nil {
+		return toolErrorResult(err.Error()), nil
 	}
-	if opts.Before, err = getDateArg(args, "before"); err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+	if opts.Before, err = getDateArg(args, toolArgBefore); err != nil {
+		return toolErrorResult(err.Error()), nil
 	}
 
 	viewTypeMap := map[string]query.ViewType{
-		"sender":    query.ViewSenders,
-		"recipient": query.ViewRecipients,
-		"domain":    query.ViewDomains,
-		"label":     query.ViewLabels,
-		"time":      query.ViewTime,
+		toolArgSender: query.ViewSenders,
+		"recipient":   query.ViewRecipients,
+		"domain":      query.ViewDomains,
+		"label":       query.ViewLabels,
+		"time":        query.ViewTime,
 	}
 
 	viewType, ok := viewTypeMap[groupBy]
 	if !ok {
-		return mcp.NewToolResultError("invalid group_by: " + groupBy), nil
+		return toolErrorResult("invalid group_by: " + groupBy), nil
 	}
 
 	rows, err := h.engine.Aggregate(ctx, viewType, opts)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("aggregate failed: %v", err)), nil
+		return nil, newInternalError("aggregate messages", err)
 	}
 
-	return jsonResult(rows)
+	return jsonResult(aggregateResponse{Data: nonNilSlice(rows)})
 }
 
 // limitArg extracts a non-negative integer limit from a map, with a default.
@@ -1916,52 +2270,97 @@ func limitArg(args map[string]any, key string, def int) int {
 	return int(v)
 }
 
-func jsonResult(v any) (*mcp.CallToolResult, error) {
-	data, err := json.Marshal(v)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("marshal error: %v", err)), nil
+func similarLimitArg(args map[string]any) int {
+	limit := limitArg(args, toolArgLimit, defaultSearchLimit)
+	if limit <= 0 {
+		return defaultSearchLimit
 	}
-	return mcp.NewToolResultText(string(data)), nil
+	return limit
 }
 
-func structuredJSONResult(v any) (*mcp.CallToolResult, error) {
-	data, err := json.Marshal(v)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("marshal error: %v", err)), nil
+func positiveInt64Arg(args map[string]any, key string) (int64, error) {
+	raw, found := args[key]
+	if !found {
+		return 0, nil
 	}
-	return mcp.NewToolResultStructured(v, string(data)), nil
+	value, ok := raw.(float64)
+	if !ok || math.IsNaN(value) || math.IsInf(value, 0) || value <= 0 ||
+		value >= float64(math.MaxInt64) || math.Trunc(value) != value {
+		return 0, fmt.Errorf("%s must be a positive integer", key)
+	}
+	return int64(value), nil
+}
+
+func positiveInt64ArrayArg(args map[string]any, key string) ([]int64, error) {
+	raw, found := args[key]
+	if !found {
+		return nil, nil
+	}
+	values, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("%s must be an array of positive integers", key)
+	}
+	result := make([]int64, 0, len(values))
+	for _, value := range values {
+		parsed, err := positiveInt64Arg(map[string]any{key: value}, key)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, parsed)
+	}
+	return result, nil
+}
+
+func stringArrayArg(args map[string]any, key string) ([]string, error) {
+	raw, found := args[key]
+	if !found {
+		return nil, nil
+	}
+	values, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("%s must be an array of nonempty strings", key)
+	}
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		text, ok := value.(string)
+		if !ok || strings.TrimSpace(text) == "" {
+			return nil, fmt.Errorf("%s must be an array of nonempty strings", key)
+		}
+		result = append(result, text)
+	}
+	return result, nil
 }
 
 // maxStageDeletionResults limits how many messages can be staged in one call.
 const maxStageDeletionResults = 100000
 
-func (h *handlers) stageDeletion(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) stageDeletion(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
 	// Look up account filter
-	account, _ := args["account"].(string)
+	account, _ := args[toolArgAccount].(string)
 	sourceID, err := h.getAccountID(ctx, account)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return dependencyError("resolve deletion account", err)
 	}
 
 	// Check for query vs structured filters
-	queryStr, _ := args["query"].(string)
+	queryStr, _ := args[toolArgQuery].(string)
 	queryStr = strings.TrimSpace(queryStr)
 	hasQuery := queryStr != ""
 
 	// Check for any structured filter
-	fromStr, _ := args["from"].(string)
+	fromStr, _ := args[toolArgFrom].(string)
 	domainStr, _ := args["domain"].(string)
 	labelStr, _ := args["label"].(string)
 	hasAttachment, _ := args["has_attachment"].(bool)
-	afterDate, err := getDateArg(args, "after")
+	afterDate, err := getDateArg(args, toolArgAfter)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
-	beforeDate, err := getDateArg(args, "before")
+	beforeDate, err := getDateArg(args, toolArgBefore)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 
 	hasStructuredFilter := fromStr != "" || domainStr != "" || labelStr != "" ||
@@ -1969,20 +2368,29 @@ func (h *handlers) stageDeletion(ctx context.Context, req mcp.CallToolRequest) (
 
 	// Validate: must have either query or structured filters, but not both
 	if hasQuery && hasStructuredFilter {
-		return mcp.NewToolResultError("use either 'query' or structured filters (from, domain, label, etc.), not both"), nil
+		return toolErrorResult("use either 'query' or structured filters (from, domain, label, etc.), not both"), nil
 	}
 	if !hasQuery && !hasStructuredFilter {
-		return mcp.NewToolResultError("must provide either 'query' or at least one filter (from, domain, label, after, before, has_attachment)"), nil
+		return toolErrorResult("must provide either 'query' or at least one filter (from, domain, label, after, before, has_attachment)"), nil
 	}
 
-	var gmailIDs []string
+	accounts, err := h.engine.ListAccounts(ctx)
+	if err != nil {
+		return dependencyError("list deletion sources", err)
+	}
+	accountsByID := make(map[int64]query.AccountInfo, len(accounts))
+	for _, info := range accounts {
+		accountsByID[info.ID] = info
+	}
+
+	var targets []query.DeletionTarget
 	var description string
 
 	if hasQuery {
 		// Query-based search
 		q := search.Parse(queryStr)
 		if msg := unsupportedSearchOperatorMessage(q); msg != "" {
-			return mcp.NewToolResultError(msg), nil
+			return toolErrorResult(msg), nil
 		}
 		if sourceID != nil {
 			q.AccountIDs = []int64{*sourceID}
@@ -1992,19 +2400,32 @@ func (h *handlers) stageDeletion(ctx context.Context, req mcp.CallToolRequest) (
 		filter := query.MessageFilter{SourceID: sourceID}
 		results, err := h.engine.SearchFast(ctx, q, filter, maxStageDeletionResults, 0)
 		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
+			return nil, newInternalError("search messages for deletion", err)
 		}
 
 		// Fall back to FTS if no results and query has text terms
 		if len(results) == 0 && len(q.TextTerms) > 0 {
 			results, err = h.engine.Search(ctx, q, maxStageDeletionResults, 0)
 			if err != nil {
-				return mcp.NewToolResultError(fmt.Sprintf("search failed: %v", err)), nil
+				return nil, newInternalError("fallback search messages for deletion", err)
 			}
 		}
 
 		for _, msg := range results {
-			gmailIDs = append(gmailIDs, msg.SourceMessageID)
+			if msg.SourceID <= 0 {
+				return toolErrorResult(fmt.Sprintf("selected message %d has no source metadata", msg.ID)), nil
+			}
+			info, ok := accountsByID[msg.SourceID]
+			if !ok {
+				return toolErrorResult(fmt.Sprintf("selected message %d has no source metadata", msg.ID)), nil
+			}
+			if strings.TrimSpace(info.SourceType) == "" || strings.TrimSpace(info.Identifier) == "" {
+				return toolErrorResult(fmt.Sprintf("selected message %d has incomplete source metadata", msg.ID)), nil
+			}
+			targets = append(targets, query.DeletionTarget{
+				MessageID: msg.ID, SourceID: msg.SourceID, SourceType: info.SourceType,
+				SourceIdentifier: info.Identifier, SourceMessageID: msg.SourceMessageID,
+			})
 		}
 		description = "query: " + queryStr
 		if len(description) > 50 {
@@ -2026,9 +2447,9 @@ func (h *handlers) stageDeletion(ctx context.Context, req mcp.CallToolRequest) (
 		}
 
 		var err error
-		gmailIDs, err = h.engine.GetGmailIDsByFilter(ctx, filter)
+		targets, err = h.engine.GetDeletionTargetsByFilter(ctx, filter)
 		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("filter failed: %v", err)), nil
+			return nil, newInternalError("filter messages for deletion", err)
 		}
 
 		// Build description from filters
@@ -2057,15 +2478,26 @@ func (h *handlers) stageDeletion(ctx context.Context, req mcp.CallToolRequest) (
 		}
 	}
 
-	if len(gmailIDs) == 0 {
-		return mcp.NewToolResultError("no messages match the specified criteria"), nil
+	if len(targets) == 0 {
+		return toolErrorResult("no messages match the specified criteria"), nil
 	}
+	source, sourceErr := deletion.SourceReferenceForTargets(targets)
+	if errors.Is(sourceErr, deletion.ErrMultipleDeletionSources) {
+		return toolErrorResult("selected messages span multiple sources; set account or stage each source separately"), nil
+	}
+	if errors.Is(sourceErr, deletion.ErrIncompleteDeletionSource) {
+		return toolErrorResult("selected message has incomplete source metadata"), nil
+	}
+	if sourceErr != nil {
+		return toolErrorResult(sourceErr.Error()), nil
+	}
+	gmailIDs := deletion.SourceMessageIDs(targets)
 
-	manifest := deletion.NewManifest(description, gmailIDs)
+	manifest := deletion.NewManifestForSource(description, gmailIDs, source)
 	manifest.CreatedBy = "mcp"
 
 	// Set filter metadata for execution
-	manifest.Filters.Account = account
+	manifest.Filters.Account = source.Identifier
 	if fromStr != "" {
 		manifest.Filters.Senders = []string{fromStr}
 	}
@@ -2083,15 +2515,10 @@ func (h *handlers) stageDeletion(ctx context.Context, req mcp.CallToolRequest) (
 	}
 
 	if err := h.saveDeletionManifest(ctx, manifest); err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("save manifest: %v", err)), nil
+		return nil, newInternalError("save deletion manifest", err)
 	}
 
-	resp := struct {
-		BatchID      string `json:"batch_id"`
-		MessageCount int    `json:"message_count"`
-		Status       string `json:"status"`
-		NextStep     string `json:"next_step"`
-	}{
+	resp := stageDeletionResponse{
 		BatchID:      manifest.ID,
 		MessageCount: len(gmailIDs),
 		Status:       string(manifest.Status),
@@ -2113,13 +2540,13 @@ func (h *handlers) saveDeletionManifest(ctx context.Context, manifest *deletion.
 	return manager.SaveManifest(manifest)
 }
 
-func (h *handlers) searchByDomains(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) searchByDomains(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	domainsStr, _ := args["domains"].(string)
+	domainsStr, _ := args[toolArgDomains].(string)
 	domainsStr = strings.TrimSpace(domainsStr)
 	if domainsStr == "" {
-		return mcp.NewToolResultError("domains is required"), nil
+		return toolErrorResult("domains is required"), nil
 	}
 
 	// Split and clean domain list
@@ -2131,27 +2558,34 @@ func (h *handlers) searchByDomains(ctx context.Context, req mcp.CallToolRequest)
 		}
 	}
 	if len(domains) == 0 {
-		return mcp.NewToolResultError("at least one domain is required"), nil
+		return toolErrorResult("at least one domain is required"), nil
 	}
 
-	limit := limitArg(args, "limit", 100)
-	offset := limitArg(args, "offset", 0)
+	limit := limitArg(args, toolArgLimit, 100)
+	offset := limitArg(args, toolArgOffset, 0)
 
-	afterDate, err := getDateArg(args, "after")
+	afterDate, err := getDateArg(args, toolArgAfter)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
-	beforeDate, err := getDateArg(args, "before")
+	beforeDate, err := getDateArg(args, toolArgBefore)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 
 	results, err := h.engine.SearchByDomains(ctx, domains, afterDate, beforeDate, limit, offset)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("search by domains failed: %v", err)), nil
+		return nil, newInternalError("search messages by domain", err)
 	}
 
-	return jsonResult(results)
+	return jsonResult(searchByDomainsResponse{Data: nonNilSlice(results)})
+}
+
+func nonNilSlice[T any](values []T) []T {
+	if values == nil {
+		return []T{}
+	}
+	return values
 }
 
 // --- WhatsApp handlers ---
@@ -2205,14 +2639,14 @@ func (h *handlers) getWhatsAppClient(ctx context.Context, args map[string]any) (
 	return client, account, nil
 }
 
-func (h *handlers) whatsAppStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) whatsAppStatus(ctx context.Context, req toolRequest) (*toolResult, error) {
 	client, _, err := h.getWhatsAppClient(ctx, req.GetArguments())
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	status, err := client.Status(ctx)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("whatsapp status: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("whatsapp status: %v", err)), nil
 	}
 	status.ApplyDerived()
 	return jsonResult(status)
@@ -2236,45 +2670,45 @@ type whatsAppLoginResponse struct {
 	NeedsAuth      bool   `json:"needs_authentication"`
 }
 
-func (h *handlers) whatsAppStartLogin(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) whatsAppStartLogin(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 	loginClient, state, err := h.getWhatsAppLoginClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	state, err = loginClient.StartLogin(ctx)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("start whatsapp login: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("start whatsapp login: %v", err)), nil
 	}
 
 	waitMS := boundedIntArg(args, "wait_ms", 3000, 15000)
 	if waitMS > 0 {
 		state, err = waitForWhatsAppLoginCode(ctx, loginClient, state, time.Duration(waitMS)*time.Millisecond)
 		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("wait for whatsapp login QR: %v", err)), nil
+			return toolErrorResult(fmt.Sprintf("wait for whatsapp login QR: %v", err)), nil
 		}
 	}
-	return structuredJSONResult(h.whatsAppLoginResponse(state, includeQRPNG(args)))
+	return jsonResult(h.whatsAppLoginResponse(state, includeQRPNG(args)))
 }
 
-func (h *handlers) whatsAppLoginStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) whatsAppLoginStatus(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 	loginClient, state, err := h.getWhatsAppLoginClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	state, err = loginClient.LoginState(ctx)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("whatsapp login status: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("whatsapp login status: %v", err)), nil
 	}
-	return structuredJSONResult(h.whatsAppLoginResponse(state, includeQRPNG(args)))
+	return jsonResult(h.whatsAppLoginResponse(state, includeQRPNG(args)))
 }
 
-func (h *handlers) whatsAppLogout(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) whatsAppLogout(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 	confirm, _ := args["confirm"].(bool)
 	if !confirm {
-		return mcp.NewToolResultError("confirm=true is required to log out WhatsApp and clear local pairing state"), nil
+		return toolErrorResult("confirm=true is required to log out WhatsApp and clear local pairing state"), nil
 	}
 	forceLocal := true
 	if v, ok := args["force_local"].(bool); ok {
@@ -2282,16 +2716,16 @@ func (h *handlers) whatsAppLogout(ctx context.Context, req mcp.CallToolRequest) 
 	}
 	client, account, err := h.getWhatsAppClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	result, err := client.Logout(ctx, whatsapplive.LogoutRequest{
 		Account:    account,
 		ForceLocal: forceLocal,
 	})
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("whatsapp logout: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("whatsapp logout: %v", err)), nil
 	}
-	return structuredJSONResult(result)
+	return jsonResult(result)
 }
 
 func (h *handlers) getWhatsAppLoginClient(ctx context.Context, args map[string]any) (whatsappLoginClient, whatsapplive.LoginState, error) {
@@ -2387,21 +2821,21 @@ func requireWhatsAppReady(ctx context.Context, client whatsapplive.Client) error
 	return nil
 }
 
-func (h *handlers) sendWhatsAppMessage(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) sendWhatsAppMessage(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 	client, account, err := h.getWhatsAppClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	chatID, _ := args["chat_id"].(string)
 	chatID = strings.TrimSpace(chatID)
 	if chatID == "" {
-		return mcp.NewToolResultError("chat_id parameter is required"), nil
+		return toolErrorResult("chat_id parameter is required"), nil
 	}
 	body, _ := args["body"].(string)
 	body = strings.TrimSpace(body)
 	if body == "" {
-		return mcp.NewToolResultError("body parameter is required"), nil
+		return toolErrorResult("body parameter is required"), nil
 	}
 	localRequestID, _ := args["local_request_id"].(string)
 	var mentions []string
@@ -2415,7 +2849,7 @@ func (h *handlers) sendWhatsAppMessage(ctx context.Context, req mcp.CallToolRequ
 		}
 	}
 	if err := requireWhatsAppReady(ctx, client); err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 
 	result, err := client.SendMessage(ctx, whatsapplive.SendMessageRequest{
@@ -2426,32 +2860,32 @@ func (h *handlers) sendWhatsAppMessage(ctx context.Context, req mcp.CallToolRequ
 		Mentions:       mentions,
 	})
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("send whatsapp message: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("send whatsapp message: %v", err)), nil
 	}
 	return jsonResult(result)
 }
 
-func (h *handlers) sendWhatsAppReaction(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) sendWhatsAppReaction(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 	client, account, err := h.getWhatsAppClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	messageID, err := getIDArg(args, "message_id")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	emojiRaw, ok := args["emoji"]
 	if !ok {
-		return mcp.NewToolResultError("emoji parameter is required; use an empty string to clear"), nil
+		return toolErrorResult("emoji parameter is required; use an empty string to clear"), nil
 	}
 	emoji, ok := emojiRaw.(string)
 	if !ok {
-		return mcp.NewToolResultError("emoji must be a string"), nil
+		return toolErrorResult("emoji must be a string"), nil
 	}
 	localRequestID, _ := args["local_request_id"].(string)
 	if err := requireWhatsAppReady(ctx, client); err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 
 	result, err := client.SendReaction(ctx, whatsapplive.SendReactionRequest{
@@ -2461,25 +2895,25 @@ func (h *handlers) sendWhatsAppReaction(ctx context.Context, req mcp.CallToolReq
 		LocalRequestID: strings.TrimSpace(localRequestID),
 	})
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("send whatsapp reaction: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("send whatsapp reaction: %v", err)), nil
 	}
 	return jsonResult(result)
 }
 
-func (h *handlers) whatsAppRequestHistorySync(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) whatsAppRequestHistorySync(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 	client, account, err := h.getWhatsAppClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	chatID, _ := args["chat_id"].(string)
 	chatID = strings.TrimSpace(chatID)
 	if chatID == "" {
-		return mcp.NewToolResultError("chat_id parameter is required"), nil
+		return toolErrorResult("chat_id parameter is required"), nil
 	}
 	count := boundedIntArg(args, "count", whatsapplive.DefaultHistorySyncRequestCount, whatsapplive.MaxHistorySyncRequestCount)
 	if err := requireWhatsAppReady(ctx, client); err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 
 	result, err := client.RequestHistorySync(ctx, whatsapplive.RequestHistorySyncRequest{
@@ -2488,9 +2922,9 @@ func (h *handlers) whatsAppRequestHistorySync(ctx context.Context, req mcp.CallT
 		Count:   count,
 	})
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("request whatsapp history sync: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("request whatsapp history sync: %v", err)), nil
 	}
-	return structuredJSONResult(struct {
+	return jsonResult(struct {
 		whatsapplive.RequestHistorySyncResult
 		Message string `json:"message"`
 	}{
@@ -2522,11 +2956,11 @@ func (h *handlers) getGoogleDocsClient(ctx context.Context) (googledocs.Client, 
 	return client, nil
 }
 
-func (h *handlers) listGoogleDocs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) listGoogleDocs(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 	client, err := h.getGoogleDocsClient(ctx)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	files, err := client.ListDocs(
 		ctx,
@@ -2535,32 +2969,32 @@ func (h *handlers) listGoogleDocs(ctx context.Context, req mcp.CallToolRequest) 
 		boundedIntArg(args, "limit", defaultGoogleDocsListLimit, maxGoogleDocsListLimit),
 	)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("list Google Docs: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("list Google Docs: %v", err)), nil
 	}
-	return jsonResult(files)
+	return jsonArrayResult("files", files)
 }
 
-func (h *handlers) searchGoogleDocs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) searchGoogleDocs(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 	query, err := requiredTrimmedStringArg(args, "query")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	client, err := h.getGoogleDocsClient(ctx)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	limit := boundedIntArg(args, "limit", defaultGoogleDocsSearchLimit, maxGoogleDocsSearchLimit)
 	snippetChars := boundedIntArg(args, "snippet_chars", defaultGoogleDocsSnippetChars, maxGoogleDocsSnippetChars)
 	files, err := client.ListDocs(ctx, optionalStringArg(args, "source"), query, limit)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("search Google Docs: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("search Google Docs: %v", err)), nil
 	}
 	results := make([]googleDocsSearchResult, 0, len(files))
 	for _, file := range files {
 		doc, err := client.GetDoc(ctx, file.Source, file.DocumentID, maxGoogleDocsMaxChars)
 		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("get Google Doc %s: %v", file.DocumentID, err)), nil
+			return toolErrorResult(fmt.Sprintf("get Google Doc %s: %v", file.DocumentID, err)), nil
 		}
 		results = append(results, googleDocsSearchResult{
 			File:          file,
@@ -2569,18 +3003,18 @@ func (h *handlers) searchGoogleDocs(ctx context.Context, req mcp.CallToolRequest
 			TextTruncated: doc.TextTruncated,
 		})
 	}
-	return jsonResult(results)
+	return jsonArrayResult("results", results)
 }
 
-func (h *handlers) getGoogleDoc(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) getGoogleDoc(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 	documentID, err := requiredTrimmedStringArg(args, "document_id")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	client, err := h.getGoogleDocsClient(ctx)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	doc, err := client.GetDoc(
 		ctx,
@@ -2589,54 +3023,54 @@ func (h *handlers) getGoogleDoc(ctx context.Context, req mcp.CallToolRequest) (*
 		boundedIntArg(args, "max_chars", defaultGoogleDocsMaxChars, maxGoogleDocsMaxChars),
 	)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("get Google Doc: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("get Google Doc: %v", err)), nil
 	}
 	return jsonResult(doc)
 }
 
-func (h *handlers) appendGoogleDocText(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) appendGoogleDocText(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 	documentID, err := requiredTrimmedStringArg(args, "document_id")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	text, err := requiredStringArg(args, "text")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	client, err := h.getGoogleDocsClient(ctx)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	result, err := client.AppendText(ctx, optionalStringArg(args, "source"), documentID, text)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("append Google Doc text: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("append Google Doc text: %v", err)), nil
 	}
 	return jsonResult(result)
 }
 
-func (h *handlers) replaceGoogleDocText(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) replaceGoogleDocText(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 	documentID, err := requiredTrimmedStringArg(args, "document_id")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	find, err := requiredStringArg(args, "find")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	replacement, err := requiredStringArgAllowEmpty(args, "replacement")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	matchCase, _ := args["match_case"].(bool)
 	client, err := h.getGoogleDocsClient(ctx)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	result, err := client.ReplaceText(ctx, optionalStringArg(args, "source"), documentID, find, replacement, matchCase)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("replace Google Doc text: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("replace Google Doc text: %v", err)), nil
 	}
 	return jsonResult(result)
 }
@@ -2747,12 +3181,12 @@ func (h *handlers) getGmailClient(ctx context.Context, args map[string]any) (gma
 	return client, account, nil
 }
 
-func (h *handlers) listDrafts(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) listDrafts(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
 	client, _, err := h.getGmailClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	defer client.Close()
 
@@ -2761,7 +3195,7 @@ func (h *handlers) listDrafts(ctx context.Context, req mcp.CallToolRequest) (*mc
 
 	drafts, err := client.ListDrafts(ctx, queryStr, limit)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("list drafts: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("list drafts: %v", err)), nil
 	}
 
 	// Return a compact summary
@@ -2784,43 +3218,43 @@ func (h *handlers) listDrafts(ctx context.Context, req mcp.CallToolRequest) (*mc
 		}
 	}
 
-	return jsonResult(summaries)
+	return jsonArrayResult("drafts", summaries)
 }
 
-func (h *handlers) getDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) getDraft(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
 	client, _, err := h.getGmailClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	defer client.Close()
 
 	draftID, _ := args["draft_id"].(string)
 	if draftID == "" {
-		return mcp.NewToolResultError("draft_id parameter is required"), nil
+		return toolErrorResult("draft_id parameter is required"), nil
 	}
 
 	draft, err := client.GetDraft(ctx, draftID)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("get draft: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("get draft: %v", err)), nil
 	}
 
 	return jsonResult(draft)
 }
 
-func (h *handlers) createDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) createDraft(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
 	client, _, err := h.getGmailClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	defer client.Close()
 
 	body, _ := args["body"].(string)
 	if body == "" {
-		return mcp.NewToolResultError("body parameter is required"), nil
+		return toolErrorResult("body parameter is required"), nil
 	}
 
 	compose := &gmail.DraftCompose{
@@ -2854,13 +3288,13 @@ func (h *handlers) createDraft(ctx context.Context, req mcp.CallToolRequest) (*m
 
 	atts, err := h.resolveDraftAttachments(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	compose.Attachments = atts
 
 	draft, err := client.CreateDraft(ctx, compose)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("create draft: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("create draft: %v", err)), nil
 	}
 
 	resp := struct {
@@ -2878,23 +3312,23 @@ func (h *handlers) createDraft(ctx context.Context, req mcp.CallToolRequest) (*m
 	return jsonResult(resp)
 }
 
-func (h *handlers) updateDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) updateDraft(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
 	client, _, err := h.getGmailClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	defer client.Close()
 
 	draftID, _ := args["draft_id"].(string)
 	if draftID == "" {
-		return mcp.NewToolResultError("draft_id parameter is required"), nil
+		return toolErrorResult("draft_id parameter is required"), nil
 	}
 
 	body, _ := args["body"].(string)
 	if body == "" {
-		return mcp.NewToolResultError("body parameter is required"), nil
+		return toolErrorResult("body parameter is required"), nil
 	}
 
 	compose := &gmail.DraftCompose{
@@ -2928,13 +3362,13 @@ func (h *handlers) updateDraft(ctx context.Context, req mcp.CallToolRequest) (*m
 
 	atts, err := h.resolveDraftAttachments(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	compose.Attachments = atts
 
 	draft, err := client.UpdateDraft(ctx, draftID, compose)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("update draft: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("update draft: %v", err)), nil
 	}
 
 	return jsonResult(struct {
@@ -2948,22 +3382,22 @@ func (h *handlers) updateDraft(ctx context.Context, req mcp.CallToolRequest) (*m
 	})
 }
 
-func (h *handlers) deleteDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) deleteDraft(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
 	client, _, err := h.getGmailClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	defer client.Close()
 
 	draftID, _ := args["draft_id"].(string)
 	if draftID == "" {
-		return mcp.NewToolResultError("draft_id parameter is required"), nil
+		return toolErrorResult("draft_id parameter is required"), nil
 	}
 
 	if err := client.DeleteDraft(ctx, draftID); err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("delete draft: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("delete draft: %v", err)), nil
 	}
 
 	return jsonResult(struct {
@@ -2975,23 +3409,23 @@ func (h *handlers) deleteDraft(ctx context.Context, req mcp.CallToolRequest) (*m
 	})
 }
 
-func (h *handlers) sendDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) sendDraft(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
 	client, _, err := h.getGmailClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	defer client.Close()
 
 	draftID, _ := args["draft_id"].(string)
 	if draftID == "" {
-		return mcp.NewToolResultError("draft_id parameter is required"), nil
+		return toolErrorResult("draft_id parameter is required"), nil
 	}
 
 	sent, err := client.SendDraft(ctx, draftID)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("send draft: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("send draft: %v", err)), nil
 	}
 
 	return jsonResult(struct {
@@ -3009,25 +3443,25 @@ func (h *handlers) sendDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp
 
 // --- Label handlers ---
 
-func (h *handlers) modifyLabels(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) modifyLabels(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
 	client, _, err := h.getGmailClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	defer client.Close()
 
 	messageIDsStr, _ := args["message_ids"].(string)
 	if messageIDsStr == "" {
-		return mcp.NewToolResultError("message_ids parameter is required"), nil
+		return toolErrorResult("message_ids parameter is required"), nil
 	}
 
 	addLabelsStr, _ := args["add_labels"].(string)
 	removeLabelsStr, _ := args["remove_labels"].(string)
 
 	if addLabelsStr == "" && removeLabelsStr == "" {
-		return mcp.NewToolResultError("at least one of add_labels or remove_labels is required"), nil
+		return toolErrorResult("at least one of add_labels or remove_labels is required"), nil
 	}
 
 	messageIDs := splitCSV(messageIDsStr)
@@ -3040,7 +3474,7 @@ func (h *handlers) modifyLabels(ctx context.Context, req mcp.CallToolRequest) (*
 		err = client.ModifyMessageLabels(ctx, messageIDs[0], addLabelIDs, removeLabelIDs)
 	}
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("modify labels: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("modify labels: %v", err)), nil
 	}
 
 	return jsonResult(struct {
@@ -3056,44 +3490,44 @@ func (h *handlers) modifyLabels(ctx context.Context, req mcp.CallToolRequest) (*
 	})
 }
 
-func (h *handlers) createLabel(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) createLabel(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
 	client, _, err := h.getGmailClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	defer client.Close()
 
 	name, _ := args["name"].(string)
 	if name == "" {
-		return mcp.NewToolResultError("name parameter is required"), nil
+		return toolErrorResult("name parameter is required"), nil
 	}
 
 	label, err := client.CreateLabel(ctx, name)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("create label: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("create label: %v", err)), nil
 	}
 
 	return jsonResult(label)
 }
 
-func (h *handlers) deleteLabel(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) deleteLabel(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
 	client, _, err := h.getGmailClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	defer client.Close()
 
 	labelID, _ := args["label_id"].(string)
 	if labelID == "" {
-		return mcp.NewToolResultError("label_id parameter is required"), nil
+		return toolErrorResult("label_id parameter is required"), nil
 	}
 
 	if err := client.DeleteLabel(ctx, labelID); err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("delete label: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("delete label: %v", err)), nil
 	}
 
 	return jsonResult(struct {
@@ -3105,21 +3539,21 @@ func (h *handlers) deleteLabel(ctx context.Context, req mcp.CallToolRequest) (*m
 	})
 }
 
-func (h *handlers) listGmailLabels(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) listGmailLabels(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
 	client, _, err := h.getGmailClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	defer client.Close()
 
 	labels, err := client.ListLabels(ctx)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("list labels: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("list labels: %v", err)), nil
 	}
 
-	return jsonResult(labels)
+	return jsonArrayResult("labels", labels)
 }
 
 // splitCSV splits a comma-separated string into trimmed parts.

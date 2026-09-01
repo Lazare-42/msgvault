@@ -1,14 +1,14 @@
 ---
 title: Beeper
-description: Archive every chat network bridged through Beeper Desktop via its local API.
+description: Archive every chat network connected to Beeper Desktop via its local API.
 ---
 
 [Beeper Desktop](https://www.beeper.com) bridges many chat networks — WhatsApp,
-Signal, Telegram, Instagram, LinkedIn, X, Facebook Messenger, and more — into
-one app. msgvault can archive all of them at once through Beeper Desktop's
-local API. Each connected network account becomes its own msgvault source, so
-a Signal thread and a Telegram thread stay separately filterable, while all
-Beeper-archived messages share `message_type = beeper` for search.
+Signal, Telegram, Instagram, LinkedIn, X, Facebook Messenger, iMessage, and
+more — into one app. msgvault can archive all of them at once through Beeper
+Desktop's local API. Each connected network account becomes its own msgvault
+source, so a Signal thread and a Telegram thread stay separately filterable,
+while all Beeper-archived messages share `message_type = beeper` for search.
 
 Beeper sync is strictly read-only: msgvault only calls read endpoints of the
 local API and never sends, edits, archives, or marks anything in Beeper.
@@ -28,7 +28,16 @@ msgvault add-beeper
 
 The command validates the token against the running Beeper Desktop, stores it
 at `tokens/beeper.json` (0600), and registers one `beeper` source per
-connected network account (e.g. `signal`, `telegram`, `whatsapp`).
+connected network account (e.g. `signal`, `telegram`, `whatsapp`,
+`imessage_…`).
+
+Beeper's accounts API omits some networks it serves natively rather than
+bridging — currently iMessage — so those are found from chat data instead.
+They are printed as *found via chats* and behave like any other `beeper`
+source afterwards.
+
+`add-beeper` is safe to re-run and does not disturb existing sources, so run it
+again after connecting a new network in Beeper Desktop to register it.
 
 Provide the token via the interactive prompt, `--token-file <path>`, or the
 `MSGVAULT_BEEPER_TOKEN` environment variable:
@@ -91,8 +100,51 @@ are only picked up by `--full` runs.
   so nothing is lost even where msgvault's relational model is narrower.
 
 Because Beeper's API serves what Beeper Desktop has synced locally, archive
-depth equals your local Beeper history: a freshly added Beeper account may
-only have recent messages until Beeper finishes its own backfill.
+depth equals your local Beeper history: a freshly added Beeper account may only
+have recent messages until Beeper finishes its own backfill. That backfill can
+land hours or weeks later, behind history msgvault has already walked, so once a
+day each sync re-checks the oldest end of every completed chat and resumes the
+backfill wherever Beeper has since filled more in. Nothing is needed to trigger
+this, and the run reports how many chats it reopened.
+
+## Repairing derived data
+
+Message bodies, snippets, the search index, and attachment classification are
+derived from the API payload at import time, so improvements to how they are
+derived do not reach messages already archived.
+
+Nothing is needed to pick those up: each account re-derives itself once, on its
+next sync, from the verbatim JSON stored with every message. The sync reports
+how many rows it repaired. To repair on demand instead of waiting — or to finish
+an interrupted pass — run it directly:
+
+```bash
+msgvault repair-derived --source-type beeper
+msgvault repair-derived --source-type beeper --identifier instagramgo
+```
+
+It needs no Beeper Desktop connection, repairs messages Beeper no longer holds,
+and rewrites only derived columns — raw payloads, downloaded media, and sync
+cursors are untouched, so it is idempotent.
+
+## Link previews
+
+Media that arrives as a forwarded link preview — an Instagram reel, an x.com
+post — is recorded with the URL it previews in `attachments.attachment_metadata`
+(`{"shared_url": "..."}`), while media a sender composed has none. This tells a
+photo a friend took apart from a public post they forwarded, which matters
+because forwarded previews can dominate an Instagram archive's bytes while
+remaining recoverable from the URL. Downloads are unaffected: everything is
+still archived. To see the split:
+
+```sql
+SELECT COALESCE(a.attachment_metadata IS NOT NULL, 0) AS is_share,
+       COUNT(*), SUM(a.size)
+FROM attachments a
+JOIN messages m ON m.id = a.message_id
+WHERE m.message_type = 'beeper'
+GROUP BY is_share;
+```
 
 ## Scheduled sync
 
@@ -139,3 +191,10 @@ resolving to the same person).
   with an error; remove and re-add the Beeper sources in that case.
 - **Remote daemons**: the Beeper API is loopback-only, so the msgvault daemon
   must run on the same machine as Beeper Desktop.
+- **iMessage**: Beeper only carries iMessage on macOS, so archiving it this way
+  needs a Mac running Beeper Desktop beside the msgvault daemon. Networks found
+  from chat data are looked for in a bounded scan of your most recently active
+  conversations, so one with no chats — or none recent enough to fall inside
+  that window — stays invisible until it sees activity; send or receive a
+  message, then re-run `add-beeper`. The scan logs a warning when it stops at
+  its bound.

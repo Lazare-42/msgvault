@@ -9,8 +9,10 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	imap "github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapclient"
 	"github.com/emersion/go-imap/v2/imapserver"
 	"github.com/emersion/go-imap/v2/imapserver/imapmemserver"
 	"github.com/stretchr/testify/require"
@@ -77,6 +79,26 @@ func (s *phantomUIDSession) Search(
 	data, err := s.Session.Search(kind, criteria, options)
 	if err != nil {
 		return nil, fmt.Errorf("search session: %w", err)
+	}
+	return data, nil
+}
+
+type statusErrorSession struct {
+	imapserver.Session
+
+	mailbox string
+}
+
+func (s *statusErrorSession) Status(
+	mailbox string,
+	options *imap.StatusOptions,
+) (*imap.StatusData, error) {
+	if mailbox == s.mailbox {
+		return nil, fmt.Errorf("synthetic STATUS failure for %q", mailbox)
+	}
+	data, err := s.Session.Status(mailbox, options)
+	if err != nil {
+		return nil, fmt.Errorf("status %q: %w", mailbox, err)
 	}
 	return data, nil
 }
@@ -198,11 +220,26 @@ func AppendIMAPMessageWithoutMessageID(
 	messageBody string,
 ) {
 	t.Helper()
+	AppendIMAPMessageAt(t, user, mailbox, messageBody, time.Time{})
+}
+
+// AppendIMAPMessageAt appends one synthetic RFC822 message with the supplied
+// body and internal date to a mailbox of an in-memory IMAP test user.
+func AppendIMAPMessageAt(
+	t *testing.T,
+	user *imapmemserver.User,
+	mailbox string,
+	messageBody string,
+	internalDate time.Time,
+) {
+	t.Helper()
 	body := fmt.Appendf(nil,
 		"From: alice@example.com\r\nTo: bob@example.com\r\n\r\n%s\r\n",
 		messageBody,
 	)
-	_, err := user.Append(mailbox, imapLiteral{bytes.NewReader(body)}, &imap.AppendOptions{})
+	_, err := user.Append(mailbox, imapLiteral{bytes.NewReader(body)}, &imap.AppendOptions{
+		Time: internalDate,
+	})
 	require.NoError(t, err)
 }
 
@@ -249,7 +286,7 @@ func AppendIMAPMessageWithMessageID(
 // down via t.Cleanup.
 func StartIMAPMemServer(t *testing.T, messagesPerMailbox map[string]int) (string, *imapmemserver.User) {
 	t.Helper()
-	return startIMAPMemServer(t, messagesPerMailbox, nil, "", 0, nil, 0)
+	return startIMAPMemServer(t, messagesPerMailbox, nil, "", 0, nil, 0, "")
 }
 
 // StartIMAPMemServerWithSpecialUse runs an in-memory IMAP server whose LIST
@@ -260,7 +297,7 @@ func StartIMAPMemServerWithSpecialUse(
 	specialUse map[string][]imap.MailboxAttr,
 ) (string, *imapmemserver.User) {
 	t.Helper()
-	return startIMAPMemServer(t, messagesPerMailbox, specialUse, "", 0, nil, 0)
+	return startIMAPMemServer(t, messagesPerMailbox, specialUse, "", 0, nil, 0, "")
 }
 
 // StartIMAPMemServerWithCreateError runs an in-memory IMAP server that returns
@@ -277,7 +314,7 @@ func StartIMAPMemServerWithCreateError(
 			Type: imap.StatusResponseTypeNo,
 			Text: "Mailbox already exists.",
 		},
-	}, 0)
+	}, 0, "")
 }
 
 // StartIMAPMemServerWithCreateFailure hides an existing mailbox from the first
@@ -296,7 +333,7 @@ func StartIMAPMemServerWithCreateFailure(
 			Code: imap.ResponseCodeOverQuota,
 			Text: "Mailbox quota exceeded.",
 		},
-	}, 0)
+	}, 0, "")
 }
 
 // StartIMAPMemServerWithPhantomUID runs an in-memory IMAP server whose first
@@ -308,7 +345,20 @@ func StartIMAPMemServerWithPhantomUID(
 	phantomUID imap.UID,
 ) (string, *imapmemserver.User) {
 	t.Helper()
-	return startIMAPMemServer(t, messagesPerMailbox, nil, "", 0, nil, phantomUID)
+	return startIMAPMemServer(t, messagesPerMailbox, nil, "", 0, nil, phantomUID, "")
+}
+
+// StartIMAPMemServerWithStatusError runs an in-memory IMAP server that rejects
+// STATUS for one mailbox while serving LIST, SELECT, SEARCH, and FETCH normally.
+func StartIMAPMemServerWithStatusError(
+	t *testing.T,
+	messagesPerMailbox map[string]int,
+	specialUse map[string][]imap.MailboxAttr,
+	statusErrorMailbox string,
+) (string, *imapmemserver.User) {
+	t.Helper()
+	return startIMAPMemServer(
+		t, messagesPerMailbox, specialUse, "", 0, nil, 0, statusErrorMailbox)
 }
 
 // StartIMAPMemServerWithSelectError runs an in-memory IMAP server that rejects
@@ -321,7 +371,7 @@ func StartIMAPMemServerWithSelectError(
 ) (string, *imapmemserver.User) {
 	t.Helper()
 	return startIMAPMemServer(
-		t, messagesPerMailbox, specialUse, selectErrorMailbox, -1, nil, 0)
+		t, messagesPerMailbox, specialUse, selectErrorMailbox, -1, nil, 0, "")
 }
 
 // StartIMAPMemServerWithOneShotSelectError runs an in-memory IMAP server that
@@ -334,7 +384,7 @@ func StartIMAPMemServerWithOneShotSelectError(
 ) (string, *imapmemserver.User) {
 	t.Helper()
 	return startIMAPMemServer(
-		t, messagesPerMailbox, specialUse, selectErrorMailbox, 1, nil, 0)
+		t, messagesPerMailbox, specialUse, selectErrorMailbox, 1, nil, 0, "")
 }
 
 type createErrorConfig struct {
@@ -350,6 +400,7 @@ func startIMAPMemServer(
 	selectErrorCount int,
 	createError *createErrorConfig,
 	phantomUID imap.UID,
+	statusErrorMailbox string,
 ) (string, *imapmemserver.User) {
 	t.Helper()
 	user := imapmemserver.NewUser(IMAPTestUsername, IMAPTestPassword)
@@ -409,6 +460,12 @@ func startIMAPMemServer(
 					claimed: &phantomUIDClaimed,
 				}
 			}
+			if statusErrorMailbox != "" {
+				session = &statusErrorSession{
+					Session: session,
+					mailbox: statusErrorMailbox,
+				}
+			}
 			return session, nil, nil
 		},
 		Caps:         caps,
@@ -421,4 +478,27 @@ func startIMAPMemServer(
 	t.Cleanup(func() { _ = server.Close() })
 
 	return ln.Addr().String(), user
+}
+
+// ExpungeIMAPMessage permanently removes one UID from a mailbox on a server
+// returned by StartIMAPMemServer. The mailbox's STATUS MESSAGES count drops by
+// one while UIDNEXT stays put — the shape of a change that a cursor without
+// CONDSTORE cannot detect from UIDNEXT alone.
+func ExpungeIMAPMessage(t *testing.T, addr, mailbox string, uid imap.UID) {
+	t.Helper()
+	client, err := imapclient.DialInsecure(addr, nil)
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	require.NoError(t, client.Login(IMAPTestUsername, IMAPTestPassword).Wait())
+	_, err = client.Select(mailbox, nil).Wait()
+	require.NoError(t, err)
+
+	var uidSet imap.UIDSet
+	uidSet.AddNum(uid)
+	require.NoError(t, client.Store(uidSet, &imap.StoreFlags{
+		Op:    imap.StoreFlagsAdd,
+		Flags: []imap.Flag{imap.FlagDeleted},
+	}, nil).Close())
+	require.NoError(t, client.Expunge().Close())
 }

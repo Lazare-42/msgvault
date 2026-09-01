@@ -23,13 +23,91 @@ import (
 	"go.kenn.io/kit/daemon"
 	"go.kenn.io/msgvault/internal/apiprotocol"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/daemonauth"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/query/querytest"
 	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/store"
 )
 
 const cliTimeoutTestAPIKey = "cli-timeout-test-key"
+
+type participantFilterTextEngine struct {
+	*querytest.MockEngine
+
+	filter query.TextFilter
+}
+
+func (e *participantFilterTextEngine) ListConversations(_ context.Context, filter query.TextFilter) ([]query.ConversationRow, error) {
+	e.filter = filter
+	return []query.ConversationRow{{ConversationID: 1}}, nil
+}
+
+func (e *participantFilterTextEngine) ListConversationsSnapshot(_ context.Context, filter query.TextFilter) ([]query.ConversationRow, string, error) {
+	e.filter = filter
+	return []query.ConversationRow{{ConversationID: 1}}, "text-test-fixed", nil
+}
+
+func (e *participantFilterTextEngine) ListConversationMessagesSnapshot(_ context.Context, _ int64, filter query.TextFilter) ([]query.MessageSummary, string, error) {
+	e.filter = filter
+	return nil, "text-test-fixed", nil
+}
+
+func (*participantFilterTextEngine) TextAggregate(context.Context, query.TextViewType, query.TextAggregateOptions) ([]query.AggregateRow, error) {
+	return nil, nil
+}
+
+func (e *participantFilterTextEngine) ListConversationMessages(_ context.Context, _ int64, filter query.TextFilter) ([]query.MessageSummary, error) {
+	e.filter = filter
+	return nil, nil
+}
+
+func (*participantFilterTextEngine) TextSearch(context.Context, string, int, int) ([]query.MessageSummary, error) {
+	return nil, nil
+}
+
+func (*participantFilterTextEngine) GetTextStats(context.Context, query.TextStatsOptions) (*query.TotalStats, error) {
+	return &query.TotalStats{}, nil
+}
+
+// TestTextConversationsParticipantIDs verifies repeated participant IDs reach
+// the text engine and malformed or non-positive IDs are rejected at the HTTP
+// boundary rather than widening the conversation scope.
+func TestTextConversationsParticipantIDs(t *testing.T) {
+	engine := &participantFilterTextEngine{MockEngine: &querytest.MockEngine{}}
+	srv := newTestServerWithEngine(t, engine)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/text/conversations?participant_id=11&participant_id=14", nil)
+	response := httptest.NewRecorder()
+	srv.Router().ServeHTTP(response, req)
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Equal(t, []int64{11, 14}, engine.filter.ParticipantIDs)
+
+	for _, target := range []string{
+		"/api/v1/text/conversations?participant_id=0",
+		"/api/v1/text/conversations?participant_id=invalid",
+	} {
+		response = httptest.NewRecorder()
+		srv.Router().ServeHTTP(response, httptest.NewRequest(http.MethodGet, target, nil))
+		assert.Equal(t, http.StatusBadRequest, response.Code, response.Body.String())
+	}
+}
+
+func TestTextConversationMessagesPassesScopedSearchQuery(t *testing.T) {
+	engine := &participantFilterTextEngine{MockEngine: &querytest.MockEngine{}}
+	srv := newTestServerWithEngine(t, engine)
+
+	response := httptest.NewRecorder()
+	srv.Router().ServeHTTP(response, httptest.NewRequest(
+		http.MethodGet,
+		"/api/v1/text/conversations/701/messages?search_query=hiddenneedle",
+		nil,
+	))
+
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.Equal(t, "hiddenneedle", engine.filter.SearchQuery)
+}
 
 // syncBuffer is a concurrency-safe buffer for capturing slog output written
 // from the logger goroutine while the test goroutine reads it.
@@ -264,19 +342,27 @@ type mockStore struct {
 	needsFTSBackfillQuick bool
 	// needsFTSBackfillFunc overrides the needsFTSBackfill field when set, so
 	// tests can block inside the probe or vary its answer per call.
-	needsFTSBackfillFunc func() bool
-	backfillFTSFunc      func(func(done, total int64)) (int64, error)
-	rebuildFTSFunc       func(func(done, total int64)) (int64, error)
-	buildCacheFunc       func(context.Context, bool, func(CLICacheBuildEvent) error) error
-	syncFunc             func(context.Context, CLISyncRequest, func(CLISyncEvent) error) error
-	verifyFunc           func(context.Context, CLIVerifyRequest, func(CLIVerifyEvent) error) error
-	repairFunc           func(context.Context, func(CLIRepairEncodingEvent) error) error
-	runFunc              func(context.Context, CLIRunRequest, func(CLIRunEvent) error) error
-	planCalendarFunc     func(context.Context, CLIAddCalendarPlanRequest) (CLIAddCalendarPlanResponse, error)
-	planEmbedsFunc       func(context.Context, CLIEmbeddingsPlanRequest) (CLIEmbeddingsPlanResponse, error)
-	planDeleteFunc       func(context.Context, CLIDeleteStagedPlanRequest) (CLIDeleteStagedPlanResponse, error)
-	planDedupFunc        func(context.Context, CLIDeduplicatePlanRequest) (CLIDeduplicatePlanResponse, error)
-	saveManifestFunc     func(context.Context, *deletion.Manifest) error
+	needsFTSBackfillFunc  func() bool
+	backfillFTSFunc       func(func(done, total int64)) (int64, error)
+	rebuildFTSFunc        func(func(done, total int64)) (int64, error)
+	buildCacheFunc        func(context.Context, bool, func(CLICacheBuildEvent) error) error
+	syncFunc              func(context.Context, CLISyncRequest, func(CLISyncEvent) error) error
+	verifyFunc            func(context.Context, CLIVerifyRequest, func(CLIVerifyEvent) error) error
+	repairFunc            func(context.Context, func(CLIRepairEncodingEvent) error) error
+	runFunc               func(context.Context, CLIRunRequest, func(CLIRunEvent) error) error
+	planCalendarFunc      func(context.Context, CLIAddCalendarPlanRequest) (CLIAddCalendarPlanResponse, error)
+	planEmbedsFunc        func(context.Context, CLIEmbeddingsPlanRequest) (CLIEmbeddingsPlanResponse, error)
+	planDeleteFunc        func(context.Context, CLIDeleteStagedPlanRequest) (CLIDeleteStagedPlanResponse, error)
+	planDedupFunc         func(context.Context, CLIDeduplicatePlanRequest) (CLIDeduplicatePlanResponse, error)
+	saveManifestFunc      func(context.Context, *deletion.Manifest) error
+	documentSearchFunc    func(context.Context, store.DocumentSearchRequest) (store.DocumentSearchResponse, error)
+	documentStatusFunc    func(context.Context, string, string, []string, []string) (store.DocumentIndexStatus, error)
+	documentRebuildFunc   func(context.Context, string, string) (store.DocumentExtractionRebuild, error)
+	documentRemainingFunc func(
+		context.Context, store.DocumentExtractionRebuild, []string, []string,
+	) (int64, error)
+	documentReconcileFunc func(context.Context) error
+	personContextFunc     func(context.Context, int64) (*store.Person, error)
 
 	// Error injection for the context-aware read paths, used to verify
 	// handlers map context deadline/cancellation to a structured 503.
@@ -304,6 +390,68 @@ type mockStore struct {
 	sourcesByLookup    map[string][]*store.Source
 	sourcesByLookupErr error
 	collections        map[string]*store.CollectionWithSources
+}
+
+func (m *mockStore) ReconcileDocumentOccurrences(ctx context.Context) error {
+	if m.documentReconcileFunc == nil {
+		return nil
+	}
+	return m.documentReconcileFunc(ctx)
+}
+
+func (m *mockStore) SearchDocuments(
+	ctx context.Context,
+	request store.DocumentSearchRequest,
+) (store.DocumentSearchResponse, error) {
+	if m.documentSearchFunc == nil {
+		return store.DocumentSearchResponse{}, nil
+	}
+	return m.documentSearchFunc(ctx, request)
+}
+
+func (m *mockStore) GetPersonContext(ctx context.Context, id int64) (*store.Person, error) {
+	if m.personContextFunc == nil {
+		return nil, store.ErrPersonNotFound
+	}
+	return m.personContextFunc(ctx, id)
+}
+
+func (m *mockStore) GetDocumentIndexStatusForScope(
+	ctx context.Context,
+	profileID string,
+	extractionInputKey string,
+	allowedMediaTypes []string,
+	allowedMessageTypes []string,
+) (store.DocumentIndexStatus, error) {
+	if m.documentStatusFunc == nil {
+		return store.DocumentIndexStatus{}, nil
+	}
+	return m.documentStatusFunc(
+		ctx, profileID, extractionInputKey, allowedMediaTypes, allowedMessageTypes,
+	)
+}
+
+func (m *mockStore) GetActiveDocumentExtractionRebuild(
+	ctx context.Context,
+	profileID string,
+	extractionInputKey string,
+) (store.DocumentExtractionRebuild, error) {
+	if m.documentRebuildFunc == nil {
+		return store.DocumentExtractionRebuild{}, store.ErrDocumentExtractionRebuildMissing
+	}
+	return m.documentRebuildFunc(ctx, profileID, extractionInputKey)
+}
+
+func (m *mockStore) CountIncompleteDocumentExtractionRebuild(
+	ctx context.Context,
+	rebuild store.DocumentExtractionRebuild,
+	allowedMediaTypes []string,
+	allowedMessageTypes []string,
+) (int64, error) {
+	if m.documentRemainingFunc == nil {
+		return 0, nil
+	}
+	return m.documentRemainingFunc(ctx, rebuild, allowedMediaTypes, allowedMessageTypes)
 }
 
 func (m *mockStore) GetStats() (*StoreStats, error) {
@@ -733,6 +881,37 @@ func TestDaemonShutdownEndpointRequiresRuntimeToken(t *testing.T) {
 	}, time.Second, 10*time.Millisecond, "shutdown callback")
 }
 
+func TestDaemonIdentityEndpointProvesRuntimeSecretWithoutReceivingIt(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	challenge, err := daemonauth.NewChallenge()
+	require.NoError(err, "create challenge")
+
+	srv := NewServerWithOptions(ServerOptions{
+		Config:        &config.Config{Server: config.ServerConfig{APIPort: 8080}},
+		Scheduler:     newMockScheduler(),
+		Logger:        testLogger(),
+		ShutdownToken: "runtime-secret",
+	})
+	req := httptest.NewRequest(http.MethodGet, DaemonIdentityPath, nil)
+	req.Header.Set(DaemonIdentityChallengeHeader, challenge)
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	assert.Equal(http.StatusNoContent, w.Code, "identity proof status")
+	proof := w.Header().Get(DaemonIdentityProofHeader)
+	assert.True(daemonauth.VerifyProof("runtime-secret", challenge, os.Getpid(), proof),
+		"proof authenticates this daemon PID")
+	assert.NotContains(proof, "runtime-secret", "response does not disclose the runtime secret")
+
+	invalid := httptest.NewRequest(http.MethodGet, DaemonIdentityPath, nil)
+	invalid.Header.Set(DaemonIdentityChallengeHeader, "invalid")
+	invalidResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(invalidResp, invalid)
+	assert.Equal(http.StatusBadRequest, invalidResp.Code, "malformed challenge status")
+}
+
 func TestAuthMiddleware(t *testing.T) {
 	cfg := &config.Config{
 		Server: config.ServerConfig{
@@ -1114,6 +1293,46 @@ func TestTimeoutMiddlewareDeadlinePolicy(t *testing.T) {
 	}
 }
 
+func TestCardDAVNetworkRoutesReceiveProtectiveDeadline(t *testing.T) {
+	srv := NewServerWithOptions(ServerOptions{
+		Config:         &config.Config{Server: config.ServerConfig{APIPort: 8080}},
+		Logger:         testLogger(),
+		RequestTimeout: 5 * time.Millisecond,
+	})
+	routes := []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodPost, path: "/api/v1/carddav/account/test"},
+		{method: http.MethodPut, path: "/api/v1/carddav/account"},
+		{method: http.MethodPost, path: "/api/v1/carddav/publications/7"},
+		{method: http.MethodDelete, path: "/api/v1/carddav/publications/7"},
+		{method: http.MethodPost, path: "/api/v1/carddav/conflicts/7/resolve"},
+		{method: http.MethodPost, path: "/api/v1/carddav/sync"},
+	}
+
+	for _, route := range routes {
+		t.Run(route.method+" "+route.path, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			var deadline time.Time
+			var hasDeadline bool
+			handler := srv.timeoutMiddleware(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				deadline, hasDeadline = r.Context().Deadline()
+			}))
+			recorder := &deadlineClearingRecorder{ResponseRecorder: httptest.NewRecorder()}
+			handler.ServeHTTP(recorder, httptest.NewRequest(route.method, route.path, nil))
+
+			require.True(hasDeadline, "network route receives a context deadline")
+			remaining := time.Until(deadline)
+			assert.Greater(remaining, DaemonLongRequestTimeout-time.Second)
+			assert.LessOrEqual(remaining, DaemonLongRequestTimeout)
+			require.Len(recorder.readDeadlines, 1, "network route extends the server read deadline")
+			assert.Empty(recorder.writeDeadlines, "network route keeps the generous server write deadline")
+		})
+	}
+}
+
 func TestCLIRequestDurationPolicy(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -1229,10 +1448,13 @@ func TestCLIRequestDurationPolicy(t *testing.T) {
 
 func TestTimeoutMiddlewareMarkedRequestPreservesCallerCancellation(t *testing.T) {
 	require := require.New(t)
+	// The timeout must be far beyond the test's cancel latency: this test
+	// proves caller CANCELLATION reaches a marked request, and a 5ms budget
+	// let slow CI runners hit the deadline before cancel() ran.
 	srv := NewServerWithOptions(ServerOptions{
 		Config:         &config.Config{Server: config.ServerConfig{APIPort: 8080}},
 		Logger:         testLogger(),
-		RequestTimeout: 5 * time.Millisecond,
+		RequestTimeout: 5 * time.Second,
 	})
 
 	started := make(chan struct{})
@@ -1245,6 +1467,7 @@ func TestTimeoutMiddlewareMarkedRequestPreservesCallerCancellation(t *testing.T)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/cli/stats", nil).WithContext(ctx)
+	req.RemoteAddr = "127.0.0.1:4242"
 	req.Header.Set(apiprotocol.ClientClassHeader, apiprotocol.ClientClassCLI)
 	requestDone := make(chan struct{})
 	go func() {
@@ -1301,6 +1524,7 @@ func TestMarkedCLIProtectiveCeilingInventory(t *testing.T) {
 		{method: http.MethodPost, path: "/api/v1/cli/deduplicate/plan"},
 		{method: http.MethodPost, path: "/api/v1/cli/identities"},
 		{method: http.MethodDelete, path: "/api/v1/cli/identities"},
+		{method: http.MethodPost, path: "/api/v1/cli/identities/import"},
 	}
 
 	for _, route := range protectiveRoutes {
@@ -1441,4 +1665,87 @@ func TestMarkedCLIProtectiveRouteCanReadBodyPastOrdinaryServerTimeout(t *testing
 		}
 		assert.Equal(t, http.StatusRequestTimeout, status)
 	})
+}
+
+type blockingAddrListener struct {
+	net.Listener
+
+	addrEntered chan struct{}
+	release     chan struct{}
+	addrOnce    sync.Once
+}
+
+func (l *blockingAddrListener) Addr() net.Addr {
+	l.addrOnce.Do(func() { close(l.addrEntered) })
+	<-l.release
+	return l.Listener.Addr()
+}
+
+func TestServerWaitStartedHonorsCancellationAndReportsReadiness(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	base, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(err, "listen")
+	listener := &blockingAddrListener{
+		Listener:    base,
+		addrEntered: make(chan struct{}),
+		release:     make(chan struct{}),
+	}
+	t.Cleanup(func() {
+		select {
+		case <-listener.release:
+		default:
+			close(listener.release)
+		}
+		_ = listener.Close()
+	})
+
+	srv := NewServerWithOptions(ServerOptions{
+		Config: config.NewDefaultConfig(),
+		Logger: testLogger(),
+	})
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.StartOnListener(listener) }()
+	select {
+	case <-listener.addrEntered:
+	case <-time.After(5 * time.Second):
+		require.FailNow("server did not reach listener-start setup")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(srv.WaitStarted(ctx), context.Canceled)
+
+	close(listener.release)
+	require.NoError(srv.WaitStarted(context.Background()), "listener startup")
+	srv.serverMu.RLock()
+	server := srv.server
+	bound := srv.listenerBound
+	srv.serverMu.RUnlock()
+	assert.NotNil(server)
+	assert.True(bound)
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), time.Second)
+	defer shutdownCancel()
+	require.NoError(srv.Shutdown(shutdownCtx), "shutdown")
+	require.ErrorIs(<-serveErr, http.ErrServerClosed, "serve result")
+}
+
+func TestServerWaitStartedReportsListenError(t *testing.T) {
+	require := require.New(t)
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(err, "reserve listener")
+	defer func() { _ = listener.Close() }()
+	addr, ok := listener.Addr().(*net.TCPAddr)
+	require.True(ok, "listener address must be TCP")
+
+	c := config.NewDefaultConfig()
+	c.Server.BindAddr = "127.0.0.1"
+	c.Server.APIPort = addr.Port
+	srv := NewServerWithOptions(ServerOptions{Config: c, Logger: testLogger()})
+	startErr := srv.Start()
+	require.Error(startErr)
+	waitErr := srv.WaitStarted(context.Background())
+	require.Error(waitErr)
+	assert.EqualError(t, waitErr, startErr.Error())
 }

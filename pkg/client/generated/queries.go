@@ -113,6 +113,14 @@ func (g GetSubAggregatesQuery) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(g))
 }
 
+type ListAttributeDefinitionsQuery struct {
+	// ObjectType Filter by object type
+	ObjectType *string `json:"object_type,omitempty"`
+
+	// IncludeHidden Include deactivated definitions
+	IncludeHidden *bool `json:"include_hidden,omitempty"`
+}
+
 type GetCLIAttachmentQuery struct {
 	// ContentHash Attachment SHA-256 content hash
 	ContentHash string `json:"content_hash" validate:"required"`
@@ -142,6 +150,9 @@ type ListCLIIdentitiesQuery struct {
 
 	// Collection Restrict to all member accounts of one collection
 	Collection *string `json:"collection,omitempty"`
+
+	// SourceID Restrict to one source by numeric ID
+	SourceID *int64 `json:"source_id,omitempty"`
 
 	// PrimaryOnly For account scope, return only the primary source instead of related sources
 	PrimaryOnly *bool `json:"primary_only,omitempty"`
@@ -178,6 +189,9 @@ type SearchCLIQuery struct {
 	// MessageType Message type filter; repeat or comma-separate for multiple values
 	MessageType *string `json:"message_type,omitempty"`
 
+	// DeletionScope Source deletion scope: active (default), deleted, or any
+	DeletionScope *string `json:"deletion_scope,omitempty"`
+
 	// Account Restrict to one account/source
 	Account *string `json:"account,omitempty"`
 
@@ -201,6 +215,9 @@ type SyncCLIQuery struct {
 	// Email Account email or display name to sync
 	Email *string `json:"email,omitempty"`
 
+	// SourceID Exact source ID to sync
+	SourceID *int64 `json:"source_id,omitempty"`
+
 	// Folder IMAP folder names to include (repeatable)
 	Folder []string `json:"folder,omitempty"`
 
@@ -211,6 +228,9 @@ type SyncCLIQuery struct {
 type SyncFullCLIQuery struct {
 	// Email Account email or display name to sync
 	Email *string `json:"email,omitempty"`
+
+	// SourceID Exact source ID to sync
+	SourceID *int64 `json:"source_id,omitempty"`
 
 	// Query Gmail search query
 	Query *string `json:"query,omitempty"`
@@ -252,6 +272,11 @@ func (v VerifyCLIQuery) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(v))
 }
 
+type ListCommunicationServicesQuery struct {
+	// IncludeInactive Include inactive catalog entries
+	IncludeInactive *bool `json:"include_inactive,omitempty"`
+}
+
 type GetConversationQuery struct {
 	// Anchor Selected message ID anchoring the chronological window
 	Anchor int64 `json:"anchor"`
@@ -269,9 +294,130 @@ type GetConversationQuery struct {
 	End *string `json:"end,omitempty"`
 }
 
+type GetActivityDayQuery struct {
+	// Limit Maximum primary rows to return
+	Limit *int64 `json:"limit,omitempty" validate:"omitempty,gte=1,lte=500"`
+
+	// Offset Zero-based primary row offset
+	Offset *int64 `json:"offset,omitempty" validate:"omitempty,gte=0"`
+
+	// EntryLimit Maximum authored entries to return independently
+	EntryLimit *int64 `json:"entry_limit,omitempty" validate:"omitempty,gte=1,lte=500"`
+
+	// EntryOffset Zero-based authored-entry offset
+	EntryOffset *int64 `json:"entry_offset,omitempty" validate:"omitempty,gte=0"`
+
+	// ActivityLimitPerPerson Maximum activity references previewed for each person
+	ActivityLimitPerPerson *int64 `json:"activity_limit_per_person,omitempty" validate:"omitempty,gte=1,lte=500"`
+}
+
+func (g GetActivityDayQuery) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+}
+
+type ListDayEntriesQuery struct {
+	// Limit Maximum primary rows to return
+	Limit *int64 `json:"limit,omitempty" validate:"omitempty,gte=1,lte=500"`
+
+	// Offset Zero-based primary row offset
+	Offset *int64 `json:"offset,omitempty" validate:"omitempty,gte=0"`
+}
+
+func (l ListDayEntriesQuery) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(l))
+}
+
 type ListDeletionsQuery struct {
 	// Status Filter manifests by status (pending, in_progress, completed, failed, cancelled)
 	Status *string `json:"status,omitempty"`
+}
+
+type SearchDocumentsQuery struct {
+	// Q Extracted document content or filename query
+	Q string `json:"q" validate:"required"`
+
+	// SourceID Source IDs to include; repeat or comma-separate values
+	SourceID []int64 `json:"source_id,omitempty"`
+
+	// MessageType Message types to include; repeat or comma-separate values
+	MessageType []string `json:"message_type,omitempty"`
+
+	// AttachmentID Exact attachment occurrence ID
+	AttachmentID *int64 `json:"attachment_id,omitempty"`
+
+	// MessageID Exact containing message ID
+	MessageID *int64 `json:"message_id,omitempty"`
+
+	// PersonID Durable person ID
+	PersonID *int64 `json:"person_id,omitempty"`
+
+	// ParticipantID Observed participant ID; translated through its durable person when bound
+	ParticipantID *int64 `json:"participant_id,omitempty"`
+
+	// Direction Person relation; repeat or comma-separate from_person, to_person, or group
+	Direction []string `json:"direction,omitempty"`
+
+	// After Only messages on or after an RFC3339 or YYYY-MM-DD date
+	After *string `json:"after,omitempty"`
+
+	// Before Only messages before an RFC3339 or YYYY-MM-DD date
+	Before *string `json:"before,omitempty"`
+
+	// Limit Maximum results to return (default 20, max 100)
+	Limit *int64 `json:"limit,omitempty"`
+
+	// Cursor Opaque cursor from the previous document search page
+	Cursor *string `json:"cursor,omitempty"`
+
+	// Mode Search mode: lexical (default and auto); semantic/hybrid send the query to the embedding provider
+	Mode *string `json:"mode,omitempty"`
+
+	// CandidateLimit Maximum candidates (default/max: lexical 10000; semantic/hybrid 100/1000)
+	CandidateLimit *int64 `json:"candidate_limit,omitempty"`
+}
+
+func (s SearchDocumentsQuery) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(s))
+}
+
+type GetDocumentIndexStatusQuery struct {
+	// ProfileID Exact document extraction profile ID
+	ProfileID string `json:"profile_id" validate:"required"`
+
+	// InputKey Exact extraction input key
+	InputKey string `json:"input_key" validate:"required"`
+
+	// MediaType Allowed document media types
+	MediaType []string `json:"media_type" validate:"required"`
+
+	// MessageType Allowed message types
+	MessageType []string `json:"message_type,omitempty"`
+}
+
+func (g GetDocumentIndexStatusQuery) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+}
+
+type GetDocumentVectorStatusQuery struct {
+	// GenerationID Generation whose bounded failures to inspect
+	GenerationID *int64 `json:"generation_id,omitempty"`
+
+	// AfterToken Stable failure cursor token
+	AfterToken *string `json:"after_token,omitempty"`
+
+	// Limit Maximum failure diagnostics (default 20, max 1000)
+	Limit *int64 `json:"limit,omitempty"`
+}
+
+type ListIdentityMatchCandidatesQuery struct {
+	// State Candidate state filter (candidate, accepted, rejected, conflict); repeat or comma-separate for multiple values
+	State *string `json:"state,omitempty"`
+
+	// Limit Maximum candidates to return (default 100, max 500)
+	Limit *int64 `json:"limit,omitempty"`
+
+	// Offset Zero-based candidate offset
+	Offset *int64 `json:"offset,omitempty"`
 }
 
 type SearchIntegrationTasksQuery struct {
@@ -289,6 +435,14 @@ type ListMessagesQuery struct {
 
 	// PageSize Page size (default 20, max 100; out-of-range values are clamped). Non-numeric values are rejected with 400.
 	PageSize *int64 `json:"page_size,omitempty"`
+}
+
+type ListChangedMessagesQuery struct {
+	// Cursor Opaque cursor from the next_cursor of the previous response, sent back verbatim. Do not parse, construct, compare, or order it; its contents may change without notice. Omit, or send it empty, to start from the beginning of the archive. The token is not authenticated: the server does not sign it and cannot tell one it issued from a well-formed one you built, so a fabricated cursor naming this archive is accepted and simply moves your own position. Rejected with 400 invalid_cursor, rather than read as the beginning: a token the server cannot read, one carrying a cursor format this build does not speak, and one issued against a different archive
+	Cursor *string `json:"cursor,omitempty"`
+
+	// Limit Maximum number of rows to return (default 100, max 500; values below 1 fall back to the default)
+	Limit *int64 `json:"limit,omitempty"`
 }
 
 type FilterMessagesQuery struct {
@@ -424,11 +578,218 @@ func (g GetMessageInlinePartQuery) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(g))
 }
 
+type ListOrganizationsQuery struct {
+	// Limit Maximum results
+	Limit *int64 `json:"limit,omitempty"`
+
+	// Offset Results to skip
+	Offset *int64 `json:"offset,omitempty"`
+
+	// IncludeRetired Include retired organizations
+	IncludeRetired *bool `json:"include_retired,omitempty"`
+
+	// Q Normalized-name search
+	Q *string `json:"q,omitempty"`
+}
+
+type ListOrganizationAttributesQuery struct {
+	// IncludeSuperseded Include superseded values
+	IncludeSuperseded *bool `json:"include_superseded,omitempty"`
+
+	// DefinitionSlug Restrict to one definition
+	DefinitionSlug *string `json:"definition_slug,omitempty"`
+}
+
+type ClearOrganizationAttributeQuery struct {
+	// Ordinal Ordinal for a multi-valued definition
+	Ordinal *int64 `json:"ordinal,omitempty"`
+
+	// ExpectedValueID Compare-and-swap: the current value ID expected to be superseded
+	ExpectedValueID *int64 `json:"expected_value_id,omitempty"`
+
+	// DryRun Validate and preview without writing
+	DryRun *bool `json:"dry_run,omitempty"`
+}
+
+type ListOrganizationEmploymentsQuery struct {
+	// CurrentOnly Only current employments
+	CurrentOnly *bool `json:"current_only,omitempty"`
+
+	// Limit Maximum results
+	Limit *int64 `json:"limit,omitempty"`
+
+	// Offset Results to skip
+	Offset *int64 `json:"offset,omitempty"`
+}
+
+type ListPersonAttributesQuery struct {
+	// History Include superseded values
+	History *bool `json:"history,omitempty"`
+
+	// Slug Restrict the response to one definition slug
+	Slug *string `json:"slug,omitempty"`
+
+	// UniversalID Restrict the response to one portable definition identifier
+	UniversalID *string `json:"universal_id,omitempty"`
+}
+
+type ClearPersonAttributeQuery struct {
+	// Ordinal Ordinal for a multi-valued definition
+	Ordinal *int64 `json:"ordinal,omitempty"`
+
+	// ExpectedValueID Compare-and-swap: the current value ID expected to be superseded
+	ExpectedValueID *int64 `json:"expected_value_id,omitempty"`
+
+	// DryRun Validate and preview without writing
+	DryRun *bool `json:"dry_run,omitempty"`
+}
+
+type SetPersonAttributeQuery struct {
+	// DryRun Validate and preview without writing
+	DryRun *bool `json:"dry_run,omitempty"`
+}
+
+type ListPersonActivityDaysQuery struct {
+	// From Inclusive first local calendar date
+	From *string `json:"from,omitempty"`
+
+	// To Inclusive last local calendar date
+	To *string `json:"to,omitempty"`
+
+	// Limit Maximum primary rows to return
+	Limit *int64 `json:"limit,omitempty" validate:"omitempty,gte=1,lte=500"`
+
+	// Offset Zero-based primary row offset
+	Offset *int64 `json:"offset,omitempty" validate:"omitempty,gte=0"`
+}
+
+func (l ListPersonActivityDaysQuery) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(l))
+}
+
+type GetPersonActivityDayQuery struct {
+	// Limit Maximum primary rows to return
+	Limit *int64 `json:"limit,omitempty" validate:"omitempty,gte=1,lte=500"`
+
+	// Offset Zero-based primary row offset
+	Offset *int64 `json:"offset,omitempty" validate:"omitempty,gte=0"`
+
+	// EntryLimit Maximum authored entries to return independently
+	EntryLimit *int64 `json:"entry_limit,omitempty" validate:"omitempty,gte=1,lte=500"`
+
+	// EntryOffset Zero-based authored-entry offset
+	EntryOffset *int64 `json:"entry_offset,omitempty" validate:"omitempty,gte=0"`
+}
+
+func (g GetPersonActivityDayQuery) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+}
+
+type ListPersonEmploymentsQuery struct {
+	// CurrentOnly Only current employments
+	CurrentOnly *bool `json:"current_only,omitempty"`
+
+	// Limit Maximum results
+	Limit *int64 `json:"limit,omitempty"`
+
+	// Offset Results to skip
+	Offset *int64 `json:"offset,omitempty"`
+}
+
+type ListPersonFactClaimsQuery struct {
+	// Target Exact target as kind:key:sha256:<64 lowercase hex characters>
+	Target *string `json:"target,omitempty"`
+
+	// Limit Maximum rows to return (default 50, max 200)
+	Limit *int64 `json:"limit,omitempty"`
+
+	// Offset Zero-based row offset
+	Offset *int64 `json:"offset,omitempty"`
+}
+
+type ListPersonFactDecisionsQuery struct {
+	// Target Exact target as kind:key:sha256:<64 lowercase hex characters>
+	Target *string `json:"target,omitempty"`
+
+	// Limit Maximum rows to return (default 50, max 200)
+	Limit *int64 `json:"limit,omitempty"`
+
+	// Offset Zero-based row offset
+	Offset *int64 `json:"offset,omitempty"`
+}
+
+type ListPersonFactEvidenceQuery struct {
+	// Target Exact target as kind:key:sha256:<64 lowercase hex characters>
+	Target *string `json:"target,omitempty"`
+
+	// Limit Maximum rows to return (default 50, max 200)
+	Limit *int64 `json:"limit,omitempty"`
+
+	// Offset Zero-based row offset
+	Offset *int64 `json:"offset,omitempty"`
+}
+
+type ListPersonFactEvidenceStatusEventsQuery struct {
+	// EvidenceKey Restrict to one immutable evidence key
+	EvidenceKey *string `json:"evidence_key,omitempty"`
+
+	// Supported Restrict to supported or unsupported events
+	Supported *bool `json:"supported,omitempty"`
+
+	// Limit Maximum events to return (default 50, max 200)
+	Limit *int64 `json:"limit,omitempty"`
+
+	// Offset Zero-based event offset
+	Offset *int64 `json:"offset,omitempty"`
+}
+
+type ListPersonMergesQuery struct {
+	// Limit Maximum results
+	Limit *int64 `json:"limit,omitempty"`
+
+	// Offset Results to skip
+	Offset *int64 `json:"offset,omitempty"`
+}
+
+type AppendPersonNoteQuery struct {
+	// DryRun Validate and preview without writing
+	DryRun *bool `json:"dry_run,omitempty"`
+}
+
+type ListPersonRelationshipsQuery struct {
+	IncludeEnded *bool `json:"include_ended,omitempty"`
+}
+
+type ListPersonFactTargetsQuery struct {
+	// IncludeSensitive Include sensitive targets
+	IncludeSensitive *bool `json:"include_sensitive,omitempty"`
+}
+
+type ListPersonRelationshipReviewsQuery struct {
+	Status   *ListPersonRelationshipReviewsQueryStatus `json:"status,omitempty"`
+	PersonID *int64                                    `json:"person_id,omitempty"`
+}
+
+func (l ListPersonRelationshipReviewsQuery) Validate() error {
+	var errors runtime.ValidationErrors
+	if l.Status != nil {
+		if v, ok := any(l.Status).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Status", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
 type SearchMessagesQuery struct {
 	// Q Search query
 	Q string `json:"q" validate:"required"`
 
-	// Mode Search mode: fts, vector, or hybrid
+	// Mode Search mode: fts, vector, or hybrid. Structured filter parameters are supported only in vector and hybrid modes
 	Mode *string `json:"mode,omitempty"`
 
 	// Page One-based page number (default 1; values below 1 are clamped to 1). Non-numeric values are rejected with 400.
@@ -457,6 +818,36 @@ type SearchMessagesQuery struct {
 
 	// Collection Restrict to one collection
 	Collection *string `json:"collection,omitempty"`
+
+	// Sender Exact sender email/address filter (vector or hybrid mode only)
+	Sender *string `json:"sender,omitempty"`
+
+	// Recipient Exact recipient email filter across to, cc, and bcc (vector or hybrid mode only)
+	Recipient *string `json:"recipient,omitempty"`
+
+	// Domain Exact sender domain filter (vector or hybrid mode only)
+	Domain *string `json:"domain,omitempty"`
+
+	// Label Exact case-insensitive label filter (vector or hybrid mode only)
+	Label *string `json:"label,omitempty"`
+
+	// TimePeriod Calendar period in YYYY, YYYY-MM, or YYYY-MM-DD format (vector or hybrid mode only)
+	TimePeriod *string `json:"time_period,omitempty"`
+
+	// TimeGranularity Time bucket granularity (vector or hybrid mode only)
+	TimeGranularity *string `json:"time_granularity,omitempty"`
+
+	// SourceID Exact source ID (vector or hybrid mode only)
+	SourceID *int64 `json:"source_id,omitempty"`
+
+	// AttachmentsOnly Only include messages with attachments (vector or hybrid mode only)
+	AttachmentsOnly *bool `json:"attachments_only,omitempty"`
+
+	// After Lower date/time bound (RFC3339 or YYYY-MM-DD; vector or hybrid mode only)
+	After *string `json:"after,omitempty"`
+
+	// Before Upper date/time bound (RFC3339 or YYYY-MM-DD; vector or hybrid mode only)
+	Before *string `json:"before,omitempty"`
 }
 
 func (s SearchMessagesQuery) Validate() error {
@@ -720,6 +1111,9 @@ type ListTextConversationsQuery struct {
 	// SourceID Source ID
 	SourceID *int64 `json:"source_id,omitempty"`
 
+	// ParticipantID Exact participant cluster member IDs
+	ParticipantID []int64 `json:"participant_id,omitempty"`
+
 	// ContactPhone Sender phone/address filter
 	ContactPhone *string `json:"contact_phone,omitempty"`
 
@@ -758,8 +1152,14 @@ type ListTextConversationsQuery struct {
 }
 
 type ListTextConversationMessagesQuery struct {
+	// SearchQuery Full-text search within the conversation
+	SearchQuery *string `json:"search_query,omitempty"`
+
 	// SourceID Source ID
 	SourceID *int64 `json:"source_id,omitempty"`
+
+	// ParticipantID Exact participant cluster member IDs
+	ParticipantID []int64 `json:"participant_id,omitempty"`
 
 	// ContactPhone Sender phone/address filter
 	ContactPhone *string `json:"contact_phone,omitempty"`

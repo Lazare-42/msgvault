@@ -1,7 +1,11 @@
 // Package gmail provides a Gmail API client with rate limiting and retry logic.
 package gmail
 
-import "context"
+import (
+	"context"
+
+	"go.kenn.io/msgvault/internal/store"
+)
 
 // AccountReader provides read access to account-level Gmail data.
 type AccountReader interface {
@@ -27,6 +31,13 @@ type MessageReader interface {
 
 	// ListHistory returns changes since the given history ID.
 	ListHistory(ctx context.Context, startHistoryID uint64, pageToken string) (*HistoryResponse, error)
+}
+
+// CompleteMessageSnapshotReader lists every message still present in Gmail,
+// including messages in Spam and Trash. The returned IDs are suitable for
+// source-presence reconciliation only after every page has been consumed.
+type CompleteMessageSnapshotReader interface {
+	ListCompleteMessageSnapshot(ctx context.Context, pageToken string) (*MessageListResponse, error)
 }
 
 // MessageDeleter provides write operations for deleting Gmail messages.
@@ -105,10 +116,20 @@ type Label struct {
 	ID                    string
 	Name                  string
 	Type                  string // "system" or "user"
+	SystemRole            string
 	MessagesTotal         int64
 	MessagesUnread        int64
 	MessageListVisibility string
 	LabelListVisibility   string
+}
+
+// SystemRoleForLabelID returns roles Gmail identifies canonically, never by
+// the localized label name returned to users.
+func SystemRoleForLabelID(sourceLabelID string) string {
+	if sourceLabelID == "SENT" {
+		return store.LabelSystemRoleSent
+	}
+	return ""
 }
 
 // MessageListResponse contains a page of message IDs.

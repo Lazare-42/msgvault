@@ -21,6 +21,7 @@ import (
 	"go.kenn.io/msgvault/internal/apiprotocol"
 	"go.kenn.io/msgvault/internal/contentverify"
 	"go.kenn.io/msgvault/internal/deletion"
+	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/store"
 	apiclient "go.kenn.io/msgvault/pkg/client"
 	"go.kenn.io/msgvault/pkg/client/generated"
@@ -208,6 +209,49 @@ func TestRunCLISyncSendsIncrementalFolderFilters(t *testing.T) {
 	require.NoError(err)
 }
 
+func TestRunCLISyncSendsExactSourceID(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","api_schema_version":"2.4.0"}`))
+			return
+		}
+		assert.Equal(t, "42", r.URL.Query().Get("source_id"))
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = w.Write([]byte(`{"type":"complete"}` + "\n"))
+	}))
+	t.Cleanup(srv.Close)
+
+	st, err := New(Config{URL: srv.URL, AllowInsecure: true, HTTPClient: srv.Client()})
+	require.NoError(t, err)
+	require.NoError(t, st.RunCLISync(context.Background(), CLISyncRequest{
+		SourceID: 42, SourceIDSet: true,
+	}, func(string, string) error { return nil }))
+}
+
+func TestRunCLISyncRejectsOldDaemonBeforeStartingSourceScopedSync(t *testing.T) {
+	syncCalls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok","api_schema_version":"2.3.0"}`))
+			return
+		}
+		syncCalls++
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = w.Write([]byte(`{"type":"complete"}` + "\n"))
+	}))
+	t.Cleanup(srv.Close)
+
+	st, err := New(Config{URL: srv.URL, AllowInsecure: true, HTTPClient: srv.Client()})
+	require.NoError(t, err)
+	err = st.RunCLISync(context.Background(), CLISyncRequest{
+		SourceID: 42, SourceIDSet: true,
+	}, func(string, string) error { return nil })
+	require.ErrorContains(t, err, "requires daemon API schema 2.4.0")
+	assert.Zero(t, syncCalls, "source-scoped sync must not start on an older daemon")
+}
+
 func TestRunCLICommandStreamsOutput(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -262,6 +306,45 @@ func TestRunCLICommandStreamsOutput(t *testing.T) {
 	require.NoError(err, "RunCLICommand")
 	assert.Equal("removed\n", stdout.String(), "stdout")
 	assert.Equal("warning\n", stderr.String(), "stderr")
+}
+
+func TestRunCLICommandGrantDecisionUsesLocalDaemonProof(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		assert.Equal("runtime-secret", r.Header.Get(apiprotocol.DaemonRuntimeTokenHeader))
+		var body map[string]any
+		if !assert.NoError(json.NewDecoder(r.Body).Decode(&body)) {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+		assert.NotContains(body, "grant_decided", "the decision must not be caller-controlled JSON")
+		w.Header().Set("Content-Type", "application/x-ndjson")
+		_, _ = w.Write([]byte(`{"type":"complete"}` + "\n"))
+	}))
+	t.Cleanup(srv.Close)
+
+	st, err := New(Config{
+		URL: srv.URL, AllowInsecure: true, HTTPClient: srv.Client(), LocalDaemonToken: "runtime-secret",
+	})
+	require.NoError(err)
+	require.NoError(st.RunCLICommand(context.Background(), CLIRunRequest{
+		Args: []string{"add-account", "user@example.com", "--readonly"}, GrantDecided: true,
+	}, nil))
+	assert.Equal(1, requests)
+}
+
+func TestRunCLICommandGrantDecisionRequiresLocalDaemonProof(t *testing.T) {
+	st, err := New(Config{URL: "http://127.0.0.1:1", AllowInsecure: true})
+	require.NoError(t, err)
+
+	err = st.RunCLICommand(context.Background(), CLIRunRequest{
+		Args: []string{"add-account", "user@example.com", "--readonly"}, GrantDecided: true,
+	}, nil)
+
+	require.EqualError(t, err, "grant preflight proof is unavailable for this daemon")
 }
 
 func TestPlanCLIAddCalendarUsesGeneratedClientAdapter(t *testing.T) {
@@ -377,6 +460,7 @@ func TestPlanCLIDeleteStagedUsesGeneratedClientAdapter(t *testing.T) {
 			Permanent           bool   `json:"permanent"`
 			Yes                 bool   `json:"yes"`
 			Account             string `json:"account"`
+			SourceID            *int64 `json:"source_id"`
 			RemoteDeleteEnabled bool   `json:"remote_delete_enabled"`
 		}
 		if !assert.NoError(json.NewDecoder(r.Body).Decode(&body), "decode request") {
@@ -387,6 +471,11 @@ func TestPlanCLIDeleteStagedUsesGeneratedClientAdapter(t *testing.T) {
 		assert.True(body.Permanent, "permanent")
 		assert.False(body.Yes, "yes")
 		assert.Equal("alice@example.com", body.Account, "account")
+		if !assert.NotNil(body.SourceID) {
+			http.Error(w, "missing source ID", http.StatusBadRequest)
+			return
+		}
+		assert.Equal(int64(42), *body.SourceID)
 		assert.True(body.RemoteDeleteEnabled, "remote delete enabled")
 
 		w.Header().Set("Content-Type", "application/json")
@@ -417,6 +506,7 @@ func TestPlanCLIDeleteStagedUsesGeneratedClientAdapter(t *testing.T) {
 		BatchID:             "batch-123",
 		Permanent:           true,
 		Account:             "alice@example.com",
+		SourceID:            func() *int64 { value := int64(42); return &value }(),
 		RemoteDeleteEnabled: true,
 	})
 
@@ -440,10 +530,16 @@ func TestPlanCLIDeleteStagedUsesGeneratedClientAdapter(t *testing.T) {
 func TestCreateCLIDeletionManifestUsesGeneratedClientAdapter(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	manifest := deletion.NewManifest("tui selection", []string{"gid1", "gid2"})
+	manifest := deletion.NewManifestForSource("tui selection", []string{"gid1", "gid2"}, deletion.SourceReference{
+		ID: 42, Type: "gmail", Identifier: "account@example.invalid",
+	})
 	manifest.CreatedBy = "tui"
 
 	s := newGeneratedClientAdapterStore(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			writeJSONResponse(t, w, map[string]any{"status": "ok", "api_schema_version": "2.4.0"})
+			return
+		}
 		assert.Equal(http.MethodPost, r.Method, "method")
 		assert.Equal("/api/v1/cli/deletion-manifests", r.URL.Path, "path")
 		var body deletion.Manifest
@@ -454,6 +550,11 @@ func TestCreateCLIDeletionManifestUsesGeneratedClientAdapter(t *testing.T) {
 		assert.Equal(manifest.ID, body.ID, "manifest id")
 		assert.Equal("tui", body.CreatedBy, "created by")
 		assert.Equal([]string{"gid1", "gid2"}, body.GmailIDs, "gmail ids")
+		if !assert.NotNil(body.Source) {
+			http.Error(w, "missing source", http.StatusBadRequest)
+			return
+		}
+		assert.Equal(*manifest.Source, *body.Source)
 
 		w.Header().Set("Content-Type", "application/json")
 		if !assert.NoError(json.NewEncoder(w).Encode(map[string]any{
@@ -469,6 +570,25 @@ func TestCreateCLIDeletionManifestUsesGeneratedClientAdapter(t *testing.T) {
 	require.NotNil(got, "result")
 	assert.Equal(manifest.ID, got.ID, "id")
 	assert.Equal(2, got.MessageCount, "message count")
+}
+
+func TestCreateCLIDeletionManifestRejectsOldDaemonBeforeSubmittingVersionTwo(t *testing.T) {
+	manifestPosts := 0
+	s := newGeneratedClientAdapterStore(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			writeJSONResponse(t, w, map[string]any{"status": "ok", "api_schema_version": "2.3.0"})
+			return
+		}
+		manifestPosts++
+		writeJSONResponse(t, w, map[string]any{"id": "unexpected", "message_count": 1})
+	})
+	manifest := deletion.NewManifestForSource("tui selection", []string{"gid1"}, deletion.SourceReference{
+		ID: 42, Type: "gmail", Identifier: "account@example.invalid",
+	})
+
+	_, err := s.CreateCLIDeletionManifest(context.Background(), manifest)
+	require.ErrorContains(t, err, "version-2 deletion manifests require daemon API schema 2.4.0")
+	assert.Zero(t, manifestPosts, "version-2 manifest must not be submitted to an older daemon")
 }
 
 func TestPlanCLIDeduplicateUsesGeneratedClientAdapter(t *testing.T) {
@@ -675,9 +795,12 @@ func TestGetStatsRejectsEmptyGeneratedOKBody(t *testing.T) {
 }
 
 func TestCreateCLICollectionRejectsEmptyGeneratedOKBody(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, http.MethodPost, r.Method, "method")
-		assert.Equal(t, "/api/v1/cli/collections", r.URL.Path, "path")
+		assert.Equal(http.MethodPost, r.Method, "method")
+		assert.Equal("/api/v1/cli/collections", r.URL.Path, "path")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -686,8 +809,8 @@ func TestCreateCLICollectionRejectsEmptyGeneratedOKBody(t *testing.T) {
 	s := newTestStore(srv, "key")
 	_, err := s.CreateCLICollection(context.Background(), CLICollectionCreateRequest{Name: "archive"})
 
-	require.Error(t, err, "empty 200 mutation body must fail")
-	assert.NotContains(t, err.Error(), "API error (200)", "empty success decode failures are not API errors")
+	require.Error(err, "empty 200 mutation body must fail")
+	assert.NotContains(err.Error(), "API error (200)", "empty success decode failures are not API errors")
 }
 
 func TestHandleErrorResponse_JSONBody(t *testing.T) {
@@ -1015,6 +1138,50 @@ func TestGetCLISearch_Success(t *testing.T) {
 	assert.Equal(1, resp.ScopeSourceCount, "ScopeSourceCount")
 }
 
+func TestGetCLISearch_DeletionScopeRequiresCompatibleDaemon(t *testing.T) {
+	tests := []struct {
+		name          string
+		schemaVersion string
+		deletionScope string
+		wantErr       bool
+		wantSearches  int
+	}{
+		{name: "older daemon rejects active", schemaVersion: "2.11.0", deletionScope: "active", wantErr: true},
+		{name: "older daemon rejects deleted", schemaVersion: "2.11.0", deletionScope: "deleted", wantErr: true},
+		{name: "compatible daemon accepts active", schemaVersion: "2.12.0", deletionScope: "active", wantSearches: 1},
+		{name: "compatible daemon accepts deleted", schemaVersion: "2.12.0", deletionScope: "deleted", wantSearches: 1},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			searches := 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.URL.Path == "/api/v1/health" {
+					_, _ = fmt.Fprintf(w, `{"status":"ok","api_schema_version":%q}`, tt.schemaVersion)
+					return
+				}
+				searches++
+				assert.Equal(t, "/api/v1/cli/search", r.URL.Path)
+				assert.Equal(t, tt.deletionScope, r.URL.Query().Get("deletion_scope"))
+				_, _ = w.Write([]byte(`{"results":[]}`))
+			}))
+			t.Cleanup(srv.Close)
+
+			client := newTestStore(srv, "")
+			_, err := client.GetCLISearch(context.Background(), CLISearchRequest{
+				Query: "scope", DeletionScope: tt.deletionScope,
+			})
+			if tt.wantErr {
+				require.ErrorContains(t, err, "requires daemon API schema 2.12.0")
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tt.wantSearches, searches,
+				"an incompatible daemon must not receive the scoped search")
+		})
+	}
+}
+
 func TestGetCLIHybridSearch_Success(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -1029,6 +1196,16 @@ func TestGetCLIHybridSearch_Success(t *testing.T) {
 		assert.Equal("5", r.URL.Query().Get("offset"), "offset query")
 		assert.Equal("true", r.URL.Query().Get("include_matches"), "include_matches query")
 		assert.Equal("0.75", r.URL.Query().Get("min_score"), "min_score query")
+		assert.Equal("alice@example.com", r.URL.Query().Get("sender"), "sender query")
+		assert.Equal("bob@example.com", r.URL.Query().Get("recipient"), "recipient query")
+		assert.Equal("example.com", r.URL.Query().Get("domain"), "domain query")
+		assert.Equal("Work", r.URL.Query().Get("label"), "label query")
+		assert.Equal("2025-02", r.URL.Query().Get("time_period"), "time_period query")
+		assert.Equal("month", r.URL.Query().Get("time_granularity"), "time_granularity query")
+		assert.Equal("77", r.URL.Query().Get("source_id"), "source_id query")
+		assert.Equal("true", r.URL.Query().Get("attachments_only"), "attachments_only query")
+		assert.Equal("2025-02-01T00:00:00Z", r.URL.Query().Get("after"), "after query")
+		assert.Equal("2025-03-01T00:00:00Z", r.URL.Query().Get("before"), "before query")
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"query": "lunch",
@@ -1076,6 +1253,9 @@ func TestGetCLIHybridSearch_Success(t *testing.T) {
 	defer srv.Close()
 
 	s := newTestStore(srv, "key")
+	after := time.Date(2025, 2, 1, 0, 0, 0, 0, time.UTC)
+	before := time.Date(2025, 3, 1, 0, 0, 0, 0, time.UTC)
+	sourceID := int64(77)
 	resp, err := s.GetCLIHybridSearch(
 		context.Background(),
 		CLIHybridSearchRequest{
@@ -1087,6 +1267,17 @@ func TestGetCLIHybridSearch_Success(t *testing.T) {
 			Offset:         5,
 			IncludeMatches: true,
 			MinScore:       0.75,
+			Filter: query.MessageFilter{
+				Sender:              "alice@example.com",
+				Recipient:           "bob@example.com",
+				Domain:              "example.com",
+				Label:               "Work",
+				TimeRange:           query.TimeRange{Period: "2025-02", Granularity: query.TimeMonth},
+				SourceID:            &sourceID,
+				WithAttachmentsOnly: true,
+				After:               &after,
+				Before:              &before,
+			},
 		},
 	)
 	require.NoError(err, "GetCLIHybridSearch")
@@ -1305,9 +1496,12 @@ func TestCLICollectionMutations(t *testing.T) {
 }
 
 func TestGetCLICollection_NotFound(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "/api/v1/cli/collection", r.URL.Path, "path")
-		assert.Equal(t, "missing", r.URL.Query().Get("name"), "name query")
+		assert.Equal("/api/v1/cli/collection", r.URL.Path, "path")
+		assert.Equal("missing", r.URL.Query().Get("name"), "name query")
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte(`{"error":"not_found","message":"Collection not found"}`))
@@ -1317,8 +1511,8 @@ func TestGetCLICollection_NotFound(t *testing.T) {
 	s := newTestStore(srv, "key")
 	collection, err := s.GetCLICollection(context.Background(), "missing")
 
-	require.ErrorIs(t, err, store.ErrCollectionNotFound, "GetCLICollection(missing)")
-	assert.Nil(t, collection, "collection")
+	require.ErrorIs(err, store.ErrCollectionNotFound, "GetCLICollection(missing)")
+	assert.Nil(collection, "collection")
 }
 
 func TestRebuildCLIFTSStreamsProgress(t *testing.T) {
@@ -1798,9 +1992,12 @@ func TestGetMessageUsesGeneratedClientAdapter(t *testing.T) {
 }
 
 func TestListMessages_ZeroLimit(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ps := r.URL.Query().Get("page_size")
-		assert.NotEqual(t, "0", ps, "page_size should not be 0")
+		assert.NotEqual("0", ps, "page_size should not be 0")
 		resp := generated.MessageListResponse{
 			Total:    0,
 			Page:     1,
@@ -1815,9 +2012,9 @@ func TestListMessages_ZeroLimit(t *testing.T) {
 
 	// This previously panicked with divide-by-zero
 	msgs, total, err := s.ListMessages(0, 0)
-	require.NoError(t, err, "ListMessages(0, 0) error")
-	assert.Equal(t, int64(0), total, "total")
-	assert.Empty(t, msgs, "len(msgs)")
+	require.NoError(err, "ListMessages(0, 0) error")
+	assert.Equal(int64(0), total, "total")
+	assert.Empty(msgs, "len(msgs)")
 }
 
 func TestListMessages_NegativeLimit(t *testing.T) {
@@ -1878,9 +2075,12 @@ func TestListMessagesUsesGeneratedClientAdapter(t *testing.T) {
 }
 
 func TestSearchMessages_ZeroLimit(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ps := r.URL.Query().Get("page_size")
-		assert.NotEqual(t, "0", ps, "page_size should not be 0")
+		assert.NotEqual("0", ps, "page_size should not be 0")
 		resp := generated.SearchResult{
 			Query:    "test",
 			Total:    0,
@@ -1896,9 +2096,9 @@ func TestSearchMessages_ZeroLimit(t *testing.T) {
 
 	// This previously panicked with divide-by-zero
 	msgs, total, err := s.SearchMessages("test", 0, 0)
-	require.NoError(t, err, "SearchMessages(test, 0, 0) error")
-	assert.Equal(t, int64(0), total, "total")
-	assert.Empty(t, msgs, "len(msgs)")
+	require.NoError(err, "SearchMessages(test, 0, 0) error")
+	assert.Equal(int64(0), total, "total")
+	assert.Empty(msgs, "len(msgs)")
 }
 
 func TestSearchMessages_QueryEncoding(t *testing.T) {
@@ -1995,8 +2195,11 @@ func TestListMessages_PageCalculation(t *testing.T) {
 }
 
 func TestListAccounts_Success(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "/api/v1/accounts", r.URL.Path, "path")
+		assert.Equal("/api/v1/accounts", r.URL.Path, "path")
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(generated.AccountListResponse{
 			Accounts: []generated.AccountInfo{
@@ -2008,9 +2211,9 @@ func TestListAccounts_Success(t *testing.T) {
 
 	s := newTestStore(srv, "key")
 	accounts, err := s.ListAccounts()
-	require.NoError(t, err, "ListAccounts error")
-	require.Len(t, accounts, 1, "len(accounts)")
-	assert.Equal(t, "user@gmail.com", accounts[0].Email, "Email")
+	require.NoError(err, "ListAccounts error")
+	require.Len(accounts, 1, "len(accounts)")
+	assert.Equal("user@gmail.com", accounts[0].Email, "Email")
 }
 
 func TestListAccountsUsesGeneratedClientAdapter(t *testing.T) {

@@ -12,6 +12,18 @@ describe('settings catalog', () => {
     expect(settingsCatalog['server.trusted_proxies'].group).toBe('server');
     expect(settingsCatalog['analytics.auto_build_cache'].group).toBe('archive');
     expect(settingsCatalog['vector.embeddings.endpoint'].testable).toBe(true);
+    expect(settingsCatalog['vector.embeddings.api_format'].options).toEqual([
+      'openai',
+      'voyage-contextual'
+    ]);
+    expect(settingsCatalog['vector.embeddings.document_prefix'].description).toContain('document chunk');
+    expect(settingsCatalog['vector.embeddings.query_prefix'].description).toContain('search query');
+    expect(settingsCatalog['vector.embed.scope.accounts'].group).toBe('search');
+    expect(settingsCatalog['vector.multimodal.enabled'].group).toBe('search');
+    expect(settingsCatalog['vector.multimodal.provider'].options).toEqual(['voyage']);
+    expect(settingsCatalog['vector.people.enabled'].description).toContain('every durable person');
+    expect(settingsCatalog['vector.people.retention_posture'].group).toBe('search');
+    expect(settingsCatalog['vector.people.training_posture'].group).toBe('search');
     expect(settingsCatalog['beeper.schedule'].group).toBe('sources');
     expect(settingsCatalog['integrations.tasks.api_key'].secret).toBe(true);
   });

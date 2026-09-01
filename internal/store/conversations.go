@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -164,6 +165,7 @@ func (s *Store) GetConversationWindowContext(
 			COALESCE(m.snippet, ''),
 			m.has_attachments,
 			COALESCE(m.size_estimate, 0),
+			m.is_from_me,
 			m.deleted_from_source_at,
 			COALESCE(LENGTH(mb.body_text), 0) + COALESCE(LENGTH(mb.body_html), 0),
 			selected.position,
@@ -199,6 +201,7 @@ func (s *Store) GetConversationWindowContext(
 	for rows.Next() {
 		var message APIMessage
 		var sentAt, deletedAt nullableTimestamp
+		var isFromMe sql.NullBool
 		var position, bodySize int64
 		if err := rows.Scan(
 			&message.ID,
@@ -216,6 +219,7 @@ func (s *Store) GetConversationWindowContext(
 			&message.Snippet,
 			&message.HasAttachments,
 			&message.SizeEstimate,
+			&isFromMe,
 			&deletedAt,
 			&bodySize,
 			&position,
@@ -224,6 +228,7 @@ func (s *Store) GetConversationWindowContext(
 		); err != nil {
 			return nil, fmt.Errorf("scan conversation message: %w", err)
 		}
+		message.IsFromMe = isFromMe.Bool
 		if sentAt.Valid {
 			message.SentAt = sentAt.Time
 		}
@@ -382,11 +387,14 @@ func (s *Store) batchPopulateAttachments(ctx context.Context, messages []APIMess
 // SetConversationMetadata writes the conversations.metadata JSON/JSONB column.
 // Passing an invalid sql.NullString clears the column.
 func (s *Store) SetConversationMetadata(conversationID int64, metadata sql.NullString) error {
-	_, err := s.db.Exec(fmt.Sprintf(`
-		UPDATE conversations
-		SET metadata = %s
-		WHERE id = ?
-	`, s.dialect.JSONBindExpr()), metadata, conversationID)
+	err := s.withSyncConversationWriteContext(context.Background(), conversationID, func(q querier) error {
+		_, err := q.Exec(fmt.Sprintf(`
+			UPDATE conversations
+			SET metadata = %s
+			WHERE id = ?
+		`, s.dialect.JSONBindExpr()), metadata, conversationID)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("set conversation metadata (id=%d): %w", conversationID, err)
 	}
@@ -402,6 +410,92 @@ func (s *Store) GetConversationMetadata(conversationID int64) (sql.NullString, e
 		return sql.NullString{}, fmt.Errorf("get conversation metadata (id=%d): %w", conversationID, err)
 	}
 	return metadata, nil
+}
+
+// SetConversationMemberCount records the exact roster size a provider just
+// read, as the member_count key of the conversation's metadata. Media policy
+// evaluates this record rather than the participant rows, which accumulate
+// every member ever seen and so can only ever raise the count.
+func (s *Store) SetConversationMemberCount(conversationID int64, count int) error {
+	metadata, err := s.conversationMetadataObject(conversationID)
+	if err != nil {
+		return err
+	}
+	encoded, err := json.Marshal(count)
+	if err != nil {
+		return fmt.Errorf("encode conversation member count: %w", err)
+	}
+	metadata["member_count"] = encoded
+	delete(metadata, "member_count_unknown")
+	return s.writeConversationMetadataObject(conversationID, metadata)
+}
+
+// MarkConversationMemberCountUnknown records that a provider could not read a
+// conversation's roster, so later policy evaluation can tell an unresolved
+// roster from a conversation with no members. A count the provider did read
+// before is kept beside the marker for reference, but the roster counts as
+// unresolved until a successful read clears the marker: the sync that could
+// not read it fails closed on the participant threshold, and a backfill or
+// purge that trusted the stale count instead could download or delete media
+// against the membership the conversation has now.
+func (s *Store) MarkConversationMemberCountUnknown(conversationID int64) error {
+	metadata, err := s.conversationMetadataObject(conversationID)
+	if err != nil {
+		return err
+	}
+	metadata["member_count_unknown"] = json.RawMessage("true")
+	return s.writeConversationMetadataObject(conversationID, metadata)
+}
+
+// conversationMetadataObject reads the metadata column as a mutable JSON
+// object, so a provider can revise one key without disturbing the others.
+func (s *Store) conversationMetadataObject(conversationID int64) (map[string]json.RawMessage, error) {
+	stored, err := s.GetConversationMetadata(conversationID)
+	if err != nil {
+		return nil, err
+	}
+	metadata := make(map[string]json.RawMessage)
+	if !stored.Valid || strings.TrimSpace(stored.String) == "" {
+		return metadata, nil
+	}
+	if err := json.Unmarshal([]byte(stored.String), &metadata); err != nil {
+		return nil, fmt.Errorf("decode conversation metadata (id=%d): %w", conversationID, err)
+	}
+	return metadata, nil
+}
+
+func (s *Store) writeConversationMetadataObject(
+	conversationID int64, metadata map[string]json.RawMessage,
+) error {
+	encoded, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("encode conversation metadata (id=%d): %w", conversationID, err)
+	}
+	return s.SetConversationMetadata(conversationID, sql.NullString{
+		String: string(encoded), Valid: len(metadata) != 0,
+	})
+}
+
+// ListConversationIDs returns the IDs of every conversation archived under
+// sourceID, in ID order.
+func (s *Store) ListConversationIDs(sourceID int64) ([]int64, error) {
+	rows, err := s.db.Query(`SELECT id FROM conversations WHERE source_id = ? ORDER BY id`, sourceID)
+	if err != nil {
+		return nil, fmt.Errorf("list conversations for source %d: %w", sourceID, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan conversation id for source %d: %w", sourceID, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list conversations for source %d: %w", sourceID, err)
+	}
+	return ids, nil
 }
 
 // ConversationMetadataBatch returns provider metadata keyed by source

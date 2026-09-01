@@ -1,10 +1,9 @@
 <script lang="ts">
-  import { Button, SearchInput, SegmentedControl } from '@kenn-io/kit-ui';
+  import { Button, EmptyState, SearchInput, SegmentedControl } from '@kenn-io/kit-ui';
 
-  import type { DomainSummary, PersonSummary } from '../../explore/models';
+  import type { DomainSummary, ExploreCacheUnavailable, PersonSummary } from '../../explore/models';
   import type { RelationshipFacet, RelationshipRow } from '../../relationships/models';
   import { compactDate } from '../../util/dates';
-  import EmptyState from '../common/EmptyState.svelte';
   import IdentityAvatar from '../common/IdentityAvatar.svelte';
 
   interface Props {
@@ -14,10 +13,11 @@
     hasMore?: boolean;
     totalCount?: number | null;
     error: string | null;
-    degraded: 'cache_unavailable' | null;
+    degraded: ExploreCacheUnavailable | null;
     facet: RelationshipFacet;
     query: string;
     showAll: boolean;
+    autofocusSearch?: boolean;
     activeTarget?: string | null;
     onQueryChange: (value: string) => void;
     onFacetChange: (facet: RelationshipFacet) => void;
@@ -46,6 +46,7 @@
     facet,
     query,
     showAll,
+    autofocusSearch = false,
     activeTarget = null,
     onQueryChange,
     onFacetChange,
@@ -165,7 +166,7 @@
 <aside class="relationship-list" aria-label="Relationship search and results">
   <div class="toolbar">
     <SearchInput value={query} ariaLabel="Search people and domains" placeholder="Search names and identifiers…"
-      block oninput={(value) => onQueryChange(value)} />
+      block autofocus={autofocusSearch} oninput={(value) => onQueryChange(value)} />
     <div class="toolbar-row">
       <SegmentedControl ariaLabel="Relationship facet" value={facet}
         options={[{ value: 'people', label: 'People' }, { value: 'domains', label: 'Domains' }]}
@@ -183,7 +184,12 @@
     </div>
   </div>
 
-  {#if degraded === 'cache_unavailable'}
+  {#if degraded?.readiness === 'building'}
+    <section class="named-state" role="status">
+      <strong>Preparing relationship ranking…</strong>
+      <span>This view will load automatically when the analytical cache is ready.</span>
+    </section>
+  {:else if degraded}
     <section class="named-state" role="status">
       <strong>Relationship ranking needs the analytical cache/engine</strong>
       <span>Rebuild the analytical cache with <code>msgvault build-cache</code>, then retry.</span>
@@ -220,9 +226,8 @@
         <p class="list-empty" role="status">Loading relationships…</p>
       {:else if views.length === 0}
         <EmptyState
-          glyph="people"
-          label="No relationships found"
-          hint="Try a different search, or switch between People and Domains."
+          title="No relationships found"
+          description="Try a different search, or switch between People and Domains."
         />
       {:else}
         {#each views as view, index (view.key)}

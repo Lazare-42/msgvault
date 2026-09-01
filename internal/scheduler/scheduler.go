@@ -12,6 +12,7 @@ import (
 
 	"github.com/robfig/cron/v3"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/jobctx"
 	"go.kenn.io/msgvault/internal/syncerr"
 )
 
@@ -34,7 +35,7 @@ type YieldChecker interface {
 
 // ErrYieldedToWaiter is the cancellation cause set when a scheduled job is
 // interrupted to let a waiting operation acquire the work gate.
-var ErrYieldedToWaiter = errors.New("yielded to a waiting operation")
+var ErrYieldedToWaiter = jobctx.ErrYieldedToWaiter
 
 // yieldPollInterval is how often a running scheduled job checks for waiters.
 // Variable only so tests can shorten it.
@@ -88,16 +89,31 @@ type Scheduler struct {
 
 	// Embed job state (optional). Set via SetEmbedJob; cron.EntryID 0
 	// may be valid, so embedEntrySet tracks whether an entry exists.
-	embedJob          *EmbedJob
-	embedEntry        cron.EntryID
-	embedEntrySet     bool
-	runEmbedAfterSync bool
+	embedJob                   *EmbedJob
+	embedEntry                 cron.EntryID
+	embedEntrySet              bool
+	runEmbedAfterSync          bool
+	visualPostSync             func(context.Context) error
+	visualPostRunning          bool
+	visualPostPending          bool
+	documentVectorJob          func(context.Context) error
+	documentVectorEntry        cron.EntryID
+	documentVectorEntrySet     bool
+	runDocumentVectorAfterSync bool
 
 	ctx     context.Context    // cancelled on Stop
 	cancel  context.CancelFunc // cancels ctx
 	wg      sync.WaitGroup     // tracks running sync goroutines
 	started bool               // true after Start(), false after Stop()
 	stopped bool               // true after Stop()
+}
+
+// SetVisualPostSyncJob installs the independently consented visual lane's
+// bounded post-sync pass. Nil disables the hook.
+func (s *Scheduler) SetVisualPostSyncJob(run func(context.Context) error) {
+	s.mu.Lock()
+	s.visualPostSync = run
+	s.mu.Unlock()
 }
 
 // New creates a new Scheduler with the given sync callback.
@@ -214,6 +230,23 @@ func (s *Scheduler) AddJob(job Job) error {
 	return nil
 }
 
+// RemoveJob removes a generic job's cron entry and callable registration.
+// An invocation already running is allowed to finish under the normal work
+// gate; no future cron or manual invocation can start after removal returns.
+func (s *Scheduler) RemoveJob(name string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if entryID, exists := s.genericJobs[name]; exists {
+		s.cron.Remove(entryID)
+	}
+	delete(s.genericJobs, name)
+	delete(s.genericSchedules, name)
+	delete(s.genericFuncs, name)
+	delete(s.genericLastRun, name)
+	delete(s.genericLastErr, name)
+	s.logger.Info("removed scheduled job", "job", name)
+}
+
 // RemoveAccount removes the schedule for an account.
 func (s *Scheduler) RemoveAccount(email string) {
 	s.mu.Lock()
@@ -286,6 +319,50 @@ func (s *Scheduler) SetEmbedJob(job *EmbedJob, schedule string, runAfterSync boo
 	s.logger.Info("scheduled embed job",
 		"schedule", schedule,
 		"next_run", s.cron.Entry(entryID).Next)
+	return nil
+}
+
+// SetDocumentVectorJob installs the bounded document-vector convergence job
+// on the same cron/post-sync policy used by message embeddings.
+func (s *Scheduler) SetDocumentVectorJob(job func(context.Context) error, schedule string, runAfterSync bool) error {
+	if job != nil && schedule != "" {
+		if err := ValidateCronExpr(schedule); err != nil {
+			return fmt.Errorf("invalid document vector cron expression %q: %w", schedule, err)
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.documentVectorEntrySet {
+		s.cron.Remove(s.documentVectorEntry)
+		s.documentVectorEntrySet = false
+	}
+	s.documentVectorJob = job
+	s.runDocumentVectorAfterSync = runAfterSync && job != nil
+	if job == nil || schedule == "" {
+		return nil
+	}
+	entry, err := s.cron.AddFunc(schedule, func() {
+		if s.isStopped() {
+			return
+		}
+		done, ok := s.beginWork()
+		if !ok {
+			return
+		}
+		defer done()
+		runCtx, endRun := s.jobContext()
+		defer endRun()
+		if runErr := job(runCtx); runErr != nil {
+			s.logger.Error("scheduled document vector reconciliation failed", "error", runErr)
+		}
+	})
+	if err != nil {
+		s.documentVectorJob = nil
+		s.runDocumentVectorAfterSync = false
+		return fmt.Errorf("register document vector cron: %w", err)
+	}
+	s.documentVectorEntry = entry
+	s.documentVectorEntrySet = true
 	return nil
 }
 
@@ -417,6 +494,67 @@ func (s *Scheduler) runSync(email string) {
 		postSync.Run(embedCtx)
 		endEmbed()
 	}
+	var documentVectorPostSync func(context.Context) error
+	s.mu.RLock()
+	if s.runDocumentVectorAfterSync && s.documentVectorJob != nil && !s.stopped {
+		documentVectorPostSync = s.documentVectorJob
+	}
+	s.mu.RUnlock()
+	if documentVectorPostSync != nil {
+		documentCtx, endDocument := s.jobContext()
+		if documentErr := documentVectorPostSync(documentCtx); documentErr != nil {
+			s.logger.Error("post-sync document vector reconciliation failed", "error", documentErr)
+		}
+		endDocument()
+	}
+	s.startVisualPostSync()
+}
+
+// startVisualPostSync queues hosted multimodal work after the source sync has
+// committed. It deliberately does not wait in the sync goroutine: provider
+// latency must never extend or fail an otherwise successful archive sync.
+func (s *Scheduler) startVisualPostSync() {
+	s.mu.Lock()
+	if s.visualPostSync == nil || s.stopped {
+		s.mu.Unlock()
+		return
+	}
+	if s.visualPostRunning {
+		// A sync finished while a pass is in flight; remember it so the
+		// changes it committed are processed right after, instead of waiting
+		// for the next sync or cron tick.
+		s.visualPostPending = true
+		s.mu.Unlock()
+		return
+	}
+	run := s.visualPostSync
+	s.visualPostRunning = true
+	s.wg.Add(1)
+	s.mu.Unlock()
+
+	go func() {
+		defer s.wg.Done()
+		defer func() {
+			s.mu.Lock()
+			s.visualPostRunning = false
+			rerun := s.visualPostPending
+			s.visualPostPending = false
+			s.mu.Unlock()
+			if rerun {
+				s.startVisualPostSync()
+			}
+		}()
+		done, ok := s.beginWork()
+		if !ok {
+			return
+		}
+		defer done()
+		visualCtx, endVisual := s.jobContext()
+		defer endVisual()
+		if err := run(visualCtx); err != nil {
+			s.logger.Error("post-sync multimodal pass failed", "error", err)
+		}
+	}()
 }
 
 // IsScheduled returns true if the account has been added to the scheduler.
@@ -586,7 +724,7 @@ func (s *Scheduler) jobContext() (context.Context, func()) {
 }
 
 func yieldedToWaiter(ctx context.Context) bool {
-	return errors.Is(context.Cause(ctx), ErrYieldedToWaiter)
+	return jobctx.YieldedToWaiter(ctx)
 }
 
 // Status returns the current status of all scheduled accounts.

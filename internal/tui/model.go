@@ -3,6 +3,7 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 	"go.kenn.io/msgvault/internal/deletion"
+	"go.kenn.io/msgvault/internal/peoplebrowser"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/update"
@@ -53,8 +55,12 @@ type Options struct {
 	ThreadMessageLimit int
 
 	// TextEngine provides text message query operations.
-	// When non-nil, the 'm' key toggles between Email and Texts mode.
+	// When non-nil, Texts participates in the top-level mode cycle.
 	TextEngine query.TextEngine
+
+	// PeopleBackend provides the People directory and contact workspace.
+	// When nil, embedders retain the three existing modes.
+	PeopleBackend peoplebrowser.Backend
 
 	// ManifestSaver saves staged deletion manifests. When nil, manifests are
 	// saved under DataDir for tests or direct embedding.
@@ -63,6 +69,10 @@ type Options struct {
 	// AttachmentReader opens attachment content streams. When nil, exports read
 	// from DataDir/attachments for tests or direct embedding.
 	AttachmentReader AttachmentReader
+
+	// SemanticSearch enables the third TUI search mode. Callers should only set
+	// it after the daemon reports that vector search is configured.
+	SemanticSearch query.SemanticMessageSearcher
 
 	// AnalyticsNotice, when non-empty, is shown on the info line while
 	// aggregate views load. It explains slow first queries (for example,
@@ -87,13 +97,18 @@ const (
 	modalError
 )
 
-// searchModeKind represents the search mode (fast metadata vs deep body search).
+// searchModeKind represents the active message search strategy.
 type searchModeKind int
 
 const (
-	searchModeFast searchModeKind = iota // Parquet metadata only (subject, sender, recipient)
-	searchModeDeep                       // SQLite FTS5 (includes body text)
+	searchModeFast     searchModeKind = iota // Parquet metadata only (subject, sender, recipient)
+	searchModeDeep                           // SQLite FTS5 (includes body text)
+	searchModeSemantic                       // Hybrid lexical/vector ranking through the daemon
 )
+
+func (m Model) hasActiveSemanticSearch() bool {
+	return m.searchMode == searchModeSemantic && m.searchQuery != ""
+}
 
 // selectionState tracks selected items for batch operations.
 type selectionState struct {
@@ -131,8 +146,16 @@ type Model struct {
 	// Texts mode state (separate from email viewState)
 	textState textState
 
+	// Shared message-detail rendering has independent state per top-level mode.
+	// messageReaderState in viewState is the active mode's instance.
+	parkedMessageReaders [modeCount]messageReaderState
+
 	// Meetings mode state (separate from email and text navigation state)
 	meetingState meetingState
+
+	// People mode dependencies and state remain separate from every other mode.
+	peopleBackend peoplebrowser.Backend
+	peopleState   peopleState
 
 	// Version info for title bar
 	version string
@@ -176,11 +199,12 @@ type Model struct {
 	selection selectionState
 
 	// Modal state
-	modal           modalType
-	modalCursor     int                // Cursor position within modal (for selector modals)
-	modalResult     string             // Result message to display
-	helpScroll      int                // Scroll offset for help modal
-	pendingManifest *deletion.Manifest // Manifest being confirmed
+	modal            modalType
+	modalCursor      int                // Cursor position within modal (for selector modals)
+	modalResultTitle string             // Optional title for action-result modals
+	modalResult      string             // Result message to display
+	helpScroll       int                // Scroll offset for help modal
+	pendingManifest  *deletion.Manifest // Manifest being confirmed
 
 	// Action controller (deletion, export)
 	actions *ActionController
@@ -204,7 +228,8 @@ type Model struct {
 	textRequestID          uint64 // Latest Text navigation/data request
 
 	// Search state
-	searchMode        searchModeKind  // Fast (Parquet) or Deep (FTS5)
+	searchMode        searchModeKind // Fast metadata, deep FTS, or semantic hybrid
+	semanticSearch    query.SemanticMessageSearcher
 	searchInput       textinput.Model // Text input for search query
 	searchTotalCount  int64           // Total matching messages (for pagination display)
 	searchOffset      int             // Current offset for pagination
@@ -224,6 +249,9 @@ type Model struct {
 	preSearchCursor       int
 	preSearchScrollOffset int
 	preSearchContextStats *query.TotalStats
+	// preSearchSnapshotInvalid marks that the saved list belongs to a
+	// previous filter scope. Clearing search must reload the current scope.
+	preSearchSnapshotInvalid bool
 
 	// transitionBuffer holds the last rendered view during level transitions.
 	// When non-empty, View() returns this string instead of rendering fresh content.
@@ -256,6 +284,14 @@ func New(engine query.Engine, opts Options) Model {
 	meetingDetailInput.Placeholder = "find in transcript"
 	meetingDetailInput.CharLimit = 200
 	meetingDetailInput.SetWidth(40)
+	peopleMeetingDetailInput := textinput.New()
+	peopleMeetingDetailInput.Placeholder = "find in transcript"
+	peopleMeetingDetailInput.CharLimit = 200
+	peopleMeetingDetailInput.SetWidth(40)
+	peopleInput := textinput.New()
+	peopleInput.Placeholder = "search names and identifiers"
+	peopleInput.CharLimit = 200
+	peopleInput.SetWidth(50)
 
 	aggLimit := opts.AggregateLimit
 	if aggLimit == 0 {
@@ -275,29 +311,33 @@ func New(engine query.Engine, opts Options) Model {
 	}
 
 	return Model{
-		engine:     engine,
-		textEngine: textEngine,
+		engine:        engine,
+		textEngine:    textEngine,
+		peopleBackend: opts.PeopleBackend,
 		actions: NewActionControllerWithOptions(engine, ActionControllerOptions{
 			DataDir:          opts.DataDir,
 			ManifestSaver:    opts.ManifestSaver,
 			AttachmentReader: opts.AttachmentReader,
 		}),
+		semanticSearch:     opts.SemanticSearch,
 		version:            opts.Version,
 		analyticsNotice:    opts.AnalyticsNotice,
 		aggregateLimit:     aggLimit,
 		threadMessageLimit: threadLimit,
-		viewState: viewState{
-			level:            levelAggregates,
-			viewType:         query.ViewSenders,
-			timeGranularity:  query.TimeMonth,
-			sortField:        query.SortByCount,
-			sortDirection:    query.SortDesc,
-			msgSortField:     query.MessageSortByDate,
-			msgSortDirection: query.SortDesc,
-		},
+		level:              levelAggregates,
+		viewType:           query.ViewSenders,
+		timeGranularity:    query.TimeMonth,
+		sortField:          query.SortByCount,
+		sortDirection:      query.SortDesc,
+		msgSortField:       query.MessageSortByDate,
+		msgSortDirection:   query.SortDesc,
 		meetingState: meetingState{
 			searchInput:       meetingInput,
 			detailSearchInput: meetingDetailInput,
+		},
+		peopleState: peopleState{
+			searchInput: peopleInput, location: time.Local,
+			parkedMeetingState: meetingState{detailSearchInput: peopleMeetingDetailInput},
 		},
 		pageSize:      20,
 		loading:       true,
@@ -374,6 +414,13 @@ func (m Model) scopeLabelForLog() string {
 type updateCheckMsg struct {
 	version    string // Latest version if available
 	isDevBuild bool
+}
+
+// AnalyticsNoticeMsg replaces the analytics notice shown while aggregate
+// data loads. The command layer sends an empty notice after a background
+// cache initialization switches the daemon from live SQL to DuckDB.
+type AnalyticsNoticeMsg struct {
+	Notice string
 }
 
 // loadData fetches aggregate data based on current view settings.
@@ -551,11 +598,9 @@ type searchDebounceMsg struct {
 	debounceID uint64
 }
 
-// exportResultMsg is returned when attachment export completes.
-type exportResultMsg struct {
-	result string
-	err    error
-}
+// exportResultMsg keeps the model's internal message name while sharing the
+// action controller's public result type.
+type exportResultMsg = ExportResultMsg
 
 // inlineSearchDebounceDelay is the delay before executing inline search (fast mode).
 const inlineSearchDebounceDelay = 100 * time.Millisecond
@@ -598,8 +643,12 @@ func (m Model) loadSearchWithOffset(queryStr string, offset int, appendResults b
 	requestID := m.searchRequestID
 	presentationGeneration := m.presentationGeneration
 	modeLabel := "fast"
-	if m.searchMode != searchModeFast {
+	switch m.searchMode {
+	case searchModeFast:
+	case searchModeDeep:
 		modeLabel = "deep"
+	case searchModeSemantic:
+		modeLabel = "semantic"
 	}
 	scopeLabel := m.scopeLabelForLog()
 	return safeCmdWithPanic(
@@ -637,7 +686,8 @@ func (m Model) loadSearchWithOffset(queryStr string, offset int, appendResults b
 				)
 			}()
 
-			if m.searchMode == searchModeFast {
+			switch m.searchMode {
+			case searchModeFast:
 				// Fast search: single-scan with temp table materialization
 				result, fastErr := m.engine.SearchFastWithStats(ctx, q, queryStr, searchFilter, m.viewType, searchPageSize, offset)
 				if fastErr == nil {
@@ -648,7 +698,7 @@ func (m Model) loadSearchWithOffset(queryStr string, offset int, appendResults b
 					}
 				}
 				err = fastErr
-			} else {
+			case searchModeDeep:
 				// Deep search: FTS5 body search
 				// Merge context filter into query to honor drill-down context
 				mergedQuery := query.MergeFilterIntoQuery(q, searchFilter)
@@ -681,6 +731,32 @@ func (m Model) loadSearchWithOffset(queryStr string, offset int, appendResults b
 							}
 							stats = &query.TotalStats{MessageCount: fallbackCount}
 						}
+					}
+				}
+			case searchModeSemantic:
+				if m.semanticSearch == nil {
+					err = errors.New("semantic search is not enabled")
+					break
+				}
+				result, semanticErr := m.semanticSearch.SearchSemanticMessages(ctx, query.SemanticMessageSearchRequest{
+					Query:  queryStr,
+					Filter: searchFilter,
+					Limit:  searchPageSize,
+					Offset: offset,
+				})
+				err = semanticErr
+				if semanticErr == nil {
+					results = result.Messages
+					totalCount = int64(offset + len(results))
+					if result.HasMore {
+						totalCount = -1
+					}
+					if !appendResults {
+						messageCount := totalCount
+						if messageCount < 0 {
+							messageCount = int64(len(results))
+						}
+						stats = &query.TotalStats{MessageCount: messageCount}
 					}
 				}
 			}
@@ -993,6 +1069,52 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleAccountsLoaded(msg)
 	case updateCheckMsg:
 		return m.handleUpdateCheck(msg)
+	case AnalyticsNoticeMsg:
+		m.analyticsNotice = msg.Notice
+		return m, nil
+	// People messages are delegated before the shared Email handlers.
+	case peopleSearchDebounceMsg:
+		return m.handlePeopleSearchDebounce(msg)
+	case peopleCompletionLoadedMsg:
+		return m.handlePeopleCompletionLoaded(msg)
+	case peopleDirectoryLoadedMsg:
+		return m.handlePeopleDirectoryLoaded(msg)
+	case peopleContactLoadedMsg:
+		return m.handlePeopleContactLoaded(msg)
+	case peopleRelationshipLoadedMsg:
+		return m.handlePeopleRelationshipLoaded(msg)
+	case peoplePromotedMsg:
+		return m.handlePeoplePromoted(msg)
+	case peopleAttributesLoadedMsg:
+		return m.handlePeopleAttributesLoaded(msg)
+	case peopleFieldCreatedMsg:
+		return m.handlePeopleFieldCreated(msg)
+	case peopleAttributeSetMsg:
+		return m.handlePeopleAttributeSet(msg)
+	case peopleInboxesLoadedMsg:
+		return m.handlePeopleInboxesLoaded(msg)
+	case peopleConversationsLoadedMsg:
+		return m.handlePeopleConversationsLoaded(msg)
+	case peopleConversationMessagesLoadedMsg:
+		return m.handlePeopleConversationMessagesLoaded(msg)
+	case peopleMessageLoadedMsg:
+		return m.handlePeopleMessageLoaded(msg)
+	case peopleMeetingsLoadedMsg:
+		return m.handlePeopleMeetingsLoaded(msg)
+	case peopleMeetingLoadedMsg:
+		return m.handlePeopleMeetingLoaded(msg)
+	case peopleFilesLoadedMsg:
+		return m.handlePeopleFilesLoaded(msg)
+	case peopleFileMessageLoadedMsg:
+		return m.handlePeopleFileMessageLoaded(msg)
+	case peopleFileExportedMsg:
+		return m.handlePeopleFileExported(msg)
+	case peopleActivityLoadedMsg:
+		return m.handlePeopleActivityLoaded(msg)
+	case peopleActivityMessageLoadedMsg:
+		return m.handlePeopleActivityMessageLoaded(msg)
+	case ExportResultMsg:
+		return m.handleExportResult(msg)
 	case messagesLoadedMsg:
 		return m.handleMessagesLoaded(msg)
 	case messageDetailLoadedMsg:
@@ -1003,8 +1125,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleSearchResults(msg)
 	case flashClearMsg:
 		return m.handleFlashClear()
-	case exportResultMsg:
-		return m.handleExportResult(msg)
 	case searchDebounceMsg:
 		return m.handleSearchDebounce(msg)
 	case spinnerTickMsg:
@@ -1016,6 +1136,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleTextAggregateLoaded(msg)
 	case textMessagesLoadedMsg:
 		return m.handleTextMessagesLoaded(msg)
+	case textMessageLoadedMsg:
+		return m.handleTextMessageLoaded(msg)
 	case textSearchResultMsg:
 		return m.handleTextSearchResult(msg)
 	case textStatsLoadedMsg:
@@ -1031,8 +1153,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 // finishModePresentation settles shared loading state only when the response
-// belongs to the mode currently on screen. The response handler may still
-// cache mode-owned data while another mode is active.
+// belongs to the mode activation currently on screen.
 func (m *Model) finishModePresentation(mode tuiMode, generation uint64) bool {
 	if m.mode != mode || m.presentationGeneration != generation {
 		return false
@@ -1048,12 +1169,13 @@ func (m Model) handleTextConversationsLoaded(msg textConversationsLoadedMsg) (te
 		return m, nil
 	}
 	active := m.finishModePresentation(modeTexts, msg.presentationGeneration)
+	if !active {
+		return m, nil
+	}
 	if msg.err != nil {
-		if active {
-			m.err = msg.err
-			m.modal = modalError
-			m.modalResult = msg.err.Error()
-		}
+		m.err = msg.err
+		m.modal = modalError
+		m.modalResult = msg.err.Error()
 		return m, nil
 	}
 	m.textState.conversations = msg.conversations
@@ -1070,12 +1192,13 @@ func (m Model) handleTextAggregateLoaded(msg textAggregateLoadedMsg) (tea.Model,
 		return m, nil
 	}
 	active := m.finishModePresentation(modeTexts, msg.presentationGeneration)
+	if !active {
+		return m, nil
+	}
 	if msg.err != nil {
-		if active {
-			m.err = msg.err
-			m.modal = modalError
-			m.modalResult = msg.err.Error()
-		}
+		m.err = msg.err
+		m.modal = modalError
+		m.modalResult = msg.err.Error()
 		return m, nil
 	}
 	m.textState.aggregateRows = msg.rows
@@ -1092,16 +1215,20 @@ func (m Model) handleTextMessagesLoaded(msg textMessagesLoadedMsg) (tea.Model, t
 		return m, nil
 	}
 	active := m.finishModePresentation(modeTexts, msg.presentationGeneration)
+	if !active {
+		return m, nil
+	}
 	if msg.err != nil {
-		if active {
-			m.err = msg.err
-			m.modal = modalError
-			m.modalResult = msg.err.Error()
-		}
+		m.err = msg.err
+		m.modal = modalError
+		m.modalResult = msg.err.Error()
 		return m, nil
 	}
 	m.textState.messages = msg.messages
-	m.textState.unfilteredMessages = nil // clear stale search snapshot
+	m.textState.globalSearchTimeline = false
+	if m.textState.filter.SearchQuery == "" {
+		m.textState.unfilteredMessages = nil
+	}
 	m.textState.cursor = 0
 	m.textState.scrollOffset = 0
 	return m, nil
@@ -1113,21 +1240,22 @@ func (m Model) handleTextSearchResult(msg textSearchResultMsg) (tea.Model, tea.C
 		return m, nil
 	}
 	active := m.finishModePresentation(modeTexts, msg.presentationGeneration)
+	if !active {
+		return m, nil
+	}
 	if msg.err != nil {
-		if active {
-			m.err = msg.err
-			m.modal = modalError
-			m.modalResult = msg.err.Error()
-		}
+		m.err = msg.err
+		m.modal = modalError
+		m.modalResult = msg.err.Error()
 		return m, nil
 	}
 	// Show search results as a timeline
 	m.textState.messages = msg.messages
-	if active {
-		m.textState.level = textLevelTimeline
-		m.textState.cursor = 0
-		m.textState.scrollOffset = 0
-	}
+	m.textState.level = textLevelTimeline
+	m.textState.globalSearchTimeline = true
+	m.textState.unfilteredMessages = nil
+	m.textState.cursor = 0
+	m.textState.scrollOffset = 0
 	return m, nil
 }
 
@@ -1152,32 +1280,23 @@ func (m Model) handleWindowSize(msg tea.WindowSizeMsg) (tea.Model, tea.Cmd) {
 		m.height = 0
 	}
 	m.pageSize = max(m.height-headerFooterLines, 1)
-	// Recalculate detail line count if in detail view (width affects wrapping)
-	if m.level == levelMessageDetail && m.messageDetail != nil {
-		m.updateDetailLineCount()
-		// Recompute detail search matches since line indices depend on text wrapping
-		if m.detailSearchQuery != "" {
-			m.findDetailMatches()
-			// Clamp match index to new match count
-			if m.detailSearchMatchIndex >= len(m.detailSearchMatches) {
-				if len(m.detailSearchMatches) > 0 {
-					m.detailSearchMatchIndex = len(m.detailSearchMatches) - 1
-				} else {
-					m.detailSearchMatchIndex = 0
-				}
-			}
-		}
-		m.clampDetailScroll()
+	if m.messageDetail != nil {
+		m.reflowMessageDetail()
 	}
-	if m.mode == modeMeetings && m.meetingState.level == meetingLevelDetail && m.meetingState.detail != nil {
-		if m.meetingState.detailSearchQuery != "" {
-			matchIndex := m.meetingState.detailSearchMatchIndex
-			m.findMeetingDetailMatches()
-			if len(m.meetingState.detailSearchMatches) > 0 {
-				m.meetingState.detailSearchMatchIndex = min(matchIndex, len(m.meetingState.detailSearchMatches)-1)
-			}
+	for mode := range modeCount {
+		if m.parkedMessageReaders[mode].messageDetail != nil {
+			m.parkedMessageReaders[mode] = m.reflowMessageReader(
+				m.parkedMessageReaders[mode],
+			)
 		}
-		m.clampMeetingDetailScroll()
+	}
+	if m.meetingState.detail != nil {
+		m.reflowMeetingDetail()
+	}
+	if m.peopleState.parkedMeetingState.detail != nil {
+		m.peopleState.parkedMeetingState = m.reflowMeetingReader(
+			m.peopleState.parkedMeetingState,
+		)
 	}
 	return m, nil
 }
@@ -1337,10 +1456,18 @@ func (m Model) handleMessageDetailLoaded(msg messageDetailLoadedMsg) (tea.Model,
 				m.modal = modalNone
 			}
 		}
-		m.messageDetail = msg.detail
-		m.detailScroll = 0
-		m.pendingDetailSubject = "" // Clear pending subject
-		m.updateDetailLineCount()   // Calculate line count for scroll bounds
+		if m.mode == modeEmail {
+			m.messageDetail = msg.detail
+			m.detailScroll = 0
+			m.pendingDetailSubject = ""
+			m.reflowMessageDetail()
+		} else {
+			reader := m.parkedMessageReaders[modeEmail]
+			reader.messageDetail = msg.detail
+			reader.detailScroll = 0
+			reader.pendingDetailSubject = ""
+			m.parkedMessageReaders[modeEmail] = m.reflowMessageReader(reader)
+		}
 	}
 	return m, nil
 }
@@ -1410,6 +1537,9 @@ func (m Model) handleSearchResults(msg searchResultsMsg) (tea.Model, tea.Cmd) {
 func (m *Model) appendSearchResults(msg searchResultsMsg) {
 	m.messages = append(m.messages, msg.messages...)
 	m.searchOffset += len(msg.messages)
+	if msg.totalCount >= 0 {
+		m.searchTotalCount = msg.totalCount
+	}
 	// Update contextStats when total is unknown so header reflects loaded count
 	if m.searchTotalCount == -1 && m.contextStats != nil {
 		m.contextStats.MessageCount = int64(len(m.messages))
@@ -1471,10 +1601,11 @@ func (m Model) handleFlashClear() (tea.Model, tea.Cmd) {
 func (m Model) handleExportResult(msg exportResultMsg) (tea.Model, tea.Cmd) {
 	m.loading = false
 	m.modal = modalExportResult
-	if msg.err != nil {
-		m.modalResult = fmt.Sprintf("Export failed: %v", msg.err)
+	m.modalResultTitle = msg.Title
+	if msg.Err != nil && msg.Result == "" {
+		m.modalResult = msg.Err.Error()
 	} else {
-		m.modalResult = msg.result
+		m.modalResult = msg.Result
 	}
 	return m, nil
 }
@@ -1499,17 +1630,14 @@ func (m Model) handleSearchDebounce(msg searchDebounceMsg) (tea.Model, tea.Cmd) 
 
 	if m.level == levelMessageList {
 		// Message list: use search engine for live results
-		m.searchFilter = m.drillFilter
-		m.searchFilter.SourceID = m.accountFilter
-		m.searchFilter.WithAttachmentsOnly = m.filters.attachmentsOnly
-		m.searchFilter.HideDeletedFromSource = m.filters.hideDeletedFromSource
+		m.syncSearchScope()
 		m.searchRequestID++
 		m.loadRequestID++ // Invalidate any in-flight loadMessages to prevent overwriting search results
 		if msg.query == "" {
 			// Empty query: reload unfiltered messages
 			return m, tea.Batch(spinCmd, m.loadMessages())
 		}
-		m.messages = nil // Clear stale messages immediately so they don't show during search
+		m.prepareSearchReplacement()
 		return m, tea.Batch(spinCmd, m.loadSearch(msg.query))
 	}
 	// Aggregate views: reload aggregates with search filter
@@ -1530,6 +1658,9 @@ func (m Model) handleSpinnerTick() (tea.Model, tea.Cmd) {
 
 // handleKeyPress processes keyboard input.
 func (m Model) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if m.mode == modePeople {
+		return m.handlePeopleKeyPress(msg)
+	}
 	// Route to Texts mode handler when active
 	if m.mode == modeTexts {
 		return m.handleTextKeyPress(msg)
@@ -1590,6 +1721,46 @@ func (m *Model) clampDetailScroll() {
 	if m.detailScroll > maxScroll {
 		m.detailScroll = maxScroll
 	}
+}
+
+func (m *Model) reflowMessageDetail() {
+	m.updateDetailLineCount()
+	if m.detailSearchQuery != "" {
+		m.findDetailMatches()
+		if m.detailSearchMatchIndex >= len(m.detailSearchMatches) {
+			if len(m.detailSearchMatches) > 0 {
+				m.detailSearchMatchIndex = len(m.detailSearchMatches) - 1
+			} else {
+				m.detailSearchMatchIndex = 0
+			}
+		}
+	}
+	m.clampDetailScroll()
+}
+
+func (m Model) reflowMessageReader(reader messageReaderState) messageReaderState {
+	m.messageReaderState = reader
+	m.reflowMessageDetail()
+	return m.messageReaderState
+}
+
+func (m *Model) reflowMeetingDetail() {
+	matchIndex := m.meetingState.detailSearchMatchIndex
+	if m.meetingState.detailSearchQuery != "" {
+		m.findMeetingDetailMatches()
+		if len(m.meetingState.detailSearchMatches) > 0 {
+			m.meetingState.detailSearchMatchIndex = min(
+				matchIndex, len(m.meetingState.detailSearchMatches)-1,
+			)
+		}
+	}
+	m.clampMeetingDetailScroll()
+}
+
+func (m Model) reflowMeetingReader(reader meetingState) meetingState {
+	m.meetingState = reader
+	m.reflowMeetingDetail()
+	return m.meetingState
 }
 
 // findDetailMatches finds all lines matching the detail search query.
@@ -1742,6 +1913,9 @@ func (m Model) View() tea.View {
 // Separated from View() so transitions can capture the current output
 // before changing state (for the transitionBuffer pattern).
 func (m Model) renderView() string {
+	if m.mode == modePeople {
+		return m.renderPeopleView()
+	}
 	if m.mode == modeTexts {
 		return m.renderTextView()
 	}

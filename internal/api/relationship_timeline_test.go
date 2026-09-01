@@ -26,7 +26,7 @@ const (
 )
 
 const relationshipTimelineMessagesCols = "id, source_id, source_message_id, conversation_id, subject, snippet, " +
-	"sent_at, size_estimate, has_attachments, attachment_count, deleted_from_source_at, sender_id, message_type, is_from_me, year, month"
+	"sent_at, size_estimate, has_attachments, attachment_count, deleted_from_source_at, sender_id, owner_participant_id, message_type, is_from_me, year, month"
 
 // writeRelationshipTimelineFixture writes (or rewrites in place) the
 // Parquet fixture for the relationship timeline HTTP tests: an owner, a
@@ -69,7 +69,7 @@ func writeRelationshipTimelineFixture(t *testing.T, analyticsDir string, now tim
 	var messageRows, recipientRows []string
 	for _, m := range rows {
 		messageRows = append(messageRows, fmt.Sprintf(
-			"(%d::BIGINT, 1::BIGINT, 'm%d', %d::BIGINT, '', 'Preview %d', TIMESTAMP '%s', 10::BIGINT, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, %s, %v, %d, %d)",
+			"(%d::BIGINT, 1::BIGINT, 'm%d', %d::BIGINT, '', 'Preview %d', TIMESTAMP '%s', 10::BIGINT, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, %s, %v, %d, %d)",
 			m.id, m.id, m.convID, m.id, m.sentAt.Format("2006-01-02 15:04:05"), sqlQuote(m.messageType), m.isFromMe, m.sentAt.Year(), int(m.sentAt.Month())))
 		recipientRows = append(recipientRows,
 			fmt.Sprintf("(%d::BIGINT, %d::BIGINT, 'from', '')", m.id, m.fromID),
@@ -173,6 +173,66 @@ func TestRelationshipTimelineOverHTTP(t *testing.T) {
 	assert.Equal(int64(3), burst.MessageCount)
 	assert.Equal("email", page.Rows[1].Kind)
 	assert.Equal("event", page.Rows[2].Kind)
+}
+
+func TestRelationshipTimelineResolvesSourceScopedIdentityBeforeAnalyzerWork(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	now := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	duckDB, _ := newRelationshipTimelineDuckDBFixture(t, now)
+	srv, identityStore, engine := newRelationshipIdentityAPIServer(
+		t,
+		duckDB,
+		[]string{
+			relationshipIdentityIdentifier,
+			"pat@example.test",
+			"pat-work@example.test",
+			"bystander@example.test",
+		},
+	)
+	path := fmt.Sprintf("/api/v1/relationships/%d/timeline", rtPatID)
+
+	baseline := postExploreJSON(t, srv, path, `{"timezone":"UTC"}`)
+	requirements.Equal(http.StatusOK, baseline.Code, baseline.Body.String())
+	var baselinePage RelationshipTimelineHTTPResponse
+	requirements.NoError(json.Unmarshal(baseline.Body.Bytes(), &baselinePage))
+	requirements.Len(baselinePage.Rows, 4)
+	assertions.Equal(1, engine.resolveCanonicalCalls)
+	assertions.Equal(1, engine.timelineCalls)
+	assertions.Zero(identityStore.resolveCalls)
+
+	filtered := postExploreJSON(t, srv, path, `{
+		"timezone":"UTC",
+		"filters":[
+			{"dimension":"source","values":["1"]},
+			{"dimension":"identity","values":["1","z-owner@example.test","sender"]}
+		]
+	}`)
+	requirements.Equal(http.StatusOK, filtered.Code, filtered.Body.String())
+	var filteredPage RelationshipTimelineHTTPResponse
+	requirements.NoError(json.Unmarshal(filtered.Body.Bytes(), &filteredPage))
+	requirements.Len(filteredPage.Rows, 1, "the resolved sender identity must retain only the owner-authored meeting")
+	assertions.Equal("event", filteredPage.Rows[0].Kind)
+	assertions.Equal(1, identityStore.resolveCalls, "the shared identity resolver runs once per request")
+	assertions.Equal(2, engine.resolveCanonicalCalls)
+	assertions.Equal(2, engine.timelineCalls)
+
+	invalid := postExploreJSON(t, srv, path, `{
+		"timezone":"UTC",
+		"filters":[
+			{"dimension":"source","values":["1"]},
+			{"dimension":"identity","values":["1","private-provider-token@example.test","sender"]}
+		]
+	}`)
+	requirements.Equal(http.StatusBadRequest, invalid.Code, invalid.Body.String())
+	var apiErr ErrorResponse
+	requirements.NoError(json.Unmarshal(invalid.Body.Bytes(), &apiErr))
+	assertions.Equal("invalid_identity_filter", apiErr.Error)
+	assertions.Equal("identity filter is malformed, unconfirmed, or does not match the selected source", apiErr.Message)
+	assertions.NotContains(invalid.Body.String(), "private-provider-token")
+	assertions.Equal(2, identityStore.resolveCalls)
+	assertions.Equal(2, engine.resolveCanonicalCalls, "invalid identity input must stop before canonical resolution")
+	assertions.Equal(2, engine.timelineCalls, "invalid identity input must stop before timeline analysis")
 }
 
 func TestRelationshipTimelineResolvesAnyMemberIDOverHTTP(t *testing.T) {

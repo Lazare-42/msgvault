@@ -34,14 +34,7 @@ func IngestRawMessage(
 	raw []byte, fallbackDate time.Time,
 	log *slog.Logger,
 ) error {
-	parsed, parseErr := mime.Parse(raw)
-	if parseErr != nil {
-		errMsg := textutil.FirstLine(parseErr.Error())
-		parsed = &mime.Message{
-			Subject:  "(MIME parse error)",
-			BodyText: fmt.Sprintf("[MIME parsing failed: %s]\n\nRaw MIME data is preserved in message_raw table.", errMsg),
-		}
-	}
+	parsed, _ := mime.ParseWithRecovery(raw, "(MIME parse error)")
 
 	subject := textutil.EnsureUTF8(parsed.Subject)
 	bodyText := textutil.EnsureUTF8(parsed.GetBodyText())
@@ -197,10 +190,7 @@ func IngestRawMessage(
 				"message", messageID, "error", err,
 			)
 		} else if storedCount != attachmentCount {
-			if _, err := st.DB().Exec(
-				st.Rebind(`UPDATE messages SET has_attachments = ?, attachment_count = ? WHERE id = ?`),
-				storedCount > 0, storedCount, messageID,
-			); err != nil {
+			if err := st.RecomputeMessageAttachmentStats(messageID); err != nil {
 				log.Warn("failed to update attachment metadata",
 					"message", messageID, "error", err,
 				)
@@ -277,7 +267,10 @@ func buildRecipientSet(recipientType string, addresses []mime.Address, participa
 		return rs
 	}
 
+	// The envelope email is pinned at first occurrence, matching
+	// display-name dedup.
 	idToName := make(map[int64]string)
+	idToEmail := make(map[int64]string)
 	var orderedIDs []int64
 
 	for _, addr := range addresses {
@@ -292,6 +285,7 @@ func buildRecipientSet(recipientType string, addresses []mime.Address, participa
 		if _, seen := idToName[id]; !seen {
 			orderedIDs = append(orderedIDs, id)
 			idToName[id] = name
+			idToEmail[id] = addr.Email
 			continue
 		}
 		if idToName[id] == "" && name != "" {
@@ -301,8 +295,10 @@ func buildRecipientSet(recipientType string, addresses []mime.Address, participa
 
 	rs.ParticipantIDs = orderedIDs
 	rs.DisplayNames = make([]string, len(orderedIDs))
+	rs.EmailAddresses = make([]string, len(orderedIDs))
 	for i, id := range orderedIDs {
 		rs.DisplayNames[i] = idToName[id]
+		rs.EmailAddresses[i] = idToEmail[id]
 	}
 	return rs
 }
@@ -315,8 +311,18 @@ func storeAttachment(
 	if err != nil || storagePath == "" {
 		return err
 	}
-	return st.UpsertAttachment(
-		messageID, att.Filename, att.ContentType,
-		storagePath, att.ContentHash, len(att.Content),
+	role, roleSource := store.AttachmentRoleFromMIME(
+		att.Disposition, att.IsInline, att.ContentID,
 	)
+	return st.UpsertAttachmentRecord(context.Background(), messageID, store.AttachmentWrite{
+		Filename:      att.Filename,
+		MIMEType:      att.ContentType,
+		StoragePath:   storagePath,
+		ContentHash:   att.ContentHash,
+		Size:          int64(len(att.Content)),
+		Role:          role,
+		RoleSource:    roleSource,
+		SourcePartKey: att.PartKey,
+		ContentID:     att.ContentID,
+	})
 }

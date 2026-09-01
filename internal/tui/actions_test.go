@@ -4,9 +4,11 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -90,12 +92,16 @@ func (e *ControllerTestEnv) StageForDeletion(args stageArgs) *deletion.Manifest 
 	if granularity == 0 {
 		granularity = query.TimeYear
 	}
+	accounts := args.accounts
+	if accounts == nil {
+		accounts = []query.AccountInfo{{ID: 1, SourceType: "gmail", Identifier: "test@gmail.com"}}
+	}
 	manifest, err := e.Ctrl.StageForDeletion(DeletionContext{
 		AggregateSelection: args.aggregates,
 		MessageSelection:   args.selection,
 		AggregateViewType:  args.view,
 		AccountFilter:      args.accountID,
-		Accounts:           args.accounts,
+		Accounts:           accounts,
 		TimeGranularity:    granularity,
 		Messages:           args.messages,
 		DrillFilter:        args.drillFilter,
@@ -105,10 +111,13 @@ func (e *ControllerTestEnv) StageForDeletion(args stageArgs) *deletion.Manifest 
 }
 
 func msgSummary(id int64, sourceID string) query.MessageSummary {
-	return query.MessageSummary{ID: id, SourceMessageID: sourceID}
+	return query.MessageSummary{ID: id, SourceID: 1, SourceMessageID: sourceID}
 }
 
 func TestStageForDeletion_FromAggregateSelection(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
 	env := newTestEnv(t, "gid1", "gid2", "gid3")
 
 	manifest := env.StageForDeletion(stageArgs{
@@ -116,9 +125,24 @@ func TestStageForDeletion_FromAggregateSelection(t *testing.T) {
 		view:       query.ViewSenders,
 	})
 
-	assert.Len(t, manifest.GmailIDs, 3)
-	assert.Equal(t, []string{"alice@example.com"}, manifest.Filters.Senders)
-	assert.Equal(t, "tui", manifest.CreatedBy)
+	assert.Len(manifest.GmailIDs, 3)
+	assert.Equal(2, manifest.Version)
+	require.NotNil(manifest.Source)
+	assert.Equal(deletion.SourceReference{ID: 1, Type: "gmail", Identifier: "test@gmail.com"}, *manifest.Source)
+	assert.Equal([]string{"alice@example.com"}, manifest.Filters.Senders)
+	assert.Equal("tui", manifest.CreatedBy)
+}
+
+func TestStageForDeletionRejectsMultipleSources(t *testing.T) {
+	engine := &querytest.MockEngine{DeletionTargets: []query.DeletionTarget{
+		{MessageID: 1, SourceID: 1, SourceType: "gmail", SourceIdentifier: "one@example.invalid", SourceMessageID: "gm-1"},
+		{MessageID: 2, SourceID: 2, SourceType: "gmail", SourceIdentifier: "two@example.invalid", SourceMessageID: "gm-2"},
+	}}
+	controller := NewActionController(engine, t.TempDir(), nil)
+	_, err := controller.StageForDeletion(DeletionContext{
+		AggregateSelection: map[string]bool{"example.invalid": true}, AggregateViewType: query.ViewDomains,
+	})
+	require.ErrorContains(t, err, "press 'a' to filter by account")
 }
 
 func TestStageForDeletion_StoresFullDescription(t *testing.T) {
@@ -236,9 +260,12 @@ func TestStageForDeletion_DrillFilterApplied(t *testing.T) {
 	// select "2024-01". The filter should include both sender AND time period.
 	var capturedFilter query.MessageFilter
 	engine := &querytest.MockEngine{
-		GetGmailIDsByFilterFunc: func(_ context.Context, f query.MessageFilter) ([]string, error) {
+		GetDeletionTargetsByFilterFunc: func(_ context.Context, f query.MessageFilter) ([]query.DeletionTarget, error) {
 			capturedFilter = f
-			return []string{"gid1", "gid2"}, nil
+			return []query.DeletionTarget{
+				{MessageID: 1, SourceID: 1, SourceType: "gmail", SourceIdentifier: "test@gmail.com", SourceMessageID: "gid1"},
+				{MessageID: 2, SourceID: 1, SourceType: "gmail", SourceIdentifier: "test@gmail.com", SourceMessageID: "gid2"},
+			}, nil
 		},
 	}
 	env := NewControllerTestEnv(t, engine)
@@ -263,9 +290,12 @@ func TestStageForDeletion_NoDrillFilter(t *testing.T) {
 	// Without drill filter, only the aggregate selection filter is applied.
 	var capturedFilter query.MessageFilter
 	engine := &querytest.MockEngine{
-		GetGmailIDsByFilterFunc: func(_ context.Context, f query.MessageFilter) ([]string, error) {
+		GetDeletionTargetsByFilterFunc: func(_ context.Context, f query.MessageFilter) ([]query.DeletionTarget, error) {
 			capturedFilter = f
-			return []string{"gid1"}, nil
+			return []query.DeletionTarget{{
+				MessageID: 1, SourceID: 1, SourceType: "gmail",
+				SourceIdentifier: "test@gmail.com", SourceMessageID: "gid1",
+			}}, nil
 		},
 	}
 	env := NewControllerTestEnv(t, engine)
@@ -277,7 +307,7 @@ func TestStageForDeletion_NoDrillFilter(t *testing.T) {
 
 	assert.Empty(t, capturedFilter.Sender)
 	assert.Equal(t, "2024-01", capturedFilter.TimeRange.Period)
-	assert.Equal(t, "email", capturedFilter.MessageType)
+	assert.Equal(t, emailMessageType, capturedFilter.MessageType)
 }
 
 func TestStageForDeletion_EmailScopeExcludesMixedMessageTypes(t *testing.T) {
@@ -285,8 +315,8 @@ func TestStageForDeletion_EmailScopeExcludesMixedMessageTypes(t *testing.T) {
 	require := require.New(t)
 	tdb := dbtest.NewTestDB(t, "../store/schema.sql")
 	tdb.SeedStandardDataSet()
-	typedEmailID := tdb.AddMessage(dbtest.MessageOpts{Subject: "typed email", MessageType: "email"})
-	legacyEmailID := tdb.AddMessage(dbtest.MessageOpts{Subject: "legacy email", MessageType: "email"})
+	typedEmailID := tdb.AddMessage(dbtest.MessageOpts{Subject: "typed email", MessageType: emailMessageType})
+	legacyEmailID := tdb.AddMessage(dbtest.MessageOpts{Subject: "legacy email", MessageType: emailMessageType})
 	tdb.AddMessage(dbtest.MessageOpts{Subject: "meeting", MessageType: "meeting_transcript"})
 	tdb.AddMessage(dbtest.MessageOpts{Subject: "text", MessageType: "sms"})
 	_, err := tdb.DB.Exec(`UPDATE messages SET message_type = '' WHERE id = ?`, legacyEmailID)
@@ -517,4 +547,228 @@ func TestExportAttachments_UsesInjectedAttachmentReader(t *testing.T) {
 	require.NoError(err, "read zip entry")
 	require.NoError(file.Close(), "close zip entry")
 	assert.Equal("daemon bytes", string(body))
+}
+
+func TestDownloadAttachmentWritesExactFileWithoutOverwrite(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	const contentHash = "abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+	outputDir := t.TempDir()
+	require.NoError(os.WriteFile(filepath.Join(outputDir, "invoice.pdf"), []byte("existing"), 0o600))
+	ctrl := NewActionControllerWithOptions(&querytest.MockEngine{}, ActionControllerOptions{
+		DataDir:             t.TempDir(),
+		AttachmentOutputDir: outputDir,
+		AttachmentReader: mapAttachmentReader{data: map[string][]byte{
+			contentHash: []byte("downloaded invoice"),
+		}},
+	})
+	var marked string
+	ctrl.markUntrusted = func(path string) error {
+		marked = path
+		return nil
+	}
+
+	msg := ctrl.DownloadAttachment(query.AttachmentInfo{
+		Filename: "invoice.pdf", ContentHash: contentHash,
+	})()
+	result, ok := msg.(ExportResultMsg)
+	require.True(ok, "expected ExportResultMsg, got %T", msg)
+	require.NoError(result.Err)
+	assert.Equal("Download Complete", result.Title)
+	assert.FileExists(filepath.Join(outputDir, "invoice_1.pdf"))
+	assert.Equal(filepath.Join(outputDir, "invoice_1.pdf"), marked)
+	body, err := os.ReadFile(filepath.Join(outputDir, "invoice_1.pdf"))
+	require.NoError(err)
+	assert.Equal("downloaded invoice", string(body))
+}
+
+func TestDownloadAttachmentDefaultsToPrivateDataDirectory(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	const contentHash = "abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+	dataDir := t.TempDir()
+	ctrl := NewActionControllerWithOptions(&querytest.MockEngine{}, ActionControllerOptions{
+		DataDir: dataDir,
+		AttachmentReader: mapAttachmentReader{data: map[string][]byte{
+			contentHash: []byte("untrusted startup content"),
+		}},
+	})
+	ctrl.markUntrusted = func(string) error { return nil }
+
+	msg := ctrl.DownloadAttachment(query.AttachmentInfo{
+		Filename: ".zshenv", ContentHash: contentHash,
+	})()
+	result, ok := msg.(ExportResultMsg)
+	require.True(ok, "expected ExportResultMsg, got %T", msg)
+	require.NoError(result.Err)
+	downloadPath := filepath.Join(dataDir, "downloads", ".zshenv")
+	assert.Contains(result.Result, downloadPath)
+	assert.FileExists(downloadPath)
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(downloadPath)
+		require.NoError(err)
+		assert.Zero(info.Mode().Perm()&0o111, "download must not be executable")
+		dirInfo, err := os.Stat(filepath.Dir(downloadPath))
+		require.NoError(err)
+		assert.Equal(os.FileMode(0o700), dirInfo.Mode().Perm())
+	}
+}
+
+func TestDownloadAttachmentReportsMarkingFailureAndPreservesFile(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	const contentHash = "abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+	outputDir := t.TempDir()
+	ctrl := NewActionControllerWithOptions(&querytest.MockEngine{}, ActionControllerOptions{
+		DataDir:             t.TempDir(),
+		AttachmentOutputDir: outputDir,
+		AttachmentReader: mapAttachmentReader{data: map[string][]byte{
+			contentHash: []byte("downloaded invoice"),
+		}},
+	})
+	ctrl.markUntrusted = func(string) error { return errors.New("marker unavailable") }
+
+	msg := ctrl.DownloadAttachment(query.AttachmentInfo{
+		Filename: "invoice.pdf", ContentHash: contentHash,
+	})()
+	result, ok := msg.(ExportResultMsg)
+	require.True(ok, "expected ExportResultMsg, got %T", msg)
+	require.Error(result.Err)
+	assert.Equal("Download Failed", result.Title)
+	assert.Contains(result.Result, filepath.Join(outputDir, "invoice.pdf"))
+	assert.FileExists(filepath.Join(outputDir, "invoice.pdf"))
+}
+
+func TestOpenAttachmentDownloadsThenUsesInjectedOSHandler(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	const contentHash = "abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+	outputDir := t.TempDir()
+	var opened string
+	ctrl := NewActionControllerWithOptions(&querytest.MockEngine{}, ActionControllerOptions{
+		DataDir:             t.TempDir(),
+		AttachmentOutputDir: outputDir,
+		AttachmentReader: mapAttachmentReader{data: map[string][]byte{
+			contentHash: []byte("contract bytes"),
+		}},
+		OpenTarget: func(_ context.Context, target string) error {
+			opened = target
+			return nil
+		},
+	})
+	var marked string
+	ctrl.markUntrusted = func(path string) error {
+		marked = path
+		return nil
+	}
+
+	msg := ctrl.OpenAttachment(query.AttachmentInfo{
+		Filename: "contract.pdf", MimeType: "application/pdf", ContentHash: contentHash,
+	})()
+	result, ok := msg.(ExportResultMsg)
+	require.True(ok, "expected ExportResultMsg, got %T", msg)
+	require.NoError(result.Err)
+	assert.Equal("Attachment Opened", result.Title)
+	assert.Equal(filepath.Join(outputDir, "contract.pdf"), opened)
+	assert.Equal(opened, marked, "download must be marked untrusted before opening")
+	assert.FileExists(opened)
+}
+
+func TestOpenAttachmentBlocksActiveUnknownAndMismatchedTypes(t *testing.T) {
+	const contentHash = "abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+	tests := []query.AttachmentInfo{
+		{Filename: "shortcut.lnk", MimeType: "application/octet-stream", ContentHash: contentHash},
+		{Filename: "macro.docm", MimeType: "application/vnd.ms-word.document.macroEnabled.12", ContentHash: contentHash},
+		{Filename: "unknown.bin", MimeType: "application/octet-stream", ContentHash: contentHash},
+		{Filename: "disguised.pdf", MimeType: "application/x-msdownload", ContentHash: contentHash},
+	}
+	for _, att := range tests {
+		t.Run(att.Filename, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			outputDir := t.TempDir()
+			opened := false
+			ctrl := NewActionControllerWithOptions(&querytest.MockEngine{}, ActionControllerOptions{
+				DataDir:             t.TempDir(),
+				AttachmentOutputDir: outputDir,
+				AttachmentReader: mapAttachmentReader{data: map[string][]byte{
+					contentHash: []byte("untrusted bytes"),
+				}},
+				OpenTarget: func(context.Context, string) error {
+					opened = true
+					return nil
+				},
+			})
+
+			msg := ctrl.OpenAttachment(att)()
+			result, ok := msg.(ExportResultMsg)
+			require.True(ok, "expected ExportResultMsg, got %T", msg)
+			require.Error(result.Err)
+			assert.Equal("Open Blocked", result.Title)
+			require.ErrorContains(result.Err, "download-only")
+			assert.False(opened)
+			entries, err := os.ReadDir(outputDir)
+			require.NoError(err)
+			assert.Empty(entries, "blocked open must not write the attachment")
+		})
+	}
+}
+
+func TestOpenAttachmentDoesNotLaunchWhenQuarantineMarkingFails(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	const contentHash = "abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
+	outputDir := t.TempDir()
+	opened := false
+	ctrl := NewActionControllerWithOptions(&querytest.MockEngine{}, ActionControllerOptions{
+		DataDir:             t.TempDir(),
+		AttachmentOutputDir: outputDir,
+		AttachmentReader: mapAttachmentReader{data: map[string][]byte{
+			contentHash: []byte("document bytes"),
+		}},
+		OpenTarget: func(context.Context, string) error {
+			opened = true
+			return nil
+		},
+	})
+	ctrl.markUntrusted = func(string) error { return errors.New("marker unavailable") }
+
+	msg := ctrl.OpenAttachment(query.AttachmentInfo{
+		Filename: "contract.pdf", MimeType: "application/pdf", ContentHash: contentHash,
+	})()
+	result, ok := msg.(ExportResultMsg)
+	require.True(ok, "expected ExportResultMsg, got %T", msg)
+	require.Error(result.Err)
+	assert.Equal("Open Failed", result.Title)
+	require.ErrorContains(result.Err, "mark downloaded attachment as untrusted")
+	assert.False(opened)
+	assert.FileExists(filepath.Join(outputDir, "contract.pdf"))
+}
+
+func TestOpenAttachmentURLRequiresHTTPAndDoesNotDownload(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	var opened string
+	ctrl := NewActionControllerWithOptions(&querytest.MockEngine{}, ActionControllerOptions{
+		AttachmentOutputDir: t.TempDir(),
+		OpenTarget: func(_ context.Context, target string) error {
+			opened = target
+			return nil
+		},
+	})
+
+	msg := ctrl.OpenAttachment(query.AttachmentInfo{
+		Filename: "shared file", URL: "https://files.example.test/shared/1",
+	})()
+	result, ok := msg.(ExportResultMsg)
+	require.True(ok, "expected ExportResultMsg, got %T", msg)
+	require.NoError(result.Err)
+	assert.Equal("https://files.example.test/shared/1", opened)
+
+	opened = ""
+	msg = ctrl.OpenAttachment(query.AttachmentInfo{URL: "file:///etc/passwd"})()
+	result, ok = msg.(ExportResultMsg)
+	require.True(ok, "expected ExportResultMsg, got %T", msg)
+	require.Error(result.Err)
+	assert.Empty(opened)
 }

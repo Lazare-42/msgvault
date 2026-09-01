@@ -34,6 +34,7 @@ type Engine struct {
 var _ query.Engine = (*Engine)(nil)
 var _ query.TextEngine = (*Engine)(nil)
 var _ query.MessageBodySearcher = (*Engine)(nil)
+var _ query.SemanticMessageSearcher = (*Engine)(nil)
 
 // NewEngine creates a new daemon-backed query engine.
 func NewEngine(cfg Config) (*Engine, error) {
@@ -61,6 +62,54 @@ func (e *Engine) Close() error {
 		return nil
 	}
 	return e.store.Close()
+}
+
+// SearchSemanticMessages runs the daemon's hybrid message search while
+// preserving the TUI's exact source, drill-down, date, and attachment scope.
+func (e *Engine) SearchSemanticMessages(
+	ctx context.Context,
+	request query.SemanticMessageSearchRequest,
+) (*query.SemanticMessageSearchResult, error) {
+	filter := request.Filter
+	if filter.SourceIDs != nil {
+		return nil, errors.New("semantic TUI search does not support multi-account source scope")
+	}
+	if !query.SemanticMessageSearchSupportsFilter(filter) {
+		return nil, errors.New("semantic TUI search cannot preserve the current display-name, conversation, or empty-value scope")
+	}
+	parsed := search.Parse(request.Query)
+	if err := parsed.Err(); err != nil {
+		return nil, err
+	}
+	if len(parsed.TextTerms) == 0 {
+		return nil, errors.New("semantic search requires a query")
+	}
+	messageTypes, noMessageTypeMatches := query.ScopedMessageTypes(parsed.MessageTypes, filter.MessageType)
+	if noMessageTypeMatches {
+		return &query.SemanticMessageSearchResult{}, nil
+	}
+	// Carry the canonical intersection as the HTTP parameter and remove the
+	// user-authored operators from q. Leaving both in place would make the
+	// hybrid backend OR them and widen an Email-mode query back to SMS/MMS.
+	parsed.MessageTypes = nil
+	transportQuery := search.Format(parsed)
+
+	response, err := e.store.GetCLIHybridSearch(ctx, CLIHybridSearchRequest{
+		Query:        transportQuery,
+		MessageTypes: messageTypes,
+		Filter:       filter,
+		Mode:         "hybrid",
+		Limit:        request.Limit,
+		Offset:       request.Offset,
+	})
+	if err != nil {
+		return nil, err
+	}
+	messages := make([]query.MessageSummary, len(response.Results))
+	for i, result := range response.Results {
+		messages[i] = result.Message
+	}
+	return &query.SemanticMessageSearchResult{Messages: messages, HasMore: response.HasMore}, nil
 }
 
 // ============================================================================
@@ -264,6 +313,7 @@ func filterMessagesQuery(filter query.MessageFilter) *generated.FilterMessagesQu
 func textConversationsQuery(filter query.TextFilter) *generated.ListTextConversationsQuery {
 	return &generated.ListTextConversationsQuery{
 		SourceID:        copyInt64(filter.SourceID),
+		ParticipantID:   append([]int64(nil), filter.ParticipantIDs...),
 		ContactPhone:    optionalString(filter.ContactPhone),
 		ContactName:     optionalString(filter.ContactName),
 		SourceType:      optionalString(filter.SourceType),
@@ -282,7 +332,9 @@ func textConversationsQuery(filter query.TextFilter) *generated.ListTextConversa
 func textConversationMessagesQuery(filter query.TextFilter) *generated.ListTextConversationMessagesQuery {
 	base := textConversationsQuery(filter)
 	return &generated.ListTextConversationMessagesQuery{
+		SearchQuery:     optionalString(filter.SearchQuery),
 		SourceID:        base.SourceID,
+		ParticipantID:   append([]int64(nil), base.ParticipantID...),
 		ContactPhone:    base.ContactPhone,
 		ContactName:     base.ContactName,
 		SourceType:      base.SourceType,
@@ -913,7 +965,7 @@ func (e *Engine) SearchFastWithStats(ctx context.Context, q *search.Query, query
 	}, nil
 }
 
-func (e *Engine) GetGmailIDsByFilter(ctx context.Context, filter query.MessageFilter) ([]string, error) {
+func (e *Engine) GetDeletionTargetsByFilter(ctx context.Context, filter query.MessageFilter) ([]query.DeletionTarget, error) {
 	resp, err := APIResponse(e.store, func(client *apiclient.Client) (*generated.GetGmailIDsByFilterResp, error) {
 		return client.GetGmailIDsByFilterWithResponse(ctx, &generated.GetGmailIDsByFilterRequestOptions{
 			Query: gmailIDsFilterQuery(filter),
@@ -922,10 +974,18 @@ func (e *Engine) GetGmailIDsByFilter(ctx context.Context, filter query.MessageFi
 	if err != nil {
 		return nil, err
 	}
-	if resp.JSON200.GmailIds == nil {
-		return []string{}, nil
+	if len(resp.JSON200.Targets) == 0 && len(resp.JSON200.GmailIds) > 0 {
+		return nil, errors.New("daemon did not return deletion source provenance; upgrade the daemon and retry")
 	}
-	return resp.JSON200.GmailIds, nil
+	targets := make([]query.DeletionTarget, len(resp.JSON200.Targets))
+	for i, target := range resp.JSON200.Targets {
+		targets[i] = query.DeletionTarget{
+			MessageID: target.MessageID, SourceID: target.SourceID,
+			SourceType: target.SourceType, SourceIdentifier: target.SourceIdentifier,
+			SourceMessageID: target.SourceMessageID,
+		}
+	}
+	return targets, nil
 }
 
 func (e *Engine) SearchByDomains(ctx context.Context, domains []string, after, before *time.Time, limit, offset int) ([]query.MessageSummary, error) {
