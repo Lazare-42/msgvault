@@ -16,7 +16,7 @@ buildGoModule {
 
   src = gitignoreSource ../.;
 
-	vendorHash = "sha256-G/55LAWHJIJ8bF+uSuy1CnWyzOJoZJ+89qoGQ1ia7t0=";
+	vendorHash = "sha256-9OF7kmPW3LTAC/ExDzTYrY4ki/aAEhP8KGnwci3Smbg=";
   proxyVendor = true;
 
   # Bun's copyfile backend can install incomplete packages when fetchBunDeps'
