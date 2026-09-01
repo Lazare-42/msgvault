@@ -77,7 +77,7 @@ func TestMCPCommandForwardsHTTPPolicy(t *testing.T) {
 	require := require.New(t)
 
 	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "daemon-key", r.Header.Get("X-Api-Key"))
+		assert.Equal("daemon-key", r.Header.Get("X-Api-Key"))
 		if r.URL.Path == "/api/v1/health" {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"status": "ok", "api_schema_version": api.APISchemaVersion,
@@ -88,8 +88,6 @@ func TestMCPCommandForwardsHTTPPolicy(t *testing.T) {
 			http.Error(w, `{"error":"visual_search_not_ready"}`, http.StatusServiceUnavailable)
 			return
 		}
-		assert.Equal("/api/v1/stats", r.URL.Path)
-		assert.Equal("daemon-key", r.Header.Get("X-Api-Key"))
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/api/v1/stats":

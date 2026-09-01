@@ -425,7 +425,6 @@ func (c *Client) applyLabelFetchResults(
 		results[idx].FlagLabels = flagLabels
 		c.recordMembershipLocked(
 			mailbox, msgBuf.UID, "", rfc822MessageID, [32]byte{}, 0, msgBuf.Flags)
-		results[idx].LabelIDs = c.labelsForMessage(mailbox, rfc822MessageID)
 		results[idx].RFC822MessageID = rfc822MessageID
 		results[idx].Err = nil
 	}
