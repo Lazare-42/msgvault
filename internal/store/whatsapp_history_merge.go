@@ -55,16 +55,16 @@ func (s *Store) ListWhatsAppConversationsForSource(sourceID int64) ([]WhatsAppMe
 // lookup (see GetMessageBodyText / Store.GetMessageRaw) to keep this bulk
 // list query off those tables per the project's SQL guidelines.
 type WhatsAppMergeMessage struct {
-	ID              int64
-	SourceMessageID string
-	SentAt          sql.NullTime
-	ReceivedAt      sql.NullTime
-	InternalDate    sql.NullTime
-	SenderID        sql.NullInt64
-	IsFromMe        bool
+	ID               int64
+	SourceMessageID  string
+	SentAt           sql.NullTime
+	ReceivedAt       sql.NullTime
+	InternalDate     sql.NullTime
+	SenderID         sql.NullInt64
+	IsFromMe         bool
 	IdentityIsFromMe bool
-	Snippet         sql.NullString
-	SizeEstimate    int64
+	Snippet          sql.NullString
+	SizeEstimate     int64
 }
 
 // ListWhatsAppMessagesForConversation returns every live (non-deleted)

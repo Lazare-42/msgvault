@@ -33,11 +33,11 @@ const (
 	contactJID = "15557654321@s.whatsapp.net" // a direct-chat contact
 	groupJID   = "15559999999-1600000000@g.us"
 
-	waMsgHello     = "wa-hello"     // from only
-	waMsgReply     = "wa-reply"     // from only, is_from_me
-	waMsgShared    = "wa-shared"    // in both from and into, must dedup
-	waMsgGroup     = "wa-group"     // from only, group chat, marker attachment
-	waMsgDeleted   = "wa-deleted"   // from only, soft-deleted, must be skipped
+	waMsgHello   = "wa-hello"   // from only
+	waMsgReply   = "wa-reply"   // from only, is_from_me
+	waMsgShared  = "wa-shared"  // in both from and into, must dedup
+	waMsgGroup   = "wa-group"   // from only, group chat, marker attachment
+	waMsgDeleted = "wa-deleted" // from only, soft-deleted, must be skipped
 )
 
 type fixture struct {
@@ -314,21 +314,21 @@ func TestMergeSource(t *testing.T) {
 		wantReactions    int
 	}{
 		{
-			name: "wa-hello copied with body, attachment, and active reaction",
+			name:            "wa-hello copied with body, attachment, and active reaction",
 			sourceMessageID: store.WhatsAppSourceMessageID(contactJID, waMsgHello),
-			wantConvJID: contactJID, wantConvType: "direct_chat",
+			wantConvJID:     contactJID, wantConvType: "direct_chat",
 			wantBody: "hello there", wantAttachHash: f.imageHash, wantReactions: 1,
 		},
 		{
-			name: "wa-reply copied (outbound, no attachment)",
+			name:            "wa-reply copied (outbound, no attachment)",
 			sourceMessageID: store.WhatsAppSourceMessageID(contactJID, waMsgReply),
-			wantConvJID: contactJID, wantConvType: "direct_chat",
+			wantConvJID:     contactJID, wantConvType: "direct_chat",
 			wantBody: "hi back",
 		},
 		{
-			name: "wa-group copied with marker attachment, correct conversation type/title",
+			name:            "wa-group copied with marker attachment, correct conversation type/title",
 			sourceMessageID: store.WhatsAppSourceMessageID(groupJID, waMsgGroup),
-			wantConvJID: groupJID, wantConvType: "group_chat",
+			wantConvJID:     groupJID, wantConvType: "group_chat",
 			wantBody: "group message", wantAttachMarker: true,
 		},
 	}
