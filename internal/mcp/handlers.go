@@ -180,6 +180,7 @@ type handlers struct {
 	whatsAppLoginURL string
 	googleDocsFactory GoogleDocsClientFactory
 	ocr               OCRClient
+	whatsAppArchive WhatsAppArchiveReader
 
 	// Optional vector-search wiring. When hybridEngine is nil, the
 	// search_message_bodies handler rejects mode=vector and mode=hybrid with

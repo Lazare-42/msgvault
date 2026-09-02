@@ -174,6 +174,18 @@ func (c *operationCatalogCache) get(capabilities catalogCapabilities) []toolDefi
 	if cached, ok := actual.([]toolDefinition); ok {
 		return cached
 	}
+	if opts.WhatsAppFactory != nil {
+		definitions = append(definitions, whatsAppOperationDefinitions...)
+	}
+	if opts.WhatsAppArchive != nil {
+		definitions = append(definitions, whatsAppArchiveOperationDefinitions...)
+	}
+	if opts.GoogleDocsFactory != nil {
+		definitions = append(definitions, googleDocsOperationDefinitions...)
+	}
+	sort.Slice(definitions, func(i, j int) bool {
+		return definitions[i].name < definitions[j].name
+	})
 	return definitions
 }
 

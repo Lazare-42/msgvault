@@ -26,6 +26,7 @@ import (
 	"go.kenn.io/msgvault/internal/googledocs"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/savedview"
+	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/hybrid"
 	"go.kenn.io/msgvault/internal/vector/visual"
@@ -42,6 +43,13 @@ type GmailClientFactory func(ctx context.Context, email string) (gmail.API, erro
 
 // WhatsAppClientFactory creates a live WhatsApp client for an archive account.
 type WhatsAppClientFactory func(ctx context.Context, account string) (whatsapplive.Client, error)
+
+// WhatsAppArchiveReader reads archived WhatsApp chats and messages for the
+// WhatsApp-scoped read tools. *store.Store satisfies it.
+type WhatsAppArchiveReader interface {
+	ListWhatsAppChats(ctx context.Context, limit int) ([]store.WhatsAppChatSummary, error)
+	ListWhatsAppMessagesAfter(ctx context.Context, chatJID string, afterID int64, limit int) ([]store.WhatsAppMessageRecord, error)
+}
 
 // GoogleDocsClientFactory creates an authenticated Google Docs client for
 // configured Drive folder sources.
@@ -133,6 +141,8 @@ const (
 	ToolAppendGoogleDocText    = "append_google_doc_text"
 	ToolReplaceGoogleDocText   = "replace_google_doc_text"
 	ToolWhatsAppRequestHistorySync = "whatsapp_request_history_sync"
+	ToolListWhatsAppChats = "list_whatsapp_chats"
+	ToolListWhatsAppMessages = "list_whatsapp_messages"
 	ToolSearchAttachmentText       = "search_attachment_text"
 	ToolGetAttachmentText          = "get_attachment_text"
 	ToolRequestAttachmentText      = "request_attachment_text"
@@ -247,6 +257,14 @@ type ServeOptions struct {
 	WhatsAppFactory WhatsAppClientFactory
 	// WhatsAppLoginURL is an optional browser URL for QR login/resync.
 	WhatsAppLoginURL string
+	// WhatsAppArchive is optional. When non-nil, the WhatsApp-scoped archive
+	// read tools list_whatsapp_chats and list_whatsapp_messages are exposed.
+	WhatsAppArchive WhatsAppArchiveReader
+	// ToolAllowlist restricts the server to the named tools when non-empty.
+	// Tools outside the list are never registered, whatever the other
+	// options enable, and attachment resources are not registered either, so
+	// a scoped server exposes nothing beyond the listed tools.
+	ToolAllowlist []string
 	// GoogleDocsFactory is optional. When non-nil, Google Docs tools are exposed.
 	GoogleDocsFactory GoogleDocsClientFactory
 }
@@ -457,9 +475,15 @@ func newMCPServerWithPolicy(
 	whatsAppFactory: opts.WhatsAppFactory,
 	googleDocsFactory: opts.GoogleDocsFactory,
 	whatsAppLoginURL: strings.TrimSpace(opts.WhatsAppLoginURL),
+	whatsAppArchive: opts.WhatsAppArchive,
+	ocr: opts.OCR,
 	}
 
+	allowed := toolAllowlistSet(opts.ToolAllowlist)
 	for _, definition := range operationCatalog(opts, h) {
+		if allowed != nil && !allowed[definition.name] {
+			continue
+		}
 		if definition.security == toolSecurityWrite && !allowWrites {
 			continue
 		}
@@ -535,6 +559,43 @@ func newMCPServerWithPolicy(
 	return s
 }
 
+// WhatsAppToolNames returns every WhatsApp tool name: the live session tools
+// plus the WhatsApp-scoped archive read tools. Use it as a ToolAllowlist to
+// serve a WhatsApp-only MCP endpoint.
+func WhatsAppToolNames() []string {
+	return []string{
+		ToolWhatsAppStatus,
+		ToolWhatsAppStartLogin,
+		ToolWhatsAppLoginStatus,
+		ToolWhatsAppLogout,
+		ToolSendWhatsAppMessage,
+		ToolSendWhatsAppReaction,
+		ToolWhatsAppRequestHistorySync,
+		ToolListWhatsAppChats,
+		ToolListWhatsAppMessages,
+	}
+}
+
+// toolAllowlistSet returns nil for an empty allowlist, meaning every tool the
+// options enable is registered.
+func toolAllowlistSet(names []string) map[string]bool {
+	if len(names) == 0 {
+		return nil
+	}
+	set := make(map[string]bool, len(names))
+	for _, name := range names {
+		set[strings.TrimSpace(name)] = true
+	}
+	return set
+}
+
+// Serve creates an MCP server with email archive tools and serves over stdio.
+// It blocks until stdin is closed or the context is cancelled.
+// dataDir is the base data directory (e.g., ~/.msgvault) used for deletions.
+//
+// Serve is a thin wrapper around ServeWithOptions that leaves the vector
+// fields empty; callers that want vector/hybrid search should use
+// ServeWithOptions directly.
 // Serve creates an MCP server with archive tools and serves over stdio.
 func Serve(ctx context.Context, engine query.Engine, attachmentsDir, dataDir string, gmailFactory ...GmailClientFactory) error {
 	return ServeWithOptions(ctx, ServeOptions{
