@@ -128,15 +128,6 @@ var whatsappLiveMCPCmd = &cobra.Command{
 			logger.Warn("WhatsApp is not paired; serving QR pairing page")
 		}
 
-		engine := query.NewEngine(st.DB(), st.IsPostgreSQL())
-		opts := mcpserver.ServeOptions{
-			Engine:         engine,
-			AttachmentsDir: cfg.AttachmentsDir(),
-			DataDir:        cfg.Data.DataDir,
-			WhatsAppFactory: func(ctx context.Context, account string) (whatsapplive.Client, error) {
-				return service, nil
-			},
-		}
 		pairingToken := whatsappLivePairingToken
 		if pairingToken == "" {
 			pairingToken = os.Getenv("MSGVAULT_WHATSAPP_PAIRING_TOKEN")
@@ -157,10 +148,36 @@ var whatsappLiveMCPCmd = &cobra.Command{
 		if err != nil {
 			return usageErr(cmd, err)
 		}
-		opts.WhatsAppLoginURL = whatsappLoginPageURL(publicBaseURL, basePath)
+		opts := whatsAppLiveMCPOptions(
+			query.NewEngine(st.DB(), st.IsPostgreSQL()), st, service,
+			cfg.AttachmentsDir(), cfg.Data.DataDir,
+			whatsappLoginPageURL(publicBaseURL, basePath),
+		)
 		apiToken := strings.TrimSpace(os.Getenv("MSGVAULT_WHATSAPP_API_TOKEN"))
 		return serveWhatsAppLiveHTTP(cmd.Context(), addr, st, service, transport, opts, pairingToken, basePath, apiToken)
 	},
+}
+
+// whatsAppLiveMCPOptions builds the MCP catalog served by whatsapp-live-mcp.
+// The allowlist keeps the endpoint WhatsApp-only: the live session tools plus
+// the WhatsApp-scoped archive readers, never the general archive catalog.
+func whatsAppLiveMCPOptions(
+	engine query.Engine,
+	archive *store.Store,
+	client whatsapplive.Client,
+	attachmentsDir, dataDir, loginURL string,
+) mcpserver.ServeOptions {
+	return mcpserver.ServeOptions{
+		Engine:         engine,
+		AttachmentsDir: attachmentsDir,
+		DataDir:        dataDir,
+		WhatsAppFactory: func(context.Context, string) (whatsapplive.Client, error) {
+			return client, nil
+		},
+		WhatsAppArchive:  archive,
+		WhatsAppLoginURL: loginURL,
+		ToolAllowlist:    mcpserver.WhatsAppToolNames(),
+	}
 }
 
 func openWhatsAppTransport(ctx context.Context) (*whatsapplive.WhatsmeowTransport, error) {

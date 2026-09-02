@@ -123,12 +123,12 @@ func runMergeWhatsAppHistory(cmd *cobra.Command, _ []string) error {
 	defer stop()
 
 	opts := historymerge.Options{
-		From:                fromStore,
-		Into:                intoStore,
-		FromAttachmentsDir:  fromCfg.AttachmentsDir(),
-		IntoAttachmentsDir:  intoCfg.AttachmentsDir(),
-		Apply:               mergeWhatsAppHistoryApply,
-		MaxAttachmentBytes:  mergeWhatsAppHistoryMaxAttachmentBytes,
+		From:               fromStore,
+		Into:               intoStore,
+		FromAttachmentsDir: fromCfg.AttachmentsDir(),
+		IntoAttachmentsDir: intoCfg.AttachmentsDir(),
+		Apply:              mergeWhatsAppHistoryApply,
+		MaxAttachmentBytes: mergeWhatsAppHistoryMaxAttachmentBytes,
 	}
 
 	out := cmd.OutOrStdout()

@@ -147,6 +147,9 @@ func operationCatalog(opts ServeOptions, _ *handlers) []toolDefinition {
 	if opts.WhatsAppFactory != nil {
 		definitions = append(definitions, whatsAppOperationDefinitions...)
 	}
+	if opts.WhatsAppArchive != nil {
+		definitions = append(definitions, whatsAppArchiveOperationDefinitions...)
+	}
 	if opts.GoogleDocsFactory != nil {
 		definitions = append(definitions, googleDocsOperationDefinitions...)
 	}
@@ -183,6 +186,10 @@ var (
 		legacyDefinition(sendWhatsAppMessageTool(), toolSecurityWrite, (*handlers).sendWhatsAppMessage),
 		legacyDefinition(sendWhatsAppReactionTool(), toolSecurityWrite, (*handlers).sendWhatsAppReaction),
 		legacyDefinition(whatsAppRequestHistorySyncTool(), toolSecurityWrite, (*handlers).whatsAppRequestHistorySync),
+	}
+	whatsAppArchiveOperationDefinitions = []toolDefinition{
+		listWhatsAppChatsDefinition(),
+		listWhatsAppMessagesDefinition(),
 	}
 	googleDocsOperationDefinitions = []toolDefinition{
 		legacyDefinition(listGoogleDocsTool(), toolSecurityRead, (*handlers).listGoogleDocs),
