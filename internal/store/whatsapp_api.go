@@ -1,10 +1,18 @@
 package store
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+
+	"go.kenn.io/msgvault/internal/sqliteutil"
 )
 
 // WhatsAppChatSummary is one WhatsApp conversation for the local live API.
@@ -41,19 +49,45 @@ const MaxWhatsAppChatPage = 1000
 // MaxWhatsAppMessagePage caps one ListWhatsAppMessagesAfter page.
 const MaxWhatsAppMessagePage = 500
 
+// ErrWhatsAppChatCursorInvalid reports a ListWhatsAppChats cursor that is
+// malformed or was issued for a different account or query filter.
+var ErrWhatsAppChatCursorInvalid = errors.New("invalid whatsapp chat cursor")
+
+// WhatsAppChatCursor is a keyset position in the most-recent-activity-first
+// chat ordering. Paging by position rather than by offset keeps a page from
+// repeating or skipping chats when activity reorders the list between pages.
+type WhatsAppChatCursor struct {
+	// ActivityEpoch is the unix-second last-activity key of the chat the
+	// page ended on; it is meaningful only when HasActivity is set. Chats
+	// without any activity sort after every chat with activity.
+	ActivityEpoch  int64
+	HasActivity    bool
+	ConversationID int64
+}
+
 // WhatsAppChatFilter narrows ListWhatsAppChats.
 type WhatsAppChatFilter struct {
 	// Account is an exact WhatsApp source identifier; empty matches every
 	// archived WhatsApp account.
 	Account string
-	// Query is a case-insensitive substring matched against the chat title
-	// and chat JID; empty matches every chat.
+	// Query is a case-insensitive (Unicode-aware) substring matched against
+	// the chat title and chat JID; empty matches every chat.
 	Query string
 	// Limit caps the page at 1..MaxWhatsAppChatPage rows; other values read
 	// as MaxWhatsAppChatPage.
 	Limit int
-	// Offset skips rows of the most-recent-activity-first ordering.
-	Offset int
+	// After resumes after the chat a previous page ended on. Nil starts at
+	// the most recently active chat.
+	After *WhatsAppChatCursor
+}
+
+// WhatsAppChatPage is one ListWhatsAppChats result.
+type WhatsAppChatPage struct {
+	Chats []WhatsAppChatSummary
+	// HasMore reports that older chats follow; Next then resumes after the
+	// last chat of this page.
+	HasMore bool
+	Next    WhatsAppChatCursor
 }
 
 // WhatsAppMessageFilter narrows ListWhatsAppMessagesAfter.
@@ -70,17 +104,101 @@ type WhatsAppMessageFilter struct {
 	Limit int
 }
 
-// ListWhatsAppChats returns WhatsApp conversations ordered by most recent
-// activity.
-func (s *Store) ListWhatsAppChats(ctx context.Context, filter WhatsAppChatFilter) ([]WhatsAppChatSummary, error) {
+const whatsAppChatCursorVersion = 1
+
+// whatsAppChatCursorWire is the opaque cursor's JSON shape.
+type whatsAppChatCursorWire struct {
+	Version int    `json:"v"`
+	Epoch   *int64 `json:"at,omitempty"`
+	ID      int64  `json:"id"`
+	Filter  string `json:"f"`
+}
+
+func whatsAppChatFilterKey(filter WhatsAppChatFilter) string {
+	digest := sha256.Sum256([]byte(filter.Account + "\x00" + whatsAppChatQueryTerm(filter)))
+	return hex.EncodeToString(digest[:8])
+}
+
+func whatsAppChatQueryTerm(filter WhatsAppChatFilter) string {
+	return strings.ToLower(strings.TrimSpace(filter.Query))
+}
+
+// EncodeWhatsAppChatCursor renders a cursor as an opaque token bound to the
+// filter's account and query, so a token cannot silently resume a different
+// listing.
+func EncodeWhatsAppChatCursor(filter WhatsAppChatFilter, cursor WhatsAppChatCursor) string {
+	wire := whatsAppChatCursorWire{
+		Version: whatsAppChatCursorVersion,
+		ID:      cursor.ConversationID,
+		Filter:  whatsAppChatFilterKey(filter),
+	}
+	if cursor.HasActivity {
+		epoch := cursor.ActivityEpoch
+		wire.Epoch = &epoch
+	}
+	encoded, err := json.Marshal(wire)
+	if err != nil {
+		panic(err) // fixed shape of scalars cannot fail to marshal
+	}
+	return base64.RawURLEncoding.EncodeToString(encoded)
+}
+
+// DecodeWhatsAppChatCursor parses a token produced by EncodeWhatsAppChatCursor
+// for the same account and query filter.
+func DecodeWhatsAppChatCursor(filter WhatsAppChatFilter, value string) (WhatsAppChatCursor, error) {
+	decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(value))
+	if err != nil || len(decoded) > 256 {
+		return WhatsAppChatCursor{}, ErrWhatsAppChatCursorInvalid
+	}
+	var wire whatsAppChatCursorWire
+	decoder := json.NewDecoder(bytes.NewReader(decoded))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&wire); err != nil ||
+		wire.Version != whatsAppChatCursorVersion || wire.ID <= 0 ||
+		wire.Filter != whatsAppChatFilterKey(filter) {
+		return WhatsAppChatCursor{}, ErrWhatsAppChatCursorInvalid
+	}
+	cursor := WhatsAppChatCursor{ConversationID: wire.ID}
+	if wire.Epoch != nil {
+		cursor.HasActivity = true
+		cursor.ActivityEpoch = *wire.Epoch
+	}
+	return cursor, nil
+}
+
+// unicodeLowerExpr lowercases a text expression with full Unicode folding on
+// both backends. SQLite's built-in LOWER folds ASCII only.
+func (s *Store) unicodeLowerExpr(expr string) string {
+	if s.IsPostgreSQL() {
+		return "LOWER(" + expr + ")"
+	}
+	return sqliteutil.UnicodeLowerFunction + "(" + expr + ")"
+}
+
+// whatsAppActivityEpochExpr converts a timestamp column to integer unix
+// seconds on both backends. SQLite stores timestamps as text that may carry
+// mixed UTC offsets, so the ordering and the keyset predicate compare
+// integers rather than text.
+func (s *Store) whatsAppActivityEpochExpr(column string) string {
+	if s.IsPostgreSQL() {
+		return "FLOOR(EXTRACT(EPOCH FROM " + column + "))::BIGINT"
+	}
+	return "CAST(strftime('%s', " + column + ") AS INTEGER)"
+}
+
+// ListWhatsAppChats returns one page of WhatsApp conversations ordered by
+// most recent activity, with chats that have no activity last.
+func (s *Store) ListWhatsAppChats(ctx context.Context, filter WhatsAppChatFilter) (WhatsAppChatPage, error) {
 	limit := filter.Limit
 	if limit <= 0 || limit > MaxWhatsAppChatPage {
 		limit = MaxWhatsAppChatPage
 	}
+	activity := s.whatsAppActivityEpochExpr("c.last_message_at")
 	query := `
 		SELECT c.id, src.identifier, c.source_conversation_id,
 		       c.title, c.conversation_type, c.message_count,
-		       c.last_message_at, c.last_message_preview
+		       c.last_message_at, c.last_message_preview,
+		       ` + activity + `
 		FROM conversations c
 		JOIN sources src ON src.id = c.source_id
 		WHERE src.source_type = ?
@@ -90,33 +208,62 @@ func (s *Store) ListWhatsAppChats(ctx context.Context, filter WhatsAppChatFilter
 		query += ` AND src.identifier = ?`
 		args = append(args, filter.Account)
 	}
-	if term := strings.TrimSpace(filter.Query); term != "" {
-		pattern := "%" + escapeLike(strings.ToLower(term)) + "%"
-		query += ` AND (LOWER(COALESCE(c.title, '')) LIKE ? ESCAPE '\' OR LOWER(c.source_conversation_id) LIKE ? ESCAPE '\')`
+	if term := whatsAppChatQueryTerm(filter); term != "" {
+		pattern := "%" + escapeLike(term) + "%"
+		query += ` AND (` + s.unicodeLowerExpr("COALESCE(c.title, '')") + ` LIKE ? ESCAPE '\'` +
+			` OR ` + s.unicodeLowerExpr("c.source_conversation_id") + ` LIKE ? ESCAPE '\')`
 		args = append(args, pattern, pattern)
 	}
-	query += ` ORDER BY c.last_message_at DESC, c.id DESC LIMIT ? OFFSET ?`
-	args = append(args, limit, max(filter.Offset, 0))
+	if after := filter.After; after != nil {
+		if after.HasActivity {
+			query += ` AND (` + activity + ` IS NULL OR ` + activity + ` < ?` +
+				` OR (` + activity + ` = ? AND c.id < ?))`
+			args = append(args, after.ActivityEpoch, after.ActivityEpoch, after.ConversationID)
+		} else {
+			query += ` AND ` + activity + ` IS NULL AND c.id < ?`
+			args = append(args, after.ConversationID)
+		}
+	}
+	query += ` ORDER BY (` + activity + ` IS NULL), ` + activity + ` DESC, c.id DESC LIMIT ?`
+	// One extra row decides HasMore without a count query.
+	args = append(args, limit+1)
 
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("list whatsapp chats: %w", err)
+		return WhatsAppChatPage{}, fmt.Errorf("list whatsapp chats: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
 	var chats []WhatsAppChatSummary
+	var epochs []sql.NullInt64
 	for rows.Next() {
 		var c WhatsAppChatSummary
+		var epoch sql.NullInt64
 		if err := rows.Scan(
 			&c.ConversationID, &c.Account, &c.ChatJID,
 			&c.Title, &c.ConversationType, &c.MessageCount,
-			&c.LastMessageAt, &c.LastMessagePreview,
+			&c.LastMessageAt, &c.LastMessagePreview, &epoch,
 		); err != nil {
-			return nil, fmt.Errorf("scan whatsapp chat: %w", err)
+			return WhatsAppChatPage{}, fmt.Errorf("scan whatsapp chat: %w", err)
 		}
 		chats = append(chats, c)
+		epochs = append(epochs, epoch)
 	}
-	return chats, rows.Err()
+	if err := rows.Err(); err != nil {
+		return WhatsAppChatPage{}, fmt.Errorf("list whatsapp chats: %w", err)
+	}
+	page := WhatsAppChatPage{Chats: chats}
+	if len(chats) > limit {
+		last := limit - 1
+		page.Chats = chats[:limit]
+		page.HasMore = true
+		page.Next = WhatsAppChatCursor{
+			ActivityEpoch:  epochs[last].Int64,
+			HasActivity:    epochs[last].Valid,
+			ConversationID: chats[last].ConversationID,
+		}
+	}
+	return page, nil
 }
 
 // ListWhatsAppMessagesAfter returns archived WhatsApp messages for one chat

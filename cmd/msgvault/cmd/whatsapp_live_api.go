@@ -84,19 +84,26 @@ func (h *whatsappLiveAPIHandler) listChats(w http.ResponseWriter, r *http.Reques
 	}
 	q := r.URL.Query()
 	limit, _ := strconv.Atoi(q.Get("limit"))
-	offset, _ := strconv.Atoi(q.Get("offset"))
-	chats, err := h.store.ListWhatsAppChats(r.Context(), store.WhatsAppChatFilter{
+	filter := store.WhatsAppChatFilter{
 		Account: strings.TrimSpace(q.Get("account")),
 		Query:   q.Get("q"),
 		Limit:   limit,
-		Offset:  offset,
-	})
+	}
+	if token := strings.TrimSpace(q.Get("cursor")); token != "" {
+		cursor, err := store.DecodeWhatsAppChatCursor(filter, token)
+		if err != nil {
+			http.Error(w, "invalid cursor for this account and q", http.StatusBadRequest)
+			return
+		}
+		filter.After = &cursor
+	}
+	page, err := h.store.ListWhatsAppChats(r.Context(), filter)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	out := make([]whatsappAPIChat, 0, len(chats))
-	for _, c := range chats {
+	out := make([]whatsappAPIChat, 0, len(page.Chats))
+	for _, c := range page.Chats {
 		item := whatsappAPIChat{
 			ConversationID:     c.ConversationID,
 			Account:            c.Account,
@@ -112,7 +119,11 @@ func (h *whatsappLiveAPIHandler) listChats(w http.ResponseWriter, r *http.Reques
 		}
 		out = append(out, item)
 	}
-	writeAPIJSON(w, map[string]any{"chats": out})
+	response := map[string]any{"chats": out, "has_more": page.HasMore}
+	if page.HasMore {
+		response["next_cursor"] = store.EncodeWhatsAppChatCursor(filter, page.Next)
+	}
+	writeAPIJSON(w, response)
 }
 
 func (h *whatsappLiveAPIHandler) listMessages(w http.ResponseWriter, r *http.Request) {

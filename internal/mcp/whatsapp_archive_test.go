@@ -122,59 +122,94 @@ func TestWhatsAppArchiveReadToolsScopeToWhatsApp(t *testing.T) {
 	// The fixture's Gmail source must never leak into the WhatsApp-scoped tools.
 	f.CreateMessage("email-1")
 
-	h := &handlers{engine: &querytest.MockEngine{}, whatsAppArchive: st}
+	// Chats with no archived messages have no activity and must sort last,
+	// newest conversation first. The accented title exercises Unicode-aware
+	// matching, which SQLite's built-in LOWER does not provide.
+	idleJID := "15550000002@s.whatsapp.net"
+	_, err = st.EnsureConversationWithType(source.ID, idleJID, "direct_chat", "École Parents")
+	require.NoError(t, err)
+	idle2JID := "15550000003@s.whatsapp.net"
+	_, err = st.EnsureConversationWithType(source.ID, idle2JID, "direct_chat", "Sans activité")
+	require.NoError(t, err)
 
-	chats := runTool[listWhatsAppChatsResponse](t, ToolListWhatsAppChats, h.listWhatsAppChats, map[string]any{})
-	require.Len(t, chats.Chats, 3)
+	h := &handlers{engine: &querytest.MockEngine{}, whatsAppArchive: st}
+	listChats := func(args map[string]any) listWhatsAppChatsResponse {
+		t.Helper()
+		return runTool[listWhatsAppChatsResponse](t, ToolListWhatsAppChats, h.listWhatsAppChats, args)
+	}
+	chatJIDs := func(page listWhatsAppChatsResponse) []string {
+		jids := make([]string, 0, len(page.Chats))
+		for _, chat := range page.Chats {
+			jids = append(jids, chat.Account+"/"+chat.ChatJID)
+		}
+		return jids
+	}
+	fullOrder := []string{
+		work + "/" + busyJID, personal + "/" + busyJID, personal + "/" + quietJID,
+		personal + "/" + idle2JID, personal + "/" + idleJID,
+	}
+
+	chats := listChats(map[string]any{})
+	assert.Equal(t, fullOrder, chatJIDs(chats), "most recent activity first, no activity last")
 	assert.False(t, chats.HasMore)
-	assert.Equal(t, 3, chats.NextOffset)
-	assert.Equal(t, work, chats.Chats[0].Account, "most recent activity first")
-	assert.Equal(t, busyJID, chats.Chats[1].ChatJID)
-	assert.Equal(t, personal, chats.Chats[1].Account)
+	assert.Empty(t, chats.NextCursor)
 	assert.Equal(t, "Family", chats.Chats[1].Title)
 	assert.Equal(t, "group_chat", chats.Chats[1].ConversationType)
 	assert.Equal(t, int64(2), chats.Chats[1].MessageCount)
 	require.NotNil(t, chats.Chats[1].LastMessageAt)
 	assert.True(t, base.Add(2*time.Hour).Equal(*chats.Chats[1].LastMessageAt))
-	assert.Equal(t, quietJID, chats.Chats[2].ChatJID)
+	assert.Nil(t, chats.Chats[4].LastMessageAt)
 
-	scoped := runTool[listWhatsAppChatsResponse](t, ToolListWhatsAppChats, h.listWhatsAppChats,
-		map[string]any{"account": personal})
-	require.Len(t, scoped.Chats, 2)
-	for _, chat := range scoped.Chats {
-		assert.Equal(t, personal, chat.Account)
+	scoped := listChats(map[string]any{"account": personal})
+	assert.Equal(t, fullOrder[1:], chatJIDs(scoped))
+
+	byUnicodeTitle := listChats(map[string]any{"query": "ÉCOLE"})
+	assert.Equal(t, []string{personal + "/" + idleJID}, chatJIDs(byUnicodeTitle), "Unicode case folding on title")
+	byTitle := listChats(map[string]any{"query": "fam", "account": personal})
+	assert.Equal(t, []string{personal + "/" + busyJID}, chatJIDs(byTitle))
+	byJID := listChats(map[string]any{"query": "15550000001"})
+	assert.Equal(t, []string{personal + "/" + quietJID}, chatJIDs(byJID))
+	assert.Empty(t, listChats(map[string]any{"query": "%_nothing"}).Chats, "LIKE metacharacters are matched literally")
+
+	// Walk the whole list one chat per page, through the no-activity tail.
+	var walked []string
+	walkArgs := map[string]any{"limit": float64(1)}
+	for pages := 0; pages < 10; pages++ {
+		page := listChats(walkArgs)
+		walked = append(walked, chatJIDs(page)...)
+		if !page.HasMore {
+			assert.Empty(t, page.NextCursor)
+			break
+		}
+		require.NotEmpty(t, page.NextCursor)
+		walkArgs = map[string]any{"limit": float64(1), "cursor": page.NextCursor}
 	}
+	assert.Equal(t, fullOrder, walked, "keyset paging visits every chat exactly once")
 
-	byTitle := runTool[listWhatsAppChatsResponse](t, ToolListWhatsAppChats, h.listWhatsAppChats,
-		map[string]any{"query": "FAM", "account": personal})
-	require.Len(t, byTitle.Chats, 1)
-	assert.Equal(t, busyJID, byTitle.Chats[0].ChatJID)
-	byJID := runTool[listWhatsAppChatsResponse](t, ToolListWhatsAppChats, h.listWhatsAppChats,
-		map[string]any{"query": "15550000001"})
-	require.Len(t, byJID.Chats, 1)
-	assert.Equal(t, quietJID, byJID.Chats[0].ChatJID)
-	noMatch := runTool[listWhatsAppChatsResponse](t, ToolListWhatsAppChats, h.listWhatsAppChats,
-		map[string]any{"query": "%_nothing"})
-	assert.Empty(t, noMatch.Chats, "LIKE metacharacters are matched literally")
+	pageOne := listChats(map[string]any{"limit": float64(2)})
+	assert.Equal(t, fullOrder[:2], chatJIDs(pageOne))
+	require.True(t, pageOne.HasMore)
+	pageTwo := listChats(map[string]any{"limit": float64(2), "cursor": pageOne.NextCursor})
+	assert.Equal(t, fullOrder[2:4], chatJIDs(pageTwo))
+	assert.True(t, pageTwo.HasMore)
 
-	pageOne := runTool[listWhatsAppChatsResponse](t, ToolListWhatsAppChats, h.listWhatsAppChats,
-		map[string]any{"limit": float64(2)})
-	require.Len(t, pageOne.Chats, 2)
-	assert.True(t, pageOne.HasMore)
-	assert.Equal(t, 2, pageOne.NextOffset)
-	pageTwo := runTool[listWhatsAppChatsResponse](t, ToolListWhatsAppChats, h.listWhatsAppChats,
-		map[string]any{"limit": float64(2), "offset": float64(pageOne.NextOffset)})
-	require.Len(t, pageTwo.Chats, 1)
-	assert.Equal(t, quietJID, pageTwo.Chats[0].ChatJID)
-	assert.False(t, pageTwo.HasMore)
-	assert.Equal(t, 3, pageTwo.NextOffset)
-	pastEnd := runTool[listWhatsAppChatsResponse](t, ToolListWhatsAppChats, h.listWhatsAppChats,
-		map[string]any{"offset": float64(pageTwo.NextOffset)})
-	assert.Empty(t, pastEnd.Chats)
-	assert.False(t, pastEnd.HasMore)
-	assert.Equal(t, 3, pastEnd.NextOffset)
-	badOffset := runToolExpectError(t, ToolListWhatsAppChats, h.listWhatsAppChats, map[string]any{"offset": float64(-1)})
-	assert.Contains(t, resultText(t, badOffset), "offset must be a non-negative integer")
+	foreignCursor := runToolExpectError(t, ToolListWhatsAppChats, h.listWhatsAppChats,
+		map[string]any{"cursor": pageOne.NextCursor, "query": "fam"})
+	assert.Contains(t, resultText(t, foreignCursor), "invalid_cursor")
+	garbageCursor := runToolExpectError(t, ToolListWhatsAppChats, h.listWhatsAppChats,
+		map[string]any{"cursor": "not-a-cursor"})
+	assert.Contains(t, resultText(t, garbageCursor), "invalid_cursor")
+
+	// New activity reorders the list between pages: the quiet chat jumps to
+	// the top. A page-one cursor must still neither repeat nor skip the chats
+	// that did not move, unlike an offset which would repeat the second chat.
+	lateID := insert(source.ID, quietConv, quietJID, "Q2", base.Add(5*time.Hour), false, "late")
+	require.NoError(t, st.RecomputeConversationStats(source.ID))
+	pageTwoAfterMove := listChats(map[string]any{"limit": float64(2), "cursor": pageOne.NextCursor})
+	assert.Equal(t, fullOrder[3:], chatJIDs(pageTwoAfterMove))
+	assert.False(t, pageTwoAfterMove.HasMore)
+	assert.Equal(t, []string{personal + "/" + quietJID, fullOrder[0], fullOrder[1]},
+		chatJIDs(listChats(map[string]any{"limit": float64(3)})))
 
 	page := runTool[listWhatsAppMessagesResponse](t, ToolListWhatsAppMessages, h.listWhatsAppMessages,
 		map[string]any{"chat_jid": busyJID, "limit": float64(1)})
@@ -220,8 +255,10 @@ func TestWhatsAppArchiveReadToolsScopeToWhatsApp(t *testing.T) {
 
 	quiet := runTool[listWhatsAppMessagesResponse](t, ToolListWhatsAppMessages, h.listWhatsAppMessages,
 		map[string]any{"chat_jid": quietJID})
-	require.Len(t, quiet.Messages, 1)
+	require.Len(t, quiet.Messages, 2)
 	assert.Equal(t, quietID, quiet.Messages[0].ID)
+	assert.Equal(t, lateID, quiet.Messages[1].ID)
+	assert.Equal(t, lateID, quiet.NextAfterID)
 
 	missing := runToolExpectError(t, ToolListWhatsAppMessages, h.listWhatsAppMessages, map[string]any{})
 	assert.Contains(t, resultText(t, missing), "chat_jid is required")

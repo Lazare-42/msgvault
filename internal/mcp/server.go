@@ -41,7 +41,7 @@ type WhatsAppClientFactory func(ctx context.Context, account string) (whatsappli
 // WhatsAppArchiveReader reads archived WhatsApp chats and messages for the
 // WhatsApp-scoped read tools. *store.Store satisfies it.
 type WhatsAppArchiveReader interface {
-	ListWhatsAppChats(ctx context.Context, filter store.WhatsAppChatFilter) ([]store.WhatsAppChatSummary, error)
+	ListWhatsAppChats(ctx context.Context, filter store.WhatsAppChatFilter) (store.WhatsAppChatPage, error)
 	ListWhatsAppMessagesAfter(ctx context.Context, filter store.WhatsAppMessageFilter) ([]store.WhatsAppMessageRecord, error)
 }
 
