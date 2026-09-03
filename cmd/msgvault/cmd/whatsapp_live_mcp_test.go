@@ -72,3 +72,36 @@ func TestWhatsAppLiveMCPServesOnlyWhatsAppTools(t *testing.T) {
 	sort.Strings(want)
 	assert.Equal(t, want, got)
 }
+
+func TestExternalWhatsAppCatalogExcludesSessionAdministration(t *testing.T) {
+	names := mcpserver.ExternalWhatsAppToolNames()
+	assert.ElementsMatch(t, []string{
+		mcpserver.ToolWhatsAppStatus,
+		mcpserver.ToolSendWhatsAppMessage,
+		mcpserver.ToolSendWhatsAppReaction,
+		mcpserver.ToolListWhatsAppChats,
+		mcpserver.ToolListWhatsAppMessages,
+	}, names)
+	assert.NotContains(t, names, mcpserver.ToolWhatsAppStartLogin)
+	assert.NotContains(t, names, mcpserver.ToolWhatsAppLoginStatus)
+	assert.NotContains(t, names, mcpserver.ToolWhatsAppLogout)
+	assert.NotContains(t, names, mcpserver.ToolWhatsAppRequestHistorySync)
+}
+
+func TestWhatsAppRemoteOAuthFromEnv(t *testing.T) {
+	t.Setenv("MSGVAULT_WHATSAPP_REMOTE_OAUTH_ISSUER", "")
+	server, err := whatsAppRemoteOAuthFromEnv()
+	require.NoError(t, err)
+	assert.Nil(t, server)
+
+	t.Setenv("MSGVAULT_WHATSAPP_REMOTE_OAUTH_ISSUER", "https://whatsapp.example.test")
+	t.Setenv("MSGVAULT_WHATSAPP_REMOTE_OAUTH_CLIENT_ID", "claude-whatsapp")
+	t.Setenv("MSGVAULT_WHATSAPP_REMOTE_OAUTH_CLIENT_SECRET", "0123456789abcdef0123456789abcdef")
+	t.Setenv("MSGVAULT_WHATSAPP_REMOTE_OAUTH_LOGIN_USER", "operator@example.test")
+	t.Setenv("MSGVAULT_WHATSAPP_REMOTE_OAUTH_LOGIN_PASSWORD", "correct horse battery staple")
+	t.Setenv("MSGVAULT_WHATSAPP_REMOTE_OAUTH_STATE_FILE", t.TempDir()+"/tokens.json")
+	t.Setenv("MSGVAULT_WHATSAPP_REMOTE_OAUTH_REDIRECT_URIS", "https://claude.ai/api/mcp/auth_callback")
+	server, err = whatsAppRemoteOAuthFromEnv()
+	require.NoError(t, err)
+	assert.NotNil(t, server)
+}
