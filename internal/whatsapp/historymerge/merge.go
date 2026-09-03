@@ -136,7 +136,7 @@ type Report struct {
 
 	Conversations int
 
-	MessagesScanned        int
+	MessagesScanned         int
 	MessagesAlreadyInTarget int
 	MessagesCopied          int
 	MessagesFailed          int
@@ -148,11 +148,11 @@ type Report struct {
 	AttachmentMarkers        int
 	AttachmentsFailed        int
 
-	ReactionsScanned    int
-	ReactionsCopied     int
-	ReactionsWouldCopy  int
-	ReactionsSkipped    int
-	ReactionsFailed     int
+	ReactionsScanned   int
+	ReactionsCopied    int
+	ReactionsWouldCopy int
+	ReactionsSkipped   int
+	ReactionsFailed    int
 
 	Errors []string
 }

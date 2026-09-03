@@ -150,6 +150,7 @@ type handlers struct {
 	gmailFactory       GmailClientFactory
 	whatsAppFactory    WhatsAppClientFactory
 	whatsAppLoginURL   string
+	whatsAppArchive    WhatsAppArchiveReader
 	googleDocsFactory  GoogleDocsClientFactory
 	ocr                OCRClient
 	documentSearcher   DocumentSearcher
