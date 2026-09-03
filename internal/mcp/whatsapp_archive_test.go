@@ -74,7 +74,11 @@ func TestEmptyToolAllowlistKeepsFullCatalog(t *testing.T) {
 func TestWhatsAppArchiveReadToolsScopeToWhatsApp(t *testing.T) {
 	f := storetest.New(t)
 	st := f.Store
-	source, err := st.GetOrCreateSource(store.WhatsAppSourceType, "15551234567@s.whatsapp.net")
+	const personal = "15551234567@s.whatsapp.net"
+	const work = "15559876543@s.whatsapp.net"
+	source, err := st.GetOrCreateSource(store.WhatsAppSourceType, personal)
+	require.NoError(t, err)
+	workSource, err := st.GetOrCreateSource(store.WhatsAppSourceType, work)
 	require.NoError(t, err)
 	senderID, err := st.EnsureParticipantByIdentifier(store.WhatsAppSourceType, "15557654321@s.whatsapp.net", "Alice")
 	require.NoError(t, err)
@@ -85,12 +89,15 @@ func TestWhatsAppArchiveReadToolsScopeToWhatsApp(t *testing.T) {
 	require.NoError(t, err)
 	busyConv, err := st.EnsureConversationWithType(source.ID, busyJID, "group_chat", "Family")
 	require.NoError(t, err)
+	// The work account is a member of the same group, so the JID is shared.
+	workConv, err := st.EnsureConversationWithType(workSource.ID, busyJID, "group_chat", "Family")
+	require.NoError(t, err)
 
 	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	insert := func(convID int64, chatJID, remoteID string, at time.Time, fromMe bool, body string) int64 {
+	insert := func(sourceID, convID int64, chatJID, remoteID string, at time.Time, fromMe bool, body string) int64 {
 		t.Helper()
 		msg := &store.Message{
-			SourceID:        source.ID,
+			SourceID:        sourceID,
 			ConversationID:  convID,
 			SourceMessageID: store.WhatsAppSourceMessageID(chatJID, remoteID),
 			MessageType:     store.WhatsAppMessageType,
@@ -106,30 +113,74 @@ func TestWhatsAppArchiveReadToolsScopeToWhatsApp(t *testing.T) {
 		require.NoError(t, st.UpsertMessageBody(id, sql.NullString{String: body, Valid: true}, sql.NullString{}))
 		return id
 	}
-	quietID := insert(quietConv, quietJID, "Q1", base, true, "hello quiet")
-	first := insert(busyConv, busyJID, "B1", base.Add(time.Hour), false, "first")
-	second := insert(busyConv, busyJID, "B2", base.Add(2*time.Hour), true, "second")
+	quietID := insert(source.ID, quietConv, quietJID, "Q1", base, true, "hello quiet")
+	first := insert(source.ID, busyConv, busyJID, "B1", base.Add(time.Hour), false, "first")
+	second := insert(source.ID, busyConv, busyJID, "B2", base.Add(2*time.Hour), true, "second")
+	workID := insert(workSource.ID, workConv, busyJID, "W1", base.Add(3*time.Hour), false, "seen from work")
 	require.NoError(t, st.RecomputeConversationStats(source.ID))
+	require.NoError(t, st.RecomputeConversationStats(workSource.ID))
 	// The fixture's Gmail source must never leak into the WhatsApp-scoped tools.
 	f.CreateMessage("email-1")
 
 	h := &handlers{engine: &querytest.MockEngine{}, whatsAppArchive: st}
 
 	chats := runTool[listWhatsAppChatsResponse](t, ToolListWhatsAppChats, h.listWhatsAppChats, map[string]any{})
-	require.Len(t, chats.Chats, 2)
-	assert.Equal(t, busyJID, chats.Chats[0].ChatJID, "most recent activity first")
-	assert.Equal(t, "Family", chats.Chats[0].Title)
-	assert.Equal(t, "group_chat", chats.Chats[0].ConversationType)
-	assert.Equal(t, int64(2), chats.Chats[0].MessageCount)
-	require.NotNil(t, chats.Chats[0].LastMessageAt)
-	assert.True(t, base.Add(2*time.Hour).Equal(*chats.Chats[0].LastMessageAt))
-	assert.Equal(t, quietJID, chats.Chats[1].ChatJID)
-	assert.Equal(t, "15551234567@s.whatsapp.net", chats.Chats[1].Account)
+	require.Len(t, chats.Chats, 3)
+	assert.False(t, chats.HasMore)
+	assert.Equal(t, 3, chats.NextOffset)
+	assert.Equal(t, work, chats.Chats[0].Account, "most recent activity first")
+	assert.Equal(t, busyJID, chats.Chats[1].ChatJID)
+	assert.Equal(t, personal, chats.Chats[1].Account)
+	assert.Equal(t, "Family", chats.Chats[1].Title)
+	assert.Equal(t, "group_chat", chats.Chats[1].ConversationType)
+	assert.Equal(t, int64(2), chats.Chats[1].MessageCount)
+	require.NotNil(t, chats.Chats[1].LastMessageAt)
+	assert.True(t, base.Add(2*time.Hour).Equal(*chats.Chats[1].LastMessageAt))
+	assert.Equal(t, quietJID, chats.Chats[2].ChatJID)
+
+	scoped := runTool[listWhatsAppChatsResponse](t, ToolListWhatsAppChats, h.listWhatsAppChats,
+		map[string]any{"account": personal})
+	require.Len(t, scoped.Chats, 2)
+	for _, chat := range scoped.Chats {
+		assert.Equal(t, personal, chat.Account)
+	}
+
+	byTitle := runTool[listWhatsAppChatsResponse](t, ToolListWhatsAppChats, h.listWhatsAppChats,
+		map[string]any{"query": "FAM", "account": personal})
+	require.Len(t, byTitle.Chats, 1)
+	assert.Equal(t, busyJID, byTitle.Chats[0].ChatJID)
+	byJID := runTool[listWhatsAppChatsResponse](t, ToolListWhatsAppChats, h.listWhatsAppChats,
+		map[string]any{"query": "15550000001"})
+	require.Len(t, byJID.Chats, 1)
+	assert.Equal(t, quietJID, byJID.Chats[0].ChatJID)
+	noMatch := runTool[listWhatsAppChatsResponse](t, ToolListWhatsAppChats, h.listWhatsAppChats,
+		map[string]any{"query": "%_nothing"})
+	assert.Empty(t, noMatch.Chats, "LIKE metacharacters are matched literally")
+
+	pageOne := runTool[listWhatsAppChatsResponse](t, ToolListWhatsAppChats, h.listWhatsAppChats,
+		map[string]any{"limit": float64(2)})
+	require.Len(t, pageOne.Chats, 2)
+	assert.True(t, pageOne.HasMore)
+	assert.Equal(t, 2, pageOne.NextOffset)
+	pageTwo := runTool[listWhatsAppChatsResponse](t, ToolListWhatsAppChats, h.listWhatsAppChats,
+		map[string]any{"limit": float64(2), "offset": float64(pageOne.NextOffset)})
+	require.Len(t, pageTwo.Chats, 1)
+	assert.Equal(t, quietJID, pageTwo.Chats[0].ChatJID)
+	assert.False(t, pageTwo.HasMore)
+	assert.Equal(t, 3, pageTwo.NextOffset)
+	pastEnd := runTool[listWhatsAppChatsResponse](t, ToolListWhatsAppChats, h.listWhatsAppChats,
+		map[string]any{"offset": float64(pageTwo.NextOffset)})
+	assert.Empty(t, pastEnd.Chats)
+	assert.False(t, pastEnd.HasMore)
+	assert.Equal(t, 3, pastEnd.NextOffset)
+	badOffset := runToolExpectError(t, ToolListWhatsAppChats, h.listWhatsAppChats, map[string]any{"offset": float64(-1)})
+	assert.Contains(t, resultText(t, badOffset), "offset must be a non-negative integer")
 
 	page := runTool[listWhatsAppMessagesResponse](t, ToolListWhatsAppMessages, h.listWhatsAppMessages,
 		map[string]any{"chat_jid": busyJID, "limit": float64(1)})
 	require.Len(t, page.Messages, 1)
 	assert.Equal(t, first, page.Messages[0].ID)
+	assert.Equal(t, personal, page.Messages[0].Account)
 	assert.Equal(t, busyJID, page.Messages[0].ChatJID)
 	assert.Equal(t, store.WhatsAppSourceMessageID(busyJID, "B1"), page.Messages[0].SourceMessageID)
 	assert.Equal(t, "first", page.Messages[0].Body)
@@ -142,16 +193,30 @@ func TestWhatsAppArchiveReadToolsScopeToWhatsApp(t *testing.T) {
 
 	next := runTool[listWhatsAppMessagesResponse](t, ToolListWhatsAppMessages, h.listWhatsAppMessages,
 		map[string]any{"chat_jid": busyJID, "after_id": float64(page.NextAfterID)})
-	require.Len(t, next.Messages, 1)
+	require.Len(t, next.Messages, 2, "without account the shared JID mixes both accounts")
 	assert.Equal(t, second, next.Messages[0].ID)
 	assert.True(t, next.Messages[0].IsFromMe)
 	assert.Empty(t, next.Messages[0].SenderJID)
-	assert.Equal(t, second, next.NextAfterID)
+	assert.Equal(t, workID, next.Messages[1].ID)
+	assert.Equal(t, work, next.Messages[1].Account)
+	assert.Equal(t, workID, next.NextAfterID)
+
+	personalOnly := runTool[listWhatsAppMessagesResponse](t, ToolListWhatsAppMessages, h.listWhatsAppMessages,
+		map[string]any{"chat_jid": busyJID, "account": personal})
+	require.Len(t, personalOnly.Messages, 2)
+	assert.Equal(t, first, personalOnly.Messages[0].ID)
+	assert.Equal(t, second, personalOnly.Messages[1].ID)
+	assert.Equal(t, second, personalOnly.NextAfterID)
+	workOnly := runTool[listWhatsAppMessagesResponse](t, ToolListWhatsAppMessages, h.listWhatsAppMessages,
+		map[string]any{"chat_jid": busyJID, "account": work})
+	require.Len(t, workOnly.Messages, 1)
+	assert.Equal(t, workID, workOnly.Messages[0].ID)
+	assert.Equal(t, "seen from work", workOnly.Messages[0].Body)
 
 	empty := runTool[listWhatsAppMessagesResponse](t, ToolListWhatsAppMessages, h.listWhatsAppMessages,
-		map[string]any{"chat_jid": busyJID, "after_id": float64(second)})
+		map[string]any{"chat_jid": busyJID, "after_id": float64(workID)})
 	assert.Empty(t, empty.Messages)
-	assert.Equal(t, second, empty.NextAfterID, "empty page echoes the requested cursor")
+	assert.Equal(t, workID, empty.NextAfterID, "empty page echoes the requested cursor")
 
 	quiet := runTool[listWhatsAppMessagesResponse](t, ToolListWhatsAppMessages, h.listWhatsAppMessages,
 		map[string]any{"chat_jid": quietJID})

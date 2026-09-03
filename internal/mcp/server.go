@@ -41,8 +41,8 @@ type WhatsAppClientFactory func(ctx context.Context, account string) (whatsappli
 // WhatsAppArchiveReader reads archived WhatsApp chats and messages for the
 // WhatsApp-scoped read tools. *store.Store satisfies it.
 type WhatsAppArchiveReader interface {
-	ListWhatsAppChats(ctx context.Context, limit int) ([]store.WhatsAppChatSummary, error)
-	ListWhatsAppMessagesAfter(ctx context.Context, chatJID string, afterID int64, limit int) ([]store.WhatsAppMessageRecord, error)
+	ListWhatsAppChats(ctx context.Context, filter store.WhatsAppChatFilter) ([]store.WhatsAppChatSummary, error)
+	ListWhatsAppMessagesAfter(ctx context.Context, filter store.WhatsAppMessageFilter) ([]store.WhatsAppMessageRecord, error)
 }
 
 // GoogleDocsClientFactory creates an authenticated Google Docs client for
