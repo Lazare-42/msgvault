@@ -50,16 +50,35 @@ const MaxWhatsAppChatPage = 1000
 const MaxWhatsAppMessagePage = 500
 
 // ErrWhatsAppChatCursorInvalid reports a ListWhatsAppChats cursor that is
-// malformed or was issued for a different account or query filter.
+// malformed or was issued for a different account, query, or order.
 var ErrWhatsAppChatCursorInvalid = errors.New("invalid whatsapp chat cursor")
 
-// WhatsAppChatCursor is a keyset position in the most-recent-activity-first
-// chat ordering. Paging by position rather than by offset keeps a page from
-// repeating or skipping chats when activity reorders the list between pages.
+// ErrWhatsAppChatOrderInvalid reports an unknown WhatsAppChatOrder.
+var ErrWhatsAppChatOrderInvalid = errors.New("invalid whatsapp chat order")
+
+// WhatsAppChatOrder selects the ListWhatsAppChats ordering.
+type WhatsAppChatOrder string
+
+const (
+	// WhatsAppChatOrderRecent lists the most recently active chat first and
+	// chats without activity last. Paging over it is best-effort: a chat
+	// that gains activity while a caller pages moves above the cursor and
+	// is not revisited by that walk; it surfaces at the top of a fresh one.
+	WhatsAppChatOrderRecent WhatsAppChatOrder = "recent"
+	// WhatsAppChatOrderCreated lists chats by ascending conversation id, an
+	// immutable key, so a walk visits every chat that existed when it began
+	// and chats created meanwhile appear at its end.
+	WhatsAppChatOrderCreated WhatsAppChatOrder = "created"
+)
+
+// WhatsAppChatCursor is a keyset position in a chat ordering. Paging by
+// position rather than by offset keeps a page from repeating or skipping the
+// chats that did not move when the list changes between pages.
 type WhatsAppChatCursor struct {
 	// ActivityEpoch is the unix-second last-activity key of the chat the
-	// page ended on; it is meaningful only when HasActivity is set. Chats
-	// without any activity sort after every chat with activity.
+	// page ended on under WhatsAppChatOrderRecent; it is meaningful only when
+	// HasActivity is set. Chats without any activity sort after every chat
+	// with activity. WhatsAppChatOrderCreated uses ConversationID alone.
 	ActivityEpoch  int64
 	HasActivity    bool
 	ConversationID int64
@@ -76,8 +95,10 @@ type WhatsAppChatFilter struct {
 	// Limit caps the page at 1..MaxWhatsAppChatPage rows; other values read
 	// as MaxWhatsAppChatPage.
 	Limit int
-	// After resumes after the chat a previous page ended on. Nil starts at
-	// the most recently active chat.
+	// Order defaults to WhatsAppChatOrderRecent when empty.
+	Order WhatsAppChatOrder
+	// After resumes after the chat a previous page ended on. Nil starts the
+	// ordering from its first chat.
 	After *WhatsAppChatCursor
 }
 
@@ -115,7 +136,7 @@ type whatsAppChatCursorWire struct {
 }
 
 func whatsAppChatFilterKey(filter WhatsAppChatFilter) string {
-	digest := sha256.Sum256([]byte(filter.Account + "\x00" + whatsAppChatQueryTerm(filter)))
+	digest := sha256.Sum256([]byte(filter.Account + "\x00" + whatsAppChatQueryTerm(filter) + "\x00" + string(whatsAppChatOrder(filter))))
 	return hex.EncodeToString(digest[:8])
 }
 
@@ -123,9 +144,16 @@ func whatsAppChatQueryTerm(filter WhatsAppChatFilter) string {
 	return strings.ToLower(strings.TrimSpace(filter.Query))
 }
 
+func whatsAppChatOrder(filter WhatsAppChatFilter) WhatsAppChatOrder {
+	if filter.Order == "" {
+		return WhatsAppChatOrderRecent
+	}
+	return filter.Order
+}
+
 // EncodeWhatsAppChatCursor renders a cursor as an opaque token bound to the
-// filter's account and query, so a token cannot silently resume a different
-// listing.
+// filter's account, query, and order, so a token cannot silently resume a
+// different listing.
 func EncodeWhatsAppChatCursor(filter WhatsAppChatFilter, cursor WhatsAppChatCursor) string {
 	wire := whatsAppChatCursorWire{
 		Version: whatsAppChatCursorVersion,
@@ -144,7 +172,7 @@ func EncodeWhatsAppChatCursor(filter WhatsAppChatFilter, cursor WhatsAppChatCurs
 }
 
 // DecodeWhatsAppChatCursor parses a token produced by EncodeWhatsAppChatCursor
-// for the same account and query filter.
+// for the same account, query, and order.
 func DecodeWhatsAppChatCursor(filter WhatsAppChatFilter, value string) (WhatsAppChatCursor, error) {
 	decoded, err := base64.RawURLEncoding.DecodeString(strings.TrimSpace(value))
 	if err != nil || len(decoded) > 256 {
@@ -186,9 +214,13 @@ func (s *Store) whatsAppActivityEpochExpr(column string) string {
 	return "CAST(strftime('%s', " + column + ") AS INTEGER)"
 }
 
-// ListWhatsAppChats returns one page of WhatsApp conversations ordered by
-// most recent activity, with chats that have no activity last.
+// ListWhatsAppChats returns one page of WhatsApp conversations in the
+// filter's order.
 func (s *Store) ListWhatsAppChats(ctx context.Context, filter WhatsAppChatFilter) (WhatsAppChatPage, error) {
+	order := whatsAppChatOrder(filter)
+	if order != WhatsAppChatOrderRecent && order != WhatsAppChatOrderCreated {
+		return WhatsAppChatPage{}, ErrWhatsAppChatOrderInvalid
+	}
 	limit := filter.Limit
 	if limit <= 0 || limit > MaxWhatsAppChatPage {
 		limit = MaxWhatsAppChatPage
@@ -214,17 +246,25 @@ func (s *Store) ListWhatsAppChats(ctx context.Context, filter WhatsAppChatFilter
 			` OR ` + s.unicodeLowerExpr("c.source_conversation_id") + ` LIKE ? ESCAPE '\')`
 		args = append(args, pattern, pattern)
 	}
-	if after := filter.After; after != nil {
-		if after.HasActivity {
-			query += ` AND (` + activity + ` IS NULL OR ` + activity + ` < ?` +
-				` OR (` + activity + ` = ? AND c.id < ?))`
-			args = append(args, after.ActivityEpoch, after.ActivityEpoch, after.ConversationID)
-		} else {
-			query += ` AND ` + activity + ` IS NULL AND c.id < ?`
+	switch after := filter.After; {
+	case order == WhatsAppChatOrderCreated:
+		if after != nil {
+			query += ` AND c.id > ?`
 			args = append(args, after.ConversationID)
 		}
+		query += ` ORDER BY c.id ASC LIMIT ?`
+	case after == nil:
+		query += ` ORDER BY (` + activity + ` IS NULL), ` + activity + ` DESC, c.id DESC LIMIT ?`
+	case after.HasActivity:
+		query += ` AND (` + activity + ` IS NULL OR ` + activity + ` < ?` +
+			` OR (` + activity + ` = ? AND c.id < ?))` +
+			` ORDER BY (` + activity + ` IS NULL), ` + activity + ` DESC, c.id DESC LIMIT ?`
+		args = append(args, after.ActivityEpoch, after.ActivityEpoch, after.ConversationID)
+	default:
+		query += ` AND ` + activity + ` IS NULL AND c.id < ?` +
+			` ORDER BY (` + activity + ` IS NULL), ` + activity + ` DESC, c.id DESC LIMIT ?`
+		args = append(args, after.ConversationID)
 	}
-	query += ` ORDER BY (` + activity + ` IS NULL), ` + activity + ` DESC, c.id DESC LIMIT ?`
 	// One extra row decides HasMore without a count query.
 	args = append(args, limit+1)
 
@@ -257,10 +297,10 @@ func (s *Store) ListWhatsAppChats(ctx context.Context, filter WhatsAppChatFilter
 		last := limit - 1
 		page.Chats = chats[:limit]
 		page.HasMore = true
-		page.Next = WhatsAppChatCursor{
-			ActivityEpoch:  epochs[last].Int64,
-			HasActivity:    epochs[last].Valid,
-			ConversationID: chats[last].ConversationID,
+		page.Next = WhatsAppChatCursor{ConversationID: chats[last].ConversationID}
+		if order == WhatsAppChatOrderRecent {
+			page.Next.ActivityEpoch = epochs[last].Int64
+			page.Next.HasActivity = epochs[last].Valid
 		}
 	}
 	return page, nil

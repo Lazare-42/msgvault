@@ -21,6 +21,7 @@ const (
 
 	toolArgChatJID = "chat_jid"
 	toolArgAfterID = "after_id"
+	toolArgOrder   = "order"
 )
 
 type whatsAppChat struct {
@@ -64,14 +65,17 @@ type listWhatsAppMessagesResponse struct {
 func listWhatsAppChatsDefinition() toolDefinition {
 	return readDefinition(
 		ToolListWhatsAppChats,
-		"List archived WhatsApp chats, most recent activity first. "+
-			"Returns the chat_jid accepted by list_whatsapp_messages and send_whatsapp_message. "+
-			"Page with cursor while has_more is true; narrow large archives with query.",
+		"List archived WhatsApp chats. Returns the chat_jid accepted by list_whatsapp_messages and send_whatsapp_message. "+
+			"Page with cursor while has_more is true; narrow large archives with query. "+
+			"order=recent (default) lists the most recently active chat first and is best-effort when paged: "+
+			"a chat that gains activity while you page moves to the top and is not revisited, so re-list the first page to catch it. "+
+			"order=created walks chats by immutable conversation id, oldest first, and visits every chat that existed when the walk began.",
 		closedObject(map[string]*jsonschema.Schema{
 			toolArgAccount: stringSchema("Only chats of this WhatsApp account identifier; omit for every archived account"),
 			toolArgQuery:   stringSchema("Case-insensitive substring of the chat title or chat JID"),
 			toolArgLimit:   nonNegativeIntegerSchema("Maximum chats per page (1-500, default 100)", defaultWhatsAppChatLimit),
-			toolArgCursor:  stringSchema("Opaque next_cursor from the previous page; requires the same account and query"),
+			toolArgOrder:   stringSchema("recent: most recent activity first (default); created: ascending conversation id, exhaustive", string(store.WhatsAppChatOrderRecent), string(store.WhatsAppChatOrderCreated)),
+			toolArgCursor:  stringSchema("Opaque next_cursor from the previous page; requires the same account, query, and order"),
 		}),
 		outputSchemaFor[listWhatsAppChatsResponse](),
 		(*handlers).listWhatsAppChats,
@@ -107,11 +111,17 @@ func (h *handlers) listWhatsAppChats(ctx context.Context, req toolRequest) (*too
 		Account: trimmedStringArg(args, toolArgAccount),
 		Query:   trimmedStringArg(args, toolArgQuery),
 		Limit:   boundedIntArg(args, toolArgLimit, defaultWhatsAppChatLimit, maxWhatsAppChatLimit),
+		Order:   store.WhatsAppChatOrder(trimmedStringArg(args, toolArgOrder)),
+	}
+	switch filter.Order {
+	case "", store.WhatsAppChatOrderRecent, store.WhatsAppChatOrderCreated:
+	default:
+		return toolErrorResult("invalid_order: order must be recent or created"), nil
 	}
 	if token := trimmedStringArg(args, toolArgCursor); token != "" {
 		cursor, err := store.DecodeWhatsAppChatCursor(filter, token)
 		if err != nil {
-			return toolErrorResult("invalid_cursor: cursor is malformed or was issued for a different account or query"), nil
+			return toolErrorResult("invalid_cursor: cursor is malformed or was issued for a different account, query, or order"), nil
 		}
 		filter.After = &cursor
 	}
