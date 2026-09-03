@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 )
 
 // WhatsAppChatSummary is one WhatsApp conversation for the local live API.
@@ -19,9 +20,12 @@ type WhatsAppChatSummary struct {
 }
 
 // WhatsAppMessageRecord is one archived WhatsApp message for the local
-// live API. IDs are ascending, so callers can page with after_id cursors.
+// live API. IDs are ascending in archive order, so callers can page with
+// after_id cursors; after a history backfill older messages may carry
+// higher IDs than newer ones.
 type WhatsAppMessageRecord struct {
 	ID              int64          `json:"id"`
+	Account         string         `json:"account"`
 	ChatJID         string         `json:"chat_jid"`
 	SourceMessageID string         `json:"source_message_id"`
 	SenderJID       string         `json:"sender_jid"`
@@ -31,23 +35,70 @@ type WhatsAppMessageRecord struct {
 	Body            sql.NullString `json:"-"`
 }
 
+// MaxWhatsAppChatPage caps one ListWhatsAppChats page.
+const MaxWhatsAppChatPage = 1000
+
+// MaxWhatsAppMessagePage caps one ListWhatsAppMessagesAfter page.
+const MaxWhatsAppMessagePage = 500
+
+// WhatsAppChatFilter narrows ListWhatsAppChats.
+type WhatsAppChatFilter struct {
+	// Account is an exact WhatsApp source identifier; empty matches every
+	// archived WhatsApp account.
+	Account string
+	// Query is a case-insensitive substring matched against the chat title
+	// and chat JID; empty matches every chat.
+	Query string
+	// Limit caps the page at 1..MaxWhatsAppChatPage rows; other values read
+	// as MaxWhatsAppChatPage.
+	Limit int
+	// Offset skips rows of the most-recent-activity-first ordering.
+	Offset int
+}
+
+// WhatsAppMessageFilter narrows ListWhatsAppMessagesAfter.
+type WhatsAppMessageFilter struct {
+	// Account is an exact WhatsApp source identifier; empty matches every
+	// archived WhatsApp account, which can mix accounts that share a chat JID.
+	Account string
+	// ChatJID is required.
+	ChatJID string
+	// AfterID returns only messages with a greater archive ID.
+	AfterID int64
+	// Limit caps the page at 1..MaxWhatsAppMessagePage rows; other values
+	// read as MaxWhatsAppMessagePage.
+	Limit int
+}
+
 // ListWhatsAppChats returns WhatsApp conversations ordered by most recent
 // activity.
-func (s *Store) ListWhatsAppChats(ctx context.Context, limit int) ([]WhatsAppChatSummary, error) {
-	if limit <= 0 || limit > 1000 {
-		limit = 1000
+func (s *Store) ListWhatsAppChats(ctx context.Context, filter WhatsAppChatFilter) ([]WhatsAppChatSummary, error) {
+	limit := filter.Limit
+	if limit <= 0 || limit > MaxWhatsAppChatPage {
+		limit = MaxWhatsAppChatPage
 	}
-	rows, err := s.db.QueryContext(ctx, `
+	query := `
 		SELECT c.id, src.identifier, c.source_conversation_id,
 		       c.title, c.conversation_type, c.message_count,
 		       c.last_message_at, c.last_message_preview
 		FROM conversations c
 		JOIN sources src ON src.id = c.source_id
 		WHERE src.source_type = ?
-		  AND c.source_conversation_id IS NOT NULL
-		ORDER BY c.last_message_at DESC
-		LIMIT ?
-	`, WhatsAppSourceType, limit)
+		  AND c.source_conversation_id IS NOT NULL`
+	args := []any{WhatsAppSourceType}
+	if filter.Account != "" {
+		query += ` AND src.identifier = ?`
+		args = append(args, filter.Account)
+	}
+	if term := strings.TrimSpace(filter.Query); term != "" {
+		pattern := "%" + escapeLike(strings.ToLower(term)) + "%"
+		query += ` AND (LOWER(COALESCE(c.title, '')) LIKE ? ESCAPE '\' OR LOWER(c.source_conversation_id) LIKE ? ESCAPE '\')`
+		args = append(args, pattern, pattern)
+	}
+	query += ` ORDER BY c.last_message_at DESC, c.id DESC LIMIT ? OFFSET ?`
+	args = append(args, limit, max(filter.Offset, 0))
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list whatsapp chats: %w", err)
 	}
@@ -69,16 +120,17 @@ func (s *Store) ListWhatsAppChats(ctx context.Context, limit int) ([]WhatsAppCha
 }
 
 // ListWhatsAppMessagesAfter returns archived WhatsApp messages for one chat
-// with id > afterID, oldest first.
-func (s *Store) ListWhatsAppMessagesAfter(ctx context.Context, chatJID string, afterID int64, limit int) ([]WhatsAppMessageRecord, error) {
-	if chatJID == "" {
+// with id > AfterID, in ascending archive ID order.
+func (s *Store) ListWhatsAppMessagesAfter(ctx context.Context, filter WhatsAppMessageFilter) ([]WhatsAppMessageRecord, error) {
+	if filter.ChatJID == "" {
 		return nil, fmt.Errorf("chat_jid is required")
 	}
-	if limit <= 0 || limit > 500 {
-		limit = 500
+	limit := filter.Limit
+	if limit <= 0 || limit > MaxWhatsAppMessagePage {
+		limit = MaxWhatsAppMessagePage
 	}
-	rows, err := s.db.QueryContext(ctx, `
-		SELECT m.id, c.source_conversation_id, m.source_message_id,
+	query := `
+		SELECT m.id, src.identifier, c.source_conversation_id, m.source_message_id,
 		       COALESCE(pi.identifier_value, ''), p.display_name,
 		       m.is_from_me, m.sent_at, mb.body_text
 		FROM messages m
@@ -92,10 +144,16 @@ func (s *Store) ListWhatsAppMessagesAfter(ctx context.Context, chatJID string, a
 		  AND m.message_type = ?
 		  AND c.source_conversation_id = ?
 		  AND m.id > ?
-		  AND m.deleted_at IS NULL
-		ORDER BY m.id ASC
-		LIMIT ?
-	`, WhatsAppIdentifierType, WhatsAppSourceType, WhatsAppMessageType, chatJID, afterID, limit)
+		  AND m.deleted_at IS NULL`
+	args := []any{WhatsAppIdentifierType, WhatsAppSourceType, WhatsAppMessageType, filter.ChatJID, filter.AfterID}
+	if filter.Account != "" {
+		query += ` AND src.identifier = ?`
+		args = append(args, filter.Account)
+	}
+	query += ` ORDER BY m.id ASC LIMIT ?`
+	args = append(args, limit)
+
+	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list whatsapp messages: %w", err)
 	}
@@ -105,7 +163,7 @@ func (s *Store) ListWhatsAppMessagesAfter(ctx context.Context, chatJID string, a
 	for rows.Next() {
 		var m WhatsAppMessageRecord
 		if err := rows.Scan(
-			&m.ID, &m.ChatJID, &m.SourceMessageID,
+			&m.ID, &m.Account, &m.ChatJID, &m.SourceMessageID,
 			&m.SenderJID, &m.SenderName,
 			&m.IsFromMe, &m.SentAt, &m.Body,
 		); err != nil {

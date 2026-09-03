@@ -40,6 +40,7 @@ type whatsappAPIChat struct {
 
 type whatsappAPIMessage struct {
 	ID              int64      `json:"id"`
+	Account         string     `json:"account"`
 	ChatJID         string     `json:"chat_jid"`
 	SourceMessageID string     `json:"source_message_id"`
 	SenderJID       string     `json:"sender_jid,omitempty"`
@@ -81,8 +82,15 @@ func (h *whatsappLiveAPIHandler) listChats(w http.ResponseWriter, r *http.Reques
 	if !h.guard(w, r, http.MethodGet) {
 		return
 	}
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	chats, err := h.store.ListWhatsAppChats(r.Context(), limit)
+	q := r.URL.Query()
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	offset, _ := strconv.Atoi(q.Get("offset"))
+	chats, err := h.store.ListWhatsAppChats(r.Context(), store.WhatsAppChatFilter{
+		Account: strings.TrimSpace(q.Get("account")),
+		Query:   q.Get("q"),
+		Limit:   limit,
+		Offset:  offset,
+	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -119,7 +127,12 @@ func (h *whatsappLiveAPIHandler) listMessages(w http.ResponseWriter, r *http.Req
 	}
 	afterID, _ := strconv.ParseInt(q.Get("after_id"), 10, 64)
 	limit, _ := strconv.Atoi(q.Get("limit"))
-	messages, err := h.store.ListWhatsAppMessagesAfter(r.Context(), chatJID, afterID, limit)
+	messages, err := h.store.ListWhatsAppMessagesAfter(r.Context(), store.WhatsAppMessageFilter{
+		Account: strings.TrimSpace(q.Get("account")),
+		ChatJID: chatJID,
+		AfterID: afterID,
+		Limit:   limit,
+	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -128,6 +141,7 @@ func (h *whatsappLiveAPIHandler) listMessages(w http.ResponseWriter, r *http.Req
 	for _, m := range messages {
 		item := whatsappAPIMessage{
 			ID:              m.ID,
+			Account:         m.Account,
 			ChatJID:         m.ChatJID,
 			SourceMessageID: m.SourceMessageID,
 			SenderJID:       m.SenderJID,
