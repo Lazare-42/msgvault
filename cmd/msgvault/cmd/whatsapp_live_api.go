@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -88,16 +89,21 @@ func (h *whatsappLiveAPIHandler) listChats(w http.ResponseWriter, r *http.Reques
 		Account: strings.TrimSpace(q.Get("account")),
 		Query:   q.Get("q"),
 		Limit:   limit,
+		Order:   store.WhatsAppChatOrder(strings.TrimSpace(q.Get("order"))),
 	}
 	if token := strings.TrimSpace(q.Get("cursor")); token != "" {
 		cursor, err := store.DecodeWhatsAppChatCursor(filter, token)
 		if err != nil {
-			http.Error(w, "invalid cursor for this account and q", http.StatusBadRequest)
+			http.Error(w, "invalid cursor for this account, q, and order", http.StatusBadRequest)
 			return
 		}
 		filter.After = &cursor
 	}
 	page, err := h.store.ListWhatsAppChats(r.Context(), filter)
+	if errors.Is(err, store.ErrWhatsAppChatOrderInvalid) {
+		http.Error(w, "order must be recent or created", http.StatusBadRequest)
+		return
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

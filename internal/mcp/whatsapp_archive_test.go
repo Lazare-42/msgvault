@@ -200,9 +200,25 @@ func TestWhatsAppArchiveReadToolsScopeToWhatsApp(t *testing.T) {
 		map[string]any{"cursor": "not-a-cursor"})
 	assert.Contains(t, resultText(t, garbageCursor), "invalid_cursor")
 
-	// New activity reorders the list between pages: the quiet chat jumps to
-	// the top. A page-one cursor must still neither repeat nor skip the chats
-	// that did not move, unlike an offset which would repeat the second chat.
+	// order=created walks by immutable conversation id, oldest first.
+	createdOrder := []string{
+		personal + "/" + quietJID, personal + "/" + busyJID, work + "/" + busyJID,
+		personal + "/" + idleJID, personal + "/" + idle2JID,
+	}
+	assert.Equal(t, createdOrder, chatJIDs(listChats(map[string]any{"order": "created"})))
+	createdPageOne := listChats(map[string]any{"order": "created", "limit": float64(2)})
+	assert.Equal(t, createdOrder[:2], chatJIDs(createdPageOne))
+	require.True(t, createdPageOne.HasMore)
+	crossOrder := runToolExpectError(t, ToolListWhatsAppChats, h.listWhatsAppChats,
+		map[string]any{"cursor": createdPageOne.NextCursor})
+	assert.Contains(t, resultText(t, crossOrder), "invalid_cursor", "a created-order cursor cannot resume a recent-order walk")
+	badOrder := runToolExpectError(t, ToolListWhatsAppChats, h.listWhatsAppChats, map[string]any{"order": "random"})
+	assert.Contains(t, resultText(t, badOrder), "invalid_order")
+
+	// New activity reorders the recent listing between pages: the quiet chat
+	// jumps to the top. A recent-order page-one cursor neither repeats nor
+	// skips the chats that did not move, but the moved chat is not revisited
+	// by that walk (documented best-effort); it leads a fresh listing.
 	lateID := insert(source.ID, quietConv, quietJID, "Q2", base.Add(5*time.Hour), false, "late")
 	require.NoError(t, st.RecomputeConversationStats(source.ID))
 	pageTwoAfterMove := listChats(map[string]any{"limit": float64(2), "cursor": pageOne.NextCursor})
@@ -210,6 +226,19 @@ func TestWhatsAppArchiveReadToolsScopeToWhatsApp(t *testing.T) {
 	assert.False(t, pageTwoAfterMove.HasMore)
 	assert.Equal(t, []string{personal + "/" + quietJID, fullOrder[0], fullOrder[1]},
 		chatJIDs(listChats(map[string]any{"limit": float64(3)})))
+
+	// The same mutation, plus a chat created mid-walk, leaves a created-order
+	// walk exhaustive: the moved chat was already visited, the idle chats
+	// still follow, and the new chat appears at the end.
+	newJID := "15550000004@s.whatsapp.net"
+	_, err = st.EnsureConversationWithType(source.ID, newJID, "direct_chat", "Brand new")
+	require.NoError(t, err)
+	createdPageTwo := listChats(map[string]any{"order": "created", "limit": float64(2), "cursor": createdPageOne.NextCursor})
+	assert.Equal(t, createdOrder[2:4], chatJIDs(createdPageTwo))
+	require.True(t, createdPageTwo.HasMore)
+	createdPageThree := listChats(map[string]any{"order": "created", "limit": float64(2), "cursor": createdPageTwo.NextCursor})
+	assert.Equal(t, []string{createdOrder[4], personal + "/" + newJID}, chatJIDs(createdPageThree))
+	assert.False(t, createdPageThree.HasMore)
 
 	page := runTool[listWhatsAppMessagesResponse](t, ToolListWhatsAppMessages, h.listWhatsAppMessages,
 		map[string]any{"chat_jid": busyJID, "limit": float64(1)})
