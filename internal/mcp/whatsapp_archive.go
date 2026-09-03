@@ -36,9 +36,10 @@ type whatsAppChat struct {
 
 type listWhatsAppChatsResponse struct {
 	Chats []whatsAppChat `json:"chats"`
-	// HasMore reports that another page follows at NextOffset.
-	HasMore    bool `json:"has_more"`
-	NextOffset int  `json:"next_offset"`
+	// HasMore reports that older chats follow; NextCursor then resumes after
+	// the last chat of this page.
+	HasMore    bool   `json:"has_more"`
+	NextCursor string `json:"next_cursor,omitempty"`
 }
 
 type whatsAppArchivedMessage struct {
@@ -65,12 +66,12 @@ func listWhatsAppChatsDefinition() toolDefinition {
 		ToolListWhatsAppChats,
 		"List archived WhatsApp chats, most recent activity first. "+
 			"Returns the chat_jid accepted by list_whatsapp_messages and send_whatsapp_message. "+
-			"Page with offset while has_more is true; narrow large archives with query.",
+			"Page with cursor while has_more is true; narrow large archives with query.",
 		closedObject(map[string]*jsonschema.Schema{
 			toolArgAccount: stringSchema("Only chats of this WhatsApp account identifier; omit for every archived account"),
 			toolArgQuery:   stringSchema("Case-insensitive substring of the chat title or chat JID"),
 			toolArgLimit:   nonNegativeIntegerSchema("Maximum chats per page (1-500, default 100)", defaultWhatsAppChatLimit),
-			toolArgOffset:  nonNegativeIntegerSchema("Chats to skip; pass next_offset from the previous page", 0),
+			toolArgCursor:  stringSchema("Opaque next_cursor from the previous page; requires the same account and query"),
 		}),
 		outputSchemaFor[listWhatsAppChatsResponse](),
 		(*handlers).listWhatsAppChats,
@@ -102,32 +103,30 @@ func (h *handlers) listWhatsAppChats(ctx context.Context, req toolRequest) (*too
 		return toolErrorResult("WhatsApp archive not configured"), nil
 	}
 	args := req.GetArguments()
-	limit := boundedIntArg(args, toolArgLimit, defaultWhatsAppChatLimit, maxWhatsAppChatLimit)
-	offset, toolErr := nonNegativeInt64Arg(args, toolArgOffset)
-	if toolErr != nil {
-		return toolErr, nil
-	}
-	if offset > math.MaxInt32 {
-		return toolErrorResult("invalid_offset: offset is too large"), nil
-	}
-	// Fetch one extra row to report has_more without a second count query.
-	chats, err := h.whatsAppArchive.ListWhatsAppChats(ctx, store.WhatsAppChatFilter{
+	filter := store.WhatsAppChatFilter{
 		Account: trimmedStringArg(args, toolArgAccount),
 		Query:   trimmedStringArg(args, toolArgQuery),
-		Limit:   limit + 1,
-		Offset:  int(offset),
-	})
+		Limit:   boundedIntArg(args, toolArgLimit, defaultWhatsAppChatLimit, maxWhatsAppChatLimit),
+	}
+	if token := trimmedStringArg(args, toolArgCursor); token != "" {
+		cursor, err := store.DecodeWhatsAppChatCursor(filter, token)
+		if err != nil {
+			return toolErrorResult("invalid_cursor: cursor is malformed or was issued for a different account or query"), nil
+		}
+		filter.After = &cursor
+	}
+	page, err := h.whatsAppArchive.ListWhatsAppChats(ctx, filter)
 	if err != nil {
 		return nil, newInternalError("list whatsapp chats", err)
 	}
-	response := listWhatsAppChatsResponse{NextOffset: int(offset)}
-	if len(chats) > limit {
-		chats = chats[:limit]
-		response.HasMore = true
+	response := listWhatsAppChatsResponse{
+		Chats:   make([]whatsAppChat, 0, len(page.Chats)),
+		HasMore: page.HasMore,
 	}
-	response.NextOffset += len(chats)
-	response.Chats = make([]whatsAppChat, 0, len(chats))
-	for _, chat := range chats {
+	if page.HasMore {
+		response.NextCursor = store.EncodeWhatsAppChatCursor(filter, page.Next)
+	}
+	for _, chat := range page.Chats {
 		item := whatsAppChat{
 			ConversationID:     chat.ConversationID,
 			Account:            chat.Account,
