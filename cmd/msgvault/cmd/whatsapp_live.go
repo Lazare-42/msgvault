@@ -17,6 +17,7 @@ import (
 	"github.com/skip2/go-qrcode"
 	"github.com/spf13/cobra"
 	mcpserver "go.kenn.io/msgvault/internal/mcp"
+	"go.kenn.io/msgvault/internal/mcp/remoteoauth"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/store"
 	whatsapplive "go.kenn.io/msgvault/internal/whatsapp/live"
@@ -153,9 +154,35 @@ var whatsappLiveMCPCmd = &cobra.Command{
 			cfg.AttachmentsDir(), cfg.Data.DataDir,
 			whatsappLoginPageURL(publicBaseURL, basePath),
 		)
+		remoteOAuth, err := whatsAppRemoteOAuthFromEnv()
+		if err != nil {
+			return usageErr(cmd, err)
+		}
 		apiToken := strings.TrimSpace(os.Getenv("MSGVAULT_WHATSAPP_API_TOKEN"))
-		return serveWhatsAppLiveHTTP(cmd.Context(), addr, st, service, transport, opts, pairingToken, basePath, apiToken)
+		return serveWhatsAppLiveHTTP(cmd.Context(), addr, st, service, transport, opts, pairingToken, basePath, apiToken, remoteOAuth)
 	},
+}
+
+func whatsAppRemoteOAuthFromEnv() (*remoteoauth.Server, error) {
+	issuer := strings.TrimSpace(os.Getenv("MSGVAULT_WHATSAPP_REMOTE_OAUTH_ISSUER"))
+	if issuer == "" {
+		return nil, nil
+	}
+	redirects := strings.Split(os.Getenv("MSGVAULT_WHATSAPP_REMOTE_OAUTH_REDIRECT_URIS"), ",")
+	server, err := remoteoauth.New(remoteoauth.Config{
+		Issuer:        issuer,
+		Resource:      strings.TrimSpace(os.Getenv("MSGVAULT_WHATSAPP_REMOTE_OAUTH_RESOURCE")),
+		ClientID:      strings.TrimSpace(os.Getenv("MSGVAULT_WHATSAPP_REMOTE_OAUTH_CLIENT_ID")),
+		ClientSecret:  os.Getenv("MSGVAULT_WHATSAPP_REMOTE_OAUTH_CLIENT_SECRET"),
+		LoginUser:     strings.TrimSpace(os.Getenv("MSGVAULT_WHATSAPP_REMOTE_OAUTH_LOGIN_USER")),
+		LoginPassword: os.Getenv("MSGVAULT_WHATSAPP_REMOTE_OAUTH_LOGIN_PASSWORD"),
+		StateFile:     strings.TrimSpace(os.Getenv("MSGVAULT_WHATSAPP_REMOTE_OAUTH_STATE_FILE")),
+		RedirectURIs:  redirects,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("configure remote WhatsApp OAuth: %w", err)
+	}
+	return server, nil
 }
 
 // whatsAppLiveMCPOptions builds the MCP catalog served by whatsapp-live-mcp.
@@ -199,7 +226,7 @@ func init() {
 	whatsappLiveMCPCmd.Flags().StringVar(&whatsappLivePublicBaseURL, "public-base-url", "", "Public base URL for QR pages, e.g. https://whats.lazare.ai/personal (or MSGVAULT_WHATSAPP_PUBLIC_BASE_URL)")
 }
 
-func serveWhatsAppLiveHTTP(ctx context.Context, addr string, st *store.Store, service *whatsapplive.Service, transport *whatsapplive.WhatsmeowTransport, opts mcpserver.ServeOptions, pairingToken string, basePath string, apiToken string) error {
+func serveWhatsAppLiveHTTP(ctx context.Context, addr string, st *store.Store, service *whatsapplive.Service, transport *whatsapplive.WhatsmeowTransport, opts mcpserver.ServeOptions, pairingToken string, basePath string, apiToken string, remoteOAuth *remoteoauth.Server) error {
 	mcpHandler := mcpserver.NewStreamableHTTPHandler(opts, true)
 	pairing := &whatsappPairingHandler{
 		ctx:          ctx,
@@ -211,6 +238,14 @@ func serveWhatsAppLiveHTTP(ctx context.Context, addr string, st *store.Store, se
 	api := &whatsappLiveAPIHandler{store: st, sender: service, token: apiToken}
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", mcpHandler)
+	if remoteOAuth != nil {
+		externalOpts := opts
+		externalOpts.ToolAllowlist = mcpserver.ExternalWhatsAppToolNames()
+		externalMCP := mcpserver.NewStreamableHTTPHandler(externalOpts, true)
+		mux.Handle("/external/mcp", remoteOAuth.Protect(externalMCP))
+		remoteOAuth.RegisterRoutes(mux)
+		logger.Info("Remote WhatsApp MCP OAuth enabled")
+	}
 	mux.HandleFunc("/", pairing.redirectRoot)
 	mux.HandleFunc("/qr", pairing.qrPage)
 	mux.HandleFunc("/qr.png", pairing.qrPNG)
