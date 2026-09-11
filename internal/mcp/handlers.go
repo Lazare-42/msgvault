@@ -460,7 +460,26 @@ type OCRClient interface {
 	RequestOCR(context.Context, string, string) (*store.OCRResult, error)
 }
 
-func (h *handlers) getOCRStatus(ctx context.Context, _ mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+// readAttachmentFile loads a content-addressed attachment for draft uploads.
+// It shares attachmentService.read rather than opening h.attachmentsDir
+// directly: on a daemon-routed MCP server (h.attachmentReader set), the
+// archive's attachments may live in packed storage with no loose file on
+// this process's own disk at all, and only attachmentReader.ReadAttachment
+// knows how to fetch packed content. A direct os.Open here would 404 on any
+// attachment that has been packed, which export_attachment and get_attachment
+// (both already routed through attachmentService) do not.
+func (h *handlers) readAttachmentFile(ctx context.Context, contentHash string) ([]byte, error) {
+	data, err := h.attachmentService().read(ctx, contentHash)
+	if err != nil {
+		if unavailable, ok := errors.AsType[*attachmentUnavailableError](err); ok {
+			return nil, errors.New(unavailable.message)
+		}
+		return nil, err
+	}
+	return data, nil
+}
+
+func (h *handlers) getOCRStatus(ctx context.Context, _ toolRequest) (*toolResult, error) {
 	status, err := h.ocr.OCRStatus(ctx)
 	if err != nil {
 		return mcp.NewToolResultError(fmt.Sprintf("get OCR status: %v", err)), nil
@@ -841,7 +860,7 @@ func (h *handlers) resolveDraftAttachments(ctx context.Context, args map[string]
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	if h.attachmentsDir == "" {
+	if h.attachmentsDir == "" && h.attachmentReader == nil {
 		return nil, fmt.Errorf("attachments directory not configured")
 	}
 
@@ -859,7 +878,7 @@ func (h *handlers) resolveDraftAttachments(ctx context.Context, args map[string]
 		if att == nil {
 			return nil, fmt.Errorf("attachment %d not found", id)
 		}
-		data, err := h.readAttachmentFile(att.ContentHash)
+		data, err := h.readAttachmentFile(ctx, att.ContentHash)
 		if err != nil {
 			return nil, fmt.Errorf("attachment %d: %v", id, err)
 		}
