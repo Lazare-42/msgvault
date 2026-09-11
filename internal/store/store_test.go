@@ -2350,3 +2350,37 @@ func TestStore_GetStatsForScope_ExcludesSourceDeleted(t *testing.T) {
 	require.NoError(t, err, "GetStatsForScope")
 	assert.Equal(t, int64(1), stats.MessageCount, "MessageCount (source-deleted excluded)")
 }
+
+// TestStore_OpenUsesWALWithSynchronousNormal locks in the production
+// connection pragmas store.Open applies: WAL journaling, synchronous=NORMAL,
+// and foreign keys on. WAL+NORMAL is SQLite's own documented safe
+// combination — it cannot corrupt the database file on crash or power loss,
+// only the last few not-yet-checkpointed commits can be lost — and
+// msgvault's sync paths (Gmail history IDs, IMAP UIDs, watermark-based
+// incremental sync) already tolerate exactly that by re-fetching on the next
+// run. This was previously synchronous=FULL, which fsyncs on every commit
+// rather than only at checkpoints; regressing back to FULL (or losing WAL or
+// foreign_keys) should fail this test, not surface only as a production
+// stall on a slow or contended disk.
+func TestStore_OpenUsesWALWithSynchronousNormal(t *testing.T) {
+	testutil.SkipIfPostgres(t, "connection pragmas are SQLite-specific")
+	require := require.New(t)
+	assert := assert.New(t)
+	dbPath := filepath.Join(t.TempDir(), "pragmas.db")
+	st, err := store.Open(dbPath)
+	require.NoError(err, "open store")
+	t.Cleanup(func() { _ = st.Close() })
+
+	var journalMode string
+	require.NoError(st.DB().QueryRow("PRAGMA journal_mode").Scan(&journalMode), "read journal_mode")
+	assert.Equal("wal", journalMode, "journal_mode")
+
+	// SQLite reports synchronous as an integer: 0=OFF, 1=NORMAL, 2=FULL, 3=EXTRA.
+	var synchronous int
+	require.NoError(st.DB().QueryRow("PRAGMA synchronous").Scan(&synchronous), "read synchronous")
+	assert.Equal(1, synchronous, "synchronous (1=NORMAL)")
+
+	var foreignKeys int
+	require.NoError(st.DB().QueryRow("PRAGMA foreign_keys").Scan(&foreignKeys), "read foreign_keys")
+	assert.Equal(1, foreignKeys, "foreign_keys")
+}

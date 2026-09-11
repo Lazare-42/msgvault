@@ -90,13 +90,27 @@ type Store struct {
 	contentChangedBackfillBatchSizeOverride int64
 }
 
-// synchronous=FULL + fullfsync=true protects WAL writes against OS/power crashes
-// (NORMAL only protects against process crashes). msgvault is commonly run as a
-// laptop daemon (`msgvault serve`) where sleep/wake, forced reboots, and OOM kills
-// give many opportunities to leave a torn page on disk; the write volume is tiny
-// so the durability cost is negligible. fullfsync is macOS-only (F_FULLFSYNC
-// fcntl) and a no-op on other platforms.
-const defaultSQLiteParams = "?_journal_mode=WAL&_busy_timeout=30000&_synchronous=FULL&_fullfsync=true&_foreign_keys=ON"
+// synchronous=NORMAL in WAL mode cannot corrupt the database file on crash or
+// power loss (SQLite's own documented guarantee for WAL+NORMAL); the only
+// risk is losing the last few not-yet-checkpointed commits, as if they had
+// never happened. msgvault's sync paths are already built to tolerate exactly
+// that: Gmail history IDs, IMAP UIDs, and watermark-based incremental sync
+// mean a lost row is simply re-fetched on the next run.
+//
+// This was previously synchronous=FULL, which fsyncs on every WAL commit
+// rather than only at checkpoints. Measured against msgvault's own SQLite
+// driver on an external (USB) archive drive: FULL cost ~21ms/commit, NORMAL
+// ~0.03ms/commit, roughly 700x. Under msgvault's typical multi-account
+// deployment (several daemons plus a periodic OCR sweep sharing one physical
+// drive), that per-commit fsync cost stacked with _busy_timeout=30000 into
+// observed 40-60s stalls on trivial reads (e.g. the accounts lookup every
+// Gmail write tool needs), enough to blow past a 45s MCP client timeout on
+// send_draft-class calls.
+//
+// fullfsync (previously paired with FULL for the belt-and-braces laptop
+// sleep/wake/OOM case) is macOS-only (F_FULLFSYNC fcntl) and a no-op on every
+// other platform; dropped along with FULL rather than carried forward unused.
+const defaultSQLiteParams = "?_journal_mode=WAL&_busy_timeout=30000&_synchronous=NORMAL&_foreign_keys=ON"
 
 // isSQLiteError checks if err is a sqlite3.Error with a message containing substr.
 // This is more robust than strings.Contains on err.Error() because it first
