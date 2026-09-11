@@ -4919,3 +4919,66 @@ func TestMCPHTTPServerMountsProtectedEndpoint(t *testing.T) {
 	checks.Equal(http.StatusMethodNotAllowed, authorized.Code)
 	checks.Equal(http.MethodPost, authorized.Header().Get("Allow"))
 }
+
+// TestResolveDraftAttachments_UsesAttachmentReaderOverLocalDisk locks in the
+// fix for a real production failure: on a daemon-routed MCP server, archived
+// attachments can live in packed storage with no loose file on this
+// process's own disk, and only attachmentReader.ReadAttachment knows how to
+// fetch packed content (get_attachment and export_attachment already go
+// through attachmentService, which prefers the reader; create_draft's
+// resolveDraftAttachments used to call a separate readAttachmentFile that
+// only ever did a raw os.Open under attachmentsDir, so any packed attachment
+// 404'd there even though export_attachment could read the exact same bytes
+// moments earlier). Also locks in that the "no local directory" guard checks
+// the reader too, not just attachmentsDir, matching attachmentService.load.
+func TestResolveDraftAttachments_UsesAttachmentReaderOverLocalDisk(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	hash := "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+	content := []byte("packed-only content, no loose file on this disk")
+
+	var gotHash string
+	h := &handlers{
+		engine: &querytest.MockEngine{
+			Attachments: map[int64]*query.AttachmentInfo{
+				9001: {ID: 9001, Filename: "constat.pdf", MimeType: "application/pdf", Size: int64(len(content)), ContentHash: hash},
+			},
+		},
+		// Deliberately empty: a daemon-routed server has no local attachments
+		// directory of its own. If resolveDraftAttachments (or its guard)
+		// regresses to requiring attachmentsDir, this must fail, not silently
+		// pass by reading some other directory.
+		attachmentsDir: "",
+		attachmentReader: attachmentReaderFunc(func(_ context.Context, contentHash string) ([]byte, error) {
+			gotHash = contentHash
+			return content, nil
+		}),
+	}
+
+	atts, err := h.resolveDraftAttachments(context.Background(), map[string]any{"attachment_ids": "9001"})
+	require.NoError(err, "resolveDraftAttachments")
+	require.Len(atts, 1)
+	assert.Equal(hash, gotHash, "content hash passed to the reader")
+	assert.Equal("constat.pdf", atts[0].Filename)
+	assert.Equal("application/pdf", atts[0].ContentType)
+	assert.Equal(content, atts[0].Content)
+}
+
+// TestResolveDraftAttachments_NeitherReaderNorDirectoryConfigured proves the
+// guard still rejects attach requests when there is truly no way to read
+// attachment bytes — the fix for the above must not turn this into a silent
+// success or a nil-pointer panic.
+func TestResolveDraftAttachments_NeitherReaderNorDirectoryConfigured(t *testing.T) {
+	require := require.New(t)
+	h := &handlers{
+		engine: &querytest.MockEngine{
+			Attachments: map[int64]*query.AttachmentInfo{
+				1: {ID: 1, Filename: "x.pdf", MimeType: "application/pdf", Size: 3, ContentHash: "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"},
+			},
+		},
+	}
+
+	_, err := h.resolveDraftAttachments(context.Background(), map[string]any{"attachment_ids": "1"})
+	require.Error(err)
+	assert.Contains(t, err.Error(), "attachments directory not configured")
+}
