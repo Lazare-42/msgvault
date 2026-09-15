@@ -55,16 +55,25 @@ func (s *Store) PersistIMAPDraftContext(
 		if !errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("check IMAP draft membership: %w", err)
 		}
-		// A new epoch can reuse an archived UID. Preserve the old message under
-		// sync's invalidated key; sync still owns membership retirement and cursors.
+		// APPEND can reuse a key held by an old-generation membership at this
+		// UID, a moved row after the folder changes generation, or a tombstoned
+		// orphan with no memberships. Preserve that row under an invalidated key;
+		// sync still owns membership retirement and cursors.
 		if _, err := tx.ExecContext(ctx, `
 			UPDATE messages SET source_message_id = 'msgvault-invalidated:' || CAST(id AS TEXT)
-			WHERE source_id = ? AND source_message_id = ? AND EXISTS (
+			WHERE source_id = ? AND source_message_id = ? AND (EXISTS (
 				SELECT 1 FROM imap_message_memberships
 				WHERE message_id = messages.id AND source_id = messages.source_id
 				  AND mailbox = ? AND uid = ? AND uidvalidity <> ?
-			)
-		`, receipt.SourceID, IMAPDraftSourceMessageID(receipt), receipt.Mailbox, receipt.UID, receipt.UIDValidity); err != nil {
+			) OR (EXISTS (
+				SELECT 1 FROM imap_folder_state WHERE source_id = messages.source_id AND mailbox = ? AND uidvalidity <> ?
+			) AND NOT EXISTS (
+				SELECT 1 FROM imap_message_memberships WHERE source_id = messages.source_id AND message_id = messages.id AND mailbox = ? AND uid = ?
+			)) OR (deleted_from_source_at IS NOT NULL AND NOT EXISTS (
+				SELECT 1 FROM imap_message_memberships WHERE source_id = messages.source_id AND message_id = messages.id
+			)))
+		`, receipt.SourceID, IMAPDraftSourceMessageID(receipt), receipt.Mailbox, receipt.UID, receipt.UIDValidity,
+			receipt.Mailbox, receipt.UIDValidity, receipt.Mailbox, receipt.UID); err != nil {
 			return fmt.Errorf("invalidate previous IMAP draft source key: %w", err)
 		}
 		err = tx.QueryRowContext(ctx, `
