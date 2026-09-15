@@ -462,6 +462,7 @@ func TestEngineTextMethodsUseGeneratedClientAdapter(t *testing.T) {
 	require.NoError(err, "ListConversationMessages")
 	require.Len(timeline, 1, "timeline")
 	assert.Equal("timeline body", timeline[0].BodyText)
+	assert.Equal(store.baseURL+"/messages/99", timeline[0].WebURL)
 	assert.Equal("Family", timeline[0].ConversationTitle)
 	assert.Equal("+15555550123", timeline[0].FromPhone)
 
@@ -469,6 +470,7 @@ func TestEngineTextMethodsUseGeneratedClientAdapter(t *testing.T) {
 	require.NoError(err, "TextSearch")
 	require.Len(searchResults, 1, "searchResults")
 	assert.Equal("search body", searchResults[0].BodyText)
+	assert.Equal(store.baseURL+"/messages/99", searchResults[0].WebURL)
 
 	stats, err := textEngine.GetTextStats(context.Background(), query.TextStatsOptions{SearchQuery: "family"})
 	require.NoError(err, "GetTextStats")
@@ -580,6 +582,7 @@ func TestEngineGetMessagePreservesGeneratedDetailMetadata(t *testing.T) {
 	require.NoError(err, "GetMessage")
 	require.NotNil(msg, "GetMessage returned nil")
 	assert.Equal("msg-42", msg.SourceMessageID, "SourceMessageID")
+	assert.Equal(store.baseURL+"/messages/42", msg.WebURL)
 	assert.Equal("sms", msg.MessageType, "MessageType")
 	require.NotNil(msg.DeletedAt, "DeletedAt")
 	assert.Equal(deletedAt, msg.DeletedAt.UTC().Format(time.RFC3339), "DeletedAt")
