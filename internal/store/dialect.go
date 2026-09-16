@@ -90,6 +90,17 @@ type Dialect interface {
 	// for the database driver. No-op for SQLite; converts to $1, $2, ... for PostgreSQL.
 	Rebind(query string) string
 
+	// UnicodeLowerExpression returns a Unicode-aware lowercasing SQL expression.
+	// SQLite uses the deterministic scalar registered on every connection;
+	// PostgreSQL uses its collation-aware LOWER implementation.
+	UnicodeLowerExpression(expr string) string
+
+	// BlobPrefixSQL returns an expression that reads at most the bytes bound by
+	// its one placeholder from a BLOB/bytea column expression. The repair
+	// paths use it before scanning raw archive payloads so database/sql never
+	// materializes a whole MIME body merely to inspect its headers.
+	BlobPrefixSQL(column string) string
+
 	// Now returns the SQL expression for the current timestamp.
 	// SQLite: "datetime('now')"  PostgreSQL: "NOW()"
 	Now() string
@@ -366,6 +377,22 @@ type Dialect interface {
 	// (emit "col = 1"); PostgreSQL has a real BOOLEAN type and rejects
 	// integer comparisons against it, so the bare column name is correct.
 	BoolTrueExpr(col string) string
+
+	// RFC822CanonicalIDExpr returns the SQL expression used to group stored
+	// Message-IDs after removing one structurally valid pair of angle brackets.
+	// SQLite must operate on BLOB bytes because its TEXT length and substring
+	// functions stop at embedded NUL; PostgreSQL TEXT rejects NUL at write time.
+	RFC822CanonicalIDExpr(col string) string
+
+	// RFC822CanonicalIDIndexDefinition returns the backend-specific portion of
+	// a composite canonical Message-ID/source index declaration beginning with
+	// ON messages. Keeping source_id in the index lets the production scope
+	// predicate be evaluated from the index while canonical ID remains first so
+	// GROUP BY can stream in index order. PostgreSQL needs an extra parenthesis
+	// pair around the CASE expression; SQLite does not. The indexed expression
+	// must stay byte-identical to RFC822CanonicalIDExpr("rfc822_message_id") so
+	// the planner can match it to the discovery query.
+	RFC822CanonicalIDIndexDefinition() string
 
 	// BuildFTSArg formats a slice of user-supplied search terms into the
 	// single string argument that FTSSearchClause's WHERE fragment binds

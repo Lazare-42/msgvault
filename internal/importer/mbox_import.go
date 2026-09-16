@@ -12,10 +12,13 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
 	"go.kenn.io/msgvault/internal/mbox"
+	"go.kenn.io/msgvault/internal/mime"
+	"go.kenn.io/msgvault/internal/remoteimage"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -39,6 +42,8 @@ type MboxImportOptions struct {
 	// AttachmentsDir controls where attachments are written.
 	// If empty, attachments are not written to disk (but messages are still imported).
 	AttachmentsDir string
+	// RemoteImages is nil unless remote image archiving was explicitly enabled.
+	RemoteImages *remoteimage.Fetcher
 
 	// MaxMessageBytes limits the maximum size of a single message read from the MBOX.
 	// If zero, a default of 128 MiB is used.
@@ -85,7 +90,9 @@ const sourceTypeMbox = "mbox"
 // This is intended for services like HEY.com that provide an export in MBOX
 // format but do not expose IMAP/POP. The importer stores the raw MIME,
 // parsed bodies, participants, recipients, and (optionally) attachments.
-func ImportMbox(ctx context.Context, st *store.Store, mboxPath string, opts MboxImportOptions) (*MboxImportSummary, error) {
+func ImportMbox(
+	ctx context.Context, st *store.Store, mboxPath string, opts MboxImportOptions,
+) (retSummary *MboxImportSummary, retErr error) {
 	if opts.SourceType == "" {
 		opts.SourceType = sourceTypeMbox
 	}
@@ -98,9 +105,13 @@ func ImportMbox(ctx context.Context, st *store.Store, mboxPath string, opts Mbox
 	if opts.MaxMessageBytes <= 0 {
 		opts.MaxMessageBytes = defaultMaxMboxMessageBytes
 	}
+	groupFallback := ""
+	if opts.SourceType == "google-groups" {
+		groupFallback = opts.Identifier
+	}
 	ingestFn := opts.IngestFunc
 	if ingestFn == nil {
-		ingestFn = ingestRawEmail
+		ingestFn = mboxMessageIngester(opts.RemoteImages, groupFallback)
 	}
 	log := opts.Logger
 	if log == nil {
@@ -124,8 +135,17 @@ func ImportMbox(ctx context.Context, st *store.Store, mboxPath string, opts Mbox
 		return nil, fmt.Errorf("get/create source: %w", err)
 	}
 	summary.SourceID = src.ID
+	ownershipCtx := context.WithoutCancel(ctx)
+	execution, err := st.AcquireSyncExecutionContext(ownershipCtx, src.ID)
+	if err != nil {
+		return nil, fmt.Errorf("acquire sync execution: %w", err)
+	}
+	defer func() {
+		retErr = errors.Join(retErr, execution.Release())
+	}()
 
-	// Create or resume the sync run for this source.
+	// Resume from a recovered checkpoint, then create a new run under the
+	// source ownership held for this import.
 	var (
 		syncID int64
 		cp     store.Checkpoint
@@ -134,12 +154,11 @@ func ImportMbox(ctx context.Context, st *store.Store, mboxPath string, opts Mbox
 	)
 
 	if !opts.NoResume {
-		active, err := st.GetActiveSync(src.ID)
+		active, err := st.GetLatestCheckpointedSyncByType(src.ID, "import-mbox")
 		if err != nil && !errors.Is(err, store.ErrSyncRunNotFound) {
-			return nil, fmt.Errorf("check active sync: %w", err)
+			return nil, fmt.Errorf("check resumable sync: %w", err)
 		}
 		if active != nil {
-			syncID = active.ID
 			cp.MessagesProcessed = active.MessagesProcessed
 			cp.MessagesAdded = active.MessagesAdded
 			cp.MessagesUpdated = active.MessagesUpdated
@@ -172,11 +191,9 @@ func ImportMbox(ctx context.Context, st *store.Store, mboxPath string, opts Mbox
 		}
 	}
 
-	if syncID == 0 {
-		syncID, err = st.StartSync(src.ID, "import-mbox")
-		if err != nil {
-			return nil, fmt.Errorf("start sync: %w", err)
-		}
+	syncID, err = execution.StartSyncContext(ownershipCtx, "import-mbox", "")
+	if err != nil {
+		return nil, fmt.Errorf("start sync: %w", err)
 	}
 	st = st.ScopedToSync(src.ID, syncID)
 
@@ -276,6 +293,7 @@ func ImportMbox(ctx context.Context, st *store.Store, mboxPath string, opts Mbox
 
 	var pending []pendingMboxMessage
 	var pendingBytes int64
+	groupLabelIDs := make(map[string]int64)
 
 	msgSeq := seq
 
@@ -324,6 +342,33 @@ func ImportMbox(ctx context.Context, st *store.Store, mboxPath string, opts Mbox
 			summary.MessagesProcessed++
 			summary.BytesProcessed += int64(len(p.Msg.Raw))
 
+			messageLabelIDs := append([]int64(nil), labelIDs...)
+			var metadata mime.GoogleGroupsHeaders
+			if groupFallback != "" {
+				metadata = mime.ParseGoogleGroupsHeaders(p.Msg.Raw, groupFallback)
+			}
+			var labelErr error
+			for _, name := range metadata.Labels {
+				id, ok := groupLabelIDs[name]
+				if !ok {
+					id, labelErr = st.EnsureLabel(src.ID, name, name, "user")
+					if labelErr != nil {
+						break
+					}
+					groupLabelIDs[name] = id
+				}
+				if !slices.Contains(messageLabelIDs, id) {
+					messageLabelIDs = append(messageLabelIDs, id)
+				}
+			}
+			if labelErr != nil {
+				cp.ErrorsCount++
+				summary.Errors++
+				log.Warn("failed to store Google Groups labels", "error", labelErr)
+				checkpointBlocked, hardErrors = true, true
+				continue
+			}
+
 			exists := false
 			if batchOK {
 				_, exists = existingWithRaw[p.SourceMsg]
@@ -347,9 +392,9 @@ func ImportMbox(ctx context.Context, st *store.Store, mboxPath string, opts Mbox
 				summary.MessagesSkipped++
 
 				// Add labels to existing message (same pattern as emlx importer).
-				if len(labelIDs) > 0 {
+				if len(messageLabelIDs) > 0 {
 					if msgID, ok := existingWithRaw[p.SourceMsg]; ok && msgID > 0 {
-						if err := st.AddMessageLabels(msgID, labelIDs); err != nil {
+						if err := st.AddMessageLabels(msgID, messageLabelIDs); err != nil {
 							log.Warn("failed to add labels to existing message",
 								"source_message_id", p.SourceMsg, "error", err)
 						} else {
@@ -387,7 +432,7 @@ func ImportMbox(ctx context.Context, st *store.Store, mboxPath string, opts Mbox
 				}
 			}
 
-			if err := ingestFn(ctx, st, src.ID, opts.Identifier, opts.AttachmentsDir, labelIDs, p.SourceMsg, p.RawHash, p.Msg, log); err != nil {
+			if err := ingestFn(ctx, st, src.ID, opts.Identifier, opts.AttachmentsDir, messageLabelIDs, p.SourceMsg, p.RawHash, p.Msg, log); err != nil {
 				cp.ErrorsCount++
 				summary.Errors++
 				log.Warn("failed to ingest message", "source_msg", p.SourceMsg, "next_offset", p.NextOffset, "error", err)
@@ -536,13 +581,28 @@ func ingestRawEmail(
 	labelIDs []int64, sourceMsgID, rawHash string,
 	msg *mbox.Message, log *slog.Logger,
 ) error {
-	var fallbackDate time.Time
-	if t, ok := parseFromLineDate(msg.FromLine); ok {
-		fallbackDate = t
+	return mboxMessageIngester(nil, "")(ctx, st, sourceID, identifier, attachmentsDir, labelIDs, sourceMsgID, rawHash, msg, log)
+}
+
+func mboxMessageIngester(images *remoteimage.Fetcher, groupFallback string) func(context.Context, *store.Store, int64, string, string, []int64, string, string, *mbox.Message, *slog.Logger) error {
+	return func(ctx context.Context, st *store.Store, sourceID int64, identifier, attachmentsDir string, labelIDs []int64, sourceMsgID, rawHash string, msg *mbox.Message, log *slog.Logger) error {
+		threadID := ""
+		if groupFallback != "" {
+			metadata := mime.ParseGoogleGroupsHeaders(msg.Raw, groupFallback)
+			if metadata.ThreadID != "" {
+				hash := sha256.Sum256([]byte(metadata.Group + "\x00" + metadata.ThreadID))
+				threadID = "google-groups:" + hex.EncodeToString(hash[:])
+			}
+			identifier = ""
+		}
+		var fallbackDate time.Time
+		if t, ok := parseFromLineDate(msg.FromLine); ok {
+			fallbackDate = t
+		}
+		return ingestRawMessage(
+			ctx, st, sourceID, identifier, attachmentsDir,
+			labelIDs, sourceMsgID, rawHash,
+			msg.Raw, fallbackDate, log, images, threadID,
+		)
 	}
-	return IngestRawMessage(
-		ctx, st, sourceID, identifier, attachmentsDir,
-		labelIDs, sourceMsgID, rawHash,
-		msg.Raw, fallbackDate, log,
-	)
 }

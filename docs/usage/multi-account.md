@@ -1,38 +1,53 @@
 ---
+last_edited: "2026-09-08"
 title: Accounts, Identities, and Collections
 description: How msgvault organizes every source into accounts, tracks which identifiers are "you," and groups accounts into collections for scoped search, stats, and deduplication.
 ---
 
-msgvault stores every source in one archive database: Gmail accounts, IMAP accounts, Microsoft 365 accounts, local imports, and chat/text imports. A source has an account identifier, optional display name, source type, labels, messages, attachments, and sync/import state.
+Keep live accounts, old imports, and chat histories in one archive while
+retaining where each message came from. Use account identities to tell
+msgvault which messages you sent, and collections to work with a chosen group
+of accounts.
 
-As an archive grows it accumulates overlapping sources: a current Gmail sync, an old mbox export, Apple Mail from a retired laptop, IMAP backups, chat exports, SMS history. Three concepts keep that collection organized without losing any source's provenance.
+## Accounts, identities, and collections
 
-## The Data Model
+| Concept | Meaning | Example |
+|---|---|---|
+| Account (also called a source) | One live connection or imported dataset | A Gmail sync and an MBOX import are separate accounts |
+| Account identity | Confirmed addresses, numbers, or handles that mean “you” in that source | Your primary email and a sending alias |
+| Collection | A named group of accounts | `Work` groups a current mailbox and older work exports |
 
-msgvault introduces three concepts, always in the same order: account, then identity, then collection. Each one builds on the previous.
+Each account keeps its own source type, messages, labels, and sync or import
+state. Importing the same mailbox through two paths does not silently merge
+them. An overlapping address or message alone does not prove that two sources
+belong together.
 
-**An account is one ingest source.** A Gmail sync is one account. An mbox import is another. It is the smallest durable unit of provenance in the archive. If you import the same real-world mailbox twice, once through Gmail sync and once from an old mbox export, you get two accounts. msgvault never silently merges them, and it never infers that two imports belong together just because an address, display name, or message content overlaps.
+Identity is per account. This matters when an export contains several people's
+mail or an old address means something different in another source. Confirmed
+identities let msgvault attribute messages to you and detect sent copies during
+[deduplication](/docs/usage/deduplication/).
 
-**An identity is the set of identifiers that mean "you" inside one account.** These are the email addresses, phone numbers, chat handles, or synthetic identifiers for that source. Identity is per-account because the same address can mean different things in different imports: an address that is unambiguously you in one source may be misleading in another. A confirmed identity lets msgvault treat a message as "from you" within that account's context, which is what makes sent-copy detection work during deduplication.
-
-**A collection is a named group of accounts.** The `All` collection exists by default and contains every account. You create others (`work`, `personal`, or any grouping you like) to search, report, and deduplicate a logical group without changing the underlying sources. A collection is the boundary for every cross-account operation. A collection's identity is the union of its member accounts' identities, computed at read time, so you never manage it directly. Collections contain accounts only, never other collections.
+The built-in `All` collection contains every account. Other collections have
+membership you choose. Their combined identity is the union of their member
+accounts' identities, calculated when used. Collections contain accounts only;
+they cannot contain other collections.
 
 <figure data-lightbox style="margin: 1.5rem 0; text-align: center;">
-  <img src="/assets/generated/concepts/account-collection-concept.png" alt="Accounts on the left are individual ingest sources, each carrying the identifiers that mean you inside that source. Collections on the right are named groups of accounts: All contains every account, with Personal and Work as deliberate subsets." loading="lazy" style="width: 100%; display: block;" />
+  <img src="/docs/assets/generated/concepts/account-collection-concept.png" alt="Accounts on the left are individual ingest sources, each carrying the identifiers that mean you inside that source. Collections on the right are named groups of accounts: All contains every account, with Personal and Work as deliberate subsets." loading="lazy" style="width: 100%; display: block;" />
 </figure>
 
-Deduplication operates over all three concepts and has its own [Deduplication](/usage/deduplication/) page.
+Deduplication operates over all three concepts and has its own [Deduplication](/docs/usage/deduplication/) page.
 
 ## OAuth Apps and Tokens
 
 For personal Gmail accounts, a single `client_secret.json` supports all of them. Each `add-account` call authorizes one account and stores a separate token file.
 
-Google Workspace organizations often restrict OAuth to apps created within their own org. If a Workspace account fails to authorize with your default app, create a separate OAuth app inside that org and add it as a named app in `config.toml`. See the [OAuth Setup Guide](/guides/oauth-setup/#google-workspace-accounts) for the full walkthrough.
+Google Workspace organizations often restrict OAuth to apps created within their own org. If a Workspace account fails to authorize with your default app, create a separate OAuth app inside that org and add it as a named app in `config.toml`. See the [OAuth Setup Guide](/docs/guides/oauth-setup/#google-workspace-accounts) for the full walkthrough.
 
 Workspace admins can also use a Google service account with domain-wide delegation. Configure `service_account_key` under `[oauth]` or `[oauth.apps.<name>]`, authorize the service account client in the Google Admin Console, then run `msgvault add-account user@domain.com`. Service-account accounts do not store per-user refresh tokens; msgvault mints delegated tokens on demand.
 
 <figure data-lightbox style="margin: 1.5rem 0; text-align: center;">
-  <img src="/assets/generated/concepts/oauth-multi-account-concept.png" alt="Two OAuth apps and the token files they create. A default app (config block [oauth]) authorizes personal Gmail accounts personal@gmail.com and other@gmail.com; a named app ([oauth.apps.acme]) authorizes the Workspace account you@acme.com. Each add-account run writes its own token file under ~/.msgvault/tokens/, color-matched to its account." loading="lazy" style="width: 100%; display: block;" />
+  <img src="/docs/assets/generated/concepts/oauth-multi-account-concept.png" alt="Two OAuth apps and the token files they create. A default app (config block [oauth]) authorizes personal Gmail accounts personal@gmail.com and other@gmail.com; a named app ([oauth.apps.acme]) authorizes the Workspace account you@acme.com. Each add-account run writes its own token file under ~/.msgvault/tokens/, color-matched to its account." loading="lazy" style="width: 100%; display: block;" />
 </figure>
 
 ## Adding Accounts
@@ -60,6 +75,60 @@ msgvault list-accounts
 !!! tip "Add every account as a Test user"
     Each Gmail account must be listed as a **Test user** in the OAuth consent screen of the app that authorizes it. For Workspace accounts using a named OAuth app, add test users in that org's Google Cloud project. This is the most common reason a second account fails to authorize.
 
+### Gmail addresses and display names
+
+Pass your Gmail account's email address to `add-account`, then select that
+account in Google's consent screen. The argument is required and must be a bare
+email address. A label such as `Work` belongs in `--display-name`:
+
+```bash
+msgvault add-account user@example.com --display-name "Work"
+msgvault update-account user@example.com --display-name "Personal"
+```
+
+Msgvault checks the authenticated mailbox against the requested address, including
+when reusing a stored token. A mismatch or failed verification stops registration
+before account settings change. Gmail's equivalent spellings (dots,
+plus-addressing, and `googlemail.com`) are accepted. For Google Workspace, use the
+primary address returned by Google; a different local part is not assumed to be
+an alias of the same account.
+
+Changing a display name keeps the account identifier and archived mail intact.
+Commands such as `sync-full` continue to use the identifier from `list-accounts`.
+
+### Recovering an older mislabeled Gmail account
+
+Older versions could store credentials under a label that did not match the
+authenticated mailbox. Account identifiers cannot currently be renamed in place.
+If you only need a readable name, use `update-account --display-name` above.
+
+To replace an incorrect identifier, remove the old Gmail source and add the
+primary address. **Removal deletes that source's local messages and sync state.**
+Only use this recovery path if the mail is still available in Gmail. Take a
+verified backup first so you can roll back; restoring it preserves the old
+identifier rather than moving mail to the new one. Removal does not delete mail
+from Google.
+
+```bash
+msgvault list-accounts
+msgvault remove-account old-label --type gmail
+msgvault add-account user@example.com
+msgvault sync-full user@example.com
+```
+
+Reuse the `--oauth-app` value originally used for this account, if any. Named
+apps are defined under `[oauth.apps.<name>]` in `config.toml`; identify the
+applicable one before removal. Use `--readonly` if you want the replacement Gmail
+grant to be read-only. Update any `[[accounts]]` schedule in `config.toml` to use the correct
+address, and recreate custom collection memberships and source identities as
+needed.
+
+Gmail removal also removes its local Google token and attempts to revoke the
+grant. Calendar sources registered under the old address remain in the archive,
+but can no longer rely on that credential. If you also sync Calendar or Drive,
+record their settings and re-authorize those integrations under the primary
+address; the Gmail commands above do not migrate them.
+
 ## Syncing
 
 Sync all accounts at once by omitting the email argument:
@@ -83,14 +152,14 @@ If a token expires during sync, msgvault prints the re-authorization URL with th
 
 ## Identities
 
-Each account has a confirmed "me" identity: the email addresses, phone numbers, chat handles, or synthetic identifiers that mean you inside that source. Deduplication uses this set for sent-copy detection, so for "sent" versus "received" to mean anything in older imports, msgvault needs to know which identifiers are you in each account.
+An account can have a confirmed "me" identity: the email addresses, phone numbers, chat handles, or synthetic identifiers that mean you inside that source. Deduplication uses this set for sent-copy detection, so for "sent" versus "received" to mean anything in older imports, msgvault needs to know which identifiers are you in each account.
 
 Source identities are different from the observed people and durable profiles
 used by relationship exploration. See [People, Profiles, and Source
-Identities](/usage/people/) for evidence discovery, bulk import, optional
+Identities](/docs/usage/people/) for evidence discovery, bulk import, optional
 Fastmail alias inventory, person promotion, and typed attributes.
 
-New Gmail, IMAP, Microsoft 365, MBOX, EMLX, WhatsApp, and Google Voice sources auto-confirm the source identifier by default. Use `--no-default-identity` on supported add/import commands when that is not correct. (iMessage imports are exempt, because iMessage contacts are not self-identifying.)
+New Gmail, IMAP, Microsoft 365, MBOX, EML, EMLX, WhatsApp, and Google Voice sources auto-confirm the source identifier by default. Use `--no-default-identity` on supported add/import commands when that is not correct. (iMessage imports are exempt, because iMessage contacts are not self-identifying.)
 
 ```bash
 # List confirmed identifiers across all accounts
@@ -112,6 +181,36 @@ Each confirmed identifier records the signals that confirmed it: `account-identi
 msgvault identity list --account work@company.com
 msgvault identity list --collection Work
 ```
+
+### Repair attribution in older archives
+
+If your account's own address was never confirmed, older sent messages may
+not be marked as yours. Confirm it and update the existing messages without a
+provider resync:
+
+```bash
+msgvault repair-identity you@example.com
+msgvault repair-identity --type imap
+```
+
+The default source type is Gmail. The command skips accounts whose own address
+is already confirmed or is not a plain valid email address. Existing aliases
+do not prevent it from adding the primary account address.
+
+### Select an exact source
+
+A live account and an import can share the same email address. Use the numeric
+ID from `list-accounts` when a command needs one exact source:
+
+```bash
+msgvault sync --source-id 3
+msgvault sync-full --source-id 3
+msgvault identity show --source-id 3
+```
+
+On commands that offer `--source-id`, use it in place of an account name. This
+avoids selecting a different source with the same identifier or display name.
+See the [CLI reference](/docs/cli-reference/) for the commands that accept it.
 
 ## Collections
 
@@ -156,16 +255,32 @@ msgvault stats --collection Work
 
 ## Deduplication
 
-Once several accounts hold overlapping copies of the same message, [deduplication](/usage/deduplication/) collapses each set to one visible survivor while keeping every source's provenance intact. It hides redundant copies rather than deleting them, and every step beyond hiding is a separate, opt-in action. See the [Deduplication](/usage/deduplication/) page for the detection rules, survivor selection, and the reversible safety ladder.
+Once several accounts hold overlapping copies of the same message, [deduplication](/docs/usage/deduplication/) collapses each set to one visible survivor while keeping every source's provenance intact. It hides redundant copies rather than deleting them, and every step beyond hiding is a separate, opt-in action. See the [Deduplication](/docs/usage/deduplication/) page for the detection rules, survivor selection, and the reversible safety ladder.
 
 ## TUI Filtering
 
-Press `A` (uppercase) inside the TUI to open the account selector modal. Pick a single account to scope every view, or pick "All Accounts" to clear the filter. The currently selected account is shown in the title bar.
+Press `A` (uppercase) inside the TUI to open the Email scope selector. Pick a
+single account, a named collection, or "All Accounts" to clear the filter. The
+title bar shows the selected account or `Collection: <name>`. A collection
+scope carries its exact member source IDs through Email aggregates, message
+lists, fast search, statistics, and deletion-target inspection. An empty
+collection matches nothing.
 
-Meetings mode uses the same key for a separate source selector. It lists only
-configured Granola and Circleback sources, and changing it does not replace the
-Email account filter.
+Named collections require API schema `2.17.0` or newer. Upgrade the daemon if
+its source selector does not offer collections. Texts and Meetings keep
+independent source selectors. Changing the Email scope returns
+to the top-level view and clears the current search and selection.
+
+Multi-source collections offer Fast search only. Deep search is available for
+single-source collections. Collection scopes do not offer Semantic search.
+Deletion staging accepts selections from one source, including within a larger
+collection; selections spanning sources are rejected. Deduplication remains
+available through the collection-scoped CLI commands, not through the TUI.
+
+Meetings mode uses the same key for a separate source selector. It lists
+Granola, Circleback, and Notion meeting sources. Changing it does not replace
+the Email account filter.
 
 ## Command Reference
 
-See the [CLI Reference](/cli-reference/#add-account) for the complete flag list on `add-account`, `add-imap`, `add-o365`, `identity`, and `collection`.
+See the [CLI Reference](/docs/cli-reference/#add-account) for the complete flag list on `add-account`, `add-imap`, `add-o365`, `identity`, and `collection`.

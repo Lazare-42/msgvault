@@ -6,6 +6,8 @@ type LoginSessionBody = SessionLoginRequest
 
 type AddAccountBody = AddAccountRequest
 
+type IssueAgentTokenBody = AgentTokenIssueRequest
+
 type CreateAttributeDefinitionBody = CreateAttributeDefinitionRequest
 
 type PatchAttributeDefinitionBody = PatchAttributeDefinitionRequest
@@ -21,6 +23,12 @@ type TestCardDAVAccountBody = CardDAVAccountRequest
 type UpdateCardDAVBookRolesBody = CardDAVBookRolesRequest
 
 type ResolveCardDAVConflictBody = CardDAVResolveRequest
+
+type BeginGoogleCardDAVAuthorizationBody = CardDAVGoogleAuthorizeRequest
+
+type CompleteGoogleCardDAVAuthorizationBody = CardDAVGoogleCallbackRequest
+
+type ApproveCardDAVPublicationBody = CardDAVPublicationApprovalRequest
 
 type SyncCardDAVBody = CardDAVSyncRequest
 
@@ -53,6 +61,8 @@ type AddCLIIdentityBody = AddRequest
 type DiscoverCLIIdentitiesBody = DiscoverRequest
 
 type ImportCLIIdentitiesBody = ImportRequest
+
+type RepairMessageCLIBody = CLIRepairMessageRequest
 
 type RunCLIBody = CLIRunRequest
 
@@ -102,6 +112,8 @@ type UnlinkIdentityParticipantsBody = IdentityLinkRequest
 
 type ImportMeetingBody = MeetingImportRequest
 
+type CreateImportJobBody = ImportJobRequest
+
 type CreateOrLinkMessageTaskBody = TaskLinkMutationRequest
 
 type StartVisualAttachmentBuildBody = VisualBuildRequest
@@ -133,6 +145,10 @@ type SearchPeopleBody = PersonSearchRequest
 type PatchPersonBody = PatchPersonRequest
 
 type SetPersonAttributeBody = SetPersonAttributeRequest
+
+type SetPersonBriefEnrollmentBody = PutPersonBriefEnrollmentRequest
+
+type RejectPersonBriefBody = RejectPersonBriefRequest
 
 type SetPersonFactPinBody = SetPersonFactPinRequest
 
@@ -170,8 +186,14 @@ type CreateSavedViewBody = CreateSavedViewRequest
 
 type PatchSavedViewBody = PatchSavedViewRequest
 
+type RunSavedViewBody = RunSavedViewRequest
+
 type SearchVisualAttachmentsBody = VisualTextSearchRequest
 
 type GetSearchCoverageBody = SearchCoverageRequest
 
 type PatchSettingsBody = SettingsPatchRequest
+
+type PutSettingsPersonEnrichmentProviderBody = PersonEnrichmentProviderUpdate
+
+type PutSettingsProviderCredentialBody = ProviderCredentialWriteRequest

@@ -27,7 +27,6 @@ components:
         accounts:
           items:
             $ref: "#/components/schemas/AccountInfo"
-          nullable: true
           type: array
       required:
         - accounts
@@ -168,12 +167,112 @@ components:
         - Email
         - Name
       type: object
+    AgentTokenIssueRequest:
+      additionalProperties: false
+      properties:
+        label:
+          type: string
+        permissions:
+          items:
+            type: string
+          type: array
+        source_ids:
+          items:
+            format: int64
+            type: integer
+          type: array
+      required:
+        - label
+        - permissions
+        - source_ids
+      type: object
+    AgentTokenIssueResponse:
+      properties:
+        created_at:
+          format: date-time
+          type: string
+        daemon_url:
+          type: string
+        id:
+          type: string
+        label:
+          type: string
+        permissions:
+          items:
+            type: string
+          type: array
+        secret:
+          type: string
+        sources:
+          items:
+            $ref: "#/components/schemas/AgentTokenSourceView"
+          type: array
+      required:
+        - id
+        - label
+        - permissions
+        - sources
+        - created_at
+        - secret
+        - daemon_url
+      type: object
+    AgentTokenListResponse:
+      properties:
+        tokens:
+          items:
+            $ref: "#/components/schemas/AgentTokenView"
+          type: array
+      required:
+        - tokens
+      type: object
+    AgentTokenSourceView:
+      properties:
+        id:
+          format: int64
+          type: integer
+        identifier:
+          type: string
+        type:
+          type: string
+      required:
+        - id
+        - type
+        - identifier
+      type: object
+    AgentTokenView:
+      properties:
+        created_at:
+          format: date-time
+          type: string
+        id:
+          type: string
+        label:
+          type: string
+        permissions:
+          items:
+            type: string
+          type: array
+        sources:
+          items:
+            $ref: "#/components/schemas/AgentTokenSourceView"
+          type: array
+      required:
+        - id
+        - label
+        - permissions
+        - sources
+        - created_at
+      type: object
     AggregateResponse:
       properties:
+        applied_source_ids:
+          items:
+            format: int64
+            type: integer
+          type: array
         rows:
           items:
             $ref: "#/components/schemas/AggregateRowJSON"
-          nullable: true
           type: array
         view_type:
           type: string
@@ -453,7 +552,6 @@ components:
         definitions:
           items:
             $ref: "#/components/schemas/AttributeDefinition"
-          nullable: true
           type: array
       required:
         - definitions
@@ -464,7 +562,6 @@ components:
         choices:
           items:
             $ref: "#/components/schemas/AttributeChoice"
-          nullable: true
           type: array
         max_length:
           format: int64
@@ -523,7 +620,6 @@ components:
         context_snippets:
           items:
             type: string
-          nullable: true
           type: array
         context_snippets_truncated:
           type: boolean
@@ -572,7 +668,6 @@ components:
         body_lines:
           items:
             type: string
-          nullable: true
           type: array
         cancel_hint:
           type: string
@@ -602,14 +697,14 @@ components:
       type: object
     CLIDeduplicatePlanItem:
       properties:
-        backfilled_count:
-          format: int64
-          type: integer
         duplicate_messages:
           format: int64
           type: integer
         needs_confirmation:
           type: boolean
+        pending_backfill_count:
+          format: int64
+          type: integer
         plan_fingerprint:
           type: string
         scope_is_collection:
@@ -635,8 +730,14 @@ components:
           type: boolean
         delete_dups_from_source_server:
           type: boolean
+        plan_protocol:
+          enum:
+            - explicit-backfill-v1
+          type: string
         prefer:
           type: string
+      required:
+        - plan_protocol
       type: object
     CLIDeduplicatePlanResponse:
       properties:
@@ -645,7 +746,6 @@ components:
         items:
           items:
             $ref: "#/components/schemas/CLIDeduplicatePlanItem"
-          nullable: true
           type: array
         prefix_stdout:
           type: string
@@ -690,7 +790,6 @@ components:
         planned_batch_ids:
           items:
             type: string
-          nullable: true
           type: array
         remote_delete_env_var:
           type: string
@@ -702,7 +801,6 @@ components:
         scope_escalation_body_lines:
           items:
             type: string
-          nullable: true
           type: array
         scope_escalation_cancel_hint:
           type: string
@@ -758,14 +856,12 @@ components:
         bcc:
           items:
             $ref: "#/components/schemas/Address"
-          nullable: true
           type: array
         body_text:
           type: string
         cc:
           items:
             $ref: "#/components/schemas/Address"
-          nullable: true
           type: array
         conversation_id:
           format: int64
@@ -789,7 +885,6 @@ components:
         labels:
           items:
             type: string
-          nullable: true
           type: array
         message_type:
           type: string
@@ -813,8 +908,9 @@ components:
         to:
           items:
             $ref: "#/components/schemas/Address"
-          nullable: true
           type: array
+        web_url:
+          type: string
       required:
         - id
         - source_message_id
@@ -841,6 +937,30 @@ components:
       required:
         - type
       type: object
+    CLIRepairMessageEvent:
+      properties:
+        data:
+          type: string
+        error:
+          type: string
+        type:
+          type: string
+      required:
+        - type
+      type: object
+    CLIRepairMessageRequest:
+      additionalProperties: false
+      properties:
+        audit:
+          type: boolean
+        json:
+          type: boolean
+        reference:
+          type: string
+        source_id:
+          format: int64
+          type: integer
+      type: object
     CLIRunEvent:
       properties:
         data:
@@ -858,7 +978,6 @@ components:
         args:
           items:
             type: string
-          nullable: true
           type: array
         cwd:
           type: string
@@ -928,7 +1047,6 @@ components:
         warnings:
           items:
             type: string
-          nullable: true
           type: array
       required:
         - status
@@ -976,7 +1094,6 @@ components:
         signals:
           items:
             type: string
-          nullable: true
           type: array
       required:
         - identifier
@@ -997,9 +1114,16 @@ components:
           type: string
         enabled:
           type: boolean
+        oauth_app:
+          type: string
         password:
           type: string
           writeOnly: true
+        provider:
+          enum:
+            - ""
+            - google
+          type: string
         schedule:
           type: string
         username:
@@ -1018,6 +1142,10 @@ components:
           type: integer
         enabled:
           type: boolean
+        oauth_app:
+          type: string
+        provider:
+          type: string
         schedule:
           type: string
         username:
@@ -1027,6 +1155,18 @@ components:
         - username
         - enabled
         - books
+      type: object
+    CardDAVAddressBookIdentityResponse:
+      properties:
+        id:
+          format: int64
+          minimum: 1
+          type: integer
+        name:
+          type: string
+      required:
+        - id
+        - name
       type: object
     CardDAVBookResponse:
       properties:
@@ -1073,97 +1213,312 @@ components:
         books:
           items:
             $ref: "#/components/schemas/CardDAVBookResponse"
-          nullable: true
           type: array
       required:
         - books
       type: object
     CardDAVConflictDetailResponse:
       properties:
-        address_book_id:
-          format: int64
-          type: integer
-        href:
+        address_book:
+          $ref: "#/components/schemas/CardDAVAddressBookIdentityResponse"
+        allowed_resolutions:
+          items:
+            enum:
+              - keep_local
+              - keep_remote
+            type: string
+            x-enum-names:
+              - CardDAVConflictDetailResponseAllowedResolutionsKeepLocal
+              - CardDAVConflictDetailResponseAllowedResolutionsKeepRemote
+          type: array
+        base:
+          $ref: "#/components/schemas/CardDAVContactSummaryResponse"
+        created_at:
+          format: date-time
           type: string
         id:
           format: int64
+          minimum: 1
           type: integer
-        local_tombstone:
-          type: boolean
-        local_vcard:
+        local:
+          $ref: "#/components/schemas/CardDAVContactSummaryResponse"
+        remote:
+          $ref: "#/components/schemas/CardDAVContactSummaryResponse"
+        resolution:
+          enum:
+            - keep_local
+            - keep_remote
           type: string
-        remote_tombstone:
-          type: boolean
-        remote_vcard:
+          x-enum-names:
+            - CardDAVConflictDetailResponseResolutionKeepLocal
+            - CardDAVConflictDetailResponseResolutionKeepRemote
+        resolved_at:
+          format: date-time
           type: string
         status:
+          enum:
+            - unresolved
+            - resolved
+          type: string
+          x-enum-names:
+            - CardDAVConflictDetailResponseStatusUnresolved
+            - CardDAVConflictDetailResponseStatusResolved
+        updated_at:
+          format: date-time
           type: string
       required:
         - id
-        - address_book_id
-        - href
-        - local_tombstone
-        - remote_tombstone
+        - address_book
         - status
+        - base
+        - local
+        - remote
+        - allowed_resolutions
+        - created_at
+        - updated_at
       type: object
     CardDAVConflictResolutionResponse:
       properties:
         id:
           format: int64
+          minimum: 1
           type: integer
-        status:
+        resolution:
+          enum:
+            - keep_local
+            - keep_remote
           type: string
+          x-enum-names:
+            - CardDAVConflictResolutionResponseResolutionKeepLocal
+            - CardDAVConflictResolutionResponseResolutionKeepRemote
+        status:
+          enum:
+            - resolved
+          type: string
+          x-enum-names:
+            - CardDAVConflictResolutionResponseStatusResolved
       required:
         - id
         - status
+        - resolution
       type: object
     CardDAVConflictResponse:
       properties:
-        address_book_id:
-          format: int64
-          type: integer
-        href:
-          type: string
+        address_book:
+          $ref: "#/components/schemas/CardDAVAddressBookIdentityResponse"
+        allowed_resolutions:
+          items:
+            enum:
+              - keep_local
+              - keep_remote
+            type: string
+            x-enum-names:
+              - CardDAVConflictResponseAllowedResolutionsKeepLocal
+              - CardDAVConflictResponseAllowedResolutionsKeepRemote
+          type: array
         id:
           format: int64
+          minimum: 1
           type: integer
-        local_tombstone:
-          type: boolean
-        remote_tombstone:
-          type: boolean
+        local_state:
+          enum:
+            - present
+            - deleted
+            - unavailable
+          type: string
+          x-enum-names:
+            - CardDAVConflictResponseLocalStatePresent
+            - CardDAVConflictResponseLocalStateDeleted
+            - CardDAVConflictResponseLocalStateUnavailable
+        remote_state:
+          enum:
+            - present
+            - deleted
+            - unavailable
+          type: string
+          x-enum-names:
+            - CardDAVConflictResponseRemoteStatePresent
+            - CardDAVConflictResponseRemoteStateDeleted
+            - CardDAVConflictResponseRemoteStateUnavailable
         status:
+          enum:
+            - unresolved
+            - resolved
+          type: string
+          x-enum-names:
+            - CardDAVConflictResponseStatusUnresolved
+            - CardDAVConflictResponseStatusResolved
+        updated_at:
+          format: date-time
           type: string
       required:
         - id
-        - address_book_id
-        - href
-        - local_tombstone
-        - remote_tombstone
+        - address_book
         - status
+        - local_state
+        - remote_state
+        - allowed_resolutions
+        - updated_at
       type: object
     CardDAVConflictsResponse:
       properties:
         conflicts:
           items:
             $ref: "#/components/schemas/CardDAVConflictResponse"
-          nullable: true
           type: array
       required:
         - conflicts
       type: object
-    CardDAVPublicationResponse:
+    CardDAVContactSummaryResponse:
       properties:
-        desired:
+        display_name:
+          type: string
+        emails:
+          items:
+            type: string
+          type: array
+        phones:
+          items:
+            type: string
+          type: array
+        state:
+          enum:
+            - present
+            - deleted
+            - unavailable
+          type: string
+          x-enum-names:
+            - CardDAVContactSummaryResponseStatePresent
+            - CardDAVContactSummaryResponseStateDeleted
+            - CardDAVContactSummaryResponseStateUnavailable
+        truncated:
           type: boolean
-        href:
+      required:
+        - state
+        - emails
+        - phones
+      type: object
+    CardDAVGoogleAuthorizeRequest:
+      additionalProperties: false
+      properties:
+        email:
           type: string
-        pending_operation:
+        oauth_app:
           type: string
+        redirect_uri:
+          type: string
+      required:
+        - email
+        - redirect_uri
+      type: object
+    CardDAVGoogleAuthorizeResponse:
+      properties:
+        state:
+          type: string
+        url:
+          type: string
+      required:
+        - url
+        - state
+      type: object
+    CardDAVGoogleCallbackRequest:
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+          writeOnly: true
+        state:
+          type: string
+      required:
+        - state
+        - code
+      type: object
+    CardDAVPublicationApprovalRequest:
+      additionalProperties: false
+      properties:
+        approval_token:
+          minLength: 1
+          type: string
+      required:
+        - approval_token
+      type: object
+    CardDAVPublicationPreviewResponse:
+      properties:
+        address_book:
+          $ref: "#/components/schemas/CardDAVAddressBookIdentityResponse"
+        approval_token:
+          type: string
+        conflict_id:
+          format: int64
+          minimum: 1
+          type: integer
+        kind:
+          enum:
+            - current
+            - pending
+            - conflict
+          type: string
+          x-enum-names:
+            - CardDAVPublicationPreviewResponseKindCurrent
+            - CardDAVPublicationPreviewResponseKindPending
+            - CardDAVPublicationPreviewResponseKindConflict
         person_id:
           format: int64
+          minimum: 1
           type: integer
+        review_required:
+          type: boolean
+        vcard:
+          type: string
       required:
         - person_id
+        - address_book
+        - kind
+        - vcard
+        - approval_token
+        - review_required
+      type: object
+    CardDAVPublicationResponse:
+      properties:
+        address_book:
+          $ref: "#/components/schemas/CardDAVAddressBookIdentityResponse"
+        conflict_id:
+          format: int64
+          minimum: 1
+          type: integer
+        desired:
+          type: boolean
+        inference_review_required:
+          type: boolean
+        pending_operation:
+          enum:
+            - create
+            - update
+            - delete
+          type: string
+          x-enum-names:
+            - CardDAVPublicationResponsePendingOperationCreate
+            - CardDAVPublicationResponsePendingOperationUpdate
+            - CardDAVPublicationResponsePendingOperationDelete
+        person_id:
+          format: int64
+          minimum: 1
+          type: integer
+        state:
+          enum:
+            - unpublished
+            - published
+            - pending
+            - conflict
+          type: string
+          x-enum-names:
+            - CardDAVPublicationResponseStateUnpublished
+            - CardDAVPublicationResponseStatePublished
+            - CardDAVPublicationResponseStatePending
+            - CardDAVPublicationResponseStateConflict
+      required:
+        - person_id
+        - state
         - desired
       type: object
     CardDAVResolveRequest:
@@ -1176,6 +1531,133 @@ components:
           type: string
       required:
         - choice
+      type: object
+    CardDAVRunResponse:
+      properties:
+        books:
+          format: int64
+          type: integer
+        created:
+          format: int64
+          type: integer
+        error_code:
+          enum:
+            - cancelled
+            - retry_after
+            - authentication_failed
+            - google_authorization_required
+            - upstream_failed
+            - safety_limit
+            - sync_failed
+            - unsafe_error_redacted
+            - daemon_restarted
+          type: string
+        error_message:
+          type: string
+        finished_at:
+          format: date-time
+          type: string
+        full:
+          type: boolean
+        id:
+          format: int64
+          type: integer
+        removed:
+          format: int64
+          type: integer
+        started_at:
+          format: date-time
+          type: string
+        state:
+          enum:
+            - running
+            - succeeded
+            - failed
+            - cancelled
+            - partial
+          type: string
+        trigger:
+          enum:
+            - manual
+            - scheduled
+          type: string
+        updated:
+          format: int64
+          type: integer
+      required:
+        - id
+        - trigger
+        - full
+        - state
+        - started_at
+        - books
+        - created
+        - updated
+        - removed
+      type: object
+    CardDAVRunsResponse:
+      properties:
+        next_before_id:
+          format: int64
+          type: integer
+        runs:
+          items:
+            $ref: "#/components/schemas/CardDAVRunResponse"
+          type: array
+      required:
+        - runs
+      type: object
+    CardDAVStatusAccount:
+      properties:
+        base_url:
+          type: string
+        username:
+          type: string
+      required:
+        - base_url
+        - username
+      type: object
+    CardDAVStatusResponse:
+      properties:
+        account:
+          $ref: "#/components/schemas/CardDAVStatusAccount"
+        active:
+          $ref: "#/components/schemas/CardDAVRunResponse"
+        available:
+          type: boolean
+        configured:
+          type: boolean
+        credential_configured:
+          type: boolean
+        enabled:
+          type: boolean
+        latest:
+          $ref: "#/components/schemas/CardDAVRunResponse"
+        latest_successful:
+          $ref: "#/components/schemas/CardDAVRunResponse"
+        next_scheduled_at:
+          format: date-time
+          type: string
+        repair_reason:
+          enum:
+            - account_missing
+            - credential_missing
+            - credential_mismatch
+            - credential_unavailable
+            - google_authorization_required
+            - runtime_unavailable
+          type: string
+        schedule:
+          type: string
+        scheduled:
+          type: boolean
+      required:
+        - configured
+        - available
+        - credential_configured
+        - enabled
+        - scheduled
+        - schedule
       type: object
     CardDAVSyncRequest:
       additionalProperties: false
@@ -1190,7 +1672,6 @@ components:
         targets:
           items:
             $ref: "#/components/schemas/TargetDescriptor"
-          nullable: true
           type: array
         version:
           type: string
@@ -1223,6 +1704,8 @@ components:
           type: integer
         internal_date:
           format: date-time
+          type: string
+        list_id:
           type: string
         message_type:
           type: string
@@ -1314,8 +1797,6 @@ components:
         source_deleted_count:
           format: int64
           type: integer
-        sync_config:
-          type: string
         type:
           type: string
       required:
@@ -1332,7 +1813,6 @@ components:
         accounts:
           items:
             $ref: "#/components/schemas/CliAccountResponse"
-          nullable: true
           type: array
       required:
         - accounts
@@ -1366,12 +1846,10 @@ components:
           items:
             format: int64
             type: integer
-          nullable: true
           type: array
         sources:
           items:
             $ref: "#/components/schemas/CliCollectionSourceResponse"
-          nullable: true
           type: array
       required:
         - id
@@ -1399,7 +1877,6 @@ components:
         collections:
           items:
             $ref: "#/components/schemas/CliCollectionResponse"
-          nullable: true
           type: array
       required:
         - collections
@@ -1424,7 +1901,6 @@ components:
         batch_ids:
           items:
             type: string
-          nullable: true
           type: array
         expected_batch_count:
           format: int64
@@ -1465,7 +1941,6 @@ components:
         batch_ids:
           items:
             type: string
-          nullable: true
           type: array
       type: object
     CliDeleteDedupedPlanResponse:
@@ -1476,7 +1951,6 @@ components:
         batches:
           items:
             $ref: "#/components/schemas/CliDeleteDedupedBatchResponse"
-          nullable: true
           type: array
         total:
           format: int64
@@ -1490,7 +1964,6 @@ components:
         rows:
           items:
             $ref: "#/components/schemas/CliIdentityRowResponse"
-          nullable: true
           type: array
       required:
         - rows
@@ -1509,7 +1982,6 @@ components:
         signals:
           items:
             type: string
-          nullable: true
           type: array
         source_id:
           format: int64
@@ -1569,12 +2041,10 @@ components:
         attachments:
           items:
             $ref: "#/components/schemas/CliMessageAttachment"
-          nullable: true
           type: array
         bcc:
           items:
             $ref: "#/components/schemas/CliMessageAddress"
-          nullable: true
           type: array
         body_html:
           type: string
@@ -1583,7 +2053,6 @@ components:
         cc:
           items:
             $ref: "#/components/schemas/CliMessageAddress"
-          nullable: true
           type: array
         conversation_id:
           format: int64
@@ -1595,7 +2064,6 @@ components:
         from:
           items:
             $ref: "#/components/schemas/CliMessageAddress"
-          nullable: true
           type: array
         has_attachments:
           type: boolean
@@ -1605,13 +2073,14 @@ components:
         labels:
           items:
             type: string
-          nullable: true
           type: array
         message_type:
           type: string
         received_at:
           format: date-time
           nullable: true
+          type: string
+        rfc822_message_id:
           type: string
         sent_at:
           format: date-time
@@ -1630,7 +2099,6 @@ components:
         to:
           items:
             $ref: "#/components/schemas/CliMessageAddress"
-          nullable: true
           type: array
       required:
         - id
@@ -1683,7 +2151,6 @@ components:
         results:
           items:
             $ref: "#/components/schemas/CLIQueryMessageSummary"
-          nullable: true
           type: array
         scope_label:
           type: string
@@ -1710,7 +2177,6 @@ components:
         aliases:
           items:
             type: string
-          nullable: true
           type: array
         created_at:
           format: date-time
@@ -1760,7 +2226,6 @@ components:
         services:
           items:
             $ref: "#/components/schemas/CommunicationService"
-          nullable: true
           type: array
       required:
         - services
@@ -1842,7 +2307,6 @@ components:
         messages:
           items:
             $ref: "#/components/schemas/MessageDetail"
-          nullable: true
           type: array
         total:
           format: int64
@@ -1907,7 +2371,6 @@ components:
         aliases:
           items:
             type: string
-          nullable: true
           type: array
         default_scope_kind:
           type: string
@@ -1966,7 +2429,6 @@ components:
             format: int64
             minimum: 1
             type: integer
-          nullable: true
           type: array
       required:
         - body
@@ -2037,7 +2499,6 @@ components:
         accounts:
           items:
             type: string
-          nullable: true
           type: array
         name:
           type: string
@@ -2092,7 +2553,6 @@ components:
           items:
             format: int64
             type: integer
-          nullable: true
           type: array
         source:
           type: string
@@ -2196,7 +2656,6 @@ components:
         body_contexts:
           items:
             $ref: "#/components/schemas/BodySearchContext"
-          nullable: true
           type: array
         count:
           format: int64
@@ -2209,7 +2668,6 @@ components:
         messages:
           items:
             $ref: "#/components/schemas/MessageSummary"
-          nullable: true
           type: array
         offset:
           format: int64
@@ -2218,10 +2676,16 @@ components:
           type: string
         scope:
           type: string
+        stats:
+          $ref: "#/components/schemas/TotalStatsResponse"
+        total_count:
+          format: int64
+          type: integer
       required:
         - query
         - messages
         - count
+        - total_count
         - has_more
         - offset
         - limit
@@ -2303,6 +2767,49 @@ components:
         - source_identifier
         - source_message_id
       type: object
+    DirectoryPeopleResponse:
+      properties:
+        next_cursor:
+          type: string
+        people:
+          items:
+            $ref: "#/components/schemas/DirectoryPersonSummary"
+          type: array
+      required:
+        - people
+      type: object
+    DirectoryPersonSummary:
+      properties:
+        categories:
+          items:
+            type: string
+          type: array
+        contact_state:
+          type: string
+        display_name:
+          type: string
+        id:
+          format: int64
+          type: integer
+        last_contact_at:
+          format: date-time
+          type: string
+        organizations:
+          items:
+            type: string
+          type: array
+        primary_channel:
+          type: string
+        revision:
+          format: int64
+          type: integer
+      required:
+        - id
+        - revision
+        - contact_state
+        - categories
+        - organizations
+      type: object
     DiscoverError:
       properties:
         code:
@@ -2356,7 +2863,6 @@ components:
         confirm:
           items:
             type: string
-          nullable: true
           type: array
         page_size:
           format: int64
@@ -2374,17 +2880,14 @@ components:
         applied:
           items:
             $ref: "#/components/schemas/IdentityConfirmationOutcome"
-          nullable: true
           type: array
         candidates:
           items:
             $ref: "#/components/schemas/Candidate"
-          nullable: true
           type: array
         rejected:
           items:
             $ref: "#/components/schemas/RejectedCandidate"
-          nullable: true
           type: array
         scanned_messages:
           format: int64
@@ -2534,7 +3037,6 @@ components:
         results:
           items:
             $ref: "#/components/schemas/DocumentSearchResult"
-          nullable: true
           type: array
         revision:
           format: int64
@@ -2582,7 +3084,6 @@ components:
         heading_path:
           items:
             type: string
-          nullable: true
           type: array
         highlight_end:
           format: int64
@@ -2599,7 +3100,6 @@ components:
         matched_signals:
           items:
             type: string
-          nullable: true
           type: array
         message_id:
           format: int64
@@ -2811,7 +3311,6 @@ components:
         failures:
           items:
             $ref: "#/components/schemas/DocumentVectorFailureDiagnostic"
-          nullable: true
           type: array
         failures_exhausted:
           type: boolean
@@ -2942,7 +3441,6 @@ components:
         rows:
           items:
             $ref: "#/components/schemas/DomainSummary"
-          nullable: true
           type: array
         search_provenance:
           $ref: "#/components/schemas/SearchProvenance"
@@ -2979,7 +3477,6 @@ components:
         source_counts:
           items:
             $ref: "#/components/schemas/SourceCount"
-          nullable: true
           type: array
       required:
         - domain
@@ -3154,7 +3651,6 @@ components:
         org:
           items:
             type: string
-          nullable: true
           type: array
         role:
           type: string
@@ -3166,7 +3662,6 @@ components:
         employments:
           items:
             $ref: "#/components/schemas/Employment"
-          nullable: true
           type: array
         projection:
           $ref: "#/components/schemas/EmploymentProjectionResponse"
@@ -3230,12 +3725,10 @@ components:
           items:
             format: int64
             type: integer
-          nullable: true
           type: array
         participant_labels:
           items:
             type: string
-          nullable: true
           type: array
         preview:
           type: string
@@ -3289,7 +3782,6 @@ components:
         failed_ids:
           items:
             type: string
-          nullable: true
           type: array
         last_processed_index:
           format: int64
@@ -3305,7 +3797,6 @@ components:
         tombstone_ids:
           items:
             type: string
-          nullable: true
           type: array
       required:
         - started_at
@@ -3431,6 +3922,8 @@ components:
           type: array
         next_cursor:
           type: string
+        search_deletion_scope:
+          type: string
         search_provenance:
           $ref: "#/components/schemas/SearchProvenance"
         total_count:
@@ -3451,6 +3944,7 @@ components:
             - participant
             - domain
             - message_type
+            - mailing_list
             - after
             - before
             - deletion
@@ -3461,6 +3955,7 @@ components:
             - ExploreFilterDimensionParticipant
             - ExploreFilterDimensionDomain
             - ExploreFilterDimensionMessageType
+            - ExploreFilterDimensionMailingList
             - ExploreFilterDimensionAfter
             - ExploreFilterDimensionBefore
             - ExploreFilterDimensionDeletion
@@ -3480,6 +3975,7 @@ components:
         - participant
         - domain
         - message_type
+        - mailing_list
         - kind
         - year
         - month
@@ -3489,6 +3985,7 @@ components:
         - ExploreGroupDimensionParticipant
         - ExploreGroupDimensionDomain
         - ExploreGroupDimensionMessageType
+        - ExploreGroupDimensionMailingList
         - ExploreGroupDimensionKind
         - ExploreGroupDimensionYear
         - ExploreGroupDimensionMonth
@@ -3549,7 +4046,6 @@ components:
         filters:
           items:
             $ref: "#/components/schemas/ExploreFilter"
-          nullable: true
           type: array
         group_key:
           type: string
@@ -3588,7 +4084,6 @@ components:
           items:
             $ref: "#/components/schemas/ExploreGroupSort"
           maxItems: 1
-          nullable: true
           type: array
       required:
         - grouping
@@ -3628,12 +4123,10 @@ components:
         filters:
           items:
             $ref: "#/components/schemas/ExploreFilter"
-          nullable: true
           type: array
         grouping:
           items:
             $ref: "#/components/schemas/ExploreGroupDimension"
-          nullable: true
           type: array
         limit:
           format: int64
@@ -3665,7 +4158,6 @@ components:
         sort:
           items:
             $ref: "#/components/schemas/ExploreSort"
-          nullable: true
           type: array
       type: object
     ExploreHTTPResponse:
@@ -3746,6 +4238,9 @@ components:
         count:
           format: int64
           type: integer
+        deletable_count:
+          format: int64
+          type: integer
         estimated_bytes:
           format: int64
           type: integer
@@ -3763,6 +4258,7 @@ components:
             $ref: "#/components/schemas/ExploreUnavailableAction"
           type: array
       required:
+        - deletable_count
         - count
         - estimated_bytes
         - cache_revision
@@ -3793,7 +4289,6 @@ components:
         exclusions:
           items:
             type: string
-          nullable: true
           type: array
         mode:
           enum:
@@ -3808,7 +4303,6 @@ components:
         row_keys:
           items:
             type: string
-          nullable: true
           type: array
         search_provenance:
           $ref: "#/components/schemas/SearchProvenance"
@@ -3886,7 +4380,6 @@ components:
         mime_families:
           items:
             type: string
-          nullable: true
           type: array
         predicate:
           $ref: "#/components/schemas/ExploreHTTPRequest"
@@ -3894,7 +4387,6 @@ components:
           items:
             $ref: "#/components/schemas/ExploreGroupSort"
           maxItems: 1
-          nullable: true
           type: array
       required:
         - predicate
@@ -3998,7 +4490,6 @@ components:
         mime_families:
           items:
             type: string
-          nullable: true
           type: array
         predicate:
           $ref: "#/components/schemas/ExploreHTTPRequest"
@@ -4021,7 +4512,6 @@ components:
         files:
           items:
             $ref: "#/components/schemas/FileSearchRow"
-          nullable: true
           type: array
         next_cursor:
           type: string
@@ -4076,18 +4566,15 @@ components:
         participant_domains:
           items:
             type: string
-          nullable: true
           type: array
         participant_ids:
           items:
             format: int64
             type: integer
-          nullable: true
           type: array
         participant_labels:
           items:
             type: string
-          nullable: true
           type: array
         search_explain:
           $ref: "#/components/schemas/FileSearchExplain"
@@ -4132,6 +4619,11 @@ components:
       type: object
     FilteredMessagesResponse:
       properties:
+        applied_source_ids:
+          items:
+            format: int64
+            type: integer
+          type: array
         count:
           format: int64
           type: integer
@@ -4143,7 +4635,6 @@ components:
         messages:
           items:
             $ref: "#/components/schemas/MessageSummary"
-          nullable: true
           type: array
         offset:
           format: int64
@@ -4167,22 +4658,22 @@ components:
         labels:
           items:
             type: string
-          nullable: true
+          type: array
+        list_ids:
+          items:
+            type: string
           type: array
         recipients:
           items:
             type: string
-          nullable: true
           type: array
         sender_domains:
           items:
             type: string
-          nullable: true
           type: array
         senders:
           items:
             type: string
-          nullable: true
           type: array
       type: object
     FormatCoverage:
@@ -4245,15 +4736,22 @@ components:
       type: object
     GmailIDsResponse:
       properties:
+        applied_source_ids:
+          items:
+            format: int64
+            type: integer
+          type: array
         gmail_ids:
           items:
             type: string
-          nullable: true
           type: array
+        search_mode:
+          type: string
+        search_query:
+          type: string
         targets:
           items:
             $ref: "#/components/schemas/DeletionTarget"
-          nullable: true
           type: array
       required:
         - gmail_ids
@@ -4299,12 +4797,10 @@ components:
         bcc:
           items:
             type: string
-          nullable: true
           type: array
         cc:
           items:
             type: string
-          nullable: true
           type: array
         conversation_id:
           format: int64
@@ -4327,12 +4823,10 @@ components:
         labels:
           items:
             type: string
-          nullable: true
           type: array
         matches:
           items:
             $ref: "#/components/schemas/HybridSearchMatch"
-          nullable: true
           type: array
         matches_truncated:
           type: boolean
@@ -4357,7 +4851,6 @@ components:
         to:
           items:
             type: string
-          nullable: true
           type: array
       required:
         - id
@@ -4402,7 +4895,6 @@ components:
         results:
           items:
             $ref: "#/components/schemas/HybridSearchItem"
-          nullable: true
           type: array
         returned:
           format: int64
@@ -4434,7 +4926,6 @@ components:
         signals:
           items:
             type: string
-          nullable: true
           type: array
       required:
         - identifier
@@ -4503,7 +4994,6 @@ components:
         evidence:
           items:
             $ref: "#/components/schemas/IdentityMatchEvidence"
-          nullable: true
           type: array
         id:
           format: int64
@@ -4555,7 +5045,6 @@ components:
         candidates:
           items:
             $ref: "#/components/schemas/IdentityMatchCandidate"
-          nullable: true
           type: array
         limit:
           format: int64
@@ -4666,6 +5155,107 @@ components:
       required:
         - identifier
       type: object
+    ImportJobRequest:
+      additionalProperties: false
+      properties:
+        account:
+          minLength: 1
+          type: string
+        after:
+          pattern: ^[0-9]{4}-[0-9]{2}-[0-9]{2}$
+          type: string
+        before:
+          pattern: ^[0-9]{4}-[0-9]{2}-[0-9]{2}$
+          type: string
+        limit:
+          format: int64
+          minimum: 0
+          type: integer
+        noresume:
+          type: boolean
+        query:
+          description: Gmail search query; not supported for IMAP sources
+          type: string
+      required:
+        - account
+      type: object
+    ImportJobResponse:
+      properties:
+        account:
+          type: string
+        added:
+          format: int64
+          type: integer
+        created_at:
+          format: date-time
+          type: string
+        error:
+          type: string
+        finished_at:
+          format: date-time
+          nullable: true
+          type: string
+        job_id:
+          type: string
+        processed:
+          format: int64
+          type: integer
+        skipped:
+          format: int64
+          type: integer
+        started_at:
+          format: date-time
+          nullable: true
+          type: string
+        status:
+          enum:
+            - pending
+            - running
+            - done
+            - failed
+          type: string
+          x-enum-names:
+            - ImportJobResponseStatusPending
+            - ImportJobResponseStatusRunning
+            - ImportJobResponseStatusDone
+            - ImportJobResponseStatusFailed
+        summary:
+          $ref: "#/components/schemas/ImportJobSummary"
+      required:
+        - job_id
+        - account
+        - status
+        - processed
+        - added
+        - skipped
+        - created_at
+        - started_at
+        - finished_at
+      type: object
+    ImportJobSummary:
+      properties:
+        added:
+          format: int64
+          type: integer
+        errors:
+          format: int64
+          type: integer
+        processed:
+          format: int64
+          type: integer
+        skipped:
+          format: int64
+          type: integer
+        updated:
+          format: int64
+          type: integer
+      required:
+        - processed
+        - added
+        - updated
+        - skipped
+        - errors
+      type: object
     ImportRequest:
       additionalProperties: false
       properties:
@@ -4714,7 +5304,6 @@ components:
         manifests:
           items:
             $ref: "#/components/schemas/DeletionManifestSummary"
-          nullable: true
           type: array
       required:
         - manifests
@@ -4736,11 +5325,13 @@ components:
         gmail_ids:
           items:
             type: string
-          nullable: true
           type: array
         id:
           type: string
-        raw_filter: {}
+        raw_filter:
+          x-go-type: json.RawMessage
+          x-go-type-import:
+            path: encoding/json
         source:
           $ref: "#/components/schemas/SourceReference"
         status:
@@ -4777,7 +5368,6 @@ components:
         attendees:
           items:
             $ref: "#/components/schemas/MeetingPerson"
-          nullable: true
           type: array
         ended_at:
           format: date-time
@@ -4808,7 +5398,6 @@ components:
         transcript_segments:
           items:
             $ref: "#/components/schemas/TranscriptSegment"
-          nullable: true
           type: array
       required:
         - external_id
@@ -4888,12 +5477,10 @@ components:
         attachments:
           items:
             $ref: "#/components/schemas/AttachmentInfo"
-          nullable: true
           type: array
         bcc:
           items:
             type: string
-          nullable: true
           type: array
         body:
           type: string
@@ -4904,7 +5491,6 @@ components:
         cc:
           items:
             type: string
-          nullable: true
           type: array
         conversation_id:
           format: int64
@@ -4929,7 +5515,6 @@ components:
         labels:
           items:
             type: string
-          nullable: true
           type: array
         message_type:
           type: string
@@ -4950,7 +5535,6 @@ components:
         to:
           items:
             type: string
-          nullable: true
           type: array
       required:
         - body
@@ -4970,7 +5554,6 @@ components:
         messages:
           items:
             $ref: "#/components/schemas/MessageSummary"
-          nullable: true
           type: array
         page:
           format: int64
@@ -4992,12 +5575,10 @@ components:
         bcc:
           items:
             type: string
-          nullable: true
           type: array
         cc:
           items:
             type: string
-          nullable: true
           type: array
         conversation_id:
           format: int64
@@ -5020,7 +5601,6 @@ components:
         labels:
           items:
             type: string
-          nullable: true
           type: array
         message_type:
           type: string
@@ -5041,7 +5621,6 @@ components:
         to:
           items:
             type: string
-          nullable: true
           type: array
       required:
         - id
@@ -5064,153 +5643,67 @@ components:
       required:
         - name
       type: object
-    OCRPage:
+    NetworkEdge:
       properties:
-        confidence:
-          format: double
-          type: number
-        method:
+        end_date:
           type: string
-        page_number:
-          format: int64
-          type: integer
-        text:
+        id:
+          type: string
+        kind:
+          enum:
+            - relationship
+            - employment
+          type: string
+        label:
+          type: string
+        relationship_type_slug:
+          type: string
+        source_node_id:
+          type: string
+        start_date:
+          type: string
+        target_node_id:
           type: string
       required:
-        - page_number
-        - method
-        - text
+        - id
+        - kind
+        - source_node_id
+        - target_node_id
+        - label
       type: object
-    OCRResult:
+    NetworkNode:
       properties:
-        attempts:
+        entity_id:
           format: int64
           type: integer
-        average_confidence:
-          format: double
-          type: number
-        content_hash:
-          type: string
-        error_code:
-          type: string
-        error_detail:
-          type: string
-        extractor_fingerprint:
-          type: string
-        method:
-          type: string
-        page_count:
+        hop:
           format: int64
           type: integer
-        pages:
-          items:
-            $ref: "#/components/schemas/OCRPage"
-          nullable: true
-          type: array
-        status:
+        id:
           type: string
-        updated_at:
-          format: date-time
+        kind:
+          enum:
+            - person
+            - organization
+          type: string
+        label:
           type: string
       required:
-        - content_hash
-        - status
-        - extractor_fingerprint
-        - attempts
-        - updated_at
+        - id
+        - kind
+        - entity_id
+        - label
+        - hop
       type: object
-    OCRRuntimeStatus:
-      properties:
-        enabled:
-          type: boolean
-        exhausted:
-          format: int64
-          type: integer
-        extractor_fingerprint:
-          type: string
-        failed:
-          format: int64
-          type: integer
-        pending:
-          format: int64
-          type: integer
-        ready:
-          format: int64
-          type: integer
-        running:
-          format: int64
-          type: integer
-        unsupported:
-          format: int64
-          type: integer
-      required:
-        - enabled
-        - extractor_fingerprint
-        - pending
-        - running
-        - ready
-        - failed
-        - exhausted
-        - unsupported
-      type: object
-    OCRSearchHit:
-      properties:
-        attachment_id:
-          format: int64
-          type: integer
-        confidence:
-          format: double
-          type: number
-        content_hash:
-          type: string
-        conversation_id:
-          format: int64
-          type: integer
-        filename:
-          type: string
-        message_id:
-          format: int64
-          type: integer
-        method:
-          type: string
-        mime_type:
-          type: string
-        page_number:
-          format: int64
-          type: integer
-        snippet:
-          type: string
-      required:
-        - attachment_id
-        - content_hash
-        - filename
-        - mime_type
-        - page_number
-        - method
-        - snippet
-        - message_id
-        - conversation_id
-      type: object
-    OcrSearchRequest:
+    OperationErrorResponse:
       additionalProperties: false
       properties:
-        limit:
-          format: int64
-          type: integer
-        query:
+        error:
+          type: string
+        message:
           type: string
       required:
-        - query
-      type: object
-    OcrSearchResponse:
-      properties:
-        results:
-          items:
-            $ref: "#/components/schemas/OCRSearchHit"
-          nullable: true
-          type: array
-      required:
-        - results
+        - error
       type: object
     OperationHealth:
       properties:
@@ -5223,6 +5716,359 @@ components:
           type: string
       required:
         - busy
+      type: object
+    OperationLaneStatus:
+      additionalProperties: false
+      properties:
+        active:
+          $ref: "#/components/schemas/OperationRunSummary"
+        configured:
+          type: boolean
+        history_availability:
+          enum:
+            - available
+            - unavailable
+          type: string
+        kind:
+          enum:
+            - carddav_sync
+            - document_embedding
+            - document_extraction
+            - message_embedding
+            - person_embedding
+            - person_enrichment
+            - person_sweep
+            - source_sync
+            - visual_embedding
+          type: string
+        lane:
+          enum:
+            - contacts
+            - documents
+            - messages
+            - person_facts
+            - visual_attachments
+          type: string
+        latest:
+          $ref: "#/components/schemas/OperationRunSummary"
+        latest_successful:
+          $ref: "#/components/schemas/OperationRunSummary"
+        related_status:
+          enum:
+            - listSourceStatus
+            - getDocumentIndexStatus
+            - getDocumentVectorStatus
+            - getVisualAttachmentStatus
+            - getCardDAVStatus
+          type: string
+        supported_actions:
+          items:
+            enum:
+              - carddav_sync
+              - visual_build
+              - visual_resume
+            type: string
+          type: array
+        unavailable_code:
+          type: string
+      required:
+        - kind
+        - lane
+        - configured
+        - history_availability
+        - supported_actions
+      type: object
+    OperationPublicCounter:
+      additionalProperties: false
+      properties:
+        name:
+          enum:
+            - added
+            - attempted
+            - books
+            - created
+            - failed
+            - identity_rejected
+            - item_errors
+            - processed
+            - projected_writes
+            - removed
+            - requested
+            - skipped
+            - started
+            - succeeded
+            - suppressed
+            - truncated
+            - updated
+          type: string
+        unit:
+          enum:
+            - attachments
+            - books
+            - chunks
+            - contacts
+            - documents
+            - messages
+            - people
+            - writes
+          type: string
+          x-enum-names:
+            - OperationPublicCounterUnitAttachments
+            - OperationPublicCounterUnitBooks
+            - OperationPublicCounterUnitChunks
+            - OperationPublicCounterUnitContacts
+            - OperationPublicCounterUnitDocuments
+            - OperationPublicCounterUnitMessages
+            - OperationPublicCounterUnitPeople
+            - OperationPublicCounterUnitWrites
+        value:
+          format: int64
+          type: integer
+      required:
+        - name
+        - unit
+        - value
+      type: object
+    OperationPublicError:
+      additionalProperties: false
+      properties:
+        code:
+          enum:
+            - archive_gap
+            - authentication_failed
+            - budget
+            - cancelled
+            - carddav_sync_failed
+            - daemon_restarted
+            - google_authorization_required
+            - internal
+            - invalid_output
+            - invocation_archive_drift
+            - invocation_authentication_failed
+            - invocation_cancelled
+            - invocation_daemon_restarted
+            - invocation_internal
+            - invocation_invalid_output
+            - invocation_rate_limited
+            - invocation_safety_limit
+            - invocation_timeout
+            - invocation_unsafe_error_redacted
+            - invocation_upstream_failed
+            - lease_lost
+            - person_sweep_failed
+            - policy
+            - provider_http
+            - rate_limited
+            - retry_after
+            - safety_limit
+            - source_sync_failed
+            - sync_failed
+            - timeout
+            - unsafe_error_redacted
+            - upstream_failed
+          type: string
+        message:
+          type: string
+      required:
+        - code
+        - message
+      type: object
+    OperationRunDetail:
+      additionalProperties: false
+      properties:
+        counters:
+          items:
+            $ref: "#/components/schemas/OperationPublicCounter"
+          type: array
+        error:
+          $ref: "#/components/schemas/OperationPublicError"
+        finished_at:
+          format: date-time
+          type: string
+        id:
+          type: string
+        kind:
+          enum:
+            - carddav_sync
+            - document_embedding
+            - document_extraction
+            - message_embedding
+            - person_embedding
+            - person_enrichment
+            - person_sweep
+            - source_sync
+            - visual_embedding
+          type: string
+        lane:
+          enum:
+            - contacts
+            - documents
+            - messages
+            - person_facts
+            - visual_attachments
+          type: string
+        related_status:
+          enum:
+            - listSourceStatus
+            - getDocumentIndexStatus
+            - getDocumentVectorStatus
+            - getVisualAttachmentStatus
+            - getCardDAVStatus
+          type: string
+        started_at:
+          format: date-time
+          type: string
+        state:
+          enum:
+            - cancelled
+            - failed
+            - partial
+            - queued
+            - running
+            - succeeded
+          type: string
+        supported_actions:
+          items:
+            enum:
+              - carddav_sync
+              - visual_build
+              - visual_resume
+            type: string
+          type: array
+        trigger:
+          enum:
+            - manual
+            - scheduled
+          type: string
+      required:
+        - supported_actions
+        - id
+        - kind
+        - lane
+        - state
+        - started_at
+        - counters
+      type: object
+    OperationRunSummary:
+      additionalProperties: false
+      properties:
+        counters:
+          items:
+            $ref: "#/components/schemas/OperationPublicCounter"
+          type: array
+        error:
+          $ref: "#/components/schemas/OperationPublicError"
+        finished_at:
+          format: date-time
+          type: string
+        id:
+          type: string
+        kind:
+          enum:
+            - carddav_sync
+            - document_embedding
+            - document_extraction
+            - message_embedding
+            - person_embedding
+            - person_enrichment
+            - person_sweep
+            - source_sync
+            - visual_embedding
+          type: string
+        lane:
+          enum:
+            - contacts
+            - documents
+            - messages
+            - person_facts
+            - visual_attachments
+          type: string
+        started_at:
+          format: date-time
+          type: string
+        state:
+          enum:
+            - cancelled
+            - failed
+            - partial
+            - queued
+            - running
+            - succeeded
+          type: string
+        trigger:
+          enum:
+            - manual
+            - scheduled
+          type: string
+      required:
+        - id
+        - kind
+        - lane
+        - state
+        - started_at
+        - counters
+      type: object
+    OperationRunsResponse:
+      additionalProperties: false
+      properties:
+        membership_revision:
+          format: int64
+          minimum: 0
+          type: integer
+        next_cursor:
+          type: string
+        runs:
+          items:
+            $ref: "#/components/schemas/OperationRunSummary"
+          type: array
+        unavailable_kinds:
+          items:
+            $ref: "#/components/schemas/OperationUnavailableKind"
+          type: array
+      required:
+        - runs
+        - membership_revision
+        - unavailable_kinds
+      type: object
+    OperationStatusResponse:
+      additionalProperties: false
+      properties:
+        lanes:
+          items:
+            $ref: "#/components/schemas/OperationLaneStatus"
+          type: array
+      required:
+        - lanes
+      type: object
+    OperationUnavailableKind:
+      additionalProperties: false
+      properties:
+        kind:
+          enum:
+            - carddav_sync
+            - document_embedding
+            - document_extraction
+            - message_embedding
+            - person_embedding
+            - person_enrichment
+            - person_sweep
+            - source_sync
+            - visual_embedding
+          type: string
+        lane:
+          enum:
+            - contacts
+            - documents
+            - messages
+            - person_facts
+            - visual_attachments
+          type: string
+        unavailable_code:
+          type: string
+      required:
+        - kind
+        - lane
+        - unavailable_code
       type: object
     Organization:
       properties:
@@ -5377,6 +6223,9 @@ components:
         source_ref:
           nullable: true
           type: string
+        source_resource_uid:
+          nullable: true
+          type: string
         street_address:
           nullable: true
           type: string
@@ -5389,7 +6238,6 @@ components:
         type_tokens:
           items:
             type: string
-          nullable: true
           type: array
         vcard_altid:
           nullable: true
@@ -5400,7 +6248,6 @@ components:
         vcard_pid:
           items:
             type: string
-          nullable: true
           type: array
         vcard_prop_id:
           nullable: true
@@ -5478,7 +6325,6 @@ components:
         values:
           items:
             $ref: "#/components/schemas/OrganizationAttributeValue"
-          nullable: true
           type: array
       required:
         - values
@@ -5560,13 +6406,15 @@ components:
         source_ref:
           nullable: true
           type: string
+        source_resource_uid:
+          nullable: true
+          type: string
         type_label:
           nullable: true
           type: string
         type_tokens:
           items:
             type: string
-          nullable: true
           type: array
         vcard_altid:
           nullable: true
@@ -5577,7 +6425,6 @@ components:
         vcard_pid:
           items:
             type: string
-          nullable: true
           type: array
         vcard_prop_id:
           nullable: true
@@ -5680,13 +6527,15 @@ components:
         source_ref:
           nullable: true
           type: string
+        source_resource_uid:
+          nullable: true
+          type: string
         type_label:
           nullable: true
           type: string
         type_tokens:
           items:
             type: string
-          nullable: true
           type: array
         uri:
           nullable: true
@@ -5700,7 +6549,6 @@ components:
         vcard_pid:
           items:
             type: string
-          nullable: true
           type: array
         vcard_prop_id:
           nullable: true
@@ -5799,13 +6647,15 @@ components:
         source_ref:
           nullable: true
           type: string
+        source_resource_uid:
+          nullable: true
+          type: string
         type_label:
           nullable: true
           type: string
         type_tokens:
           items:
             type: string
-          nullable: true
           type: array
         vcard_altid:
           nullable: true
@@ -5816,7 +6666,6 @@ components:
         vcard_pid:
           items:
             type: string
-          nullable: true
           type: array
         vcard_prop_id:
           nullable: true
@@ -5908,13 +6757,15 @@ components:
         source_ref:
           nullable: true
           type: string
+        source_resource_uid:
+          nullable: true
+          type: string
         type_label:
           nullable: true
           type: string
         type_tokens:
           items:
             type: string
-          nullable: true
           type: array
         uri:
           nullable: true
@@ -5928,7 +6779,6 @@ components:
         vcard_pid:
           items:
             type: string
-          nullable: true
           type: array
         vcard_prop_id:
           nullable: true
@@ -6002,13 +6852,15 @@ components:
         source_ref:
           nullable: true
           type: string
+        source_resource_uid:
+          nullable: true
+          type: string
         type_label:
           nullable: true
           type: string
         type_tokens:
           items:
             type: string
-          nullable: true
           type: array
         vcard_altid:
           nullable: true
@@ -6019,7 +6871,6 @@ components:
         vcard_pid:
           items:
             type: string
-          nullable: true
           type: array
         vcard_prop_id:
           nullable: true
@@ -6037,32 +6888,26 @@ components:
         addresses:
           items:
             $ref: "#/components/schemas/OrganizationAddress"
-          nullable: true
           type: array
         categories:
           items:
             $ref: "#/components/schemas/OrganizationCategory"
-          nullable: true
           type: array
         contact_points:
           items:
             $ref: "#/components/schemas/OrganizationContactPoint"
-          nullable: true
           type: array
         identifiers:
           items:
             $ref: "#/components/schemas/OrganizationIdentifier"
-          nullable: true
           type: array
         media:
           items:
             $ref: "#/components/schemas/OrganizationMedia"
-          nullable: true
           type: array
         names:
           items:
             $ref: "#/components/schemas/OrganizationName"
-          nullable: true
           type: array
         organization:
           $ref: "#/components/schemas/Organization"
@@ -6081,32 +6926,26 @@ components:
         addresses:
           items:
             $ref: "#/components/schemas/OrganizationAddressBody"
-          nullable: true
           type: array
         categories:
           items:
             $ref: "#/components/schemas/OrganizationCategoryBody"
-          nullable: true
           type: array
         contact_points:
           items:
             $ref: "#/components/schemas/OrganizationContactPointBody"
-          nullable: true
           type: array
         identifiers:
           items:
             $ref: "#/components/schemas/OrganizationIdentifierBody"
-          nullable: true
           type: array
         media:
           items:
             $ref: "#/components/schemas/OrganizationMediaBody"
-          nullable: true
           type: array
         names:
           items:
             $ref: "#/components/schemas/OrganizationNameBody"
-          nullable: true
           type: array
       type: object
     OrganizationsResponse:
@@ -6120,7 +6959,6 @@ components:
         organizations:
           items:
             $ref: "#/components/schemas/Organization"
-          nullable: true
           type: array
         total:
           format: int64
@@ -6164,7 +7002,6 @@ components:
         rows:
           items:
             $ref: "#/components/schemas/ParticipantCompletionHTTPRow"
-          nullable: true
           type: array
       required:
         - rows
@@ -6266,7 +7103,6 @@ components:
         rows:
           items:
             $ref: "#/components/schemas/PersonSummary"
-          nullable: true
           type: array
         search_provenance:
           $ref: "#/components/schemas/SearchProvenance"
@@ -6352,7 +7188,6 @@ components:
         people:
           items:
             $ref: "#/components/schemas/Person"
-          nullable: true
           type: array
       required:
         - people
@@ -6371,7 +7206,6 @@ components:
           items:
             format: int64
             type: integer
-          nullable: true
           type: array
         revision:
           format: int64
@@ -6481,13 +7315,11 @@ components:
         add:
           items:
             $ref: "#/components/schemas/PersonAddressInputRequest"
-          nullable: true
           type: array
         supersede:
           items:
             format: int64
             type: integer
-          nullable: true
           type: array
       type: object
     PersonAttributeConflictResponse:
@@ -6509,14 +7341,12 @@ components:
         current:
           items:
             $ref: "#/components/schemas/PersonAttributeValue"
-          nullable: true
           type: array
         definition:
           $ref: "#/components/schemas/AttributeDefinition"
         history:
           items:
             $ref: "#/components/schemas/PersonAttributeValue"
-          nullable: true
           type: array
       required:
         - definition
@@ -6588,7 +7418,6 @@ components:
         attributes:
           items:
             $ref: "#/components/schemas/PersonAttributeGroup"
-          nullable: true
           type: array
         person_id:
           format: int64
@@ -6596,6 +7425,181 @@ components:
       required:
         - person_id
         - attributes
+      type: object
+    PersonBrief:
+      properties:
+        boundary:
+          x-go-type: json.RawMessage
+          x-go-type-import:
+            path: encoding/json
+        dropped_item_count:
+          format: int64
+          type: integer
+        evidence:
+          items:
+            $ref: "#/components/schemas/PersonBriefEvidencePointer"
+          type: array
+        generated_at:
+          format: date-time
+          type: string
+        model:
+          type: string
+        program_id:
+          type: string
+        program_version:
+          type: string
+        provider:
+          type: string
+        rejected_at:
+          format: date-time
+          nullable: true
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        rejected_reason:
+          type: string
+        rendered_text:
+          type: string
+        renderer_policy:
+          type: string
+        sentences:
+          items:
+            $ref: "#/components/schemas/PersonBriefSentence"
+          type: array
+        status:
+          type: string
+        structured:
+          x-go-type: json.RawMessage
+          x-go-type-import:
+            path: encoding/json
+        superseded_at:
+          format: date-time
+          nullable: true
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        version:
+          format: int64
+          type: integer
+      required:
+        - version
+        - status
+        - generated_at
+        - rendered_text
+        - renderer_policy
+        - sentences
+        - structured
+        - evidence
+        - boundary
+        - dropped_item_count
+        - program_id
+        - program_version
+        - provider
+        - model
+        - rejected_at
+        - rejected_reason
+        - superseded_at
+      type: object
+    PersonBriefEnrollment:
+      properties:
+        actor:
+          type: string
+        enabled_at:
+          format: date-time
+          nullable: true
+          type: string
+          x-oapi-codegen-extra-tags:
+            validate: omitempty
+          x-omitempty: false
+        enrolled:
+          type: boolean
+        person_id:
+          format: int64
+          type: integer
+      required:
+        - person_id
+        - enrolled
+        - enabled_at
+        - actor
+      type: object
+    PersonBriefEvidencePointer:
+      properties:
+        directness:
+          type: string
+        event_time:
+          format: date-time
+          type: string
+        evidence_id:
+          format: int64
+          type: integer
+        evidence_key:
+          type: string
+        evidence_supported:
+          type: boolean
+        ordinal:
+          format: int64
+          type: integer
+        source_ref:
+          type: string
+        source_url:
+          type: string
+      required:
+        - ordinal
+        - evidence_id
+        - evidence_key
+        - source_ref
+        - source_url
+        - directness
+        - event_time
+        - evidence_supported
+      type: object
+    PersonBriefRun:
+      properties:
+        attempt_id:
+          type: string
+        brief_failure_class:
+          type: string
+        brief_version:
+          format: int64
+          type: integer
+        run_id:
+          type: string
+      required:
+        - run_id
+        - attempt_id
+        - brief_version
+        - brief_failure_class
+      type: object
+    PersonBriefSentence:
+      properties:
+        evidence_ordinals:
+          items:
+            format: int64
+            type: integer
+          type: array
+        index:
+          format: int64
+          type: integer
+        kind:
+          type: string
+        text:
+          type: string
+      required:
+        - kind
+        - index
+        - text
+        - evidence_ordinals
+      type: object
+    PersonBriefVersionsResponse:
+      properties:
+        versions:
+          items:
+            $ref: "#/components/schemas/PersonBrief"
+          type: array
+      required:
+        - versions
       type: object
     PersonCategory:
       properties:
@@ -6631,13 +7635,11 @@ components:
         add:
           items:
             $ref: "#/components/schemas/PersonCategoryInputRequest"
-          nullable: true
           type: array
         supersede:
           items:
             format: int64
             type: integer
-          nullable: true
           type: array
       type: object
     PersonCluster:
@@ -6648,13 +7650,11 @@ components:
         edges:
           items:
             $ref: "#/components/schemas/PersonClusterEdge"
-          nullable: true
           type: array
         member_ids:
           items:
             format: int64
             type: integer
-          nullable: true
           type: array
       required:
         - canonical_id
@@ -6736,13 +7736,11 @@ components:
         add:
           items:
             $ref: "#/components/schemas/PersonContactPointInputRequest"
-          nullable: true
           type: array
         supersede:
           items:
             format: int64
             type: integer
-          nullable: true
           type: array
       type: object
     PersonDate:
@@ -6798,13 +7796,11 @@ components:
         add:
           items:
             $ref: "#/components/schemas/PersonDateInputRequest"
-          nullable: true
           type: array
         supersede:
           items:
             format: int64
             type: integer
-          nullable: true
           type: array
       type: object
     PersonDay:
@@ -6872,6 +7868,149 @@ components:
         - days
         - total_count
       type: object
+    PersonEnrichmentProviderSetting:
+      properties:
+        allow_sensitive_targets:
+          type: boolean
+        allowed_identifiers:
+          items:
+            type: string
+          type: array
+        credential:
+          $ref: "#/components/schemas/SecretSettingState"
+        credential_id:
+          type: string
+        enabled:
+          type: boolean
+        endpoint:
+          type: string
+        kind:
+          enum:
+            - exa
+            - sixtyfour
+          type: string
+        max_job_age:
+          type: string
+        max_requests_per_day:
+          format: int64
+          type: integer
+        max_requests_per_run:
+          format: int64
+          type: integer
+        max_retries:
+          format: int64
+          type: integer
+        mode:
+          type: string
+        name:
+          type: string
+        num_results:
+          format: int64
+          type: integer
+        poll_endpoint:
+          type: string
+        poll_interval:
+          type: string
+        refresh_interval:
+          type: string
+        request_timeout:
+          type: string
+        retention_posture:
+          type: string
+        target_keys:
+          items:
+            type: string
+          type: array
+        tier:
+          type: string
+        training_posture:
+          type: string
+      required:
+        - name
+        - kind
+        - enabled
+        - endpoint
+        - allowed_identifiers
+        - target_keys
+        - allow_sensitive_targets
+        - retention_posture
+        - training_posture
+        - refresh_interval
+        - request_timeout
+        - poll_interval
+        - max_job_age
+        - max_retries
+        - max_requests_per_run
+        - max_requests_per_day
+        - credential_id
+      type: object
+    PersonEnrichmentProviderUpdate:
+      additionalProperties: false
+      properties:
+        allow_sensitive_targets:
+          type: boolean
+        allowed_identifiers:
+          items:
+            type: string
+          type: array
+        enabled:
+          type: boolean
+        endpoint:
+          type: string
+        kind:
+          enum:
+            - exa
+            - sixtyfour
+          type: string
+        max_job_age:
+          type: string
+        max_requests_per_day:
+          format: int64
+          type: integer
+        max_requests_per_run:
+          format: int64
+          type: integer
+        max_retries:
+          format: int64
+          type: integer
+        mode:
+          type: string
+        num_results:
+          format: int64
+          type: integer
+        poll_endpoint:
+          type: string
+        poll_interval:
+          type: string
+        refresh_interval:
+          type: string
+        request_timeout:
+          type: string
+        retention_posture:
+          type: string
+        target_keys:
+          items:
+            type: string
+          type: array
+        tier:
+          type: string
+        training_posture:
+          type: string
+      required:
+        - kind
+        - enabled
+        - endpoint
+        - allowed_identifiers
+        - target_keys
+        - allow_sensitive_targets
+        - retention_posture
+        - training_posture
+        - refresh_interval
+        - request_timeout
+        - max_retries
+        - max_requests_per_run
+        - max_requests_per_day
+      type: object
     PersonFactClaim:
       properties:
         claim_key:
@@ -6885,7 +8024,6 @@ components:
           items:
             format: int64
             type: integer
-          nullable: true
           type: array
         generation_id:
           format: int64
@@ -7118,12 +8256,10 @@ components:
         projections:
           items:
             $ref: "#/components/schemas/ProjectionRef"
-          nullable: true
           type: array
         resolutions:
           items:
             $ref: "#/components/schemas/PersonFactResolutionResult"
-          nullable: true
           type: array
         state:
           $ref: "#/components/schemas/PinState"
@@ -7137,7 +8273,6 @@ components:
         pins:
           items:
             $ref: "#/components/schemas/PinState"
-          nullable: true
           type: array
       required:
         - pins
@@ -7147,7 +8282,6 @@ components:
         decisions:
           items:
             $ref: "#/components/schemas/PersonFactDecision"
-          nullable: true
           type: array
         id:
           format: int64
@@ -7157,7 +8291,6 @@ components:
         projections:
           items:
             $ref: "#/components/schemas/ProjectionRef"
-          nullable: true
           type: array
         resolved_at:
           format: date-time
@@ -7216,13 +8349,11 @@ components:
               - to_person
               - group
             type: string
-          nullable: true
           type: array
         participant_ids:
           items:
             format: int64
             type: integer
-          nullable: true
           type: array
         roles:
           items:
@@ -7233,7 +8364,6 @@ components:
               - bcc
               - conversation_member
             type: string
-          nullable: true
           type: array
       required:
         - participant_ids
@@ -7252,7 +8382,6 @@ components:
               - to_person
               - group
             type: string
-          nullable: true
           type: array
         filename_query:
           type: string
@@ -7264,7 +8393,6 @@ components:
         mime_families:
           items:
             type: string
-          nullable: true
           type: array
         predicate:
           $ref: "#/components/schemas/ExploreHTTPRequest"
@@ -7287,7 +8415,6 @@ components:
         files:
           items:
             $ref: "#/components/schemas/PersonFileSearchRow"
-          nullable: true
           type: array
         next_cursor:
           type: string
@@ -7342,18 +8469,15 @@ components:
         participant_domains:
           items:
             type: string
-          nullable: true
           type: array
         participant_ids:
           items:
             format: int64
             type: integer
-          nullable: true
           type: array
         participant_labels:
           items:
             type: string
-          nullable: true
           type: array
         person_provenance:
           $ref: "#/components/schemas/PersonFileProvenance"
@@ -7420,7 +8544,6 @@ components:
         rows:
           items:
             $ref: "#/components/schemas/PersonInboxRow"
-          nullable: true
           type: array
       required:
         - rows
@@ -7518,13 +8641,11 @@ components:
         add:
           items:
             $ref: "#/components/schemas/PersonMediaInputRequest"
-          nullable: true
           type: array
         supersede:
           items:
             format: int64
             type: integer
-          nullable: true
           type: array
       type: object
     PersonMerge:
@@ -7585,25 +8706,21 @@ components:
         participants:
           items:
             $ref: "#/components/schemas/PersonMergeParticipant"
-          nullable: true
           type: array
           x-omitempty: false
         review_candidates:
           items:
             $ref: "#/components/schemas/PersonMergeReviewCandidate"
-          nullable: true
           type: array
           x-omitempty: false
         rows:
           items:
             $ref: "#/components/schemas/PersonMergeRow"
-          nullable: true
           type: array
           x-omitempty: false
         splits:
           items:
             $ref: "#/components/schemas/PersonSplit"
-          nullable: true
           type: array
           x-omitempty: false
       required:
@@ -7650,7 +8767,6 @@ components:
         profiles:
           items:
             $ref: "#/components/schemas/PersonMergeProfile"
-          nullable: true
           type: array
       required:
         - error
@@ -7674,7 +8790,6 @@ components:
         review_candidates:
           items:
             $ref: "#/components/schemas/PersonMergeReviewCandidate"
-          nullable: true
           type: array
           x-omitempty: false
       required:
@@ -7836,7 +8951,6 @@ components:
         merges:
           items:
             $ref: "#/components/schemas/PersonMergeSummary"
-          nullable: true
           type: array
         offset:
           format: int64
@@ -7939,14 +9053,37 @@ components:
         add:
           items:
             $ref: "#/components/schemas/PersonNameInputRequest"
-          nullable: true
           type: array
         supersede:
           items:
             format: int64
             type: integer
-          nullable: true
           type: array
+      type: object
+    PersonNetwork:
+      properties:
+        depth:
+          format: int64
+          type: integer
+        edges:
+          items:
+            $ref: "#/components/schemas/NetworkEdge"
+          type: array
+        nodes:
+          items:
+            $ref: "#/components/schemas/NetworkNode"
+          type: array
+        root_person_id:
+          format: int64
+          type: integer
+        truncated:
+          type: boolean
+      required:
+        - root_person_id
+        - depth
+        - truncated
+        - nodes
+        - edges
       type: object
     PersonProfile:
       properties:
@@ -7967,37 +9104,30 @@ components:
         addresses:
           items:
             $ref: "#/components/schemas/PersonAddress"
-          nullable: true
           type: array
         categories:
           items:
             $ref: "#/components/schemas/PersonCategory"
-          nullable: true
           type: array
         contact_points:
           items:
             $ref: "#/components/schemas/PersonContactPoint"
-          nullable: true
           type: array
         dates:
           items:
             $ref: "#/components/schemas/PersonDate"
-          nullable: true
           type: array
         media:
           items:
             $ref: "#/components/schemas/PersonMedia"
-          nullable: true
           type: array
         names:
           items:
             $ref: "#/components/schemas/PersonName"
-          nullable: true
           type: array
         observations:
           items:
             $ref: "#/components/schemas/ParticipantContactObservation"
-          nullable: true
           type: array
         person:
           $ref: "#/components/schemas/Person"
@@ -8126,7 +9256,6 @@ components:
         relationships:
           items:
             $ref: "#/components/schemas/PersonRelationshipView"
-          nullable: true
           type: array
       required:
         - relationships
@@ -8212,7 +9341,6 @@ components:
         ambiguous_rows:
           items:
             $ref: "#/components/schemas/PersonMergeRowRef"
-          nullable: true
           type: array
           x-omitempty: false
         cache_state:
@@ -8236,7 +9364,6 @@ components:
         unrestored_rows:
           items:
             $ref: "#/components/schemas/PersonMergeRowRef"
-          nullable: true
           type: array
       required:
         - split
@@ -8277,7 +9404,6 @@ components:
         identifiers:
           items:
             $ref: "#/components/schemas/PersonIdentifier"
-          nullable: true
           type: array
         last_at:
           format: date-time
@@ -8298,7 +9424,6 @@ components:
         source_counts:
           items:
             $ref: "#/components/schemas/SourceCount"
-          nullable: true
           type: array
       required:
         - id
@@ -8396,13 +9521,11 @@ components:
               - to_person
               - group
             type: string
-          nullable: true
           type: array
         participant_ids:
           items:
             format: int64
             type: integer
-          nullable: true
           type: array
         roles:
           items:
@@ -8413,12 +9536,33 @@ components:
               - bcc
               - conversation_member
             type: string
-          nullable: true
           type: array
       required:
         - participant_ids
         - roles
         - directions
+      type: object
+    ProviderCredentialResponse:
+      properties:
+        credential_id:
+          type: string
+        pending_restart:
+          type: boolean
+        state:
+          $ref: "#/components/schemas/SecretSettingState"
+      required:
+        - credential_id
+        - state
+        - pending_restart
+      type: object
+    ProviderCredentialWriteRequest:
+      additionalProperties: false
+      properties:
+        value:
+          minLength: 1
+          type: string
+      required:
+        - value
       type: object
     ProviderUsage:
       properties:
@@ -8438,6 +9582,16 @@ components:
         - input_bytes
         - billed_units
         - usage_available
+      type: object
+    PutPersonBriefEnrollmentRequest:
+      additionalProperties: false
+      properties:
+        enrolled:
+          type: boolean
+        track:
+          type: boolean
+      required:
+        - enrolled
       type: object
     PutPersonTrackingRequest:
       additionalProperties: false
@@ -8460,7 +9614,6 @@ components:
         columns:
           items:
             type: string
-          nullable: true
           type: array
         row_count:
           format: int64
@@ -8469,14 +9622,18 @@ components:
           items:
             items:
               x-go-type: any
-            nullable: true
             type: array
-          nullable: true
           type: array
       required:
         - columns
         - rows
         - row_count
+      type: object
+    RejectPersonBriefRequest:
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
       type: object
     RejectedCandidate:
       properties:
@@ -8550,7 +9707,6 @@ components:
         annual:
           items:
             $ref: "#/components/schemas/AnnualTemperatureSummary"
-          nullable: true
           type: array
         cache_revision:
           type: string
@@ -8562,7 +9718,6 @@ components:
         days:
           items:
             $ref: "#/components/schemas/RelationshipCalendarDay"
-          nullable: true
           type: array
         effective_date:
           type: string
@@ -8665,7 +9820,6 @@ components:
         reviews:
           items:
             $ref: "#/components/schemas/RelationshipReview"
-          nullable: true
           type: array
       required:
         - reviews
@@ -8684,7 +9838,6 @@ components:
           items:
             format: int64
             type: integer
-          nullable: true
           type: array
         score:
           format: double
@@ -8739,7 +9892,6 @@ components:
         filters:
           items:
             $ref: "#/components/schemas/ExploreFilter"
-          nullable: true
           type: array
         limit:
           format: int64
@@ -8764,7 +9916,6 @@ components:
         rows:
           items:
             $ref: "#/components/schemas/TimelineRow"
-          nullable: true
           type: array
         total_count:
           format: int64
@@ -8836,7 +9987,6 @@ components:
         relationship_types:
           items:
             $ref: "#/components/schemas/RelationshipType"
-          nullable: true
           type: array
       required:
         - relationship_types
@@ -8849,7 +9999,6 @@ components:
         filters:
           items:
             $ref: "#/components/schemas/ExploreFilter"
-          nullable: true
           type: array
         limit:
           format: int64
@@ -8871,7 +10020,6 @@ components:
         rows:
           items:
             $ref: "#/components/schemas/RelationshipRow"
-          nullable: true
           type: array
         total_count:
           format: int64
@@ -8925,10 +10073,71 @@ components:
         - identifier
         - removed
       type: object
+    RunSavedViewRequest:
+      additionalProperties: false
+      properties:
+        cursor:
+          type: string
+        limit:
+          format: int64
+          maximum: 100
+          minimum: 0
+          type: integer
+      type: object
+    RunSavedViewResponse:
+      properties:
+        cache_revision:
+          type: string
+        candidate_pool_saturated:
+          type: boolean
+        candidate_snapshot_id:
+          type: string
+        files:
+          items:
+            $ref: "#/components/schemas/ExploreFileFact"
+          type: array
+        groups:
+          items:
+            $ref: "#/components/schemas/ExploreGroupRow"
+          type: array
+        next_cursor:
+          type: string
+        result_kind:
+          enum:
+            - entries
+            - groups
+            - files
+          type: string
+          x-enum-names:
+            - RunSavedViewResponseResultKindEntries
+            - RunSavedViewResponseResultKindGroups
+            - RunSavedViewResponseResultKindFiles
+        rows:
+          items:
+            $ref: "#/components/schemas/EntryRow"
+          type: array
+        saved_view:
+          $ref: "#/components/schemas/SavedView"
+        search_deletion_scope:
+          type: string
+        search_provenance:
+          $ref: "#/components/schemas/SearchProvenance"
+        total_count:
+          format: int64
+          type: integer
+      required:
+        - saved_view
+        - result_kind
+        - cache_revision
+        - search_provenance
+      type: object
     SavedView:
       properties:
         canonical_state:
-          $ref: "#/components/schemas/SavedViewStateEnvelope"
+          description: Stored definition, including incompatible values; check incompatibility_reason before execution
+          x-go-type: json.RawMessage
+          x-go-type-import:
+            path: encoding/json
         created_at:
           format: date-time
           type: string
@@ -8937,6 +10146,9 @@ components:
         id:
           format: int64
           type: integer
+        incompatibility_reason:
+          description: Definition validation error that prevents this Saved View from executing
+          type: string
         name:
           type: string
         revision:
@@ -8961,9 +10173,39 @@ components:
       additionalProperties: false
       properties:
         field:
+          enum:
+            - source
+            - identity
+            - participant
+            - domain
+            - mailing_list
+            - message_type
+            - after
+            - before
+            - deletion
+            - participant_id
+            - source_id
           type: string
+          x-enum-names:
+            - SavedViewFilterFieldSource
+            - SavedViewFilterFieldIdentity
+            - SavedViewFilterFieldParticipant
+            - SavedViewFilterFieldDomain
+            - SavedViewFilterFieldMailingList
+            - SavedViewFilterFieldMessageType
+            - SavedViewFilterFieldAfter
+            - SavedViewFilterFieldBefore
+            - SavedViewFilterFieldDeletion
+            - SavedViewFilterFieldParticipantID
+            - SavedViewFilterFieldSourceID
         operator:
+          enum:
+            - eq
+            - in
           type: string
+          x-enum-names:
+            - SavedViewFilterOperatorEq
+            - SavedViewFilterOperatorIn
         values:
           description: Exact filter values; numeric identifiers use decimal strings
           items:
@@ -8979,11 +10221,14 @@ components:
       properties:
         direction:
           enum:
-            - asc
             - desc
           type: string
         field:
+          enum:
+            - occurred_at
           type: string
+          x-enum-names:
+            - SavedViewSortFieldOccurredAt
       required:
         - field
         - direction
@@ -8993,7 +10238,23 @@ components:
       properties:
         columns:
           items:
+            enum:
+              - kind
+              - people
+              - title
+              - excerpt
+              - time
+              - attachments
+              - size
             type: string
+            x-enum-names:
+              - SavedViewStateEnvelopeColumnsKind
+              - SavedViewStateEnvelopeColumnsPeople
+              - SavedViewStateEnvelopeColumnsTitle
+              - SavedViewStateEnvelopeColumnsExcerpt
+              - SavedViewStateEnvelopeColumnsTime
+              - SavedViewStateEnvelopeColumnsAttachments
+              - SavedViewStateEnvelopeColumnsSize
           type: array
         filters:
           items:
@@ -9001,7 +10262,25 @@ components:
           type: array
         grouping:
           items:
+            enum:
+              - source
+              - participant
+              - domain
+              - message_type
+              - mailing_list
+              - kind
+              - year
+              - month
             type: string
+            x-enum-names:
+              - SavedViewStateEnvelopeGroupingSource
+              - SavedViewStateEnvelopeGroupingParticipant
+              - SavedViewStateEnvelopeGroupingDomain
+              - SavedViewStateEnvelopeGroupingMessageType
+              - SavedViewStateEnvelopeGroupingMailingList
+              - SavedViewStateEnvelopeGroupingKind
+              - SavedViewStateEnvelopeGroupingYear
+              - SavedViewStateEnvelopeGroupingMonth
           type: array
         inspector_pinned:
           type: boolean
@@ -9014,7 +10293,15 @@ components:
         query:
           type: string
         search_mode:
+          enum:
+            - full_text
+            - semantic
+            - hybrid
           type: string
+          x-enum-names:
+            - SavedViewStateEnvelopeSearchModeFullText
+            - SavedViewStateEnvelopeSearchModeSemantic
+            - SavedViewStateEnvelopeSearchModeHybrid
         sort:
           items:
             $ref: "#/components/schemas/SavedViewSort"
@@ -9025,7 +10312,6 @@ components:
         saved_views:
           items:
             $ref: "#/components/schemas/SavedView"
-          nullable: true
           type: array
       required:
         - saved_views
@@ -9035,7 +10321,6 @@ components:
         accounts:
           items:
             $ref: "#/components/schemas/AccountStatus"
-          nullable: true
           type: array
         running:
           type: boolean
@@ -9063,7 +10348,6 @@ components:
         filters:
           items:
             $ref: "#/components/schemas/ExploreFilter"
-          nullable: true
           type: array
       type: object
     SearchCoverageResponse:
@@ -9116,12 +10400,10 @@ components:
           items:
             format: int64
             type: integer
-          nullable: true
           type: array
         messages:
           items:
             $ref: "#/components/schemas/MessageSummary"
-          nullable: true
           type: array
         query:
           type: string
@@ -9158,7 +10440,6 @@ components:
         results:
           items:
             $ref: "#/components/schemas/AttachmentSearchResult"
-          nullable: true
           type: array
         usage:
           $ref: "#/components/schemas/Usage"
@@ -9174,7 +10455,6 @@ components:
         messages:
           items:
             $ref: "#/components/schemas/MessageSummary"
-          nullable: true
           type: array
         page:
           format: int64
@@ -9198,6 +10478,15 @@ components:
       properties:
         configured:
           type: boolean
+        hint:
+          description: First three and last three characters of the value joined by an ellipsis, so a person can tell which key is set. Omitted for a value under twelve characters, for passwords, and when nothing is set.
+          type: string
+        source:
+          enum:
+            - stored
+            - environment
+            - none
+          type: string
       required:
         - configured
       type: object
@@ -9242,6 +10531,7 @@ components:
             - api_key
             - session
             - required
+            - delegated
           type: string
         csrf_token:
           type: string
@@ -9351,6 +10641,10 @@ components:
       type: object
     Setting:
       properties:
+        credential_id:
+          type: string
+        description:
+          type: string
         group:
           enum:
             - browser
@@ -9358,8 +10652,16 @@ components:
             - archive
             - search
             - sources
+            - attachments
+            - enrichment
             - integrations
+            - sync
+            - logging
+            - activity
+            - backup
           type: string
+        inherited:
+          type: boolean
         key:
           type: string
         kind:
@@ -9371,10 +10673,11 @@ components:
             - string_array
             - secret
           type: string
+        label:
+          type: string
         options:
           items:
             type: string
-          nullable: true
           type: array
         read_only:
           type: boolean
@@ -9382,15 +10685,66 @@ components:
           type: boolean
         secret:
           $ref: "#/components/schemas/SecretSettingState"
+        section:
+          type: string
         testable:
           type: boolean
+        validation:
+          $ref: "#/components/schemas/SettingValidation"
         value:
           $ref: "#/components/schemas/SettingValue"
       required:
         - key
         - group
+        - label
+        - description
         - kind
         - restart_required
+      type: object
+    SettingGroup:
+      properties:
+        description:
+          type: string
+        id:
+          type: string
+        label:
+          type: string
+        sections:
+          items:
+            $ref: "#/components/schemas/SettingSection"
+          type: array
+      required:
+        - id
+        - label
+        - description
+      type: object
+    SettingOff:
+      properties:
+        label:
+          type: string
+        on_minimum:
+          format: double
+          type: number
+        suggest:
+          type: string
+        value:
+          nullable: true
+          type: string
+      required:
+        - value
+        - label
+      type: object
+    SettingSection:
+      properties:
+        description:
+          type: string
+        id:
+          type: string
+        label:
+          type: string
+      required:
+        - id
+        - label
       type: object
     SettingUpdate:
       additionalProperties: false
@@ -9403,6 +10757,25 @@ components:
           $ref: "#/components/schemas/SettingValue"
       required:
         - key
+      type: object
+    SettingValidation:
+      properties:
+        format:
+          enum:
+            - cron
+          type: string
+        hint:
+          type: string
+        maximum:
+          format: double
+          type: number
+        minimum:
+          format: double
+          type: number
+        "off":
+          $ref: "#/components/schemas/SettingOff"
+        required:
+          type: boolean
       type: object
     SettingValue:
       oneOf:
@@ -9448,8 +10821,6 @@ components:
     SettingsPatchRequest:
       additionalProperties: false
       properties:
-        confirm_api_key_restart:
-          type: boolean
         updates:
           items:
             $ref: "#/components/schemas/SettingUpdate"
@@ -9460,14 +10831,26 @@ components:
       type: object
     SettingsResponse:
       properties:
+        credential_etag:
+          type: string
+        groups:
+          items:
+            $ref: "#/components/schemas/SettingGroup"
+          type: array
         pending_restart:
           type: boolean
+        person_enrichment_providers:
+          items:
+            $ref: "#/components/schemas/PersonEnrichmentProviderSetting"
+          type: array
         settings:
           items:
             $ref: "#/components/schemas/Setting"
           type: array
       required:
+        - groups
         - settings
+        - credential_etag
         - pending_restart
       type: object
     SimilarSearchResponse:
@@ -9477,7 +10860,6 @@ components:
         messages:
           items:
             $ref: "#/components/schemas/MessageSummary"
-          nullable: true
           type: array
         returned:
           format: int64
@@ -9624,7 +11006,6 @@ components:
         sources:
           items:
             $ref: "#/components/schemas/SourceStatus"
-          nullable: true
           type: array
       required:
         - sources
@@ -9635,7 +11016,6 @@ components:
         accounts:
           items:
             type: string
-          nullable: true
           type: array
       required:
         - accounts
@@ -9650,7 +11030,6 @@ components:
           items:
             format: int64
             type: integer
-          nullable: true
           type: array
       required:
         - merge_id
@@ -9666,6 +11045,8 @@ components:
         domain:
           type: string
         label:
+          type: string
+        list_id:
           type: string
         recipient:
           type: string
@@ -9692,7 +11073,6 @@ components:
           items:
             format: int64
             type: integer
-          nullable: true
           type: array
         operation_token:
           type: string
@@ -9707,14 +11087,19 @@ components:
           type: boolean
         id:
           type: string
+        matched_count:
+          format: int64
+          type: integer
         message_count:
           format: int64
           type: integer
         sample_gmail_ids:
           items:
             type: string
-          nullable: true
           type: array
+        skipped_count:
+          format: int64
+          type: integer
         source:
           $ref: "#/components/schemas/SourceReference"
         status:
@@ -9756,7 +11141,6 @@ components:
         vector_text_message_types:
           items:
             type: string
-          nullable: true
           type: array
         vector_text_status:
           type: string
@@ -9817,7 +11201,6 @@ components:
         formats:
           items:
             $ref: "#/components/schemas/FormatCoverage"
-          nullable: true
           type: array
         generation:
           $ref: "#/components/schemas/VisualGeneration"
@@ -9889,32 +11272,26 @@ components:
         addresses:
           items:
             $ref: "#/components/schemas/PersonAddress"
-          nullable: true
           type: array
         categories:
           items:
             $ref: "#/components/schemas/PersonCategory"
-          nullable: true
           type: array
         contact_points:
           items:
             $ref: "#/components/schemas/PersonContactPoint"
-          nullable: true
           type: array
         dates:
           items:
             $ref: "#/components/schemas/PersonDate"
-          nullable: true
           type: array
         media:
           items:
             $ref: "#/components/schemas/PersonMedia"
-          nullable: true
           type: array
         names:
           items:
             $ref: "#/components/schemas/PersonName"
-          nullable: true
           type: array
         person:
           $ref: "#/components/schemas/Person"
@@ -9933,14 +11310,12 @@ components:
         accounts:
           items:
             type: string
-          nullable: true
           type: array
         date_range:
           items:
             type: string
           maxItems: 2
           minItems: 2
-          nullable: true
           type: array
         message_count:
           format: int64
@@ -9948,7 +11323,6 @@ components:
         top_senders:
           items:
             $ref: "#/components/schemas/SenderCount"
-          nullable: true
           type: array
         total_size_bytes:
           format: int64
@@ -10022,7 +11396,6 @@ components:
         item_errors:
           items:
             $ref: "#/components/schemas/SyncRunItemStatus"
-          nullable: true
           type: array
         messages_added:
           format: int64
@@ -10064,14 +11437,12 @@ components:
         choices:
           items:
             $ref: "#/components/schemas/ChoiceDescriptor"
-          nullable: true
           type: array
         description:
           type: string
         fields:
           items:
             $ref: "#/components/schemas/FieldDescriptor"
-          nullable: true
           type: array
         key:
           type: string
@@ -10181,7 +11552,6 @@ components:
         labels:
           items:
             type: string
-          nullable: true
           type: array
         priority:
           type: string
@@ -10253,7 +11623,6 @@ components:
         tasks:
           items:
             $ref: "#/components/schemas/TaskSummary"
-          nullable: true
           type: array
       required:
         - tasks
@@ -10347,7 +11716,6 @@ components:
         conversations:
           items:
             $ref: "#/components/schemas/TextConversationRow"
-          nullable: true
           type: array
         count:
           format: int64
@@ -10383,7 +11751,6 @@ components:
         messages:
           items:
             $ref: "#/components/schemas/CLIQueryMessageSummary"
-          nullable: true
           type: array
         offset:
           format: int64
@@ -10398,6 +11765,9 @@ components:
       type: object
     TextSearchResponse:
       properties:
+        applied_source_id:
+          format: int64
+          type: integer
         count:
           format: int64
           type: integer
@@ -10409,7 +11779,6 @@ components:
         messages:
           items:
             $ref: "#/components/schemas/CLIQueryMessageSummary"
-          nullable: true
           type: array
         offset:
           format: int64
@@ -10476,7 +11845,6 @@ components:
         scopes:
           items:
             type: string
-          nullable: true
           type: array
         tenant_id:
           type: string
@@ -10499,7 +11867,6 @@ components:
           items:
             format: int64
             type: integer
-          nullable: true
           type: array
         attachment_count:
           format: int64
@@ -10590,7 +11957,6 @@ components:
         pid:
           items:
             type: string
-          nullable: true
           type: array
         prop_id:
           type: string
@@ -10634,7 +12000,6 @@ components:
         type_tokens:
           items:
             type: string
-          nullable: true
           type: array
         updated_at:
           format: date-time
@@ -10679,7 +12044,6 @@ components:
         type_tokens:
           items:
             type: string
-          nullable: true
           type: array
         vcard:
           $ref: "#/components/schemas/VCardIdentity"
@@ -10766,7 +12130,6 @@ components:
         directions:
           items:
             type: string
-          nullable: true
           type: array
         filename:
           type: string
@@ -10802,7 +12165,7 @@ components:
       type: apiKey
 info:
   title: msgvault API
-  version: 2.12.0
+  version: 2.26.0
 openapi: 3.0.3
 paths:
   /api/ping:
@@ -10941,6 +12304,73 @@ paths:
       summary: Add an account
       tags:
         - API
+  /api/v1/agent-tokens:
+    get:
+      operationId: listAgentTokens
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentTokenListResponse"
+          description: OK
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: List active agent grants
+      tags:
+        - API
+    post:
+      operationId: issueAgentToken
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AgentTokenIssueRequest"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentTokenIssueResponse"
+          description: Created
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Issue a restricted agent grant
+      tags:
+        - API
+  /api/v1/agent-tokens/{id}:
+    delete:
+      operationId: revokeAgentToken
+      parameters:
+        - description: Agent grant ID to revoke
+          in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: No Content
+        default:
+          description: Error
+      security:
+        - apiKey: []
+      summary: Revoke an agent grant by ID
+      tags:
+        - API
   /api/v1/aggregates:
     get:
       operationId: getAggregates
@@ -10977,6 +12407,14 @@ paths:
           schema:
             format: int64
             type: integer
+        - description: Source IDs; repeat or comma-separate values
+          in: query
+          name: source_ids
+          schema:
+            items:
+              format: int64
+              type: integer
+            type: array
         - description: Only include messages with attachments
           in: query
           name: attachments_only
@@ -11057,6 +12495,14 @@ paths:
           schema:
             format: int64
             type: integer
+        - description: Source IDs; repeat or comma-separate values
+          in: query
+          name: source_ids
+          schema:
+            items:
+              format: int64
+              type: integer
+            type: array
         - description: Only include messages with attachments
           in: query
           name: attachments_only
@@ -11110,6 +12556,11 @@ paths:
         - description: Label filter
           in: query
           name: label
+          schema:
+            type: string
+        - description: Exact case-insensitive RFC 2919 List-Id filter
+          in: query
+          name: list_id
           schema:
             type: string
         - description: Message type filter
@@ -11215,62 +12666,6 @@ paths:
       security:
         - apiKey: []
       summary: Download attachment content by SHA-256 hash
-      tags:
-        - API
-  /api/v1/attachments/{hash}/text:
-    get:
-      operationId: getAttachmentText
-      parameters:
-        - description: Attachment SHA-256 content hash
-          in: path
-          name: hash
-          required: true
-          schema:
-            type: string
-      responses:
-        "200":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/OCRResult"
-          description: OK
-        default:
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-      security:
-        - apiKey: []
-      summary: Get cached attachment text
-      tags:
-        - API
-  /api/v1/attachments/{hash}/text/request:
-    post:
-      operationId: requestAttachmentText
-      parameters:
-        - description: Attachment SHA-256 content hash
-          in: path
-          name: hash
-          required: true
-          schema:
-            type: string
-      responses:
-        "202":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/OCRResult"
-          description: Accepted
-        default:
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-      security:
-        - apiKey: []
-      summary: Queue attachment text extraction
       tags:
         - API
   /api/v1/attachments/{id}:
@@ -12064,6 +13459,106 @@ paths:
       summary: Resolve a CardDAV conflict
       tags:
         - API
+  /api/v1/carddav/google/authorize:
+    post:
+      description: Start sign-in from the msgvault Web UI. The Origin header must match the redirect_uri origin, and redirect_uri must be the Web UI's root URL. For terminal authorization, use msgvault carddav authorize-google.
+      operationId: beginGoogleCardDAVAuthorization
+      parameters:
+        - description: Origin of the msgvault Web UI, matching redirect_uri
+          in: header
+          name: Origin
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CardDAVGoogleAuthorizeRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CardDAVGoogleAuthorizeResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+          headers:
+            Retry-After:
+              description: Seconds until CardDAV retry is safe
+              schema:
+                format: int64
+                minimum: 0
+                type: integer
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Start Google Contacts authorization in a browser
+      tags:
+        - API
+  /api/v1/carddav/google/callback:
+    post:
+      operationId: completeGoogleCardDAVAuthorization
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CardDAVGoogleCallbackRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusMessageResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+          headers:
+            Retry-After:
+              description: Seconds until CardDAV retry is safe
+              schema:
+                format: int64
+                minimum: 0
+                type: integer
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Complete Google Contacts authorization
+      tags:
+        - API
   /api/v1/carddav/publications/{person_id}:
     delete:
       operationId: unpublishCardDAVPerson
@@ -12230,6 +13725,12 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
           description: Error
+        "413":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
         "500":
           content:
             application/json:
@@ -12264,6 +13765,263 @@ paths:
       security:
         - apiKey: []
       summary: Publish a person to CardDAV
+      tags:
+        - API
+  /api/v1/carddav/publications/{person_id}/approve:
+    post:
+      operationId: approveCardDAVPublication
+      parameters:
+        - in: path
+          name: person_id
+          required: true
+          schema:
+            format: int64
+            minimum: 1
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CardDAVPublicationApprovalRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CardDAVPublicationResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "413":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+          headers:
+            Retry-After:
+              description: Seconds until CardDAV retry is safe
+              schema:
+                format: int64
+                minimum: 0
+                type: integer
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Approve a publication preview; conflicts require explicit resolution
+      tags:
+        - API
+  /api/v1/carddav/publications/{person_id}/preview:
+    get:
+      operationId: previewCardDAVPublication
+      parameters:
+        - in: path
+          name: person_id
+          required: true
+          schema:
+            format: int64
+            minimum: 1
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CardDAVPublicationPreviewResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "413":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+          headers:
+            Retry-After:
+              description: Seconds until CardDAV retry is safe
+              schema:
+                format: int64
+                minimum: 0
+                type: integer
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Preview the exact vCard and approval token for a person's publication
+      tags:
+        - API
+  /api/v1/carddav/runs:
+    get:
+      operationId: listCardDAVRuns
+      parameters:
+        - description: Maximum runs to return (default 25, max 100)
+          in: query
+          name: limit
+          schema:
+            format: int64
+            maximum: 100
+            minimum: 1
+            type: integer
+        - description: Return runs with IDs lower than this cursor
+          in: query
+          name: before_id
+          schema:
+            format: int64
+            minimum: 1
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CardDAVRunsResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: List CardDAV synchronization runs
+      tags:
+        - API
+  /api/v1/carddav/status:
+    get:
+      operationId: getCardDAVStatus
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CardDAVStatusResponse"
+          description: OK
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+          headers:
+            Retry-After:
+              description: Seconds until CardDAV retry is safe
+              schema:
+                format: int64
+                minimum: 0
+                type: integer
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Get CardDAV synchronization status
       tags:
         - API
   /api/v1/carddav/sync:
@@ -13408,6 +15166,33 @@ paths:
       summary: Repair CLI archive encoding
       tags:
         - API
+  /api/v1/cli/repair-message:
+    post:
+      operationId: repairMessageCLI
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CLIRepairMessageRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/x-ndjson:
+              schema:
+                $ref: "#/components/schemas/CLIRepairMessageEvent"
+          description: OK
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Repair or audit Gmail message snapshots
+      tags:
+        - API
   /api/v1/cli/run:
     post:
       operationId: runCLI
@@ -14541,6 +16326,51 @@ paths:
       summary: Get extracted document index status
       tags:
         - API
+  /api/v1/documents/status/current:
+    get:
+      operationId: getCurrentDocumentIndexStatus
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentIndexStatusResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "429":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Get extracted document index status for the selected durable profile
+      tags:
+        - API
   /api/v1/documents/vectors/status:
     get:
       operationId: getDocumentVectorStatus
@@ -15565,33 +17395,6 @@ paths:
       summary: Search analytical files
       tags:
         - Exploration
-  /api/v1/files/text-search:
-    post:
-      operationId: searchAttachmentText
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/OcrSearchRequest"
-        required: true
-      responses:
-        "200":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/OcrSearchResponse"
-          description: OK
-        default:
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-      security:
-        - apiKey: []
-      summary: Search cached attachment text
-      tags:
-        - API
   /api/v1/files/{id}:
     get:
       operationId: getFile
@@ -15952,6 +17755,127 @@ paths:
       summary: Import one meeting
       tags:
         - API
+  /api/v1/imports:
+    post:
+      operationId: createImportJob
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImportJobRequest"
+        required: true
+      responses:
+        "202":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportJobResponse"
+          description: Accepted
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "413":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "415":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Start a bounded historical import
+      tags:
+        - API
+  /api/v1/imports/{job_id}:
+    get:
+      operationId: getImportJob
+      parameters:
+        - description: Historical import job ID
+          in: path
+          name: job_id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportJobResponse"
+          description: OK
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Get historical import status
+      tags:
+        - API
   /api/v1/integrations/tasks/search:
     get:
       operationId: searchIntegrationTasks
@@ -16153,6 +18077,11 @@ paths:
           name: label
           schema:
             type: string
+        - description: Exact case-insensitive RFC 2919 List-Id filter
+          in: query
+          name: list_id
+          schema:
+            type: string
         - description: Message type filter
           in: query
           name: message_type
@@ -16180,6 +18109,14 @@ paths:
           schema:
             format: int64
             type: integer
+        - description: Source IDs; repeat or comma-separate values
+          in: query
+          name: source_ids
+          schema:
+            items:
+              format: int64
+              type: integer
+            type: array
         - description: Only include messages with attachments
           in: query
           name: attachments_only
@@ -16279,6 +18216,11 @@ paths:
           name: label
           schema:
             type: string
+        - description: Exact case-insensitive RFC 2919 List-Id filter
+          in: query
+          name: list_id
+          schema:
+            type: string
         - description: Message type filter
           in: query
           name: message_type
@@ -16306,6 +18248,14 @@ paths:
           schema:
             format: int64
             type: integer
+        - description: Source IDs; repeat or comma-separate values
+          in: query
+          name: source_ids
+          schema:
+            items:
+              format: int64
+              type: integer
+            type: array
         - description: Only include messages with attachments
           in: query
           name: attachments_only
@@ -16351,6 +18301,26 @@ paths:
         - description: "Sort direction: asc or desc"
           in: query
           name: direction
+          schema:
+            type: string
+        - description: Structured search query
+          in: query
+          name: q
+          schema:
+            type: string
+        - description: "Search mode: fast, deep, or aggregate; required with q"
+          in: query
+          name: search_mode
+          schema:
+            type: string
+        - description: Aggregate view type; required for aggregate search
+          in: query
+          name: view_type
+          schema:
+            type: string
+        - description: Displayed aggregate row key; required for aggregate search
+          in: query
+          name: aggregate_key
           schema:
             type: string
       responses:
@@ -16698,25 +18668,186 @@ paths:
       summary: Get visual attachment embedding status
       tags:
         - API
-  /api/v1/ocr/status:
+  /api/v1/operations/runs:
     get:
-      operationId: getOCRStatus
+      operationId: listOperationRuns
+      parameters:
+        - description: Exact operation kind
+          in: query
+          name: kind
+          schema:
+            enum:
+              - carddav_sync
+              - document_embedding
+              - document_extraction
+              - message_embedding
+              - person_embedding
+              - person_enrichment
+              - person_sweep
+              - source_sync
+              - visual_embedding
+            type: string
+        - description: Exact semantic operation lane
+          in: query
+          name: lane
+          schema:
+            enum:
+              - contacts
+              - documents
+              - messages
+              - person_facts
+              - visual_attachments
+            type: string
+        - description: Exact operation state
+          in: query
+          name: state
+          schema:
+            enum:
+              - cancelled
+              - failed
+              - partial
+              - queued
+              - running
+              - succeeded
+            type: string
+        - description: Inclusive canonical UTC RFC3339 lower bound
+          in: query
+          name: started_from
+          schema:
+            format: date-time
+            type: string
+        - description: Exclusive canonical UTC RFC3339 upper bound
+          in: query
+          name: started_before
+          schema:
+            format: date-time
+            type: string
+        - description: Maximum runs to return (default 25, max 100)
+          in: query
+          name: limit
+          schema:
+            format: int64
+            maximum: 100
+            minimum: 1
+            type: integer
+        - description: Opaque cursor bound to this archive and the complete normalized filter set
+          in: query
+          name: cursor
+          schema:
+            type: string
       responses:
         "200":
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/OCRRuntimeStatus"
+                $ref: "#/components/schemas/OperationRunsResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationErrorResponse"
+          description: Error
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationErrorResponse"
+          description: Error
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: List normalized operation history
+      tags:
+        - API
+  /api/v1/operations/runs/{id}:
+    get:
+      operationId: getOperationRun
+      parameters:
+        - description: Opaque archive-bound operation run ID
+          in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationRunDetail"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationErrorResponse"
+          description: Error
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Get one normalized operation run
+      tags:
+        - API
+  /api/v1/operations/status:
+    get:
+      operationId: getOperationStatus
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationStatusResponse"
           description: OK
         default:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: "#/components/schemas/OperationErrorResponse"
           description: Error
       security:
         - apiKey: []
-      summary: Get attachment text extraction status
+      summary: Get normalized operation lane status
       tags:
         - API
   /api/v1/organizations:
@@ -17977,6 +20108,98 @@ paths:
       summary: Promote a participant cluster to a durable person
       tags:
         - API
+  /api/v1/people/directory:
+    get:
+      description: Returns one stable, non-sensitive page of promoted durable people.
+      operationId: listDirectoryPeople
+      parameters:
+        - description: Lexical query over person names, contact points, and organizations
+          in: query
+          name: q
+          schema:
+            type: string
+        - description: Opaque cursor returned by the previous Directory page
+          in: query
+          name: cursor
+          schema:
+            type: string
+        - description: Maximum rows to return (default 50, max 100)
+          in: query
+          name: limit
+          schema:
+            format: int64
+            type: integer
+        - description: "Current contact state: active or inactive"
+          in: query
+          name: contact_state
+          schema:
+            type: string
+        - description: Current person category
+          in: query
+          name: category
+          schema:
+            type: string
+        - description: Current organization
+          in: query
+          name: organization
+          schema:
+            type: string
+        - description: Primary communication channel
+          in: query
+          name: primary_channel
+          schema:
+            type: string
+        - description: Return people contacted at or after this RFC3339 timestamp
+          in: query
+          name: last_contact_after
+          schema:
+            format: date-time
+            type: string
+        - description: Return people contacted at or before this RFC3339 timestamp
+          in: query
+          name: last_contact_before
+          schema:
+            format: date-time
+            type: string
+        - description: "Directory order: name, last_contact_desc, or last_contact_asc"
+          in: query
+          name: sort
+          schema:
+            enum:
+              - name
+              - last_contact_desc
+              - last_contact_asc
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DirectoryPeopleResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Query durable people for the Directory
+      tags:
+        - API
   /api/v1/people/search:
     post:
       description: Searches only the curated person vector corpus and returns durable person roots in relevance order.
@@ -18398,6 +20621,317 @@ paths:
       security:
         - apiKey: []
       summary: Set a person's attribute value
+      tags:
+        - API
+  /api/v1/people/{id}/brief:
+    get:
+      operationId: getPersonBrief
+      parameters:
+        - description: Durable person ID
+          in: path
+          name: id
+          required: true
+          schema:
+            format: int64
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonBrief"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Get a person's current brief version
+      tags:
+        - API
+  /api/v1/people/{id}/brief-enrollment:
+    get:
+      operationId: getPersonBriefEnrollment
+      parameters:
+        - description: Durable person ID
+          in: path
+          name: id
+          required: true
+          schema:
+            format: int64
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonBriefEnrollment"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Get a person's brief enrollment
+      tags:
+        - API
+    put:
+      operationId: setPersonBriefEnrollment
+      parameters:
+        - description: Durable person ID
+          in: path
+          name: id
+          required: true
+          schema:
+            format: int64
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PutPersonBriefEnrollmentRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonBriefEnrollment"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Replace a person's brief enrollment
+      tags:
+        - API
+  /api/v1/people/{id}/brief/generate:
+    post:
+      operationId: generatePersonBrief
+      parameters:
+        - description: Durable person ID
+          in: path
+          name: id
+          required: true
+          schema:
+            format: int64
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonBriefRun"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Generate a person's brief now
+      tags:
+        - API
+  /api/v1/people/{id}/brief/reject:
+    post:
+      operationId: rejectPersonBrief
+      parameters:
+        - description: Durable person ID
+          in: path
+          name: id
+          required: true
+          schema:
+            format: int64
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RejectPersonBriefRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonBrief"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Reject a person's current brief version
+      tags:
+        - API
+  /api/v1/people/{id}/brief/versions:
+    get:
+      operationId: listPersonBriefVersions
+      parameters:
+        - description: Durable person ID
+          in: path
+          name: id
+          required: true
+          schema:
+            format: int64
+            type: integer
+        - description: Maximum versions to return (default 20, max 200)
+          in: query
+          name: limit
+          schema:
+            format: int64
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonBriefVersionsResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: List a person's brief version history
       tags:
         - API
   /api/v1/people/{id}/contact-state:
@@ -19328,6 +21862,68 @@ paths:
       security:
         - apiKey: []
       summary: List merge history for a durable person
+      tags:
+        - API
+  /api/v1/people/{id}/network:
+    get:
+      description: Returns declared person relationships and employments only; archive-derived associations are excluded.
+      operationId: getPersonNetwork
+      parameters:
+        - description: Durable person ID
+          in: path
+          name: id
+          required: true
+          schema:
+            format: int64
+            type: integer
+        - description: Breadth-first depth (default 1, minimum 1, maximum 3)
+          in: query
+          name: depth
+          schema:
+            default: 1
+            format: int64
+            maximum: 3
+            minimum: 1
+            type: integer
+        - description: Include ended relationships and employment records
+          in: query
+          name: include_ended
+          schema:
+            type: boolean
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonNetwork"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Get a bounded curated person network
       tags:
         - API
   /api/v1/people/{id}/notes/append:
@@ -21109,6 +23705,67 @@ paths:
       summary: Update a shared analytical Saved View
       tags:
         - API
+  /api/v1/saved-views/{id}/run:
+    post:
+      operationId: runSavedView
+      parameters:
+        - description: Saved View ID
+          in: path
+          name: id
+          required: true
+          schema:
+            format: int64
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RunSavedViewRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RunSavedViewResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/ExploreCacheUnavailableResponse"
+                  - $ref: "#/components/schemas/ErrorResponse"
+          description: Service Unavailable
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Run a shared analytical Saved View through its canonical Explore definition
+      tags:
+        - API
   /api/v1/scheduler/status:
     get:
       operationId: getSchedulerStatus
@@ -21140,7 +23797,7 @@ paths:
           required: true
           schema:
             type: string
-        - description: "Search mode: fts, vector, or hybrid. Structured filter parameters are supported only in vector and hybrid modes"
+        - description: "Search mode: fts, vector, or hybrid. conversation_id applies in every mode; other structured filter parameters require vector or hybrid"
           in: query
           name: mode
           schema:
@@ -21193,6 +23850,12 @@ paths:
           name: collection
           schema:
             type: string
+        - description: Exact conversation ID (all search modes)
+          in: query
+          name: conversation_id
+          schema:
+            format: int64
+            type: integer
         - description: Exact sender email/address filter (vector or hybrid mode only)
           in: query
           name: sender
@@ -21211,6 +23874,11 @@ paths:
         - description: Exact case-insensitive label filter (vector or hybrid mode only)
           in: query
           name: label
+          schema:
+            type: string
+        - description: Exact case-insensitive RFC 2919 List-Id filter (vector or hybrid mode only)
+          in: query
+          name: list_id
           schema:
             type: string
         - description: Calendar period in YYYY, YYYY-MM, or YYYY-MM-DD format (vector or hybrid mode only)
@@ -21412,42 +24080,47 @@ paths:
           name: scope
           schema:
             type: string
-        - description: Sender email/address filter
+        - description: Sender email/address filter; not supported when scope=body
           in: query
           name: sender
           schema:
             type: string
-        - description: Sender display-name filter
+        - description: Sender display-name filter; not supported when scope=body
           in: query
           name: sender_name
           schema:
             type: string
-        - description: Recipient email/address filter
+        - description: Recipient email/address filter; not supported when scope=body
           in: query
           name: recipient
           schema:
             type: string
-        - description: Recipient display-name filter
+        - description: Recipient display-name filter; not supported when scope=body
           in: query
           name: recipient_name
           schema:
             type: string
-        - description: Domain filter
+        - description: Domain filter; not supported when scope=body
           in: query
           name: domain
           schema:
             type: string
-        - description: Label filter
+        - description: Label filter; not supported when scope=body
           in: query
           name: label
           schema:
             type: string
-        - description: Message type filter
+        - description: Exact case-insensitive RFC 2919 List-Id filter; not supported when scope=body
+          in: query
+          name: list_id
+          schema:
+            type: string
+        - description: Message type filter; not supported when scope=body
           in: query
           name: message_type
           schema:
             type: string
-        - description: Named time period
+        - description: Named time period; not supported when scope=body
           in: query
           name: time_period
           schema:
@@ -21457,7 +24130,7 @@ paths:
           name: time_granularity
           schema:
             type: string
-        - description: Conversation ID
+        - description: Conversation ID; not supported when scope=body
           in: query
           name: conversation_id
           schema:
@@ -21469,6 +24142,14 @@ paths:
           schema:
             format: int64
             type: integer
+        - description: Source IDs; repeat or comma-separate values; not supported by deep search
+          in: query
+          name: source_ids
+          schema:
+            items:
+              format: int64
+              type: integer
+            type: array
         - description: Only include messages with attachments
           in: query
           name: attachments_only
@@ -21489,7 +24170,7 @@ paths:
           name: before
           schema:
             type: string
-        - description: Comma-separated aggregate view names to match empty values
+        - description: Comma-separated aggregate view names to match empty values; not supported when scope=body
           in: query
           name: empty_targets
           schema:
@@ -21629,6 +24310,11 @@ paths:
           name: label
           schema:
             type: string
+        - description: Exact case-insensitive RFC 2919 List-Id filter
+          in: query
+          name: list_id
+          schema:
+            type: string
         - description: Message type filter
           in: query
           name: message_type
@@ -21656,6 +24342,14 @@ paths:
           schema:
             format: int64
             type: integer
+        - description: Source IDs; repeat or comma-separate values
+          in: query
+          name: source_ids
+          schema:
+            items:
+              format: int64
+              type: integer
+            type: array
         - description: Only include messages with attachments
           in: query
           name: attachments_only
@@ -21703,14 +24397,6 @@ paths:
           name: direction
           schema:
             type: string
-        - description: Source IDs; repeat the parameter for multiple sources
-          in: query
-          name: source_ids
-          schema:
-            items:
-              format: int64
-              type: integer
-            type: array
       responses:
         "200":
           content:
@@ -21800,6 +24486,10 @@ paths:
                 $ref: "#/components/schemas/SettingsResponse"
           description: OK
           headers:
+            Credential-ETag:
+              description: Strong content hash for the independent provider credential store
+              schema:
+                type: string
             ETag:
               description: Strong content hash for optimistic concurrency
               schema:
@@ -21838,6 +24528,10 @@ paths:
                 $ref: "#/components/schemas/SettingsResponse"
           description: OK
           headers:
+            Credential-ETag:
+              description: Strong content hash for the independent provider credential store
+              schema:
+                type: string
             ETag:
               description: Strong content hash for optimistic concurrency
               schema:
@@ -21881,6 +24575,227 @@ paths:
       security:
         - apiKey: []
       summary: Update browser-managed settings
+      tags:
+        - API
+  /api/v1/settings/person-enrichment/providers/{name}:
+    put:
+      operationId: putSettingsPersonEnrichmentProvider
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - description: Strong config ETag returned by the latest settings read
+          in: header
+          name: If-Match
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PersonEnrichmentProviderUpdate"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SettingsResponse"
+          description: OK
+          headers:
+            ETag:
+              description: Strong content hash for optimistic concurrency
+              schema:
+                type: string
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "412":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "428":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Create or update one named person-enrichment provider
+      tags:
+        - API
+  /api/v1/settings/provider-credentials/{credential_id}:
+    delete:
+      operationId: deleteSettingsProviderCredential
+      parameters:
+        - in: path
+          name: credential_id
+          required: true
+          schema:
+            type: string
+        - description: Strong ETag for the provider credential store
+          in: header
+          name: If-Match
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderCredentialResponse"
+          description: OK
+          headers:
+            ETag:
+              description: Strong content hash for optimistic concurrency
+              schema:
+                type: string
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "412":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "428":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Clear a stored provider credential
+      tags:
+        - API
+    put:
+      operationId: putSettingsProviderCredential
+      parameters:
+        - in: path
+          name: credential_id
+          required: true
+          schema:
+            type: string
+        - description: Strong ETag for the provider credential store
+          in: header
+          name: If-Match
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProviderCredentialWriteRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderCredentialResponse"
+          description: OK
+          headers:
+            ETag:
+              description: Strong content hash for optimistic concurrency
+              schema:
+                type: string
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "412":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "428":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Set a write-only provider credential
       tags:
         - API
   /api/v1/sources/status:
@@ -21964,12 +24879,6 @@ paths:
     get:
       operationId: getTotalStats
       parameters:
-        - description: Source ID
-          in: query
-          name: source_id
-          schema:
-            format: int64
-            type: integer
         - description: Source IDs; repeat the parameter for multiple sources
           in: query
           name: source_ids
@@ -21978,16 +24887,6 @@ paths:
               format: int64
               type: integer
             type: array
-        - description: Only include messages with attachments
-          in: query
-          name: attachments_only
-          schema:
-            type: boolean
-        - description: Exclude deleted messages
-          in: query
-          name: hide_deleted
-          schema:
-            type: boolean
         - description: Search query
           in: query
           name: search_query
@@ -22001,6 +24900,93 @@ paths:
         - description: Aggregate view type for grouping
           in: query
           name: group_by
+          schema:
+            type: string
+        - description: Sender email/address filter
+          in: query
+          name: sender
+          schema:
+            type: string
+        - description: Sender display-name filter
+          in: query
+          name: sender_name
+          schema:
+            type: string
+        - description: Recipient email/address filter
+          in: query
+          name: recipient
+          schema:
+            type: string
+        - description: Recipient display-name filter
+          in: query
+          name: recipient_name
+          schema:
+            type: string
+        - description: Domain filter
+          in: query
+          name: domain
+          schema:
+            type: string
+        - description: Label filter
+          in: query
+          name: label
+          schema:
+            type: string
+        - description: Exact case-insensitive RFC 2919 List-Id filter
+          in: query
+          name: list_id
+          schema:
+            type: string
+        - description: Message type filter
+          in: query
+          name: message_type
+          schema:
+            type: string
+        - description: Named time period
+          in: query
+          name: time_period
+          schema:
+            type: string
+        - description: Time bucket granularity
+          in: query
+          name: time_granularity
+          schema:
+            type: string
+        - description: Conversation ID
+          in: query
+          name: conversation_id
+          schema:
+            format: int64
+            type: integer
+        - description: Source ID
+          in: query
+          name: source_id
+          schema:
+            format: int64
+            type: integer
+        - description: Only include messages with attachments
+          in: query
+          name: attachments_only
+          schema:
+            type: boolean
+        - description: Exclude deleted messages
+          in: query
+          name: hide_deleted
+          schema:
+            type: boolean
+        - description: Lower date/time bound (RFC3339 or YYYY-MM-DD)
+          in: query
+          name: after
+          schema:
+            type: string
+        - description: Upper date/time bound (RFC3339 or YYYY-MM-DD)
+          in: query
+          name: before
+          schema:
+            type: string
+        - description: Comma-separated aggregate view names to match empty values
+          in: query
+          name: empty_targets
           schema:
             type: string
       responses:
@@ -22335,6 +25321,12 @@ paths:
     get:
       operationId: searchTextMessages
       parameters:
+        - description: Source ID
+          in: query
+          name: source_id
+          schema:
+            format: int64
+            type: integer
         - description: Search query
           in: query
           name: q

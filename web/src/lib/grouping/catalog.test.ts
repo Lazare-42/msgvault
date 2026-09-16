@@ -1,5 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
+import { ExploreGroupDimension } from '../api/generated/models';
+
 import {
   GROUPING_CATALOG,
   groupingByDimension,
@@ -17,18 +19,21 @@ describe('universal grouping catalog', () => {
       'time',
       'source',
       'modality',
+      'kind',
+      'mailing_lists',
       'labels',
       'attachment_facts',
       'conversation'
     ]);
-    expect(groupingOptions().map((entry) => entry.value)).toEqual(
-      ['participant', 'domain', 'year', 'month', 'source', 'message_type']
+    expect(new Set(groupingOptions().map((entry) => entry.value))).toEqual(
+      new Set(Object.values(ExploreGroupDimension))
     );
     expect(groupingByDimension('participant')).toMatchObject({
       label: 'People',
       family: 'people'
     });
     expect(groupingByDimension('year')).toMatchObject({ family: 'time' });
+    expect(groupingByDimension('mailing_list')).toMatchObject({ label: 'Lists', family: 'mailing_lists' });
   });
 
   it('keeps unsupported concepts visible but incapable of forming API requests', () => {
@@ -46,7 +51,7 @@ describe('universal grouping catalog', () => {
       }),
       expect.objectContaining({ value: 'unavailable:attachment_facts', disabled: true })
     ]));
-    expect(isGroupingDimension('kind')).toBe(false);
+    expect(isGroupingDimension('unknown')).toBe(false);
   });
 
   it('validates URL and Saved View grouping without accepting unknown dimensions', () => {
@@ -55,6 +60,8 @@ describe('universal grouping catalog', () => {
     expect(validateGroupingChain(['participant', 'year'])).toEqual(['participant', 'year']);
     expect(validateGroupingChain(['domain', 'message_type'])).toEqual(['domain', 'message_type']);
     expect(validateGroupingChain(['source', 'month'])).toEqual(['source', 'month']);
-    expect(validateGroupingChain(['source', 'kind'])).toEqual([]);
+    expect(validateGroupingChain(['mailing_list', 'source'])).toEqual(['mailing_list', 'source']);
+    expect(validateGroupingChain(['source', 'kind'])).toEqual(['source', 'kind']);
+    expect(validateGroupingChain(['source', 'unknown'])).toEqual([]);
   });
 });

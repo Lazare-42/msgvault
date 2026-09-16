@@ -7,13 +7,13 @@ import (
 	"log/slog"
 	"net"
 	"net/mail"
-	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/BurntSushi/toml"
 	"github.com/robfig/cron/v3"
@@ -25,6 +25,7 @@ import (
 	"go.kenn.io/msgvault/internal/ocr"
 	"go.kenn.io/msgvault/internal/peoplesweep"
 	"go.kenn.io/msgvault/internal/personenrichment"
+	"go.kenn.io/msgvault/internal/sqliteutil"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/taskclient"
 	"go.kenn.io/msgvault/internal/vector"
@@ -55,6 +56,9 @@ type AnalyticsConfig struct {
 	BuilderMemoryLimit string        `toml:"builder_memory_limit"` // Optional DuckDB cache-builder memory limit
 	BuilderThreads     int           `toml:"builder_threads"`      // Optional DuckDB cache-builder threads; zero uses the default
 	BuilderTempLimit   string        `toml:"builder_temp_limit"`   // Optional DuckDB cache-builder temp-directory limit
+	QueryMemoryLimit   string        `toml:"query_memory_limit"`   // Optional DuckDB daemon-query memory limit; empty uses the default
+	QueryThreads       int           `toml:"query_threads"`        // Optional DuckDB daemon-query threads; zero uses the default
+	QueryTempLimit     string        `toml:"query_temp_limit"`     // Optional DuckDB daemon-query temp-directory limit; empty uses the default
 }
 
 const (
@@ -164,6 +168,8 @@ func (a *AnalyticsConfig) Validate() error {
 	}{
 		{key: "builder_memory_limit", value: a.BuilderMemoryLimit},
 		{key: "builder_temp_limit", value: a.BuilderTempLimit},
+		{key: "query_memory_limit", value: a.QueryMemoryLimit},
+		{key: "query_temp_limit", value: a.QueryTempLimit},
 	} {
 		if size.value != "" && !duckdbutil.ValidSize(size.value) {
 			return fmt.Errorf("invalid [analytics] %s %q: want a positive integer followed by B, KB, MB, GB, TB, KiB, MiB, GiB, or TiB",
@@ -172,6 +178,9 @@ func (a *AnalyticsConfig) Validate() error {
 	}
 	if a.BuilderThreads < 0 {
 		return fmt.Errorf("invalid [analytics] builder_threads %d: must be zero or positive", a.BuilderThreads)
+	}
+	if a.QueryThreads < 0 {
+		return fmt.Errorf("invalid [analytics] query_threads %d: must be zero or positive", a.QueryThreads)
 	}
 	if a.MinRebuildInterval < 0 {
 		return fmt.Errorf("invalid [analytics] min_rebuild_interval %q: must be zero or positive",
@@ -186,6 +195,7 @@ type ServerConfig struct {
 	BindAddr          string        `toml:"bind_addr"`           // Bind address (default: 127.0.0.1)
 	APIKey            string        `toml:"api_key"`             // API authentication key
 	AllowInsecure     bool          `toml:"allow_insecure"`      // Allow unauthenticated non-loopback access
+	AgentAccess       bool          `toml:"agent_access"`        // Enable restricted agent grant tokens (requires api_key)
 	CORSOrigins       []string      `toml:"cors_origins"`        // Allowed CORS origins (empty = disabled)
 	CORSCredentials   bool          `toml:"cors_credentials"`    // Allow credentials in CORS
 	CORSMaxAge        int           `toml:"cors_max_age"`        // Preflight cache duration in seconds
@@ -204,6 +214,9 @@ func (s *ServerConfig) ApplyDefaults() {
 func (s *ServerConfig) Validate() error {
 	if s.APIPort < 0 || s.APIPort > 65535 {
 		return fmt.Errorf("invalid [server] api_port %d: must be between 0 and 65535 (0 auto-selects an open port)", s.APIPort)
+	}
+	if s.AgentAccess && s.APIKey == "" {
+		return errors.New("invalid [server] agent_access: requires api_key to be set")
 	}
 	switch s.DaemonAutoRestart {
 	case DaemonAutoRestartNewer, DaemonAutoRestartNever, DaemonAutoRestartAlways:
@@ -259,6 +272,8 @@ type AccountSchedule struct {
 // CardDAVConfig contains non-secret connection settings for the external
 // address book. The password is stored separately in tokens/carddav.json.
 type CardDAVConfig struct {
+	Provider string `toml:"provider"`
+	OAuthApp string `toml:"oauth_app"`
 	BaseURL  string `toml:"base_url"`
 	Username string `toml:"username"`
 	Schedule string `toml:"schedule"`
@@ -349,9 +364,23 @@ type BackupConfig struct {
 }
 
 const (
-	DefaultChatMaxMediaBytes       int64         = 100 << 20
+	// DefaultChatMaxMediaBytes is the per-attachment size cap for Beeper,
+	// Slack, and Teams when max_media_mb is unset. The importers fall back to
+	// the same attachmentpolicy constant, so the effective default is one
+	// number wherever the policy is resolved.
+	DefaultChatMaxMediaBytes       int64         = attachmentpolicy.DefaultChatMaxBytes
 	DefaultDiscordMaxMediaBytes    int64         = 50 << 20
 	DefaultDiscordEditRescanWindow time.Duration = 7 * 24 * time.Hour
+
+	// DefaultMediaMaxParticipants is the participant cap applied to Beeper,
+	// Slack, Discord, and Teams media collection when a config file omits
+	// media_max_participants. Media from rooms above this size is skipped
+	// with a typed participant_threshold marker; direct chats and small
+	// groups keep theirs. NewDefaultConfig pre-fills the four provider
+	// fields so a file that omits the key inherits the cap, while an explicit
+	// media_max_participants = 0 still means "no cap" because TOML decoding
+	// overwrites the pre-filled value with the operator's zero.
+	DefaultMediaMaxParticipants = 20
 )
 
 // MediaAccountConfig overrides attachment download settings for one provider
@@ -409,36 +438,39 @@ func (b *BackupConfig) Validate() error {
 }
 
 type Config struct {
-	Data         DataConfig                      `toml:"data"`
-	Log          LogConfig                       `toml:"log"`
-	OAuth        OAuthConfig                     `toml:"oauth"`
-	Microsoft    MicrosoftConfig                 `toml:"microsoft"`
-	Sync         SyncConfig                      `toml:"sync"`
-	Chat         ChatConfig                      `toml:"chat"`
-	Server       ServerConfig                    `toml:"server"`
-	Analytics    AnalyticsConfig                 `toml:"analytics"`
-	Web          WebConfig                       `toml:"web"`
-	Integrations IntegrationsConfig              `toml:"integrations"`
-	Remote       RemoteConfig                    `toml:"remote"`
-	Vector       vector.Config                   `toml:"vector"`
-	Identity     IdentityConfig                  `toml:"identity"`
-	Fastmail     []FastmailSource                `toml:"fastmail"`
-	CardDAV      CardDAVConfig                   `toml:"carddav"`
-	Accounts     []AccountSchedule               `toml:"accounts"`
-	SynctechSMS  SynctechSMSConfig               `toml:"synctech_sms"`
-	GCal         []GCalSource                    `toml:"gcal"`
-	Beeper       BeeperConfig                    `toml:"beeper"`
-	Slack        SlackConfig                     `toml:"slack"`
-	Granola      []GranolaSource                 `toml:"granola"`
-	Circleback   []CirclebackSource              `toml:"circleback"`
-	Backup       BackupConfig                    `toml:"backup"`
-	Discord      DiscordConfig                   `toml:"discord"`
-	GoogleDocs   GoogleDocsConfig                `toml:"google_docs"`
-	OCR          OCRConfig                       `toml:"ocr"`
-	Attachments  documentindex.AttachmentsConfig `toml:"attachments"`
-	Activity     ActivityConfig                  `toml:"activity"`
-	People       PeopleConfig                    `toml:"people"`
-	Teams        TeamsConfig                     `toml:"teams"`
+	Data           DataConfig                      `toml:"data"`
+	Log            LogConfig                       `toml:"log"`
+	OAuth          OAuthConfig                     `toml:"oauth"`
+	Microsoft      MicrosoftConfig                 `toml:"microsoft"`
+	Sync           SyncConfig                      `toml:"sync"`
+	Chat           ChatConfig                      `toml:"chat"`
+	Server         ServerConfig                    `toml:"server"`
+	Analytics      AnalyticsConfig                 `toml:"analytics"`
+	Web            WebConfig                       `toml:"web"`
+	Integrations   IntegrationsConfig              `toml:"integrations"`
+	Remote         RemoteConfig                    `toml:"remote"`
+	Vector         vector.Config                   `toml:"vector"`
+	Identity       IdentityConfig                  `toml:"identity"`
+	Fastmail       []FastmailSource                `toml:"fastmail"`
+	CardDAV        CardDAVConfig                   `toml:"carddav"`
+	Accounts       []AccountSchedule               `toml:"accounts"`
+	SynctechSMS    SynctechSMSConfig               `toml:"synctech_sms"`
+	GCal           []GCalSource                    `toml:"gcal"`
+	Beeper         BeeperConfig                    `toml:"beeper"`
+	Slack          SlackConfig                     `toml:"slack"`
+	Granola        []GranolaSource                 `toml:"granola"`
+	Circleback     []CirclebackSource              `toml:"circleback"`
+	NotionMeetings []NotionMeetingsSource          `toml:"notion_meetings"`
+	Backup         BackupConfig                    `toml:"backup"`
+	Discord        DiscordConfig                   `toml:"discord"`
+	GoogleDocs     GoogleDocsConfig                `toml:"google_docs"`
+	OCR            OCRConfig                       `toml:"ocr"`
+	Attachments    documentindex.AttachmentsConfig `toml:"attachments"`
+	Activity       ActivityConfig                  `toml:"activity"`
+	People         PeopleConfig                    `toml:"people"`
+	Teams          TeamsConfig                     `toml:"teams"`
+	Deletion       DeletionConfig                  `toml:"deletion"`
+	IMAP           IMAPConfig                      `toml:"imap"`
 
 	// Computed paths (not from config file)
 	HomeDir    string `toml:"-"`
@@ -532,6 +564,24 @@ func (o OCRConfig) Validate() error {
 		return fmt.Errorf("invalid [ocr] max_image_scale %d: must be between 1 and 8", o.MaxImageScale)
 	}
 	return nil
+}
+
+// IMAPConfig contains operator-owned settings for IMAP mutations.
+type IMAPConfig struct {
+	Drafts []IMAPDraftSource `toml:"drafts"`
+}
+
+// IMAPDraftSource grants one source permission to create a draft in a literal
+// mailbox. The daemon copies this grant at startup.
+type IMAPDraftSource struct {
+	SourceID int64  `toml:"source_id"`
+	Enabled  bool   `toml:"enabled"`
+	Mailbox  string `toml:"mailbox"`
+}
+
+// DeletionConfig records durable operator consent for remote deletion.
+type DeletionConfig struct {
+	RemoteEnabled bool `toml:"remote_enabled"`
 }
 
 // PeopleConfig keeps the existing archive sweep and external enrichment as
@@ -633,6 +683,7 @@ type LogConfig struct {
 // DataConfig holds data storage configuration.
 type DataConfig struct {
 	DataDir          string `toml:"data_dir"`
+	ExportDir        string `toml:"export_dir"`
 	DatabaseURL      string `toml:"database_url"`
 	LooseAttachments bool   `toml:"loose_attachments"`
 }
@@ -727,6 +778,19 @@ func (c *MicrosoftConfig) EffectiveTenantID() string {
 // SyncConfig holds sync-related configuration.
 type SyncConfig struct {
 	RateLimitQPS int `toml:"rate_limit_qps"`
+	// ArchiveRemoteImages opts into sender-controlled HTTP requests, which
+	// can activate tracking pixels. Unset is deliberately false.
+	ArchiveRemoteImages bool `toml:"archive_remote_images"`
+	// TrustedIMAPSentMailboxes maps an exact IMAP source identifier (the
+	// ACCOUNT value printed by `msgvault list-accounts`, e.g.
+	// "imaps://user@example.com@imap.example.com:993") to that source's
+	// Sent-folder mailbox names, for servers whose (possibly localized) Sent
+	// folder advertises no RFC 6154 \Sent role. The mapping is per source:
+	// a same-named mailbox in another account never gains trust. Each entry
+	// is an explicit trust assumption, not evidence. Untrusted-by-default:
+	// a missing entry leaves snapshot refresh authorized only by
+	// unambiguous advertised \Sent or \Drafts placement.
+	TrustedIMAPSentMailboxes map[string][]string `toml:"trusted_imap_sent_mailboxes"`
 }
 
 // DefaultHome returns the default msgvault home directory.
@@ -786,6 +850,11 @@ func NewDefaultConfig() *Config {
 		SynctechSMS: SynctechSMSConfig{Sources: []SynctechSMSSource{}},
 		GCal:        []GCalSource{},
 		GoogleDocs:  GoogleDocsConfig{Sources: []GoogleDocsSource{}},
+		// Group-room media is capped by default; see DefaultMediaMaxParticipants.
+		Beeper:  BeeperConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
+		Slack:   SlackConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
+		Discord: DiscordConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
+		Teams:   TeamsConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
 	}
 	cfg.Attachments.Documents = documentindex.DefaultDocumentsConfig()
 	cfg.Vector.ApplyDefaults()
@@ -880,6 +949,10 @@ func decodeConfig(cfg *Config, path string, explicit, homeOverride bool, content
 	// the pre-filled section so changing endpoint cannot silently carry the
 	// default Voyage key environment name to another origin.
 	cfg.Vector.Multimodal = vector.MultimodalConfig{}
+	// People-sweep provider defaults include a generated profile. Decode into
+	// an empty section so ApplyDefaults only fills it when the file defines
+	// no profiles of its own.
+	cfg.People.Sweep = peoplesweep.Config{}
 	metadata, err := toml.Decode(string(content), cfg)
 	if err != nil {
 		if strings.Contains(err.Error(), "invalid escape") ||
@@ -889,38 +962,25 @@ func decodeConfig(cfg *Config, path string, explicit, homeOverride bool, content
 		}
 		return nil, fmt.Errorf("decode config: %w", err)
 	}
-	if cfg.People.Sweep.Provider.AllowAnonymous &&
-		!metadata.IsDefined("people", "sweep", "provider", "api_key_env") {
-		// The default authenticated credential is loaded before TOML decoding.
-		// Anonymous loopback mode instead defaults to no credential, while an
-		// explicitly configured key remains visible to validation and is rejected.
-		cfg.People.Sweep.Provider.APIKeyEnv = ""
-	}
-	if cfg.People.Sweep.Provider.Kind == peoplesweep.ProviderCodexAppServer {
-		if !metadata.IsDefined("people", "sweep", "provider", "endpoint") {
-			cfg.People.Sweep.Provider.Endpoint = ""
-		}
-		if !metadata.IsDefined("people", "sweep", "provider", "api_key_env") {
-			cfg.People.Sweep.Provider.APIKeyEnv = ""
-		}
-		if !metadata.IsDefined("people", "sweep", "provider", "executable") {
-			cfg.People.Sweep.Provider.Executable = "codex"
-		}
-		if !metadata.IsDefined("people", "sweep", "provider", "execution_boundary") {
-			cfg.People.Sweep.Provider.ExecutionBoundary = peoplesweep.CodexExecutionBoundaryV1
-		}
-	}
+	cfg.People.Sweep.ApplyDefaults()
 	for _, key := range metadata.Undecoded() {
 		if key.String() == "carddav.password" {
 			return nil, errors.New("[carddav] password is not allowed in config; store it in tokens/carddav.json")
+		}
+		if strings.HasPrefix(key.String(), "imap.drafts.") {
+			return nil, fmt.Errorf("unknown IMAP draft config key %q", key.String())
 		}
 	}
 	if err := cfg.validateFastmailSources(fastmailSourceIDConfigured(content)); err != nil {
 		return nil, err
 	}
+	if err := cfg.validateIMAPDraftSources(content); err != nil {
+		return nil, err
+	}
 
 	// Expand ~ in paths
 	cfg.Data.DataDir = expandPath(cfg.Data.DataDir)
+	cfg.Data.ExportDir = expandPath(cfg.Data.ExportDir)
 	cfg.Log.Dir = expandPath(cfg.Log.Dir)
 	cfg.OAuth.ClientSecrets = expandPath(cfg.OAuth.ClientSecrets)
 	cfg.OAuth.ServiceAccountKey = expandPath(cfg.OAuth.ServiceAccountKey)
@@ -938,6 +998,7 @@ func decodeConfig(cfg *Config, path string, explicit, homeOverride bool, content
 	// directory so behavior doesn't depend on the working directory.
 	if explicit {
 		cfg.Data.DataDir = resolveRelative(cfg.Data.DataDir, cfg.HomeDir)
+		cfg.Data.ExportDir = resolveRelative(cfg.Data.ExportDir, cfg.HomeDir)
 		cfg.Log.Dir = resolveRelative(cfg.Log.Dir, cfg.HomeDir)
 		cfg.OAuth.ClientSecrets = resolveRelative(cfg.OAuth.ClientSecrets, cfg.HomeDir)
 		cfg.OAuth.ServiceAccountKey = resolveRelative(cfg.OAuth.ServiceAccountKey, cfg.HomeDir)
@@ -1022,6 +1083,39 @@ func (c *Config) rebaseDefaultOCRSocket(homeDir string) {
 		c.OCR.Socket = ocr.DefaultSocket(homeDir)
 	}
 }
+
+func (c *Config) validateIMAPDraftSources(content []byte) error {
+	var raw struct {
+		IMAP struct {
+			Drafts []struct {
+				SourceID *int64 `toml:"source_id"`
+			} `toml:"drafts"`
+		} `toml:"imap"`
+	}
+	_, _ = toml.Decode(string(content), &raw)
+	seen := make(map[int64]struct{}, len(c.IMAP.Drafts))
+	for i := range c.IMAP.Drafts {
+		draft := &c.IMAP.Drafts[i]
+		if i >= len(raw.IMAP.Drafts) || raw.IMAP.Drafts[i].SourceID == nil {
+			return fmt.Errorf("[[imap.drafts]] entry %d: source_id is required", i+1)
+		}
+		if draft.SourceID <= 0 {
+			return fmt.Errorf("[[imap.drafts]] entry %d: source_id must be positive", i+1)
+		}
+		if _, ok := seen[draft.SourceID]; ok {
+			return fmt.Errorf("[[imap.drafts]] entry %d: duplicate source_id selector %d", i+1, draft.SourceID)
+		}
+		seen[draft.SourceID] = struct{}{}
+		if !utf8.ValidString(draft.Mailbox) || strings.TrimSpace(draft.Mailbox) == "" {
+			return fmt.Errorf("[[imap.drafts]] entry %d: mailbox must be nonblank UTF-8", i+1)
+		}
+		if strings.ContainsAny(draft.Mailbox, "\x00\r\n") {
+			return fmt.Errorf("[[imap.drafts]] entry %d: mailbox contains control characters", i+1)
+		}
+	}
+	return nil
+}
+
 func fastmailSourceIDConfigured(content []byte) []bool {
 	var raw struct {
 		Fastmail []struct {
@@ -1184,31 +1278,7 @@ func (c *Config) DatabaseDSN() string {
 // cannot operate on.
 func (c *Config) DatabasePath() (string, error) {
 	dsn := c.DatabaseDSN()
-	if strings.HasPrefix(dsn, "file:") {
-		u, err := url.Parse(dsn)
-		if err != nil {
-			return "", fmt.Errorf("parse file: URI %q: %w", dsn, err)
-		}
-		// SQLite accepts both file:/abs/path (Path) and file:rel/path
-		// (Opaque) shapes. url.Parse decodes percent-encoding for Path
-		// but NOT for Opaque, so a relative file: URI like
-		// "file:my%20vault.db" leaves the encoding intact in u.Opaque
-		// and the on-disk filename never matches. PathUnescape handles
-		// the relative-form case explicitly.
-		path := u.Path
-		if path == "" {
-			decoded, err := url.PathUnescape(u.Opaque)
-			if err != nil {
-				return "", fmt.Errorf("decode file: URI opaque part %q: %w", u.Opaque, err)
-			}
-			path = decoded
-		}
-		if path == "" {
-			return "", fmt.Errorf("empty file: URI in database DSN: %q", dsn)
-		}
-		return path, nil
-	}
-	if strings.Contains(dsn, "://") {
+	if strings.Contains(dsn, "://") && !strings.HasPrefix(dsn, "file:") {
 		// postgres://, mysql://, etc. — non-file DSN; backup is
 		// SQLite-specific and the caller can't operate on these.
 		return "", fmt.Errorf(
@@ -1217,12 +1287,21 @@ func (c *Config) DatabasePath() (string, error) {
 				"plain filesystem path or file: URI)", dsn,
 		)
 	}
-	return dsn, nil
+	_, path, err := sqliteutil.ResolveDSN(dsn)
+	return path, err
 }
 
 // AttachmentsDir returns the path to the attachments directory.
 func (c *Config) AttachmentsDir() string {
 	return filepath.Join(c.Data.DataDir, "attachments")
+}
+
+// ExportDir returns the directory used for user-requested file exports.
+func (c *Config) ExportDir() string {
+	if c.Data.ExportDir != "" {
+		return c.Data.ExportDir
+	}
+	return filepath.Join(c.Data.DataDir, "exports")
 }
 
 // TokensDir returns the path to the OAuth tokens directory.
@@ -1377,11 +1456,12 @@ type BeeperConfig struct {
 	RateLimitQPS float64 `toml:"rate_limit_qps"`
 	// Media toggles attachment download (nil/absent = enabled).
 	Media *bool `toml:"media"`
-	// MaxMediaMB caps individual attachment downloads in MiB (0 = 100).
+	// MaxMediaMB caps individual attachment downloads in MiB (0 = 250).
 	MaxMediaMB int `toml:"max_media_mb"`
 	// MediaScope is all, direct, or none (empty = all).
 	MediaScope string `toml:"media_scope"`
-	// MediaMaxParticipants caps eligible conversation membership (0 = no cap).
+	// MediaMaxParticipants caps eligible conversation membership (omitted =
+	// DefaultMediaMaxParticipants; explicit 0 = no cap).
 	MediaMaxParticipants int `toml:"media_max_participants"`
 	// AccountsConfig holds per-Beeper-account media overrides.
 	AccountsConfig map[string]MediaAccountConfig `toml:"accounts_config"`
@@ -1402,17 +1482,20 @@ type SlackConfig struct {
 	ExcludeChannels []string `toml:"exclude_channels"`
 	// Media toggles file download (nil/absent = enabled).
 	Media *bool `toml:"media"`
-	// MaxMediaMB caps individual file downloads in MiB (0 = 100).
+	// MaxMediaMB caps individual file downloads in MiB (0 = 250).
 	MaxMediaMB int `toml:"max_media_mb"`
 	// MediaScope is all, direct, or none (empty = all).
 	MediaScope string `toml:"media_scope"`
-	// MediaMaxParticipants caps eligible conversation membership (0 = no cap).
+	// MediaMaxParticipants caps eligible conversation membership (omitted =
+	// DefaultMediaMaxParticipants; explicit 0 = no cap).
 	MediaMaxParticipants int `toml:"media_max_participants"`
 	// AccountsConfig holds per-workspace media overrides keyed by team ID.
 	AccountsConfig map[string]MediaAccountConfig `toml:"accounts_config"`
 }
 
 // TeamsConfig configures provider-wide and per-account Teams media policy.
+// MediaMaxParticipants follows the same omitted-versus-explicit-zero rule as
+// the other providers.
 type TeamsConfig struct {
 	Media                *bool                         `toml:"media"`
 	MediaScope           string                        `toml:"media_scope"`
@@ -1444,7 +1527,7 @@ func (b BeeperConfig) MaxMediaBytes() int64 {
 	if b.MaxMediaMB > 0 {
 		return int64(b.MaxMediaMB) << 20
 	}
-	return 100 << 20
+	return DefaultChatMaxMediaBytes
 }
 
 // MediaPolicy resolves Beeper provider settings and an account override.
@@ -1650,6 +1733,22 @@ type CirclebackSource struct {
 	Enabled      bool   `toml:"enabled"`
 }
 
+// NotionMeetingsSource is one configured Notion AI Meeting Notes identity.
+// Authentication uses a read-only integration token stored in config.toml.
+type NotionMeetingsSource struct {
+	Identifier   string `toml:"identifier"`
+	AccountEmail string `toml:"account_email"`
+	Token        string `toml:"token"`
+	Schedule     string `toml:"schedule"`
+	Enabled      bool   `toml:"enabled"`
+}
+
+// EffectiveAccountEmail returns the normalized primary identity configured
+// for this source.
+func (s NotionMeetingsSource) EffectiveAccountEmail() (string, error) {
+	return effectiveMeetingAccountEmail("notion_meetings", s.Identifier, s.AccountEmail)
+}
+
 // EffectiveAccountEmail returns the normalized primary identity configured
 // for this source.
 func (s CirclebackSource) EffectiveAccountEmail() (string, error) {
@@ -1681,7 +1780,7 @@ func normalizedMeetingAccountEmail(value string) (string, bool) {
 	return email, true
 }
 
-// applyMeetingSourceDefaults normalizes [[granola]]/[[circleback]] entries: a
+// applyMeetingSourceDefaults normalizes native meeting-source entries: a
 // single entry with no identifier becomes "default" so the CLI argument can
 // be omitted in the common one-account case.
 func (c *Config) applyMeetingSourceDefaults() {
@@ -1691,9 +1790,12 @@ func (c *Config) applyMeetingSourceDefaults() {
 	if len(c.Circleback) == 1 && c.Circleback[0].Identifier == "" {
 		c.Circleback[0].Identifier = "default"
 	}
+	if len(c.NotionMeetings) == 1 && c.NotionMeetings[0].Identifier == "" {
+		c.NotionMeetings[0].Identifier = "default"
+	}
 }
 
-// validateMeetingSources rejects [[granola]]/[[circleback]] lists with empty
+// validateMeetingSources rejects native meeting-source lists with empty
 // or duplicate identifiers — the identifier keys the source row and token
 // file, so a collision would silently merge two accounts.
 func (c *Config) validateMeetingSources() error {
@@ -1743,6 +1845,22 @@ func (c *Config) validateMeetingSources() error {
 			c.Circleback[i].AccountEmail = email
 		}
 	}
+	notionIDs := make([]string, len(c.NotionMeetings))
+	for i, s := range c.NotionMeetings {
+		notionIDs[i] = s.Identifier
+	}
+	if err := check("notion_meetings", notionIDs); err != nil {
+		return err
+	}
+	for i := range c.NotionMeetings {
+		email, err := c.NotionMeetings[i].EffectiveAccountEmail()
+		if err != nil {
+			return err
+		}
+		if strings.TrimSpace(c.NotionMeetings[i].AccountEmail) != "" {
+			c.NotionMeetings[i].AccountEmail = email
+		}
+	}
 	return nil
 }
 
@@ -1785,6 +1903,30 @@ func (c *Config) GetCirclebackSource(identifier string) *CirclebackSource {
 func (c *Config) ScheduledCirclebackSources() []CirclebackSource {
 	var out []CirclebackSource
 	for _, src := range c.Circleback {
+		if src.Enabled && src.Schedule != "" {
+			out = append(out, src)
+		}
+	}
+	return out
+}
+
+// GetNotionMeetingsSource returns the configured Notion meeting source
+// matching identifier (case-insensitive), or nil.
+func (c *Config) GetNotionMeetingsSource(identifier string) *NotionMeetingsSource {
+	for _, src := range c.NotionMeetings {
+		if strings.EqualFold(src.Identifier, identifier) {
+			cp := src
+			return &cp
+		}
+	}
+	return nil
+}
+
+// ScheduledNotionMeetingsSources returns enabled Notion meeting sources with
+// a cron schedule.
+func (c *Config) ScheduledNotionMeetingsSources() []NotionMeetingsSource {
+	var out []NotionMeetingsSource
+	for _, src := range c.NotionMeetings {
 		if src.Enabled && src.Schedule != "" {
 			out = append(out, src)
 		}

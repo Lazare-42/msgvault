@@ -1,7 +1,10 @@
 package api
 
 import (
-	"encoding/json"
+	jsonv1 "encoding/json"
+	jsonv2 "encoding/json/v2"
+	"fmt"
+	"io"
 	"net/http"
 	"reflect"
 	"strconv"
@@ -27,7 +30,21 @@ const (
 	cliRouteTag          = "CLI"
 )
 
-var configureHumaErrorsOnce sync.Once
+var configureHumaOnce sync.Once
+
+// marshalAPIJSON preserves the API's established JSON v1 behavior except for
+// nil slices, which JSON v2 writes as empty arrays to match the OpenAPI schema.
+func marshalAPIJSON(w io.Writer, value any) error {
+	err := jsonv2.MarshalWrite(
+		w, value,
+		jsonv1.DefaultOptionsV1(),
+		jsonv2.FormatNilSliceAsNull(false),
+	)
+	if err != nil {
+		return fmt.Errorf("marshal API JSON: %w", err)
+	}
+	return nil
+}
 
 type apiHTTPError struct {
 	ErrorResponse
@@ -62,8 +79,11 @@ func newAPIHTTPError(status int, code string, message string) *apiHTTPError {
 	}
 }
 
-func setupHumaErrors() {
-	configureHumaErrorsOnce.Do(func() {
+func configureHuma() {
+	configureHumaOnce.Do(func() {
+		// The API uses encoding/json/v2, which encodes nil slices as empty
+		// arrays. Keep Huma's schemas aligned with that wire contract.
+		huma.DefaultArrayNullable = false
 		huma.NewError = func(status int, message string, _ ...error) huma.StatusError {
 			if message == "" {
 				message = http.StatusText(status)
@@ -108,9 +128,19 @@ func errorCodeForStatus(status int) string {
 }
 
 func (s *Server) setupHumaAPI(mux humago.Mux) huma.API {
-	setupHumaErrors()
+	configureHuma()
 
 	config := huma.DefaultConfig("msgvault API", APISchemaVersion)
+	jsonFormat := huma.Format{
+		Marshal: marshalAPIJSON,
+		Unmarshal: func(data []byte, value any) error {
+			return jsonv2.Unmarshal(data, value, jsonv1.DefaultOptionsV1())
+		},
+	}
+	config.Formats = map[string]huma.Format{
+		"application/json": jsonFormat,
+		"json":             jsonFormat,
+	}
 	// Disable huma's built-in /docs page: it loads Stoplight Elements from
 	// unpkg.com on the same origin as the browser session cookie, so a
 	// compromised CDN response could use the session to read archive data or
@@ -159,7 +189,17 @@ func withAPIKeySecurity(op huma.Operation) huma.Operation {
 
 func (s *Server) humaAuthMiddleware(ctx huma.Context, next func(huma.Context)) {
 	req, _ := humago.Unwrap(ctx)
-	if s.requestAuthentication(req).Mode != AuthModeRequired {
+	auth := s.requestAuthentication(req)
+	if auth.Mode == AuthModeDelegated {
+		if op := ctx.Operation(); op != nil && delegatedOperationAllowed(op.OperationID) {
+			next(ctx)
+			return
+		}
+		s.logUnauthorizedAPIRequest(req)
+		writeHumaError(ctx, http.StatusUnauthorized, "unauthorized", "Invalid or missing API key")
+		return
+	}
+	if auth.Mode != AuthModeRequired {
 		next(ctx)
 		return
 	}
@@ -171,7 +211,7 @@ func (s *Server) humaAuthMiddleware(ctx huma.Context, next func(huma.Context)) {
 func writeHumaError(ctx huma.Context, status int, code string, message string) {
 	ctx.SetHeader("Content-Type", applicationJSONMediaType)
 	ctx.SetStatus(status)
-	_ = json.NewEncoder(ctx.BodyWriter()).Encode(ErrorResponse{ //nolint:errchkjson // best-effort error response write
+	_ = marshalAPIJSON(ctx.BodyWriter(), ErrorResponse{
 		Error:   code,
 		Message: message,
 	})
@@ -224,6 +264,7 @@ func (s *Server) registerHumaRoutes(api huma.API, apiV1 huma.API) {
 	}, s.handleDaemonShutdown)
 
 	registerAPIV1RawHumaJSONRoute[StatsResponse](apiV1, "getStats", http.MethodGet, "/stats", "Get archive statistics", s.handleStats)
+	s.registerImportJobRoutes(apiV1)
 	s.registerSettingsRoutes(apiV1)
 	s.registerCardDAVRoutes(apiV1)
 	s.registerSavedViewRoutes(apiV1)
@@ -232,7 +273,9 @@ func (s *Server) registerHumaRoutes(api huma.API, apiV1 huma.API) {
 	s.registerOCRRoutes(apiV1)
 	s.registerDocumentSearchRoute(apiV1)
 	s.registerPersonProfileRoutes(apiV1)
+	s.registerPersonNetworkRoutes(apiV1)
 	s.registerPersonTrackingRoutes(apiV1)
+	s.registerPersonBriefRoutes(apiV1)
 	s.registerPersonMergeRoutes(apiV1)
 	s.registerOrganizationRoutes(apiV1)
 	s.registerEmploymentRoutes(apiV1)
@@ -292,6 +335,7 @@ func (s *Server) registerHumaRoutes(api huma.API, apiV1 huma.API) {
 	registerAPIV1RawHumaNDJSONRoute[CLICacheBuildEvent](apiV1, "buildCLICache", http.MethodPost, "/cli/build-cache", "Build the CLI analytics cache", s.handleCLIBuildCache)
 	registerAPIV1RawHumaNDJSONRoute[CLISyncEvent](apiV1, "syncCLI", http.MethodPost, "/cli/sync", "Run CLI incremental sync", s.handleCLISync)
 	registerAPIV1RawHumaNDJSONRoute[CLISyncEvent](apiV1, "syncFullCLI", http.MethodPost, "/cli/sync-full", "Run CLI full sync", s.handleCLISyncFull)
+	registerAPIV1RawHumaNDJSONRouteWithRequest[CLIRepairMessageRequest, CLIRepairMessageEvent](apiV1, "repairMessageCLI", http.MethodPost, "/cli/repair-message", "Repair or audit Gmail message snapshots", s.handleCLIRepairMessage)
 	registerAPIV1RawHumaNDJSONRoute[CLIVerifyEvent](apiV1, "verifyCLI", http.MethodPost, "/cli/verify", "Verify the CLI archive against Gmail", s.handleCLIVerify)
 	registerAPIV1RawHumaNDJSONRoute[CLIRepairEncodingEvent](apiV1, "repairEncodingCLI", http.MethodPost, "/cli/repair-encoding", "Repair CLI archive encoding", s.handleCLIRepairEncoding)
 	registerAPIV1RawHumaJSONRouteWithRequest[CLIAddCalendarPlanRequest, CLIAddCalendarPlanResponse](apiV1, "planCLIAddCalendar", http.MethodPost, "/cli/add-calendar/plan", "Plan CLI Calendar account setup", s.handleCLIAddCalendarPlan)
@@ -300,6 +344,14 @@ func (s *Server) registerHumaRoutes(api huma.API, apiV1 huma.API) {
 	registerAPIV1RawHumaJSONRouteWithRequest[CLIEmbeddingsPlanRequest, CLIEmbeddingsPlanResponse](apiV1, "planCLIEmbeddings", http.MethodPost, "/cli/embeddings/plan", "Plan CLI embeddings management", s.handleCLIEmbeddingsPlan)
 	registerAPIV1RawHumaNDJSONRouteWithRequest[CLIRunRequest, CLIRunEvent](apiV1, "runCLI", http.MethodPost, "/cli/run", "Run an allowlisted CLI command", s.handleCLIRun)
 	registerAPIV1RawHumaJSONRoute[cliMessageResponse](apiV1, "getCLIMessage", http.MethodGet, "/cli/message", "Get one message for CLI output", s.handleCLIMessage)
+	// Agent-token management routes: owner API key required.
+	registerAPIV1RawHumaJSONRouteWithRequest[agentTokenIssueRequest, agentTokenIssueResponse](apiV1, "issueAgentToken", http.MethodPost, "/agent-tokens", "Issue a restricted agent grant", s.handleIssueAgentToken, http.StatusCreated)
+	registerAPIV1RawHumaJSONRoute[agentTokenListResponse](apiV1, "listAgentTokens", http.MethodGet, "/agent-tokens", "List active agent grants", s.handleListAgentTokens)
+	{
+		op := rawAPIV1Operation("revokeAgentToken", http.MethodDelete, "/agent-tokens/{id}", "Revoke an agent grant by ID")
+		op.Responses = rawHumaResponses(http.StatusNoContent)
+		registerRawHumaRoute(apiV1, op, s.handleRevokeAgentToken)
+	}
 	registerAPIV1RawHumaBinaryRoute(
 		apiV1,
 		"getCLIMessageRaw",
@@ -429,6 +481,22 @@ func (s *Server) registerHumaRoutes(api huma.API, apiV1 huma.API) {
 		http.StatusInternalServerError,
 		http.StatusServiceUnavailable,
 	)
+	registerAPIV1RawHumaOperationJSONRoute[OperationRunsResponse](
+		apiV1, "listOperationRuns", http.MethodGet, "/operations/runs",
+		"List normalized operation history", s.handleOperationRuns,
+		http.StatusBadRequest, http.StatusConflict, http.StatusInternalServerError,
+		http.StatusServiceUnavailable,
+	)
+	registerAPIV1RawHumaOperationJSONRoute[OperationStatusResponse](
+		apiV1, "getOperationStatus", http.MethodGet, "/operations/status",
+		"Get normalized operation lane status", s.handleOperationStatus,
+	)
+	registerAPIV1RawHumaOperationJSONRoute[OperationRunDetail](
+		apiV1, "getOperationRun", http.MethodGet, "/operations/runs/{id}",
+		"Get one normalized operation run", s.handleOperationRunDetail,
+		http.StatusBadRequest, http.StatusNotFound, http.StatusInternalServerError,
+		http.StatusServiceUnavailable,
+	)
 	registerAPIV1RawHumaJSONRoute[GmailIDsResponse](apiV1, "getGmailIDsByFilter", http.MethodGet, "/messages/gmail-ids", "List Gmail message IDs matching a filter", s.handleGmailIDsByFilter)
 	registerAPIV1RawHumaJSONRoute[TotalStatsResponse](apiV1, "getTotalStats", http.MethodGet, "/stats/total", "Get aggregate totals", s.handleTotalStats)
 	registerAPIV1RawHumaJSONRoute[FilteredMessagesResponse](apiV1, "searchMessagesByDomains", http.MethodGet, "/search/domains", "Search messages by participant domains", s.handleSearchByDomains)
@@ -500,6 +568,26 @@ func registerAPIV1RawHumaJSONRouteWithErrors[T any](
 	op.Responses = jsonResponsesFor[T](api)
 	for _, status := range errorStatuses {
 		op.Responses[httpStatusKey(status)] = errorResponseFor(api)
+	}
+	registerRawHumaRoute(api, op, handler)
+}
+
+// registerAPIV1RawHumaOperationJSONRoute keeps the Operations error contract
+// closed without changing the legacy error schema used by unrelated routes.
+func registerAPIV1RawHumaOperationJSONRoute[T any](
+	api huma.API,
+	operationID string,
+	method string,
+	path string,
+	summary string,
+	handler http.HandlerFunc,
+	errorStatuses ...int,
+) {
+	op := rawAPIV1Operation(operationID, method, path, summary)
+	op.Responses = jsonResponsesFor[T](api)
+	op.Responses["default"] = operationErrorResponseFor(api)
+	for _, status := range errorStatuses {
+		op.Responses[httpStatusKey(status)] = operationErrorResponseFor(api)
 	}
 	registerRawHumaRoute(api, op, handler)
 }
@@ -611,8 +699,35 @@ func rawAPIV1Operation(operationID, method, path, summary string) huma.Operation
 
 func rawRouteParameters(operationID string) []*huma.Param {
 	switch operationID {
+	case "listOperationRuns":
+		kind := queryStringParam("kind", "Exact operation kind", false)
+		kind.Schema.Enum = stringsToAny(operationKindValues())
+		lane := queryStringParam("lane", "Exact semantic operation lane", false)
+		lane.Schema.Enum = stringsToAny(operationLaneValues())
+		state := queryStringParam("state", "Exact operation state", false)
+		state.Schema.Enum = stringsToAny(operationStateValues())
+		startedFrom := queryStringParam("started_from", "Inclusive canonical UTC RFC3339 lower bound", false)
+		startedFrom.Schema.Format = "date-time"
+		startedBefore := queryStringParam("started_before", "Exclusive canonical UTC RFC3339 upper bound", false)
+		startedBefore.Schema.Format = "date-time"
+		limit := queryIntegerParam("limit", "Maximum runs to return (default 25, max 100)")
+		minimum, maximum := float64(1), float64(100)
+		limit.Schema.Minimum, limit.Schema.Maximum = &minimum, &maximum
+		return []*huma.Param{
+			kind,
+			lane,
+			state,
+			startedFrom,
+			startedBefore,
+			limit,
+			queryStringParam("cursor", "Opaque cursor bound to this archive and the complete normalized filter set", false),
+		}
+	case "getOperationRun":
+		return []*huma.Param{pathStringParam("id", "Opaque archive-bound operation run ID")}
 	case "getCLIStats":
 		return scopeParams()
+	case "getImportJob":
+		return []*huma.Param{pathStringParam("job_id", "Historical import job ID")}
 	case "searchCLI":
 		return append([]*huma.Param{
 			queryStringParam("q", "Search query", true),
@@ -752,7 +867,7 @@ func rawRouteParameters(operationID string) []*huma.Param {
 	case "searchMessages":
 		return mergeParams([]*huma.Param{
 			queryStringParam("q", "Search query", true),
-			queryStringParam("mode", "Search mode: fts, vector, or hybrid. Structured filter parameters are supported only in vector and hybrid modes", false),
+			queryStringParam("mode", "Search mode: fts, vector, or hybrid. conversation_id applies in every mode; other structured filter parameters require vector or hybrid", false),
 			queryIntegerParam("page", "One-based page number (default 1; values below 1 are clamped to 1). Non-numeric values are rejected with 400."),
 			queryIntegerParam("page_size", "Page size (default 20, max 100; out-of-range values are clamped). Non-numeric values are rejected with 400."),
 			queryIntegerParam("offset", "Zero-based ranking offset for vector or hybrid search (default 0)"),
@@ -778,7 +893,12 @@ func rawRouteParameters(operationID string) []*huma.Param {
 	case "listChangedMessages":
 		return changesParams()
 	case "getGmailIDsByFilter":
-		return messageFilterParams()
+		return append(messageFilterParams(),
+			queryStringParam("q", "Structured search query", false),
+			queryStringParam("search_mode", "Search mode: fast, deep, or aggregate; required with q", false),
+			queryStringParam("view_type", "Aggregate view type; required for aggregate search", false),
+			queryStringParam("aggregate_key", "Displayed aggregate row key; required for aggregate search", false),
+		)
 	case "searchMessagesByDomains":
 		return []*huma.Param{
 			queryStringParam("domains", "Comma-separated participant domains", true),
@@ -798,28 +918,34 @@ func rawRouteParameters(operationID string) []*huma.Param {
 			queryBooleanParam("has_attachment", "Only include messages with attachments"),
 		}
 	case "getTotalStats":
-		return []*huma.Param{
-			queryIntegerParam("source_id", "Source ID"),
+		return mergeParams([]*huma.Param{
 			queryIntegerArrayParam("source_ids", "Source IDs; repeat the parameter for multiple sources"),
-			queryBooleanParam("attachments_only", "Only include messages with attachments"),
-			queryBooleanParam("hide_deleted", "Exclude deleted messages"),
 			queryStringParam("search_query", "Search query", false),
 			queryBooleanParam("search_scope", "Include all message types when the search has no explicit message_type"),
 			queryStringParam("group_by", "Aggregate view type for grouping", false),
-		}
+		}, messageFilterScopeParams())
 	case "fastSearch":
 		params := append([]*huma.Param{
 			queryStringParam("q", "Search query", true),
 			queryStringParam("view_type", "Stats grouping view type", false),
 		}, messageFilterParams()...)
-		return append(params,
-			queryIntegerArrayParam("source_ids", "Source IDs; repeat the parameter for multiple sources"),
-		)
+		return params
 	case "deepSearch":
+		filterParams := messageFilterParams()
+		for _, parameter := range filterParams {
+			switch parameter.Name {
+			case "source_ids":
+				parameter.Description += "; not supported by deep search"
+			case "sender", "sender_name", recipientParam, "recipient_name", "domain", "label",
+				"time_period", "conversation_id",
+				"empty_targets", "message_type", "list_id":
+				parameter.Description += "; not supported when scope=body"
+			}
+		}
 		return append([]*huma.Param{
 			queryStringParam("q", "Search query", true),
 			queryStringParam("scope", "Exact search scope: body; omit for composite full-text search", false),
-		}, messageFilterParams()...)
+		}, filterParams...)
 	case "listTextConversations":
 		return textFilterParams()
 	case "getTextAggregates":
@@ -841,6 +967,7 @@ func rawRouteParameters(operationID string) []*huma.Param {
 		}, textFilterParams()...)
 	case "searchTextMessages":
 		return []*huma.Param{
+			queryIntegerParam("source_id", "Source ID"),
 			queryStringParam("q", "Search query", true),
 			queryIntegerParam("offset", "Zero-based row offset"),
 			queryIntegerParam(limitParam, "Maximum number of rows to return"),
@@ -861,9 +988,19 @@ func rawRouteParameters(operationID string) []*huma.Param {
 		}
 	case "uploadToken":
 		return []*huma.Param{pathStringParam("email", "Account email address")}
+	case "revokeAgentToken":
+		return []*huma.Param{pathStringParam("id", "Agent grant ID to revoke")}
 	default:
 		return nil
 	}
+}
+
+func stringsToAny(values []string) []any {
+	result := make([]any, 0, len(values))
+	for _, value := range values {
+		result = append(result, value)
+	}
+	return result
 }
 
 func scopeParams() []*huma.Param {
@@ -887,6 +1024,7 @@ func aggregateOptionParams() []*huma.Param {
 		queryIntegerParam(limitParam, "Maximum number of rows to return (default 100; values below 1 fall back to the default)"),
 		queryStringParam("time_granularity", "Time bucket granularity", false),
 		queryIntegerParam("source_id", "Source ID"),
+		queryIntegerArrayParam("source_ids", "Source IDs; repeat or comma-separate values"),
 		queryBooleanParam("attachments_only", "Only include messages with attachments"),
 		queryBooleanParam("hide_deleted", "Exclude deleted messages"),
 		queryStringParam("search_query", "Search query", false),
@@ -896,6 +1034,15 @@ func aggregateOptionParams() []*huma.Param {
 }
 
 func messageFilterParams() []*huma.Param {
+	return append(messageFilterScopeParams(),
+		queryIntegerParam("offset", "Zero-based row offset"),
+		queryIntegerParam(limitParam, "Maximum number of rows to return (default and max 500; larger values are clamped)"),
+		queryStringParam("sort", "Sort field: date, size, or subject", false),
+		queryStringParam("direction", "Sort direction: asc or desc", false),
+	)
+}
+
+func messageFilterScopeParams() []*huma.Param {
 	return []*huma.Param{
 		queryStringParam("sender", "Sender email/address filter", false),
 		queryStringParam("sender_name", "Sender display-name filter", false),
@@ -903,29 +1050,29 @@ func messageFilterParams() []*huma.Param {
 		queryStringParam("recipient_name", "Recipient display-name filter", false),
 		queryStringParam("domain", "Domain filter", false),
 		queryStringParam("label", "Label filter", false),
+		queryStringParam("list_id", "Exact case-insensitive RFC 2919 List-Id filter", false),
 		queryStringParam("message_type", "Message type filter", false),
 		queryStringParam("time_period", "Named time period", false),
 		queryStringParam("time_granularity", "Time bucket granularity", false),
 		queryIntegerParam("conversation_id", "Conversation ID"),
 		queryIntegerParam("source_id", "Source ID"),
+		queryIntegerArrayParam("source_ids", "Source IDs; repeat or comma-separate values"),
 		queryBooleanParam("attachments_only", "Only include messages with attachments"),
 		queryBooleanParam("hide_deleted", "Exclude deleted messages"),
 		queryStringParam("after", "Lower date/time bound (RFC3339 or YYYY-MM-DD)", false),
 		queryStringParam("before", "Upper date/time bound (RFC3339 or YYYY-MM-DD)", false),
 		queryStringParam("empty_targets", "Comma-separated aggregate view names to match empty values", false),
-		queryIntegerParam("offset", "Zero-based row offset"),
-		queryIntegerParam(limitParam, "Maximum number of rows to return (default and max 500; larger values are clamped)"),
-		queryStringParam("sort", "Sort field: date, size, or subject", false),
-		queryStringParam("direction", "Sort direction: asc or desc", false),
 	}
 }
 
 func semanticMessageFilterParams() []*huma.Param {
 	return []*huma.Param{
+		queryIntegerParam("conversation_id", "Exact conversation ID (all search modes)"),
 		queryStringParam("sender", "Exact sender email/address filter (vector or hybrid mode only)", false),
 		queryStringParam(recipientParam, "Exact recipient email filter across to, cc, and bcc (vector or hybrid mode only)", false),
 		queryStringParam("domain", "Exact sender domain filter (vector or hybrid mode only)", false),
 		queryStringParam("label", "Exact case-insensitive label filter (vector or hybrid mode only)", false),
+		queryStringParam("list_id", "Exact case-insensitive RFC 2919 List-Id filter (vector or hybrid mode only)", false),
 		queryStringParam("time_period", "Calendar period in YYYY, YYYY-MM, or YYYY-MM-DD format (vector or hybrid mode only)", false),
 		queryStringParam("time_granularity", "Time bucket granularity (vector or hybrid mode only)", false),
 		queryIntegerParam("source_id", "Exact source ID (vector or hybrid mode only)"),
@@ -1130,6 +1277,15 @@ func errorResponseFor(api huma.API) *huma.Response {
 		Description: "Error",
 		Content: map[string]*huma.MediaType{
 			applicationJSONMediaType: {Schema: schemaFor[ErrorResponse](api)},
+		},
+	}
+}
+
+func operationErrorResponseFor(api huma.API) *huma.Response {
+	return &huma.Response{
+		Description: "Error",
+		Content: map[string]*huma.MediaType{
+			applicationJSONMediaType: {Schema: schemaFor[OperationErrorResponse](api)},
 		},
 	}
 }

@@ -38,6 +38,39 @@ enabled = true
 	assert.NotContains(encoded.String(), "password")
 }
 
+func TestIMAPDraftConfig(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	path := filepath.Join(t.TempDir(), "config.toml")
+	content := "[[imap.drafts]]\nsource_id = 42\nenabled = true\nmailbox = \"Drafts*2026\"\n"
+	requirements.NoError(os.WriteFile(path, []byte(content), 0o600))
+	t.Log("[[imap.drafts]] enabled source_id=42 mailbox=Drafts*2026")
+	cfg, err := Load(path, "")
+	requirements.NoError(err)
+	requirements.Len(cfg.IMAP.Drafts, 1)
+	assertions.Equal(int64(42), cfg.IMAP.Drafts[0].SourceID)
+	assertions.True(cfg.IMAP.Drafts[0].Enabled)
+	assertions.Equal("Drafts*2026", cfg.IMAP.Drafts[0].Mailbox)
+	requirements.NoError(cfg.Save())
+	reloaded, err := Load(path, "")
+	requirements.NoError(err)
+	requirements.Len(reloaded.IMAP.Drafts, 1)
+	assertions.Equal("Drafts*2026", reloaded.IMAP.Drafts[0].Mailbox)
+	t.Log("config Save/load round-trip kept enabled=true mailbox=Drafts*2026")
+
+	for _, invalid := range []string{
+		"[[imap.drafts]]\nsource_id = 0\nenabled = true\nmailbox = \"Drafts\"\n",
+		"[[imap.drafts]]\nsource_id = 42\nenabled = true\nmailbox = \"\"\n",
+		"[[imap.drafts]]\nsource_id = 42\nenabled = true\nmailbox = \"Drafts\"\n[[imap.drafts]]\nsource_id = 42\nenabled = false\nmailbox = \"Drafts\"\n",
+		"[[imap.drafts]]\nsource_id = 42\nenabled = true\nmailbox = \"Drafts\"\nextra = true\n",
+	} {
+		requirements.NoError(os.WriteFile(path, []byte(invalid), 0o600))
+		_, err := Load(path, "")
+		requirements.Error(err)
+	}
+	t.Log("invalid [[imap.drafts]] entries reject bad source_id, mailbox, duplicate source_id, and unknown keys")
+}
+
 func TestCardDAVConfigRejectsPasswordField(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.toml")
 	require.NoError(t, os.WriteFile(path, []byte(`[carddav]
@@ -74,6 +107,19 @@ func TestServerConfigDefaults(t *testing.T) {
 	// open port at daemon startup (clients discover it via the runtime record).
 	assert.Equal(t, 0, cfg.Server.APIPort)
 	assert.Empty(t, cfg.Server.APIKey)
+}
+
+func TestDeletionConfigDefaultsDisabledAndLoadsRemoteEnabled(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	assert.False(NewDefaultConfig().Deletion.RemoteEnabled)
+
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(os.WriteFile(configPath, []byte("[deletion]\nremote_enabled = true\n"), 0o600))
+
+	cfg, err := Load(configPath, "")
+	require.NoError(err)
+	assert.True(cfg.Deletion.RemoteEnabled)
 }
 
 func TestAnalyticsConfigDefaults(t *testing.T) {
@@ -141,6 +187,28 @@ builder_temp_limit = "12gB"
 	assertions.Equal("12gB", cfg.Analytics.BuilderTempLimit)
 }
 
+// The daemon-query knobs mirror the cache-builder ones: the InteractivePolicy
+// defaults are laptop-sized, and a large archive has to raise them or heavy
+// queries fail once they spill past max_temp_directory_size.
+func TestLoadWithAnalyticsQueryResourceLimits(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.toml")
+	requirements.NoError(os.WriteFile(configPath, []byte(`
+[analytics]
+query_memory_limit = "8GB"
+query_threads = 6
+query_temp_limit = "40GiB"
+`), 0o600))
+
+	cfg, err := Load(configPath, "")
+	requirements.NoError(err)
+	assertions.Equal("8GB", cfg.Analytics.QueryMemoryLimit)
+	assertions.Equal(6, cfg.Analytics.QueryThreads)
+	assertions.Equal("40GiB", cfg.Analytics.QueryTempLimit)
+}
+
 func TestLoadRejectsInvalidAnalyticsBuilderResourceLimits(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -155,6 +223,10 @@ func TestLoadRejectsInvalidAnalyticsBuilderResourceLimits(t *testing.T) {
 		{name: "negative temp", key: "builder_temp_limit", value: `"-8GB"`},
 		{name: "missing temp number", key: "builder_temp_limit", value: `"GB"`},
 		{name: "negative threads", key: "builder_threads", value: "-1"},
+		{name: "zero query memory", key: "query_memory_limit", value: `"0GB"`},
+		{name: "missing query memory unit", key: "query_memory_limit", value: `"2"`},
+		{name: "negative query temp", key: "query_temp_limit", value: `"-8GB"`},
+		{name: "negative query threads", key: "query_threads", value: "-1"},
 	}
 
 	for _, tt := range tests {
@@ -843,6 +915,7 @@ func TestLoadEmptyPath(t *testing.T) {
 	// Verify default values
 	assert.Equal(tmpDir, cfg.HomeDir)
 	assert.Equal(tmpDir, cfg.Data.DataDir)
+	assert.Equal(filepath.Join(tmpDir, "exports"), cfg.ExportDir())
 	assert.Equal(5, cfg.Sync.RateLimitQPS)
 
 	// DatabaseDSN should return default path
@@ -862,6 +935,7 @@ func TestLoadWithConfigFile(t *testing.T) {
 	configContent := `
 [data]
 data_dir = "~/custom/data"
+export_dir = "~/custom/exports"
 
 [oauth]
 client_secrets = "~/secrets/client.json"
@@ -880,6 +954,7 @@ rate_limit_qps = 10
 	// Verify paths were expanded
 	expectedDataDir := filepath.Join(home, "custom/data")
 	assert.Equal(expectedDataDir, cfg.Data.DataDir)
+	assert.Equal(filepath.Join(home, "custom/exports"), cfg.ExportDir())
 
 	expectedSecrets := filepath.Join(home, "secrets/client.json")
 	assert.Equal(expectedSecrets, cfg.OAuth.ClientSecrets)
@@ -962,6 +1037,7 @@ func TestLoadExplicitPathRelativePaths(t *testing.T) {
 	configContent := `
 [data]
 data_dir = "data"
+export_dir = "exports"
 
 [oauth]
 client_secrets = "secrets/client.json"
@@ -973,6 +1049,7 @@ client_secrets = "secrets/client.json"
 
 	expectedDataDir := filepath.Join(tmpDir, "data")
 	assert.Equal(expectedDataDir, cfg.Data.DataDir)
+	assert.Equal(filepath.Join(tmpDir, "exports"), cfg.ExportDir())
 
 	expectedSecrets := filepath.Join(tmpDir, "secrets/client.json")
 	assert.Equal(expectedSecrets, cfg.OAuth.ClientSecrets)
@@ -1978,7 +2055,7 @@ func TestDatabasePath(t *testing.T) {
 		cfg.Data.DatabaseURL = "file:/var/lib/msgvault.db"
 		got, err := cfg.DatabasePath()
 		require.NoError(t, err, "DatabasePath")
-		assert.Equal(t, "/var/lib/msgvault.db", got)
+		assert.Equal(t, filepath.FromSlash("/var/lib/msgvault.db"), got)
 	})
 
 	t.Run("file: URI with query string drops query", func(t *testing.T) {
@@ -1986,7 +2063,7 @@ func TestDatabasePath(t *testing.T) {
 		cfg.Data.DatabaseURL = "file:/var/lib/msgvault.db?_journal_mode=WAL&_busy_timeout=5000"
 		got, err := cfg.DatabasePath()
 		require.NoError(t, err, "DatabasePath")
-		assert.Equal(t, "/var/lib/msgvault.db", got)
+		assert.Equal(t, filepath.FromSlash("/var/lib/msgvault.db"), got)
 	})
 
 	t.Run("file: URI decodes percent-encoded path", func(t *testing.T) {
@@ -1994,7 +2071,7 @@ func TestDatabasePath(t *testing.T) {
 		cfg.Data.DatabaseURL = "file:/var/lib/my%20vault.db"
 		got, err := cfg.DatabasePath()
 		require.NoError(t, err, "DatabasePath")
-		assert.Equal(t, "/var/lib/my vault.db", got)
+		assert.Equal(t, filepath.FromSlash("/var/lib/my vault.db"), got)
 	})
 
 	t.Run("file: URI relative path (Opaque)", func(t *testing.T) {
@@ -2016,6 +2093,14 @@ func TestDatabasePath(t *testing.T) {
 		got, err := cfg.DatabasePath()
 		require.NoError(t, err, "DatabasePath")
 		assert.Equal(t, "my vault.db", got)
+	})
+
+	t.Run("net/url Windows path form", func(t *testing.T) {
+		cfg := &Config{}
+		cfg.Data.DatabaseURL = `file://C:%5CUsers%5Crunner%5Cmsgvault.db`
+		got, err := cfg.DatabasePath()
+		require.NoError(t, err, "DatabasePath")
+		assert.Equal(t, `C:\Users\runner\msgvault.db`, got)
 	})
 
 	t.Run("postgres:// is rejected", func(t *testing.T) {
@@ -2205,4 +2290,67 @@ capabilities_file = "manifests/voyage.json"
 	require.NoError(err)
 	assert.Equal(filepath.Join(tmpDir, "manifests/voyage.json"),
 		cfg.Vector.Multimodal.CapabilitiesFile)
+}
+
+// TestAgentAccessRequiresAPIKey verifies that [server] agent_access = true is
+// rejected unless api_key is also set. An agent grant secret is useless without
+// an API key because the owner has no stable credential to manage grants.
+func TestAgentAccessRequiresAPIKey(t *testing.T) {
+	t.Run("agent_access without api_key rejected", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		configPath := filepath.Join(t.TempDir(), "config.toml")
+		require.NoError(os.WriteFile(configPath, []byte(`
+[server]
+agent_access = true
+`), 0o600))
+		_, err := Load(configPath, "")
+		require.Error(err)
+		assert.Contains(err.Error(), "agent_access")
+		assert.Contains(err.Error(), "api_key")
+	})
+
+	t.Run("agent_access with api_key accepted", func(t *testing.T) {
+		configPath := filepath.Join(t.TempDir(), "config.toml")
+		require.NoError(t, os.WriteFile(configPath, []byte(`
+[server]
+agent_access = true
+api_key = "owner-secret"
+`), 0o600))
+		cfg, err := Load(configPath, "")
+		require.NoError(t, err)
+		assert.True(t, cfg.Server.AgentAccess)
+	})
+
+	t.Run("agent_access false without api_key accepted", func(t *testing.T) {
+		cfg := NewDefaultConfig()
+		assert.False(t, cfg.Server.AgentAccess)
+	})
+}
+
+func TestLoadTrustedIMAPSentMailboxesPerSource(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	content := `[sync]
+trusted_imap_sent_mailboxes = { "imaps://alice@example.com@imap.example.com:993" = ["Gesendete Elemente", "Sent Items"] }
+`
+	require.NoError(os.WriteFile(configPath, []byte(content), 0o600))
+
+	cfg, err := Load(configPath, "")
+	require.NoError(err)
+	require.Len(cfg.Sync.TrustedIMAPSentMailboxes, 1)
+	assert.Equal(
+		[]string{"Gesendete Elemente", "Sent Items"},
+		cfg.Sync.TrustedIMAPSentMailboxes["imaps://alice@example.com@imap.example.com:993"])
+	assert.Empty(
+		cfg.Sync.TrustedIMAPSentMailboxes["imaps://bob@example.com@imap.example.com:993"],
+		"a same-named mailbox in another account gains no trust")
+
+	emptyPath := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(os.WriteFile(emptyPath, []byte(""), 0o600))
+	cfg, err = Load(emptyPath, "")
+	require.NoError(err)
+	assert.Empty(cfg.Sync.TrustedIMAPSentMailboxes,
+		"unconfigured archives carry no explicit Sent-folder trust")
 }

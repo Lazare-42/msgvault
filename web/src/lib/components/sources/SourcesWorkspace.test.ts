@@ -25,6 +25,16 @@ function run(status: string, processed: number, overrides: Record<string, unknow
 afterEach(() => vi.useRealTimers());
 
 describe('SourcesWorkspace', () => {
+  it('opens normalized source-sync operation history through its shell callback', async () => {
+    const onOpenOperations = vi.fn();
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json({ sources: [] }));
+    render(SourcesWorkspace, { client: createAPIClient(fetchFn), onOpenOperations });
+
+    await fireEvent.click(screen.getByRole('button', { name: 'View source operations' }));
+
+    expect(onOpenOperations).toHaveBeenCalledOnce();
+  });
+
   it('shows status and only exposes Sync now from server capability truth', async () => {
     const fetchFn = vi.fn<typeof fetch>(async () => Response.json({ sources: [
       source(),
@@ -77,7 +87,8 @@ describe('SourcesWorkspace', () => {
       client: createAPIClient(fetchFn), now: () => new Date('2026-07-19T12:00:00Z')
     });
 
-    expect(await screen.findByText('0 */6 * * *')).toBeDefined();
+    expect(await screen.findByText('At :00 past every 6th hour')).toBeDefined();
+    expect(screen.getByText('0 */6 * * *')).toBeDefined();
     expect(screen.getByTitle('2026-07-19T18:00:00Z')).toBeDefined();
     expect(screen.queryByText('stale_last_result')).toBeNull();
     expect(screen.getByText('1 item error')).toBeDefined();

@@ -3,6 +3,7 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/subtle"
 	"errors"
 	"fmt"
@@ -20,11 +21,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	"go.kenn.io/msgvault/internal/agentgrant"
 	"go.kenn.io/msgvault/internal/apiprotocol"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonauth"
+	"go.kenn.io/msgvault/internal/operations"
+	"go.kenn.io/msgvault/internal/providercredentials"
 	"go.kenn.io/msgvault/internal/provideridentity"
 	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/remoteimage"
 	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/store"
@@ -277,6 +282,12 @@ type Server struct {
 	visualCoverageRateLimiter *RateLimiter
 	idleTracker               *IdleTracker
 	operationGate             OperationGate
+	operationHistoryReader    operations.HistoryReader
+	importContext             context.Context
+	cancelImports             context.CancelFunc
+	importMu                  sync.Mutex
+	importsClosed             bool
+	importWG                  sync.WaitGroup
 	// ftsIndexComplete memoizes that the FTS index is fully populated so
 	// handleCLISearch stops probing on every request. NeedsFTSBackfill runs an
 	// anti-join that scans every message when the index is complete (the
@@ -311,6 +322,11 @@ type Server struct {
 	// settingsConfigEditor is the persisted config transaction boundary. Tests
 	// replace it to deterministically exercise post-publication error handling.
 	settingsConfigEditor func(string, string, []config.Edit) (config.ConfigFile, error)
+	// settingsCredentialDeleter is the independent credential-store transaction
+	// boundary used when a settings edit changes a provider origin.
+	settingsCredentialDeleter func(
+		string, providercredentials.Snapshot, []string,
+	) (providercredentials.Snapshot, error)
 	// activity reports request-scoped work that health should surface even
 	// though it runs outside (or with more detail than) the operation gate,
 	// e.g. the first-search FTS completeness probe and backfill progress.
@@ -329,10 +345,13 @@ type Server struct {
 	backend            vector.Backend
 	personSearchEngine PersonSearchEngine
 	visualSearch       *visual.SearchService
-	visualBuild        func(context.Context) error
-	visualRun          func(context.Context) error
-	visualRetry        func(context.Context, int64, string) error
+	visualBuild        func(context.Context, operations.PassScope) error
+	visualRun          func(context.Context, operations.PassScope) error
+	visualRetry        func(context.Context, operations.PassScope, int64, string) error
 	visualStatus       func(context.Context, bool) (visual.Status, error)
+	// visualAction prevents concurrent HTTP build/resume requests from both
+	// passing the active-run check before either worker records its run.
+	visualAction sync.Mutex
 	// visualCoverageScan serializes the archive-wide coverage scan behind
 	// GET /multimodal/status?coverage=1.
 	visualCoverageScan sync.Mutex
@@ -371,12 +390,13 @@ type Server struct {
 	// remoteImages is the SSRF-hardened fetcher behind
 	// POST /api/v1/content/remote-image. Tests replace it to inject a fake
 	// resolver and dialer.
-	remoteImages *remoteImageFetcher
+	remoteImages *remoteimage.Fetcher
 	// inlineCache parses each message's raw MIME once and serves every cid: from
 	// that result, collapsing the per-cid fan-out (see inline_cache.go).
 	inlineCache *inlineParseCache
 	spaHandler  http.Handler
 	sessions    *sessionStore
+	agentGrants *agentgrant.Registry
 	// trustedProxies contains only explicitly configured direct proxy peers.
 	// Forwarded scheme/host data is ignored for every other RemoteAddr.
 	trustedProxies   []netip.Prefix
@@ -392,6 +412,11 @@ type Server struct {
 	taskLinkOperations       TaskLinkOperations
 	taskIdentityResolver     TaskIdentityResolver
 	fastmailInventoryFactory provideridentity.Factory
+	// personBriefGenerator runs one manual, forced person brief through the
+	// daemon's people sweep worker. Nil in every process that does not own the
+	// worker, which makes POST /people/{id}/brief/generate report unavailable.
+	personBriefGeneratorMu sync.RWMutex
+	personBriefGenerator   PersonBriefGenerator
 	// listenerBound is set true once StartOnListener binds a real listener
 	// (the sole production serve path). It stays false for direct-handler unit
 	// tests that drive s.Router() without starting a listener, leaving the
@@ -400,6 +425,20 @@ type Server struct {
 	// listenPort is the actual TCP port StartOnListener bound. The keyless-
 	// loopback Host guard requires the request authority's port to match it.
 	listenPort int
+}
+
+// SetPersonBriefGenerator installs the daemon's manual brief runner. The
+// daemon calls it once at startup when the people sweep is enabled.
+func (s *Server) SetPersonBriefGenerator(generate PersonBriefGenerator) {
+	s.personBriefGeneratorMu.Lock()
+	s.personBriefGenerator = generate
+	s.personBriefGeneratorMu.Unlock()
+}
+
+func (s *Server) personBriefGeneratorFunc() PersonBriefGenerator {
+	s.personBriefGeneratorMu.RLock()
+	defer s.personBriefGeneratorMu.RUnlock()
+	return s.personBriefGenerator
 }
 
 // clockNow returns the current wall time, honoring the test-injected clock.
@@ -466,6 +505,11 @@ type ServerOptions struct {
 	Logger        *slog.Logger
 	IdleTracker   *IdleTracker
 	OperationGate OperationGate
+	// OperationHistoryReader owns the normalized, privacy-bounded operation
+	// ledgers. It stays separate from MessageStore so unsupported stores can
+	// expose an explicit unavailable contract instead of implementing unrelated
+	// history methods.
+	OperationHistoryReader operations.HistoryReader
 	// BlobStore serves attachment bytes for /api/v1/cli/attachment through
 	// packed CAS storage with a loose-file fallback. Nil keeps the legacy
 	// loose-file-only read path.
@@ -529,37 +573,47 @@ func NewServerWithOptions(opts ServerOptions) *Server {
 	if fastmailInventoryFactory == nil {
 		fastmailInventoryFactory = provideridentity.NewFastmailInventory
 	}
+	importContext, cancelImports := context.WithCancel(context.Background())
 	s := &Server{
-		cfg:                      opts.Config,
-		store:                    opts.Store,
-		savedViewStore:           opts.SavedViewStore,
-		sqlQueryRunner:           opts.SQLQueryRunner,
-		shutdownToken:            opts.ShutdownToken,
-		shutdownFunc:             opts.ShutdownFunc,
-		hybridEngine:             opts.HybridEngine,
-		vectorCfg:                opts.VectorCfg,
-		backend:                  opts.Backend,
-		personSearchEngine:       opts.PersonSearchEngine,
-		scheduler:                opts.Scheduler,
-		cardDAV:                  opts.CardDAV,
-		logger:                   opts.Logger,
-		requestTimeout:           timeout,
-		readTimeout:              daemonReadTimeout,
-		queryTimeout:             QueryEndpointTimeout,
-		inProgressThreshold:      inProgressLogThreshold,
-		inProgressInterval:       inProgressLogInterval,
-		daemonVersion:            opts.DaemonVersion,
-		idleTracker:              opts.IdleTracker,
-		operationGate:            opts.OperationGate,
-		blobStore:                opts.BlobStore,
-		remoteImages:             newRemoteImageFetcher(),
-		inlineCache:              newInlineParseCache(inlineCacheMaxEntries, inlineCacheMaxBytes),
-		spaHandler:               opts.SPAHandler,
-		sessions:                 newSessionStore(defaultSessionTTL),
+		cfg:                    opts.Config,
+		store:                  opts.Store,
+		savedViewStore:         opts.SavedViewStore,
+		sqlQueryRunner:         opts.SQLQueryRunner,
+		shutdownToken:          opts.ShutdownToken,
+		shutdownFunc:           opts.ShutdownFunc,
+		hybridEngine:           opts.HybridEngine,
+		vectorCfg:              opts.VectorCfg,
+		backend:                opts.Backend,
+		personSearchEngine:     opts.PersonSearchEngine,
+		scheduler:              opts.Scheduler,
+		cardDAV:                opts.CardDAV,
+		logger:                 opts.Logger,
+		requestTimeout:         timeout,
+		readTimeout:            daemonReadTimeout,
+		queryTimeout:           QueryEndpointTimeout,
+		inProgressThreshold:    inProgressLogThreshold,
+		inProgressInterval:     inProgressLogInterval,
+		daemonVersion:          opts.DaemonVersion,
+		idleTracker:            opts.IdleTracker,
+		operationGate:          opts.OperationGate,
+		operationHistoryReader: opts.OperationHistoryReader,
+		importContext:          importContext,
+		cancelImports:          cancelImports,
+		blobStore:              opts.BlobStore,
+		remoteImages:           remoteimage.NewFetcher(),
+		inlineCache:            newInlineParseCache(inlineCacheMaxEntries, inlineCacheMaxBytes),
+		spaHandler:             opts.SPAHandler,
+		sessions:               newSessionStore(defaultSessionTTL),
+		agentGrants: func() *agentgrant.Registry {
+			if opts.Config != nil && opts.Config.Server.AgentAccess {
+				return agentgrant.NewRegistry()
+			}
+			return nil
+		}(),
 		exploreState:             newExploreServerState(time.Now),
 		exploreCursorKey:         newExploreCursorKey(),
 		trustedProxies:           trustedProxyPrefixes(opts.Config.Server.TrustedProxies),
-		settingsConfigEditor:     config.EditConfigFile,
+		settingsConfigEditor:     config.EditConfigFilePrivate,
 		taskIntegrationProbe:     taskProbe,
 		taskLinkOperations:       opts.TaskLinkOperations,
 		taskIdentityResolver:     opts.TaskIdentityResolver,
@@ -639,7 +693,7 @@ func (s *Server) setupRouter() http.Handler {
 	// unauthenticated requests do not register as waiters.
 	var h http.Handler = mux
 	h = s.analyticsEngineMiddleware(h)
-	h = operationGateMiddleware(s.operationGate, s.apiRequestAuthorized)(h)
+	h = operationGateMiddleware(s.operationGate, s.requestGateEligible)(h)
 	h = s.csrfMiddleware(h)
 	h = s.requestSecurityMiddleware(h)
 	h = RateLimitMiddleware(s.rateLimiter, s.loopbackRateLimitExempt)(h)
@@ -789,6 +843,23 @@ func (s *Server) StartOnListener(ln net.Listener) error {
 
 // Shutdown gracefully shuts down the server.
 func (s *Server) Shutdown(ctx context.Context) error {
+	s.importMu.Lock()
+	s.importsClosed = true
+	if s.cancelImports != nil {
+		s.cancelImports()
+	}
+	s.importMu.Unlock()
+	importsDone := make(chan struct{})
+	go func() {
+		s.importWG.Wait()
+		close(importsDone)
+	}()
+	var importJobsErr error
+	select {
+	case <-importsDone:
+	case <-ctx.Done():
+		importJobsErr = ctx.Err()
+	}
 	if s.rateLimiter != nil {
 		s.rateLimiter.Close()
 	}
@@ -804,14 +875,17 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	if s.sessions != nil {
 		s.sessions.Close()
 	}
+	if s.agentGrants != nil {
+		s.agentGrants.Close()
+	}
 	s.serverMu.RLock()
 	server := s.server
 	s.serverMu.RUnlock()
 	if server == nil {
-		return nil
+		return importJobsErr
 	}
 	s.logger.Info("shutting down API server")
-	return server.Shutdown(ctx)
+	return errors.Join(importJobsErr, server.Shutdown(ctx))
 }
 
 // Router returns the HTTP router for testing.
@@ -1100,12 +1174,14 @@ func (s *Server) requestTimeoutForPath(path string) (time.Duration, bool) {
 func isLongDaemonRequest(path string) bool {
 	switch path {
 	case "/api/v1/cli/build-cache",
+		importJobsEndpointPath,
 		"/api/v1/carddav/sync",
 		"/api/v1/cli/deduplicate/plan",
 		meetingImportEndpointPath,
 		"/api/v1/cli/identities/discover",
 		"/api/v1/cli/rebuild-fts",
 		"/api/v1/cli/repair-encoding",
+		"/api/v1/cli/repair-message",
 		"/api/v1/cli/run",
 		"/api/v1/cli/search",
 		"/api/v1/cli/sync",
@@ -1113,8 +1189,35 @@ func isLongDaemonRequest(path string) bool {
 		"/api/v1/cli/verify":
 		return true
 	default:
+		return isPersonBriefGeneratePath(path)
+	}
+}
+
+// isPersonBriefGeneratePath matches POST /api/v1/people/{id}/brief/generate.
+// A manual brief runs a provider call (and, when the person's cursors are
+// already caught up, one bounded extraction page), so it must not be cut off
+// by the standard per-request deadline. The operation gate still serializes it.
+func isPersonBriefGeneratePath(path string) bool {
+	const prefix = "/api/v1/people/"
+	const suffix = "/brief/generate"
+	// The length guard comes first because prefix and suffix are the same
+	// length: "/api/v1/people/brief/generate" satisfies both HasPrefix and
+	// HasSuffix while being shorter than the two together, so slicing it
+	// would cross its own bounds. Requiring more than both also guarantees a
+	// non-empty ID below.
+	if len(path) <= len(prefix)+len(suffix) {
 		return false
 	}
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return false
+	}
+	id := path[len(prefix) : len(path)-len(suffix)]
+	for _, digit := range id {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // loggerMiddleware logs HTTP requests on completion and, for requests that
@@ -1202,15 +1305,15 @@ func (s *Server) recoverMiddleware(next http.Handler) http.Handler {
 
 type requestIDKey struct{}
 
-var nextRequestID atomic.Uint64
-
 func requestIDMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := r.Header.Get("X-Request-Id")
+		id := r.Header.Get("X-Request-ID")
 		if id == "" {
-			id = fmt.Sprintf("msgvault-%d", nextRequestID.Add(1))
+			// Request IDs also own durable operation invocations, so they
+			// must stay distinct across daemon restarts.
+			id = "msgvault-" + rand.Text()
 		}
-		w.Header().Set("X-Request-Id", id)
+		w.Header().Set("X-Request-ID", id)
 		ctx := context.WithValue(r.Context(), requestIDKey{}, id)
 		// Also stash it where the SQL logger reads it, so a "sql slow"
 		// line can be correlated with this request's "http request" line.
@@ -1354,9 +1457,22 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleAuthenticatedHealth returns health details that are safe behind the
-// API-key boundary.
+// API-key boundary. Delegated callers receive the public projection plus
+// APISchemaVersion only, so they can verify version compatibility without
+// seeing internal operation labels that name configured account identifiers.
 func (s *Server) handleAuthenticatedHealth(w http.ResponseWriter, r *http.Request) {
 	s.refreshVectorStatus(r.Context())
+	auth := s.requestAuthentication(r)
+	if auth.Mode == AuthModeDelegated {
+		writeJSON(w, http.StatusOK, HealthResponse{
+			Status:           "ok",
+			Vector:           s.vectorHealthPublic(),
+			Operation:        s.operationBusyHealth(),
+			AnalyticsEngine:  s.analyticsModeForContext(r.Context()),
+			APISchemaVersion: APISchemaVersion,
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, HealthResponse{
 		Status:           "ok",
 		Vector:           s.vectorHealth(),

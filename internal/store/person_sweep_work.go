@@ -120,22 +120,25 @@ func (s *Store) finalizeReclaimedPersonSweepAttempts(
 func (s *Store) finalizeReclaimedPersonSweepAttempt(
 	ctx context.Context, tx *loggedTx, attemptID, runID string,
 ) error {
-	rows, err := tx.QueryContext(ctx, `SELECT batch_ordinal, utc_day, status,
+	rows, err := tx.QueryContext(ctx, `SELECT batch_ordinal, call_ordinal, purpose, utc_day, status,
 		reserved_requests, reserved_input_tokens, reserved_output_tokens, reserved_cost_micro_usd
 		FROM person_sweep_batches
-		WHERE attempt_id = ? AND status IN ('reserved', 'running') ORDER BY batch_ordinal`, attemptID)
+		WHERE attempt_id = ?
+		ORDER BY batch_ordinal, call_ordinal`, attemptID)
 	if err != nil {
 		return fmt.Errorf("list abandoned person sweep batches: %w", err)
 	}
 	type abandonedBatch struct {
-		ordinal     int
-		day, status string
-		reserved    peoplesweep.Usage
+		ordinal, callOrdinal int
+		purpose              string
+		day, status          string
+		reserved             peoplesweep.Usage
 	}
 	batches := make([]abandonedBatch, 0)
 	for rows.Next() {
 		var batch abandonedBatch
-		if err := rows.Scan(&batch.ordinal, &batch.day, &batch.status,
+		if err := rows.Scan(&batch.ordinal, &batch.callOrdinal, &batch.purpose,
+			&batch.day, &batch.status,
 			&batch.reserved.Requests, &batch.reserved.InputTokens,
 			&batch.reserved.OutputTokens, &batch.reserved.EstimatedCostMicroUSD); err != nil {
 			_ = rows.Close()
@@ -150,20 +153,32 @@ func (s *Store) finalizeReclaimedPersonSweepAttempt(
 	if err := rows.Close(); err != nil {
 		return fmt.Errorf("close abandoned person sweep batches: %w", err)
 	}
+	coordinates := make([]personSweepBatchCoordinate, 0, len(batches))
 	for _, batch := range batches {
+		coordinates = append(coordinates, personSweepBatchCoordinate{ordinal: batch.ordinal,
+			callOrdinal: batch.callOrdinal, purpose: batch.purpose, day: batch.day})
+	}
+	if err := validatePersonSweepCallCoordinateSet(coordinates); err != nil {
+		return fmt.Errorf("finalize abandoned person sweep attempt: %w", err)
+	}
+	for _, batch := range batches {
+		if batch.status != "reserved" && batch.status != "running" {
+			continue
+		}
 		actual := peoplesweep.Usage{}
-		status := "cancelled"
-		if batch.status == "running" {
-			status = "failed"
+		status := personSweepBatchStatusCancelled
+		if batch.status == personSweepBatchStatusRunning {
+			status = personSweepBatchStatusFailed
 			actual = batch.reserved
 		}
 		_, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE person_sweep_batches SET
 			status = ?, actual_requests = ?, actual_input_tokens = ?, actual_output_tokens = ?,
 			actual_cost_micro_usd = ?, failure_class = ?, completed_at = %s
-			WHERE attempt_id = ? AND batch_ordinal = ? AND status = ?`, s.dialect.Now()),
+			WHERE attempt_id = ? AND batch_ordinal = ? AND call_ordinal = ? AND status = ?`,
+			s.dialect.Now()),
 			status, actual.Requests, actual.InputTokens, actual.OutputTokens,
 			actual.EstimatedCostMicroUSD, peoplesweep.FailureLeaseLost,
-			attemptID, batch.ordinal, batch.status)
+			attemptID, batch.ordinal, batch.callOrdinal, batch.status)
 		if err != nil {
 			return fmt.Errorf("finalize abandoned person sweep batch: %w", err)
 		}
@@ -234,6 +249,30 @@ func (s *Store) RenewPersonSweep(
 	}
 	renewed.ExpiresAt = expiresAt.Time.UTC()
 	return &renewed, nil
+}
+
+// CompleteIdlePersonSweep finishes a claim that has no planned brief or
+// extraction progress. Recheck durable work while holding the lease row so new
+// extraction work remains queued instead of being discarded with the old brief.
+func (s *Store) CompleteIdlePersonSweep(
+	ctx context.Context, lease peoplesweep.Lease, programFingerprint, catalogFingerprint string,
+) error {
+	if programFingerprint == "" || catalogFingerprint == "" {
+		return errors.New("complete idle person sweep: fingerprints are required")
+	}
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
+		current, err := s.lockPersonSweepWorkRowTx(ctx, tx, lease)
+		if err != nil {
+			return err
+		}
+		if !current {
+			return peoplesweep.ErrLeaseLost
+		}
+		_, err = s.finishPersonSweepWorkTx(ctx, tx, personSweepWorkCompletion{
+			Lease: lease, ProgramFingerprint: programFingerprint, CatalogFingerprint: catalogFingerprint,
+		})
+		return err
+	})
 }
 
 // FailPersonSweepWork releases exactly one fenced lease and schedules its
@@ -556,6 +595,7 @@ func (s *Store) ReconcilePersonSweepWorkContext(
 			return err
 		}
 		result.PeopleScanned = len(people)
+		result.PersonIDs = people
 		if len(people) == 0 {
 			return nil
 		}
@@ -712,6 +752,8 @@ func (s *Store) upsertPersonSweepWorkTxMode(
 	if s.IsPostgreSQL() {
 		maxExpr = "GREATEST(person_sweep_work.dirty_through_sequence, excluded.dirty_through_sequence)"
 	}
+	// New activity advances the high water, but must not cancel an active
+	// failure delay. Only an explicit force bypasses retry backoff.
 	now := s.dialect.Now()
 	_, err = tx.ExecContext(ctx, s.Rebind(fmt.Sprintf(`
 		INSERT INTO person_sweep_work
@@ -723,11 +765,49 @@ func (s *Store) upsertPersonSweepWorkTxMode(
 			dirty_through_sequence = %s,
 			available_at = CASE
 				WHEN ? THEN %s
+				WHEN person_sweep_work.last_failure_class <> '' AND person_sweep_work.available_at > %s
+				THEN person_sweep_work.available_at
 				WHEN excluded.dirty_through_sequence > person_sweep_work.dirty_through_sequence
 				THEN %s ELSE person_sweep_work.available_at END,
-			updated_at = %s`, now, now, now, maxExpr, now, now, now)), personID, dirtyThrough, forceAvailable)
+			updated_at = %s`, now, now, now, maxExpr, now, now, now, now)), personID, dirtyThrough, forceAvailable)
 	if err != nil {
 		return fmt.Errorf("upsert person sweep work: %w", err)
 	}
 	return nil
+}
+
+// EnsurePersonSweepWork publishes a work row for one tracked person. When
+// forceAvailable is true it also clears retry backoff. A person whose journal
+// has no dirty work has no work row, so a due brief would otherwise find
+// nothing to claim. It reports false when the person is not
+// tracked, because tracking is the outer boundary the sweep never crosses.
+//
+// The published dirty-through sequence is the person's current lane high water,
+// which is what ReconcilePersonSweepWorkContext would have published; an
+// existing row keeps the greater of the two.
+func (s *Store) EnsurePersonSweepWork(ctx context.Context, personID int64, forceAvailable bool) (bool, error) {
+	if personID <= 0 {
+		return false, errors.New("ensure person sweep work: person ID must be positive")
+	}
+	published := false
+	err := s.withTxContext(ctx, func(tx *loggedTx) error {
+		var dirtyThrough int64
+		if err := tx.QueryRowContext(ctx, s.Rebind(`
+			SELECT COALESCE(MAX(sequence), 0) FROM person_sweep_changes WHERE person_id = ?`),
+			personID).Scan(&dirtyThrough); err != nil {
+			return fmt.Errorf("read person sweep high water: %w", err)
+		}
+		// Manual generation clears retry backoff; automatic brief scheduling
+		// preserves it just like extraction reconciliation does.
+		if err := s.upsertPersonSweepWorkTxMode(ctx, tx, personID, dirtyThrough, forceAvailable); err != nil {
+			return err
+		}
+		return tx.QueryRowContext(ctx, s.Rebind(
+			`SELECT EXISTS (SELECT 1 FROM person_sweep_work WHERE person_id = ?)`),
+			personID).Scan(&published)
+	})
+	if err != nil {
+		return false, fmt.Errorf("ensure person sweep work: %w", err)
+	}
+	return published, nil
 }

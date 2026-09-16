@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -534,10 +535,12 @@ func TestCreateCLIDeletionManifestUsesGeneratedClientAdapter(t *testing.T) {
 		ID: 42, Type: "gmail", Identifier: "account@example.invalid",
 	})
 	manifest.CreatedBy = "tui"
+	manifest.Filters.ListIDs = []string{"announce.example.org"}
+	manifest.RawFilter = json.RawMessage(`{"scope":"all_matches","search_query":"invoice","match_filter":{"attachments_only":true}}`)
 
 	s := newGeneratedClientAdapterStore(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/health" {
-			writeJSONResponse(t, w, map[string]any{"status": "ok", "api_schema_version": "2.4.0"})
+			writeJSONResponse(t, w, map[string]any{"status": "ok", "api_schema_version": "2.14.0"})
 			return
 		}
 		assert.Equal(http.MethodPost, r.Method, "method")
@@ -550,6 +553,8 @@ func TestCreateCLIDeletionManifestUsesGeneratedClientAdapter(t *testing.T) {
 		assert.Equal(manifest.ID, body.ID, "manifest id")
 		assert.Equal("tui", body.CreatedBy, "created by")
 		assert.Equal([]string{"gid1", "gid2"}, body.GmailIDs, "gmail ids")
+		assert.Equal([]string{"announce.example.org"}, body.Filters.ListIDs, "list ids")
+		assert.JSONEq(string(manifest.RawFilter), string(body.RawFilter), "raw filter")
 		if !assert.NotNil(body.Source) {
 			http.Error(w, "missing source", http.StatusBadRequest)
 			return
@@ -596,9 +601,17 @@ func TestPlanCLIDeduplicateUsesGeneratedClientAdapter(t *testing.T) {
 	require := require.New(t)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			assert.Equal(http.MethodGet, r.Method, "health method")
+			writeJSONResponse(t, w, map[string]any{
+				"status": "ok", "api_schema_version": "2.13.0",
+			})
+			return
+		}
 		assert.Equal(http.MethodPost, r.Method, "method")
 		assert.Equal("/api/v1/cli/deduplicate/plan", r.URL.Path, "path")
 		var body struct {
+			PlanProtocol               string `json:"plan_protocol"`
 			Account                    string `json:"account"`
 			Collection                 string `json:"collection"`
 			Prefer                     string `json:"prefer"`
@@ -610,6 +623,7 @@ func TestPlanCLIDeduplicateUsesGeneratedClientAdapter(t *testing.T) {
 			return
 		}
 		assert.Equal("alice@example.com", body.Account, "account")
+		assert.Equal(apiprotocol.DeduplicatePlanProtocol, body.PlanProtocol, "plan protocol")
 		assert.Empty(body.Collection, "collection")
 		assert.Equal("gmail,mbox", body.Prefer, "prefer")
 		assert.True(body.ContentHash, "content hash")
@@ -620,14 +634,14 @@ func TestPlanCLIDeduplicateUsesGeneratedClientAdapter(t *testing.T) {
 			"prefix_stdout": "Deduping across collection\n",
 			"items": []map[string]any{
 				{
-					"source_id":           42,
-					"scope_label":         "alice@example.com",
-					"scope_is_collection": false,
-					"stdout":              "Duplicate groups found: 1\n",
-					"duplicate_messages":  2,
-					"backfilled_count":    3,
-					"plan_fingerprint":    "fp-client",
-					"needs_confirmation":  true,
+					"source_id":              42,
+					"scope_label":            "alice@example.com",
+					"scope_is_collection":    false,
+					"stdout":                 "Duplicate groups found: 1\n",
+					"duplicate_messages":     2,
+					"pending_backfill_count": 3,
+					"plan_fingerprint":       "fp-client",
+					"needs_confirmation":     true,
 				},
 			},
 			"footer_stdout": "No duplicates found in any source.\n",
@@ -656,9 +670,28 @@ func TestPlanCLIDeduplicateUsesGeneratedClientAdapter(t *testing.T) {
 	assert.Equal("alice@example.com", got.Items[0].ScopeLabel, "scope label")
 	assert.Equal("Duplicate groups found: 1\n", got.Items[0].Stdout, "stdout")
 	assert.Equal(2, got.Items[0].DuplicateMessages, "duplicate messages")
-	assert.Equal(int64(3), got.Items[0].BackfilledCount, "backfilled count")
+	assert.Equal(int64(3), got.Items[0].PendingBackfillCount, "pending backfill count")
 	assert.Equal("fp-client", got.Items[0].PlanFingerprint, "fingerprint")
 	assert.True(got.Items[0].NeedsConfirmation, "needs confirmation")
+}
+
+func TestPlanCLIDeduplicateRejectsOldDaemonBeforeSubmittingPlan(t *testing.T) {
+	planPosts := 0
+	s := newGeneratedClientAdapterStore(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			writeJSONResponse(t, w, map[string]any{
+				"status": "ok", "api_schema_version": "2.12.0",
+			})
+			return
+		}
+		planPosts++
+		writeJSONResponse(t, w, map[string]any{"items": []any{}})
+	})
+
+	_, err := s.PlanCLIDeduplicate(context.Background(), CLIDeduplicatePlanRequest{})
+
+	require.ErrorContains(t, err, "deduplicate planning requires daemon API schema 2.13.0")
+	assert.Zero(t, planPosts, "plan must not be submitted to an older daemon")
 }
 
 // newTestStore creates a Client pointing at the given httptest server.
@@ -1182,10 +1215,39 @@ func TestGetCLISearch_DeletionScopeRequiresCompatibleDaemon(t *testing.T) {
 	}
 }
 
+func TestGetCLISearchRejectsListIDAgainstOlderDaemonBeforeRequest(t *testing.T) {
+	var searchRequests int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			writeJSONResponse(t, w, map[string]any{
+				"status":             "ok",
+				"api_schema_version": "2.13.0",
+			})
+			return
+		}
+		searchRequests++
+		http.Error(w, "unexpected search request", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	_, err := newTestStore(srv, "").GetCLISearch(t.Context(), CLISearchRequest{
+		Query: "needle list:dev@example.test",
+	})
+	require.ErrorContains(t, err, "List-ID filter requires daemon API schema 2.14.0 or newer")
+	assert.Zero(t, searchRequests, "List-ID CLI search must not reach an older daemon")
+}
+
 func TestGetCLIHybridSearch_Success(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			writeJSONResponse(t, w, map[string]any{
+				"status":             "ok",
+				"api_schema_version": "2.14.0",
+			})
+			return
+		}
 		assert.Equal("/api/v1/search", r.URL.Path, "path")
 		assert.Equal("lunch", r.URL.Query().Get("q"), "query")
 		assert.Equal("vector", r.URL.Query().Get("mode"), "mode query")
@@ -1200,6 +1262,7 @@ func TestGetCLIHybridSearch_Success(t *testing.T) {
 		assert.Equal("bob@example.com", r.URL.Query().Get("recipient"), "recipient query")
 		assert.Equal("example.com", r.URL.Query().Get("domain"), "domain query")
 		assert.Equal("Work", r.URL.Query().Get("label"), "label query")
+		assert.Equal("<dev@example.test>", r.URL.Query().Get("list_id"), "list_id query")
 		assert.Equal("2025-02", r.URL.Query().Get("time_period"), "time_period query")
 		assert.Equal("month", r.URL.Query().Get("time_granularity"), "time_granularity query")
 		assert.Equal("77", r.URL.Query().Get("source_id"), "source_id query")
@@ -1272,6 +1335,7 @@ func TestGetCLIHybridSearch_Success(t *testing.T) {
 				Recipient:           "bob@example.com",
 				Domain:              "example.com",
 				Label:               "Work",
+				ListID:              "<dev@example.test>",
 				TimeRange:           query.TimeRange{Period: "2025-02", Granularity: query.TimeMonth},
 				SourceID:            &sourceID,
 				WithAttachmentsOnly: true,
@@ -1366,6 +1430,29 @@ func TestGetCLIHybridSearchUsesGeneratedClientAdapter(t *testing.T) {
 	require.NoError(err, "GetCLIHybridSearch")
 	require.Len(resp.Results, 1, "Results")
 	assert.Equal("alice@example.com", resp.Results[0].FromEmail, "result FromEmail")
+}
+
+func TestGetCLIHybridSearchRejectsListIDAgainstOlderDaemonBeforeRequest(t *testing.T) {
+	var searchRequests int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			writeJSONResponse(t, w, map[string]any{
+				"status":             "ok",
+				"api_schema_version": "2.13.0",
+			})
+			return
+		}
+		searchRequests++
+		http.Error(w, "unexpected search request", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	_, err := newTestStore(srv, "").GetCLIHybridSearch(t.Context(), CLIHybridSearchRequest{
+		Query: "needle list:dev@example.test",
+		Mode:  "hybrid",
+	})
+	require.ErrorContains(t, err, "List-ID filter requires daemon API schema 2.14.0 or newer")
+	assert.Zero(t, searchRequests, "List-ID hybrid search must not reach an older daemon")
 }
 
 func TestGetCLIAccounts_Success(t *testing.T) {
@@ -1578,6 +1665,183 @@ func TestRunCLIRepairEncodingStreamsOutput(t *testing.T) {
 	assert.Equal([]string{"stdout:Scanning messages\n", "stderr:repair warning\n"}, output, "output")
 }
 
+func TestRunCLIRepairMessageUsesGeneratedRequestAndStreamsOutput(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/api/v1/health":
+			writeJSONResponse(t, w, map[string]any{
+				"status": "ok", "api_schema_version": "2.15.0",
+			})
+		case "/api/v1/cli/repair-message":
+			assertions.Equal(http.MethodPost, r.Method)
+			assertions.Empty(r.URL.RawQuery, "repair request is encoded in the generated JSON body")
+			var body generated.CLIRepairMessageRequest
+			if !assertions.NoError(json.NewDecoder(r.Body).Decode(&body)) {
+				return
+			}
+			if !assertions.NotNil(body.Reference) {
+				return
+			}
+			assertions.Equal("gmail-42", *body.Reference)
+			if !assertions.NotNil(body.SourceID) {
+				return
+			}
+			assertions.Equal(int64(7), *body.SourceID)
+			assertions.Nil(body.Audit)
+			assertions.Nil(body.JSON)
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			_, _ = w.Write([]byte(`{"type":"stdout","data":"repaired\n"}` + "\n"))
+			_, _ = w.Write([]byte(`{"type":"stderr","data":"repair warning\n"}` + "\n"))
+			_, _ = w.Write([]byte(`{"type":"complete"}` + "\n"))
+		default:
+			http.Error(w, "unexpected endpoint", http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	s := newTestStore(srv, "secret")
+	reference := "gmail-42"
+	sourceID := int64(7)
+	var output []string
+	err := s.RunCLIRepairMessage(context.Background(), generated.CLIRepairMessageRequest{
+		Reference: &reference,
+		SourceID:  &sourceID,
+	}, func(stream, data string) error {
+		output = append(output, stream+":"+data)
+		return nil
+	})
+
+	requirements.NoError(err)
+	assertions.Equal([]string{"/api/v1/health", "/api/v1/cli/repair-message"}, paths)
+	assertions.Equal([]string{"stdout:repaired\n", "stderr:repair warning\n"}, output)
+}
+
+func TestRunCLIRepairMessageWithPreflightChecksCapabilityBeforePreflightAndRequest(t *testing.T) {
+	assert := assert.New(t)
+	var sequence atomic.Int32
+	var capabilityStep atomic.Int32
+	var repairStep atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/health":
+			capabilityStep.Store(sequence.Add(1))
+			writeJSONResponse(t, w, map[string]any{
+				"status": "ok", "api_schema_version": "2.15.0",
+			})
+		case "/api/v1/cli/repair-message":
+			repairStep.Store(sequence.Add(1))
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			_, _ = w.Write([]byte(`{"type":"complete"}` + "\n"))
+		default:
+			http.Error(w, "unexpected endpoint", http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	s := newTestStore(srv, "secret")
+	reference := "gmail-42"
+	var preflightStep atomic.Int32
+	err := s.RunCLIRepairMessageWithPreflight(
+		context.Background(),
+		generated.CLIRepairMessageRequest{Reference: &reference},
+		func(context.Context) error {
+			preflightStep.Store(sequence.Add(1))
+			return nil
+		},
+		nil,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(int32(1), capabilityStep.Load())
+	assert.Equal(int32(2), preflightStep.Load())
+	assert.Equal(int32(3), repairStep.Load())
+}
+
+func TestRunCLIRepairMessageFailsClosedWithoutCompatibleSchema(t *testing.T) {
+	tests := []struct {
+		name          string
+		healthPayload string
+		wantVersion   string
+	}{
+		{name: "missing version", healthPayload: `{"status":"ok"}`, wantVersion: `daemon reports ""`},
+		{name: "malformed version", healthPayload: `{"status":"ok","api_schema_version":"2.13"}`, wantVersion: `daemon reports "2.13"`},
+		{name: "older version", healthPayload: `{"status":"ok","api_schema_version":"2.13.0"}`, wantVersion: `daemon reports "2.13.0"`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var nonHealthRequests atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/v1/health" {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(test.healthPayload))
+					return
+				}
+				nonHealthRequests.Add(1)
+				w.Header().Set("Content-Type", "application/x-ndjson")
+				_, _ = w.Write([]byte(`{"type":"complete"}` + "\n"))
+			}))
+			t.Cleanup(srv.Close)
+
+			s := newTestStore(srv, "")
+			reference := "gmail-42"
+			err := s.RunCLIRepairMessage(context.Background(), generated.CLIRepairMessageRequest{
+				Reference: &reference,
+			}, nil)
+
+			require.ErrorContains(t, err, "requires daemon API schema 2.15.0")
+			require.ErrorContains(t, err, test.wantVersion)
+			assert.Zero(t, nonHealthRequests.Load(), "incompatible daemon must receive neither repair nor sync requests")
+		})
+	}
+}
+
+func TestRunCLIRepairMessagePropagatesCancellation(t *testing.T) {
+	repairStarted := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			writeJSONResponse(t, w, map[string]any{
+				"status": "ok", "api_schema_version": "2.15.0",
+			})
+			return
+		}
+		assert.Equal(t, "/api/v1/cli/repair-message", r.URL.Path)
+		close(repairStarted)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(func() {
+		close(release)
+		srv.Close()
+	})
+
+	s := newTestStore(srv, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	audit := true
+	go func() {
+		done <- s.RunCLIRepairMessage(ctx, generated.CLIRepairMessageRequest{Audit: &audit}, nil)
+	}()
+	require.Eventually(t, func() bool {
+		select {
+		case <-repairStarted:
+			return true
+		default:
+			return false
+		}
+	}, 2*time.Second, 10*time.Millisecond)
+	cancel()
+
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
 func TestRebuildCLIFTSUsesGeneratedClientAdapter(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -1683,6 +1947,7 @@ func TestGetCLIMessage_Success(t *testing.T) {
 	require.NotNil(t, msg, "message")
 	assert.Equal(int64(42), msg.ID, "ID")
 	assert.Equal("remote-42", msg.SourceMessageID, "SourceMessageID")
+	assert.Empty(msg.RFC822MessageID, "older daemons may omit the RFC Message-ID")
 	assert.Equal("Test Subject", msg.Subject, "Subject")
 	assert.Equal("alice@example.com", msg.From[0].Email, "From")
 	assert.Equal("Hello over HTTP", msg.BodyText, "BodyText")

@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -23,6 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/api"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/discord"
 	imaplib "go.kenn.io/msgvault/internal/imap"
 	"go.kenn.io/msgvault/internal/oauth"
@@ -385,6 +388,52 @@ func TestRunServeStartsReadOnlyWithoutOAuthConfig(t *testing.T) {
 		require.NoError(t, err, "runServe")
 	case <-time.After(5 * time.Second):
 		require.FailNow(t, "runServe did not stop after context cancellation")
+	}
+}
+
+func TestRunServeFailsPendingImportFromPreviousDaemon(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	oldCfg := cfg
+	dataDir := t.TempDir()
+	c := lifecycleTestConfig(dataDir)
+	c.Server.APIPort = freeTCPPort(t)
+	c.Analytics.Engine = config.AnalyticsEngineSQL
+	c.Vector.Enabled = false
+	cfg = c
+	t.Cleanup(func() { cfg = oldCfg })
+
+	st, err := store.Open(c.DatabaseDSN())
+	require.NoError(err)
+	require.NoError(st.InitSchema())
+	source, err := st.GetOrCreateSource("gmail", "orphaned-import@example.com")
+	require.NoError(err)
+	_, err = st.CreateSyncOperation(source.ID, "orphaned-operation")
+	require.NoError(err)
+	require.NoError(st.Close())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	cmd := &cobra.Command{Use: serveCmd.Use}
+	cmd.SetContext(ctx)
+	errCh := make(chan error, 1)
+	go func() { errCh <- runServe(cmd, nil) }()
+	waitForServeHealth(t, c.Server.APIPort, errCh)
+
+	observer, err := store.Open(c.DatabaseDSN())
+	require.NoError(err)
+	t.Cleanup(func() { require.NoError(observer.Close()) })
+	op, err := observer.GetSyncOperation("orphaned-operation")
+	require.NoError(err)
+	assert.Equal("failed", op.Status)
+	assert.True(op.FinishedAt.Valid)
+
+	cancel()
+	select {
+	case err := <-errCh:
+		require.NoError(err, "runServe")
+	case <-time.After(5 * time.Second):
+		require.FailNow("runServe did not stop after context cancellation")
 	}
 }
 
@@ -1465,9 +1514,167 @@ func TestCLISyncSubprocessArgsIncludesExactSourceID(t *testing.T) {
 		cliSyncSubprocessArgs(api.CLISyncRequest{SourceID: 42, SourceIDSet: true}),
 	)
 	assert.Equal(t,
-		[]string{"sync-full", "--source-id", "42"},
-		cliSyncSubprocessArgs(api.CLISyncRequest{Full: true, SourceID: 42, SourceIDSet: true}),
+		[]string{"sync-full", "--source-id", "42", "--sync-operation-id", "operation-1"},
+		cliSyncSubprocessArgs(api.CLISyncRequest{
+			Full: true, SourceID: 42, SourceIDSet: true, OperationID: "operation-1",
+		}),
 	)
+}
+
+func TestDaemonCLIRunCannotUseServerRemoteDeleteConfigOrEnvironment(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	repoRoot, err := filepath.Abs(filepath.Join("..", "..", ".."))
+	require.NoError(err)
+	binaryName := "msgvault"
+	if runtime.GOOS == "windows" {
+		binaryName += ".exe"
+	}
+	binaryPath := filepath.Join(t.TempDir(), binaryName)
+	build := exec.Command("go", "build", "-tags", "fts5 sqlite_vec", "-o", binaryPath, "./cmd/msgvault")
+	build.Dir = repoRoot
+	buildOutput, err := build.CombinedOutput()
+	require.NoError(err, "build real msgvault binary: %s", buildOutput)
+
+	savedResolver := daemonCLIExecutableResolver
+	daemonCLIExecutableResolver = func() (string, error) { return binaryPath, nil }
+	t.Cleanup(func() { daemonCLIExecutableResolver = savedResolver })
+
+	dataDir := t.TempDir()
+	configPath := filepath.Join(dataDir, "config.toml")
+	configContents := fmt.Sprintf(`[data]
+data_dir = %q
+
+[server]
+api_key = %q
+
+[deletion]
+remote_enabled = true
+`, dataDir, "boundary-secret")
+	require.NoError(os.WriteFile(configPath, []byte(configContents), 0o600))
+	serverCfg, err := config.Load(configPath, "")
+	require.NoError(err)
+
+	savedCfg, savedCfgFile, savedHomeDir, savedUseLocal := cfg, cfgFile, homeDir, useLocal
+	cfg, cfgFile, homeDir, useLocal = serverCfg, configPath, "", false
+	t.Cleanup(func() {
+		cfg, cfgFile, homeDir, useLocal = savedCfg, savedCfgFile, savedHomeDir, savedUseLocal
+	})
+	t.Setenv(remoteDeleteEnvVar, "1")
+
+	st, err := store.Open(serverCfg.DatabaseDSN())
+	require.NoError(err)
+	t.Cleanup(func() { require.NoError(st.Close()) })
+	require.NoError(st.InitSchema())
+	source, err := st.GetOrCreateSource("gmail", "boundary@example.invalid")
+	require.NoError(err)
+
+	manager, err := deletion.NewManager(filepath.Join(dataDir, "deletions"))
+	require.NoError(err)
+	manifest := deletion.NewManifestForSource("daemon consent boundary", []string{"remote-1"}, deletion.SourceReference{
+		ID: source.ID, Type: source.SourceType, Identifier: source.Identifier,
+	})
+	require.NoError(manager.SaveManifest(manifest))
+
+	daemon := api.NewServerWithOptions(api.ServerOptions{
+		Config: serverCfg,
+		Store:  &storeAPIAdapter{store: st},
+		Logger: slog.New(slog.DiscardHandler),
+	})
+	body, err := json.Marshal(api.CLIRunRequest{
+		Args: []string{"delete-staged", "--yes", manifest.ID},
+	})
+	require.NoError(err)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/cli/run", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Api-Key", "boundary-secret")
+	response := httptest.NewRecorder()
+
+	daemon.Router().ServeHTTP(response, request)
+
+	require.Equal(http.StatusOK, response.Code, response.Body.String())
+	var events []api.CLIRunEvent
+	decoder := json.NewDecoder(response.Body)
+	for decoder.More() {
+		var event api.CLIRunEvent
+		require.NoError(decoder.Decode(&event))
+		events = append(events, event)
+	}
+	require.Len(events, 3, response.Body.String())
+	blocked := "remote deletion is gated; set [deletion] remote_enabled = true in the invoking CLI's config.toml for durable consent; one-command alternative: " +
+		remoteDeleteEnvVar + "=1"
+	var stdout, stderr, subprocessError string
+	for _, event := range events {
+		switch event.Type {
+		case "stdout":
+			stdout += event.Data
+		case "stderr":
+			stderr += event.Data
+		case "error":
+			subprocessError = event.Error
+		}
+	}
+	assert.Contains(stdout, "Deletion Summary:\n")
+	assert.Equal("Error: "+blocked+"\n", stderr)
+	assert.Equal(cliSubprocessExitSentinel, subprocessError)
+	assert.FileExists(filepath.Join(manager.PendingDir(), manifest.ID+".json"))
+	assert.NoFileExists(filepath.Join(manager.InProgressDir(), manifest.ID+".json"))
+}
+
+func TestStoreAPIAdapterCanceledSyncOperationIsFailed(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := storetest.New(t)
+	_, err := f.Store.CreateSyncOperation(f.Source.ID, "operation-1")
+	require.NoError(err)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	adapter := &storeAPIAdapter{store: f.Store}
+
+	err = adapter.runCLISyncOperationWithRunner(
+		ctx,
+		api.CLISyncRequest{Full: true, OperationID: "operation-1"},
+		nil,
+		func(context.Context, []string, func(string, string) error) error { return nil },
+	)
+
+	require.ErrorIs(err, context.Canceled)
+	op, err := f.Store.GetSyncOperation("operation-1")
+	require.NoError(err)
+	assert.Equal("failed", op.Status)
+	assert.False(op.StartedAt.Valid)
+	assert.True(op.FinishedAt.Valid)
+	assert.Empty(op.Runs)
+}
+
+func TestStoreAPIAdapterFinalizesSyncOperationAfterRunnerReturns(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := storetest.New(t)
+	_, err := f.Store.CreateSyncOperation(f.Source.ID, "operation-1")
+	require.NoError(err)
+	adapter := &storeAPIAdapter{store: f.Store}
+
+	err = adapter.runCLISyncOperationWithRunner(
+		t.Context(),
+		api.CLISyncRequest{Full: true, OperationID: "operation-1"},
+		nil,
+		func(context.Context, []string, func(string, string) error) error {
+			runID, err := f.Store.StartSyncOperation(f.Source.ID, "operation-1")
+			require.NoError(err)
+			require.NoError(f.Store.CompleteSync(runID, "cursor"))
+			op, err := f.Store.GetSyncOperation("operation-1")
+			require.NoError(err)
+			assert.Equal("running", op.Status)
+			return nil
+		},
+	)
+
+	require.NoError(err)
+	op, err := f.Store.GetSyncOperation("operation-1")
+	require.NoError(err)
+	assert.Equal("done", op.Status)
 }
 
 func TestStoreAPIAdapterRunCLICommandPacksOnlyAllowlistedSuccess(t *testing.T) {
@@ -1540,6 +1747,60 @@ func TestStoreAPIAdapterRunCLICommandPacksOnlyAllowlistedSuccess(t *testing.T) {
 			assert.Empty(events, "successful automatic maintenance writes no normal CLI output")
 		})
 	}
+}
+
+func TestStoreAPIAdapterRunCLIRepairMessageUsesDedicatedLocalArgv(t *testing.T) {
+	tests := []struct {
+		name string
+		req  api.CLIRepairMessageRequest
+		want []string
+	}{
+		{
+			name: "repair",
+			req:  api.CLIRepairMessageRequest{Reference: "gmail-42", SourceID: 7},
+			want: []string{"repair-message", "--local", "--source-id", "7", "--", "gmail-42"},
+		},
+		{
+			name: "hyphen-prefixed reference stays positional",
+			req:  api.CLIRepairMessageRequest{Reference: "--audit"},
+			want: []string{"repair-message", "--local", "--", "--audit"},
+		},
+		{
+			name: "whole archive audit json",
+			req:  api.CLIRepairMessageRequest{Audit: true, JSON: true},
+			want: []string{"repair-message", "--local", "--audit", "--json"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var gotArgs []string
+			var events []api.CLIRepairMessageEvent
+			adapter := &storeAPIAdapter{}
+			err := adapter.runCLIRepairMessageWithRunner(t.Context(), test.req, func(event api.CLIRepairMessageEvent) error {
+				events = append(events, event)
+				return nil
+			}, func(_ context.Context, args []string, emit func(string, string) error) error {
+				gotArgs = append([]string(nil), args...)
+				return emit("stdout", "line\n")
+			})
+
+			require.NoError(t, err)
+			assert.Equal(t, test.want, gotArgs)
+			assert.Equal(t, []api.CLIRepairMessageEvent{{Type: "stdout", Data: "line\n"}}, events)
+		})
+	}
+}
+
+func TestStoreAPIAdapterRunCLIRepairMessagePropagatesCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	adapter := &storeAPIAdapter{}
+	err := adapter.runCLIRepairMessageWithRunner(ctx, api.CLIRepairMessageRequest{Audit: true}, nil,
+		func(ctx context.Context, _ []string, _ func(string, string) error) error {
+			cancel()
+			<-ctx.Done()
+			return ctx.Err()
+		})
+	require.ErrorIs(t, err, context.Canceled)
 }
 
 func TestStoreAPIAdapterAppendsServerOwnedGrantDecision(t *testing.T) {
@@ -1674,6 +1935,7 @@ func TestStoreAPIAdapterRepackAfterSuccessfulRemovalOnly(t *testing.T) {
 		{name: "successful account removal", args: []string{"remove-account", "alice@example.com", "--yes"}, wantRemoved: true},
 		{name: "failed account removal", args: []string{"remove-account", "alice@example.com", "--yes"}, predecessorErr: errors.New("remove failed")},
 		{name: "successful excluded media purge", args: []string{"purge-excluded-media", "--yes"}, wantRemoved: true},
+		{name: "successful garbage collection", args: []string{"gc", "--yes"}, wantRemoved: true},
 		{name: "dry run is not a removal", args: []string{"purge-excluded-media", "--dry-run"}},
 		{name: "unconfirmed purge is not a removal", args: []string{"purge-excluded-media"}},
 		{name: "failed excluded media purge", args: []string{"purge-excluded-media", "--yes"}, predecessorErr: errors.New("purge failed")},
@@ -1949,6 +2211,31 @@ func TestSetupVectorFeatures_Disabled(t *testing.T) {
 	vf, err := setupVectorFeatures(context.Background(), nil, "", false)
 	require.NoError(t, err, "setupVectorFeatures")
 	assert.Nil(t, vf, "setupVectorFeatures should be nil when disabled")
+}
+
+func TestRunScheduledGmailSync_ReauthGuidance(t *testing.T) {
+	for _, tc := range []struct {
+		name, scope, flags string
+	}{
+		{"default", oauth.ScopeGmailModify, ""},
+		{"readonly", oauth.ScopeGmailReadonly, " --readonly"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			// An expired token without a refresh token fails locally, without
+			// contacting Google or opening an authorization flow.
+			_, restore := seedTokenEnv(t, fmt.Sprintf(`{"access_token":"expired","expiry":"2000-01-01T00:00:00Z","scopes":[%q]}`, tc.scope))
+			defer restore()
+			mgr, err := oauth.NewManager(cfg.OAuth.ClientSecrets, cfg.TokensDir(), logger)
+			require.NoError(err)
+			_, err = runScheduledGmailSync(t.Context(), scopeEscalationAccount, nil, nil,
+				func(string) (*oauth.Manager, error) { return mgr, nil })
+			require.Error(err)
+			assert.Contains(err.Error(), "msgvault add-account user@example.com"+tc.flags+" --force")
+			assert.Contains(err.Error(), "msgvault add-account user@example.com"+tc.flags+" --headless")
+		})
+	}
 }
 
 // TestRunScheduledIMAPSync_NoCredentials verifies that the IMAP path

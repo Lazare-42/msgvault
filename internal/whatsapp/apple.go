@@ -138,6 +138,10 @@ func (imp *Importer) importApple(
 	if err != nil {
 		return nil, fmt.Errorf("load Apple LID mapping: %w", err)
 	}
+	pushNames, err := loadApplePushNames(ctx, db)
+	if err != nil {
+		return nil, fmt.Errorf("load Apple push names: %w", err)
+	}
 	duplicateStanzas, duplicateRows, err := fetchDuplicateAppleTextStanzas(ctx, db)
 	if err != nil {
 		return nil, fmt.Errorf("find duplicate Apple stanza IDs: %w", err)
@@ -170,6 +174,7 @@ func (imp *Importer) importApple(
 	}
 	totalLimit := int64(opts.Limit)
 	var totalAdded int64
+	pendingPushNames := make(map[string]string)
 
 	for _, chat := range chats {
 		if err := ctx.Err(); err != nil {
@@ -214,12 +219,18 @@ func (imp *Importer) importApple(
 				if phone == "" {
 					continue
 				}
+				legacyName := firstNonEmptyApple(member.ContactName, member.FirstName)
 				participantID, err := ensureAppleParticipant(
-					imp.store, phone, firstNonEmptyApple(member.ContactName, member.FirstName),
+					imp.store, phone, legacyName,
 					participantIDs, summary,
 				)
 				if err != nil {
 					return summary, err
+				}
+				if legacyName == "" {
+					if pushName := applePushNameFor(pushNames, member.JID); pushName != "" {
+						pendingPushNames[phone] = pushName
+					}
 				}
 				role := "member"
 				if member.IsAdmin {
@@ -237,6 +248,11 @@ func (imp *Importer) importApple(
 			)
 			if err != nil {
 				return summary, err
+			}
+			if strings.TrimSpace(chat.Name) == "" {
+				if pushName := applePushNameFor(pushNames, chat.RawJID); pushName != "" {
+					pendingPushNames[phone] = pushName
+				}
 			}
 			if err := imp.store.EnsureConversationParticipant(
 				conversationID, participantID, "member",
@@ -275,7 +291,9 @@ func (imp *Importer) importApple(
 			for _, sourceMessage := range messages {
 				afterRowID = sourceMessage.RowID
 				summary.MessagesProcessed++
-				if sourceMessage.MessageType != 0 ||
+				// iOS uses 0 for text and 7 for URL messages; these codes differ from Android.
+				// Keep this filter in sync with fetchDuplicateAppleTextStanzas.
+				if (sourceMessage.MessageType != 0 && sourceMessage.MessageType != 7) ||
 					!sourceMessage.Text.Valid || strings.TrimSpace(sourceMessage.Text.String) == "" ||
 					strings.TrimSpace(sourceMessage.StanzaID) == "" {
 					summary.MessagesSkipped++
@@ -292,6 +310,12 @@ func (imp *Importer) importApple(
 				)
 				if err != nil {
 					return summary, err
+				}
+				if sourceMessage.FromMe == 0 && senderPhone != "" && sourceMessage.GroupMemberJID != "" &&
+					firstNonEmptyApple(sourceMessage.GroupContact, sourceMessage.GroupFirstName) == "" {
+					if pushName := applePushNameFor(pushNames, sourceMessage.GroupMemberJID); pushName != "" {
+						pendingPushNames[senderPhone] = pushName
+					}
 				}
 				if sourceMessage.FromMe != 0 {
 					senderPhone = opts.Phone
@@ -356,6 +380,13 @@ func (imp *Importer) importApple(
 			}
 		}
 		imp.progress.OnChatComplete(canonicalChatJID, chatAdded)
+	}
+	for phone, pushName := range pendingPushNames {
+		if _, err := ensureAppleParticipant(
+			imp.store, phone, pushName, participantIDs, summary,
+		); err != nil {
+			return summary, err
+		}
 	}
 
 	if err := imp.store.RecomputeConversationStats(source.ID); err != nil {
@@ -465,11 +496,12 @@ func fetchDuplicateAppleTextStanzas(
 	ctx context.Context,
 	db *sql.DB,
 ) (map[string]struct{}, int64, error) {
+	// Match importApple's iOS text (0) and URL (7) message filter.
 	rows, err := db.QueryContext(ctx, `
 		SELECT m.ZSTANZAID, COUNT(*)
 		FROM ZWAMESSAGE m
 		JOIN ZWACHATSESSION c ON c.Z_PK = m.ZCHATSESSION
-		WHERE COALESCE(m.ZMESSAGETYPE, 0) = 0
+		WHERE COALESCE(m.ZMESSAGETYPE, 0) IN (0, 7)
 		  AND TRIM(COALESCE(m.ZSTANZAID, '')) <> ''
 		  AND TRIM(COALESCE(m.ZTEXT, '')) <> ''
 		  AND (
@@ -555,6 +587,55 @@ func loadAppleLIDMap(ctx context.Context, chatDBPath string) (map[string]string,
 		mapping[strings.TrimSuffix(identifier, "@lid")] = phone
 	}
 	return mapping, rows.Err()
+}
+
+func loadApplePushNames(
+	ctx context.Context,
+	db *sql.DB,
+) (mapping map[string]string, retErr error) {
+	var tableCount int
+	if err := db.QueryRowContext(ctx, `
+		SELECT COUNT(*) FROM sqlite_master
+		WHERE type = 'table' AND name = 'ZWAPROFILEPUSHNAME'
+	`).Scan(&tableCount); err != nil {
+		return nil, fmt.Errorf("check ZWAPROFILEPUSHNAME availability: %w", err)
+	}
+	if tableCount == 0 {
+		return map[string]string{}, nil
+	}
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT COALESCE(ZJID, ''), COALESCE(ZPUSHNAME, '')
+		FROM ZWAPROFILEPUSHNAME
+		WHERE TRIM(COALESCE(ZJID, '')) <> ''
+		  AND TRIM(COALESCE(ZPUSHNAME, '')) <> ''
+		ORDER BY Z_PK ASC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("query ZWAPROFILEPUSHNAME: %w", err)
+	}
+	defer func() {
+		if err := rows.Close(); retErr == nil && err != nil {
+			retErr = fmt.Errorf("close ZWAPROFILEPUSHNAME rows: %w", err)
+		}
+	}()
+
+	mapping = make(map[string]string)
+	for rows.Next() {
+		var jid, pushName string
+		if err := rows.Scan(&jid, &pushName); err != nil {
+			return nil, fmt.Errorf("scan ZWAPROFILEPUSHNAME: %w", err)
+		}
+		jid = strings.ToLower(strings.TrimSpace(jid))
+		pushName = strings.TrimSpace(pushName)
+		if _, exists := mapping[jid]; !exists {
+			mapping[jid] = pushName
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate ZWAPROFILEPUSHNAME: %w", err)
+	}
+	return mapping, nil
 }
 
 func resolveAppleMessageSender(
@@ -709,4 +790,15 @@ func firstNonEmptyApple(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func applePushNameFor(pushNames map[string]string, jid string) string {
+	if len(pushNames) == 0 {
+		return ""
+	}
+	key := strings.ToLower(strings.TrimSpace(jid))
+	if key == "" {
+		return ""
+	}
+	return pushNames[key]
 }

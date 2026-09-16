@@ -60,6 +60,8 @@ func (m Model) meetingSourceLabel(sourceID int64) string {
 			return "Granola"
 		case meetingSourceCircleback:
 			return "Circleback"
+		case meetingSourceNotion:
+			return "Notion"
 		case meetingSourceImported:
 			if account.DisplayName != "" {
 				return textutil.SanitizeTerminal(account.DisplayName)
@@ -170,12 +172,12 @@ func (m Model) meetingListView() string {
 }
 
 func (m Model) meetingFooterView() string {
-	keys := []string{"↑/k", "↓/j", helpLabelEnter, "A source", "/ search", "m mode", helpLabelHelp}
+	keys := []string{"↑/k", "↓/j", helpLabelEnter, "A source", "/ search", helpLabelMode, helpLabelHelp}
 	if m.width < 60 {
 		keys = []string{helpLabelVertical, helpLabelEnter, "/", "m", "?"}
 	}
 	if m.meetingState.level == meetingLevelDetail {
-		keys = []string{"↑/k", "↓/j", "←/h prev", "→/l next", "/ find", helpLabelBack, "m mode", helpLabelHelp}
+		keys = []string{"↑/k", "↓/j", "←/h prev", "→/l next", "/ find", helpLabelBack, helpLabelMode, helpLabelHelp}
 		if m.width < 60 {
 			keys = []string{helpLabelVertical, "←/→", "/", helpLabelEsc, "?"}
 		}

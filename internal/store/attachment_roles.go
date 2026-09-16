@@ -151,6 +151,33 @@ func (s *Store) UpsertAttachmentRecord(
 	return s.upsertAttachmentRecord(boundQuerier{ctx: ctx, q: s.db}, messageID, write)
 }
 
+// UpsertAttachmentRecordWithStats atomically updates an attachment and its message
+// stats. Callers skip unchanged records and request cache invalidation unless the
+// message is new and its attachments will be included in an incremental export.
+func (s *Store) UpsertAttachmentRecordWithStats(
+	ctx context.Context, messageID int64, write AttachmentWrite, invalidateCache bool,
+) error {
+	write = write.normalized()
+	if err := write.validate(); err != nil {
+		return err
+	}
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
+		if err := s.requireSyncMessageSourceTx(tx, messageID); err != nil {
+			return err
+		}
+		if err := s.upsertAttachmentRecord(tx, messageID, write); err != nil {
+			return err
+		}
+		if err := recomputeMessageAttachmentStatsWith(tx, messageID); err != nil {
+			return err
+		}
+		if invalidateCache {
+			return s.bumpDerivedDataRevision(tx)
+		}
+		return nil
+	})
+}
+
 // UpdateAttachmentMediaMetadataContext records provider media dimensions on
 // attachment occurrences belonging to one message.
 func (s *Store) UpdateAttachmentMediaMetadataContext(
@@ -211,8 +238,29 @@ func (s *Store) DeleteUnstoredAttachmentByMetadataContext(
 	})
 }
 
+type attachmentConflictPolicy int
+
+const (
+	updateAttachmentConflicts attachmentConflictPolicy = iota
+	preserveProviderAttachmentConflicts
+	preserveLegacyAttachmentRows
+)
+
 func (s *Store) upsertAttachmentRecord(q querier, messageID int64, write AttachmentWrite) error {
-	if write.SourcePartKey != "" && write.ContentHash != "" {
+	return s.upsertAttachmentRecordWithPolicy(q, messageID, write, updateAttachmentConflicts)
+}
+
+func (s *Store) upsertAttachmentRecordWithPolicy(
+	q querier, messageID int64, write AttachmentWrite, conflictPolicy attachmentConflictPolicy,
+) error {
+	legacyOwnershipPredicate := ""
+	keyedConflictPredicate := ""
+	if conflictPolicy == preserveProviderAttachmentConflicts {
+		legacyOwnershipPredicate = " AND source_attachment_id IS NULL"
+		keyedConflictPredicate = " WHERE attachments.source_attachment_id IS NULL"
+	}
+
+	if conflictPolicy != preserveLegacyAttachmentRows && write.SourcePartKey != "" && write.ContentHash != "" {
 		// Upgrade the pre-provenance row in place when a resync supplies a
 		// stable source occurrence for the same bytes. This preserves its row
 		// identity and prevents a later raw-MIME repair from colliding with a
@@ -228,11 +276,12 @@ func (s *Store) upsertAttachmentRecord(q querier, messageID int64, write Attachm
 			  AND source_part_key IS NULL
 			  AND content_hash = ?
 			  AND attachment_role = 'unknown'
+			  %s
 			  AND NOT EXISTS (
 				SELECT 1 FROM attachments keyed
 				WHERE keyed.message_id = ? AND keyed.source_part_key = ?
 			  )
-		`, s.dialect.JSONBindExpr()),
+		`, s.dialect.JSONBindExpr(), legacyOwnershipPredicate),
 			write.Filename, write.MIMEType, write.StoragePath, write.ContentHash, write.Size,
 			nullIfEmpty(write.SourceAttachmentID), nullIfEmpty(write.MediaType),
 			nullIfZero(write.Width), nullIfZero(write.Height), nullIfZero(write.DurationMS),
@@ -277,7 +326,7 @@ func (s *Store) upsertAttachmentRecord(q querier, messageID int64, write Attachm
 		s.dialect.JSONBindExpr(), s.dialect.Now())
 
 	if write.SourcePartKey != "" {
-		_, err := q.Exec(`
+		result, err := q.Exec(`
 			INSERT INTO attachments `+columns+`
 			`+values+`
 			ON CONFLICT (message_id, source_part_key) WHERE source_part_key IS NOT NULL
@@ -297,12 +346,28 @@ func (s *Store) upsertAttachmentRecord(q querier, messageID int64, write Attachm
 				role_source = EXCLUDED.role_source,
 				content_id = EXCLUDED.content_id,
 				attachment_state = EXCLUDED.attachment_state,
-				attachment_skip_reason = EXCLUDED.attachment_skip_reason`, args...)
-		return err
+				attachment_skip_reason = EXCLUDED.attachment_skip_reason`+keyedConflictPredicate, args...)
+		if err != nil {
+			return err
+		}
+		if conflictPolicy != preserveProviderAttachmentConflicts {
+			return nil
+		}
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("inspect MIME attachment source-part upsert: %w", err)
+		}
+		if rowsAffected == 0 {
+			return fmt.Errorf(
+				"provider-owned attachment source-part collision: message %d part %q",
+				messageID, write.SourcePartKey,
+			)
+		}
+		return nil
 	}
 
 	if write.ContentHash != "" {
-		_, err := q.Exec(`
+		result, err := q.Exec(`
 			INSERT INTO attachments `+columns+`
 			`+values+`
 			ON CONFLICT (message_id, content_hash)
@@ -310,7 +375,33 @@ func (s *Store) upsertAttachmentRecord(q querier, messageID int64, write Attachm
 				  AND content_hash IS NOT NULL
 				  AND content_hash != ''
 			DO NOTHING`, args...)
-		return err
+		if err != nil || conflictPolicy != preserveProviderAttachmentConflicts {
+			return err
+		}
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("inspect MIME attachment content-hash upsert: %w", err)
+		}
+		if rowsAffected > 0 {
+			return nil
+		}
+		var providerID int64
+		err = q.QueryRow(`
+			SELECT id FROM attachments
+			WHERE message_id = ? AND content_hash = ?
+			  AND source_part_key IS NULL
+			  AND source_attachment_id IS NOT NULL
+		`, messageID, write.ContentHash).Scan(&providerID)
+		if err == nil {
+			return fmt.Errorf(
+				"provider-owned attachment content-hash collision: message %d hash %q",
+				messageID, write.ContentHash,
+			)
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		return fmt.Errorf("inspect MIME attachment content-hash collision: %w", err)
 	}
 
 	var existingID int64
@@ -331,4 +422,30 @@ func (s *Store) upsertAttachmentRecord(q querier, messageID int64, write Attachm
 	}
 	_, err = q.Exec(`INSERT INTO attachments `+columns+` `+values, args...)
 	return err
+}
+
+func (s *Store) replaceMIMEAttachmentsWith(
+	q querier, messageID int64, replacement *[]AttachmentWrite,
+) error {
+	if replacement == nil {
+		return nil
+	}
+	if _, err := q.Exec(`
+		DELETE FROM attachments
+		WHERE message_id = ? AND source_attachment_id IS NULL
+	`, messageID); err != nil {
+		return err
+	}
+	for _, attachment := range *replacement {
+		attachment = attachment.normalized()
+		if err := attachment.validate(); err != nil {
+			return err
+		}
+		if err := s.upsertAttachmentRecordWithPolicy(
+			q, messageID, attachment, preserveProviderAttachmentConflicts,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
 }

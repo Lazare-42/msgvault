@@ -29,9 +29,7 @@ components:
         accounts:
           items:
             $ref: "#/components/schemas/AccountInfo"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - accounts
       type: object
@@ -175,15 +173,118 @@ components:
         - Email
         - Name
       type: object
+    AgentTokenIssueRequest:
+      additionalProperties: false
+      properties:
+        label:
+          type: string
+        permissions:
+          items:
+            type: string
+          type: array
+        source_ids:
+          items:
+            format: int64
+            type: integer
+          type: array
+      required:
+        - label
+        - permissions
+        - source_ids
+      type: object
+    AgentTokenIssueResponse:
+      additionalProperties: true
+      properties:
+        created_at:
+          format: date-time
+          type: string
+        daemon_url:
+          type: string
+        id:
+          type: string
+        label:
+          type: string
+        permissions:
+          items:
+            type: string
+          type: array
+        secret:
+          type: string
+        sources:
+          items:
+            $ref: "#/components/schemas/AgentTokenSourceView"
+          type: array
+      required:
+        - id
+        - label
+        - permissions
+        - sources
+        - created_at
+        - secret
+        - daemon_url
+      type: object
+    AgentTokenListResponse:
+      additionalProperties: true
+      properties:
+        tokens:
+          items:
+            $ref: "#/components/schemas/AgentTokenView"
+          type: array
+      required:
+        - tokens
+      type: object
+    AgentTokenSourceView:
+      additionalProperties: true
+      properties:
+        id:
+          format: int64
+          type: integer
+        identifier:
+          type: string
+        type:
+          type: string
+      required:
+        - id
+        - type
+        - identifier
+      type: object
+    AgentTokenView:
+      additionalProperties: true
+      properties:
+        created_at:
+          format: date-time
+          type: string
+        id:
+          type: string
+        label:
+          type: string
+        permissions:
+          items:
+            type: string
+          type: array
+        sources:
+          items:
+            $ref: "#/components/schemas/AgentTokenSourceView"
+          type: array
+      required:
+        - id
+        - label
+        - permissions
+        - sources
+        - created_at
+      type: object
     AggregateResponse:
       additionalProperties: true
       properties:
+        applied_source_ids:
+          items:
+            format: int64
+            type: integer
+          type: array
         rows:
           items:
             $ref: "#/components/schemas/AggregateRowJSON"
-          type:
-            - array
-            - "null"
+          type: array
         view_type:
           type: string
       required:
@@ -461,9 +562,7 @@ components:
         definitions:
           items:
             $ref: "#/components/schemas/AttributeDefinition"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - definitions
       type: object
@@ -473,9 +572,7 @@ components:
         choices:
           items:
             $ref: "#/components/schemas/AttributeChoice"
-          type:
-            - array
-            - "null"
+          type: array
         max_length:
           format: int64
           type: integer
@@ -536,9 +633,7 @@ components:
         context_snippets:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         context_snippets_truncated:
           type: boolean
         message_id:
@@ -588,9 +683,7 @@ components:
         body_lines:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         cancel_hint:
           type: string
         headline:
@@ -621,14 +714,14 @@ components:
     CLIDeduplicatePlanItem:
       additionalProperties: true
       properties:
-        backfilled_count:
-          format: int64
-          type: integer
         duplicate_messages:
           format: int64
           type: integer
         needs_confirmation:
           type: boolean
+        pending_backfill_count:
+          format: int64
+          type: integer
         plan_fingerprint:
           type: string
         scope_is_collection:
@@ -654,8 +747,14 @@ components:
           type: boolean
         delete_dups_from_source_server:
           type: boolean
+        plan_protocol:
+          enum:
+            - explicit-backfill-v1
+          type: string
         prefer:
           type: string
+      required:
+        - plan_protocol
       type: object
     CLIDeduplicatePlanResponse:
       additionalProperties: true
@@ -665,9 +764,7 @@ components:
         items:
           items:
             $ref: "#/components/schemas/CLIDeduplicatePlanItem"
-          type:
-            - array
-            - "null"
+          type: array
         prefix_stdout:
           type: string
       required:
@@ -712,9 +809,7 @@ components:
         planned_batch_ids:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         remote_delete_env_var:
           type: string
         resolved_source_id:
@@ -725,9 +820,7 @@ components:
         scope_escalation_body_lines:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         scope_escalation_cancel_hint:
           type: string
         scope_escalation_headline:
@@ -785,17 +878,13 @@ components:
         bcc:
           items:
             $ref: "#/components/schemas/Address"
-          type:
-            - array
-            - "null"
+          type: array
         body_text:
           type: string
         cc:
           items:
             $ref: "#/components/schemas/Address"
-          type:
-            - array
-            - "null"
+          type: array
         conversation_id:
           format: int64
           type: integer
@@ -818,9 +907,7 @@ components:
         labels:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         message_type:
           type: string
         sent_at:
@@ -843,9 +930,9 @@ components:
         to:
           items:
             $ref: "#/components/schemas/Address"
-          type:
-            - array
-            - "null"
+          type: array
+        web_url:
+          type: string
       required:
         - id
         - source_message_id
@@ -873,6 +960,31 @@ components:
       required:
         - type
       type: object
+    CLIRepairMessageEvent:
+      additionalProperties: true
+      properties:
+        data:
+          type: string
+        error:
+          type: string
+        type:
+          type: string
+      required:
+        - type
+      type: object
+    CLIRepairMessageRequest:
+      additionalProperties: false
+      properties:
+        audit:
+          type: boolean
+        json:
+          type: boolean
+        reference:
+          type: string
+        source_id:
+          format: int64
+          type: integer
+      type: object
     CLIRunEvent:
       additionalProperties: true
       properties:
@@ -891,9 +1003,7 @@ components:
         args:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         cwd:
           type: string
         env:
@@ -965,9 +1075,7 @@ components:
         warnings:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - status
       type: object
@@ -1016,9 +1124,7 @@ components:
         signals:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - identifier
         - normalized_identifier
@@ -1038,9 +1144,16 @@ components:
           type: string
         enabled:
           type: boolean
+        oauth_app:
+          type: string
         password:
           type: string
           writeOnly: true
+        provider:
+          enum:
+            - ""
+            - google
+          type: string
         schedule:
           type: string
         username:
@@ -1060,6 +1173,10 @@ components:
           type: integer
         enabled:
           type: boolean
+        oauth_app:
+          type: string
+        provider:
+          type: string
         schedule:
           type: string
         username:
@@ -1069,6 +1186,19 @@ components:
         - username
         - enabled
         - books
+      type: object
+    CardDAVAddressBookIdentityResponse:
+      additionalProperties: true
+      properties:
+        id:
+          format: int64
+          minimum: 1
+          type: integer
+        name:
+          type: string
+      required:
+        - id
+        - name
       type: object
     CardDAVBookResponse:
       additionalProperties: true
@@ -1117,77 +1247,127 @@ components:
         books:
           items:
             $ref: "#/components/schemas/CardDAVBookResponse"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - books
       type: object
     CardDAVConflictDetailResponse:
       additionalProperties: true
       properties:
-        address_book_id:
-          format: int64
-          type: integer
-        href:
+        address_book:
+          $ref: "#/components/schemas/CardDAVAddressBookIdentityResponse"
+        allowed_resolutions:
+          items:
+            enum:
+              - keep_local
+              - keep_remote
+            type: string
+          type: array
+        base:
+          $ref: "#/components/schemas/CardDAVContactSummaryResponse"
+        created_at:
+          format: date-time
           type: string
         id:
           format: int64
+          minimum: 1
           type: integer
-        local_tombstone:
-          type: boolean
-        local_vcard:
+        local:
+          $ref: "#/components/schemas/CardDAVContactSummaryResponse"
+        remote:
+          $ref: "#/components/schemas/CardDAVContactSummaryResponse"
+        resolution:
+          enum:
+            - keep_local
+            - keep_remote
           type: string
-        remote_tombstone:
-          type: boolean
-        remote_vcard:
+        resolved_at:
+          format: date-time
           type: string
         status:
+          enum:
+            - unresolved
+            - resolved
+          type: string
+        updated_at:
+          format: date-time
           type: string
       required:
         - id
-        - address_book_id
-        - href
-        - local_tombstone
-        - remote_tombstone
+        - address_book
         - status
+        - base
+        - local
+        - remote
+        - allowed_resolutions
+        - created_at
+        - updated_at
       type: object
     CardDAVConflictResolutionResponse:
       additionalProperties: true
       properties:
         id:
           format: int64
+          minimum: 1
           type: integer
+        resolution:
+          enum:
+            - keep_local
+            - keep_remote
+          type: string
         status:
+          enum:
+            - resolved
           type: string
       required:
         - id
         - status
+        - resolution
       type: object
     CardDAVConflictResponse:
       additionalProperties: true
       properties:
-        address_book_id:
-          format: int64
-          type: integer
-        href:
-          type: string
+        address_book:
+          $ref: "#/components/schemas/CardDAVAddressBookIdentityResponse"
+        allowed_resolutions:
+          items:
+            enum:
+              - keep_local
+              - keep_remote
+            type: string
+          type: array
         id:
           format: int64
+          minimum: 1
           type: integer
-        local_tombstone:
-          type: boolean
-        remote_tombstone:
-          type: boolean
+        local_state:
+          enum:
+            - present
+            - deleted
+            - unavailable
+          type: string
+        remote_state:
+          enum:
+            - present
+            - deleted
+            - unavailable
+          type: string
         status:
+          enum:
+            - unresolved
+            - resolved
+          type: string
+        updated_at:
+          format: date-time
           type: string
       required:
         - id
-        - address_book_id
-        - href
-        - local_tombstone
-        - remote_tombstone
+        - address_book
         - status
+        - local_state
+        - remote_state
+        - allowed_resolutions
+        - updated_at
       type: object
     CardDAVConflictsResponse:
       additionalProperties: true
@@ -1195,26 +1375,147 @@ components:
         conflicts:
           items:
             $ref: "#/components/schemas/CardDAVConflictResponse"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - conflicts
+      type: object
+    CardDAVContactSummaryResponse:
+      additionalProperties: true
+      properties:
+        display_name:
+          type: string
+        emails:
+          items:
+            type: string
+          type: array
+        phones:
+          items:
+            type: string
+          type: array
+        state:
+          enum:
+            - present
+            - deleted
+            - unavailable
+          type: string
+        truncated:
+          type: boolean
+      required:
+        - state
+        - emails
+        - phones
+      type: object
+    CardDAVGoogleAuthorizeRequest:
+      additionalProperties: false
+      properties:
+        email:
+          type: string
+        oauth_app:
+          type: string
+        redirect_uri:
+          type: string
+      required:
+        - email
+        - redirect_uri
+      type: object
+    CardDAVGoogleAuthorizeResponse:
+      additionalProperties: true
+      properties:
+        state:
+          type: string
+        url:
+          type: string
+      required:
+        - url
+        - state
+      type: object
+    CardDAVGoogleCallbackRequest:
+      additionalProperties: false
+      properties:
+        code:
+          type: string
+          writeOnly: true
+        state:
+          type: string
+      required:
+        - state
+        - code
+      type: object
+    CardDAVPublicationApprovalRequest:
+      additionalProperties: false
+      properties:
+        approval_token:
+          minLength: 1
+          type: string
+      required:
+        - approval_token
+      type: object
+    CardDAVPublicationPreviewResponse:
+      additionalProperties: true
+      properties:
+        address_book:
+          $ref: "#/components/schemas/CardDAVAddressBookIdentityResponse"
+        approval_token:
+          type: string
+        conflict_id:
+          format: int64
+          minimum: 1
+          type: integer
+        kind:
+          enum:
+            - current
+            - pending
+            - conflict
+          type: string
+        person_id:
+          format: int64
+          minimum: 1
+          type: integer
+        review_required:
+          type: boolean
+        vcard:
+          type: string
+      required:
+        - person_id
+        - address_book
+        - kind
+        - vcard
+        - approval_token
+        - review_required
       type: object
     CardDAVPublicationResponse:
       additionalProperties: true
       properties:
+        address_book:
+          $ref: "#/components/schemas/CardDAVAddressBookIdentityResponse"
+        conflict_id:
+          format: int64
+          minimum: 1
+          type: integer
         desired:
           type: boolean
-        href:
-          type: string
+        inference_review_required:
+          type: boolean
         pending_operation:
+          enum:
+            - create
+            - update
+            - delete
           type: string
         person_id:
           format: int64
+          minimum: 1
           type: integer
+        state:
+          enum:
+            - unpublished
+            - published
+            - pending
+            - conflict
+          type: string
       required:
         - person_id
+        - state
         - desired
       type: object
     CardDAVResolveRequest:
@@ -1227,6 +1528,137 @@ components:
           type: string
       required:
         - choice
+      type: object
+    CardDAVRunResponse:
+      additionalProperties: true
+      properties:
+        books:
+          format: int64
+          type: integer
+        created:
+          format: int64
+          type: integer
+        error_code:
+          enum:
+            - cancelled
+            - retry_after
+            - authentication_failed
+            - google_authorization_required
+            - upstream_failed
+            - safety_limit
+            - sync_failed
+            - unsafe_error_redacted
+            - daemon_restarted
+          type: string
+        error_message:
+          type: string
+        finished_at:
+          format: date-time
+          type: string
+        full:
+          type: boolean
+        id:
+          format: int64
+          type: integer
+        removed:
+          format: int64
+          type: integer
+        started_at:
+          format: date-time
+          type: string
+        state:
+          enum:
+            - running
+            - succeeded
+            - failed
+            - cancelled
+            - partial
+          type: string
+        trigger:
+          enum:
+            - manual
+            - scheduled
+          type: string
+        updated:
+          format: int64
+          type: integer
+      required:
+        - id
+        - trigger
+        - full
+        - state
+        - started_at
+        - books
+        - created
+        - updated
+        - removed
+      type: object
+    CardDAVRunsResponse:
+      additionalProperties: true
+      properties:
+        next_before_id:
+          format: int64
+          type: integer
+        runs:
+          items:
+            $ref: "#/components/schemas/CardDAVRunResponse"
+          type: array
+      required:
+        - runs
+      type: object
+    CardDAVStatusAccount:
+      additionalProperties: true
+      properties:
+        base_url:
+          type: string
+        username:
+          type: string
+      required:
+        - base_url
+        - username
+      type: object
+    CardDAVStatusResponse:
+      additionalProperties: true
+      properties:
+        account:
+          $ref: "#/components/schemas/CardDAVStatusAccount"
+        active:
+          $ref: "#/components/schemas/CardDAVRunResponse"
+        available:
+          type: boolean
+        configured:
+          type: boolean
+        credential_configured:
+          type: boolean
+        enabled:
+          type: boolean
+        latest:
+          $ref: "#/components/schemas/CardDAVRunResponse"
+        latest_successful:
+          $ref: "#/components/schemas/CardDAVRunResponse"
+        next_scheduled_at:
+          format: date-time
+          type: string
+        repair_reason:
+          enum:
+            - account_missing
+            - credential_missing
+            - credential_mismatch
+            - credential_unavailable
+            - google_authorization_required
+            - runtime_unavailable
+          type: string
+        schedule:
+          type: string
+        scheduled:
+          type: boolean
+      required:
+        - configured
+        - available
+        - credential_configured
+        - enabled
+        - scheduled
+        - schedule
       type: object
     CardDAVSyncRequest:
       additionalProperties: false
@@ -1242,9 +1674,7 @@ components:
         targets:
           items:
             $ref: "#/components/schemas/TargetDescriptor"
-          type:
-            - array
-            - "null"
+          type: array
         version:
           type: string
       required:
@@ -1277,6 +1707,8 @@ components:
           type: integer
         internal_date:
           format: date-time
+          type: string
+        list_id:
           type: string
         message_type:
           type: string
@@ -1373,8 +1805,6 @@ components:
         source_deleted_count:
           format: int64
           type: integer
-        sync_config:
-          type: string
         type:
           type: string
       required:
@@ -1392,9 +1822,7 @@ components:
         accounts:
           items:
             $ref: "#/components/schemas/CliAccountResponse"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - accounts
       type: object
@@ -1429,15 +1857,11 @@ components:
           items:
             format: int64
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
         sources:
           items:
             $ref: "#/components/schemas/CliCollectionSourceResponse"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - id
         - name
@@ -1466,9 +1890,7 @@ components:
         collections:
           items:
             $ref: "#/components/schemas/CliCollectionResponse"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - collections
       type: object
@@ -1492,9 +1914,7 @@ components:
         batch_ids:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         expected_batch_count:
           format: int64
           type: integer
@@ -1535,9 +1955,7 @@ components:
         batch_ids:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
       type: object
     CliDeleteDedupedPlanResponse:
       additionalProperties: true
@@ -1548,9 +1966,7 @@ components:
         batches:
           items:
             $ref: "#/components/schemas/CliDeleteDedupedBatchResponse"
-          type:
-            - array
-            - "null"
+          type: array
         total:
           format: int64
           type: integer
@@ -1564,9 +1980,7 @@ components:
         rows:
           items:
             $ref: "#/components/schemas/CliIdentityRowResponse"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - rows
       type: object
@@ -1585,9 +1999,7 @@ components:
         signals:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         source_id:
           format: int64
           type: integer
@@ -1650,15 +2062,11 @@ components:
         attachments:
           items:
             $ref: "#/components/schemas/CliMessageAttachment"
-          type:
-            - array
-            - "null"
+          type: array
         bcc:
           items:
             $ref: "#/components/schemas/CliMessageAddress"
-          type:
-            - array
-            - "null"
+          type: array
         body_html:
           type: string
         body_text:
@@ -1666,9 +2074,7 @@ components:
         cc:
           items:
             $ref: "#/components/schemas/CliMessageAddress"
-          type:
-            - array
-            - "null"
+          type: array
         conversation_id:
           format: int64
           type: integer
@@ -1680,9 +2086,7 @@ components:
         from:
           items:
             $ref: "#/components/schemas/CliMessageAddress"
-          type:
-            - array
-            - "null"
+          type: array
         has_attachments:
           type: boolean
         id:
@@ -1691,9 +2095,7 @@ components:
         labels:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         message_type:
           type: string
         received_at:
@@ -1701,6 +2103,8 @@ components:
           type:
             - string
             - "null"
+        rfc822_message_id:
+          type: string
         sent_at:
           format: date-time
           type: string
@@ -1718,9 +2122,7 @@ components:
         to:
           items:
             $ref: "#/components/schemas/CliMessageAddress"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - id
         - source_message_id
@@ -1774,9 +2176,7 @@ components:
         results:
           items:
             $ref: "#/components/schemas/CLIQueryMessageSummary"
-          type:
-            - array
-            - "null"
+          type: array
         scope_label:
           type: string
         scope_source_count:
@@ -1804,9 +2204,7 @@ components:
         aliases:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         created_at:
           format: date-time
           type: string
@@ -1856,9 +2254,7 @@ components:
         services:
           items:
             $ref: "#/components/schemas/CommunicationService"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - services
       type: object
@@ -1942,9 +2338,7 @@ components:
         messages:
           items:
             $ref: "#/components/schemas/MessageDetail"
-          type:
-            - array
-            - "null"
+          type: array
         total:
           format: int64
           type: integer
@@ -2008,9 +2402,7 @@ components:
         aliases:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         default_scope_kind:
           type: string
         display_label:
@@ -2057,9 +2449,7 @@ components:
             format: int64
             minimum: 1
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - body
       type: object
@@ -2134,9 +2524,7 @@ components:
         accounts:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         name:
           type: string
       required:
@@ -2192,9 +2580,7 @@ components:
           items:
             format: int64
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
         source:
           type: string
         source_ref:
@@ -2300,9 +2686,7 @@ components:
         body_contexts:
           items:
             $ref: "#/components/schemas/BodySearchContext"
-          type:
-            - array
-            - "null"
+          type: array
         count:
           format: int64
           type: integer
@@ -2314,9 +2698,7 @@ components:
         messages:
           items:
             $ref: "#/components/schemas/MessageSummary"
-          type:
-            - array
-            - "null"
+          type: array
         offset:
           format: int64
           type: integer
@@ -2324,10 +2706,16 @@ components:
           type: string
         scope:
           type: string
+        stats:
+          $ref: "#/components/schemas/TotalStatsResponse"
+        total_count:
+          format: int64
+          type: integer
       required:
         - query
         - messages
         - count
+        - total_count
         - has_more
         - offset
         - limit
@@ -2412,6 +2800,51 @@ components:
         - source_identifier
         - source_message_id
       type: object
+    DirectoryPeopleResponse:
+      additionalProperties: true
+      properties:
+        next_cursor:
+          type: string
+        people:
+          items:
+            $ref: "#/components/schemas/DirectoryPersonSummary"
+          type: array
+      required:
+        - people
+      type: object
+    DirectoryPersonSummary:
+      additionalProperties: true
+      properties:
+        categories:
+          items:
+            type: string
+          type: array
+        contact_state:
+          type: string
+        display_name:
+          type: string
+        id:
+          format: int64
+          type: integer
+        last_contact_at:
+          format: date-time
+          type: string
+        organizations:
+          items:
+            type: string
+          type: array
+        primary_channel:
+          type: string
+        revision:
+          format: int64
+          type: integer
+      required:
+        - id
+        - revision
+        - contact_state
+        - categories
+        - organizations
+      type: object
     DiscoverError:
       additionalProperties: true
       properties:
@@ -2468,9 +2901,7 @@ components:
         confirm:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         page_size:
           format: int64
           type: integer
@@ -2488,21 +2919,15 @@ components:
         applied:
           items:
             $ref: "#/components/schemas/IdentityConfirmationOutcome"
-          type:
-            - array
-            - "null"
+          type: array
         candidates:
           items:
             $ref: "#/components/schemas/Candidate"
-          type:
-            - array
-            - "null"
+          type: array
         rejected:
           items:
             $ref: "#/components/schemas/RejectedCandidate"
-          type:
-            - array
-            - "null"
+          type: array
         scanned_messages:
           format: int64
           type: integer
@@ -2655,9 +3080,7 @@ components:
         results:
           items:
             $ref: "#/components/schemas/DocumentSearchResult"
-          type:
-            - array
-            - "null"
+          type: array
         revision:
           format: int64
           type: integer
@@ -2705,9 +3128,7 @@ components:
         heading_path:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         highlight_end:
           format: int64
           type: integer
@@ -2723,9 +3144,7 @@ components:
         matched_signals:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         message_id:
           format: int64
           type: integer
@@ -2942,9 +3361,7 @@ components:
         failures:
           items:
             $ref: "#/components/schemas/DocumentVectorFailureDiagnostic"
-          type:
-            - array
-            - "null"
+          type: array
         failures_exhausted:
           type: boolean
         generation_id:
@@ -3079,9 +3496,7 @@ components:
         rows:
           items:
             $ref: "#/components/schemas/DomainSummary"
-          type:
-            - array
-            - "null"
+          type: array
         search_provenance:
           $ref: "#/components/schemas/SearchProvenance"
         total_count:
@@ -3118,9 +3533,7 @@ components:
         source_counts:
           items:
             $ref: "#/components/schemas/SourceCount"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - domain
         - activity_count
@@ -3310,9 +3723,7 @@ components:
         org:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         role:
           type: string
         title:
@@ -3324,9 +3735,7 @@ components:
         employments:
           items:
             $ref: "#/components/schemas/Employment"
-          type:
-            - array
-            - "null"
+          type: array
         projection:
           $ref: "#/components/schemas/EmploymentProjectionResponse"
       required:
@@ -3390,15 +3799,11 @@ components:
           items:
             format: int64
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
         participant_labels:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         preview:
           type: string
         source_id:
@@ -3452,9 +3857,7 @@ components:
         failed_ids:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         last_processed_index:
           format: int64
           type: integer
@@ -3469,9 +3872,7 @@ components:
         tombstone_ids:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - started_at
         - method
@@ -3592,6 +3993,8 @@ components:
           type: array
         next_cursor:
           type: string
+        search_deletion_scope:
+          type: string
         search_provenance:
           $ref: "#/components/schemas/SearchProvenance"
         total_count:
@@ -3612,6 +4015,7 @@ components:
             - participant
             - domain
             - message_type
+            - mailing_list
             - after
             - before
             - deletion
@@ -3632,6 +4036,7 @@ components:
         - participant
         - domain
         - message_type
+        - mailing_list
         - kind
         - year
         - month
@@ -3686,9 +4091,7 @@ components:
         filters:
           items:
             $ref: "#/components/schemas/ExploreFilter"
-          type:
-            - array
-            - "null"
+          type: array
         group_key:
           type: string
         grouping:
@@ -3718,9 +4121,7 @@ components:
           items:
             $ref: "#/components/schemas/ExploreGroupSort"
           maxItems: 1
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - grouping
       type: object
@@ -3760,15 +4161,11 @@ components:
         filters:
           items:
             $ref: "#/components/schemas/ExploreFilter"
-          type:
-            - array
-            - "null"
+          type: array
         grouping:
           items:
             $ref: "#/components/schemas/ExploreGroupDimension"
-          type:
-            - array
-            - "null"
+          type: array
         limit:
           format: int64
           maximum: 500
@@ -3791,9 +4188,7 @@ components:
         sort:
           items:
             $ref: "#/components/schemas/ExploreSort"
-          type:
-            - array
-            - "null"
+          type: array
       type: object
     ExploreHTTPResponse:
       additionalProperties: true
@@ -3876,6 +4271,9 @@ components:
         count:
           format: int64
           type: integer
+        deletable_count:
+          format: int64
+          type: integer
         estimated_bytes:
           format: int64
           type: integer
@@ -3893,6 +4291,7 @@ components:
             $ref: "#/components/schemas/ExploreUnavailableAction"
           type: array
       required:
+        - deletable_count
         - count
         - estimated_bytes
         - cache_revision
@@ -3924,9 +4323,7 @@ components:
         exclusions:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         mode:
           enum:
             - explicit
@@ -3937,9 +4334,7 @@ components:
         row_keys:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         search_provenance:
           $ref: "#/components/schemas/SearchProvenance"
       required:
@@ -4012,18 +4407,14 @@ components:
         mime_families:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         predicate:
           $ref: "#/components/schemas/ExploreHTTPRequest"
         sort:
           items:
             $ref: "#/components/schemas/ExploreGroupSort"
           maxItems: 1
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - predicate
         - grouping
@@ -4127,9 +4518,7 @@ components:
         mime_families:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         predicate:
           $ref: "#/components/schemas/ExploreHTTPRequest"
         sort:
@@ -4152,9 +4541,7 @@ components:
         files:
           items:
             $ref: "#/components/schemas/FileSearchRow"
-          type:
-            - array
-            - "null"
+          type: array
         next_cursor:
           type: string
         search_provenance:
@@ -4207,22 +4594,16 @@ components:
         participant_domains:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         participant_ids:
           items:
             format: int64
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
         participant_labels:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         search_explain:
           $ref: "#/components/schemas/FileSearchExplain"
         size_bytes:
@@ -4267,6 +4648,11 @@ components:
     FilteredMessagesResponse:
       additionalProperties: true
       properties:
+        applied_source_ids:
+          items:
+            format: int64
+            type: integer
+          type: array
         count:
           format: int64
           type: integer
@@ -4278,9 +4664,7 @@ components:
         messages:
           items:
             $ref: "#/components/schemas/MessageSummary"
-          type:
-            - array
-            - "null"
+          type: array
         offset:
           format: int64
           type: integer
@@ -4303,27 +4687,23 @@ components:
         labels:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
+        list_ids:
+          items:
+            type: string
+          type: array
         recipients:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         sender_domains:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         senders:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
       type: object
     FormatCoverage:
       additionalProperties: true
@@ -4388,18 +4768,23 @@ components:
     GmailIDsResponse:
       additionalProperties: true
       properties:
+        applied_source_ids:
+          items:
+            format: int64
+            type: integer
+          type: array
         gmail_ids:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
+        search_mode:
+          type: string
+        search_query:
+          type: string
         targets:
           items:
             $ref: "#/components/schemas/DeletionTarget"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - gmail_ids
       type: object
@@ -4447,15 +4832,11 @@ components:
         bcc:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         cc:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         conversation_id:
           format: int64
           type: integer
@@ -4477,15 +4858,11 @@ components:
         labels:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         matches:
           items:
             $ref: "#/components/schemas/HybridSearchMatch"
-          type:
-            - array
-            - "null"
+          type: array
         matches_truncated:
           type: boolean
         message_type:
@@ -4509,9 +4886,7 @@ components:
         to:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - id
         - subject
@@ -4557,9 +4932,7 @@ components:
         results:
           items:
             $ref: "#/components/schemas/HybridSearchItem"
-          type:
-            - array
-            - "null"
+          type: array
         returned:
           format: int64
           type: integer
@@ -4591,9 +4964,7 @@ components:
         signals:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - identifier
         - added
@@ -4664,9 +5035,7 @@ components:
         evidence:
           items:
             $ref: "#/components/schemas/IdentityMatchEvidence"
-          type:
-            - array
-            - "null"
+          type: array
         id:
           format: int64
           type: integer
@@ -4718,9 +5087,7 @@ components:
         candidates:
           items:
             $ref: "#/components/schemas/IdentityMatchCandidate"
-          type:
-            - array
-            - "null"
+          type: array
         limit:
           format: int64
           type: integer
@@ -4825,6 +5192,106 @@ components:
       required:
         - identifier
       type: object
+    ImportJobRequest:
+      additionalProperties: false
+      properties:
+        account:
+          minLength: 1
+          type: string
+        after:
+          pattern: ^[0-9]{4}-[0-9]{2}-[0-9]{2}$
+          type: string
+        before:
+          pattern: ^[0-9]{4}-[0-9]{2}-[0-9]{2}$
+          type: string
+        limit:
+          format: int64
+          minimum: 0
+          type: integer
+        noresume:
+          type: boolean
+        query:
+          description: Gmail search query; not supported for IMAP sources
+          type: string
+      required:
+        - account
+      type: object
+    ImportJobResponse:
+      additionalProperties: true
+      properties:
+        account:
+          type: string
+        added:
+          format: int64
+          type: integer
+        created_at:
+          format: date-time
+          type: string
+        error:
+          type: string
+        finished_at:
+          format: date-time
+          type:
+            - string
+            - "null"
+        job_id:
+          type: string
+        processed:
+          format: int64
+          type: integer
+        skipped:
+          format: int64
+          type: integer
+        started_at:
+          format: date-time
+          type:
+            - string
+            - "null"
+        status:
+          enum:
+            - pending
+            - running
+            - done
+            - failed
+          type: string
+        summary:
+          $ref: "#/components/schemas/ImportJobSummary"
+      required:
+        - job_id
+        - account
+        - status
+        - processed
+        - added
+        - skipped
+        - created_at
+        - started_at
+        - finished_at
+      type: object
+    ImportJobSummary:
+      additionalProperties: true
+      properties:
+        added:
+          format: int64
+          type: integer
+        errors:
+          format: int64
+          type: integer
+        processed:
+          format: int64
+          type: integer
+        skipped:
+          format: int64
+          type: integer
+        updated:
+          format: int64
+          type: integer
+      required:
+        - processed
+        - added
+        - updated
+        - skipped
+        - errors
+      type: object
     ImportRequest:
       additionalProperties: false
       properties:
@@ -4875,9 +5342,7 @@ components:
         manifests:
           items:
             $ref: "#/components/schemas/DeletionManifestSummary"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - manifests
       type: object
@@ -4898,9 +5363,7 @@ components:
         gmail_ids:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         id:
           type: string
         raw_filter: {}
@@ -4983,9 +5446,7 @@ components:
         attendees:
           items:
             $ref: "#/components/schemas/MeetingPerson"
-          type:
-            - array
-            - "null"
+          type: array
         ended_at:
           format: date-time
           type: string
@@ -5012,9 +5473,7 @@ components:
         transcript_segments:
           items:
             $ref: "#/components/schemas/TranscriptSegment"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - external_id
         - started_at
@@ -5091,15 +5550,11 @@ components:
         attachments:
           items:
             $ref: "#/components/schemas/AttachmentInfo"
-          type:
-            - array
-            - "null"
+          type: array
         bcc:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         body:
           type: string
         body_html:
@@ -5109,9 +5564,7 @@ components:
         cc:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         conversation_id:
           format: int64
           type: integer
@@ -5135,9 +5588,7 @@ components:
         labels:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         message_type:
           type: string
         sent_at:
@@ -5157,9 +5608,7 @@ components:
         to:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - body
         - attachments
@@ -5179,9 +5628,7 @@ components:
         messages:
           items:
             $ref: "#/components/schemas/MessageSummary"
-          type:
-            - array
-            - "null"
+          type: array
         page:
           format: int64
           type: integer
@@ -5203,15 +5650,11 @@ components:
         bcc:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         cc:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         conversation_id:
           format: int64
           type: integer
@@ -5233,9 +5676,7 @@ components:
         labels:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         message_type:
           type: string
         sent_at:
@@ -5255,9 +5696,7 @@ components:
         to:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - id
         - subject
@@ -5280,160 +5719,69 @@ components:
       required:
         - name
       type: object
-    OCRPage:
+    NetworkEdge:
       additionalProperties: true
       properties:
-        confidence:
-          format: double
-          type: number
-        method:
+        end_date:
           type: string
-        page_number:
-          format: int64
-          type: integer
-        text:
+        id:
+          type: string
+        kind:
+          enum:
+            - relationship
+            - employment
+          type: string
+        label:
+          type: string
+        relationship_type_slug:
+          type: string
+        source_node_id:
+          type: string
+        start_date:
+          type: string
+        target_node_id:
           type: string
       required:
-        - page_number
-        - method
-        - text
+        - id
+        - kind
+        - source_node_id
+        - target_node_id
+        - label
       type: object
-    OCRResult:
+    NetworkNode:
       additionalProperties: true
       properties:
-        attempts:
+        entity_id:
           format: int64
           type: integer
-        average_confidence:
-          format: double
-          type: number
-        content_hash:
-          type: string
-        error_code:
-          type: string
-        error_detail:
-          type: string
-        extractor_fingerprint:
-          type: string
-        method:
-          type: string
-        page_count:
+        hop:
           format: int64
           type: integer
-        pages:
-          items:
-            $ref: "#/components/schemas/OCRPage"
-          type:
-            - array
-            - "null"
-        status:
+        id:
           type: string
-        updated_at:
-          format: date-time
+        kind:
+          enum:
+            - person
+            - organization
+          type: string
+        label:
           type: string
       required:
-        - content_hash
-        - status
-        - extractor_fingerprint
-        - attempts
-        - updated_at
+        - id
+        - kind
+        - entity_id
+        - label
+        - hop
       type: object
-    OCRRuntimeStatus:
-      additionalProperties: true
-      properties:
-        enabled:
-          type: boolean
-        exhausted:
-          format: int64
-          type: integer
-        extractor_fingerprint:
-          type: string
-        failed:
-          format: int64
-          type: integer
-        pending:
-          format: int64
-          type: integer
-        ready:
-          format: int64
-          type: integer
-        running:
-          format: int64
-          type: integer
-        unsupported:
-          format: int64
-          type: integer
-      required:
-        - enabled
-        - extractor_fingerprint
-        - pending
-        - running
-        - ready
-        - failed
-        - exhausted
-        - unsupported
-      type: object
-    OCRSearchHit:
-      additionalProperties: true
-      properties:
-        attachment_id:
-          format: int64
-          type: integer
-        confidence:
-          format: double
-          type: number
-        content_hash:
-          type: string
-        conversation_id:
-          format: int64
-          type: integer
-        filename:
-          type: string
-        message_id:
-          format: int64
-          type: integer
-        method:
-          type: string
-        mime_type:
-          type: string
-        page_number:
-          format: int64
-          type: integer
-        snippet:
-          type: string
-      required:
-        - attachment_id
-        - content_hash
-        - filename
-        - mime_type
-        - page_number
-        - method
-        - snippet
-        - message_id
-        - conversation_id
-      type: object
-    OcrSearchRequest:
+    OperationErrorResponse:
       additionalProperties: false
       properties:
-        limit:
-          format: int64
-          type: integer
-        query:
+        error:
+          type: string
+        message:
           type: string
       required:
-        - query
-      type: object
-    OcrSearchResponse:
-      additionalProperties: true
-      properties:
-        results:
-          items:
-            $ref: "#/components/schemas/OCRSearchHit"
-          type:
-            - array
-            - "null"
-      required:
-        - results
+        - error
       type: object
     OperationHealth:
       additionalProperties: true
@@ -5447,6 +5795,350 @@ components:
           type: string
       required:
         - busy
+      type: object
+    OperationLaneStatus:
+      additionalProperties: false
+      properties:
+        active:
+          $ref: "#/components/schemas/OperationRunSummary"
+        configured:
+          type: boolean
+        history_availability:
+          enum:
+            - available
+            - unavailable
+          type: string
+        kind:
+          enum:
+            - carddav_sync
+            - document_embedding
+            - document_extraction
+            - message_embedding
+            - person_embedding
+            - person_enrichment
+            - person_sweep
+            - source_sync
+            - visual_embedding
+          type: string
+        lane:
+          enum:
+            - contacts
+            - documents
+            - messages
+            - person_facts
+            - visual_attachments
+          type: string
+        latest:
+          $ref: "#/components/schemas/OperationRunSummary"
+        latest_successful:
+          $ref: "#/components/schemas/OperationRunSummary"
+        related_status:
+          enum:
+            - listSourceStatus
+            - getDocumentIndexStatus
+            - getDocumentVectorStatus
+            - getVisualAttachmentStatus
+            - getCardDAVStatus
+          type: string
+        supported_actions:
+          items:
+            enum:
+              - carddav_sync
+              - visual_build
+              - visual_resume
+            type: string
+          type: array
+        unavailable_code:
+          type: string
+      required:
+        - kind
+        - lane
+        - configured
+        - history_availability
+        - supported_actions
+      type: object
+    OperationPublicCounter:
+      additionalProperties: false
+      properties:
+        name:
+          enum:
+            - added
+            - attempted
+            - books
+            - created
+            - failed
+            - identity_rejected
+            - item_errors
+            - processed
+            - projected_writes
+            - removed
+            - requested
+            - skipped
+            - started
+            - succeeded
+            - suppressed
+            - truncated
+            - updated
+          type: string
+        unit:
+          enum:
+            - attachments
+            - books
+            - chunks
+            - contacts
+            - documents
+            - messages
+            - people
+            - writes
+          type: string
+        value:
+          format: int64
+          type: integer
+      required:
+        - name
+        - unit
+        - value
+      type: object
+    OperationPublicError:
+      additionalProperties: false
+      properties:
+        code:
+          enum:
+            - archive_gap
+            - authentication_failed
+            - budget
+            - cancelled
+            - carddav_sync_failed
+            - daemon_restarted
+            - google_authorization_required
+            - internal
+            - invalid_output
+            - invocation_archive_drift
+            - invocation_authentication_failed
+            - invocation_cancelled
+            - invocation_daemon_restarted
+            - invocation_internal
+            - invocation_invalid_output
+            - invocation_rate_limited
+            - invocation_safety_limit
+            - invocation_timeout
+            - invocation_unsafe_error_redacted
+            - invocation_upstream_failed
+            - lease_lost
+            - person_sweep_failed
+            - policy
+            - provider_http
+            - rate_limited
+            - retry_after
+            - safety_limit
+            - source_sync_failed
+            - sync_failed
+            - timeout
+            - unsafe_error_redacted
+            - upstream_failed
+          type: string
+        message:
+          type: string
+      required:
+        - code
+        - message
+      type: object
+    OperationRunDetail:
+      additionalProperties: false
+      properties:
+        counters:
+          items:
+            $ref: "#/components/schemas/OperationPublicCounter"
+          type: array
+        error:
+          $ref: "#/components/schemas/OperationPublicError"
+        finished_at:
+          format: date-time
+          type: string
+        id:
+          type: string
+        kind:
+          enum:
+            - carddav_sync
+            - document_embedding
+            - document_extraction
+            - message_embedding
+            - person_embedding
+            - person_enrichment
+            - person_sweep
+            - source_sync
+            - visual_embedding
+          type: string
+        lane:
+          enum:
+            - contacts
+            - documents
+            - messages
+            - person_facts
+            - visual_attachments
+          type: string
+        related_status:
+          enum:
+            - listSourceStatus
+            - getDocumentIndexStatus
+            - getDocumentVectorStatus
+            - getVisualAttachmentStatus
+            - getCardDAVStatus
+          type: string
+        started_at:
+          format: date-time
+          type: string
+        state:
+          enum:
+            - cancelled
+            - failed
+            - partial
+            - queued
+            - running
+            - succeeded
+          type: string
+        supported_actions:
+          items:
+            enum:
+              - carddav_sync
+              - visual_build
+              - visual_resume
+            type: string
+          type: array
+        trigger:
+          enum:
+            - manual
+            - scheduled
+          type: string
+      required:
+        - supported_actions
+        - id
+        - kind
+        - lane
+        - state
+        - started_at
+        - counters
+      type: object
+    OperationRunSummary:
+      additionalProperties: false
+      properties:
+        counters:
+          items:
+            $ref: "#/components/schemas/OperationPublicCounter"
+          type: array
+        error:
+          $ref: "#/components/schemas/OperationPublicError"
+        finished_at:
+          format: date-time
+          type: string
+        id:
+          type: string
+        kind:
+          enum:
+            - carddav_sync
+            - document_embedding
+            - document_extraction
+            - message_embedding
+            - person_embedding
+            - person_enrichment
+            - person_sweep
+            - source_sync
+            - visual_embedding
+          type: string
+        lane:
+          enum:
+            - contacts
+            - documents
+            - messages
+            - person_facts
+            - visual_attachments
+          type: string
+        started_at:
+          format: date-time
+          type: string
+        state:
+          enum:
+            - cancelled
+            - failed
+            - partial
+            - queued
+            - running
+            - succeeded
+          type: string
+        trigger:
+          enum:
+            - manual
+            - scheduled
+          type: string
+      required:
+        - id
+        - kind
+        - lane
+        - state
+        - started_at
+        - counters
+      type: object
+    OperationRunsResponse:
+      additionalProperties: false
+      properties:
+        membership_revision:
+          format: int64
+          minimum: 0
+          type: integer
+        next_cursor:
+          type: string
+        runs:
+          items:
+            $ref: "#/components/schemas/OperationRunSummary"
+          type: array
+        unavailable_kinds:
+          items:
+            $ref: "#/components/schemas/OperationUnavailableKind"
+          type: array
+      required:
+        - runs
+        - membership_revision
+        - unavailable_kinds
+      type: object
+    OperationStatusResponse:
+      additionalProperties: false
+      properties:
+        lanes:
+          items:
+            $ref: "#/components/schemas/OperationLaneStatus"
+          type: array
+      required:
+        - lanes
+      type: object
+    OperationUnavailableKind:
+      additionalProperties: false
+      properties:
+        kind:
+          enum:
+            - carddav_sync
+            - document_embedding
+            - document_extraction
+            - message_embedding
+            - person_embedding
+            - person_enrichment
+            - person_sweep
+            - source_sync
+            - visual_embedding
+          type: string
+        lane:
+          enum:
+            - contacts
+            - documents
+            - messages
+            - person_facts
+            - visual_attachments
+          type: string
+        unavailable_code:
+          type: string
+      required:
+        - kind
+        - lane
+        - unavailable_code
       type: object
     Organization:
       additionalProperties: true
@@ -5619,6 +6311,10 @@ components:
           type:
             - string
             - "null"
+        source_resource_uid:
+          type:
+            - string
+            - "null"
         street_address:
           type:
             - string
@@ -5634,9 +6330,7 @@ components:
         type_tokens:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         vcard_altid:
           type:
             - string
@@ -5648,9 +6342,7 @@ components:
         vcard_pid:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         vcard_prop_id:
           type:
             - string
@@ -5732,9 +6424,7 @@ components:
         values:
           items:
             $ref: "#/components/schemas/OrganizationAttributeValue"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - values
       type: object
@@ -5823,6 +6513,10 @@ components:
           type:
             - string
             - "null"
+        source_resource_uid:
+          type:
+            - string
+            - "null"
         type_label:
           type:
             - string
@@ -5830,9 +6524,7 @@ components:
         type_tokens:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         vcard_altid:
           type:
             - string
@@ -5844,9 +6536,7 @@ components:
         vcard_pid:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         vcard_prop_id:
           type:
             - string
@@ -5958,6 +6648,10 @@ components:
           type:
             - string
             - "null"
+        source_resource_uid:
+          type:
+            - string
+            - "null"
         type_label:
           type:
             - string
@@ -5965,9 +6659,7 @@ components:
         type_tokens:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         uri:
           type:
             - string
@@ -5983,9 +6675,7 @@ components:
         vcard_pid:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         vcard_prop_id:
           type:
             - string
@@ -6092,6 +6782,10 @@ components:
           type:
             - string
             - "null"
+        source_resource_uid:
+          type:
+            - string
+            - "null"
         type_label:
           type:
             - string
@@ -6099,9 +6793,7 @@ components:
         type_tokens:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         vcard_altid:
           type:
             - string
@@ -6113,9 +6805,7 @@ components:
         vcard_pid:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         vcard_prop_id:
           type:
             - string
@@ -6215,6 +6905,10 @@ components:
           type:
             - string
             - "null"
+        source_resource_uid:
+          type:
+            - string
+            - "null"
         type_label:
           type:
             - string
@@ -6222,9 +6916,7 @@ components:
         type_tokens:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         uri:
           type:
             - string
@@ -6240,9 +6932,7 @@ components:
         vcard_pid:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         vcard_prop_id:
           type:
             - string
@@ -6322,6 +7012,10 @@ components:
           type:
             - string
             - "null"
+        source_resource_uid:
+          type:
+            - string
+            - "null"
         type_label:
           type:
             - string
@@ -6329,9 +7023,7 @@ components:
         type_tokens:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         vcard_altid:
           type:
             - string
@@ -6343,9 +7035,7 @@ components:
         vcard_pid:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         vcard_prop_id:
           type:
             - string
@@ -6365,39 +7055,27 @@ components:
         addresses:
           items:
             $ref: "#/components/schemas/OrganizationAddress"
-          type:
-            - array
-            - "null"
+          type: array
         categories:
           items:
             $ref: "#/components/schemas/OrganizationCategory"
-          type:
-            - array
-            - "null"
+          type: array
         contact_points:
           items:
             $ref: "#/components/schemas/OrganizationContactPoint"
-          type:
-            - array
-            - "null"
+          type: array
         identifiers:
           items:
             $ref: "#/components/schemas/OrganizationIdentifier"
-          type:
-            - array
-            - "null"
+          type: array
         media:
           items:
             $ref: "#/components/schemas/OrganizationMedia"
-          type:
-            - array
-            - "null"
+          type: array
         names:
           items:
             $ref: "#/components/schemas/OrganizationName"
-          type:
-            - array
-            - "null"
+          type: array
         organization:
           $ref: "#/components/schemas/Organization"
       required:
@@ -6415,39 +7093,27 @@ components:
         addresses:
           items:
             $ref: "#/components/schemas/OrganizationAddressBody"
-          type:
-            - array
-            - "null"
+          type: array
         categories:
           items:
             $ref: "#/components/schemas/OrganizationCategoryBody"
-          type:
-            - array
-            - "null"
+          type: array
         contact_points:
           items:
             $ref: "#/components/schemas/OrganizationContactPointBody"
-          type:
-            - array
-            - "null"
+          type: array
         identifiers:
           items:
             $ref: "#/components/schemas/OrganizationIdentifierBody"
-          type:
-            - array
-            - "null"
+          type: array
         media:
           items:
             $ref: "#/components/schemas/OrganizationMediaBody"
-          type:
-            - array
-            - "null"
+          type: array
         names:
           items:
             $ref: "#/components/schemas/OrganizationNameBody"
-          type:
-            - array
-            - "null"
+          type: array
       type: object
     OrganizationsResponse:
       additionalProperties: true
@@ -6461,9 +7127,7 @@ components:
         organizations:
           items:
             $ref: "#/components/schemas/Organization"
-          type:
-            - array
-            - "null"
+          type: array
         total:
           format: int64
           type: integer
@@ -6507,9 +7171,7 @@ components:
         rows:
           items:
             $ref: "#/components/schemas/ParticipantCompletionHTTPRow"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - rows
         - cache_revision
@@ -6614,9 +7276,7 @@ components:
         rows:
           items:
             $ref: "#/components/schemas/PersonSummary"
-          type:
-            - array
-            - "null"
+          type: array
         search_provenance:
           $ref: "#/components/schemas/SearchProvenance"
         total_count:
@@ -6702,9 +7362,7 @@ components:
         people:
           items:
             $ref: "#/components/schemas/Person"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - people
       type: object
@@ -6723,9 +7381,7 @@ components:
           items:
             format: int64
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
         revision:
           format: int64
           type: integer
@@ -6835,16 +7491,12 @@ components:
         add:
           items:
             $ref: "#/components/schemas/PersonAddressInputRequest"
-          type:
-            - array
-            - "null"
+          type: array
         supersede:
           items:
             format: int64
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
       type: object
     PersonAttributeConflictResponse:
       additionalProperties: true
@@ -6867,17 +7519,13 @@ components:
         current:
           items:
             $ref: "#/components/schemas/PersonAttributeValue"
-          type:
-            - array
-            - "null"
+          type: array
         definition:
           $ref: "#/components/schemas/AttributeDefinition"
         history:
           items:
             $ref: "#/components/schemas/PersonAttributeValue"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - definition
         - current
@@ -6951,15 +7599,182 @@ components:
         attributes:
           items:
             $ref: "#/components/schemas/PersonAttributeGroup"
-          type:
-            - array
-            - "null"
+          type: array
         person_id:
           format: int64
           type: integer
       required:
         - person_id
         - attributes
+      type: object
+    PersonBrief:
+      additionalProperties: true
+      properties:
+        boundary: {}
+        dropped_item_count:
+          format: int64
+          type: integer
+        evidence:
+          items:
+            $ref: "#/components/schemas/PersonBriefEvidencePointer"
+          type: array
+        generated_at:
+          format: date-time
+          type: string
+        model:
+          type: string
+        program_id:
+          type: string
+        program_version:
+          type: string
+        provider:
+          type: string
+        rejected_at:
+          format: date-time
+          type:
+            - string
+            - "null"
+        rejected_reason:
+          type: string
+        rendered_text:
+          type: string
+        renderer_policy:
+          type: string
+        sentences:
+          items:
+            $ref: "#/components/schemas/PersonBriefSentence"
+          type: array
+        status:
+          type: string
+        structured: {}
+        superseded_at:
+          format: date-time
+          type:
+            - string
+            - "null"
+        version:
+          format: int64
+          type: integer
+      required:
+        - version
+        - status
+        - generated_at
+        - rendered_text
+        - renderer_policy
+        - sentences
+        - structured
+        - evidence
+        - boundary
+        - dropped_item_count
+        - program_id
+        - program_version
+        - provider
+        - model
+        - rejected_at
+        - rejected_reason
+        - superseded_at
+      type: object
+    PersonBriefEnrollment:
+      additionalProperties: true
+      properties:
+        actor:
+          type: string
+        enabled_at:
+          format: date-time
+          type:
+            - string
+            - "null"
+        enrolled:
+          type: boolean
+        person_id:
+          format: int64
+          type: integer
+      required:
+        - person_id
+        - enrolled
+        - enabled_at
+        - actor
+      type: object
+    PersonBriefEvidencePointer:
+      additionalProperties: true
+      properties:
+        directness:
+          type: string
+        event_time:
+          format: date-time
+          type: string
+        evidence_id:
+          format: int64
+          type: integer
+        evidence_key:
+          type: string
+        evidence_supported:
+          type: boolean
+        ordinal:
+          format: int64
+          type: integer
+        source_ref:
+          type: string
+        source_url:
+          type: string
+      required:
+        - ordinal
+        - evidence_id
+        - evidence_key
+        - source_ref
+        - source_url
+        - directness
+        - event_time
+        - evidence_supported
+      type: object
+    PersonBriefRun:
+      additionalProperties: true
+      properties:
+        attempt_id:
+          type: string
+        brief_failure_class:
+          type: string
+        brief_version:
+          format: int64
+          type: integer
+        run_id:
+          type: string
+      required:
+        - run_id
+        - attempt_id
+        - brief_version
+        - brief_failure_class
+      type: object
+    PersonBriefSentence:
+      additionalProperties: true
+      properties:
+        evidence_ordinals:
+          items:
+            format: int64
+            type: integer
+          type: array
+        index:
+          format: int64
+          type: integer
+        kind:
+          type: string
+        text:
+          type: string
+      required:
+        - kind
+        - index
+        - text
+        - evidence_ordinals
+      type: object
+    PersonBriefVersionsResponse:
+      additionalProperties: true
+      properties:
+        versions:
+          items:
+            $ref: "#/components/schemas/PersonBrief"
+          type: array
+      required:
+        - versions
       type: object
     PersonCategory:
       additionalProperties: true
@@ -6996,16 +7811,12 @@ components:
         add:
           items:
             $ref: "#/components/schemas/PersonCategoryInputRequest"
-          type:
-            - array
-            - "null"
+          type: array
         supersede:
           items:
             format: int64
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
       type: object
     PersonCluster:
       additionalProperties: true
@@ -7016,16 +7827,12 @@ components:
         edges:
           items:
             $ref: "#/components/schemas/PersonClusterEdge"
-          type:
-            - array
-            - "null"
+          type: array
         member_ids:
           items:
             format: int64
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - canonical_id
         - member_ids
@@ -7108,16 +7915,12 @@ components:
         add:
           items:
             $ref: "#/components/schemas/PersonContactPointInputRequest"
-          type:
-            - array
-            - "null"
+          type: array
         supersede:
           items:
             format: int64
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
       type: object
     PersonDate:
       additionalProperties: true
@@ -7173,16 +7976,12 @@ components:
         add:
           items:
             $ref: "#/components/schemas/PersonDateInputRequest"
-          type:
-            - array
-            - "null"
+          type: array
         supersede:
           items:
             format: int64
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
       type: object
     PersonDay:
       additionalProperties: true
@@ -7252,6 +8051,150 @@ components:
         - days
         - total_count
       type: object
+    PersonEnrichmentProviderSetting:
+      additionalProperties: true
+      properties:
+        allow_sensitive_targets:
+          type: boolean
+        allowed_identifiers:
+          items:
+            type: string
+          type: array
+        credential:
+          $ref: "#/components/schemas/SecretSettingState"
+        credential_id:
+          type: string
+        enabled:
+          type: boolean
+        endpoint:
+          type: string
+        kind:
+          enum:
+            - exa
+            - sixtyfour
+          type: string
+        max_job_age:
+          type: string
+        max_requests_per_day:
+          format: int64
+          type: integer
+        max_requests_per_run:
+          format: int64
+          type: integer
+        max_retries:
+          format: int64
+          type: integer
+        mode:
+          type: string
+        name:
+          type: string
+        num_results:
+          format: int64
+          type: integer
+        poll_endpoint:
+          type: string
+        poll_interval:
+          type: string
+        refresh_interval:
+          type: string
+        request_timeout:
+          type: string
+        retention_posture:
+          type: string
+        target_keys:
+          items:
+            type: string
+          type: array
+        tier:
+          type: string
+        training_posture:
+          type: string
+      required:
+        - name
+        - kind
+        - enabled
+        - endpoint
+        - allowed_identifiers
+        - target_keys
+        - allow_sensitive_targets
+        - retention_posture
+        - training_posture
+        - refresh_interval
+        - request_timeout
+        - poll_interval
+        - max_job_age
+        - max_retries
+        - max_requests_per_run
+        - max_requests_per_day
+        - credential_id
+      type: object
+    PersonEnrichmentProviderUpdate:
+      additionalProperties: false
+      properties:
+        allow_sensitive_targets:
+          type: boolean
+        allowed_identifiers:
+          items:
+            type: string
+          type: array
+        enabled:
+          type: boolean
+        endpoint:
+          type: string
+        kind:
+          enum:
+            - exa
+            - sixtyfour
+          type: string
+        max_job_age:
+          type: string
+        max_requests_per_day:
+          format: int64
+          type: integer
+        max_requests_per_run:
+          format: int64
+          type: integer
+        max_retries:
+          format: int64
+          type: integer
+        mode:
+          type: string
+        num_results:
+          format: int64
+          type: integer
+        poll_endpoint:
+          type: string
+        poll_interval:
+          type: string
+        refresh_interval:
+          type: string
+        request_timeout:
+          type: string
+        retention_posture:
+          type: string
+        target_keys:
+          items:
+            type: string
+          type: array
+        tier:
+          type: string
+        training_posture:
+          type: string
+      required:
+        - kind
+        - enabled
+        - endpoint
+        - allowed_identifiers
+        - target_keys
+        - allow_sensitive_targets
+        - retention_posture
+        - training_posture
+        - refresh_interval
+        - request_timeout
+        - max_retries
+        - max_requests_per_run
+        - max_requests_per_day
+      type: object
     PersonFactClaim:
       additionalProperties: true
       properties:
@@ -7266,9 +8209,7 @@ components:
           items:
             format: int64
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
         generation_id:
           format: int64
           type: integer
@@ -7522,15 +8463,11 @@ components:
         projections:
           items:
             $ref: "#/components/schemas/ProjectionRef"
-          type:
-            - array
-            - "null"
+          type: array
         resolutions:
           items:
             $ref: "#/components/schemas/PersonFactResolutionResult"
-          type:
-            - array
-            - "null"
+          type: array
         state:
           $ref: "#/components/schemas/PinState"
       required:
@@ -7544,9 +8481,7 @@ components:
         pins:
           items:
             $ref: "#/components/schemas/PinState"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - pins
       type: object
@@ -7556,9 +8491,7 @@ components:
         decisions:
           items:
             $ref: "#/components/schemas/PersonFactDecision"
-          type:
-            - array
-            - "null"
+          type: array
         id:
           format: int64
           type: integer
@@ -7567,9 +8500,7 @@ components:
         projections:
           items:
             $ref: "#/components/schemas/ProjectionRef"
-          type:
-            - array
-            - "null"
+          type: array
         resolved_at:
           format: date-time
           type: string
@@ -7629,16 +8560,12 @@ components:
               - to_person
               - group
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         participant_ids:
           items:
             format: int64
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
         roles:
           items:
             enum:
@@ -7648,9 +8575,7 @@ components:
               - bcc
               - conversation_member
             type: string
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - participant_ids
         - roles
@@ -7668,9 +8593,7 @@ components:
               - to_person
               - group
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         filename_query:
           type: string
         limit:
@@ -7681,9 +8604,7 @@ components:
         mime_families:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         predicate:
           $ref: "#/components/schemas/ExploreHTTPRequest"
         sort:
@@ -7706,9 +8627,7 @@ components:
         files:
           items:
             $ref: "#/components/schemas/PersonFileSearchRow"
-          type:
-            - array
-            - "null"
+          type: array
         next_cursor:
           type: string
         search_provenance:
@@ -7761,22 +8680,16 @@ components:
         participant_domains:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         participant_ids:
           items:
             format: int64
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
         participant_labels:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         person_provenance:
           $ref: "#/components/schemas/PersonFileProvenance"
         search_explain:
@@ -7844,9 +8757,7 @@ components:
         rows:
           items:
             $ref: "#/components/schemas/PersonInboxRow"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - rows
         - cache_revision
@@ -7945,16 +8856,12 @@ components:
         add:
           items:
             $ref: "#/components/schemas/PersonMediaInputRequest"
-          type:
-            - array
-            - "null"
+          type: array
         supersede:
           items:
             format: int64
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
       type: object
     PersonMerge:
       additionalProperties: true
@@ -8016,27 +8923,19 @@ components:
         participants:
           items:
             $ref: "#/components/schemas/PersonMergeParticipant"
-          type:
-            - array
-            - "null"
+          type: array
         review_candidates:
           items:
             $ref: "#/components/schemas/PersonMergeReviewCandidate"
-          type:
-            - array
-            - "null"
+          type: array
         rows:
           items:
             $ref: "#/components/schemas/PersonMergeRow"
-          type:
-            - array
-            - "null"
+          type: array
         splits:
           items:
             $ref: "#/components/schemas/PersonSplit"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - merge
         - participants
@@ -8084,9 +8983,7 @@ components:
         profiles:
           items:
             $ref: "#/components/schemas/PersonMergeProfile"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - error
         - message
@@ -8110,9 +9007,7 @@ components:
         review_candidates:
           items:
             $ref: "#/components/schemas/PersonMergeReviewCandidate"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - person
         - merge
@@ -8275,9 +9170,7 @@ components:
         merges:
           items:
             $ref: "#/components/schemas/PersonMergeSummary"
-          type:
-            - array
-            - "null"
+          type: array
         offset:
           format: int64
           type: integer
@@ -8380,16 +9273,38 @@ components:
         add:
           items:
             $ref: "#/components/schemas/PersonNameInputRequest"
-          type:
-            - array
-            - "null"
+          type: array
         supersede:
           items:
             format: int64
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
+      type: object
+    PersonNetwork:
+      additionalProperties: true
+      properties:
+        depth:
+          format: int64
+          type: integer
+        edges:
+          items:
+            $ref: "#/components/schemas/NetworkEdge"
+          type: array
+        nodes:
+          items:
+            $ref: "#/components/schemas/NetworkNode"
+          type: array
+        root_person_id:
+          format: int64
+          type: integer
+        truncated:
+          type: boolean
+      required:
+        - root_person_id
+        - depth
+        - truncated
+        - nodes
+        - edges
       type: object
     PersonProfile:
       additionalProperties: true
@@ -8412,45 +9327,31 @@ components:
         addresses:
           items:
             $ref: "#/components/schemas/PersonAddress"
-          type:
-            - array
-            - "null"
+          type: array
         categories:
           items:
             $ref: "#/components/schemas/PersonCategory"
-          type:
-            - array
-            - "null"
+          type: array
         contact_points:
           items:
             $ref: "#/components/schemas/PersonContactPoint"
-          type:
-            - array
-            - "null"
+          type: array
         dates:
           items:
             $ref: "#/components/schemas/PersonDate"
-          type:
-            - array
-            - "null"
+          type: array
         media:
           items:
             $ref: "#/components/schemas/PersonMedia"
-          type:
-            - array
-            - "null"
+          type: array
         names:
           items:
             $ref: "#/components/schemas/PersonName"
-          type:
-            - array
-            - "null"
+          type: array
         observations:
           items:
             $ref: "#/components/schemas/ParticipantContactObservation"
-          type:
-            - array
-            - "null"
+          type: array
         person:
           $ref: "#/components/schemas/Person"
       required:
@@ -8581,9 +9482,7 @@ components:
         relationships:
           items:
             $ref: "#/components/schemas/PersonRelationshipView"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - relationships
       type: object
@@ -8672,9 +9571,7 @@ components:
         ambiguous_rows:
           items:
             $ref: "#/components/schemas/PersonMergeRowRef"
-          type:
-            - array
-            - "null"
+          type: array
         cache_state:
           enum:
             - ready
@@ -8696,9 +9593,7 @@ components:
         unrestored_rows:
           items:
             $ref: "#/components/schemas/PersonMergeRowRef"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - split
         - source_person
@@ -8739,9 +9634,7 @@ components:
         identifiers:
           items:
             $ref: "#/components/schemas/PersonIdentifier"
-          type:
-            - array
-            - "null"
+          type: array
         last_at:
           format: date-time
           type: string
@@ -8761,9 +9654,7 @@ components:
         source_counts:
           items:
             $ref: "#/components/schemas/SourceCount"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - id
         - display_label
@@ -8864,16 +9755,12 @@ components:
               - to_person
               - group
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         participant_ids:
           items:
             format: int64
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
         roles:
           items:
             enum:
@@ -8883,13 +9770,34 @@ components:
               - bcc
               - conversation_member
             type: string
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - participant_ids
         - roles
         - directions
+      type: object
+    ProviderCredentialResponse:
+      additionalProperties: true
+      properties:
+        credential_id:
+          type: string
+        pending_restart:
+          type: boolean
+        state:
+          $ref: "#/components/schemas/SecretSettingState"
+      required:
+        - credential_id
+        - state
+        - pending_restart
+      type: object
+    ProviderCredentialWriteRequest:
+      additionalProperties: false
+      properties:
+        value:
+          minLength: 1
+          type: string
+      required:
+        - value
       type: object
     ProviderUsage:
       additionalProperties: true
@@ -8910,6 +9818,16 @@ components:
         - input_bytes
         - billed_units
         - usage_available
+      type: object
+    PutPersonBriefEnrollmentRequest:
+      additionalProperties: false
+      properties:
+        enrolled:
+          type: boolean
+        track:
+          type: boolean
+      required:
+        - enrolled
       type: object
     PutPersonTrackingRequest:
       additionalProperties: false
@@ -8933,25 +9851,25 @@ components:
         columns:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         row_count:
           format: int64
           type: integer
         rows:
           items:
             items: {}
-            type:
-              - array
-              - "null"
-          type:
-            - array
-            - "null"
+            type: array
+          type: array
       required:
         - columns
         - rows
         - row_count
+      type: object
+    RejectPersonBriefRequest:
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
       type: object
     RejectedCandidate:
       additionalProperties: true
@@ -9028,9 +9946,7 @@ components:
         annual:
           items:
             $ref: "#/components/schemas/AnnualTemperatureSummary"
-          type:
-            - array
-            - "null"
+          type: array
         cache_revision:
           type: string
         canonical_id:
@@ -9041,9 +9957,7 @@ components:
         days:
           items:
             $ref: "#/components/schemas/RelationshipCalendarDay"
-          type:
-            - array
-            - "null"
+          type: array
         effective_date:
           type: string
         identity_revision:
@@ -9147,9 +10061,7 @@ components:
         reviews:
           items:
             $ref: "#/components/schemas/RelationshipReview"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - reviews
       type: object
@@ -9168,9 +10080,7 @@ components:
           items:
             format: int64
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
         score:
           format: double
           type: number
@@ -9225,9 +10135,7 @@ components:
         filters:
           items:
             $ref: "#/components/schemas/ExploreFilter"
-          type:
-            - array
-            - "null"
+          type: array
         limit:
           format: int64
           maximum: 500
@@ -9252,9 +10160,7 @@ components:
         rows:
           items:
             $ref: "#/components/schemas/TimelineRow"
-          type:
-            - array
-            - "null"
+          type: array
         total_count:
           format: int64
           type: integer
@@ -9327,9 +10233,7 @@ components:
         relationship_types:
           items:
             $ref: "#/components/schemas/RelationshipType"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - relationship_types
       type: object
@@ -9341,9 +10245,7 @@ components:
         filters:
           items:
             $ref: "#/components/schemas/ExploreFilter"
-          type:
-            - array
-            - "null"
+          type: array
         limit:
           format: int64
           maximum: 500
@@ -9365,9 +10267,7 @@ components:
         rows:
           items:
             $ref: "#/components/schemas/RelationshipRow"
-          type:
-            - array
-            - "null"
+          type: array
         total_count:
           format: int64
           type: integer
@@ -9421,11 +10321,66 @@ components:
         - identifier
         - removed
       type: object
+    RunSavedViewRequest:
+      additionalProperties: false
+      properties:
+        cursor:
+          type: string
+        limit:
+          format: int64
+          maximum: 100
+          minimum: 0
+          type: integer
+      type: object
+    RunSavedViewResponse:
+      additionalProperties: true
+      properties:
+        cache_revision:
+          type: string
+        candidate_pool_saturated:
+          type: boolean
+        candidate_snapshot_id:
+          type: string
+        files:
+          items:
+            $ref: "#/components/schemas/ExploreFileFact"
+          type: array
+        groups:
+          items:
+            $ref: "#/components/schemas/ExploreGroupRow"
+          type: array
+        next_cursor:
+          type: string
+        result_kind:
+          enum:
+            - entries
+            - groups
+            - files
+          type: string
+        rows:
+          items:
+            $ref: "#/components/schemas/EntryRow"
+          type: array
+        saved_view:
+          $ref: "#/components/schemas/SavedView"
+        search_deletion_scope:
+          type: string
+        search_provenance:
+          $ref: "#/components/schemas/SearchProvenance"
+        total_count:
+          format: int64
+          type: integer
+      required:
+        - saved_view
+        - result_kind
+        - cache_revision
+        - search_provenance
+      type: object
     SavedView:
       additionalProperties: true
       properties:
         canonical_state:
-          $ref: "#/components/schemas/SavedViewStateEnvelope"
+          description: Stored definition, including incompatible values; check incompatibility_reason before execution
         created_at:
           format: date-time
           type: string
@@ -9434,6 +10389,9 @@ components:
         id:
           format: int64
           type: integer
+        incompatibility_reason:
+          description: Definition validation error that prevents this Saved View from executing
+          type: string
         name:
           type: string
         revision:
@@ -9458,8 +10416,23 @@ components:
       additionalProperties: false
       properties:
         field:
+          enum:
+            - source
+            - identity
+            - participant
+            - domain
+            - mailing_list
+            - message_type
+            - after
+            - before
+            - deletion
+            - participant_id
+            - source_id
           type: string
         operator:
+          enum:
+            - eq
+            - in
           type: string
         values:
           description: Exact filter values; numeric identifiers use decimal strings
@@ -9476,10 +10449,11 @@ components:
       properties:
         direction:
           enum:
-            - asc
             - desc
           type: string
         field:
+          enum:
+            - occurred_at
           type: string
       required:
         - field
@@ -9490,6 +10464,14 @@ components:
       properties:
         columns:
           items:
+            enum:
+              - kind
+              - people
+              - title
+              - excerpt
+              - time
+              - attachments
+              - size
             type: string
           type: array
         filters:
@@ -9498,6 +10480,15 @@ components:
           type: array
         grouping:
           items:
+            enum:
+              - source
+              - participant
+              - domain
+              - message_type
+              - mailing_list
+              - kind
+              - year
+              - month
             type: string
           type: array
         inspector_pinned:
@@ -9511,6 +10502,10 @@ components:
         query:
           type: string
         search_mode:
+          enum:
+            - full_text
+            - semantic
+            - hybrid
           type: string
         sort:
           items:
@@ -9523,9 +10518,7 @@ components:
         saved_views:
           items:
             $ref: "#/components/schemas/SavedView"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - saved_views
       type: object
@@ -9535,9 +10528,7 @@ components:
         accounts:
           items:
             $ref: "#/components/schemas/AccountStatus"
-          type:
-            - array
-            - "null"
+          type: array
         running:
           type: boolean
       required:
@@ -9565,9 +10556,7 @@ components:
         filters:
           items:
             $ref: "#/components/schemas/ExploreFilter"
-          type:
-            - array
-            - "null"
+          type: array
       type: object
     SearchCoverageResponse:
       additionalProperties: true
@@ -9621,15 +10610,11 @@ components:
           items:
             format: int64
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
         messages:
           items:
             $ref: "#/components/schemas/MessageSummary"
-          type:
-            - array
-            - "null"
+          type: array
         query:
           type: string
         stats:
@@ -9666,9 +10651,7 @@ components:
         results:
           items:
             $ref: "#/components/schemas/AttachmentSearchResult"
-          type:
-            - array
-            - "null"
+          type: array
         usage:
           $ref: "#/components/schemas/Usage"
       required:
@@ -9684,9 +10667,7 @@ components:
         messages:
           items:
             $ref: "#/components/schemas/MessageSummary"
-          type:
-            - array
-            - "null"
+          type: array
         page:
           format: int64
           type: integer
@@ -9710,6 +10691,15 @@ components:
       properties:
         configured:
           type: boolean
+        hint:
+          description: First three and last three characters of the value joined by an ellipsis, so a person can tell which key is set. Omitted for a value under twelve characters, for passwords, and when nothing is set.
+          type: string
+        source:
+          enum:
+            - stored
+            - environment
+            - none
+          type: string
       required:
         - configured
       type: object
@@ -9755,6 +10745,7 @@ components:
             - api_key
             - session
             - required
+            - delegated
           type: string
         csrf_token:
           type: string
@@ -9872,6 +10863,10 @@ components:
     Setting:
       additionalProperties: true
       properties:
+        credential_id:
+          type: string
+        description:
+          type: string
         group:
           enum:
             - browser
@@ -9879,8 +10874,16 @@ components:
             - archive
             - search
             - sources
+            - attachments
+            - enrichment
             - integrations
+            - sync
+            - logging
+            - activity
+            - backup
           type: string
+        inherited:
+          type: boolean
         key:
           type: string
         kind:
@@ -9892,27 +10895,82 @@ components:
             - string_array
             - secret
           type: string
+        label:
+          type: string
         options:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         read_only:
           type: boolean
         restart_required:
           type: boolean
         secret:
           $ref: "#/components/schemas/SecretSettingState"
+        section:
+          type: string
         testable:
           type: boolean
+        validation:
+          $ref: "#/components/schemas/SettingValidation"
         value:
           $ref: "#/components/schemas/SettingValue"
       required:
         - key
         - group
+        - label
+        - description
         - kind
         - restart_required
+      type: object
+    SettingGroup:
+      additionalProperties: true
+      properties:
+        description:
+          type: string
+        id:
+          type: string
+        label:
+          type: string
+        sections:
+          items:
+            $ref: "#/components/schemas/SettingSection"
+          type: array
+      required:
+        - id
+        - label
+        - description
+      type: object
+    SettingOff:
+      additionalProperties: true
+      properties:
+        label:
+          type: string
+        on_minimum:
+          format: double
+          type: number
+        suggest:
+          type: string
+        value:
+          type:
+            - string
+            - "null"
+      required:
+        - value
+        - label
+      type: object
+    SettingSection:
+      additionalProperties: true
+      properties:
+        description:
+          type: string
+        id:
+          type: string
+        label:
+          type: string
+      required:
+        - id
+        - label
       type: object
     SettingUpdate:
       additionalProperties: false
@@ -9925,6 +10983,26 @@ components:
           $ref: "#/components/schemas/SettingValue"
       required:
         - key
+      type: object
+    SettingValidation:
+      additionalProperties: true
+      properties:
+        format:
+          enum:
+            - cron
+          type: string
+        hint:
+          type: string
+        maximum:
+          format: double
+          type: number
+        minimum:
+          format: double
+          type: number
+        "off":
+          $ref: "#/components/schemas/SettingOff"
+        required:
+          type: boolean
       type: object
     SettingValue:
       oneOf:
@@ -9970,8 +11048,6 @@ components:
     SettingsPatchRequest:
       additionalProperties: false
       properties:
-        confirm_api_key_restart:
-          type: boolean
         updates:
           items:
             $ref: "#/components/schemas/SettingUpdate"
@@ -9983,14 +11059,26 @@ components:
     SettingsResponse:
       additionalProperties: true
       properties:
+        credential_etag:
+          type: string
+        groups:
+          items:
+            $ref: "#/components/schemas/SettingGroup"
+          type: array
         pending_restart:
           type: boolean
+        person_enrichment_providers:
+          items:
+            $ref: "#/components/schemas/PersonEnrichmentProviderSetting"
+          type: array
         settings:
           items:
             $ref: "#/components/schemas/Setting"
           type: array
       required:
+        - groups
         - settings
+        - credential_etag
         - pending_restart
       type: object
     SimilarSearchResponse:
@@ -10001,9 +11089,7 @@ components:
         messages:
           items:
             $ref: "#/components/schemas/MessageSummary"
-          type:
-            - array
-            - "null"
+          type: array
         returned:
           format: int64
           type: integer
@@ -10159,9 +11245,7 @@ components:
         sources:
           items:
             $ref: "#/components/schemas/SourceStatus"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - sources
       type: object
@@ -10171,9 +11255,7 @@ components:
         accounts:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - accounts
       type: object
@@ -10187,9 +11269,7 @@ components:
           items:
             format: int64
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - merge_id
         - participant_ids
@@ -10204,6 +11284,8 @@ components:
         domain:
           type: string
         label:
+          type: string
+        list_id:
           type: string
         recipient:
           type: string
@@ -10230,9 +11312,7 @@ components:
           items:
             format: int64
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
         operation_token:
           type: string
         selection:
@@ -10247,15 +11327,19 @@ components:
           type: boolean
         id:
           type: string
+        matched_count:
+          format: int64
+          type: integer
         message_count:
           format: int64
           type: integer
         sample_gmail_ids:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
+        skipped_count:
+          format: int64
+          type: integer
         source:
           $ref: "#/components/schemas/SourceReference"
         status:
@@ -10298,9 +11382,7 @@ components:
         vector_text_message_types:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         vector_text_status:
           type: string
         vector_visual_status:
@@ -10362,9 +11444,7 @@ components:
         formats:
           items:
             $ref: "#/components/schemas/FormatCoverage"
-          type:
-            - array
-            - "null"
+          type: array
         generation:
           $ref: "#/components/schemas/VisualGeneration"
         journal_cursor:
@@ -10437,39 +11517,27 @@ components:
         addresses:
           items:
             $ref: "#/components/schemas/PersonAddress"
-          type:
-            - array
-            - "null"
+          type: array
         categories:
           items:
             $ref: "#/components/schemas/PersonCategory"
-          type:
-            - array
-            - "null"
+          type: array
         contact_points:
           items:
             $ref: "#/components/schemas/PersonContactPoint"
-          type:
-            - array
-            - "null"
+          type: array
         dates:
           items:
             $ref: "#/components/schemas/PersonDate"
-          type:
-            - array
-            - "null"
+          type: array
         media:
           items:
             $ref: "#/components/schemas/PersonMedia"
-          type:
-            - array
-            - "null"
+          type: array
         names:
           items:
             $ref: "#/components/schemas/PersonName"
-          type:
-            - array
-            - "null"
+          type: array
         person:
           $ref: "#/components/schemas/Person"
       required:
@@ -10487,26 +11555,20 @@ components:
         accounts:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         date_range:
           items:
             type: string
           maxItems: 2
           minItems: 2
-          type:
-            - array
-            - "null"
+          type: array
         message_count:
           format: int64
           type: integer
         top_senders:
           items:
             $ref: "#/components/schemas/SenderCount"
-          type:
-            - array
-            - "null"
+          type: array
         total_size_bytes:
           format: int64
           type: integer
@@ -10586,9 +11648,7 @@ components:
         item_errors:
           items:
             $ref: "#/components/schemas/SyncRunItemStatus"
-          type:
-            - array
-            - "null"
+          type: array
         messages_added:
           format: int64
           type: integer
@@ -10630,17 +11690,13 @@ components:
         choices:
           items:
             $ref: "#/components/schemas/ChoiceDescriptor"
-          type:
-            - array
-            - "null"
+          type: array
         description:
           type: string
         fields:
           items:
             $ref: "#/components/schemas/FieldDescriptor"
-          type:
-            - array
-            - "null"
+          type: array
         key:
           type: string
         kind:
@@ -10752,9 +11808,7 @@ components:
         labels:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         priority:
           type: string
         task_id:
@@ -10829,9 +11883,7 @@ components:
         tasks:
           items:
             $ref: "#/components/schemas/TaskSummary"
-          type:
-            - array
-            - "null"
+          type: array
       required:
         - tasks
       type: object
@@ -10929,9 +11981,7 @@ components:
         conversations:
           items:
             $ref: "#/components/schemas/TextConversationRow"
-          type:
-            - array
-            - "null"
+          type: array
         count:
           format: int64
           type: integer
@@ -10967,9 +12017,7 @@ components:
         messages:
           items:
             $ref: "#/components/schemas/CLIQueryMessageSummary"
-          type:
-            - array
-            - "null"
+          type: array
         offset:
           format: int64
           type: integer
@@ -10984,6 +12032,9 @@ components:
     TextSearchResponse:
       additionalProperties: true
       properties:
+        applied_source_id:
+          format: int64
+          type: integer
         count:
           format: int64
           type: integer
@@ -10995,9 +12046,7 @@ components:
         messages:
           items:
             $ref: "#/components/schemas/CLIQueryMessageSummary"
-          type:
-            - array
-            - "null"
+          type: array
         offset:
           format: int64
           type: integer
@@ -11064,9 +12113,7 @@ components:
         scopes:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         tenant_id:
           type: string
         token_type:
@@ -11089,9 +12136,7 @@ components:
           items:
             format: int64
             type: integer
-          type:
-            - array
-            - "null"
+          type: array
         attachment_count:
           format: int64
           type: integer
@@ -11183,9 +12228,7 @@ components:
         pid:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         prop_id:
           type: string
         property:
@@ -11229,9 +12272,7 @@ components:
         type_tokens:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         updated_at:
           format: date-time
           type: string
@@ -11275,9 +12316,7 @@ components:
         type_tokens:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         vcard:
           $ref: "#/components/schemas/VCardIdentity"
       required:
@@ -11365,9 +12404,7 @@ components:
         directions:
           items:
             type: string
-          type:
-            - array
-            - "null"
+          type: array
         filename:
           type: string
         limit:
@@ -11402,7 +12439,7 @@ components:
       type: apiKey
 info:
   title: msgvault API
-  version: 2.12.0
+  version: 2.26.0
 openapi: 3.1.0
 paths:
   /api/ping:
@@ -11541,6 +12578,73 @@ paths:
       summary: Add an account
       tags:
         - API
+  /api/v1/agent-tokens:
+    get:
+      operationId: listAgentTokens
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentTokenListResponse"
+          description: OK
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: List active agent grants
+      tags:
+        - API
+    post:
+      operationId: issueAgentToken
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AgentTokenIssueRequest"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AgentTokenIssueResponse"
+          description: Created
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Issue a restricted agent grant
+      tags:
+        - API
+  /api/v1/agent-tokens/{id}:
+    delete:
+      operationId: revokeAgentToken
+      parameters:
+        - description: Agent grant ID to revoke
+          in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: No Content
+        default:
+          description: Error
+      security:
+        - apiKey: []
+      summary: Revoke an agent grant by ID
+      tags:
+        - API
   /api/v1/aggregates:
     get:
       operationId: getAggregates
@@ -11577,6 +12681,14 @@ paths:
           schema:
             format: int64
             type: integer
+        - description: Source IDs; repeat or comma-separate values
+          in: query
+          name: source_ids
+          schema:
+            items:
+              format: int64
+              type: integer
+            type: array
         - description: Only include messages with attachments
           in: query
           name: attachments_only
@@ -11657,6 +12769,14 @@ paths:
           schema:
             format: int64
             type: integer
+        - description: Source IDs; repeat or comma-separate values
+          in: query
+          name: source_ids
+          schema:
+            items:
+              format: int64
+              type: integer
+            type: array
         - description: Only include messages with attachments
           in: query
           name: attachments_only
@@ -11710,6 +12830,11 @@ paths:
         - description: Label filter
           in: query
           name: label
+          schema:
+            type: string
+        - description: Exact case-insensitive RFC 2919 List-Id filter
+          in: query
+          name: list_id
           schema:
             type: string
         - description: Message type filter
@@ -11815,62 +12940,6 @@ paths:
       security:
         - apiKey: []
       summary: Download attachment content by SHA-256 hash
-      tags:
-        - API
-  /api/v1/attachments/{hash}/text:
-    get:
-      operationId: getAttachmentText
-      parameters:
-        - description: Attachment SHA-256 content hash
-          in: path
-          name: hash
-          required: true
-          schema:
-            type: string
-      responses:
-        "200":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/OCRResult"
-          description: OK
-        default:
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-      security:
-        - apiKey: []
-      summary: Get cached attachment text
-      tags:
-        - API
-  /api/v1/attachments/{hash}/text/request:
-    post:
-      operationId: requestAttachmentText
-      parameters:
-        - description: Attachment SHA-256 content hash
-          in: path
-          name: hash
-          required: true
-          schema:
-            type: string
-      responses:
-        "202":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/OCRResult"
-          description: Accepted
-        default:
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-      security:
-        - apiKey: []
-      summary: Queue attachment text extraction
       tags:
         - API
   /api/v1/attachments/{id}:
@@ -12664,6 +13733,106 @@ paths:
       summary: Resolve a CardDAV conflict
       tags:
         - API
+  /api/v1/carddav/google/authorize:
+    post:
+      description: Start sign-in from the msgvault Web UI. The Origin header must match the redirect_uri origin, and redirect_uri must be the Web UI's root URL. For terminal authorization, use msgvault carddav authorize-google.
+      operationId: beginGoogleCardDAVAuthorization
+      parameters:
+        - description: Origin of the msgvault Web UI, matching redirect_uri
+          in: header
+          name: Origin
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CardDAVGoogleAuthorizeRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CardDAVGoogleAuthorizeResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+          headers:
+            Retry-After:
+              description: Seconds until CardDAV retry is safe
+              schema:
+                format: int64
+                minimum: 0
+                type: integer
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Start Google Contacts authorization in a browser
+      tags:
+        - API
+  /api/v1/carddav/google/callback:
+    post:
+      operationId: completeGoogleCardDAVAuthorization
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CardDAVGoogleCallbackRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatusMessageResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+          headers:
+            Retry-After:
+              description: Seconds until CardDAV retry is safe
+              schema:
+                format: int64
+                minimum: 0
+                type: integer
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Complete Google Contacts authorization
+      tags:
+        - API
   /api/v1/carddav/publications/{person_id}:
     delete:
       operationId: unpublishCardDAVPerson
@@ -12830,6 +13999,12 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
           description: Error
+        "413":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
         "500":
           content:
             application/json:
@@ -12864,6 +14039,263 @@ paths:
       security:
         - apiKey: []
       summary: Publish a person to CardDAV
+      tags:
+        - API
+  /api/v1/carddav/publications/{person_id}/approve:
+    post:
+      operationId: approveCardDAVPublication
+      parameters:
+        - in: path
+          name: person_id
+          required: true
+          schema:
+            format: int64
+            minimum: 1
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CardDAVPublicationApprovalRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CardDAVPublicationResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "413":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+          headers:
+            Retry-After:
+              description: Seconds until CardDAV retry is safe
+              schema:
+                format: int64
+                minimum: 0
+                type: integer
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Approve a publication preview; conflicts require explicit resolution
+      tags:
+        - API
+  /api/v1/carddav/publications/{person_id}/preview:
+    get:
+      operationId: previewCardDAVPublication
+      parameters:
+        - in: path
+          name: person_id
+          required: true
+          schema:
+            format: int64
+            minimum: 1
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CardDAVPublicationPreviewResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "413":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+          headers:
+            Retry-After:
+              description: Seconds until CardDAV retry is safe
+              schema:
+                format: int64
+                minimum: 0
+                type: integer
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Preview the exact vCard and approval token for a person's publication
+      tags:
+        - API
+  /api/v1/carddav/runs:
+    get:
+      operationId: listCardDAVRuns
+      parameters:
+        - description: Maximum runs to return (default 25, max 100)
+          in: query
+          name: limit
+          schema:
+            format: int64
+            maximum: 100
+            minimum: 1
+            type: integer
+        - description: Return runs with IDs lower than this cursor
+          in: query
+          name: before_id
+          schema:
+            format: int64
+            minimum: 1
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CardDAVRunsResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: List CardDAV synchronization runs
+      tags:
+        - API
+  /api/v1/carddav/status:
+    get:
+      operationId: getCardDAVStatus
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CardDAVStatusResponse"
+          description: OK
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+          headers:
+            Retry-After:
+              description: Seconds until CardDAV retry is safe
+              schema:
+                format: int64
+                minimum: 0
+                type: integer
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Get CardDAV synchronization status
       tags:
         - API
   /api/v1/carddav/sync:
@@ -14008,6 +15440,33 @@ paths:
       summary: Repair CLI archive encoding
       tags:
         - API
+  /api/v1/cli/repair-message:
+    post:
+      operationId: repairMessageCLI
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CLIRepairMessageRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/x-ndjson:
+              schema:
+                $ref: "#/components/schemas/CLIRepairMessageEvent"
+          description: OK
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Repair or audit Gmail message snapshots
+      tags:
+        - API
   /api/v1/cli/run:
     post:
       operationId: runCLI
@@ -15141,6 +16600,51 @@ paths:
       summary: Get extracted document index status
       tags:
         - API
+  /api/v1/documents/status/current:
+    get:
+      operationId: getCurrentDocumentIndexStatus
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentIndexStatusResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "429":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Get extracted document index status for the selected durable profile
+      tags:
+        - API
   /api/v1/documents/vectors/status:
     get:
       operationId: getDocumentVectorStatus
@@ -16165,33 +17669,6 @@ paths:
       summary: Search analytical files
       tags:
         - Exploration
-  /api/v1/files/text-search:
-    post:
-      operationId: searchAttachmentText
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/OcrSearchRequest"
-        required: true
-      responses:
-        "200":
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/OcrSearchResponse"
-          description: OK
-        default:
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ErrorResponse"
-          description: Error
-      security:
-        - apiKey: []
-      summary: Search cached attachment text
-      tags:
-        - API
   /api/v1/files/{id}:
     get:
       operationId: getFile
@@ -16552,6 +18029,127 @@ paths:
       summary: Import one meeting
       tags:
         - API
+  /api/v1/imports:
+    post:
+      operationId: createImportJob
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImportJobRequest"
+        required: true
+      responses:
+        "202":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportJobResponse"
+          description: Accepted
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "413":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "415":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Start a bounded historical import
+      tags:
+        - API
+  /api/v1/imports/{job_id}:
+    get:
+      operationId: getImportJob
+      parameters:
+        - description: Historical import job ID
+          in: path
+          name: job_id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportJobResponse"
+          description: OK
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Get historical import status
+      tags:
+        - API
   /api/v1/integrations/tasks/search:
     get:
       operationId: searchIntegrationTasks
@@ -16753,6 +18351,11 @@ paths:
           name: label
           schema:
             type: string
+        - description: Exact case-insensitive RFC 2919 List-Id filter
+          in: query
+          name: list_id
+          schema:
+            type: string
         - description: Message type filter
           in: query
           name: message_type
@@ -16780,6 +18383,14 @@ paths:
           schema:
             format: int64
             type: integer
+        - description: Source IDs; repeat or comma-separate values
+          in: query
+          name: source_ids
+          schema:
+            items:
+              format: int64
+              type: integer
+            type: array
         - description: Only include messages with attachments
           in: query
           name: attachments_only
@@ -16879,6 +18490,11 @@ paths:
           name: label
           schema:
             type: string
+        - description: Exact case-insensitive RFC 2919 List-Id filter
+          in: query
+          name: list_id
+          schema:
+            type: string
         - description: Message type filter
           in: query
           name: message_type
@@ -16906,6 +18522,14 @@ paths:
           schema:
             format: int64
             type: integer
+        - description: Source IDs; repeat or comma-separate values
+          in: query
+          name: source_ids
+          schema:
+            items:
+              format: int64
+              type: integer
+            type: array
         - description: Only include messages with attachments
           in: query
           name: attachments_only
@@ -16951,6 +18575,26 @@ paths:
         - description: "Sort direction: asc or desc"
           in: query
           name: direction
+          schema:
+            type: string
+        - description: Structured search query
+          in: query
+          name: q
+          schema:
+            type: string
+        - description: "Search mode: fast, deep, or aggregate; required with q"
+          in: query
+          name: search_mode
+          schema:
+            type: string
+        - description: Aggregate view type; required for aggregate search
+          in: query
+          name: view_type
+          schema:
+            type: string
+        - description: Displayed aggregate row key; required for aggregate search
+          in: query
+          name: aggregate_key
           schema:
             type: string
       responses:
@@ -17298,25 +18942,186 @@ paths:
       summary: Get visual attachment embedding status
       tags:
         - API
-  /api/v1/ocr/status:
+  /api/v1/operations/runs:
     get:
-      operationId: getOCRStatus
+      operationId: listOperationRuns
+      parameters:
+        - description: Exact operation kind
+          in: query
+          name: kind
+          schema:
+            enum:
+              - carddav_sync
+              - document_embedding
+              - document_extraction
+              - message_embedding
+              - person_embedding
+              - person_enrichment
+              - person_sweep
+              - source_sync
+              - visual_embedding
+            type: string
+        - description: Exact semantic operation lane
+          in: query
+          name: lane
+          schema:
+            enum:
+              - contacts
+              - documents
+              - messages
+              - person_facts
+              - visual_attachments
+            type: string
+        - description: Exact operation state
+          in: query
+          name: state
+          schema:
+            enum:
+              - cancelled
+              - failed
+              - partial
+              - queued
+              - running
+              - succeeded
+            type: string
+        - description: Inclusive canonical UTC RFC3339 lower bound
+          in: query
+          name: started_from
+          schema:
+            format: date-time
+            type: string
+        - description: Exclusive canonical UTC RFC3339 upper bound
+          in: query
+          name: started_before
+          schema:
+            format: date-time
+            type: string
+        - description: Maximum runs to return (default 25, max 100)
+          in: query
+          name: limit
+          schema:
+            format: int64
+            maximum: 100
+            minimum: 1
+            type: integer
+        - description: Opaque cursor bound to this archive and the complete normalized filter set
+          in: query
+          name: cursor
+          schema:
+            type: string
       responses:
         "200":
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/OCRRuntimeStatus"
+                $ref: "#/components/schemas/OperationRunsResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationErrorResponse"
+          description: Error
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationErrorResponse"
+          description: Error
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: List normalized operation history
+      tags:
+        - API
+  /api/v1/operations/runs/{id}:
+    get:
+      operationId: getOperationRun
+      parameters:
+        - description: Opaque archive-bound operation run ID
+          in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationRunDetail"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationErrorResponse"
+          description: Error
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Get one normalized operation run
+      tags:
+        - API
+  /api/v1/operations/status:
+    get:
+      operationId: getOperationStatus
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OperationStatusResponse"
           description: OK
         default:
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ErrorResponse"
+                $ref: "#/components/schemas/OperationErrorResponse"
           description: Error
       security:
         - apiKey: []
-      summary: Get attachment text extraction status
+      summary: Get normalized operation lane status
       tags:
         - API
   /api/v1/organizations:
@@ -18577,6 +20382,98 @@ paths:
       summary: Promote a participant cluster to a durable person
       tags:
         - API
+  /api/v1/people/directory:
+    get:
+      description: Returns one stable, non-sensitive page of promoted durable people.
+      operationId: listDirectoryPeople
+      parameters:
+        - description: Lexical query over person names, contact points, and organizations
+          in: query
+          name: q
+          schema:
+            type: string
+        - description: Opaque cursor returned by the previous Directory page
+          in: query
+          name: cursor
+          schema:
+            type: string
+        - description: Maximum rows to return (default 50, max 100)
+          in: query
+          name: limit
+          schema:
+            format: int64
+            type: integer
+        - description: "Current contact state: active or inactive"
+          in: query
+          name: contact_state
+          schema:
+            type: string
+        - description: Current person category
+          in: query
+          name: category
+          schema:
+            type: string
+        - description: Current organization
+          in: query
+          name: organization
+          schema:
+            type: string
+        - description: Primary communication channel
+          in: query
+          name: primary_channel
+          schema:
+            type: string
+        - description: Return people contacted at or after this RFC3339 timestamp
+          in: query
+          name: last_contact_after
+          schema:
+            format: date-time
+            type: string
+        - description: Return people contacted at or before this RFC3339 timestamp
+          in: query
+          name: last_contact_before
+          schema:
+            format: date-time
+            type: string
+        - description: "Directory order: name, last_contact_desc, or last_contact_asc"
+          in: query
+          name: sort
+          schema:
+            enum:
+              - name
+              - last_contact_desc
+              - last_contact_asc
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DirectoryPeopleResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Query durable people for the Directory
+      tags:
+        - API
   /api/v1/people/search:
     post:
       description: Searches only the curated person vector corpus and returns durable person roots in relevance order.
@@ -18998,6 +20895,317 @@ paths:
       security:
         - apiKey: []
       summary: Set a person's attribute value
+      tags:
+        - API
+  /api/v1/people/{id}/brief:
+    get:
+      operationId: getPersonBrief
+      parameters:
+        - description: Durable person ID
+          in: path
+          name: id
+          required: true
+          schema:
+            format: int64
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonBrief"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Get a person's current brief version
+      tags:
+        - API
+  /api/v1/people/{id}/brief-enrollment:
+    get:
+      operationId: getPersonBriefEnrollment
+      parameters:
+        - description: Durable person ID
+          in: path
+          name: id
+          required: true
+          schema:
+            format: int64
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonBriefEnrollment"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Get a person's brief enrollment
+      tags:
+        - API
+    put:
+      operationId: setPersonBriefEnrollment
+      parameters:
+        - description: Durable person ID
+          in: path
+          name: id
+          required: true
+          schema:
+            format: int64
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PutPersonBriefEnrollmentRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonBriefEnrollment"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Replace a person's brief enrollment
+      tags:
+        - API
+  /api/v1/people/{id}/brief/generate:
+    post:
+      operationId: generatePersonBrief
+      parameters:
+        - description: Durable person ID
+          in: path
+          name: id
+          required: true
+          schema:
+            format: int64
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonBriefRun"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Generate a person's brief now
+      tags:
+        - API
+  /api/v1/people/{id}/brief/reject:
+    post:
+      operationId: rejectPersonBrief
+      parameters:
+        - description: Durable person ID
+          in: path
+          name: id
+          required: true
+          schema:
+            format: int64
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RejectPersonBriefRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonBrief"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Reject a person's current brief version
+      tags:
+        - API
+  /api/v1/people/{id}/brief/versions:
+    get:
+      operationId: listPersonBriefVersions
+      parameters:
+        - description: Durable person ID
+          in: path
+          name: id
+          required: true
+          schema:
+            format: int64
+            type: integer
+        - description: Maximum versions to return (default 20, max 200)
+          in: query
+          name: limit
+          schema:
+            format: int64
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonBriefVersionsResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: List a person's brief version history
       tags:
         - API
   /api/v1/people/{id}/contact-state:
@@ -19928,6 +22136,68 @@ paths:
       security:
         - apiKey: []
       summary: List merge history for a durable person
+      tags:
+        - API
+  /api/v1/people/{id}/network:
+    get:
+      description: Returns declared person relationships and employments only; archive-derived associations are excluded.
+      operationId: getPersonNetwork
+      parameters:
+        - description: Durable person ID
+          in: path
+          name: id
+          required: true
+          schema:
+            format: int64
+            type: integer
+        - description: Breadth-first depth (default 1, minimum 1, maximum 3)
+          in: query
+          name: depth
+          schema:
+            default: 1
+            format: int64
+            maximum: 3
+            minimum: 1
+            type: integer
+        - description: Include ended relationships and employment records
+          in: query
+          name: include_ended
+          schema:
+            type: boolean
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PersonNetwork"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Get a bounded curated person network
       tags:
         - API
   /api/v1/people/{id}/notes/append:
@@ -21709,6 +23979,67 @@ paths:
       summary: Update a shared analytical Saved View
       tags:
         - API
+  /api/v1/saved-views/{id}/run:
+    post:
+      operationId: runSavedView
+      parameters:
+        - description: Saved View ID
+          in: path
+          name: id
+          required: true
+          schema:
+            format: int64
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RunSavedViewRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RunSavedViewResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "503":
+          content:
+            application/json:
+              schema:
+                anyOf:
+                  - $ref: "#/components/schemas/ExploreCacheUnavailableResponse"
+                  - $ref: "#/components/schemas/ErrorResponse"
+          description: Service Unavailable
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Run a shared analytical Saved View through its canonical Explore definition
+      tags:
+        - API
   /api/v1/scheduler/status:
     get:
       operationId: getSchedulerStatus
@@ -21740,7 +24071,7 @@ paths:
           required: true
           schema:
             type: string
-        - description: "Search mode: fts, vector, or hybrid. Structured filter parameters are supported only in vector and hybrid modes"
+        - description: "Search mode: fts, vector, or hybrid. conversation_id applies in every mode; other structured filter parameters require vector or hybrid"
           in: query
           name: mode
           schema:
@@ -21793,6 +24124,12 @@ paths:
           name: collection
           schema:
             type: string
+        - description: Exact conversation ID (all search modes)
+          in: query
+          name: conversation_id
+          schema:
+            format: int64
+            type: integer
         - description: Exact sender email/address filter (vector or hybrid mode only)
           in: query
           name: sender
@@ -21811,6 +24148,11 @@ paths:
         - description: Exact case-insensitive label filter (vector or hybrid mode only)
           in: query
           name: label
+          schema:
+            type: string
+        - description: Exact case-insensitive RFC 2919 List-Id filter (vector or hybrid mode only)
+          in: query
+          name: list_id
           schema:
             type: string
         - description: Calendar period in YYYY, YYYY-MM, or YYYY-MM-DD format (vector or hybrid mode only)
@@ -22012,42 +24354,47 @@ paths:
           name: scope
           schema:
             type: string
-        - description: Sender email/address filter
+        - description: Sender email/address filter; not supported when scope=body
           in: query
           name: sender
           schema:
             type: string
-        - description: Sender display-name filter
+        - description: Sender display-name filter; not supported when scope=body
           in: query
           name: sender_name
           schema:
             type: string
-        - description: Recipient email/address filter
+        - description: Recipient email/address filter; not supported when scope=body
           in: query
           name: recipient
           schema:
             type: string
-        - description: Recipient display-name filter
+        - description: Recipient display-name filter; not supported when scope=body
           in: query
           name: recipient_name
           schema:
             type: string
-        - description: Domain filter
+        - description: Domain filter; not supported when scope=body
           in: query
           name: domain
           schema:
             type: string
-        - description: Label filter
+        - description: Label filter; not supported when scope=body
           in: query
           name: label
           schema:
             type: string
-        - description: Message type filter
+        - description: Exact case-insensitive RFC 2919 List-Id filter; not supported when scope=body
+          in: query
+          name: list_id
+          schema:
+            type: string
+        - description: Message type filter; not supported when scope=body
           in: query
           name: message_type
           schema:
             type: string
-        - description: Named time period
+        - description: Named time period; not supported when scope=body
           in: query
           name: time_period
           schema:
@@ -22057,7 +24404,7 @@ paths:
           name: time_granularity
           schema:
             type: string
-        - description: Conversation ID
+        - description: Conversation ID; not supported when scope=body
           in: query
           name: conversation_id
           schema:
@@ -22069,6 +24416,14 @@ paths:
           schema:
             format: int64
             type: integer
+        - description: Source IDs; repeat or comma-separate values; not supported by deep search
+          in: query
+          name: source_ids
+          schema:
+            items:
+              format: int64
+              type: integer
+            type: array
         - description: Only include messages with attachments
           in: query
           name: attachments_only
@@ -22089,7 +24444,7 @@ paths:
           name: before
           schema:
             type: string
-        - description: Comma-separated aggregate view names to match empty values
+        - description: Comma-separated aggregate view names to match empty values; not supported when scope=body
           in: query
           name: empty_targets
           schema:
@@ -22229,6 +24584,11 @@ paths:
           name: label
           schema:
             type: string
+        - description: Exact case-insensitive RFC 2919 List-Id filter
+          in: query
+          name: list_id
+          schema:
+            type: string
         - description: Message type filter
           in: query
           name: message_type
@@ -22256,6 +24616,14 @@ paths:
           schema:
             format: int64
             type: integer
+        - description: Source IDs; repeat or comma-separate values
+          in: query
+          name: source_ids
+          schema:
+            items:
+              format: int64
+              type: integer
+            type: array
         - description: Only include messages with attachments
           in: query
           name: attachments_only
@@ -22303,14 +24671,6 @@ paths:
           name: direction
           schema:
             type: string
-        - description: Source IDs; repeat the parameter for multiple sources
-          in: query
-          name: source_ids
-          schema:
-            items:
-              format: int64
-              type: integer
-            type: array
       responses:
         "200":
           content:
@@ -22400,6 +24760,10 @@ paths:
                 $ref: "#/components/schemas/SettingsResponse"
           description: OK
           headers:
+            Credential-ETag:
+              description: Strong content hash for the independent provider credential store
+              schema:
+                type: string
             ETag:
               description: Strong content hash for optimistic concurrency
               schema:
@@ -22438,6 +24802,10 @@ paths:
                 $ref: "#/components/schemas/SettingsResponse"
           description: OK
           headers:
+            Credential-ETag:
+              description: Strong content hash for the independent provider credential store
+              schema:
+                type: string
             ETag:
               description: Strong content hash for optimistic concurrency
               schema:
@@ -22481,6 +24849,227 @@ paths:
       security:
         - apiKey: []
       summary: Update browser-managed settings
+      tags:
+        - API
+  /api/v1/settings/person-enrichment/providers/{name}:
+    put:
+      operationId: putSettingsPersonEnrichmentProvider
+      parameters:
+        - in: path
+          name: name
+          required: true
+          schema:
+            type: string
+        - description: Strong config ETag returned by the latest settings read
+          in: header
+          name: If-Match
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PersonEnrichmentProviderUpdate"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SettingsResponse"
+          description: OK
+          headers:
+            ETag:
+              description: Strong content hash for optimistic concurrency
+              schema:
+                type: string
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "412":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "428":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Create or update one named person-enrichment provider
+      tags:
+        - API
+  /api/v1/settings/provider-credentials/{credential_id}:
+    delete:
+      operationId: deleteSettingsProviderCredential
+      parameters:
+        - in: path
+          name: credential_id
+          required: true
+          schema:
+            type: string
+        - description: Strong ETag for the provider credential store
+          in: header
+          name: If-Match
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderCredentialResponse"
+          description: OK
+          headers:
+            ETag:
+              description: Strong content hash for optimistic concurrency
+              schema:
+                type: string
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "412":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "428":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Clear a stored provider credential
+      tags:
+        - API
+    put:
+      operationId: putSettingsProviderCredential
+      parameters:
+        - in: path
+          name: credential_id
+          required: true
+          schema:
+            type: string
+        - description: Strong ETag for the provider credential store
+          in: header
+          name: If-Match
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProviderCredentialWriteRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderCredentialResponse"
+          description: OK
+          headers:
+            ETag:
+              description: Strong content hash for optimistic concurrency
+              schema:
+                type: string
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "412":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        "428":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+        default:
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+          description: Error
+      security:
+        - apiKey: []
+      summary: Set a write-only provider credential
       tags:
         - API
   /api/v1/sources/status:
@@ -22564,12 +25153,6 @@ paths:
     get:
       operationId: getTotalStats
       parameters:
-        - description: Source ID
-          in: query
-          name: source_id
-          schema:
-            format: int64
-            type: integer
         - description: Source IDs; repeat the parameter for multiple sources
           in: query
           name: source_ids
@@ -22578,16 +25161,6 @@ paths:
               format: int64
               type: integer
             type: array
-        - description: Only include messages with attachments
-          in: query
-          name: attachments_only
-          schema:
-            type: boolean
-        - description: Exclude deleted messages
-          in: query
-          name: hide_deleted
-          schema:
-            type: boolean
         - description: Search query
           in: query
           name: search_query
@@ -22601,6 +25174,93 @@ paths:
         - description: Aggregate view type for grouping
           in: query
           name: group_by
+          schema:
+            type: string
+        - description: Sender email/address filter
+          in: query
+          name: sender
+          schema:
+            type: string
+        - description: Sender display-name filter
+          in: query
+          name: sender_name
+          schema:
+            type: string
+        - description: Recipient email/address filter
+          in: query
+          name: recipient
+          schema:
+            type: string
+        - description: Recipient display-name filter
+          in: query
+          name: recipient_name
+          schema:
+            type: string
+        - description: Domain filter
+          in: query
+          name: domain
+          schema:
+            type: string
+        - description: Label filter
+          in: query
+          name: label
+          schema:
+            type: string
+        - description: Exact case-insensitive RFC 2919 List-Id filter
+          in: query
+          name: list_id
+          schema:
+            type: string
+        - description: Message type filter
+          in: query
+          name: message_type
+          schema:
+            type: string
+        - description: Named time period
+          in: query
+          name: time_period
+          schema:
+            type: string
+        - description: Time bucket granularity
+          in: query
+          name: time_granularity
+          schema:
+            type: string
+        - description: Conversation ID
+          in: query
+          name: conversation_id
+          schema:
+            format: int64
+            type: integer
+        - description: Source ID
+          in: query
+          name: source_id
+          schema:
+            format: int64
+            type: integer
+        - description: Only include messages with attachments
+          in: query
+          name: attachments_only
+          schema:
+            type: boolean
+        - description: Exclude deleted messages
+          in: query
+          name: hide_deleted
+          schema:
+            type: boolean
+        - description: Lower date/time bound (RFC3339 or YYYY-MM-DD)
+          in: query
+          name: after
+          schema:
+            type: string
+        - description: Upper date/time bound (RFC3339 or YYYY-MM-DD)
+          in: query
+          name: before
+          schema:
+            type: string
+        - description: Comma-separated aggregate view names to match empty values
+          in: query
+          name: empty_targets
           schema:
             type: string
       responses:
@@ -22935,6 +25595,12 @@ paths:
     get:
       operationId: searchTextMessages
       parameters:
+        - description: Source ID
+          in: query
+          name: source_id
+          schema:
+            format: int64
+            type: integer
         - description: Search query
           in: query
           name: q

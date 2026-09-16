@@ -10,6 +10,7 @@ import (
 
 	"go.kenn.io/msgvault/internal/export"
 	"go.kenn.io/msgvault/internal/mime"
+	"go.kenn.io/msgvault/internal/remoteimage"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/textutil"
 )
@@ -33,6 +34,24 @@ func IngestRawMessage(
 	labelIDs []int64, sourceMsgID, rawHash string,
 	raw []byte, fallbackDate time.Time,
 	log *slog.Logger,
+) error {
+	return ingestRawMessage(ctx, st, sourceID, identifier, attachmentsDir, labelIDs, sourceMsgID, rawHash, raw, fallbackDate, log, nil, "")
+}
+
+type rawMessageIngestFunc func(context.Context, *store.Store, int64, string, string, []int64, string, string, []byte, time.Time, *slog.Logger) error
+
+func rawMessageIngester(images *remoteimage.Fetcher) rawMessageIngestFunc {
+	return func(ctx context.Context, st *store.Store, sourceID int64, identifier, attachmentsDir string, labelIDs []int64, sourceMsgID, rawHash string, raw []byte, fallbackDate time.Time, log *slog.Logger) error {
+		return ingestRawMessage(ctx, st, sourceID, identifier, attachmentsDir, labelIDs, sourceMsgID, rawHash, raw, fallbackDate, log, images, "")
+	}
+}
+
+func ingestRawMessage(
+	ctx context.Context, st *store.Store,
+	sourceID int64, identifier, attachmentsDir string,
+	labelIDs []int64, sourceMsgID, rawHash string,
+	raw []byte, fallbackDate time.Time,
+	log *slog.Logger, images *remoteimage.Fetcher, threadID string,
 ) error {
 	parsed, _ := mime.ParseWithRecovery(raw, "(MIME parse error)")
 
@@ -80,7 +99,9 @@ func IngestRawMessage(
 		}
 	}
 
-	threadID := threadKey(parsed, rawHash)
+	if threadID == "" {
+		threadID = threadKey(parsed, rawHash)
+	}
 
 	convSubject := subject
 	if convSubject == "" {
@@ -121,10 +142,13 @@ func IngestRawMessage(
 	hasAttachments := len(parsed.Attachments) > 0
 	attachmentCount := len(parsed.Attachments)
 
+	rfcID := mime.NormalizeMessageID(parsed.MessageID)
 	rec := &store.Message{
 		ConversationID:  conversationID,
 		SourceID:        sourceID,
 		SourceMessageID: sourceMsgID,
+		RFC822MessageID: sql.NullString{String: rfcID, Valid: rfcID != ""},
+		ListID:          sql.NullString{String: parsed.ListID, Valid: parsed.ListID != ""},
 		MessageType:     "email",
 		SentAt:          sentAt,
 		InternalDate:    internalDate,
@@ -150,7 +174,7 @@ func IngestRawMessage(
 	}
 
 	// Persist atomically
-	messageID, err := st.PersistMessage(&store.MessagePersistData{
+	messageID, err := st.PersistMessageContext(ctx, &store.MessagePersistData{
 		Message:    rec,
 		BodyText:   sql.NullString{String: bodyText, Valid: bodyText != ""},
 		BodyHTML:   sql.NullString{String: bodyHTML, Valid: bodyHTML != ""},
@@ -198,6 +222,13 @@ func IngestRawMessage(
 		}
 	}
 
+	if images != nil {
+		result := images.Archive(ctx, st, attachmentsDir, messageID, bodyHTML)
+		for _, imageErr := range result.Errors {
+			log.Warn("failed to archive remote image", "message", messageID, "error", imageErr)
+		}
+	}
+
 	// FTS: best-effort outside the transaction
 	if st.FTS5Available() {
 		fromAddr := joinEmails(parsed.From)
@@ -211,6 +242,10 @@ func IngestRawMessage(
 				"message", messageID, "error", err,
 			)
 		}
+	}
+
+	if err := st.RecordEmailHeadersContext(ctx, sourceID, messageID, "", parsed.InReplyTo); err != nil {
+		return fmt.Errorf("record email reply header: %w", err)
 	}
 
 	return nil

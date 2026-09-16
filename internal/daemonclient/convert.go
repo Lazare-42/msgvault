@@ -1,6 +1,7 @@
 package daemonclient
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -138,6 +139,10 @@ func cliDeletionManifestToGenerated(manifest *deletion.Manifest) generated.Creat
 		Status:      string(manifest.Status),
 		Version:     int64(manifest.Version),
 	}
+	if len(manifest.RawFilter) > 0 {
+		rawFilter := append(json.RawMessage(nil), manifest.RawFilter...)
+		out.RawFilter = &rawFilter
+	}
 	if manifest.Execution != nil {
 		out.Execution = cliDeletionExecutionToGenerated(manifest.Execution)
 	}
@@ -158,6 +163,7 @@ func cliDeletionFiltersToGenerated(filters deletion.Filters) generated.Filters {
 		After:         optionalString(filters.After),
 		Before:        optionalString(filters.Before),
 		Labels:        append([]string(nil), filters.Labels...),
+		ListIds:       append([]string(nil), filters.ListIDs...),
 		Recipients:    append([]string(nil), filters.Recipients...),
 		SenderDomains: append([]string(nil), filters.SenderDomains...),
 		Senders:       append([]string(nil), filters.Senders...),
@@ -207,14 +213,14 @@ func cliDeduplicatePlanFromGenerated(resp *generated.PlanCLIDeduplicateResponse)
 	items := make([]CLIDeduplicatePlanItem, len(resp.Items))
 	for i, item := range resp.Items {
 		items[i] = CLIDeduplicatePlanItem{
-			SourceID:          int64Value(item.SourceID),
-			ScopeLabel:        stringValue(item.ScopeLabel),
-			ScopeIsCollection: boolValue(item.ScopeIsCollection),
-			Stdout:            stringValue(item.Stdout),
-			DuplicateMessages: int(int64Value(item.DuplicateMessages)),
-			BackfilledCount:   int64Value(item.BackfilledCount),
-			PlanFingerprint:   stringValue(item.PlanFingerprint),
-			NeedsConfirmation: item.NeedsConfirmation,
+			SourceID:             int64Value(item.SourceID),
+			ScopeLabel:           stringValue(item.ScopeLabel),
+			ScopeIsCollection:    boolValue(item.ScopeIsCollection),
+			Stdout:               stringValue(item.Stdout),
+			DuplicateMessages:    int(int64Value(item.DuplicateMessages)),
+			PendingBackfillCount: int64Value(item.PendingBackfillCount),
+			PlanFingerprint:      stringValue(item.PlanFingerprint),
+			NeedsConfirmation:    item.NeedsConfirmation,
 		}
 	}
 	return &CLIDeduplicatePlan{
@@ -397,6 +403,7 @@ func cliMessageDetailFromGenerated(resp *generated.GetCLIMessageResponse) *query
 	return &query.MessageDetail{
 		ID:                   resp.ID,
 		SourceMessageID:      resp.SourceMessageID,
+		RFC822MessageID:      stringValue(resp.Rfc822MessageID),
 		ConversationID:       resp.ConversationID,
 		SourceConversationID: resp.SourceConversationID,
 		Subject:              resp.Subject,

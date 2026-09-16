@@ -27,6 +27,7 @@ const (
 	datasetConversations            = "conversations"
 	datasetConversationParticipants = "conversation_participants"
 	datasetOwnerParticipants        = "owner_participants"
+	datasetPersonDisplayNames       = "person_display_names"
 	datasetParticipantClusters      = "participant_clusters"
 	messageTypeDimension            = "message_type"
 	messageTypeEmail                = "email"
@@ -71,6 +72,29 @@ func hasExplicitMessageTypeSearch(searchQuery string) bool {
 // authoritative in either mode.
 func shouldDefaultStatsToEmail(opts StatsOptions) bool {
 	return !opts.SearchScope && !hasExplicitMessageTypeSearch(opts.SearchQuery)
+}
+
+// effectiveStatsFilter returns the complete message scope for a stats query.
+// Legacy top-level options remain authoritative so existing callers can add a
+// full filter without changing their source, attachment, or deletion scope.
+func effectiveStatsFilter(opts StatsOptions) *MessageFilter {
+	if opts.Filter == nil {
+		return nil
+	}
+	filter := opts.Filter.Clone()
+	if opts.SourceIDs != nil {
+		filter.SourceIDs = make([]int64, len(opts.SourceIDs))
+		copy(filter.SourceIDs, opts.SourceIDs)
+		filter.SourceID = nil
+	} else if opts.SourceID != nil {
+		filter.SourceID = opts.SourceID
+		filter.SourceIDs = nil
+	}
+	filter.WithAttachmentsOnly = filter.WithAttachmentsOnly || opts.WithAttachmentsOnly
+	filter.HideDeletedFromSource = filter.HideDeletedFromSource || opts.HideDeletedFromSource
+	filter.Pagination = Pagination{}
+	filter.Sorting = MessageSorting{}
+	return &filter
 }
 
 // participantNameExpr returns the SQL expression for a participant's display
@@ -462,6 +486,7 @@ func getMessageByQueryShared(ctx context.Context, db *sql.DB, rebind rebindFunc,
 			m.id,
 			m.source_id,
 			m.source_message_id,
+			COALESCE(m.rfc822_message_id, ''),
 			m.conversation_id,
 			COALESCE(conv.source_conversation_id, ''),
 			COALESCE(m.rfc822_message_id, ''),
@@ -485,6 +510,7 @@ func getMessageByQueryShared(ctx context.Context, db *sql.DB, rebind rebindFunc,
 		&msg.ID,
 		&msg.SourceID,
 		&msg.SourceMessageID,
+		&msg.RFC822MessageID,
 		&msg.ConversationID,
 		&msg.SourceConversationID,
 		&msg.RFC822MessageID,

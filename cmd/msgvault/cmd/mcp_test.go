@@ -109,9 +109,11 @@ func TestMCPCommandForwardsHTTPPolicy(t *testing.T) {
 	}))
 	t.Cleanup(daemon.Close)
 
+	home := t.TempDir()
 	withStoreResolverConfig(t, &config.Config{
-		Data:   config.DataConfig{DataDir: t.TempDir()},
-		Server: config.ServerConfig{APIKey: "mcp-http-key"},
+		HomeDir: home,
+		Data:    config.DataConfig{DataDir: t.TempDir()},
+		Server:  config.ServerConfig{APIKey: "mcp-http-key"},
 		Remote: config.RemoteConfig{
 			URL:           daemon.URL,
 			APIKey:        "daemon-key",
@@ -152,9 +154,11 @@ func TestMCPCommandForwardsHTTPPolicy(t *testing.T) {
 	require.ErrorIs(err, wantErr)
 	assert.True(gotServeOpts.AllowProfileWrites)
 	assert.Equal(mcpserver.HTTPOptions{
-		Addr:        "0.0.0.0:8081",
-		APIKey:      "mcp-http-key",
-		AllowWrites: true,
+		Addr:               "0.0.0.0:8081",
+		DiscoveryDirectory: filepath.Join(home, "mcp"),
+		BackendURL:         daemon.URL,
+		APIKey:             "mcp-http-key",
+		AllowWrites:        true,
 	}, gotHTTPOpts)
 }
 
@@ -189,17 +193,25 @@ func TestDaemonMCPServeOptionsGatesPeopleToolsByAPISchema(t *testing.T) {
 		Data: config.DataConfig{DataDir: t.TempDir()},
 	})
 	tests := []struct {
-		name          string
-		schemaVersion string
-		wantPeople    bool
+		name           string
+		schemaVersion  string
+		wantPeople     bool
+		wantDirectory  bool
+		wantSavedViews bool
 	}{
 		{name: "people schema", schemaVersion: "2.10.0", wantPeople: true},
-		{name: "newer schema", schemaVersion: "2.11.0", wantPeople: true},
+		{name: "directory predecessor", schemaVersion: "2.12.9", wantPeople: true},
+		{name: "directory schema", schemaVersion: "2.13.0", wantPeople: true, wantDirectory: true},
+		{name: "newer schema", schemaVersion: "2.14.0", wantPeople: true, wantDirectory: true},
+		{name: "schema before the Saved View run endpoint", schemaVersion: "2.20.0", wantPeople: true, wantDirectory: true},
+		{name: "saved view run schema", schemaVersion: "2.21.0", wantPeople: true, wantDirectory: true, wantSavedViews: true},
 		{name: "older same-major schema", schemaVersion: "2.9.9"},
+		{name: "malformed schema", schemaVersion: "not-a-version"},
 		{name: "missing schema"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
 			client := newMCPDaemonClient(t, func(w http.ResponseWriter, r *http.Request) {
 				switch r.URL.Path {
 				case "/api/v1/health":
@@ -213,22 +225,29 @@ func TestDaemonMCPServeOptionsGatesPeopleToolsByAPISchema(t *testing.T) {
 				case "/api/v1/multimodal/status":
 					http.Error(w, `{"error":"visual_search_not_ready"}`, http.StatusServiceUnavailable)
 				default:
-					assert.Failf(t, "unexpected request", "%s %s", r.Method, r.URL.Path)
+					assert.Failf("unexpected request", "%s %s", r.Method, r.URL.Path)
 				}
 			})
 
 			opts, err := daemonMCPServeOptions(t.Context(), client)
 			require.NoError(t, err)
 			if tt.wantPeople {
-				assert.NotNil(t, opts.PeopleBackend)
+				assert.NotNil(opts.PeopleBackend)
 			} else {
-				assert.Nil(t, opts.PeopleBackend)
+				assert.Nil(opts.PeopleBackend)
 			}
+			if tt.wantSavedViews {
+				assert.NotNil(opts.SavedViews, "Saved View tools need the daemon run endpoint")
+			} else {
+				assert.Nil(opts.SavedViews, "an older daemon cannot run Saved Views")
+			}
+			assert.Equal(tt.wantDirectory, opts.DirectoryBackend != nil)
 		})
 	}
 }
 
 func TestDaemonMCPServeOptionsWarnsWhenPeopleCapabilityProbeFails(t *testing.T) {
+	assert := assert.New(t)
 	withStoreResolverConfig(t, &config.Config{
 		Data: config.DataConfig{DataDir: t.TempDir()},
 	})
@@ -246,14 +265,53 @@ func TestDaemonMCPServeOptionsWarnsWhenPeopleCapabilityProbeFails(t *testing.T) 
 		case "/api/v1/multimodal/status":
 			http.Error(w, `{"error":"visual_search_not_ready"}`, http.StatusServiceUnavailable)
 		default:
-			assert.Failf(t, "unexpected request", "%s %s", r.Method, r.URL.Path)
+			assert.Failf("unexpected request", "%s %s", r.Method, r.URL.Path)
 		}
 	})
 
 	opts, err := daemonMCPServeOptions(t.Context(), client)
 	require.NoError(t, err)
-	assert.Nil(t, opts.PeopleBackend)
-	assert.Contains(t, logs.String(), "people tools disabled")
+	assert.Nil(opts.PeopleBackend)
+	assert.Nil(opts.DirectoryBackend)
+	assert.Contains(logs.String(), "people tools disabled")
+}
+
+func TestDaemonMCPServeOptionsUsesOneCapabilityProbe(t *testing.T) {
+	assert := assert.New(t)
+	withStoreResolverConfig(t, &config.Config{
+		Data: config.DataConfig{DataDir: t.TempDir()},
+	})
+	var logs bytes.Buffer
+	previousLogger := logger
+	logger = slog.New(slog.NewTextHandler(&logs, nil))
+	t.Cleanup(func() { logger = previousLogger })
+	var healthRequests atomic.Int32
+	client := newMCPDaemonClient(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/health":
+			if healthRequests.Add(1) == 1 {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"status": "ok", "api_schema_version": "2.21.0",
+				})
+				return
+			}
+			http.Error(w, `{"error":"temporarily_unavailable"}`, http.StatusServiceUnavailable)
+		case "/api/v1/stats":
+			_, _ = w.Write([]byte(`{"total_messages":0}`))
+		case "/api/v1/multimodal/status":
+			http.Error(w, `{"error":"visual_search_not_ready"}`, http.StatusServiceUnavailable)
+		default:
+			assert.Failf("unexpected request", "%s %s", r.Method, r.URL.Path)
+		}
+	})
+
+	opts, err := daemonMCPServeOptions(t.Context(), client)
+	require.NoError(t, err)
+	assert.NotNil(opts.PeopleBackend)
+	assert.NotNil(opts.DirectoryBackend)
+	assert.NotNil(opts.SavedViews)
+	assert.Equal(int32(1), healthRequests.Load())
+	assert.Empty(logs.String())
 }
 
 func TestDaemonMCPServeOptionsSavesDeletionManifestsThroughDaemon(t *testing.T) {

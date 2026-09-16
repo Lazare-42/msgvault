@@ -69,6 +69,8 @@ func TestSixtyfourAsyncLifecycleUsesExactWireAndSurvivesRestart(t *testing.T) {
 	defer server.Close()
 
 	config := sixtyfourConfig(server.URL+"/people-intelligence-async", server.URL+"/job-status")
+	// Bound the HTTP wait without making runner throughput part of the lifecycle contract.
+	config.RequestTimeout = 30 * time.Second
 	request := sixtyfourRequest(t)
 	provider, err := personenrichment.NewSixtyfourProvider(config, "test-key", server.Client())
 	requirements.NoError(err)
@@ -143,6 +145,17 @@ func TestSixtyfourAsyncLifecycleUsesExactWireAndSurvivesRestart(t *testing.T) {
 	requirements.NoError(err)
 	checks.NotEqual(attempt.GeneratedSchemaHash, changedAttempt.GeneratedSchemaHash)
 	checks.NotEqual(attempt.ProgramFingerprint, changedAttempt.ProgramFingerprint)
+}
+
+func TestSixtyfourProviderRejectsCredentialDestinationsOnDifferentOrigins(t *testing.T) {
+	config := sixtyfourConfig(
+		"https://start.example.test/people-intelligence-async",
+		"https://poll.example.test/job-status",
+	)
+
+	provider, err := personenrichment.NewSixtyfourProvider(config, "test-key", http.DefaultClient)
+	require.ErrorContains(t, err, "same origin")
+	assert.Nil(t, provider)
 }
 
 func TestSixtyfourRejectsUndocumentedRequestID(t *testing.T) {

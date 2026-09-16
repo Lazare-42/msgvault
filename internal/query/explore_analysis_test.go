@@ -3,6 +3,7 @@ package query
 import (
 	"context"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,6 +32,49 @@ func TestExploreGroupsAggregatesCompleteLogicalPopulation(t *testing.T) {
 	assertions.Equal(int64(2), result.Rows[0].Count)
 	assertions.Equal(int64(300), result.Rows[0].EstimatedBytes)
 	assertions.NotEmpty(result.CacheRevision)
+}
+
+// TestExploreGroupsMailingListsPreserveAggregateDrillPopulation catches a
+// mailing-list dimension that drops empty values, splits case variants into
+// separate rows, or applies a broader-than-exact drill predicate.
+func TestExploreGroupsMailingListsPreserveAggregateDrillPopulation(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	b := NewTestDataBuilder(t)
+	b.AddSource("archive@example.com")
+	upper := "<Dev_1@Example.Test>"
+	lower := "<dev_1@example.test>"
+	digest := "<digest@example.test>"
+	empty := ""
+	b.AddMessage(MessageOpt{Subject: "Upper", ListID: &upper, SizeEstimate: 100})
+	b.AddMessage(MessageOpt{Subject: "Lower", ListID: &lower, SizeEstimate: 200})
+	b.AddMessage(MessageOpt{Subject: "Digest", ListID: &digest, SizeEstimate: 50})
+	b.AddMessage(MessageOpt{Subject: "Empty", ListID: &empty, SizeEstimate: 400})
+	b.AddMessage(MessageOpt{Subject: "Missing", SizeEstimate: 800})
+	engine := b.BuildEngine()
+
+	grouped, err := engine.ExploreGroups(context.Background(), ExploreGroupRequest{
+		Explore: ExploreRequest{}, Dimension: "mailing_list",
+		Sort: SortSpec{Field: "count", Direction: "desc"}, Page: PageSpec{Limit: 10},
+	})
+	requirements.NoError(err)
+	requirements.Len(grouped.Rows, 2, "NULL and empty List-Ids must not form groups")
+	assertions.Equal(int64(2), grouped.TotalCount)
+	assertions.Equal(upper, grouped.Rows[0].Key)
+	assertions.Equal(upper, grouped.Rows[0].Label)
+	assertions.Equal(int64(2), grouped.Rows[0].Count, "case variants must share one group")
+	assertions.Equal(int64(300), grouped.Rows[0].EstimatedBytes)
+
+	drilledFast, drilledLegacy := runExploreBothPaths(t, engine, ExploreRequest{
+		Context: Context{MailingLists: []string{strings.ToUpper(grouped.Rows[0].Key)}},
+		Page:    PageSpec{Limit: 10},
+	})
+	assertions.Equal(drilledLegacy, drilledFast)
+	assertions.Equal(grouped.Rows[0].Count, drilledFast.TotalCount,
+		"exact case-insensitive drill must reproduce the aggregate population")
+	assertions.ElementsMatch([]string{"Upper", "Lower"}, []string{
+		drilledFast.Rows[0].Title, drilledFast.Rows[1].Title,
+	})
 }
 
 // TestExploreGroupsMessageTypeCollapsesLegacyRowsIntoEmail pins the grouping
@@ -314,6 +358,35 @@ func TestExploreSelectionStatsCanResolveExactDeletableMessageIDs(t *testing.T) {
 	assertions.Equal(int64(1), result.Count)
 	assertions.Equal([]int64{second}, result.DeletableMessageIDs)
 	assertions.NotContains(result.DeletableMessageIDs, first)
+}
+
+func TestExploreSelectionStatsExcludesDedupHiddenDeletionTargets(t *testing.T) {
+	for _, deletion := range []DeletionFilter{DeletionAny, DeletionActive} {
+		t.Run(string(deletion), func(t *testing.T) {
+			assertions := assert.New(t)
+			requirements := require.New(t)
+			b := NewTestDataBuilder(t)
+			source := b.AddSource("archive@example.com")
+			live := b.AddMessage(MessageOpt{SourceID: source, Subject: "Live message"})
+			hiddenAt := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+			b.AddMessage(MessageOpt{SourceID: source, Subject: "Hidden duplicate", InternalDeletedAt: &hiddenAt})
+			engine := b.BuildEngine()
+
+			stats, err := engine.ExploreSelectionStats(context.Background(), ExploreSelectionRequest{
+				Explore:                    ExploreRequest{Context: Context{Deletion: deletion}},
+				IncludeDeletableMessageIDs: true,
+			})
+			requirements.NoError(err)
+			assertions.Equal(int64(2), stats.Count, "the selection still includes both matching entries")
+			assertions.Equal(int64(1), stats.DeletableCount, "only the live message can be staged")
+			assertions.Equal([]int64{live}, stats.DeletableMessageIDs)
+
+			targets, err := engine.GetDeletionTargetsByMessageIDs(context.Background(), stats.DeletableMessageIDs)
+			requirements.NoError(err)
+			requirements.Len(targets, 1)
+			assertions.Equal(stats.DeletableCount, int64(len(targets)), "preflight and staging resolve the same subset")
+		})
+	}
 }
 
 func TestExploreSelectionStatsCanResolveExactRawExportMessageID(t *testing.T) {

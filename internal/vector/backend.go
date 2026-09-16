@@ -192,6 +192,10 @@ type Chunk struct {
 //     internal/store/api.go so the vector and SQLite paths agree.
 //   - SubjectSubstrings each add one `m.subject LIKE ? ESCAPE '\'`
 //     condition, ANDed together (all substrings must match).
+//   - ListIDSubstrings each add one case-insensitive `m.list_id LIKE ?`
+//     condition, ANDed together (all substrings must match).
+//   - ListIDExactGroups are AND-of-OR case-insensitive exact membership groups.
+//   - ListID restricts m.list_id by case-insensitive equality.
 //   - MessageTypes restricts m.message_type by exact value.
 //   - After/Before are half-open against m.sent_at:
 //     `>= After` and `< Before`.
@@ -199,6 +203,7 @@ type Chunk struct {
 type Filter struct {
 	MessageIDs         []int64   // exact bounded candidate population; empty = unrestricted
 	SourceIDs          []int64   // from [server/sources].identifier; empty = no source filter
+	ConversationIDs    []int64   // exact messages.conversation_id values; empty = unrestricted
 	SenderGroups       [][]int64 // one inner slice per `from:` token; AND across, OR within
 	SenderExactGroups  [][]int64 // exact structured sender; from rows OR messages.sender_id
 	RecipientAnyGroups [][]int64 // exact structured recipient; to/cc/bcc rows are OR'd
@@ -211,7 +216,11 @@ type Filter struct {
 	LargerThan         *int64   // `larger:` — strictly greater than
 	SmallerThan        *int64   // `smaller:` — strictly less than
 	SubjectSubstrings  []string // one per `subject:` term (ANDed)
+	ListIDSubstrings   []string // one per `list:` term (ANDed, literal substring)
+	ListID             string   // exact structured List-Id; empty = unrestricted
 	MessageTypes       []string // exact m.message_type values; empty = unrestricted
+
+	ListIDExactGroups [][]string // exact structured groups (AND across, OR within)
 }
 
 // IsEmpty reports whether the filter has no restrictions. A zero-value
@@ -219,6 +228,7 @@ type Filter struct {
 func (f Filter) IsEmpty() bool {
 	return len(f.MessageIDs) == 0 &&
 		len(f.SourceIDs) == 0 &&
+		len(f.ConversationIDs) == 0 &&
 		len(f.SenderGroups) == 0 &&
 		len(f.SenderExactGroups) == 0 &&
 		len(f.RecipientAnyGroups) == 0 &&
@@ -232,6 +242,9 @@ func (f Filter) IsEmpty() bool {
 		f.LargerThan == nil &&
 		f.SmallerThan == nil &&
 		len(f.SubjectSubstrings) == 0 &&
+		len(f.ListIDSubstrings) == 0 &&
+		len(f.ListIDExactGroups) == 0 &&
+		f.ListID == "" &&
 		len(f.MessageTypes) == 0
 }
 

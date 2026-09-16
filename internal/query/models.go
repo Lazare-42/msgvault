@@ -23,6 +23,8 @@ type AggregateRow struct {
 // MessageSummary represents a message in list views.
 // Contains enough information for display without fetching the full body.
 type MessageSummary struct {
+	// WebURL is derived by the daemon client for browser navigation.
+	WebURL                       string     `json:"web_url,omitempty"`
 	ID                           int64      `json:"id"`
 	SourceID                     int64      `json:"source_id,omitempty"`
 	SourceMessageID              string     `json:"source_message_id"`
@@ -61,6 +63,8 @@ type DeletionTarget struct {
 
 // MessageDetail represents a full message with body and attachments.
 type MessageDetail struct {
+	// WebURL is derived by the daemon client for browser navigation.
+	WebURL               string `json:"web_url,omitempty"`
 	ID                   int64  `json:"id"`
 	SourceID             int64  `json:"source_id,omitempty"`
 	SourceMessageID      string `json:"source_message_id"`
@@ -123,6 +127,7 @@ const (
 	ViewRecipientNames
 	ViewDomains
 	ViewLabels
+	ViewLists
 	ViewTime
 
 	// ViewTypeCount is the total number of view types. Must be last.
@@ -143,6 +148,8 @@ func (v ViewType) String() string {
 		return "Domains"
 	case ViewLabels:
 		return "Labels"
+	case ViewLists:
+		return "Lists"
 	case ViewTime:
 		return "Time"
 	default:
@@ -226,6 +233,7 @@ type MessageFilter struct {
 	RecipientName string // filter by recipient display name (COALESCE(display_name, email))
 	Domain        string // filter by sender domain
 	Label         string // filter by label name
+	ListID        string // filter by exact RFC 2919 List-Id (case-insensitive)
 	MessageType   string // filter by messages.message_type
 
 	// Filter by conversation (thread)
@@ -312,7 +320,8 @@ func (f *MessageFilter) Clone() MessageFilter {
 		maps.Copy(clone.EmptyValueTargets, f.EmptyValueTargets)
 	}
 	if f.SourceIDs != nil {
-		clone.SourceIDs = append([]int64(nil), f.SourceIDs...)
+		clone.SourceIDs = make([]int64, len(f.SourceIDs))
+		copy(clone.SourceIDs, f.SourceIDs)
 	}
 	return clone
 }
@@ -365,11 +374,12 @@ type AccountInfo struct {
 
 // StatsOptions configures a stats query.
 type StatsOptions struct {
-	SourceID              *int64   // nil means all accounts
-	SourceIDs             []int64  // multi-source filter (collections)
-	WithAttachmentsOnly   bool     // only count messages with attachments
-	HideDeletedFromSource bool     // exclude messages where deleted_from_source_at IS NOT NULL
-	SearchQuery           string   // when set, stats reflect only messages matching this search
-	SearchScope           bool     // include all message types when SearchQuery has no explicit message_type
-	GroupBy               ViewType // when set, search filters on this view's key columns instead of subject+sender
+	Filter                *MessageFilter // complete message scope; nil preserves legacy top-level filtering
+	SourceID              *int64         // nil means all accounts
+	SourceIDs             []int64        // multi-source filter (collections)
+	WithAttachmentsOnly   bool           // only count messages with attachments
+	HideDeletedFromSource bool           // exclude messages where deleted_from_source_at IS NOT NULL
+	SearchQuery           string         // when set, stats reflect only messages matching this search
+	SearchScope           bool           // include all message types when SearchQuery has no explicit message_type
+	GroupBy               ViewType       // when set, search filters on this view's key columns instead of subject+sender
 }

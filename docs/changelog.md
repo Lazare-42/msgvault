@@ -1,4 +1,5 @@
 ---
+last_edited: "2026-09-15"
 title: Changelog
 description: Release history for msgvault
 ---
@@ -7,60 +8,260 @@ All notable changes to msgvault, grouped by release.
 
 ## Unreleased
 
-**Breaking changes**
+Since **0.19.3**, msgvault has added richer people profiles, document and image
+search, background operations, and more ways to import and maintain an archive.
+This section covers work on `main` through **September 15, 2026**. These changes
+are not included in 0.19.3; this is not a new release announcement.
 
-- The HTTP API separates observed participant analytics from durable curated
-  people, crossing the API schema 2.0 compatibility boundary at 2.1.0. The
-  current unreleased API schema is 2.4.0. The
-  analytical routes formerly under `/api/v1/people/*` (search, detail,
-  summary, timeline, files) now live under `/api/v1/participants/*`, and the
-  durable person routes formerly under `/api/v1/persons/*` now live under
-  `/api/v1/people/*`. The old paths are removed, not aliased: `/api/v1/people`
-  changed meaning, so an alias would silently serve differently shaped data.
-  The CLI and daemon refuse to interoperate across the 1.x/2.x schema
-  boundary with a clear error — upgrade both together. This covers configured
-  remotes too: the daemon reports `api_schema_version` on authenticated
-  `/api/v1/health`, and a CLI in remote mode verifies it on connect,
-  rejecting daemons that predate schema 2.0.
+macOS analytics cache builds use the existing CSV export without the unusable
+SQLite extension download and warning.
 
-- Deletion staging now requires every selected message to belong to one exact
-  source. TUI and MCP selections that span accounts are rejected instead of
-  creating a manifest that could mark or delete the wrong account's messages.
-  In the TUI, press `a` to filter by account before staging again; MCP callers
-  should pass `account` or stage each source separately.
 
-**Features**
+### Upgrade and compatibility
 
-- Exact source selection is available through `--source-id` on `sync`,
-  `sync-full`, `update-account`, `remove-account`, and `delete-staged`.
-  Account arguments continue to accept identifiers and display names, while
-  destructive commands reject ambiguous tokens. Version-2 deletion manifests
-  and staging responses preserve the source type and identifier so execution
-  remains scoped when two source types share the same identifier.
+- **Back up before opening an existing archive with a newer binary.** SQLite
+  schema changes run on writable open. Keep the
+  [backup repository](usage/backup.md) outside your archive home. PostgreSQL
+  users need their own database backup; see
+  [backend limits](architecture/postgresql.md).
+- **Upgrade clients and daemon together.** The API crossed the 1.x/2.x
+  compatibility boundary; the current schema is **2.25.0**. Analytical
+  `/api/v1/people/*` routes moved to `/api/v1/participants/*`. Durable profiles
+  moved from `/api/v1/persons/*` to `/api/v1/people/*`. The old paths were
+  removed. Clients reject incompatible daemons; authenticated `/api/v1/health`
+  reports `api_schema_version`. See
+  [daemon migration](guides/daemon-migration.md).
+- **Review CardDAV integrations.** Since schema 2.14.0, publication and conflict
+  responses use bounded summaries without raw vCards or resource hrefs. Since
+  2.25.0, inferred profile changes require approval of the exact card before
+  export. Sync skips people awaiting review; direct publication returns HTTP 409
+  `carddav_inference_review_required`. Use `person publish <id> --preview` and
+  `--approve <token>`, or the matching API routes. See
+  [CardDAV review](usage/people-carddav.md#review-inferred-changes-before-they-are-exported).
+- **Check embedding status before rebuilding.** Upgrading preserves active
+  vectors and converts their coverage records, except for work already awaiting
+  re-embedding or an in-flight rebuild. For a matching generation, scheduled
+  embedding or `embeddings resume --backstop` fills remaining gaps. A changed
+  fingerprint reports `index_stale` and requires
+  `embeddings build --full-rebuild --yes`; older fingerprints can be stale even
+  with unchanged configuration. See
+  [vector upgrades](usage/vector-search.md#upgrading-an-existing-archive).
+- **Check people-provider consent.** `person provider status --all` identifies
+  checks and consent from an earlier extraction program.
+  `person provider reverify NAME --yes` runs a synthetic check and records
+  consent for the current program. Historical profiles remain available to
+  `status --all` and `revoke --all`. See
+  [profile automation](usage/people-automation.md).
+- **Review chat media settings.** Rooms with more than 20 participants skip
+  media by default. Beeper, Slack, and Teams default to 250 MiB per attachment;
+  Discord remains 50 MiB. Explicit size settings stay unchanged. See
+  [media policy](configuration.md#media-policy) for overrides and backfill.
+- **Remote deletion remains opt-in and preserves your archive.** The invoking
+  CLI must enable `[deletion] remote_enabled = true` or set
+  `MSGVAULT_ENABLE_REMOTE_DELETE=1`. Both options remain supported. The daemon's
+  configuration does not grant another client's consent. Gmail and IMAP move
+  mail to Trash by default; `--permanent` requests permanent source deletion. A
+  separate local purge removes archived content. See
+  [deleting email](usage/deletion.md).
 
-- Person profile catalog and tracking foundation: eleven reconciled system
-  profile attributes (location, birthplace, membership, religion, politics,
-  personality, pets, interests, favorites) with portable `is_sensitive`
-  metadata, plus `msgvault person track|untrack` and
-  `/api/v1/people/{id}/tracking` to opt a durable person into future profile
-  maintenance.
+Keyword search and basic browsing do not require a model provider. Optional
+features can be enabled after the archive is usable.
 
-- Scope embedding builds to selected accounts: `[vector.embed.scope] accounts`
-  keeps the daemon's scheduled embeds within the listed accounts, and
-  `msgvault embeddings build --account/--collection` overrides the account
-  scope for a single run. The account scope is part of the generation
-  fingerprint, so changing it requires a full rebuild; account-scoped indexes
-  do not gate search — out-of-scope accounts simply rank on BM25 alone.
-  Activation refuses a source scope that matches no live messages (an added
-  but never-synced account) rather than replacing the serving index with an
-  empty one, and the daemon marks vector search stale when the configured
-  accounts resolve to a different source set than it was started with.
+### People and relationships
 
-**Bug fixes**
+- Maintain structured names, contact details, addresses, dates, categories,
+  private notes, organizations, employment, and relationships with start and end
+  dates. Merge or split duplicate profiles, inspect the history, and reverse
+  supported merges.
+- Browse saved people by last contact in Web Directory, `person directory`, and
+  MCP's `list_directory_people`. Filter by dates and contact details, choose an
+  order, and page through results. `person list` retains its existing use.
+- Find a person by remembered profile facts with semantic search. Find their
+  files across attachment metadata, document text, and the visual index.
+- Keep the evidence behind profile facts, pin corrections, and repair derived
+  values when their inputs change. Curated names now appear in analytics, search
+  results, and exported authors. `export-messages --person-id` selects messages
+  through the person's bound participants.
+- Maintain tracked profiles with consented provider sweeps. Profiles support
+  OpenAI Chat, OpenAI Responses, Anthropic Messages, and Gemini. Codex
+  app-server configuration exists, but no executable is approved by its release
+  gate. The CLI can add, update, check, select, and reverify profiles.
+- Configure separate Exa or SixtyFour enrichment with exact consent, request
+  limits, and suppression controls.
+- Generate a **“Last time we talked”** brief for an enrolled person and inspect
+  its cited sources and earlier versions. Briefs use supported chat and text
+  messages; email, meetings, documents, and your replies are excluded. CLI, TUI,
+  Web Directory, and API manage briefs; MCP reads saved versions.
+- Review Beeper identity candidates across sources. Strong provider or Beeper
+  identifiers can link automatically; same-service usernames require review, and
+  conflicting bindings remain separate.
+- Import CardDAV contacts and publish selected profiles with conflict review and
+  lossless vCard handling. Connect **Google Contacts** through OAuth from Web
+  Settings or the CLI. Contact sync now works with iCloud servers that reject
+  full URLs in requests for individual cards.
+- Record `how_we_met` and up to 280 characters in seeded text attributes.
+  Multiline Notes retain their separate behavior.
 
-- Everything and Files now page narrow analytical metadata before enriching
-  participant details, preventing default listings on multi-million-message
-  archives from exhausting the interactive DuckDB memory budget.
+See [people](usage/people.md), [profile automation](usage/people-automation.md),
+[enrichment](usage/people-enrichment.md), [briefs](usage/people-briefs.md),
+[Beeper identities](usage/beeper.md#review-identities-across-sources), and
+[CardDAV](usage/people-carddav.md).
+
+### Search and attachments
+
+- Search Beeper chats and meeting transcripts with embeddings that include
+  nearby messages. Build embeddings for selected accounts or collections and
+  configure model-specific task prefixes. Changing scope requires a rebuild;
+  hybrid search can still find out-of-scope messages through keyword matching.
+- Extract attachment text with the shared Docbank engine and search it by
+  keyword, meaning, or both. CSV files can opt into local PDF conversion while
+  retaining their original file identity and extraction history.
+- Search image and video content through a separately configured visual
+  provider, after its capabilities have been checked.
+- Find mailing-list traffic with `list:` or `list-id:` and browse Lists
+  grouping. `repair-list-ids` previews an offline backfill; `--apply` writes it.
+  Use `conversation_id:` to select one local conversation.
+- Choose whether search includes, excludes, or shows only messages deleted from
+  their source. Their local content remains available until purged.
+- Preserve remote email images for offline reading after explicit opt-in, with a
+  separate backfill for existing mail. Stored MIME and HTML remain unchanged.
+  Fetching these images can activate tracking.
+
+See [searching](usage/searching.md), [vector search](usage/vector-search.md),
+[document indexing](usage/document-indexing.md), and
+[remote images](usage/remote-images.md).
+
+### Browser, terminal, and integrations
+
+- Use Web Directory to edit profiles, relationships, and employment, review
+  identity matches and facts, merge or split profiles, publish CardDAV contacts,
+  and inspect curated networks and person attachment galleries.
+- Monitor sync, extraction, embeddings, enrichment, and CardDAV in Web
+  Operations. Filter run history, inspect failures, and run the actions the
+  daemon offers. CardDAV history survives daemon restarts.
+- Edit Web Settings in sections with visible numeric limits, switches for
+  settings that can be off, and schedule presets with time zones and validation.
+  Track unsaved changes, discard them, and see when a restart is needed.
+  Credentials can be replaced or removed without revealing the complete stored
+  value. Host-managed settings stay read-only in the browser.
+- Read messages beside the results or below them, resize the preview, and keep
+  the layout between visits. In dark mode, HTML email uses app colors; switch to
+  the sender's original colors for the open message when needed.
+- Browse People and attachments in the TUI, use semantic search and Emacs-style
+  navigation, and scope Email by named collections. Multi-source collections
+  offer Fast search only; empty collections match nothing. Email, Texts, and
+  Meetings keep independent source selectors.
+- Download, open, or export TUI attachments as a ZIP. Press `s` in email detail
+  to save the archived original as `.eml` in the client's current directory.
+  Existing files are preserved, and the original email must be archived.
+- Share Saved Views between the browser, API, and MCP assistants. Read tools can
+  list, inspect, and run views. Creation, editing, and deletion are write tools;
+  HTTP requires `--http-allow-writes`. Stored definitions are validated against
+  the version-1 vocabulary, and revision checks prevent stale edits.
+- Read person profiles, Notes, relationships, and files through MCP. General
+  profile reads exclude sensitive attributes and private Notes; Notes have a
+  separate explicit read tool. Profile writes require additional opt-in.
+- Discover running HTTP MCP endpoints with `mcp status --json`, including actual
+  ports, backend URLs, and private token-file paths. Status does not start a
+  daemon or print token contents. MCP also supports protocol `2026-07-28`,
+  publishes object-root output schemas, and accepts parameterless inbound
+  messages.
+- Use `setup providers` for consented provider defaults and `setup status` to
+  understand readiness. Sensitive profile inference requires a separate
+  `--allow-sensitive` opt-in.
+- Browse the new website's product overview, archive lifecycle guide, and
+  operating documentation under `/docs/`.
+
+See [Web UI](web-ui.md), [TUI](usage/tui.md),
+[recommended configuration](usage/recommended-configuration.md), and
+[MCP](usage/chat.md).
+
+### Sync, imports, and maintenance
+
+- Sync Notion AI Meeting Notes with available transcripts, verified attendees,
+  changed-note refresh, and bounded retries for late transcripts.
+- Import Slackdump directories or ZIPs, EML files and `.mailbox` trees, and
+  Maildir or Maildir++ archives. Maildir imports retain folder and flag labels
+  and recognize previously archived messages after filename changes.
+- Import Google Groups Takeout MBOX or ZIP exports. Apple Mail imports preserve
+  RFC Message-ID and link unambiguous replies within a source. Re-import and
+  rebuild the cache to fill missing IDs in existing Apple Mail archives; see
+  [message identifier recovery](usage/importing.md#message-identifiers-and-replies).
+- Import Apple WhatsApp ChatStorage text, including URL messages, with available
+  participant and push names. Contact-number matching requires country codes;
+  missing group-participant tables no longer block otherwise usable exports.
+- Preserve Google Voice voicemail audio supplied in Takeout exports. Missing or
+  unreadable recordings remain visible as failed attachment records. Discord
+  voice messages retain their duration and waveform metadata.
+- Run bounded historical Gmail or IMAP imports as background jobs through the
+  API, with durable status and checkpoint-based resumption.
+- Keep IMAP sync incremental with QRESYNC where available and avoid refetching
+  unchanged folders without it. Retry connection failures within bounds,
+  preserve valid mailbox state after incomplete responses, and treat messages
+  removed during a fetch as handled. `repair-labels` rebuilds labels from stored
+  folder membership without contacting the provider.
+- Create an IMAP reply draft with `draft-reply` after an operator grants access
+  to a specific source and Drafts folder. The server must support UIDPLUS.
+  Msgvault stores an archived copy; it never sends the email.
+- Add restricted agent grants. Owner-only `agent-token issue/list/revoke`
+  commands manage in-memory tokens with `draft.create` permission for named
+  sources. Agents use `--agent-url` and `--agent-token-file` to run only
+  `draft-reply`; grants expire when revoked or when the daemon restarts.
+  Enable `[server] agent_access = true` with a non-empty `api_key`; see
+  [agent-token](cli-reference.md#agent-token) and
+  [configuration](configuration.md#server).
+- Refresh the archived body, recipients, and attachments when a trusted outgoing
+  IMAP copy is edited or moves from Drafts to Sent. Ordinary received-mail and
+  All Mail copies cannot replace that content. Historical rows that already lost
+  their old location are not repaired automatically. See [IMAP](usage/imap.md).
+- Authorize Gmail with read-only access using `add-account --readonly`. Existing
+  write grants require the documented revoke-and-reauthorize steps. Google
+  Calendar registration now also works directly with Workspace service accounts;
+  delegation and disabled-API errors stop without lengthy retries.
+- Archive Teams self-chat and avoid replaying the last message at each
+  incremental boundary. Preserve Beeper transcript metadata, resume backfilled
+  history, store plain text, distinguish link previews, and repair older
+  classifications from archived payloads. Calendar snippets retain valid UTF-8.
+- Select exact sources with `--source-id` where supported. Deletion manifests
+  preserve source type and identifier. Stage by query or explicit message IDs,
+  preview counts, and skip ineligible query matches. Eligible messages must
+  belong to one exact source; TUI and MCP reject cross-source staging.
+- Keep messages and attachments after permanent source deletion. Use the
+  separate SQLite `gc` command to purge source-deleted rows and unreferenced
+  blobs. Deduplication requires the reviewed plan to remain valid and prefers
+  attachment-complete survivors only under its documented equivalence rules.
+- Repair source identity, sender attribution, Gmail snapshots, and derived
+  metadata. Gmail sync reconciles expired history, retries failed fetches from
+  the previous completed run, verifies cached account identities, and bounds
+  request and OAuth refresh waits. Scheduler errors show copyable
+  reauthorization commands.
+- Recover more malformed MIME messages and report importer read errors. Bound
+  large analytical listings, rebuild caches less often, maintain SQLite planner
+  statistics, resolve cached recipient addresses, and prune orphan embeddings.
+  Tune DuckDB query memory, threads, and disk spill separately from cache-build
+  limits.
+
+See [sources](guides/sources.md), [imports](usage/importing.md),
+[text messages](usage/text-messages.md), [Calendar](usage/calendar.md),
+[OAuth](guides/oauth-setup.md), [deletion](usage/deletion.md),
+[deduplication](usage/deduplication.md), and
+[analytics configuration](configuration.md#analytics).
+
+### Building and maintaining msgvault
+
+- Build with Go 1.27 and the documented Bun, Node.js, and native SQLite
+  prerequisites. Nix flake packaging has been removed.
+- Use Docker Bake to export Linux AMD64 and ARM64 images as OCI archives. Image
+  builds check database initialization, DuckDB queries, and the embedded Web UI.
+  Repository release-publishing workflows and tag/changelog scripts have been
+  removed; local builds and installers remain available.
+- Generate the browser API client with Orval and pinned OpenAPI tools. Local
+  SQLite test scheduling scales to available CPU and memory; PostgreSQL
+  configurations remain separately covered. Synthetic media examples and
+  relevance judgments prepare future retrieval evaluation; they do not add audio
+  transcription or a runnable evaluation workflow.
+
+See [Development](development.md) for build and check commands.
 
 ---
 
@@ -220,7 +421,9 @@ All notable changes to msgvault, grouped by release.
 - Daemon runtime-record cleanup now requires a probe-confirmed identity
   mismatch before deletion, tolerates small creation-time clock skew, and lets
   a live daemon republish a missing record. This prevents false local-writer
-  conflicts during later operations such as backup.
+  conflicts during later operations such as backup. After larger guest clock
+  steps, runtime-secret proofs keep daemon discovery, authenticated reads, and
+  shutdown working without authorizing OS signals to a mismatched PID.
 - Full message detail, including MCP `get_message`, restores chat senders from
   `messages.sender_id` when a direct message has no explicit `from` recipient
   row. Explicit email sender rows remain authoritative.
@@ -444,7 +647,7 @@ All notable changes to msgvault, grouped by release.
   the single archive writer: concurrent operations queue with a visible
   `Waiting:` message, read-only commands run immediately, and scheduled
   syncs yield to interactive commands. See the
-  [Daemon Migration Guide](/guides/daemon-migration/).
+  [Daemon Migration Guide](/docs/guides/daemon-migration/).
 - Daemon lifecycle management via `msgvault serve start|status|stop|restart`,
   with automatic restart of older local daemons on binary upgrade
   (`[server].daemon_auto_restart`).
@@ -634,7 +837,7 @@ All notable changes to msgvault, grouped by release.
 
 **New features**
 
-- **Vector search (semantic and hybrid).** msgvault can now embed your archive using a configured OpenAI-compatible embedding endpoint (Ollama, llama.cpp `server`, LM Studio, etc.) and search it by meaning, not just keywords. `msgvault search --mode vector` runs pure semantic search; `--mode hybrid` fuses BM25 and vector similarity via Reciprocal Rank Fusion. Exposed through local CLI search (`msgvault search`), the HTTP API (`GET /api/v1/search?mode=vector|hybrid`), and the MCP server (`search_messages` mode argument plus a new `find_similar_messages` tool). See [Vector Search](/usage/vector-search/).
+- **Vector search (semantic and hybrid).** msgvault can now embed your archive using a configured OpenAI-compatible embedding endpoint (Ollama, llama.cpp `server`, LM Studio, etc.) and search it by meaning, not just keywords. `msgvault search --mode vector` runs pure semantic search; `--mode hybrid` fuses BM25 and vector similarity via Reciprocal Rank Fusion. Exposed through local CLI search (`msgvault search`), the HTTP API (`GET /api/v1/search?mode=vector|hybrid`), and the MCP server (`search_messages` mode argument plus a new `find_similar_messages` tool). See [Vector Search](/docs/usage/vector-search/).
 - `msgvault build-embeddings` command to generate and maintain the local vector index. Incremental by default; `--full-rebuild` creates a new generation and atomically activates it once coverage reaches zero. Same-model rebuilds keep answering against the previous active generation while the new one is built, with active-generation top-ups frozen until activation; model or dimension changes return `index_stale` until activation.
 - Background embedding via the daemon scheduler. A new `[vector.embed.schedule]` config block drives the embed worker on cron and/or after every successful scheduled sync, so `msgvault serve` can keep the vector index current without manual intervention.
 - `/api/v1/stats` gains a `vector_search` sub-object reporting the active generation, any in-flight rebuild, and the actionable missing embedding count for the generation the worker will target next.
@@ -643,7 +846,7 @@ All notable changes to msgvault, grouped by release.
 **Improvements**
 
 - `search` command gains `--mode fts|vector|hybrid` and `--explain` flags. `--explain` includes per-signal scores (RRF, BM25, vector) in table and JSON output for ranking inspection.
-- Configuration gains a full `[vector]` block with sub-tables for the embedding endpoint, message preprocessing, hybrid ranking, and the embed scheduler. See [Configuration: vector](/configuration/#vector).
+- Configuration gains a full `[vector]` block with sub-tables for the embedding endpoint, message preprocessing, hybrid ranking, and the embed scheduler. See [Configuration: vector](/docs/configuration/#vector).
 - `remove-account` deletes attachment files from disk when they were unique to the removed account. Files shared across multiple accounts are preserved automatically, and an in-progress sync on any account skips file deletion to avoid racing new attachment writes.
 
 **Bug fixes**
@@ -672,7 +875,7 @@ All notable changes to msgvault, grouped by release.
 
 **New features**
 
-- Structured file logging with per-run correlation IDs. Every CLI invocation gets a unique `run_id` on every log line, making it easy to trace a single run across shared log files. New `msgvault logs` command for viewing and tailing logs. File logging is opt-in; see [Configuration: Log](/configuration/#log) for setup.
+- Structured file logging with per-run correlation IDs. Every CLI invocation gets a unique `run_id` on every log line, making it easy to trace a single run across shared log files. New `msgvault logs` command for viewing and tailing logs. File logging is opt-in; see [Configuration: Log](/docs/configuration/#log) for setup.
 
 **Improvements**
 
@@ -725,9 +928,9 @@ All notable changes to msgvault, grouped by release.
 
 **New features**
 
-- SQL query interface via `msgvault query`. Run arbitrary SQL against DuckDB over Parquet with `--format json|csv|table`. See [SQL Queries](/usage/querying/).
+- SQL query interface via `msgvault query`. Run arbitrary SQL against DuckDB over Parquet with `--format json|csv|table`. See [SQL Queries](/docs/usage/querying/).
 - Microsoft 365 OAuth2 support via `msgvault add-o365` for Outlook.com and organizational accounts. Auto-detects personal vs. org IMAP hosts.
-- Text message import: `import-whatsapp`, `import-imessage`, and `import-gvoice` for WhatsApp, iMessage, and Google Voice. See [Text Messages](/usage/text-messages/).
+- Text message import: `import-whatsapp`, `import-imessage`, and `import-gvoice` for WhatsApp, iMessage, and Google Voice. See [Text Messages](/docs/usage/text-messages/).
 - TUI text mode: press `m` to toggle between Email and Texts for browsing imported text conversations.
 - `--after` and `--before` date filters for `sync-full` with IMAP accounts.
 - CC and BCC recipients exposed in the message API responses.

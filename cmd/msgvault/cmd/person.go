@@ -678,12 +678,13 @@ func init() {
 	personCmd.AddCommand(newPersonProviderCommand(defaultPersonProviderCommandDeps()))
 	personCmd.AddCommand(newPersonSweepCommand(defaultPersonSweepCommandDeps()))
 	personCmd.AddCommand(newPersonEnrichmentCommand(defaultPersonEnrichmentCommandDeps()))
+	personCmd.AddCommand(newPersonBriefCommand())
 	personCmd.AddCommand(personPromoteCmd, personGetCmd, personListCmd,
 		personSetDisplayNameCmd, personDeleteCmd, personTrackCmd, personUntrackCmd,
 		personMergeCmd, personSplitCmd, personMergeHistoryCmd, personMergeShowCmd,
 		personMergeCandidateCmd, personNotesCmd,
 		newPersonFilesCommand(defaultPersonFilesCommandDeps()), personSearchCmd,
-		newPersonFactsCommand())
+		newPersonFactsCommand(), newPersonDirectoryCommand())
 	for _, command := range []*cobra.Command{
 		personPromoteCmd, personGetCmd, personListCmd, personSetDisplayNameCmd,
 		personTrackCmd, personUntrackCmd,

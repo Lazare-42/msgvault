@@ -1,4 +1,5 @@
 ---
+last_edited: 2026-09-03
 title: Discord
 description: Archive Discord guild channels, threads, and attachments through a read-only bot.
 ---
@@ -84,18 +85,27 @@ ambiguous fails instead of guessing.
 ## Configure media, repairs, and channel filters
 
 Discord settings are optional. The defaults download attachments up to 50 MiB
-and re-scan the trailing seven days for edits, deletions, and changed reaction
-counts:
+from channels with at most 20 members, and re-scan the trailing seven days for
+edits, deletions, and changed reaction counts:
 
 ```toml
 [discord]
 max_media_bytes = 52428800
+media_scope = "all"            # all, direct, or none
+media_max_participants = 20    # skip media from larger channels; 0 = no cap
 edit_rescan_window = "168h"
 
 [discord.guilds."123456789012345678"]
 include = ["456789012345678901"]
 exclude = ["567890123456789012"]
+# media = false                # per-guild media override
+# max_media_mb = 25
 ```
+
+Most guild channels have more than 20 members, so the default participant cap
+keeps guild media out of the archive unless you raise the cap or set it to `0`.
+Skipped attachments carry a typed `participant_threshold` marker rather than a
+retry marker; see [Media policy](/docs/configuration/#media-policy).
 
 `include` and `exclude` contain Discord channel, thread, or forum-post IDs. An
 empty `include` means every accessible message container. Top-level channels
@@ -131,6 +141,9 @@ Use `--after` for an exclusive lower bound in `YYYY-MM-DD` or RFC3339 form:
 ```bash
 msgvault sync-discord 123456789012345678 --after 2025-01-01
 ```
+
+A bounded sync defers the full-source automatic metadata repair pass, so rows
+older than the bound remain untouched. Run `msgvault repair-derived --source-type discord` when historical metadata needs repair.
 
 Use `--full` to ignore normal completion cursors, re-fetch all available
 history, repair existing rows, and detect historical upstream deletions:
@@ -176,6 +189,57 @@ resolved and synced independently through the same importer as
   remain in metadata when a target was deleted, excluded by `--after`, or
   lives in another container, so the reply can appear as unavailable.
 - Attachment metadata and, within the configured cap, content-addressed bytes.
+
+Discord message metadata stores the complete nonzero message flag integer in
+`messages.metadata.discord_message_flags`. When that value contains `8192`,
+each attachment receives a `discord` object in
+`attachments.attachment_metadata`. A nonempty waveform remains the exact
+source string at `attachments.attachment_metadata.discord.waveform`, including
+strings that aren't valid base64. An empty waveform still produces
+`{"discord":{}}`. Existing `attachments.duration_ms`, MIME, and generic media
+type fields keep their current meanings.
+
+Run these queries against the archive database with a SQLite or PostgreSQL
+client. The `msgvault query` command reads the analytics cache, whose views
+don't include every archive column used here.
+
+For SQLite:
+
+```sql
+SELECT m.id AS message_id,
+       json_extract(m.metadata, '$.discord_message_flags') AS message_flags,
+       a.source_attachment_id,
+       json_extract(a.attachment_metadata, '$.discord.waveform') AS waveform,
+       a.duration_ms, a.mime_type, a.media_type
+FROM messages AS m
+JOIN attachments AS a ON a.message_id = m.id
+WHERE m.message_type = 'discord'
+  AND a.source_attachment_id LIKE 'discord:%';
+```
+
+For PostgreSQL, use the JSONB operators:
+
+```sql
+SELECT m.id AS message_id,
+       m.metadata->>'discord_message_flags' AS message_flags,
+       a.source_attachment_id,
+       a.attachment_metadata->'discord'->>'waveform' AS waveform,
+       a.duration_ms, a.mime_type, a.media_type
+FROM messages AS m
+JOIN attachments AS a ON a.message_id = m.id
+WHERE m.message_type = 'discord'
+  AND a.source_attachment_id LIKE 'discord:%';
+```
+
+On a fresh import or after a successful repair, NULL
+`attachment_metadata` means the current mapper emitted no Discord voice
+metadata for that row. A row imported before this change can also have NULL metadata because
+the old mapper omitted the field. Missing or undecodable raw data can leave a
+historical row unresolved. NULL alone therefore doesn't prove that a
+historical message is non-voice. Run `msgvault repair-derived --source-type
+discord`, or inspect the archived `discord_json`, before interpreting that
+value. Repair reads the archive and changes derived message and attachment
+metadata only. It doesn't download or rewrite media.
 
 Reaction metadata is stored as stable summaries such as `👍 12`, including
 custom emoji name, ID, animation state, and count. Version 1 does not fetch
@@ -239,7 +303,7 @@ credentials or call the Discord API.
 ## Attachment backfill and limits
 
 Retry attachment downloads after a transient failure or after raising
-`max_media_bytes`:
+`max_media_bytes` or `media_max_participants`:
 
 ```bash
 # Scan all archived Discord messages that have attachments.
@@ -278,10 +342,10 @@ msgvault query --format table "
 "
 ```
 
-In the [TUI](/usage/tui/), press `m` to switch to Texts mode. Discord channels
+In the [TUI](/docs/usage/tui/), press `m` to switch to Texts mode. Discord channels
 and threads appear alongside other chat conversations. The HTTP search and
 message endpoints use the same `message_type = discord` filter; see the
-[Web Server](/api-server/). If vector search is enabled, run
+[Web Server](/docs/api-server/). If vector search is enabled, run
 `msgvault embeddings build` after a manual sync or enable
 `[vector.embed.schedule].run_after_sync` for scheduled syncs.
 

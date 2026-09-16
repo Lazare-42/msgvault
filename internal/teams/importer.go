@@ -87,7 +87,13 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 	imp = imp.scopedToSync(src.ID, syncID)
 	defer func() {
 		if err != nil {
-			_ = imp.store.FailSync(syncID, err.Error())
+			blob, _ := state.Marshal()
+			_ = imp.store.FailSyncWithCheckpoint(syncID, err.Error(), &store.Checkpoint{
+				PageToken:         blob,
+				MessagesProcessed: sum.MessagesProcessed,
+				MessagesAdded:     sum.MessagesAdded,
+				ErrorsCount:       sum.Errors,
+			})
 		}
 	}()
 
@@ -104,6 +110,15 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 	}
 
 	blob, _ := state.Marshal()
+	// Errors can occur without any conversation reaching a checkpoint.
+	if err = imp.store.UpdateSyncCheckpoint(syncID, &store.Checkpoint{
+		PageToken:         blob,
+		MessagesProcessed: sum.MessagesProcessed,
+		MessagesAdded:     sum.MessagesAdded,
+		ErrorsCount:       sum.Errors,
+	}); err != nil {
+		return sum, err
+	}
 	if err = imp.store.CompleteSync(syncID, blob); err != nil {
 		return sum, err
 	}
@@ -196,6 +211,14 @@ func (imp *Importer) syncChats(ctx context.Context, sourceID, syncID int64, opts
 	if err != nil {
 		return err
 	}
+	selfChat, selfMembers, err := imp.selfChat(ctx, opts.Email)
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err != nil {
+		sum.Errors++
+	}
+	chats = append(chats, selfChat...)
 	total := len(chats)
 	for idx, ch := range chats {
 		if ctx.Err() != nil {
@@ -208,7 +231,7 @@ func (imp *Importer) syncChats(ctx context.Context, sourceID, syncID int64, opts
 		// Resolve chat members once for this chat.
 		// Member fetch failure is non-fatal; we proceed with empty toRecips
 		// rather than aborting the chat import.
-		members, merr := imp.client.ListChatMembers(ctx, ch.ID)
+		members, merr := imp.chatMembers(ctx, ch.ID, selfMembers)
 		// Only the roster's size and read outcome matter to media policy; the
 		// members are resolved below, where their display names are kept too.
 		roster := &memberRoster{memberCount: len(members), err: merr}
@@ -315,6 +338,51 @@ func (imp *Importer) syncChats(ctx context.Context, sourceID, syncID int64, opts
 		}
 	}
 	return nil
+}
+
+// selfChat reports the chat a user holds with themselves, which Graph does not
+// list under /me/chats, together with its roster. An empty result or a 404
+// means the thread is absent. Other probe errors are reported so a failed read
+// cannot silently omit the chat from the archive.
+//
+// Graph also rejects a members read on the thread, so the roster is taken from
+// a user-authored message in a bounded probe instead. System and application
+// messages do not identify the chat's sole member. A user sender carries the
+// same object ID a members read would have returned, preserving the participant
+// cache key that sender and mention resolution read. If the probe finds no
+// user, chatMembers leaves the roster unresolved so a later sync can retry it.
+func (imp *Importer) selfChat(ctx context.Context, email string) ([]Chat, []ChatMember, error) {
+	msgs, _, err := imp.client.ListChatMessages(ctx, SelfChatID, "", 50)
+	if errors.Is(err, errGraphNotFound) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(msgs) == 0 {
+		return nil, nil, nil
+	}
+	var members []ChatMember
+	for _, msg := range msgs {
+		if from := msg.From; from != nil && from.User != nil && from.User.ID != "" {
+			members = []ChatMember{{UserID: from.User.ID, DisplayName: from.User.DisplayName, Email: email}}
+			break
+		}
+	}
+	return []Chat{{ID: SelfChatID, ChatType: "oneOnOne"}}, members, nil
+}
+
+// chatMembers reads a chat's roster, using the roster selfChat already resolved
+// for the self chat. A roster reported as unreadable would archive the chat
+// with unknown membership and fail media policy closed against it.
+func (imp *Importer) chatMembers(ctx context.Context, chatID string, self []ChatMember) ([]ChatMember, error) {
+	if chatID == SelfChatID {
+		if len(self) == 0 {
+			return nil, errors.New("self-chat probe found no user identity")
+		}
+		return self, nil
+	}
+	return imp.client.ListChatMembers(ctx, chatID)
 }
 
 func (imp *Importer) syncChannels(ctx context.Context, sourceID, syncID int64, opts ImportOptions, state *SyncState, sum *ImportSummary) error {
@@ -1092,7 +1160,7 @@ func (imp *Importer) downloadInlineImages(ctx context.Context, messageID int64, 
 	policy := opts.MediaPolicy
 	maxBytes := policy.MaxBytes
 	if maxBytes <= 0 {
-		maxBytes = 100 << 20
+		maxBytes = attachmentpolicy.DefaultChatMaxBytes
 	}
 	policy.MaxBytes = maxBytes
 

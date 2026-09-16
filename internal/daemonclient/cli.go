@@ -16,12 +16,14 @@ import (
 
 	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
 	"go.kenn.io/msgvault/internal/accountops"
+	"go.kenn.io/msgvault/internal/apiprotocol"
 	"go.kenn.io/msgvault/internal/cacheops"
 	"go.kenn.io/msgvault/internal/collectionops"
 	"go.kenn.io/msgvault/internal/contentverify"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/identityops"
 	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/store"
 	apiclient "go.kenn.io/msgvault/pkg/client"
 	"go.kenn.io/msgvault/pkg/client/generated"
@@ -141,14 +143,14 @@ type CLIDeduplicatePlan struct {
 }
 
 type CLIDeduplicatePlanItem struct {
-	SourceID          int64
-	ScopeLabel        string
-	ScopeIsCollection bool
-	Stdout            string
-	DuplicateMessages int
-	BackfilledCount   int64
-	PlanFingerprint   string
-	NeedsConfirmation bool
+	SourceID             int64
+	ScopeLabel           string
+	ScopeIsCollection    bool
+	Stdout               string
+	DuplicateMessages    int
+	PendingBackfillCount int64
+	PlanFingerprint      string
+	NeedsConfirmation    bool
 }
 
 type CLIInitDB struct {
@@ -442,12 +444,14 @@ func (c *Client) RunCLISync(
 }
 
 const (
-	sourceIDSyncMinAPISchemaVersion   = "2.4.0"
-	searchDeletionMinAPISchemaVersion = "2.12.0"
+	sourceIDSyncMinAPISchemaVersion    = "2.4.0"
+	searchDeletionMinAPISchemaVersion  = "2.12.0"
+	deduplicatePlanMinAPISchemaVersion = "2.13.0"
+	repairMessageMinAPISchemaVersion   = "2.15.0"
 )
 
 func (c *Client) requireSourceIDSyncCapability(ctx context.Context) error {
-	version, err := c.daemonAPISchemaVersion(ctx)
+	version, err := c.APISchemaVersion(ctx)
 	if err != nil {
 		return fmt.Errorf("check daemon source-ID sync capability: %w", err)
 	}
@@ -460,7 +464,9 @@ func (c *Client) requireSourceIDSyncCapability(ctx context.Context) error {
 	return nil
 }
 
-func (c *Client) daemonAPISchemaVersion(ctx context.Context) (string, error) {
+// APISchemaVersion fetches the daemon API schema version, or an empty string
+// when the daemon does not report one.
+func (c *Client) APISchemaVersion(ctx context.Context) (string, error) {
 	resp, err := APIResponse(c, func(client *apiclient.Client) (*generated.GetHealthResp, error) {
 		return client.GetHealthWithResponse(ctx)
 	})
@@ -478,7 +484,7 @@ func (c *Client) daemonAPISchemaVersion(ctx context.Context) (string, error) {
 // requested additive HTTP contract. Missing and malformed versions fail
 // closed, as do health-probe errors.
 func (c *Client) SupportsAPISchemaVersion(ctx context.Context, minimum string) (bool, error) {
-	version, err := c.daemonAPISchemaVersion(ctx)
+	version, err := c.APISchemaVersion(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -514,6 +520,12 @@ func apiSchemaVersionAtLeast(version, minimum string) bool {
 	return true
 }
 
+// APISchemaVersionAtLeast reports whether version satisfies an additive API
+// contract minimum. Missing and malformed versions fail closed.
+func APISchemaVersionAtLeast(version, minimum string) bool {
+	return apiSchemaVersionAtLeast(version, minimum)
+}
+
 func (c *Client) RunCLIVerify(
 	ctx context.Context,
 	req CLIVerifyRequest,
@@ -535,6 +547,52 @@ func (c *Client) RunCLIRepairEncoding(
 	output func(stream, data string) error,
 ) error {
 	return c.runCLIStream(ctx, "/api/v1/cli/repair-encoding", "repair-encoding", nil, output)
+}
+
+// RunCLIRepairMessage repairs one Gmail message snapshot or audits stored
+// Gmail MIME through the dedicated generated endpoint. The explicit schema
+// probe is load-bearing: an older daemon must never receive a request that it
+// could reinterpret as a broader sync operation.
+func (c *Client) RunCLIRepairMessage(
+	ctx context.Context,
+	req generated.CLIRepairMessageRequest,
+	output func(stream, data string) error,
+) error {
+	return c.RunCLIRepairMessageWithPreflight(ctx, req, nil, output)
+}
+
+// RunCLIRepairMessageWithPreflight validates the daemon capability before
+// running the caller's credential preflight, then opens the dedicated repair
+// stream. Keeping that order inside the client prevents credential changes
+// when the selected daemon cannot execute the operation.
+func (c *Client) RunCLIRepairMessageWithPreflight(
+	ctx context.Context,
+	req generated.CLIRepairMessageRequest,
+	preflight func(context.Context) error,
+	output func(stream, data string) error,
+) error {
+	version, err := c.APISchemaVersion(ctx)
+	if err != nil {
+		return fmt.Errorf("check daemon repair-message capability: %w", err)
+	}
+	if !apiSchemaVersionAtLeast(version, repairMessageMinAPISchemaVersion) {
+		return fmt.Errorf(
+			"repair-message requires daemon API schema %s or newer (daemon reports %q)",
+			repairMessageMinAPISchemaVersion, version,
+		)
+	}
+	if preflight != nil {
+		if err := preflight(ctx); err != nil {
+			return err
+		}
+	}
+	return c.runCLIStream(
+		ctx,
+		"/api/v1/cli/repair-message",
+		"repair-message",
+		&generated.RepairMessageCLIRequestOptions{Body: &req},
+		output,
+	)
 }
 
 func (c *Client) RunCLICommand(
@@ -683,7 +741,7 @@ func (c *Client) CreateCLIDeletionManifest(
 		return nil, errors.New("missing deletion manifest")
 	}
 	if manifest.Version == 2 {
-		version, err := c.daemonAPISchemaVersion(ctx)
+		version, err := c.APISchemaVersion(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("check daemon deletion manifest capability: %w", err)
 		}
@@ -716,12 +774,25 @@ func (c *Client) PlanCLIDeduplicate(
 	ctx context.Context,
 	req CLIDeduplicatePlanRequest,
 ) (*CLIDeduplicatePlan, error) {
+	version, err := c.APISchemaVersion(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("check daemon deduplicate-plan capability: %w", err)
+	}
+	if !apiSchemaVersionAtLeast(version, deduplicatePlanMinAPISchemaVersion) {
+		return nil, fmt.Errorf(
+			"deduplicate planning requires daemon API schema %s or newer (daemon reports %q)",
+			deduplicatePlanMinAPISchemaVersion, version,
+		)
+	}
 	body := generated.PlanCLIDeduplicateBody{
 		Account:                    optionalString(req.Account),
 		Collection:                 optionalString(req.Collection),
 		Prefer:                     optionalString(req.Prefer),
 		ContentHash:                optionalBool(req.ContentHash),
 		DeleteDupsFromSourceServer: optionalBool(req.DeleteDupsFromSourceServer),
+		PlanProtocol: generated.CLIDeduplicatePlanRequestPlanProtocol(
+			apiprotocol.DeduplicatePlanProtocol,
+		),
 	}
 	resp, err := CLIResponse(c, func(client *apiclient.Client) (*generated.PlanCLIDeduplicateResp, error) {
 		return client.PlanCLIDeduplicateWithResponse(ctx, &generated.PlanCLIDeduplicateRequestOptions{Body: &body})
@@ -818,8 +889,11 @@ func (c *Client) GetCLIStats(
 }
 
 func (c *Client) GetCLISearch(ctx context.Context, req CLISearchRequest) (*CLISearch, error) {
+	if err := c.requireListIDCapability(ctx, search.Parse(req.Query), query.MessageFilter{}); err != nil {
+		return nil, err
+	}
 	if req.DeletionScope != "" {
-		version, err := c.daemonAPISchemaVersion(ctx)
+		version, err := c.APISchemaVersion(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("check daemon search deletion-scope capability: %w", err)
 		}
@@ -846,13 +920,20 @@ func (c *Client) GetCLISearch(ctx context.Context, req CLISearchRequest) (*CLISe
 	if err != nil {
 		return nil, err
 	}
-	return cliSearchFromGenerated(resp.JSON200), nil
+	result := cliSearchFromGenerated(resp.JSON200)
+	for i := range result.Results {
+		result.Results[i].WebURL = c.messageWebURL(result.Results[i].ID)
+	}
+	return result, nil
 }
 
 func (c *Client) GetCLIHybridSearch(
 	ctx context.Context,
 	req CLIHybridSearchRequest,
 ) (*CLIHybridSearch, error) {
+	if err := c.requireListIDCapability(ctx, search.Parse(req.Query), req.Filter); err != nil {
+		return nil, err
+	}
 	resp, err := APIResponse(c, func(client *apiclient.Client) (*generated.SearchMessagesResp, error) {
 		return client.SearchMessagesWithResponse(ctx, &generated.SearchMessagesRequestOptions{
 			Query: &generated.SearchMessagesQuery{
@@ -870,8 +951,10 @@ func (c *Client) GetCLIHybridSearch(
 				Recipient:       optionalString(req.Filter.Recipient),
 				Domain:          optionalString(req.Filter.Domain),
 				Label:           optionalString(req.Filter.Label),
+				ListID:          optionalString(req.Filter.ListID),
 				TimePeriod:      optionalString(req.Filter.TimeRange.Period),
 				TimeGranularity: optionalString(timeGranularityToString(req.Filter.TimeRange.Granularity)),
+				ConversationID:  req.Filter.ConversationID,
 				SourceID:        req.Filter.SourceID,
 				AttachmentsOnly: optionalBool(req.Filter.WithAttachmentsOnly),
 				After:           optionalTimeRFC3339(req.Filter.After),
@@ -890,7 +973,14 @@ func (c *Client) GetCLIHybridSearch(
 	if err != nil {
 		return nil, err
 	}
-	return cliHybridSearchFromGenerated(hybridResp)
+	result, err := cliHybridSearchFromGenerated(hybridResp)
+	if err != nil {
+		return nil, err
+	}
+	for i := range result.Results {
+		result.Results[i].Message.WebURL = c.messageWebURL(result.Results[i].Message.ID)
+	}
+	return result, nil
 }
 
 func (c *Client) FindSimilarMessages(
@@ -926,7 +1016,7 @@ func (c *Client) FindSimilarMessages(
 			Fingerprint: resp.JSON200.Generation.Fingerprint,
 			State:       resp.JSON200.Generation.State,
 		},
-		Messages: messageSummariesFromGenerated(resp.JSON200.Messages),
+		Messages: c.messageSummariesWithURLs(resp.JSON200.Messages),
 	}, nil
 }
 
@@ -1222,7 +1312,11 @@ func (c *Client) GetCLIMessage(ctx context.Context, id string) (*query.MessageDe
 	if err != nil {
 		return nil, err
 	}
-	return cliMessageDetailFromGenerated(resp.JSON200), nil
+	message := cliMessageDetailFromGenerated(resp.JSON200)
+	if message != nil {
+		message.WebURL = c.messageWebURL(message.ID)
+	}
+	return message, nil
 }
 
 func (c *Client) GetCLIMessageRaw(ctx context.Context, id string) ([]byte, string, error) {
@@ -1363,4 +1457,21 @@ func cliAccountUpdateResultFromGenerated(result *generated.UpdateResult) *CLIAcc
 		Email:       result.Email,
 		DisplayName: result.DisplayName,
 	}
+}
+
+// messageWebURL opens the selected daemon's direct message route.
+// Message IDs are local to that daemon.
+func (c *Client) messageWebURL(id int64) string {
+	if id <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s/messages/%d", c.baseURL, id)
+}
+
+func (c *Client) messageSummariesWithURLs(messages []generated.MessageSummary) []query.MessageSummary {
+	result := messageSummariesFromGenerated(messages)
+	for i := range result {
+		result[i].WebURL = c.messageWebURL(result[i].ID)
+	}
+	return result
 }

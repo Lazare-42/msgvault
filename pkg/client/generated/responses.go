@@ -35,6 +35,14 @@ type AddAccountResponseJSON = StatusMessageResponse
 
 type AddAccountErrorResponse = ErrorResponse
 
+type ListAgentTokensResponse = AgentTokenListResponse
+
+type ListAgentTokensErrorResponse = ErrorResponse
+
+type IssueAgentTokenResponse = AgentTokenIssueResponse
+
+type IssueAgentTokenErrorResponse = ErrorResponse
+
 type GetAggregatesResponse = AggregateResponse
 
 type GetAggregatesErrorResponse = ErrorResponse
@@ -54,14 +62,6 @@ type GetAttachmentContentErrorResponseJSON404 = ErrorResponse
 type GetAttachmentContentErrorResponseJSON500 = ErrorResponse
 
 type GetAttachmentContentErrorResponseJSON503 = ErrorResponse
-
-type GetAttachmentTextResponse = OCRResult
-
-type GetAttachmentTextErrorResponse = ErrorResponse
-
-type RequestAttachmentTextResponse = OCRResult
-
-type RequestAttachmentTextErrorResponse = ErrorResponse
 
 type GetAttachmentResponse = AttachmentInfo
 
@@ -189,6 +189,18 @@ type ResolveCardDAVConflictErrorResponseJSON502 = ErrorResponse
 
 type ResolveCardDAVConflictErrorResponseJSON503 = ErrorResponse
 
+type BeginGoogleCardDAVAuthorizationResponse = CardDAVGoogleAuthorizeResponse
+
+type BeginGoogleCardDAVAuthorizationErrorResponse = ErrorResponse
+
+type BeginGoogleCardDAVAuthorizationErrorResponseJSON = ErrorResponse
+
+type CompleteGoogleCardDAVAuthorizationResponse = StatusMessageResponse
+
+type CompleteGoogleCardDAVAuthorizationErrorResponse = ErrorResponse
+
+type CompleteGoogleCardDAVAuthorizationErrorResponseJSON = ErrorResponse
+
 type UnpublishCardDAVPersonResponse = CardDAVPublicationResponse
 
 type UnpublishCardDAVPersonErrorResponse = ErrorResponse
@@ -221,11 +233,59 @@ type PublishCardDAVPersonErrorResponseJSON = ErrorResponse
 
 type PublishCardDAVPersonErrorResponseJSON409 = ErrorResponse
 
+type PublishCardDAVPersonErrorResponseJSON413 = ErrorResponse
+
 type PublishCardDAVPersonErrorResponseJSON500 = ErrorResponse
 
 type PublishCardDAVPersonErrorResponseJSON502 = ErrorResponse
 
 type PublishCardDAVPersonErrorResponseJSON503 = ErrorResponse
+
+type ApproveCardDAVPublicationResponse = CardDAVPublicationResponse
+
+type ApproveCardDAVPublicationErrorResponse = ErrorResponse
+
+type ApproveCardDAVPublicationErrorResponseJSON = ErrorResponse
+
+type ApproveCardDAVPublicationErrorResponseJSON409 = ErrorResponse
+
+type ApproveCardDAVPublicationErrorResponseJSON413 = ErrorResponse
+
+type ApproveCardDAVPublicationErrorResponseJSON500 = ErrorResponse
+
+type ApproveCardDAVPublicationErrorResponseJSON502 = ErrorResponse
+
+type ApproveCardDAVPublicationErrorResponseJSON503 = ErrorResponse
+
+type PreviewCardDAVPublicationResponse = CardDAVPublicationPreviewResponse
+
+type PreviewCardDAVPublicationErrorResponse = ErrorResponse
+
+type PreviewCardDAVPublicationErrorResponseJSON = ErrorResponse
+
+type PreviewCardDAVPublicationErrorResponseJSON409 = ErrorResponse
+
+type PreviewCardDAVPublicationErrorResponseJSON413 = ErrorResponse
+
+type PreviewCardDAVPublicationErrorResponseJSON500 = ErrorResponse
+
+type PreviewCardDAVPublicationErrorResponseJSON502 = ErrorResponse
+
+type PreviewCardDAVPublicationErrorResponseJSON503 = ErrorResponse
+
+type ListCardDAVRunsResponse = CardDAVRunsResponse
+
+type ListCardDAVRunsErrorResponse = ErrorResponse
+
+type ListCardDAVRunsErrorResponseJSON = ErrorResponse
+
+type ListCardDAVRunsErrorResponseJSON503 = ErrorResponse
+
+type GetCardDAVStatusResponse = CardDAVStatusResponse
+
+type GetCardDAVStatusErrorResponse = ErrorResponse
+
+type GetCardDAVStatusErrorResponseJSON = ErrorResponse
 
 type SyncCardDAVResponse = SyncResult
 
@@ -451,6 +511,10 @@ type RepairEncodingCLIResponse = []byte
 
 type RepairEncodingCLIErrorResponse = ErrorResponse
 
+type RepairMessageCLIResponse = []byte
+
+type RepairMessageCLIErrorResponse = ErrorResponse
+
 type RunCLIResponse = []byte
 
 type RunCLIErrorResponse = ErrorResponse
@@ -600,6 +664,16 @@ type GetDocumentIndexStatusErrorResponseJSON = ErrorResponse
 type GetDocumentIndexStatusErrorResponseJSON429 = ErrorResponse
 
 type GetDocumentIndexStatusErrorResponseJSON503 = ErrorResponse
+
+type GetCurrentDocumentIndexStatusResponse = DocumentIndexStatusResponse
+
+type GetCurrentDocumentIndexStatusErrorResponse = ErrorResponse
+
+type GetCurrentDocumentIndexStatusErrorResponseJSON = ErrorResponse
+
+type GetCurrentDocumentIndexStatusErrorResponseJSON429 = ErrorResponse
+
+type GetCurrentDocumentIndexStatusErrorResponseJSON503 = ErrorResponse
 
 type GetDocumentVectorStatusResponse = DocumentVectorOperationsResponse
 
@@ -1201,10 +1275,6 @@ func (s *SearchFilesErrorResponseJSON503) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-type SearchAttachmentTextResponse = OcrSearchResponse
-
-type SearchAttachmentTextErrorResponse = ErrorResponse
-
 type GetFileResponse = FileMetadataResponse
 
 type GetFileErrorResponse = ErrorResponse
@@ -1335,6 +1405,32 @@ type ImportMeetingResponseJSON = MeetingImportResponse
 
 type ImportMeetingErrorResponse = ErrorResponse
 
+type CreateImportJobResponse = ImportJobResponse
+
+type CreateImportJobErrorResponse = ErrorResponse
+
+type CreateImportJobErrorResponseJSON = ErrorResponse
+
+type CreateImportJobErrorResponseJSON404 = ErrorResponse
+
+type CreateImportJobErrorResponseJSON409 = ErrorResponse
+
+type CreateImportJobErrorResponseJSON413 = ErrorResponse
+
+type CreateImportJobErrorResponseJSON415 = ErrorResponse
+
+type CreateImportJobErrorResponseJSON422 = ErrorResponse
+
+type CreateImportJobErrorResponseJSON500 = ErrorResponse
+
+type CreateImportJobErrorResponseJSON503 = ErrorResponse
+
+type GetImportJobResponse = ImportJobResponse
+
+type GetImportJobErrorResponse = ErrorResponse
+
+type GetImportJobErrorResponseJSON = ErrorResponse
+
 type SearchIntegrationTasksResponse = TaskSearchResponse
 
 type SearchIntegrationTasksErrorResponse = ErrorResponse
@@ -1419,9 +1515,29 @@ type GetVisualAttachmentStatusResponse = Status
 
 type GetVisualAttachmentStatusErrorResponse = ErrorResponse
 
-type GetOCRStatusResponse = OCRRuntimeStatus
+type ListOperationRunsResponse = OperationRunsResponse
 
-type GetOCRStatusErrorResponse = ErrorResponse
+type ListOperationRunsErrorResponse = OperationErrorResponse
+
+type ListOperationRunsErrorResponseJSON = OperationErrorResponse
+
+type ListOperationRunsErrorResponseJSON500 = OperationErrorResponse
+
+type ListOperationRunsErrorResponseJSON503 = OperationErrorResponse
+
+type GetOperationRunResponse = OperationRunDetail
+
+type GetOperationRunErrorResponse = OperationErrorResponse
+
+type GetOperationRunErrorResponseJSON = OperationErrorResponse
+
+type GetOperationRunErrorResponseJSON500 = OperationErrorResponse
+
+type GetOperationRunErrorResponseJSON503 = OperationErrorResponse
+
+type GetOperationStatusResponse = OperationStatusResponse
+
+type GetOperationStatusErrorResponse = OperationErrorResponse
 
 type ListOrganizationsResponse = OrganizationsResponse
 
@@ -1837,6 +1953,12 @@ type CreatePersonErrorResponse = ErrorResponse
 
 type CreatePersonErrorResponseJSON = ErrorResponse
 
+type ListDirectoryPeopleResponse = DirectoryPeopleResponse
+
+type ListDirectoryPeopleErrorResponse = ErrorResponse
+
+type ListDirectoryPeopleErrorResponseJSON = ErrorResponse
+
 type SearchPeopleResponse = PersonSearchResponse
 
 type SearchPeopleErrorResponse = ErrorResponse
@@ -1896,6 +2018,58 @@ type SetPersonAttributeErrorResponseJSON = ErrorResponse
 type SetPersonAttributeErrorResponseJSON409 = PersonAttributeConflictResponse
 
 type SetPersonAttributeErrorResponseJSON503 = ErrorResponse
+
+type GetPersonBriefResponse = PersonBrief
+
+type GetPersonBriefErrorResponse = ErrorResponse
+
+type GetPersonBriefErrorResponseJSON = ErrorResponse
+
+type GetPersonBriefErrorResponseJSON503 = ErrorResponse
+
+type GetPersonBriefEnrollmentResponse = PersonBriefEnrollment
+
+type GetPersonBriefEnrollmentErrorResponse = ErrorResponse
+
+type GetPersonBriefEnrollmentErrorResponseJSON = ErrorResponse
+
+type GetPersonBriefEnrollmentErrorResponseJSON503 = ErrorResponse
+
+type SetPersonBriefEnrollmentResponse = PersonBriefEnrollment
+
+type SetPersonBriefEnrollmentErrorResponse = ErrorResponse
+
+type SetPersonBriefEnrollmentErrorResponseJSON = ErrorResponse
+
+type SetPersonBriefEnrollmentErrorResponseJSON409 = ErrorResponse
+
+type SetPersonBriefEnrollmentErrorResponseJSON503 = ErrorResponse
+
+type GeneratePersonBriefResponse = PersonBriefRun
+
+type GeneratePersonBriefErrorResponse = ErrorResponse
+
+type GeneratePersonBriefErrorResponseJSON = ErrorResponse
+
+type GeneratePersonBriefErrorResponseJSON409 = ErrorResponse
+
+type GeneratePersonBriefErrorResponseJSON503 = ErrorResponse
+
+type RejectPersonBriefResponse = PersonBrief
+
+type RejectPersonBriefErrorResponse = ErrorResponse
+
+type RejectPersonBriefErrorResponseJSON = ErrorResponse
+
+type RejectPersonBriefErrorResponseJSON503 = ErrorResponse
+
+type ListPersonBriefVersionsResponse = PersonBriefVersionsResponse
+
+type ListPersonBriefVersionsErrorResponse = ErrorResponse
+
+type ListPersonBriefVersionsErrorResponseJSON = ErrorResponse
+
+type ListPersonBriefVersionsErrorResponseJSON503 = ErrorResponse
 
 type GetPersonContactStateResponse = ContactState
 
@@ -2066,6 +2240,14 @@ type ListPersonMergesErrorResponse = ErrorResponse
 type ListPersonMergesErrorResponseJSON = ErrorResponse
 
 type ListPersonMergesErrorResponseJSON503 = ErrorResponse
+
+type GetPersonNetworkResponse = PersonNetwork
+
+type GetPersonNetworkErrorResponse = ErrorResponse
+
+type GetPersonNetworkErrorResponseJSON = ErrorResponse
+
+type GetPersonNetworkErrorResponseJSON503 = ErrorResponse
 
 type AppendPersonNoteResponse = PersonAttributeWrite
 
@@ -2457,6 +2639,52 @@ type PatchSavedViewErrorResponseJSON428 = ErrorResponse
 
 type PatchSavedViewErrorResponseJSON503 = ErrorResponse
 
+type RunSavedViewResponseJSON = RunSavedViewResponse
+
+type RunSavedViewErrorResponse = ErrorResponse
+
+type RunSavedViewErrorResponseJSON = ErrorResponse
+
+type RunSavedViewErrorResponseJSON409 = ErrorResponse
+
+type RunSavedViewErrorResponseJSON503 struct {
+	RunSavedView_ErrorResponse_503_AnyOf *RunSavedView_ErrorResponse_503_AnyOf `json:"-"`
+}
+
+func (r RunSavedViewErrorResponseJSON503) MarshalJSON() ([]byte, error) {
+	var parts []json.RawMessage
+
+	{
+		b, err := runtime.MarshalJSON(r.RunSavedView_ErrorResponse_503_AnyOf)
+		if err != nil {
+			return nil, fmt.Errorf("RunSavedView_ErrorResponse_503_AnyOf marshal: %w", err)
+		}
+		parts = append(parts, b)
+	}
+
+	return runtime.CoalesceOrMerge(parts...)
+}
+
+func (r *RunSavedViewErrorResponseJSON503) UnmarshalJSON(data []byte) error {
+	trim := bytes.TrimSpace(data)
+	if bytes.Equal(trim, []byte("null")) {
+		return nil
+	}
+	if len(trim) == 0 {
+		return fmt.Errorf("empty JSON input")
+	}
+
+	if r.RunSavedView_ErrorResponse_503_AnyOf == nil {
+		r.RunSavedView_ErrorResponse_503_AnyOf = &RunSavedView_ErrorResponse_503_AnyOf{}
+	}
+
+	if err := runtime.UnmarshalJSON(data, r.RunSavedView_ErrorResponse_503_AnyOf); err != nil {
+		return fmt.Errorf("RunSavedView_ErrorResponse_503_AnyOf unmarshal: %w", err)
+	}
+
+	return nil
+}
+
 type GetSchedulerStatusResponse = SchedulerStatusResponse
 
 type GetSchedulerStatusErrorResponse = ErrorResponse
@@ -2585,6 +2813,44 @@ type PatchSettingsErrorResponseJSON422 = ErrorResponse
 
 type PatchSettingsErrorResponseJSON428 = ErrorResponse
 
+type PutSettingsPersonEnrichmentProviderResponse = SettingsResponse
+
+type PutSettingsPersonEnrichmentProviderErrorResponse = ErrorResponse
+
+type PutSettingsPersonEnrichmentProviderErrorResponseJSON = ErrorResponse
+
+type PutSettingsPersonEnrichmentProviderErrorResponseJSON409 = ErrorResponse
+
+type PutSettingsPersonEnrichmentProviderErrorResponseJSON412 = ErrorResponse
+
+type PutSettingsPersonEnrichmentProviderErrorResponseJSON422 = ErrorResponse
+
+type PutSettingsPersonEnrichmentProviderErrorResponseJSON428 = ErrorResponse
+
+type DeleteSettingsProviderCredentialResponse = ProviderCredentialResponse
+
+type DeleteSettingsProviderCredentialErrorResponse = ErrorResponse
+
+type DeleteSettingsProviderCredentialErrorResponseJSON = ErrorResponse
+
+type DeleteSettingsProviderCredentialErrorResponseJSON412 = ErrorResponse
+
+type DeleteSettingsProviderCredentialErrorResponseJSON422 = ErrorResponse
+
+type DeleteSettingsProviderCredentialErrorResponseJSON428 = ErrorResponse
+
+type PutSettingsProviderCredentialResponse = ProviderCredentialResponse
+
+type PutSettingsProviderCredentialErrorResponse = ErrorResponse
+
+type PutSettingsProviderCredentialErrorResponseJSON = ErrorResponse
+
+type PutSettingsProviderCredentialErrorResponseJSON412 = ErrorResponse
+
+type PutSettingsProviderCredentialErrorResponseJSON422 = ErrorResponse
+
+type PutSettingsProviderCredentialErrorResponseJSON428 = ErrorResponse
+
 type ListSourceStatusResponse = SourceStatusResponse
 
 type ListSourceStatusErrorResponse = ErrorResponse
@@ -2672,6 +2938,26 @@ type AddAccountResp struct {
 	JSON201      *AddAccountResponseJSON
 }
 
+type ListAgentTokensResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *ListAgentTokensResponse
+}
+
+type IssueAgentTokenResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON201      *IssueAgentTokenResponse
+}
+
+type RevokeAgentTokenResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+}
+
 type GetAggregatesResp struct {
 	HTTPResponse *http.Response
 	Body         []byte
@@ -2695,20 +2981,6 @@ type GetAttachmentContentResp struct {
 	JSON404      *GetAttachmentContentErrorResponseJSON404
 	JSON500      *GetAttachmentContentErrorResponseJSON500
 	JSON503      *GetAttachmentContentErrorResponseJSON503
-}
-
-type GetAttachmentTextResp struct {
-	HTTPResponse *http.Response
-	Body         []byte
-	StatusCode   int
-	JSON200      *GetAttachmentTextResponse
-}
-
-type RequestAttachmentTextResp struct {
-	HTTPResponse *http.Response
-	Body         []byte
-	StatusCode   int
-	JSON202      *RequestAttachmentTextResponse
 }
 
 type GetAttachmentResp struct {
@@ -2916,6 +3188,34 @@ type ResolveCardDAVConflictResp struct {
 	Headers503   *ResolveCardDAVConflictResp503Headers
 }
 
+type BeginGoogleCardDAVAuthorizationResp503Headers struct {
+	RetryAfter string `header:"Retry-After"`
+}
+
+type BeginGoogleCardDAVAuthorizationResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *BeginGoogleCardDAVAuthorizationResponse
+	JSON400      *BeginGoogleCardDAVAuthorizationErrorResponse
+	JSON503      *BeginGoogleCardDAVAuthorizationErrorResponseJSON
+	Headers503   *BeginGoogleCardDAVAuthorizationResp503Headers
+}
+
+type CompleteGoogleCardDAVAuthorizationResp503Headers struct {
+	RetryAfter string `header:"Retry-After"`
+}
+
+type CompleteGoogleCardDAVAuthorizationResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *CompleteGoogleCardDAVAuthorizationResponse
+	JSON400      *CompleteGoogleCardDAVAuthorizationErrorResponse
+	JSON503      *CompleteGoogleCardDAVAuthorizationErrorResponseJSON
+	Headers503   *CompleteGoogleCardDAVAuthorizationResp503Headers
+}
+
 type UnpublishCardDAVPersonResp503Headers struct {
 	RetryAfter string `header:"Retry-After"`
 }
@@ -2962,10 +3262,73 @@ type PublishCardDAVPersonResp struct {
 	JSON400      *PublishCardDAVPersonErrorResponse
 	JSON404      *PublishCardDAVPersonErrorResponseJSON
 	JSON409      *PublishCardDAVPersonErrorResponseJSON409
+	JSON413      *PublishCardDAVPersonErrorResponseJSON413
 	JSON500      *PublishCardDAVPersonErrorResponseJSON500
 	JSON502      *PublishCardDAVPersonErrorResponseJSON502
 	JSON503      *PublishCardDAVPersonErrorResponseJSON503
 	Headers503   *PublishCardDAVPersonResp503Headers
+}
+
+type ApproveCardDAVPublicationResp503Headers struct {
+	RetryAfter string `header:"Retry-After"`
+}
+
+type ApproveCardDAVPublicationResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *ApproveCardDAVPublicationResponse
+	JSON400      *ApproveCardDAVPublicationErrorResponse
+	JSON404      *ApproveCardDAVPublicationErrorResponseJSON
+	JSON409      *ApproveCardDAVPublicationErrorResponseJSON409
+	JSON413      *ApproveCardDAVPublicationErrorResponseJSON413
+	JSON500      *ApproveCardDAVPublicationErrorResponseJSON500
+	JSON502      *ApproveCardDAVPublicationErrorResponseJSON502
+	JSON503      *ApproveCardDAVPublicationErrorResponseJSON503
+	Headers503   *ApproveCardDAVPublicationResp503Headers
+}
+
+type PreviewCardDAVPublicationResp503Headers struct {
+	RetryAfter string `header:"Retry-After"`
+}
+
+type PreviewCardDAVPublicationResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *PreviewCardDAVPublicationResponse
+	JSON400      *PreviewCardDAVPublicationErrorResponse
+	JSON404      *PreviewCardDAVPublicationErrorResponseJSON
+	JSON409      *PreviewCardDAVPublicationErrorResponseJSON409
+	JSON413      *PreviewCardDAVPublicationErrorResponseJSON413
+	JSON500      *PreviewCardDAVPublicationErrorResponseJSON500
+	JSON502      *PreviewCardDAVPublicationErrorResponseJSON502
+	JSON503      *PreviewCardDAVPublicationErrorResponseJSON503
+	Headers503   *PreviewCardDAVPublicationResp503Headers
+}
+
+type ListCardDAVRunsResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *ListCardDAVRunsResponse
+	JSON400      *ListCardDAVRunsErrorResponse
+	JSON500      *ListCardDAVRunsErrorResponseJSON
+	JSON503      *ListCardDAVRunsErrorResponseJSON503
+}
+
+type GetCardDAVStatusResp503Headers struct {
+	RetryAfter string `header:"Retry-After"`
+}
+
+type GetCardDAVStatusResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *GetCardDAVStatusResponse
+	JSON500      *GetCardDAVStatusErrorResponse
+	JSON503      *GetCardDAVStatusErrorResponseJSON
+	Headers503   *GetCardDAVStatusResp503Headers
 }
 
 type SyncCardDAVResp503Headers struct {
@@ -3239,6 +3602,12 @@ type RepairEncodingCLIResp struct {
 	StatusCode   int
 }
 
+type RepairMessageCLIResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+}
+
 type RunCLIResp struct {
 	HTTPResponse *http.Response
 	Body         []byte
@@ -3416,6 +3785,17 @@ type GetDocumentIndexStatusResp struct {
 	JSON403      *GetDocumentIndexStatusErrorResponseJSON
 	JSON429      *GetDocumentIndexStatusErrorResponseJSON429
 	JSON503      *GetDocumentIndexStatusErrorResponseJSON503
+}
+
+type GetCurrentDocumentIndexStatusResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *GetCurrentDocumentIndexStatusResponse
+	JSON400      *GetCurrentDocumentIndexStatusErrorResponse
+	JSON403      *GetCurrentDocumentIndexStatusErrorResponseJSON
+	JSON429      *GetCurrentDocumentIndexStatusErrorResponseJSON429
+	JSON503      *GetCurrentDocumentIndexStatusErrorResponseJSON503
 }
 
 type GetDocumentVectorStatusResp struct {
@@ -3640,13 +4020,6 @@ type SearchFilesResp struct {
 	JSON503      *SearchFilesErrorResponseJSON503
 }
 
-type SearchAttachmentTextResp struct {
-	HTTPResponse *http.Response
-	Body         []byte
-	StatusCode   int
-	JSON200      *SearchAttachmentTextResponse
-}
-
 type GetFileResp struct {
 	HTTPResponse *http.Response
 	Body         []byte
@@ -3721,6 +4094,31 @@ type ImportMeetingResp struct {
 	StatusCode   int
 	JSON200      *ImportMeetingResponse
 	JSON201      *ImportMeetingResponseJSON
+}
+
+type CreateImportJobResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON202      *CreateImportJobResponse
+	JSON400      *CreateImportJobErrorResponse
+	JSON401      *CreateImportJobErrorResponseJSON
+	JSON404      *CreateImportJobErrorResponseJSON404
+	JSON409      *CreateImportJobErrorResponseJSON409
+	JSON413      *CreateImportJobErrorResponseJSON413
+	JSON415      *CreateImportJobErrorResponseJSON415
+	JSON422      *CreateImportJobErrorResponseJSON422
+	JSON500      *CreateImportJobErrorResponseJSON500
+	JSON503      *CreateImportJobErrorResponseJSON503
+}
+
+type GetImportJobResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *GetImportJobResponse
+	JSON401      *GetImportJobErrorResponse
+	JSON404      *GetImportJobErrorResponseJSON
 }
 
 type SearchIntegrationTasksResp struct {
@@ -3852,11 +4250,33 @@ type GetVisualAttachmentStatusResp struct {
 	JSON200      *GetVisualAttachmentStatusResponse
 }
 
-type GetOCRStatusResp struct {
+type ListOperationRunsResp struct {
 	HTTPResponse *http.Response
 	Body         []byte
 	StatusCode   int
-	JSON200      *GetOCRStatusResponse
+	JSON200      *ListOperationRunsResponse
+	JSON400      *ListOperationRunsErrorResponse
+	JSON409      *ListOperationRunsErrorResponseJSON
+	JSON500      *ListOperationRunsErrorResponseJSON500
+	JSON503      *ListOperationRunsErrorResponseJSON503
+}
+
+type GetOperationRunResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *GetOperationRunResponse
+	JSON400      *GetOperationRunErrorResponse
+	JSON404      *GetOperationRunErrorResponseJSON
+	JSON500      *GetOperationRunErrorResponseJSON500
+	JSON503      *GetOperationRunErrorResponseJSON503
+}
+
+type GetOperationStatusResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *GetOperationStatusResponse
 }
 
 type ListOrganizationsResp struct {
@@ -4126,6 +4546,15 @@ type CreatePersonResp struct {
 	JSON503      *CreatePersonErrorResponseJSON
 }
 
+type ListDirectoryPeopleResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *ListDirectoryPeopleResponse
+	JSON400      *ListDirectoryPeopleErrorResponse
+	JSON503      *ListDirectoryPeopleErrorResponseJSON
+}
+
 type SearchPeopleResp struct {
 	HTTPResponse *http.Response
 	Body         []byte
@@ -4206,6 +4635,68 @@ type SetPersonAttributeResp struct {
 	JSON404      *SetPersonAttributeErrorResponseJSON
 	JSON409      *SetPersonAttributeErrorResponseJSON409
 	JSON503      *SetPersonAttributeErrorResponseJSON503
+}
+
+type GetPersonBriefResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *GetPersonBriefResponse
+	JSON400      *GetPersonBriefErrorResponse
+	JSON404      *GetPersonBriefErrorResponseJSON
+	JSON503      *GetPersonBriefErrorResponseJSON503
+}
+
+type GetPersonBriefEnrollmentResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *GetPersonBriefEnrollmentResponse
+	JSON400      *GetPersonBriefEnrollmentErrorResponse
+	JSON404      *GetPersonBriefEnrollmentErrorResponseJSON
+	JSON503      *GetPersonBriefEnrollmentErrorResponseJSON503
+}
+
+type SetPersonBriefEnrollmentResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *SetPersonBriefEnrollmentResponse
+	JSON400      *SetPersonBriefEnrollmentErrorResponse
+	JSON404      *SetPersonBriefEnrollmentErrorResponseJSON
+	JSON409      *SetPersonBriefEnrollmentErrorResponseJSON409
+	JSON503      *SetPersonBriefEnrollmentErrorResponseJSON503
+}
+
+type GeneratePersonBriefResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *GeneratePersonBriefResponse
+	JSON400      *GeneratePersonBriefErrorResponse
+	JSON404      *GeneratePersonBriefErrorResponseJSON
+	JSON409      *GeneratePersonBriefErrorResponseJSON409
+	JSON503      *GeneratePersonBriefErrorResponseJSON503
+}
+
+type RejectPersonBriefResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *RejectPersonBriefResponse
+	JSON400      *RejectPersonBriefErrorResponse
+	JSON404      *RejectPersonBriefErrorResponseJSON
+	JSON503      *RejectPersonBriefErrorResponseJSON503
+}
+
+type ListPersonBriefVersionsResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *ListPersonBriefVersionsResponse
+	JSON400      *ListPersonBriefVersionsErrorResponse
+	JSON404      *ListPersonBriefVersionsErrorResponseJSON
+	JSON503      *ListPersonBriefVersionsErrorResponseJSON503
 }
 
 type GetPersonContactStateResp struct {
@@ -4356,6 +4847,16 @@ type ListPersonMergesResp struct {
 	JSON404      *ListPersonMergesErrorResponse
 	JSON500      *ListPersonMergesErrorResponseJSON
 	JSON503      *ListPersonMergesErrorResponseJSON503
+}
+
+type GetPersonNetworkResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *GetPersonNetworkResponse
+	JSON400      *GetPersonNetworkErrorResponse
+	JSON404      *GetPersonNetworkErrorResponseJSON
+	JSON503      *GetPersonNetworkErrorResponseJSON503
 }
 
 type AppendPersonNoteResp struct {
@@ -4761,6 +5262,17 @@ type PatchSavedViewResp struct {
 	JSON503      *PatchSavedViewErrorResponseJSON503
 }
 
+type RunSavedViewResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *RunSavedViewResponseJSON
+	JSON400      *RunSavedViewErrorResponse
+	JSON404      *RunSavedViewErrorResponseJSON
+	JSON409      *RunSavedViewErrorResponseJSON409
+	JSON503      *RunSavedViewErrorResponseJSON503
+}
+
 type GetSchedulerStatusResp struct {
 	HTTPResponse *http.Response
 	Body         []byte
@@ -4824,7 +5336,8 @@ type FindSimilarMessagesResp struct {
 }
 
 type GetSettingsResp200Headers struct {
-	ETag string `header:"ETag"`
+	CredentialETag string `header:"Credential-ETag"`
+	ETag           string `header:"ETag"`
 }
 
 type GetSettingsResp struct {
@@ -4836,7 +5349,8 @@ type GetSettingsResp struct {
 }
 
 type PatchSettingsResp200Headers struct {
-	ETag string `header:"ETag"`
+	CredentialETag string `header:"Credential-ETag"`
+	ETag           string `header:"ETag"`
 }
 
 type PatchSettingsResp struct {
@@ -4850,6 +5364,58 @@ type PatchSettingsResp struct {
 	JSON412      *PatchSettingsErrorResponseJSON412
 	JSON422      *PatchSettingsErrorResponseJSON422
 	JSON428      *PatchSettingsErrorResponseJSON428
+}
+
+type PutSettingsPersonEnrichmentProviderResp200Headers struct {
+	ETag string `header:"ETag"`
+}
+
+type PutSettingsPersonEnrichmentProviderResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *PutSettingsPersonEnrichmentProviderResponse
+	Headers200   *PutSettingsPersonEnrichmentProviderResp200Headers
+	JSON400      *PutSettingsPersonEnrichmentProviderErrorResponse
+	JSON404      *PutSettingsPersonEnrichmentProviderErrorResponseJSON
+	JSON409      *PutSettingsPersonEnrichmentProviderErrorResponseJSON409
+	JSON412      *PutSettingsPersonEnrichmentProviderErrorResponseJSON412
+	JSON422      *PutSettingsPersonEnrichmentProviderErrorResponseJSON422
+	JSON428      *PutSettingsPersonEnrichmentProviderErrorResponseJSON428
+}
+
+type DeleteSettingsProviderCredentialResp200Headers struct {
+	ETag string `header:"ETag"`
+}
+
+type DeleteSettingsProviderCredentialResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *DeleteSettingsProviderCredentialResponse
+	Headers200   *DeleteSettingsProviderCredentialResp200Headers
+	JSON400      *DeleteSettingsProviderCredentialErrorResponse
+	JSON404      *DeleteSettingsProviderCredentialErrorResponseJSON
+	JSON412      *DeleteSettingsProviderCredentialErrorResponseJSON412
+	JSON422      *DeleteSettingsProviderCredentialErrorResponseJSON422
+	JSON428      *DeleteSettingsProviderCredentialErrorResponseJSON428
+}
+
+type PutSettingsProviderCredentialResp200Headers struct {
+	ETag string `header:"ETag"`
+}
+
+type PutSettingsProviderCredentialResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *PutSettingsProviderCredentialResponse
+	Headers200   *PutSettingsProviderCredentialResp200Headers
+	JSON400      *PutSettingsProviderCredentialErrorResponse
+	JSON404      *PutSettingsProviderCredentialErrorResponseJSON
+	JSON412      *PutSettingsProviderCredentialErrorResponseJSON412
+	JSON422      *PutSettingsProviderCredentialErrorResponseJSON422
+	JSON428      *PutSettingsProviderCredentialErrorResponseJSON428
 }
 
 type ListSourceStatusResp struct {

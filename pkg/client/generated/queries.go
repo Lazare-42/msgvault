@@ -3,6 +3,8 @@
 package generated
 
 import (
+	"time"
+
 	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
 )
 
@@ -24,6 +26,9 @@ type GetAggregatesQuery struct {
 
 	// SourceID Source ID
 	SourceID *int64 `json:"source_id,omitempty"`
+
+	// SourceIds Source IDs; repeat or comma-separate values
+	SourceIds []int64 `json:"source_ids,omitempty"`
 
 	// AttachmentsOnly Only include messages with attachments
 	AttachmentsOnly *bool `json:"attachments_only,omitempty"`
@@ -60,6 +65,9 @@ type GetSubAggregatesQuery struct {
 	// SourceID Source ID
 	SourceID *int64 `json:"source_id,omitempty"`
 
+	// SourceIds Source IDs; repeat or comma-separate values
+	SourceIds []int64 `json:"source_ids,omitempty"`
+
 	// AttachmentsOnly Only include messages with attachments
 	AttachmentsOnly *bool `json:"attachments_only,omitempty"`
 
@@ -93,6 +101,9 @@ type GetSubAggregatesQuery struct {
 	// Label Label filter
 	Label *string `json:"label,omitempty"`
 
+	// ListID Exact case-insensitive RFC 2919 List-Id filter
+	ListID *string `json:"list_id,omitempty"`
+
 	// MessageType Message type filter
 	MessageType *string `json:"message_type,omitempty"`
 
@@ -119,6 +130,18 @@ type ListAttributeDefinitionsQuery struct {
 
 	// IncludeHidden Include deactivated definitions
 	IncludeHidden *bool `json:"include_hidden,omitempty"`
+}
+
+type ListCardDAVRunsQuery struct {
+	// Limit Maximum runs to return (default 25, max 100)
+	Limit *int64 `json:"limit,omitempty" validate:"omitempty,gte=1,lte=100"`
+
+	// BeforeID Return runs with IDs lower than this cursor
+	BeforeID *int64 `json:"before_id,omitempty" validate:"omitempty,gte=1"`
+}
+
+func (l ListCardDAVRunsQuery) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(l))
 }
 
 type GetCLIAttachmentQuery struct {
@@ -464,6 +487,9 @@ type FilterMessagesQuery struct {
 	// Label Label filter
 	Label *string `json:"label,omitempty"`
 
+	// ListID Exact case-insensitive RFC 2919 List-Id filter
+	ListID *string `json:"list_id,omitempty"`
+
 	// MessageType Message type filter
 	MessageType *string `json:"message_type,omitempty"`
 
@@ -478,6 +504,9 @@ type FilterMessagesQuery struct {
 
 	// SourceID Source ID
 	SourceID *int64 `json:"source_id,omitempty"`
+
+	// SourceIds Source IDs; repeat or comma-separate values
+	SourceIds []int64 `json:"source_ids,omitempty"`
 
 	// AttachmentsOnly Only include messages with attachments
 	AttachmentsOnly *bool `json:"attachments_only,omitempty"`
@@ -526,6 +555,9 @@ type GetGmailIDsByFilterQuery struct {
 	// Label Label filter
 	Label *string `json:"label,omitempty"`
 
+	// ListID Exact case-insensitive RFC 2919 List-Id filter
+	ListID *string `json:"list_id,omitempty"`
+
 	// MessageType Message type filter
 	MessageType *string `json:"message_type,omitempty"`
 
@@ -540,6 +572,9 @@ type GetGmailIDsByFilterQuery struct {
 
 	// SourceID Source ID
 	SourceID *int64 `json:"source_id,omitempty"`
+
+	// SourceIds Source IDs; repeat or comma-separate values
+	SourceIds []int64 `json:"source_ids,omitempty"`
 
 	// AttachmentsOnly Only include messages with attachments
 	AttachmentsOnly *bool `json:"attachments_only,omitempty"`
@@ -567,6 +602,18 @@ type GetGmailIDsByFilterQuery struct {
 
 	// Direction Sort direction: asc or desc
 	Direction *string `json:"direction,omitempty"`
+
+	// Q Structured search query
+	Q *string `json:"q,omitempty"`
+
+	// SearchMode Search mode: fast, deep, or aggregate; required with q
+	SearchMode *string `json:"search_mode,omitempty"`
+
+	// ViewType Aggregate view type; required for aggregate search
+	ViewType *string `json:"view_type,omitempty"`
+
+	// AggregateKey Displayed aggregate row key; required for aggregate search
+	AggregateKey *string `json:"aggregate_key,omitempty"`
 }
 
 type GetMessageInlinePartQuery struct {
@@ -576,6 +623,63 @@ type GetMessageInlinePartQuery struct {
 
 func (g GetMessageInlinePartQuery) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+}
+
+type ListOperationRunsQuery struct {
+	// Kind Exact operation kind
+	Kind *ListOperationRunsQueryKind `json:"kind,omitempty"`
+
+	// Lane Exact semantic operation lane
+	Lane *ListOperationRunsQueryLane `json:"lane,omitempty"`
+
+	// State Exact operation state
+	State *ListOperationRunsQueryState `json:"state,omitempty"`
+
+	// StartedFrom Inclusive canonical UTC RFC3339 lower bound
+	StartedFrom *time.Time `json:"started_from,omitempty"`
+
+	// StartedBefore Exclusive canonical UTC RFC3339 upper bound
+	StartedBefore *time.Time `json:"started_before,omitempty"`
+
+	// Limit Maximum runs to return (default 25, max 100)
+	Limit *int64 `json:"limit,omitempty" validate:"omitempty,gte=1,lte=100"`
+
+	// Cursor Opaque cursor bound to this archive and the complete normalized filter set
+	Cursor *string `json:"cursor,omitempty"`
+}
+
+func (l ListOperationRunsQuery) Validate() error {
+	var errors runtime.ValidationErrors
+	if l.Kind != nil {
+		if v, ok := any(l.Kind).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Kind", err)
+			}
+		}
+	}
+	if l.Lane != nil {
+		if v, ok := any(l.Lane).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Lane", err)
+			}
+		}
+	}
+	if l.State != nil {
+		if v, ok := any(l.State).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("State", err)
+			}
+		}
+	}
+	if l.Limit != nil {
+		if err := typesValidator.Var(l.Limit, "omitempty,gte=1,lte=100"); err != nil {
+			errors = errors.Append("Limit", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
 }
 
 type ListOrganizationsQuery struct {
@@ -622,6 +726,53 @@ type ListOrganizationEmploymentsQuery struct {
 	Offset *int64 `json:"offset,omitempty"`
 }
 
+type ListDirectoryPeopleQuery struct {
+	// Q Lexical query over person names, contact points, and organizations
+	Q *string `json:"q,omitempty"`
+
+	// Cursor Opaque cursor returned by the previous Directory page
+	Cursor *string `json:"cursor,omitempty"`
+
+	// Limit Maximum rows to return (default 50, max 100)
+	Limit *int64 `json:"limit,omitempty"`
+
+	// ContactState Current contact state: active or inactive
+	ContactState *string `json:"contact_state,omitempty"`
+
+	// Category Current person category
+	Category *string `json:"category,omitempty"`
+
+	// Organization Current organization
+	Organization *string `json:"organization,omitempty"`
+
+	// PrimaryChannel Primary communication channel
+	PrimaryChannel *string `json:"primary_channel,omitempty"`
+
+	// LastContactAfter Return people contacted at or after this RFC3339 timestamp
+	LastContactAfter *time.Time `json:"last_contact_after,omitempty"`
+
+	// LastContactBefore Return people contacted at or before this RFC3339 timestamp
+	LastContactBefore *time.Time `json:"last_contact_before,omitempty"`
+
+	// Sort Directory order: name, last_contact_desc, or last_contact_asc
+	Sort *ListDirectoryPeopleQuerySort `json:"sort,omitempty"`
+}
+
+func (l ListDirectoryPeopleQuery) Validate() error {
+	var errors runtime.ValidationErrors
+	if l.Sort != nil {
+		if v, ok := any(l.Sort).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Sort", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
 type ListPersonAttributesQuery struct {
 	// History Include superseded values
 	History *bool `json:"history,omitempty"`
@@ -647,6 +798,11 @@ type ClearPersonAttributeQuery struct {
 type SetPersonAttributeQuery struct {
 	// DryRun Validate and preview without writing
 	DryRun *bool `json:"dry_run,omitempty"`
+}
+
+type ListPersonBriefVersionsQuery struct {
+	// Limit Maximum versions to return (default 20, max 200)
+	Limit *int64 `json:"limit,omitempty"`
 }
 
 type ListPersonActivityDaysQuery struct {
@@ -751,6 +907,18 @@ type ListPersonMergesQuery struct {
 	Offset *int64 `json:"offset,omitempty"`
 }
 
+type GetPersonNetworkQuery struct {
+	// Depth Breadth-first depth (default 1, minimum 1, maximum 3)
+	Depth *int64 `json:"depth,omitempty" validate:"omitempty,gte=1,lte=3"`
+
+	// IncludeEnded Include ended relationships and employment records
+	IncludeEnded *bool `json:"include_ended,omitempty"`
+}
+
+func (g GetPersonNetworkQuery) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+}
+
 type AppendPersonNoteQuery struct {
 	// DryRun Validate and preview without writing
 	DryRun *bool `json:"dry_run,omitempty"`
@@ -789,7 +957,7 @@ type SearchMessagesQuery struct {
 	// Q Search query
 	Q string `json:"q" validate:"required"`
 
-	// Mode Search mode: fts, vector, or hybrid. Structured filter parameters are supported only in vector and hybrid modes
+	// Mode Search mode: fts, vector, or hybrid. conversation_id applies in every mode; other structured filter parameters require vector or hybrid
 	Mode *string `json:"mode,omitempty"`
 
 	// Page One-based page number (default 1; values below 1 are clamped to 1). Non-numeric values are rejected with 400.
@@ -819,6 +987,9 @@ type SearchMessagesQuery struct {
 	// Collection Restrict to one collection
 	Collection *string `json:"collection,omitempty"`
 
+	// ConversationID Exact conversation ID (all search modes)
+	ConversationID *int64 `json:"conversation_id,omitempty"`
+
 	// Sender Exact sender email/address filter (vector or hybrid mode only)
 	Sender *string `json:"sender,omitempty"`
 
@@ -830,6 +1001,9 @@ type SearchMessagesQuery struct {
 
 	// Label Exact case-insensitive label filter (vector or hybrid mode only)
 	Label *string `json:"label,omitempty"`
+
+	// ListID Exact case-insensitive RFC 2919 List-Id filter (vector or hybrid mode only)
+	ListID *string `json:"list_id,omitempty"`
 
 	// TimePeriod Calendar period in YYYY, YYYY-MM, or YYYY-MM-DD format (vector or hybrid mode only)
 	TimePeriod *string `json:"time_period,omitempty"`
@@ -861,38 +1035,44 @@ type DeepSearchQuery struct {
 	// Scope Exact search scope: body; omit for composite full-text search
 	Scope *string `json:"scope,omitempty"`
 
-	// Sender Sender email/address filter
+	// Sender Sender email/address filter; not supported when scope=body
 	Sender *string `json:"sender,omitempty"`
 
-	// SenderName Sender display-name filter
+	// SenderName Sender display-name filter; not supported when scope=body
 	SenderName *string `json:"sender_name,omitempty"`
 
-	// Recipient Recipient email/address filter
+	// Recipient Recipient email/address filter; not supported when scope=body
 	Recipient *string `json:"recipient,omitempty"`
 
-	// RecipientName Recipient display-name filter
+	// RecipientName Recipient display-name filter; not supported when scope=body
 	RecipientName *string `json:"recipient_name,omitempty"`
 
-	// Domain Domain filter
+	// Domain Domain filter; not supported when scope=body
 	Domain *string `json:"domain,omitempty"`
 
-	// Label Label filter
+	// Label Label filter; not supported when scope=body
 	Label *string `json:"label,omitempty"`
 
-	// MessageType Message type filter
+	// ListID Exact case-insensitive RFC 2919 List-Id filter; not supported when scope=body
+	ListID *string `json:"list_id,omitempty"`
+
+	// MessageType Message type filter; not supported when scope=body
 	MessageType *string `json:"message_type,omitempty"`
 
-	// TimePeriod Named time period
+	// TimePeriod Named time period; not supported when scope=body
 	TimePeriod *string `json:"time_period,omitempty"`
 
 	// TimeGranularity Time bucket granularity
 	TimeGranularity *string `json:"time_granularity,omitempty"`
 
-	// ConversationID Conversation ID
+	// ConversationID Conversation ID; not supported when scope=body
 	ConversationID *int64 `json:"conversation_id,omitempty"`
 
 	// SourceID Source ID
 	SourceID *int64 `json:"source_id,omitempty"`
+
+	// SourceIds Source IDs; repeat or comma-separate values; not supported by deep search
+	SourceIds []int64 `json:"source_ids,omitempty"`
 
 	// AttachmentsOnly Only include messages with attachments
 	AttachmentsOnly *bool `json:"attachments_only,omitempty"`
@@ -906,7 +1086,7 @@ type DeepSearchQuery struct {
 	// Before Upper date/time bound (RFC3339 or YYYY-MM-DD)
 	Before *string `json:"before,omitempty"`
 
-	// EmptyTargets Comma-separated aggregate view names to match empty values
+	// EmptyTargets Comma-separated aggregate view names to match empty values; not supported when scope=body
 	EmptyTargets *string `json:"empty_targets,omitempty"`
 
 	// Offset Zero-based row offset
@@ -972,6 +1152,9 @@ type FastSearchQuery struct {
 	// Label Label filter
 	Label *string `json:"label,omitempty"`
 
+	// ListID Exact case-insensitive RFC 2919 List-Id filter
+	ListID *string `json:"list_id,omitempty"`
+
 	// MessageType Message type filter
 	MessageType *string `json:"message_type,omitempty"`
 
@@ -986,6 +1169,9 @@ type FastSearchQuery struct {
 
 	// SourceID Source ID
 	SourceID *int64 `json:"source_id,omitempty"`
+
+	// SourceIds Source IDs; repeat or comma-separate values
+	SourceIds []int64 `json:"source_ids,omitempty"`
 
 	// AttachmentsOnly Only include messages with attachments
 	AttachmentsOnly *bool `json:"attachments_only,omitempty"`
@@ -1013,9 +1199,6 @@ type FastSearchQuery struct {
 
 	// Direction Sort direction: asc or desc
 	Direction *string `json:"direction,omitempty"`
-
-	// SourceIds Source IDs; repeat the parameter for multiple sources
-	SourceIds []int64 `json:"source_ids,omitempty"`
 }
 
 func (f FastSearchQuery) Validate() error {
@@ -1051,17 +1234,8 @@ type ListSourceStatusQuery struct {
 }
 
 type GetTotalStatsQuery struct {
-	// SourceID Source ID
-	SourceID *int64 `json:"source_id,omitempty"`
-
 	// SourceIds Source IDs; repeat the parameter for multiple sources
 	SourceIds []int64 `json:"source_ids,omitempty"`
-
-	// AttachmentsOnly Only include messages with attachments
-	AttachmentsOnly *bool `json:"attachments_only,omitempty"`
-
-	// HideDeleted Exclude deleted messages
-	HideDeleted *bool `json:"hide_deleted,omitempty"`
 
 	// SearchQuery Search query
 	SearchQuery *string `json:"search_query,omitempty"`
@@ -1071,6 +1245,57 @@ type GetTotalStatsQuery struct {
 
 	// GroupBy Aggregate view type for grouping
 	GroupBy *string `json:"group_by,omitempty"`
+
+	// Sender Sender email/address filter
+	Sender *string `json:"sender,omitempty"`
+
+	// SenderName Sender display-name filter
+	SenderName *string `json:"sender_name,omitempty"`
+
+	// Recipient Recipient email/address filter
+	Recipient *string `json:"recipient,omitempty"`
+
+	// RecipientName Recipient display-name filter
+	RecipientName *string `json:"recipient_name,omitempty"`
+
+	// Domain Domain filter
+	Domain *string `json:"domain,omitempty"`
+
+	// Label Label filter
+	Label *string `json:"label,omitempty"`
+
+	// ListID Exact case-insensitive RFC 2919 List-Id filter
+	ListID *string `json:"list_id,omitempty"`
+
+	// MessageType Message type filter
+	MessageType *string `json:"message_type,omitempty"`
+
+	// TimePeriod Named time period
+	TimePeriod *string `json:"time_period,omitempty"`
+
+	// TimeGranularity Time bucket granularity
+	TimeGranularity *string `json:"time_granularity,omitempty"`
+
+	// ConversationID Conversation ID
+	ConversationID *int64 `json:"conversation_id,omitempty"`
+
+	// SourceID Source ID
+	SourceID *int64 `json:"source_id,omitempty"`
+
+	// AttachmentsOnly Only include messages with attachments
+	AttachmentsOnly *bool `json:"attachments_only,omitempty"`
+
+	// HideDeleted Exclude deleted messages
+	HideDeleted *bool `json:"hide_deleted,omitempty"`
+
+	// After Lower date/time bound (RFC3339 or YYYY-MM-DD)
+	After *string `json:"after,omitempty"`
+
+	// Before Upper date/time bound (RFC3339 or YYYY-MM-DD)
+	Before *string `json:"before,omitempty"`
+
+	// EmptyTargets Comma-separated aggregate view names to match empty values
+	EmptyTargets *string `json:"empty_targets,omitempty"`
 }
 
 type TriggerSyncQuery struct {
@@ -1199,6 +1424,9 @@ type ListTextConversationMessagesQuery struct {
 }
 
 type SearchTextMessagesQuery struct {
+	// SourceID Source ID
+	SourceID *int64 `json:"source_id,omitempty"`
+
 	// Q Search query
 	Q string `json:"q" validate:"required"`
 

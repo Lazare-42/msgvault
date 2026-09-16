@@ -3,15 +3,17 @@ package cmd
 // Source-type identifiers stored in sources.source_type and matched against
 // when dispatching sync/import logic per account kind.
 const (
-	sourceTypeGmail      = "gmail"
-	sourceTypeIMAP       = "imap"
-	sourceTypeMbox       = "mbox"
-	sourceTypeTeams      = "teams"
-	sourceTypeCalendar   = "gcal"
-	sourceTypeBeeper     = "beeper"
-	sourceTypeSlack      = "slack"
-	sourceTypeGranola    = "granola"
-	sourceTypeCircleback = "circleback"
+	sourceTypeGmail          = "gmail"
+	sourceTypeIMAP           = "imap"
+	sourceTypeMbox           = "mbox"
+	sourceTypeTeams          = "teams"
+	sourceTypeCalendar       = "gcal"
+	sourceTypeBeeper         = "beeper"
+	sourceTypeSlack          = "slack"
+	sourceTypeSlackdump      = "slackdump"
+	sourceTypeGranola        = "granola"
+	sourceTypeCircleback     = "circleback"
+	sourceTypeNotionMeetings = "notion_meetings"
 )
 
 // Analytics dataset / SQLite table names: the Parquet subdirectory under
@@ -23,6 +25,7 @@ const (
 	tableMessages                 = "messages"
 	tableLabels                   = "labels"
 	tableAttachments              = "attachments"
+	tablePersonDisplayNames       = "person_display_names"
 	tableParticipants             = "participants"
 	tableParticipantIdentifiers   = "participant_identifiers"
 	tableConversations            = "conversations"

@@ -1,4 +1,5 @@
 ---
+last_edited: "2026-09-15"
 title: Google Calendar
 description: Archive Google Calendar events alongside your email, with full-text and semantic search over meetings, organizers, and attendees.
 ---
@@ -14,8 +15,9 @@ anything on your Google Calendar.
 
 ## Prerequisites
 
-- An OAuth client already configured for Gmail (see [OAuth Setup](/guides/oauth-setup/)).
-  Calendar reuses the same `client_secret.json`.
+- A Google OAuth client (see [OAuth Setup](/docs/guides/oauth-setup/)), or a
+  [Workspace service account](#google-workspace-service-accounts). Browser
+  authorization can reuse the `client_secret.json` already configured for Gmail.
 - The **Google Calendar API** enabled on that OAuth project. In the
   [Google Cloud Console](https://console.cloud.google.com/), go to
   **APIs & Services > Library**, search for "Google Calendar API", and click
@@ -110,7 +112,7 @@ msgvault search "standup" --message-type calendar_event
 msgvault search "after:2024-01-01 before:2024-04-01" --message-type calendar_event
 ```
 
-When [vector search](/usage/vector-search/) is enabled, events become eligible
+When [vector search](/docs/usage/vector-search/) is enabled, events become eligible
 for embedding after sync and can be found semantically with `--mode vector` or
 `--mode hybrid` once the embedding worker has processed them. For manual
 `sync-calendar` runs, follow up with `msgvault embeddings build`. In the
@@ -132,7 +134,7 @@ enabled = true
 ```
 
 The first scheduled run full-syncs and registers calendars; later runs are
-incremental. See [Configuration](/configuration/#google-calendar-sources) for
+incremental. See [Configuration](/docs/configuration/#google-calendar-sources) for
 every field.
 
 !!! note
@@ -148,31 +150,31 @@ account, copy that token to the browser machine first so re-consent preserves
 Drive or other previously granted Google scopes.
 
 1. **If a token already exists on the server**, copy it to the browser machine:
-   ```bash
-   mkdir -p ~/.msgvault/tokens
-   scp user@server:~/.msgvault/tokens/you@gmail.com.json ~/.msgvault/tokens/
-   ```
+    ```bash
+    mkdir -p ~/.msgvault/tokens
+    scp user@server:~/.msgvault/tokens/you@gmail.com.json ~/.msgvault/tokens/
+    ```
 
 2. **On a machine with a browser**, using the **same `client_secret.json`** as
-   the server:
-   ```bash
-   msgvault add-calendar you@gmail.com
-   ```
-   Keep all existing permissions plus Calendar checked on the consent screen.
+    the server:
+    ```bash
+    msgvault add-calendar you@gmail.com
+    ```
+    Keep all existing permissions plus Calendar checked on the consent screen.
 
 3. **Copy the token back to the server**, replacing the existing one. It now
-   carries Calendar plus the existing Google permissions, so current sync jobs
-   keep working:
-   ```bash
-   ssh user@server mkdir -p ~/.msgvault/tokens
-   scp ~/.msgvault/tokens/you@gmail.com.json user@server:~/.msgvault/tokens/
-   ```
+    carries Calendar plus the existing Google permissions, so current sync jobs
+    keep working:
+    ```bash
+    ssh user@server mkdir -p ~/.msgvault/tokens
+    scp ~/.msgvault/tokens/you@gmail.com.json user@server:~/.msgvault/tokens/
+    ```
 
 4. **On the server**, register the calendars (no browser needed) and sync:
-   ```bash
-   msgvault add-calendar you@gmail.com
-   msgvault sync-calendar you@gmail.com
-   ```
+    ```bash
+    msgvault add-calendar you@gmail.com
+    msgvault sync-calendar you@gmail.com
+    ```
 
 Run `msgvault add-calendar you@gmail.com --headless` on the server to print these
 steps at any time.
@@ -182,16 +184,28 @@ steps at any time.
 Workspace admins using domain-wide delegation do not need per-user browser
 tokens for Calendar. Enable the Google Calendar API, authorize the service
 account client ID for `https://www.googleapis.com/auth/calendar.readonly`, and
-configure `[oauth].service_account_key` or `[oauth.apps.<name>].service_account_key`
-as described in [OAuth Setup](/guides/oauth-setup/#google-workspace-service-accounts).
+configure `[oauth].service_account_key` or
+`[oauth.apps.<name>].service_account_key` as described in
+[OAuth Setup](/docs/guides/oauth-setup/#google-workspace-service-accounts).
 
-Then sync the account directly or add a scheduled `[[gcal]]` entry:
+Register the calendars, then sync their events:
 
 ```bash
-msgvault sync-calendar user@domain.com --oauth-app acme
+msgvault add-calendar user@example.com --oauth-app example
+msgvault sync-calendar user@example.com --oauth-app example
 ```
 
-The first sync registers matching calendars and stores their sync cursors.
+Replace `example` with the configured OAuth app name. Omit `--oauth-app` when
+using the default `[oauth]` configuration. `add-calendar` uses delegated access
+directly: it does not request `client_secrets`, open a browser, or create a
+per-user refresh token. The usual `--all-calendars`, `--min-access-role`, and
+`--calendars` registration filters still apply.
+
+You can also start with `sync-calendar`, which registers matching calendars on
+its first run, or configure a scheduled `[[gcal]]` entry. If Google rejects the
+delegated permission or reports that the Calendar API is disabled, msgvault
+reports the error immediately. Correct the service account's Calendar permission
+or enable the API before trying again.
 
 ## Privacy
 

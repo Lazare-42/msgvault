@@ -29,7 +29,7 @@ type IdentityPredicate struct {
 	ParticipantIDs []int64
 	// EmailIdentifier carries the confirmed address when it is email-shaped.
 	// Non-empty, it switches recipient-row matching to the immutable
-	// envelope snapshot (message_recipients.email_address, compared
+	// envelope snapshot (message_recipients.envelope_address, compared
 	// case-insensitively like every email rule): participant merges repoint
 	// recipient rows onto a survivor that may carry several aliases, so a
 	// participant-only match would let one alias's filter select another
@@ -65,11 +65,16 @@ type Context struct {
 	// AdditionalDomainGroups is the domain analogue of
 	// AdditionalParticipantGroups: each inner slice is OR'd internally, the
 	// groups are AND'd together and AND'd with the primary Domains group.
-	AdditionalDomainGroups [][]string     `json:"additional_domain_groups,omitempty"`
-	MessageTypes           []string       `json:"message_types,omitempty"`
-	After                  *time.Time     `json:"after,omitempty"`
-	Before                 *time.Time     `json:"before,omitempty"`
-	Deletion               DeletionFilter `json:"deletion,omitempty"`
+	AdditionalDomainGroups [][]string `json:"additional_domain_groups,omitempty"`
+	MessageTypes           []string   `json:"message_types,omitempty"`
+	// MailingLists is an exact case-insensitive scalar membership group.
+	// AdditionalMailingListGroups preserves repeated API filter conjunctions;
+	// values within each group are OR'd, while groups are AND'd.
+	MailingLists                []string       `json:"mailing_lists,omitempty"`
+	AdditionalMailingListGroups [][]string     `json:"additional_mailing_list_groups,omitempty"`
+	After                       *time.Time     `json:"after,omitempty"`
+	Before                      *time.Time     `json:"before,omitempty"`
+	Deletion                    DeletionFilter `json:"deletion,omitempty"`
 }
 
 type DeletionFilter string

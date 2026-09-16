@@ -76,6 +76,16 @@ type APIMessage struct {
 	Attachments          []APIAttachment
 }
 
+// MessageRecipient is one archived message-recipient relationship.
+// EmailAddress comes from the immutable message envelope when available,
+// rather than from a participant that may be merged. ParticipantID groups
+// historical envelope aliases that now resolve to the same participant.
+type MessageRecipient struct {
+	ParticipantID int64
+	EmailAddress  string
+	DisplayName   string
+}
+
 // APIAttachment represents attachment metadata for API responses.
 type APIAttachment struct {
 	ID          int64
@@ -619,15 +629,62 @@ func (s *Store) searchMessagesQueryImpl(
 		args = append(args, "%"+escapeLike(strings.ToLower(term))+"%")
 	}
 
-	// message_type: / message_type= filter.
-	if len(q.MessageTypes) > 0 {
-		placeholders := make([]string, len(q.MessageTypes))
-		for i, typ := range q.MessageTypes {
-			placeholders[i] = "?"
-			args = append(args, typ)
+	// list: / list-id: filters. Each predicate is separate so repeated
+	// operators are ANDed. list_id being NULL naturally excludes rows.
+	for _, listID := range q.ListIDs {
+		if strings.TrimSpace(listID) == "" {
+			continue
 		}
-		conditions = append(conditions,
-			"m.message_type IN ("+strings.Join(placeholders, ",")+")")
+		conditions = append(conditions, fmt.Sprintf(`%s LIKE %s ESCAPE '\'`,
+			s.dialect.UnicodeLowerExpression("COALESCE(m.list_id, '')"),
+			s.dialect.UnicodeLowerExpression("?")))
+		args = append(args, "%"+escapeLike(strings.ToLower(listID))+"%")
+	}
+	// Structured Explore mailing-list filters use exact membership. Each
+	// request filter is an OR group, and repeated filters are ANDed.
+	for _, group := range q.ListIDExactGroups {
+		if len(group) == 0 {
+			continue
+		}
+		parts := make([]string, len(group))
+		for i, listID := range group {
+			parts[i] = fmt.Sprintf(`%s = %s`,
+				s.dialect.UnicodeLowerExpression("COALESCE(m.list_id, '')"),
+				s.dialect.UnicodeLowerExpression("?"))
+			args = append(args, listID)
+		}
+		conditions = append(conditions, "("+strings.Join(parts, " OR ")+")")
+	}
+
+	// message_type: / message_type= filter. An "email" value also matches an
+	// empty or NULL message_type. Rows imported before the column existed
+	// carry a blank value on current schemas and NULL on pre-constraint
+	// archives (see newLegacyNullableMessageTypeStore coverage); both count
+	// as email everywhere else (IsEmailMessageType, the analytical email
+	// filters), so a plain IN list would drop legacy mail from
+	// message_type:email searches.
+	if len(q.MessageTypes) > 0 {
+		var parts, exact []string
+		for _, typ := range q.MessageTypes {
+			if IsEmailMessageType(typ) {
+				continue
+			}
+			exact = append(exact, typ)
+		}
+		if len(exact) < len(q.MessageTypes) {
+			parts = append(parts,
+				"(m.message_type = ? OR m.message_type = '' OR m.message_type IS NULL)")
+			args = append(args, MessageTypeEmail)
+		}
+		if len(exact) > 0 {
+			placeholders := make([]string, len(exact))
+			for i, typ := range exact {
+				placeholders[i] = "?"
+				args = append(args, typ)
+			}
+			parts = append(parts, "m.message_type IN ("+strings.Join(placeholders, ",")+")")
+		}
+		conditions = append(conditions, "("+strings.Join(parts, " OR ")+")")
 	}
 
 	// Account scoping (in: / API account/collection filter). The HTTP
@@ -644,6 +701,22 @@ func (s *Store) searchMessagesQueryImpl(
 		}
 		conditions = append(conditions,
 			"m.source_id IN ("+strings.Join(placeholders, ",")+")")
+	}
+
+	// conversation_id: filters one or more internal conversation scopes.
+	// Repeated operators are alternatives within the same dimension.
+	if q.ConversationIDs != nil {
+		if len(q.ConversationIDs) == 0 {
+			conditions = append(conditions, "1=0")
+		} else {
+			placeholders := make([]string, len(q.ConversationIDs))
+			for i, id := range q.ConversationIDs {
+				placeholders[i] = "?"
+				args = append(args, id)
+			}
+			conditions = append(conditions,
+				"m.conversation_id IN ("+strings.Join(placeholders, ",")+")")
+		}
 	}
 
 	// has:attachment
@@ -1137,6 +1210,45 @@ func (s *Store) getRecipients(ctx context.Context, messageID int64, recipientTyp
 	return recipients, nil
 }
 
+// GetMessageRecipientsContext returns structured recipient relationships for a
+// message. Importers use this when provider identity lookup is temporarily
+// degraded and replacing an already verified relationship would lose data.
+func (s *Store) GetMessageRecipientsContext(
+	ctx context.Context, messageID int64, recipientType string,
+) ([]MessageRecipient, error) {
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT
+			mr.participant_id,
+			COALESCE(NULLIF(mr.email_address, ''), NULLIF(p.email_address, ''), ''),
+			COALESCE(NULLIF(TRIM(mr.display_name), ''), NULLIF(TRIM(p.display_name), ''), '')
+		FROM message_recipients mr
+		JOIN participants p ON p.id = mr.participant_id
+		WHERE mr.message_id = ? AND mr.recipient_type = ?
+		ORDER BY mr.id
+	`, messageID, recipientType)
+	if err != nil {
+		return nil, fmt.Errorf("get structured recipients: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var recipients []MessageRecipient
+	for rows.Next() {
+		var recipient MessageRecipient
+		if err := rows.Scan(
+			&recipient.ParticipantID, &recipient.EmailAddress, &recipient.DisplayName,
+		); err != nil {
+			return nil, fmt.Errorf("scan structured recipient: %w", err)
+		}
+		if strings.TrimSpace(recipient.EmailAddress) != "" {
+			recipients = append(recipients, recipient)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate structured recipients: %w", err)
+	}
+	return recipients, nil
+}
+
 // ChangedMessage is one row of the content-change feed. Every field is a column
 // of `messages`, but the feed's fields and the watermark's columns are not the
 // same set: sender_id and metadata move the watermark without appearing here,
@@ -1151,6 +1263,7 @@ type ChangedMessage struct {
 	SourceMessageID     string
 	ConversationID      int64
 	MessageType         string
+	ListID              *string
 	Subject             string
 	Snippet             string
 	SentAt              *time.Time
@@ -1278,7 +1391,7 @@ func (c ChangedMessagesCursor) AfterID() (int64, bool) { return c.afterID, c.aft
 // passed it is indistinguishable from the end of a page.
 const changedMessagesSelect = `
 	SELECT id, source_id, COALESCE(source_message_id,''), COALESCE(conversation_id,0),
-	       COALESCE(message_type,''), COALESCE(subject,''), COALESCE(snippet,''),
+	       COALESCE(message_type,''), list_id, COALESCE(subject,''), COALESCE(snippet,''),
 	       sent_at, received_at, internal_date, COALESCE(size_estimate,0),
 	       COALESCE(has_attachments,FALSE), COALESCE(attachment_count,0),
 	       deleted_at, deleted_from_source_at, content_changed_at
@@ -1408,6 +1521,7 @@ func (s *Store) ListChangedMessages(
 		// strings.
 		var sentAt, receivedAt, internalDate nullableTimestamp
 		var deletedAt, deletedFromSourceAt nullableTimestamp
+		var listID sql.NullString
 		var contentChangedAt requiredTimestamp
 		if err := rows.Scan(
 			&m.ID,
@@ -1415,6 +1529,7 @@ func (s *Store) ListChangedMessages(
 			&m.SourceMessageID,
 			&m.ConversationID,
 			&m.MessageType,
+			&listID,
 			&m.Subject,
 			&m.Snippet,
 			&sentAt,
@@ -1431,6 +1546,9 @@ func (s *Store) ListChangedMessages(
 		}
 		m.SentAt = optionalTimestamp(sentAt)
 		m.ReceivedAt = optionalTimestamp(receivedAt)
+		if listID.Valid {
+			m.ListID = new(listID.String)
+		}
 		m.InternalDate = optionalTimestamp(internalDate)
 		m.DeletedAt = optionalTimestamp(deletedAt)
 		m.DeletedFromSourceAt = optionalTimestamp(deletedFromSourceAt)

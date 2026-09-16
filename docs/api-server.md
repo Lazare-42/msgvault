@@ -1,5 +1,5 @@
 ---
-last_edited: "2026-08-15"
+last_edited: "2026-09-09"
 title: Web UI & API Server
 description: Daemon-served analytical Web UI and REST API for your msgvault archive, with optional background sync scheduling.
 ---
@@ -10,14 +10,103 @@ description: Daemon-served analytical Web UI and REST API for your msgvault arch
 `msgvault serve` starts an HTTP server that exposes your archive through the
 first-party Web UI at `/` and a REST API under `/api`. It optionally runs a
 background sync scheduler to keep accounts up to date on a cron-based schedule.
-The complete UI is embedded in the release binary; see [Web UI](/web-ui/) for
+The complete UI is embedded in the release binary; see [Web UI](/docs/web-ui/) for
 browser login, secure remote deployment, search states, and keyboard controls.
 
-The API is registered through Huma and exposes a generated OpenAPI document at `/openapi.json`. You can also run `msgvault openapi` to print the same checked-in contract without starting a daemon or opening the archive database. The OpenAPI `info.version` is the API schema version used for client/server compatibility; the current schema is 2.4.0. The running daemon binary version is exposed separately in the generated document metadata. The API queries the same archive database and attachment store as the CLI, Web UI, and TUI. SQLite is the default archive database; PostgreSQL is supported when `[data].database_url` is a PostgreSQL DSN. Keyword search and ordinary archive reads stay local to that database. If vector search is enabled, semantic and hybrid search also call the embedding endpoint configured in `[vector.embeddings]`. The server is designed for interactive archive use, local integrations, dashboards, and automation scripts.
+### Choose an integration path
+
+| Need | Start here |
+|---|---|
+| Browse the archive | [Web UI](web-ui.md) |
+| Use a generated Go client | `pkg/client` in the repository |
+| Build a client in another language | `/openapi.json` from the daemon or `msgvault openapi` |
+| Submit a background backfill | [Historical import jobs](#historical-import-jobs) |
+| Follow background work | `/api/v1/operations/runs` and `/api/v1/operations/status` |
+| Integrate an AI assistant | [MCP server](usage/chat.md) |
+
+### API compatibility
+
+The API publishes its generated OpenAPI contract at `/openapi.json`.
+`msgvault openapi` prints the checked-in contract without starting a daemon or
+opening an archive. OpenAPI `info.version` is the **API schema version**;
+it is separate from the binary release version. The current schema is **2.25.0**.
+Upgrade clients and daemon together across incompatible schema versions,
+including remote deployments.
+
+Schema 2.25.0 adds the CardDAV publication review flow:
+`GET /api/v1/carddav/publications/{person_id}/preview` returns the exact
+vCard the next write would send plus an approval token, and
+`POST /api/v1/carddav/publications/{person_id}/approve` approves it. For a
+conflict preview, follow approval with explicit `keep_local` conflict resolution;
+other previews publish on approval.
+Publication responses gain `inference_review_required`; see the
+[CardDAV guide](usage/people-carddav.md#review-inferred-changes-before-they-are-exported).
+
+Schema 2.24.0 adds Google Contacts authorization and CardDAV provider selection.
+
+Schema 2.23.0 describes Settings structure. A sectioned group lists its
+`sections`, and each setting in such a group names its `section`; groups
+without sections omit both. A secret's state gains an optional `hint`: the
+first three and last three characters of the value joined by an ellipsis
+(`sk-…x9Q`), so a client can show which key is set. It is omitted for a
+value under twelve characters, for the CardDAV password, and when nothing
+is set; the value itself is never returned. `validation` gains two optional
+fields:
+
+- `format: "cron"` marks a five-field cron schedule (minute, hour, day of
+  month, month, day of week) as the daemon's scheduler parses it: `*` or `?`,
+  numbers, ranges, comma lists, `/step`, and three-letter month and weekday
+  names. A `CRON_TZ=<zone>` or `TZ=<zone>` prefix with an IANA zone name runs
+  the schedule in that zone instead of the daemon's local time. Descriptors
+  such as `@hourly`, the `L`, `W`, and `#` extensions, and a field made only
+  of commas are rejected. The daemon trims surrounding whitespace and treats
+  a zone prefix with no fields after it as the empty value, then validates
+  the expression on PATCH; an empty value is rejected when the setting is
+  `required`.
+- `off` names the value that switches a setting off (`value`), what happens
+  while it is off (`label`), a starting value for switching it on (`suggest`),
+  and `on_minimum`, the smallest value accepted while on. A value between the
+  off value and `on_minimum` is raised to `on_minimum` on PATCH rather than
+  rejected. `minimum` and `maximum` keep covering every accepted value
+  including the off value, so a client that ignores `off` still accepts what
+  the daemon stores.
+
+The daemon no longer emits the `sync`, `logging`, `activity`, and `backup`
+groups, which folded into `sources`, `server`, and `archive`; the `group` enum
+keeps them so clients still accept older daemons.
+
+Schema 2.21.0 adds Saved View execution at
+`POST /api/v1/saved-views/{id}/run`, publishes the accepted Saved View
+definition values, and includes incompatibility reasons when reading stored
+views. Explore file responses also declare when semantic search uses only
+active messages.
+
+Participant analytics live under `/api/v1/participants/*`; durable curated
+profiles live under `/api/v1/people/*`. CardDAV publication and conflict
+responses are bounded projections that omit raw vCards and resource hrefs;
+only the explicit publication preview route returns a raw vCard.
+See [release changes](changelog.md#upgrade-and-compatibility) for removed paths
+and the 1.x/2.x transition.
+
+### Archive and processing boundaries
+
+The API uses the same archive database and attachment store as other clients.
+SQLite is the default; PostgreSQL has [documented feature limits](architecture/postgresql.md).
+Keyword search and ordinary reads use stored data. Semantic and hybrid search
+also call the configured embedding endpoint. Profile, document, and enrichment
+operations have their own provider and consent contracts.
+
+Operation history includes durable worker runs, date filters, filter-bound
+pagination, error codes, and supported actions. `GET
+/api/v1/documents/status/current` reports the selected document extraction
+profile without requiring its identifier. The OpenAPI document defines exact
+request and response fields.
 
 Go integrations can use the generated client in `pkg/client`. The wrapper
 handles msgvault-specific response details such as deletion staging dry-runs
 returning `200` while created manifests return `201`.
+
+### Startup and readiness
 
 The HTTP listener, health endpoint, and API routing start before analytics cache
 maintenance. With `engine = "auto"`, aggregate requests initially use live SQL
@@ -75,7 +164,311 @@ is required. Three API-key authentication methods are supported:
 
 If no `api_key` is configured, authentication is not required regardless of bind address. The separate `allow_insecure` / security validation prevents starting without an API key on non-loopback addresses.
 
+## Historical import jobs {#historical-import-jobs}
+
+Start a Gmail or IMAP history backfill and poll its progress without keeping an
+HTTP request open. These endpoints use the daemon's existing account
+credentials and full-sync path. They do not accept uploaded archive files.
+See [the importing guide](/docs/usage/importing/#historical-import-jobs) for a
+step-by-step example.
+
+### Start an import {#post-apiv1imports}
+
+**Endpoint:** `POST /api/v1/imports`
+
+Send one JSON object with `Content-Type: application/json`. The request body is
+limited to 16 KiB; unknown fields and additional JSON values are rejected.
+
+| Field | Required | Meaning |
+|---|---|---|
+| `account` | Yes | Exact account identifier or display name, matched case-insensitively, for one Gmail or IMAP source |
+| `after` | No | Lower date bound in `YYYY-MM-DD` form |
+| `before` | No | Upper date bound in `YYYY-MM-DD` form; must be later than `after` when both are present |
+| `limit` | No | Non-negative message limit; `0` or omission means unlimited |
+| `query` | No | Gmail search expression; a nonempty value is rejected for IMAP |
+| `noresume` | No | Set `true` to start fresh instead of using a resumable checkpoint; defaults to `false` |
+
+A successful request returns **`202 Accepted`** with a durable `job_id` and the
+status record described below. It starts background work immediately; it does
+not create a persistent queue that will automatically resume after a restart.
+
+| Error | Meaning |
+|---|---|
+| `404 not_found` | No matching account exists |
+| `409 ambiguous_account` | More than one syncable source matches the account name |
+| `409 sync_already_active` | The source already has an active sync or import |
+| `422 account_not_syncable` | The matching source is not Gmail or IMAP |
+| `422 validation_failed` | A required value, date range, limit, or provider-specific field is invalid |
+| `413 request_too_large` | The body exceeds 16 KiB |
+| `415 unsupported_media_type` | The request is not JSON |
+| `503 service_unavailable` | The daemon cannot start historical imports, including during shutdown |
+
+Malformed JSON and unknown fields return `400 bad_request`. Normal API
+authentication and archive-operation locking also apply.
+
+### Read progress {#get-apiv1importsjobid}
+
+**Endpoint:** `GET /api/v1/imports/{job_id}`
+
+Returns **`200 OK`** for an existing job or **`404 not_found`** for an unknown
+ID. The start and progress responses have the same shape:
+
+| Field | Meaning |
+|---|---|
+| `job_id` | Durable ID to save and poll |
+| `account` | Resolved source identifier |
+| `status` | `pending`, `running`, `done`, or `failed` |
+| `processed`, `added`, `skipped` | Counts across sync runs belonging to this job |
+| `created_at` | UTC creation time |
+| `started_at` | UTC start time, or `null` before work starts |
+| `finished_at` | UTC completion time, or `null` while unfinished |
+| `summary` | Present for `done`; contains `processed`, `added`, `updated`, `skipped`, and `errors` |
+| `error` | Present for `failed`; currently the generic message `import failed` |
+
+`skipped` is the non-negative remainder of processed messages after additions
+and updates. Check `summary.errors` as well as the terminal status when
+assessing coverage. Detailed failure information belongs to daemon logs and
+sync-run diagnostics; it is not returned in the job's generic `error` field.
+
+### Disconnects, failures, and restarts
+
+Closing the client connection does not cancel a submitted job. Daemon shutdown
+cancels running import work. On the next start, the daemon marks jobs abandoned
+in `pending` or `running` state as `failed`; it preserves their IDs and progress
+for later inspection.
+
+Messages already committed remain archived after a failure. Submit a new job
+with the same account and bounds to continue through the normal resumable
+importer. Leave `noresume` false when you want to reuse available progress.
+There is no dedicated cancellation endpoint for these jobs.
+
 ## API Endpoints
+
+### Curated person network {#get-apiv1peopleidnetwork}
+
+**Endpoint:** `GET /api/v1/people/{id}/network`
+
+Returns a read-only, person-centred projection built only from durable typed
+relationships and employments. It never derives nodes or edges from messages,
+conversations, participant co-occurrence, or the analytical cache.
+
+`depth` defaults to `1` and accepts `1`, `2`, or `3`. `include_ended` defaults
+to `false`; set it to `true` to admit ended relationships and employment
+records. The deterministic breadth-first response contains at most 250 nodes
+and 500 edges. `truncated: true` means the response is a bounded prefix and can
+contain fewer than either maximum. The root durable person is returned even
+when it has no qualifying connections.
+
+```json
+{
+  "root_person_id": 42,
+  "depth": 2,
+  "truncated": false,
+  "nodes": [
+    {"id": "person:42", "kind": "person", "entity_id": 42, "label": "Example Person", "hop": 0},
+    {"id": "organization:21", "kind": "organization", "entity_id": 21, "label": "Example Organization", "hop": 1}
+  ],
+  "edges": [
+    {"id": "employment:7", "kind": "employment", "source_node_id": "person:42", "target_node_id": "organization:21", "label": "Engineer"}
+  ]
+}
+```
+
+Invalid depths return `400`; an unknown durable person returns `404`. The
+projection has no ETag because it is not a mutation resource.
+
+---
+
+### Person brief enrollment {#get-apiv1peopleidbrief-enrollment}
+
+**Endpoint:** `GET /api/v1/people/{id}/brief-enrollment`
+
+Read whether a durable person is enrolled in the "last time we talked" brief.
+Enrollment enables brief generation for that person when eligible messages
+and provider budget are available.
+
+```json
+{"person_id": 7, "enrolled": true, "enabled_at": "2026-08-14T09:12:03Z", "actor": "api"}
+```
+
+`enrolled` is `false` with a `null` `enabled_at` and an empty `actor` when the
+person has no enrollment row. An unknown durable person returns `404` /
+`person_profile_not_found`.
+
+---
+
+### Replace person brief enrollment {#put-apiv1peopleidbrief-enrollment}
+
+**Endpoint:** `PUT /api/v1/people/{id}/brief-enrollment`
+
+**Request:**
+
+```json
+{"enrolled": true, "track": true}
+```
+
+`enrolled` is required. Enrollment requires a tracking row: `track: true` adds
+one in the same transaction, and without it an untracked person is refused with
+`409` / `person_brief_not_tracked`. `track` is ignored when `enrolled` is
+`false`. The response is the same shape as the read above.
+
+---
+
+### Current person brief {#get-apiv1peopleidbrief}
+
+**Endpoint:** `GET /api/v1/people/{id}/brief`
+
+Return the person's current brief version. A person with no stored version
+returns `404` / `person_brief_not_found`.
+
+```json
+{
+  "version": 2,
+  "status": "current",
+  "generated_at": "2026-08-29T18:44:02Z",
+  "rendered_text": "Last time you talked (Aug 29, chat): they were preparing for a role change. They said they were learning to cook on weekends. You may want to ask how the transition went.",
+  "renderer_policy": "person-brief-render-v1",
+  "sentences": [
+    {"kind": "last_interaction", "index": 0, "text": "Last time you talked (Aug 29, chat): they were preparing for a role change.", "evidence_ordinals": [0]},
+    {"kind": "highlight", "index": 0, "text": "They said they were learning to cook on weekends.", "evidence_ordinals": [0]},
+    {"kind": "follow_up", "index": 0, "text": "You may want to ask how the transition went.", "evidence_ordinals": [0]}
+  ],
+  "structured": {
+    "last_meaningful_interaction": {"evidence_id": "evidence:...", "summary": "they were preparing for a role change"},
+    "highlights": [
+      {"text": "they were learning to cook on weekends", "speaker": "person", "evidence_ids": ["evidence:..."], "observed_at": "2026-08-29", "confidence_basis_points": 700}
+    ],
+    "follow_ups": [
+      {"question": "how the transition went", "why": "the change was still pending", "highlight_index": 0, "evidence_ids": ["evidence:..."]}
+    ],
+    "appreciations": [],
+    "uncertainties": [],
+    "possible_attributes": []
+  },
+  "evidence": [
+    {
+      "ordinal": 0,
+      "evidence_id": 4411,
+      "evidence_key": "9c2f...",
+      "source_ref": "person-sweep/v1:...",
+      "source_url": "",
+      "directness": "direct-self",
+      "event_time": "2026-08-29T18:41:55Z",
+      "evidence_supported": true
+    }
+  ],
+  "boundary": {
+    "lanes": ["conversation_text"],
+    "from_event_time": "2026-07-01T00:00:00Z",
+    "through_event_time": "2026-08-29T18:41:55Z",
+    "through_sequence": 184233,
+    "item_count": 31,
+    "input_bytes": 48211,
+    "packet_sha256": "..."
+  },
+  "dropped_item_count": 1,
+  "program_id": "msgvault-person-brief",
+  "program_version": "v1",
+  "provider": "glm",
+  "model": "glm-5.3",
+  "rejected_at": null,
+  "rejected_reason": "",
+  "superseded_at": null
+}
+```
+
+`structured` is the validated record; `rendered_text` is derived from it.
+`sentences` maps each rendered sentence back to the structured item it came
+from; it is rebuilt on read and is empty for a version stored under a renderer
+policy this build does not know, which `renderer_policy` names. Each sentence's
+`evidence_ordinals` are the `ordinal` values in this response's `evidence` array
+that the sentence itself cites, so a client can expand one sentence to its own
+citations. The list is empty when the citation order behind the version cannot
+be accounted for exactly, and a client falls back to the whole `evidence` array
+rather than attributing a citation it is not sure of. `evidence` cites the
+archive items the brief as a whole used, with `evidence_supported: false` once a
+later status event invalidated an item's source. `dropped_item_count` counts
+structured items msgvault refused. Responses are `Cache-Control: no-store`. The
+brief never contains an excerpt of the archive text it was derived from.
+
+---
+
+### Person brief version history {#get-apiv1peopleidbriefversions}
+
+**Endpoint:** `GET /api/v1/people/{id}/brief/versions`
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `limit` | integer | `20` | Versions to return, 1 to 200. Out-of-range values return `400` / `invalid_limit` |
+
+Newest-first history under a `versions` array, each entry shaped exactly like
+the current-brief response. Versions are immutable: a regeneration inserts the
+next version as `current` and marks the previous one `superseded`.
+
+---
+
+### Reject a person brief {#post-apiv1peopleidbriefreject}
+
+**Endpoint:** `POST /api/v1/people/{id}/brief/reject`
+
+**Request:**
+
+```json
+{"reason": "merges two different threads"}
+```
+
+Marks the current version `rejected` and returns it in the same shape as the
+current-brief response, with `rejected_at` and `rejected_reason` set. `reason`
+is optional. The version stays readable in history, and the next eligible run
+produces a replacement without waiting out `min_interval`. A person with no
+current version returns `404` / `person_brief_not_found`, and so does
+`GET /api/v1/people/{id}/brief` after a rejection, until a replacement version
+is generated.
+
+---
+
+### Generate a person brief {#post-apiv1peopleidbriefgenerate}
+
+**Endpoint:** `POST /api/v1/people/{id}/brief/generate`
+
+Runs one forced sweep attempt for that person and waits for it. The request has
+no body.
+
+```json
+{"run_id": "9d1c...", "attempt_id": "5f20...", "brief_version": 3, "brief_failure_class": ""}
+```
+
+`brief_version` is the version the attempt stored, or `0` when it stored none;
+`brief_failure_class` identifies a brief-generation failure when the overall
+attempt succeeded. It can also be empty with version `0`: no eligible evidence
+is a successful attempt that produces no brief. For example, an email-only
+person has no supported brief evidence.
+The forced run bypasses the minimum interval and the new-activity check but
+still requires enrollment, a consented provider profile with
+`allow_sensitive = true`, and available budget. It spends provider budget for
+every call it makes, and on a person whose cursors are already caught up it may
+also run one bounded extraction page.
+
+Generation reports these conditions before running:
+
+| Status | Code | Meaning |
+|---|---|---|
+| `409` | `person_brief_not_enrolled` | Enroll the person first |
+| `409` | `person_brief_lane_disabled` | `[people.sweep.brief] enabled` is `false` |
+| `409` | `person_brief_policy_refused` | The provider profile does not allow sensitive content |
+| `409` | `person_brief_no_supported_lane` | The provider profile does not allow `conversation_text` |
+| `409` | `person_brief_busy` | Another worker holds the person's sweep lease; retry after it finishes |
+| `503` | `brief_generation_unavailable` | The daemon started without the people sweep worker, for example with `[people.sweep] enabled = false` |
+
+Briefs use only supported chat and text-message sources within
+`conversation_text`; email, meeting transcripts, documents, and owner-authored
+messages are excluded. A scheduled sweep skips brief generation when the
+profile does not permit its sources or sensitive content.
+
+Restart the daemon after enabling sweeps or changing the selected provider.
+Manual brief generation uses the configuration loaded at daemon startup.
+
+---
 
 ### Health check {#get-health}
 
@@ -160,7 +553,7 @@ the building generation while a rebuild is in flight, otherwise the active
 generation. During a rebuild the old active generation keeps serving vector
 and hybrid search, but active-generation top-ups are frozen until the
 building generation activates. See
-[Vector Search](/usage/vector-search/) for the end-to-end workflow.
+[Vector Search](/docs/usage/vector-search/) for the end-to-end workflow.
 
 ---
 
@@ -1046,8 +1439,8 @@ that signal (BM25 missed it or the ANN pool did not include it).
 nothing to fuse). `subject_boosted` is true when the subject-line
 boost was applied.
 
-See [Searching](/usage/searching/) for the full query syntax
-reference and [Vector Search](/usage/vector-search/) for vector /
+See [Searching](/docs/usage/searching/) for the full query syntax
+reference and [Vector Search](/docs/usage/vector-search/) for vector /
 hybrid setup.
 
 ---
@@ -1362,6 +1755,7 @@ explore contract is in the generated OpenAPI document (`/openapi.json`).
 ```json
 {
   "count": 1234,
+  "deletable_count": 1200,
   "estimated_bytes": 52428800,
   "cache_revision": "<current cache revision>",
   "search_provenance": {},
@@ -1375,10 +1769,15 @@ explore contract is in the generated OpenAPI document (`/openapi.json`).
 }
 ```
 
+`count` includes all selected items after exclusions. `deletable_count` is the
+Gmail subset that can be staged; the difference is the number of items staging
+will skip. A chat conversation counts as one item.
+
 `unavailable_actions` lists actions this selection does not support. A
-`stage_deletion` entry means the selection includes items that cannot be
-deleted from their source; staging it would fail with
-`409 selection_not_deletable`.
+`stage_deletion` entry means nothing in the selection can be deleted from its
+source; staging it would fail with `409 selection_not_deletable`. A selection
+that mixes deletable and non-deletable items carries no entry: staging takes
+the deletable subset and reports the rest as skipped.
 
 The `operation_token` is bound to this exact selection, its match count, and
 the current cache revision. It expires at `expires_at` (five minutes after
@@ -1388,11 +1787,149 @@ reused or expired token is rejected with `409 operation_token_invalid`.
 
 Malformed selections return `400` with `invalid_selection` (bad `mode`,
 missing `cache_revision`, or `mode: "explicit"` without `row_keys`) or
-`invalid_selection_predicate`. If the analytical cache or search index changes
+`invalid_selection_predicate`. Malformed search operators return `400 invalid_query`.
+If the analytical cache or search index changes
 after the explore response was produced, preflight fails with
 `409 archive_revision_changed` or `409 search_revision_changed` — re-run
 explore and preflight against the new revision. Staging repeats all of these
 checks.
+
+---
+
+### Saved Views {#saved-views}
+
+Saved Views are persistent, shared analytical definitions: a query, an
+explicit search mode, filters, a grouping chain, a presentation, a sort, the
+visible columns, and the inspector preference. Each record carries a schema
+version and a revision. The Web UI, the MCP server, and any API client read,
+edit, and run the same records, so a view saved in the browser can be executed
+by an agent without rebuilding its query.
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/api/v1/saved-views` | List every Saved View, ordered by name. |
+| `POST` | `/api/v1/saved-views` | Create a view. Returns `201` with an `ETag` and `Location` header. |
+| `GET` | `/api/v1/saved-views/{id}` | Read one view. Returns its `ETag`. |
+| `PATCH` | `/api/v1/saved-views/{id}` | Update only the supplied fields. Requires `If-Match`. |
+| `DELETE` | `/api/v1/saved-views/{id}` | Delete a view definition. Requires `If-Match`. Never touches archive messages. |
+| `POST` | `/api/v1/saved-views/{id}/run` | Execute a view through its canonical Explore definition. |
+
+`canonical_state` is a closed version-1 object. The daemon rejects a
+definition it could not execute, so every stored view can be opened by the
+Web UI and run by the API:
+
+| Field | Accepted values |
+|-------|-----------------|
+| `query` | Free text. Empty means no text search. |
+| `search_mode` | `full_text`, `semantic`, `hybrid`. Defaults to `full_text` when a query is present. |
+| `filters[].field` | An Explore filter dimension: `source`, `identity`, `participant`, `domain`, `mailing_list`, `message_type`, `after`, `before`, `deletion`. The legacy aliases `source_id` and `participant_id` are accepted and executed as `source` and `participant`. |
+| `filters[].operator` | `eq` or `in`. |
+| `filters[].values` | One or more non-empty strings. Numeric identifiers are decimal strings so they survive JavaScript clients unchanged. |
+| `grouping` | A drill-down chain of Explore grouping dimensions: `source`, `participant`, `domain`, `message_type`, `mailing_list`, `kind`, `year`, `month`. |
+| `presentation` | `table`, `timeline`, or `files`. |
+| `sort` | Only `{"field": "occurred_at", "direction": "desc"}`. |
+| `columns` | `kind`, `people`, `title`, `excerpt`, `time`, `attachments`, `size`. Presentation only; never sent to Explore. |
+| `inspector_pinned` | Optional inspector pin metadata. API and MCP clients preserve explicit `true` and `false` values. The current Web UI keeps the inspector pinned and ignores this field. |
+
+Every field is optional, an explicit `null` is rejected, and unknown or
+transient workspace state such as selections and result rows is rejected.
+Values are checked with the rules Explore applies when the view runs: `source`
+and `participant` take positive integer IDs, `after` and `before` take one
+RFC3339 timestamp each and appear at most once, `deletion` takes `active` or
+`deleted`, an `identity` filter carries source ID, identifier, and direction
+next to a matching single-value `source` filter, and at most one `sort` entry
+is allowed. The same vocabulary is published as enums in the OpenAPI document,
+so generated clients validate it before a request is sent.
+
+Read responses preserve `canonical_state` as the original JSON, including
+definitions from older or unsupported schema versions. Check
+`incompatibility_reason` before treating that JSON as an executable definition.
+An incompatible view remains readable through the API and MCP so clients can
+explain the problem and offer removal.
+
+Mutations use the record revision as an optimistic-concurrency guard. Send
+the latest `ETag` (for example `"saved-view-7-r3"`) as `If-Match`; a stale tag
+returns `409 saved_view_revision_conflict`, so reload the view and review the
+latest revision instead of overwriting it. Other errors are
+`400 invalid_saved_view` for a definition outside the vocabulary or an
+unsupported schema version, `404 saved_view_not_found`,
+`409 saved_view_name_conflict`, `428 if_match_required`, and
+`400 invalid_if_match`.
+
+---
+
+### Run a Saved View {#post-apiv1saved-viewsidrun}
+
+**Endpoint:** `POST /api/v1/saved-views/{id}/run`
+
+Executes the stored definition through the Explore endpoint its definition
+selects, with the same validation, search resolution, and cursor pagination
+that endpoint applies:
+
+- A view with a `grouping` chain runs `POST /api/v1/explore/groups` at the
+  first level of the chain, the level the Web UI shows when it opens the view.
+- A view with `presentation: "files"` runs `POST /api/v1/explore/files`.
+- Every other view runs `POST /api/v1/explore` as a table. Timeline is a
+  client-side rendering of the same entry rows.
+
+```json
+{
+  "limit": 20,
+  "cursor": "eyJvZmZzZXQiOjIwLC..."
+}
+```
+
+`limit` is `1` to `100` and defaults to `100`. `cursor` is the opaque
+`next_cursor` from the previous page and is omitted for the first page. An
+empty object `{}` is a valid body.
+
+```json
+{
+  "saved_view": {
+    "id": 7,
+    "name": "Invoices",
+    "canonical_state": {
+      "query": "invoice",
+      "search_mode": "full_text",
+      "filters": [{"field": "source", "operator": "in", "values": ["1"]}],
+      "presentation": "table"
+    },
+    "schema_version": 1,
+    "revision": 3,
+    "created_at": "2026-07-19T10:00:00Z",
+    "updated_at": "2026-07-19T11:00:00Z"
+  },
+  "result_kind": "entries",
+  "rows": [
+    {"key": "message:42", "kind": "email", "title": "Quarterly invoice", "occurred_at": "2026-07-18T11:00:00Z"}
+  ],
+  "total_count": 2,
+  "next_cursor": "eyJvZmZzZXQiOjEsLi4u",
+  "cache_revision": "cache-9",
+  "search_provenance": {"lexical_index_revision": "fts-4"}
+}
+```
+
+`result_kind` names the populated array: `entries` carries `rows` in the
+`POST /api/v1/explore` row shape, `groups` carries `groups`, and `files`
+carries `files`. For semantic and hybrid searches, entry pages omit
+`total_count` and report `candidate_snapshot_id` and `candidate_pool_saturated`.
+Group and file pages retain Explore's `total_count`: the number of matching
+groups or files within the resolved candidate set, not an archive-wide semantic
+match count. These pages report `candidate_snapshot_id` and reject an incomplete
+candidate pool. `search_deletion_scope` is `active` when a semantic search
+narrowed an unrestricted deletion context. `next_cursor` is present while more
+results remain.
+
+A missing view returns `404 saved_view_not_found`, and a stored definition the
+current daemon cannot execute, such as one written under another schema
+version, returns `400 invalid_saved_view`. Every other failure is the Explore
+endpoint's own response passed through unchanged: `400 invalid_cursor` or
+`invalid_limit`, `409 archive_revision_changed` or `search_revision_changed`
+when pagination must restart, `503 vector_not_enabled` or another vector
+readiness error for semantic and hybrid views, and the analytical cache
+readiness response when the cache is unavailable. Semantic and hybrid views
+never fall back to full-text search.
 
 ---
 
@@ -1468,6 +2005,10 @@ the IDs are already an explicit, reviewed list:
 }
 ```
 
+IDs that do not resolve to live deletable Gmail messages with provider message
+IDs are omitted, and the
+response `message_count` reports the number of targets resolved by the daemon.
+
 A pending manifest is written and `201` returned:
 
 ```json
@@ -1489,7 +2030,7 @@ re-evaluated filter — is what gets staged:
 1. `POST /api/v1/explore` with the predicate; review the rows and note
    `cache_revision` (plus `search_provenance` and `candidate_snapshot_id` for
    search-backed predicates).
-2. `POST /api/v1/explore/preflight` with the `selection`; review `count` and
+2. `POST /api/v1/explore/preflight` with the `selection`; review `count`, `deletable_count`, and
    `estimated_bytes`, and keep the `operation_token`.
 3. `POST /api/v1/deletions` with the same `selection` and the token:
 
@@ -1511,13 +2052,35 @@ re-evaluated filter — is what gets staged:
 }
 ```
 
-The response is the same `201` manifest shape as above. `selection` cannot be
-combined with `filter` or `message_ids` (`400 invalid_request`). The server
-re-validates the selection against the preflight grant before staging: the
-selection, its match count, and the cache/search revisions must be unchanged,
-and every selected item must be deletable. `"dry_run": true` may be combined
-with a selection to preview the resolved count and sample; the token is
-validated but not consumed.
+The response is the same `201` manifest shape as above, plus `matched_count`
+and `skipped_count`:
+
+```json
+{
+  "dry_run": false,
+  "message_count": 2,
+  "matched_count": 3,
+  "skipped_count": 1,
+  "account": "you@gmail.com",
+  "source": {"id": 1, "type": "gmail", "identifier": "you@gmail.com"},
+  "id": "20260706-153000-old-example-com-mail-a1b2",
+  "status": "pending"
+}
+```
+
+`message_count` is the staged subset, `matched_count` the reviewed match set,
+and `skipped_count` the items no source supports deleting. Deletion covers
+Gmail-source email, so a mixed selection stages its Gmail rows and reports the
+rest as skipped rather than failing; only a selection with nothing deletable
+returns `409 selection_not_deletable`. Legacy Gmail rows with a blank
+`message_type` count as email.
+
+`selection` cannot be combined with `filter` or `message_ids`
+(`400 invalid_request`). The server re-validates the selection against the
+preflight grant before staging: the selection, its match count, and the
+cache/search revisions must be unchanged. `"dry_run": true` may be combined
+with a selection to preview the same staged subset, counts, and sample; the
+token is validated but not consumed.
 
 #### Errors
 
@@ -1532,7 +2095,8 @@ validated but not consumed.
 | `409` | `operation_token_invalid` | Token expired, already used, or does not match the selection, count, and revision |
 | `409` | `archive_revision_changed` | The analytical cache changed since preflight |
 | `409` | `search_revision_changed` | The search index revision changed since preflight |
-| `409` | `selection_not_deletable` | The selection contains items that cannot be deleted from their source |
+| `400` | `invalid_selection_predicate` | The predicate query carries an empty `from` / `to` / `cc` / `bcc` value |
+| `409` | `selection_not_deletable` | No item in the selection can be deleted from its source |
 | `409` | `selection_changed` | The matching messages changed between preflight and staging |
 
 ---
@@ -1634,7 +2198,7 @@ The same HTTP server backs configured remote CLI access and the local background
     messages. Teams and Discord importers detect and checkpoint their own
     first-run history backfills.
 
-`msgvault serve` also runs scheduled SyncTech SMS Backup & Restore Drive sources configured under `[[synctech_sms.sources]]`; see [Configuration](/configuration/#synctech-sms-sources).
+`msgvault serve` also runs scheduled SyncTech SMS Backup & Restore Drive sources configured under `[[synctech_sms.sources]]`; see [Configuration](/docs/configuration/#synctech-sms-sources).
 
 ## Security Model
 
@@ -1676,13 +2240,19 @@ All server settings go in the `[server]` section of `config.toml`. Account sched
 | `engine` | `auto` | Aggregate engine for Web UI, TUI, and aggregate HTTP views: `auto`, `sql`, or `duckdb` |
 | `auto_build_cache` | `true` | Build stale or missing Parquet cache files during daemon startup and after scheduled syncs; `false` skips both automatic paths |
 | `min_rebuild_interval` | `0s` | Minimum age of a usable cache before a scheduled sync may rebuild it; zero preserves rebuilding after each sync |
+| `builder_memory_limit` | `2GB` | DuckDB memory limit for cache builds, such as `4GB` or `512MiB` |
+| `builder_threads` | min(CPUs, 2) | DuckDB threads for cache builds; zero keeps the default |
+| `builder_temp_limit` | `32GB` | Maximum spill-to-disk size for cache builds |
+| `query_memory_limit` | `512MB` | DuckDB memory limit for daemon aggregate queries; raise it on a large archive |
+| `query_threads` | min(CPUs, 4) | DuckDB threads for daemon aggregate queries; zero keeps the default |
+| `query_temp_limit` | `2GB` | Maximum spill-to-disk size for daemon aggregate queries; a query that spills past it fails with a DuckDB out-of-memory error |
 
 `engine = "sql"` forces live SQL for aggregate views. `engine = "duckdb"`
 requires a usable Parquet cache and keeps analytics unavailable until it is
 ready; a build or open failure is fatal rather than a silent SQL fallback.
 `auto_build_cache = false` leaves cache rebuilds to explicit
 `msgvault build-cache` runs. These settings replace the TUI/MCP analytics flags
-deprecated in 0.17.0; see [Configuration: analytics](/configuration/#analytics).
+deprecated in 0.17.0; see [Configuration: analytics](/docs/configuration/#analytics).
 
 `min_rebuild_interval` limits only automatic post-sync rebuilds. Explicit
 builds, startup maintenance, query-required builds, and unusable-cache recovery
@@ -1700,4 +2270,4 @@ repeated archive-scale work on frequently synced archives. Changes under
 | `schedule` | — | Cron expression for sync schedule |
 | `enabled` | `true` | Whether scheduled sync is active |
 
-See the [Configuration](/configuration/) page for the full config file reference.
+See the [Configuration](/docs/configuration/) page for the full config file reference.

@@ -34,7 +34,9 @@ type catalogCapabilities struct {
 	similarMessages bool
 	documentSearch  bool
 	people          bool
+	directoryPeople bool
 	visualSearch    bool
+	savedViews      bool
 }
 
 func visualSearchAvailable(capabilities catalogCapabilities) bool {
@@ -109,27 +111,31 @@ func capabilitiesFor(opts ServeOptions) catalogCapabilities {
 		similarMessages: opts.Backend != nil || opts.SimilarSearcher != nil,
 		documentSearch:  opts.DocumentSearcher != nil,
 		people:          opts.PeopleBackend != nil,
+		directoryPeople: opts.DirectoryBackend != nil,
 		visualSearch:    opts.VisualSearcher != nil,
+		savedViews:      opts.SavedViews != nil,
 	}
 }
 
 // stableOperationCatalogs owns the immutable schemas registered with the SDK.
 // The SDK v1.7 schema cache keys explicit schemas by pointer identity, so a
 // stateless server must reuse these roots instead of rebuilding them per HTTP
-// request. There are only sixty-four possible capability keys, which also keeps
+// request. There are only 256 possible capability keys, which also keeps
 // the shared SDK cache boundary fixed.
 var stableOperationCatalogs = buildOperationCatalogs()
 
 func buildOperationCatalogs() map[catalogCapabilities][]toolDefinition {
-	catalogs := make(map[catalogCapabilities][]toolDefinition, 64)
-	for mask := range 64 {
+	catalogs := make(map[catalogCapabilities][]toolDefinition, 256)
+	for mask := range 256 {
 		capabilities := catalogCapabilities{
-			semanticSearch:  mask&0b100000 != 0,
-			vectorInMessage: mask&0b010000 != 0,
-			similarMessages: mask&0b001000 != 0,
-			documentSearch:  mask&0b000100 != 0,
-			people:          mask&0b000010 != 0,
-			visualSearch:    mask&0b000001 != 0,
+			directoryPeople: mask&0b10000000 != 0,
+			semanticSearch:  mask&0b01000000 != 0,
+			vectorInMessage: mask&0b00100000 != 0,
+			similarMessages: mask&0b00010000 != 0,
+			documentSearch:  mask&0b00001000 != 0,
+			people:          mask&0b00000100 != 0,
+			visualSearch:    mask&0b00000010 != 0,
+			savedViews:      mask&0b00000001 != 0,
 		}
 		catalogs[capabilities] = buildOperationCatalog(capabilities)
 	}
@@ -223,14 +229,21 @@ func legacyDefinition(tool legacymcp.Tool, security toolSecurityClass, handler c
 func buildOperationCatalog(capabilities catalogCapabilities) []toolDefinition {
 	definitions := []toolDefinition{
 		aggregateDefinition(nil),
+		createSavedViewDefinition(nil),
+		deleteSavedViewDefinition(nil),
 		exportAttachmentDefinition(nil),
 		findSimilarMessagesDefinition(nil),
 		getAttachmentDefinition(nil),
 		getMessageDefinition(nil),
 		getPersonNotesDefinition(nil),
+		getPersonProfileDefinition(nil),
 		getPersonRelationshipDefinition(nil),
+		getSavedViewDefinition(nil),
 		getStatsDefinition(nil),
 		listMessagesDefinition(nil),
+		listDirectoryPeopleDefinition(nil),
+		listSavedViewsDefinition(nil),
+		runSavedViewDefinition(nil),
 		searchByDomainsDefinition(nil),
 		searchDocumentsDefinition(nil),
 		searchInMessageDefinition(nil, capabilities.vectorInMessage),
@@ -244,6 +257,7 @@ func buildOperationCatalog(capabilities catalogCapabilities) []toolDefinition {
 		stageDeletionDefinition(nil),
 		promotePersonDefinition(nil),
 		updatePersonNotesDefinition(nil),
+		updateSavedViewDefinition(nil),
 	}
 
 	available := definitions[:0]
@@ -302,6 +316,17 @@ func profileWriteDefinition(
 	return definition
 }
 
+func destructiveWriteDefinition(
+	name, description string,
+	inputSchema, outputSchema *jsonschema.Schema,
+	handler catalogToolHandler,
+) toolDefinition {
+	definition := writeDefinition(name, description, inputSchema, outputSchema, handler)
+	trueValue := true
+	definition.annotations.DestructiveHint = &trueValue
+	return definition
+}
+
 func alwaysAvailable(catalogCapabilities) bool { return true }
 
 func similarMessagesAvailable(c catalogCapabilities) bool { return c.similarMessages }
@@ -309,6 +334,10 @@ func similarMessagesAvailable(c catalogCapabilities) bool { return c.similarMess
 func documentSearchAvailable(c catalogCapabilities) bool { return c.documentSearch }
 
 func peopleAvailable(c catalogCapabilities) bool { return c.people }
+
+func directoryPeopleAvailable(c catalogCapabilities) bool { return c.directoryPeople }
+
+func savedViewsAvailable(c catalogCapabilities) bool { return c.savedViews }
 
 func toolAnnotations(readOnly bool) *sdkmcp.ToolAnnotations {
 	falseValue := false
@@ -685,10 +714,10 @@ func getStatsDefinition(_ *handlers) toolDefinition {
 func aggregateDefinition(_ *handlers) toolDefinition {
 	return readDefinition(
 		ToolAggregate,
-		"Get grouped statistics (top senders, recipients, domains, labels, or message volume by calendar year). "+
+		"Get grouped statistics (top senders, recipients, domains, labels, mailing lists, or message volume by calendar year). "+
 			"Returns an object with a data array containing objects with fields Key, Count, TotalSize, AttachmentSize, AttachmentCount, and TotalUnique.",
 		closedObject(map[string]*jsonschema.Schema{
-			toolArgGroupBy: stringSchema("Dimension to group by. When 'time', buckets are by calendar year only (Key is a year string like \"2024\").", toolArgSender, "recipient", "domain", "label", "time"),
+			toolArgGroupBy: stringSchema("Dimension to group by. When 'time', buckets are by calendar year only (Key is a year string like \"2024\").", toolArgSender, "recipient", "domain", "label", toolArgList, "time"),
 			toolArgAccount: accountProperty(),
 			toolArgLimit:   nonNegativeIntegerSchema("Maximum results to return (default 50)", 50),
 			toolArgAfter:   afterProperty(),
@@ -719,7 +748,7 @@ func searchByDomainsDefinition(_ *handlers) toolDefinition {
 func stageDeletionDefinition(_ *handlers) toolDefinition {
 	return writeDefinition(
 		ToolStageDeletion,
-		"Stage messages for deletion. Use EITHER 'query' (Gmail-style search) OR structured filters (from, domain, label, etc.), not both. Does NOT delete immediately - run 'msgvault delete-staged' CLI command to execute staged deletions.",
+		"Stage messages for deletion. Use EITHER 'query' (Gmail-style search) OR structured filters (from, domain, label, etc.), not both. Does NOT delete immediately. To execute, set '[deletion] remote_enabled = true' in the invoking CLI's config.toml for durable consent, then run 'msgvault delete-staged'. One-command alternative: MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged.",
 		closedObject(map[string]*jsonschema.Schema{
 			toolArgAccount:   accountProperty(),
 			toolArgQuery:     stringSchema("Gmail-style search query (e.g. 'from:linkedin subject:job alert'). Cannot be combined with structured filters."),

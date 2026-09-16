@@ -131,6 +131,8 @@ func viewTypeAbbrev(vt query.ViewType) string {
 		return "Domain"
 	case query.ViewLabels:
 		return "Label"
+	case query.ViewLists:
+		return "List ID"
 	case query.ViewTime:
 		return "Time"
 	default:
@@ -153,6 +155,8 @@ func viewTypePrefix(vt query.ViewType) string {
 		return "D"
 	case query.ViewLabels:
 		return "L"
+	case query.ViewLists:
+		return "LI"
 	case query.ViewTime:
 		return "T"
 	default:
@@ -174,17 +178,7 @@ func (m Model) buildTitleBar() string {
 	}
 
 	// Account indicator
-	var accountStr string
-	if m.accountFilter == nil {
-		accountStr = "All Accounts"
-	} else {
-		for _, acc := range m.accounts {
-			if acc.ID == *m.accountFilter {
-				accountStr = acc.Identifier
-				break
-			}
-		}
-	}
+	accountStr := m.scopeTitle()
 
 	// Filter indicators
 	if m.filters.attachmentsOnly {
@@ -232,7 +226,7 @@ func (m Model) buildBreadcrumb() string {
 		return breadcrumb
 	case levelDrillDown:
 		// Show drill context: "S: foo@example.com (by To)"
-		drillKey := m.drillFilterKey()
+		drillKey := textutil.SanitizeTerminal(m.drillFilterKey())
 		breadcrumb := fmt.Sprintf("%s: %s (by %s)", viewTypePrefix(m.drillViewType), truncateRunes(drillKey, 30), viewTypeAbbrev(m.viewType))
 		if m.viewType == query.ViewTime {
 			breadcrumb += " " + m.timeGranularity.String()
@@ -246,19 +240,21 @@ func (m Model) buildBreadcrumb() string {
 			return "All Messages"
 		}
 		if m.hasDrillFilter() {
-			drillKey := m.drillFilterKey()
-			if m.filterKey != "" && m.filterKey != drillKey {
-				return fmt.Sprintf("%s: %s > %s: %s", viewTypePrefix(m.drillViewType), truncateRunes(drillKey, 20), viewTypePrefix(m.viewType), truncateRunes(m.filterKey, 20))
+			rawDrillKey := m.drillFilterKey()
+			drillKey := textutil.SanitizeTerminal(rawDrillKey)
+			if m.filterKey != "" && m.filterKey != rawDrillKey {
+				filterKey := textutil.SanitizeTerminal(m.filterKey)
+				return fmt.Sprintf("%s: %s > %s: %s", viewTypePrefix(m.drillViewType), truncateRunes(drillKey, 20), viewTypePrefix(m.viewType), truncateRunes(filterKey, 20))
 			}
 			return fmt.Sprintf("%s: %s", viewTypePrefix(m.drillViewType), truncateRunes(drillKey, 40))
 		}
-		return fmt.Sprintf("%s: %s", viewTypePrefix(m.viewType), truncateRunes(m.filterKey, 40))
+		return fmt.Sprintf("%s: %s", viewTypePrefix(m.viewType), truncateRunes(textutil.SanitizeTerminal(m.filterKey), 40))
 	case levelMessageDetail:
 		subject := m.pendingDetailSubject
 		if m.messageDetail != nil {
 			subject = m.messageDetail.Subject
 		}
-		return "Message: " + truncateRunes(subject, 50)
+		return "Message: " + truncateRunes(textutil.SanitizeTerminal(subject), 50)
 	case levelThreadView:
 		if m.threadTruncated {
 			return fmt.Sprintf("Thread (showing %d of %d+ messages)", len(m.threadMessages), len(m.threadMessages))
@@ -411,7 +407,7 @@ func (m Model) aggregateTableView() string {
 
 		// Pad key to fixed width first, then highlight — so ANSI codes
 		// don't affect column alignment.
-		key := truncateRunes(row.Key, keyWidth)
+		key := truncateRunes(textutil.SanitizeTerminal(row.Key), keyWidth)
 		key = fmt.Sprintf("%-*s", keyWidth, key)
 		key = highlightTerms(key, m.searchQuery)
 
@@ -457,15 +453,17 @@ func (m Model) aggregateTableView() string {
 
 	// Info line - show inline search bar when active, search filter when searching, otherwise blank
 	var infoContent string
-	isLoading := m.loading || m.inlineSearchLoading || m.searchLoadingMore
 	if m.inlineSearchActive {
 		infoContent = "/" + m.searchInput.View()
+		if m.inlineSearchError != "" {
+			infoContent += "  " + m.inlineSearchError
+		}
 	} else if m.searchQuery != "" {
 		infoContent = fmt.Sprintf(" Search: %q", m.searchQuery)
 	} else if m.loading && m.analyticsNotice != "" {
 		infoContent = " " + m.analyticsNotice
 	}
-	sb.WriteString(m.renderInfoLine(infoContent, isLoading))
+	sb.WriteString(m.renderInfoLine(infoContent, m.isLoading()))
 
 	// Overlay modal if active
 	if m.modal != modalNone {
@@ -641,7 +639,6 @@ func (m Model) messageListView() string {
 
 	// Info line - show inline search bar when active, search info when searching, otherwise blank
 	var infoContent string
-	isLoading := m.loading || m.inlineSearchLoading || m.searchLoadingMore
 	if m.inlineSearchActive {
 		modeTag := "[Fast]"
 		switch m.searchMode {
@@ -652,6 +649,11 @@ func (m Model) messageListView() string {
 			modeTag = "[Semantic: active messages only]"
 		}
 		infoContent = modeTag + "/" + m.searchInput.View()
+		if m.inlineSearchError != "" {
+			infoContent += "  " + m.inlineSearchError
+		}
+	} else if m.deletionLoading {
+		infoContent = " Resolving all deletion matches…"
 	} else if m.searchQuery != "" {
 		infoContent = fmt.Sprintf(" Search: %q", m.searchQuery)
 		if m.searchTotalCount > 0 {
@@ -669,7 +671,7 @@ func (m Model) messageListView() string {
 			infoContent += " [Semantic: active messages only]"
 		}
 	}
-	sb.WriteString(m.renderInfoLine(infoContent, isLoading))
+	sb.WriteString(m.renderInfoLine(infoContent, m.isLoading()))
 
 	// Overlay modal if active
 	if m.modal != modalNone {
@@ -677,6 +679,10 @@ func (m Model) messageListView() string {
 	}
 
 	return sb.String()
+}
+
+func (m Model) isLoading() bool {
+	return m.loading || m.inlineSearchLoading || m.searchLoadingMore || m.deletionLoading
 }
 
 // buildDetailLines constructs the lines for message detail view.
@@ -722,7 +728,7 @@ func (m Model) buildDetailLines() []string {
 
 	// Labels
 	if len(msg.Labels) > 0 {
-		lines = append(lines, "Labels: "+strings.Join(msg.Labels, ", "))
+		lines = append(lines, "Labels: "+textutil.SanitizeTerminal(strings.Join(msg.Labels, ", ")))
 	}
 
 	// Attachments
@@ -1091,6 +1097,11 @@ func (m Model) footerView() string {
 			"↑/↓ scroll",
 			"/ find",
 		}
+		if m.savingMessage {
+			keys = append(keys, "saving .eml")
+		} else {
+			keys = append(keys, "s save .eml")
+		}
 		if m.detailSearchQuery != "" {
 			keys = append(keys, "n/N next/prev")
 		}
@@ -1200,6 +1211,7 @@ var rawHelpLines = []string{
 	"",
 	"Views & Sorting",
 	"  g/Tab       Cycle view types",
+	"  l           Jump to Lists view",
 	"  t           Jump to Time view (cycle granularity when in Time)",
 	"  s           Cycle sort field",
 	"  v/r         Reverse sort order",
@@ -1208,7 +1220,8 @@ var rawHelpLines = []string{
 	"  Space       Toggle selection",
 	"  S           Select all visible",
 	"  x           Clear selection",
-	"  d/D         Stage for deletion",
+	"  d           Stage selected/current for deletion",
+	"  D           Stage all current row/filter matches",
 	"  a           View all messages",
 	"",
 	"Other",
@@ -1216,7 +1229,9 @@ var rawHelpLines = []string{
 	"  A           Select account",
 	"  f           Filter (attachments, deleted)",
 	"  e           Browse attachments (in message view)",
+	"  s           Save email to current directory (in message view)",
 	"  m           Cycle Email/Texts/Meetings/People",
+	"  ,           Open Settings",
 	"  q           Quit",
 	"",
 	"[↑/↓] Scroll  [Any other key] Close",
@@ -1242,6 +1257,7 @@ var meetingHelpLines = []string{
 	"",
 	"Other",
 	"  m           Cycle Email/Texts/Meetings/People",
+	"  ,           Open Settings",
 	"  ?           Show this help",
 	"  q           Quit",
 	"",
@@ -1268,6 +1284,7 @@ var peopleHelpLines = []string{
 	"",
 	"Other",
 	"  m           Cycle Email/Texts/Meetings/People",
+	"  ,           Open Settings",
 	"  ?           Show this help",
 	"  q           Quit",
 	"",
@@ -1283,6 +1300,8 @@ func (m Model) activeHelpLines() []string {
 					addition := []string{
 						"  [           Previous relationship year",
 						"  ]           Next relationship year",
+						"  b           Brief structured view (Esc returns)",
+						"  :           Brief commands: enroll, generate, reject",
 					}
 					lines = append(lines[:i], append(addition, lines[i:]...)...)
 					break
@@ -1314,8 +1333,10 @@ func (m Model) renderDeleteConfirmModal() string {
 	sb.WriteString("\n\n")
 	_, _ = fmt.Fprintf(&sb, "Stage %d messages for deletion?\n\n", len(m.pendingManifest.GmailIDs))
 	sb.WriteString("This creates a deletion batch. Messages will NOT be\n")
-	sb.WriteString("deleted until you run 'msgvault delete-staged'\n")
-	sb.WriteString("with MSGVAULT_ENABLE_REMOTE_DELETE=1 set.\n\n")
+	sb.WriteString("deleted until you run 'msgvault delete-staged'.\n")
+	sb.WriteString("Enable execution durably in the invoking CLI config:\n")
+	sb.WriteString("[deletion] remote_enabled = true\n")
+	sb.WriteString("Or for one command: MSGVAULT_ENABLE_REMOTE_DELETE=1\n\n")
 	if m.pendingManifest.Filters.Account == "" {
 		sb.WriteString("! Account not set. Use --account when executing.\n\n")
 	}
@@ -1348,19 +1369,16 @@ func (m Model) renderAccountSelectorModal() string {
 	}
 	sb.WriteString(m.styles.modalTitle.Render(title))
 	sb.WriteString("\n\n")
-	// All Accounts option
-	indicator := "○"
-	if m.modalCursor == 0 {
-		indicator = "●"
-	}
-	_, _ = fmt.Fprintf(&sb, " %s %s\n", indicator, allLabel)
-	// Individual accounts
-	for i, acc := range m.selectableAccounts() {
-		indicator = "○"
-		if m.modalCursor == i+1 {
+	for i, option := range m.selectorOptions() {
+		label := option.label
+		if i == 0 {
+			label = allLabel
+		}
+		indicator := "○"
+		if m.modalCursor == i {
 			indicator = "●"
 		}
-		_, _ = fmt.Fprintf(&sb, " %s %s\n", indicator, acc.Identifier)
+		_, _ = fmt.Fprintf(&sb, " %s %s\n", indicator, label)
 	}
 	sb.WriteString("\n[↑/↓] Navigate  [Enter] Select  [Esc] Cancel")
 	return sb.String()

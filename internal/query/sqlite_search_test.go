@@ -23,6 +23,7 @@ func TestSearch_Filters(t *testing.T) {
 		name      string
 		query     *search.Query
 		wantCount int
+		setup     func(*testEnv)
 		validator func(MessageSummary) bool
 		validDesc string
 	}{
@@ -71,6 +72,27 @@ func TestSearch_Filters(t *testing.T) {
 			wantCount: 1,
 		},
 		{
+			name:      "ConversationIDFilter",
+			query:     &search.Query{ConversationIDs: []int64{1, 104}},
+			wantCount: 4,
+			setup: func(env *testEnv) {
+				_, err := env.DB.Exec(`
+					INSERT INTO conversations (
+						id, source_id, source_conversation_id, conversation_type, title
+					) VALUES
+						(104, 1, 'thread104', 'email_thread', 'Included thread'),
+						(105, 1, 'thread105', 'email_thread', 'Excluded thread');
+					UPDATE messages SET conversation_id = 104 WHERE id = 4;
+					UPDATE messages SET conversation_id = 105 WHERE id = 5;
+				`)
+				require.NoError(t, err, "seed conversation filter scope")
+			},
+			validator: func(m MessageSummary) bool {
+				return m.ConversationID == 1 || m.ConversationID == 104
+			},
+			validDesc: "ConversationID is in requested scope",
+		},
+		{
 			name:      "SizeFilter",
 			query:     &search.Query{LargerThan: new(largerThan)},
 			wantCount: 1,
@@ -87,6 +109,9 @@ func TestSearch_Filters(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			env := newTestEnv(t)
+			if tc.setup != nil {
+				tc.setup(env)
+			}
 			results := assertSearchCount(t, env, tc.query, tc.wantCount)
 			if tc.validator != nil {
 				assertAllResults(t, results, tc.validDesc, tc.validator)
@@ -168,6 +193,65 @@ func TestSearch_MessageTypeFilter(t *testing.T) {
 	require.Len(results, 1, "message_type must scope FTS search")
 	assert.Equal(smsID, results[0].ID)
 	assert.Equal("sms", results[0].MessageType)
+}
+
+// TestSearch_ListIDFilters catches Search dropping list: predicates after FTS
+// candidate selection. It exercises case folding, literal LIKE escaping, and
+// repeated-operator AND semantics against real message rows.
+func TestSearch_ListIDFilters(t *testing.T) {
+	env := newTestEnv(t)
+	aliceID := env.MustLookupParticipant("alice@example.com")
+	bobID := env.MustLookupParticipant("bob@company.org")
+	matchingID := env.AddMessage(dbtest.MessageOpts{
+		Subject: "shared list announcement", SentAt: "2024-04-10 10:00:00", FromID: aliceID, ToIDs: []int64{bobID},
+	})
+	announceOnlyID := env.AddMessage(dbtest.MessageOpts{
+		Subject: "shared list digest", SentAt: "2024-04-11 10:00:00", FromID: aliceID, ToIDs: []int64{bobID},
+	})
+	literalID := env.AddMessage(dbtest.MessageOpts{
+		Subject: "literal list marker", SentAt: "2024-04-12 10:00:00", FromID: aliceID, ToIDs: []int64{bobID},
+	})
+	unicodeID := env.AddMessage(dbtest.MessageOpts{
+		Subject: "unicode list marker", SentAt: "2024-04-13 10:00:00", FromID: aliceID, ToIDs: []int64{bobID},
+	})
+	_, err := env.DB.Exec(`UPDATE messages SET list_id = CASE id
+		WHEN ? THEN '<Announce.Shared.example.org>'
+		WHEN ? THEN '<announce.example.net>'
+		WHEN ? THEN '<Ops%_Team\Archive.example.org>'
+		WHEN ? THEN '<ÉCOLE.example.org>'
+	END WHERE id IN (?, ?, ?, ?)`,
+		matchingID, announceOnlyID, literalID, unicodeID, matchingID, announceOnlyID, literalID, unicodeID)
+	require.NoError(t, err, "seed list ids")
+	env.EnableFTS()
+
+	assertIDs := func(q *search.Query, want ...int64) {
+		t.Helper()
+		results := env.MustSearch(q, 100, 0)
+		got := make([]int64, len(results))
+		for i, result := range results {
+			got[i] = result.ID
+		}
+		assert.ElementsMatch(t, want, got)
+	}
+
+	assertIDs(&search.Query{ListIDs: []string{"ANNOUNCE"}}, matchingID, announceOnlyID)
+	assertIDs(&search.Query{ListIDs: []string{"announce", "shared"}}, matchingID)
+	assertIDs(&search.Query{ListIDs: []string{"ops%_team"}}, literalID)
+	assertIDs(&search.Query{ListIDs: []string{"ops%_team\\archive"}}, literalID)
+	assertIDs(&search.Query{ListIDs: []string{"école"}}, unicodeID)
+
+	before := env.MustSearch(&search.Query{TextTerms: []string{"shared"}}, 100, 0)
+	after := env.MustSearch(&search.Query{TextTerms: []string{"shared"}, ListIDs: []string{"announce"}}, 100, 0)
+	beforeIDs := make([]int64, len(before))
+	afterIDs := make([]int64, len(after))
+	for i, result := range before {
+		beforeIDs[i] = result.ID
+	}
+	for i, result := range after {
+		afterIDs[i] = result.ID
+	}
+	assert.Equal(t, []int64{announceOnlyID, matchingID}, beforeIDs)
+	assert.Equal(t, beforeIDs, afterIDs, "List-Id narrowing preserves canonical search order")
 }
 
 // TestSearch_WithFTS_SpecialChars verifies that FTS5 special characters in
@@ -468,6 +552,34 @@ func TestMergeFilterIntoQuery_DoesNotMutateOriginal(t *testing.T) {
 
 	require.Len(t, q.FromAddrs, 1, "Original query was mutated")
 	assert.Equal(t, "original@example.com", q.FromAddrs[0], "Original query was mutated")
+}
+
+func TestMergeFilterIntoQuery_ConversationID(t *testing.T) {
+	conversationID := int64(42)
+	original := &search.Query{ConversationIDs: []int64{7, 42}}
+
+	merged := MergeFilterIntoQuery(original, MessageFilter{ConversationID: &conversationID})
+
+	assert.Equal(t, []int64{42}, merged.ConversationIDs,
+		"drill-down conversation must scope the merged search")
+	assert.Equal(t, []int64{7, 42}, original.ConversationIDs,
+		"merge must not mutate the original query")
+}
+
+func TestMergeFilterIntoQuery_ConflictingConversationIDMatchesNothing(t *testing.T) {
+	conversationID := int64(42)
+	original := &search.Query{ConversationIDs: []int64{7, 8}}
+
+	merged := MergeFilterIntoQuery(original, MessageFilter{ConversationID: &conversationID})
+
+	require.NotNil(t, merged.ConversationIDs,
+		"a conflicting scope must remain distinguishable from no scope")
+	assert.Empty(t, merged.ConversationIDs, "conflicting scopes must match nothing")
+	conditions, _ := appendConversationFilter(
+		nil, nil, "m.conversation_id", merged.ConversationIDs,
+	)
+	assert.Equal(t, []string{"1=0"}, conditions,
+		"an explicit empty scope must become a match-nothing condition")
 }
 
 // TestMergeFilterIntoQuery_EmptySourceIDsClearsAccountScope verifies that

@@ -21,6 +21,9 @@ var (
 	ErrPersonCardDAVPublished             = errors.New("person has CardDAV publication state")
 	ErrPersonMergeActive                  = errors.New("person has active merge lineage")
 	ErrPersonEnrichmentDispatchInProgress = errors.New("person enrichment provider dispatch is in progress")
+	ErrInvalidDirectoryQuery              = errors.New("invalid directory query")
+	ErrInvalidDirectoryCursor             = errors.New("invalid directory cursor")
+	ErrDirectoryProjectionStale           = errors.New("directory projection is stale")
 )
 
 // PersonBindingConflictError reports the curated people that would be
@@ -278,7 +281,7 @@ func (s *Store) deletePersonOnce(ctx context.Context, input DeletePersonEnrichme
 		}
 		var hasCardDAVPublication bool
 		if err := tx.QueryRowContext(ctx,
-			`SELECT EXISTS (SELECT 1 FROM carddav_publications WHERE person_id = ?)`, id,
+			`SELECT EXISTS (SELECT 1 FROM carddav_publications WHERE person_id = ? UNION ALL SELECT 1 FROM carddav_conflicts c JOIN carddav_resources r ON r.address_book_id=c.address_book_id AND r.href=c.href WHERE c.status='unresolved' AND c.local_mutation_intent IS NOT NULL AND r.person_id=?)`, id, id,
 		).Scan(&hasCardDAVPublication); err != nil {
 			return fmt.Errorf("check CardDAV publication for person %d: %w", id, err)
 		}
@@ -501,8 +504,19 @@ func (s *Store) updatePersonDisplayNameOnce(
 		if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
 			return err
 		}
+		var previousName sql.NullString
+		err := tx.QueryRowContext(ctx,
+			`SELECT display_name FROM persons WHERE id = ? AND revision = ?`,
+			id, expectedRevision,
+		).Scan(&previousName)
+		if errors.Is(err, sql.ErrNoRows) {
+			return s.personCASMissTx(ctx, tx, id)
+		}
+		if err != nil {
+			return fmt.Errorf("read person %d display name: %w", id, err)
+		}
 		var updatedID int64
-		err := tx.QueryRowContext(ctx, fmt.Sprintf(`
+		err = tx.QueryRowContext(ctx, fmt.Sprintf(`
 			UPDATE persons
 			SET display_name = ?, revision = revision + 1,
 			    vcard_projection_revision = vcard_projection_revision + 1,
@@ -515,6 +529,17 @@ func (s *Store) updatePersonDisplayNameOnce(
 		}
 		if err != nil {
 			return fmt.Errorf("update person %d: %w", id, err)
+		}
+		// Preserve the person revision contract, but invalidate analytics only
+		// when the normalized display name actually changed.
+		nameChanged := previousName.Valid
+		if displayName != nil {
+			nameChanged = !previousName.Valid || previousName.String != *displayName
+		}
+		if nameChanged {
+			if err := s.bumpPersonDisplayNameRevisionContext(ctx, tx); err != nil {
+				return err
+			}
 		}
 		if err := s.bumpDisplayNameCounterpartVCardProjectionsTx(
 			ctx, tx, updatedID,

@@ -18,6 +18,10 @@ import (
 	extOAuth2 "golang.org/x/oauth2"
 )
 
+func TestSanitizeArgsDraftBody(t *testing.T) {
+	assert.Equal(t, []string{"draft-reply", "42", "--body", "<redacted>", "--body=<redacted>"}, sanitizeArgs([]string{"draft-reply", "42", "--body", "body-secret-731", "--body=body-secret-731"}))
+}
+
 func TestErrOAuthNotConfigured(t *testing.T) {
 	assert := assert.New(t)
 	err := errOAuthNotConfigured()
@@ -638,4 +642,42 @@ func TestGetTokenSourceWithReauthUsesScopePreservingReauth(t *testing.T) {
 	assert.NotNil(ts)
 	assert.Equal(1, m.authorizePreserveCount, "scope-preserving reauth call count")
 	assert.Equal(0, m.authorizeManualCount, "plain reauth call count")
+}
+
+// withAgentFlags sets the global agent-mode flags and restores them on
+// test cleanup.
+func withAgentFlags(t *testing.T, url, tokenFile string) {
+	t.Helper()
+	old := agentURL
+	oldTF := agentTokenFile
+	agentURL = url
+	agentTokenFile = tokenFile
+	t.Cleanup(func() {
+		agentURL = old
+		agentTokenFile = oldTF
+	})
+}
+
+// TestAgentDelegatedCapableCommandSucceeds verifies that a delegated-capable
+// command (draft-reply) with agent flags passes the PersistentPreRunE
+// early-return path (returns nil without loading config).
+func TestAgentDelegatedCapableCommandSucceeds(t *testing.T) {
+	withAgentFlags(t, "http://daemon.example:8080", "/tmp/token")
+
+	cmd := &cobra.Command{Use: "draft-reply"}
+	err := rootCmd.PersistentPreRunE(cmd, nil)
+	require.NoError(t, err, "draft-reply with agent flags should succeed in PersistentPreRunE")
+}
+
+// TestAgentDelegatedNonCapableCommandReturnsError verifies that a command
+// not in the delegated-capable set (serve) returns "not available in
+// agent-delegated mode" when agent flags are present.
+func TestAgentDelegatedNonCapableCommandReturnsError(t *testing.T) {
+	withAgentFlags(t, "http://daemon.example:8080", "/tmp/token")
+
+	cmd := &cobra.Command{Use: "serve"}
+	err := rootCmd.PersistentPreRunE(cmd, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not available in agent-delegated mode")
+	assert.Contains(t, err.Error(), "serve")
 }

@@ -11,6 +11,9 @@ import (
 	"go.kenn.io/docbank/document/voyage"
 
 	"go.kenn.io/msgvault/internal/fileutil"
+	"go.kenn.io/msgvault/internal/providercredentials"
+	"go.kenn.io/msgvault/internal/vector"
+	"go.kenn.io/msgvault/internal/vector/visual"
 )
 
 var (
@@ -53,9 +56,20 @@ capability profile.`,
 		if err := cfg.Vector.Multimodal.Validate(); err != nil {
 			return err
 		}
-		apiKey := cfg.Vector.Multimodal.APIKey()
+		credentials, err := providercredentials.Read(cfg.TokensDir())
+		if err != nil {
+			return fmt.Errorf("load provider credentials: %w", err)
+		}
+		apiKey, err := resolveProviderCredentialFromSnapshot(
+			credentials, providercredentials.VectorMultimodalID,
+			cfg.Vector.Multimodal.Endpoint, cfg.Vector.Multimodal.APIKeyEnv,
+		)
+		if err != nil {
+			return fmt.Errorf("resolve visual embedding credential: %w", err)
+		}
 		if apiKey == "" {
-			return fmt.Errorf("environment variable %s is not set", cfg.Vector.Multimodal.APIKeyEnv)
+			return fmt.Errorf("visual embedding credential is not configured: store one for %s in Settings "+
+				"or set environment variable %s", providercredentials.VectorMultimodalID, cfg.Vector.Multimodal.APIKeyEnv)
 		}
 		if !multimodalProbeYes {
 			return usageErr(cmd, errors.New("the probe sends synthetic fixture media to the configured provider; pass --yes to continue"))
@@ -86,7 +100,9 @@ capability profile.`,
 		if err := voyage.ValidateProbeFixtures(ctx, policy, fixtures); err != nil {
 			return fmt.Errorf("validate probe fixtures: %w", err)
 		}
-		client, err := voyage.NewClient(policy, voyage.ClientConfig{APIKey: apiKey})
+		client, err := voyage.NewClient(policy, voyage.ClientConfig{
+			APIKey: apiKey, HTTPClient: providerHTTPClientWithoutRedirects(nil),
+		})
 		if err != nil {
 			return fmt.Errorf("voyage client: %w", err)
 		}
@@ -129,6 +145,53 @@ func writeVisualCapabilityManifest(path string, manifest voyage.CapabilityManife
 		return fmt.Errorf("write capability manifest: %w", err)
 	}
 	return nil
+}
+
+// visualVoyageConfig binds the manifest to the media policy used by both
+// runtime uploads and setup's read-only consent check.
+func visualVoyageConfig(cfg vector.Config) (visual.VoyageConfig, error) {
+	manifest, err := loadVisualCapabilityManifest(cfg.Multimodal.CapabilitiesFile)
+	if err != nil {
+		return visual.VoyageConfig{}, err
+	}
+	media := visual.DefaultMediaPolicy()
+	media.IncludeImages = cfg.Multimodal.ImagesEnabled() || cfg.Multimodal.ImageQueriesEnabled()
+	media.IncludeVideo = cfg.Multimodal.VideoEnabled()
+	media.AllowAnimatedGIF = cfg.Multimodal.AnimatedGIFsEnabled()
+	provider := visual.VoyageConfig{
+		Model: cfg.Multimodal.Model, Dimension: cfg.Multimodal.Dimension,
+		Manifest: manifest, Media: media,
+	}
+	policy, err := provider.Policy()
+	if err != nil {
+		return visual.VoyageConfig{}, fmt.Errorf("configure visual capability policy: %w", err)
+	}
+	// Every visual search embeds its text query through this provider. A
+	// manifest that only authorizes indexing cannot make the lane usable.
+	if _, err := policy.Authorize(manifest, voyage.CapabilityQueryText); err != nil {
+		return visual.VoyageConfig{}, fmt.Errorf("capability manifest does not authorize text queries; re-run `msgvault multimodal probe`: %w", err)
+	}
+	return provider, nil
+}
+
+// loadVisualCapabilityManifest reads and strictly validates the operator's
+// probed Voyage capability manifest. The multimodal lane cannot run without
+// one: nothing has upload authority until a probe recorded it.
+func loadVisualCapabilityManifest(path string) (voyage.CapabilityManifest, error) {
+	if strings.TrimSpace(path) == "" {
+		return voyage.CapabilityManifest{}, errors.New(
+			"vector.multimodal.capabilities_file is not set; run `msgvault multimodal probe` and configure the manifest path")
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return voyage.CapabilityManifest{}, fmt.Errorf("open Voyage capability manifest: %w", err)
+	}
+	defer func() { _ = file.Close() }()
+	manifest, err := voyage.DecodeCapabilityManifest(file)
+	if err != nil {
+		return voyage.CapabilityManifest{}, fmt.Errorf("decode Voyage capability manifest %s: %w", path, err)
+	}
+	return manifest, nil
 }
 
 func init() {

@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -25,8 +27,10 @@ import (
 type inProcessPersonProviderDaemonStore struct {
 	*storeAPIAdapter
 
-	config     peoplesweep.Config
-	httpClient *http.Client
+	config      peoplesweep.Config
+	httpClient  *http.Client
+	credentials peoplesweep.CredentialStore
+	requests    chan<- api.CLIRunRequest
 }
 
 func (s *inProcessPersonProviderDaemonStore) RunCLICommand(
@@ -34,19 +38,28 @@ func (s *inProcessPersonProviderDaemonStore) RunCLICommand(
 	req api.CLIRunRequest,
 	emit func(api.CLIRunEvent) error,
 ) error {
+	if s.requests != nil {
+		s.requests <- req
+	}
 	deps := localPersonProviderDeps(s.config, s.store, nil)
 	deps.newChecker = func(
 		config peoplesweep.Config,
 		consent personProviderStore,
 	) (personProviderChecker, error) {
+		registry, err := peoplesweep.NewDriverRegistry(s.httpClient, nil, nil)
+		if err != nil {
+			return nil, err
+		}
 		return peoplesweep.NewRunner(
 			config,
 			consent,
-			peoplesweep.NewOpenAICompatibleTransport(s.httpClient),
-			func(name string) (string, bool) {
-				value, ok := req.Env[name]
-				return value, ok
-			},
+			registry,
+			peoplesweep.NewCredentialResolver(s.credentials, func(name string) (string, bool) {
+				if value, ok := req.Env[name]; ok {
+					return value, true
+				}
+				return os.LookupEnv(name)
+			}),
 		)
 	}
 
@@ -70,6 +83,93 @@ func (s *inProcessPersonProviderDaemonStore) RunCLICommand(
 	return nil
 }
 
+func TestSavedPersonProviderCheckForwardsExactCredentialThroughDaemon(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	const keyName = "SETUP_ONLY_PROVIDER_KEY"
+	const secret = "synthetic-onboarding-key"
+	t.Setenv(keyName, "") // The daemon process does not have the caller's key.
+	var received atomic.Int64
+	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+secret {
+			http.Error(w, "missing credential", http.StatusUnauthorized)
+			return
+		}
+		received.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"model":"test-model","choices":[{"message":{"content":"{\"ok\":true}"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}`)
+	}))
+	t.Cleanup(provider.Close)
+	peopleConfig := personProviderTestConfig()
+	onboarded := configuredPersonProvider(peopleConfig)
+	onboarded.Endpoint, onboarded.CredentialEnv = provider.URL+"/v1", keyName
+	peopleConfig.Providers["onboarded"] = onboarded
+	daemonConfig := config.NewDefaultConfig()
+	daemonConfig.HomeDir = t.TempDir()
+	daemonConfig.People.Sweep = personProviderTestConfig()
+	// Onboarding publishes a new profile after the daemon has started.
+	saved := *daemonConfig
+	saved.People.Sweep = peopleConfig
+	require.NoError(saved.Save())
+	st := &inProcessPersonProviderDaemonStore{
+		storeAPIAdapter: &storeAPIAdapter{store: testutil.NewSQLiteTestStore(t)},
+		config:          peopleConfig, httpClient: provider.Client(),
+	}
+	daemon := api.NewServerWithOptions(api.ServerOptions{
+		Config: daemonConfig, Store: st, Logger: slog.New(slog.DiscardHandler),
+		OperationGate: api.NewSerialOperationGate(),
+	})
+	server := httptest.NewServer(daemon.Router())
+	t.Cleanup(server.Close)
+	frontend := *daemonConfig
+	frontend.People.Sweep = peopleConfig
+	frontend.Remote = config.RemoteConfig{URL: server.URL, AllowInsecure: true}
+	withStoreResolverConfig(t, &frontend)
+	deps := defaultPersonProviderCommandDeps()
+	callerHasKey := false
+	deps.setup.lookupEnv = func(name string) (string, bool) {
+		assert.Equal(keyName, name)
+		return secret, callerHasKey
+	}
+	var output bytes.Buffer
+	command := &cobra.Command{Use: "setup"}
+	command.SetContext(t.Context())
+	command.SetOut(&output)
+	command.SetErr(&output)
+	require.Error(executeSavedPersonProviderCheck(command, deps, "onboarded", "", &output))
+	assert.Zero(received.Load())
+	output.Reset()
+	callerHasKey = true
+	require.NoError(executeSavedPersonProviderCheck(command, deps, "onboarded", "", &output), output.String())
+	assert.Equal(int64(1), received.Load())
+	assert.NotContains(output.String(), secret)
+
+	profileConfig := peopleConfig
+	profileConfig.Enabled = true
+	profileConfig.Provider = peoplesweep.ProviderSelection{Name: "onboarded"}
+	profile, err := profileConfig.Profile()
+	require.NoError(err)
+	for _, test := range []struct{ name, fingerprint, key string }{
+		{name: "other provider key", fingerprint: profile.Fingerprint, key: "TEST_PROVIDER_KEY"},
+		{name: "changed profile", fingerprint: strings.Repeat("a", 64), key: keyName},
+		{name: "ordinary check", key: keyName},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			args := []string{"person", "provider", "check", "onboarded"}
+			if test.fingerprint != "" {
+				args = append(args, "--if-fingerprint", test.fingerprint)
+			}
+			body := mustJSON(t, api.CLIRunRequest{Args: args, Env: map[string]string{test.key: secret}})
+			request := httptest.NewRequest(http.MethodPost, "/api/v1/cli/run", bytes.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			response := httptest.NewRecorder()
+			daemon.Router().ServeHTTP(response, request)
+			assert.Equal(http.StatusBadRequest, response.Code, response.Body.String())
+			assert.Equal(int64(1), received.Load())
+		})
+	}
+}
+
 func TestPersonProviderRealDaemonSyntheticCheckAndRevoke(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -90,7 +190,7 @@ func TestPersonProviderRealDaemonSyntheticCheckAndRevoke(t *testing.T) {
 			Body:          body,
 		}
 		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("x-request-id", "req-daemon")
+		w.Header().Set("X-Request-ID", "req-daemon")
 		_, _ = io.WriteString(w, `{
 			"model":"test-model",
 			"choices":[{"message":{"content":"{\"ok\":true}"}}],
@@ -100,30 +200,55 @@ func TestPersonProviderRealDaemonSyntheticCheckAndRevoke(t *testing.T) {
 	t.Cleanup(provider.Close)
 
 	peopleConfig := personProviderTestConfig()
-	peopleConfig.Provider.Endpoint = provider.URL + "/v1"
+	mutateConfiguredPersonProvider(&peopleConfig, func(config *peoplesweep.ProviderConfig) {
+		config.Endpoint = provider.URL + "/v1"
+	})
 	st := testutil.NewSQLiteTestStore(t)
+	requestsToDaemon := make(chan api.CLIRunRequest, 4)
 	daemonConfig := &config.Config{People: config.PeopleConfig{Sweep: peopleConfig}}
 	daemonStore := &inProcessPersonProviderDaemonStore{
 		storeAPIAdapter: &storeAPIAdapter{store: st},
 		config:          peopleConfig,
 		httpClient:      provider.Client(),
+		requests:        requestsToDaemon,
 	}
-	logger := slog.New(slog.DiscardHandler)
+	var daemonLogs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&daemonLogs, nil))
 	daemon := api.NewServerWithOptions(api.ServerOptions{
 		Config: daemonConfig, Store: daemonStore, Logger: logger,
 		OperationGate: api.NewSerialOperationGate(),
 	})
-	daemonHTTP := httptest.NewServer(daemon.Router())
+	rawDaemonBodies := make(chan []byte, 4)
+	daemonRouter := daemon.Router()
+	daemonHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/cli/run" {
+			body, readErr := io.ReadAll(r.Body)
+			if readErr != nil {
+				http.Error(w, "read request body", http.StatusBadRequest)
+				return
+			}
+			rawDaemonBodies <- body
+			r.Body = io.NopCloser(bytes.NewReader(body))
+		}
+		daemonRouter.ServeHTTP(w, r)
+	}))
 	t.Cleanup(daemonHTTP.Close)
 
 	frontendConfig := *daemonConfig
 	frontendConfig.Remote = config.RemoteConfig{URL: daemonHTTP.URL, AllowInsecure: true}
 	withStoreResolverConfig(t, &frontendConfig)
-	t.Setenv("TEST_PROVIDER_KEY", "caller-key")
+	const environmentSecretCanary = "caller-key-never-in-daemon-request"
+	t.Setenv("TEST_PROVIDER_KEY", environmentSecretCanary)
 	deps := defaultPersonProviderCommandDeps()
 
-	_, err := executePersonProviderCommand(t, deps, "consent", "--yes", "--json")
+	reverifyOutput, err := executePersonProviderCommand(t, deps, "reverify", "--yes")
 	require.NoError(err)
+	assert.Contains(reverifyOutput, "People inference provider disclosure")
+	assert.Contains(reverifyOutput, provider.URL+"/v1")
+	captured := <-requests
+	consentOutput, err := executePersonProviderCommand(t, deps, "consent", "--yes", "--json")
+	require.NoError(err)
+	assert.Contains(consentOutput, `"active":true`)
 	output, err := executePersonProviderCommand(t, deps, "check", "--json")
 	require.NoError(err)
 	assert.JSONEq(`{
@@ -133,8 +258,7 @@ func TestPersonProviderRealDaemonSyntheticCheckAndRevoke(t *testing.T) {
 		"usage":{"input_tokens":9,"output_tokens":2}
 	}`, output)
 
-	captured := <-requests
-	assert.Equal("Bearer caller-key", captured.Authorization)
+	assert.Equal("Bearer "+environmentSecretCanary, captured.Authorization)
 	assert.Equal("/v1/chat/completions", captured.Path)
 	assert.Equal("test-model", captured.Body["model"])
 	messages, ok := captured.Body["messages"].([]any)
@@ -144,12 +268,89 @@ func TestPersonProviderRealDaemonSyntheticCheckAndRevoke(t *testing.T) {
 	require.True(ok)
 	assert.Equal("Return an object with ok set to true.", message["content"])
 	assert.NotContains(string(mustJSON(t, captured.Body)), "archive")
+	for range 3 {
+		req := <-requestsToDaemon
+		wire := mustJSON(t, req)
+		assert.Empty(req.Env)
+		assert.NotContains(string(wire), environmentSecretCanary)
+		assert.NotContains(string(<-rawDaemonBodies), environmentSecretCanary)
+	}
+	assert.NotContains(output, environmentSecretCanary)
+	assert.NotContains(daemonLogs.String(), environmentSecretCanary)
+	<-requests
 
 	_, err = executePersonProviderCommand(t, deps, "revoke", "--json")
 	require.NoError(err)
-	_, err = executePersonProviderCommand(t, deps, "check", "--json")
-	require.ErrorContains(err, "active exact consent")
-	assert.Equal(int64(1), requestCount.Load(), "revoked check must not reach the provider")
+	output, err = executePersonProviderCommand(t, deps, "check", "--json")
+	require.NoError(err)
+	assert.JSONEq(`{
+		"ok":true,
+		"provider_request_id":"req-daemon",
+		"model":"test-model",
+		"usage":{"input_tokens":9,"output_tokens":2}
+	}`, output)
+	assert.Equal(int64(3), requestCount.Load(), "synthetic checks bypass archive consent")
+}
+
+func TestPersonProviderStoredCheckKeepsSecretOutOfDaemonMetadata(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	requireStoredCredentialStorePlatform(t)
+	const secretCanary = "stored-daemon-secret-canary"
+	requests := make(chan api.CLIRunRequest, 1)
+	providerRequests := make(chan string, 1)
+	provider := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		providerRequests <- r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{
+			"model":"test-model",
+			"choices":[{"message":{"content":"{\"ok\":true}"}}],
+			"usage":{"prompt_tokens":1,"completion_tokens":1}
+		}`)
+	}))
+	t.Cleanup(provider.Close)
+
+	peopleConfig := personProviderTestConfig()
+	stored := configuredPersonProvider(peopleConfig)
+	stored.Endpoint = provider.URL + "/v1"
+	stored.Credential = peoplesweep.CredentialStored
+	stored.CredentialEnv = ""
+	peopleConfig.Provider = peoplesweep.ProviderSelection{Name: "stored"}
+	peopleConfig.Providers = map[string]peoplesweep.ProviderConfig{"stored": stored}
+	credentialStore := peoplesweep.NewFileCredentialStore(t.TempDir())
+	require.NoError(credentialStore.Save("stored", peoplesweep.NewCredential(
+		peoplesweep.AuthBearer, secretCanary)))
+	st := testutil.NewSQLiteTestStore(t)
+	daemonConfig := &config.Config{People: config.PeopleConfig{Sweep: peopleConfig}}
+	daemonStore := &inProcessPersonProviderDaemonStore{
+		storeAPIAdapter: &storeAPIAdapter{store: st},
+		config:          peopleConfig,
+		httpClient:      provider.Client(),
+		credentials:     credentialStore,
+		requests:        requests,
+	}
+	daemon := api.NewServerWithOptions(api.ServerOptions{
+		Config: daemonConfig, Store: daemonStore, Logger: slog.New(slog.DiscardHandler),
+		OperationGate: api.NewSerialOperationGate(),
+	})
+	daemonHTTP := httptest.NewServer(daemon.Router())
+	t.Cleanup(daemonHTTP.Close)
+
+	frontendConfig := *daemonConfig
+	frontendConfig.Remote = config.RemoteConfig{URL: daemonHTTP.URL, AllowInsecure: true}
+	withStoreResolverConfig(t, &frontendConfig)
+	deps := defaultPersonProviderCommandDeps()
+	output, err := executePersonProviderCommand(t, deps, "check", "stored", "--json")
+	require.NoError(err)
+	assert.NotContains(output, secretCanary)
+
+	req := <-requests
+	wire, err := json.Marshal(req)
+	require.NoError(err)
+	assert.Equal([]string{"person", "provider", "check", "--json", "stored"}, req.Args)
+	assert.Empty(req.Env)
+	assert.NotContains(string(wire), secretCanary)
+	assert.Equal("Bearer "+secretCanary, <-providerRequests)
 }
 
 func mustJSON(t *testing.T, value any) []byte {

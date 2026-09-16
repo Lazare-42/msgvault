@@ -40,6 +40,14 @@ func (d *PostgreSQLDialect) Rebind(query string) string {
 	return sqldialect.RebindPostgreSQL(query)
 }
 
+func (d *PostgreSQLDialect) UnicodeLowerExpression(expr string) string {
+	return "LOWER(" + expr + ")"
+}
+
+func (d *PostgreSQLDialect) BlobPrefixSQL(column string) string {
+	return "SUBSTRING(" + column + " FROM 1 FOR ?)"
+}
+
 // Now returns the PostgreSQL expression for the current timestamp.
 func (d *PostgreSQLDialect) Now() string { return "NOW()" }
 
@@ -281,6 +289,32 @@ func (d *PostgreSQLDialect) visibilityFloor(
 // BoolTrueExpr returns the bare column name. PostgreSQL has a real BOOLEAN
 // type and rejects integer comparisons (`col = 1`) against boolean columns.
 func (d *PostgreSQLDialect) BoolTrueExpr(col string) string { return col }
+
+// RFC822CanonicalIDExpr strips one clean angle-bracket pair from a stored
+// Message-ID. PostgreSQL TEXT cannot contain embedded NUL bytes, so its native
+// character-oriented LENGTH and SUBSTR semantics are sufficient.
+func (d *PostgreSQLDialect) RFC822CanonicalIDExpr(col string) string {
+	return fmt.Sprintf(`CASE
+		WHEN LENGTH(%[1]s) > 2
+		 AND SUBSTR(%[1]s, 1, 1) = '<'
+		 AND SUBSTR(%[1]s, LENGTH(%[1]s), 1) = '>'
+		 AND SUBSTR(%[1]s, 2, 1) NOT IN ('<', '>', ' ')
+		 AND SUBSTR(%[1]s, LENGTH(%[1]s) - 1, 1) NOT IN ('<', '>', ' ')
+			THEN SUBSTR(%[1]s, 2, LENGTH(%[1]s) - 2)
+			ELSE %[1]s
+	END`, col)
+}
+
+// RFC822CanonicalIDIndexDefinition defines the composite expression index over
+// canonical Message-ID and source. A bare CASE is not valid PostgreSQL index
+// syntax, so the expression has its required extra parenthesis pair. The
+// functions in the expression are immutable and therefore indexable.
+func (d *PostgreSQLDialect) RFC822CanonicalIDIndexDefinition() string {
+	return fmt.Sprintf(
+		"ON messages((%s), source_id)",
+		d.RFC822CanonicalIDExpr("rfc822_message_id"),
+	)
+}
 
 // JSONBindExpr returns "?::JSONB" — PG won't implicit-cast text to JSONB,
 // so a bare placeholder bound to a Go string raises a column-type
@@ -587,6 +621,10 @@ func (d *PostgreSQLDialect) FTSRebuildSchema(ctx context.Context, q contextQueri
 //	TEXT → TEXT, DATETIME → TIMESTAMPTZ, JSON → JSONB.
 func (d *PostgreSQLDialect) LegacyColumnMigrations() []ColumnMigration {
 	return []ColumnMigration{
+		{`ALTER TABLE carddav_publications ADD COLUMN IF NOT EXISTS outgoing_envelope_metadata BYTEA`, "carddav_publications.outgoing_envelope_metadata"},
+		{`ALTER TABLE carddav_publications ADD COLUMN IF NOT EXISTS approved_body_sha256 TEXT`, "carddav_publications.approved_body_sha256"},
+		{`ALTER TABLE carddav_publications ADD COLUMN IF NOT EXISTS approved_inference_revision BIGINT`, "carddav_publications.approved_inference_revision"},
+		{`ALTER TABLE carddav_publications ADD COLUMN IF NOT EXISTS approved_mutation_revision BIGINT`, "carddav_publications.approved_mutation_revision"},
 		{`ALTER TABLE person_sweep_cursors ADD COLUMN IF NOT EXISTS backstop_upper_key TEXT NOT NULL DEFAULT ''`, "person_sweep_cursors.backstop_upper_key"},
 		{`ALTER TABLE person_sweep_cursors ADD COLUMN IF NOT EXISTS backstop_after_key TEXT NOT NULL DEFAULT ''`, "person_sweep_cursors.backstop_after_key"},
 		{`ALTER TABLE person_sweep_cursors ADD COLUMN IF NOT EXISTS optimistic_document_key TEXT NOT NULL DEFAULT ''`, "person_sweep_cursors.optimistic_document_key"},
@@ -594,14 +632,25 @@ func (d *PostgreSQLDialect) LegacyColumnMigrations() []ColumnMigration {
 		{`ALTER TABLE person_sweep_cursors ADD COLUMN IF NOT EXISTS backstop_document_key TEXT NOT NULL DEFAULT ''`, "person_sweep_cursors.backstop_document_key"},
 		{`ALTER TABLE carddav_address_books ADD COLUMN IF NOT EXISTS needs_full_reconcile BOOLEAN NOT NULL DEFAULT FALSE`, "carddav_address_books.needs_full_reconcile"},
 		{`ALTER TABLE carddav_address_books ADD COLUMN IF NOT EXISTS sync_token TEXT NOT NULL DEFAULT ''`, "carddav_address_books.sync_token"},
+		{`ALTER TABLE carddav_conflicts ADD COLUMN IF NOT EXISTS review_revision BIGINT NOT NULL DEFAULT 1`, "carddav_conflicts.review_revision"},
+		{`ALTER TABLE carddav_conflicts ADD COLUMN IF NOT EXISTS local_inference_revision BIGINT`, "carddav_conflicts.local_inference_revision"},
+		{`ALTER TABLE carddav_conflicts ADD COLUMN IF NOT EXISTS approved_local_body_sha256 TEXT`, "carddav_conflicts.approved_local_body_sha256"},
+		{`ALTER TABLE carddav_conflicts ADD COLUMN IF NOT EXISTS approved_local_inference_revision BIGINT`, "carddav_conflicts.approved_local_inference_revision"},
+		{`ALTER TABLE carddav_conflicts ADD COLUMN IF NOT EXISTS approved_conflict_revision BIGINT`, "carddav_conflicts.approved_conflict_revision"},
+		{`ALTER TABLE carddav_conflicts ADD COLUMN IF NOT EXISTS local_envelope_metadata BYTEA`, "carddav_conflicts.local_envelope_metadata"},
+		{`ALTER TABLE carddav_conflicts ADD COLUMN IF NOT EXISTS local_mutation_intent BYTEA`, "carddav_conflicts.local_mutation_intent"},
 		{`ALTER TABLE carddav_conflicts ADD COLUMN IF NOT EXISTS pending_operation TEXT CHECK (pending_operation IN ('delete'))`, "carddav_conflicts.pending_operation"},
 		{`ALTER TABLE carddav_conflicts ADD COLUMN IF NOT EXISTS connection_generation BIGINT`, "carddav_conflicts.connection_generation"},
 		{`ALTER TABLE carddav_conflicts ADD COLUMN IF NOT EXISTS book_sync_revision BIGINT`, "carddav_conflicts.book_sync_revision"},
 		{`ALTER TABLE carddav_conflicts ADD COLUMN IF NOT EXISTS previous_mapping_revision BIGINT`, "carddav_conflicts.previous_mapping_revision"},
 		{`ALTER TABLE carddav_conflicts ADD COLUMN IF NOT EXISTS pending_started_at TIMESTAMPTZ`, "carddav_conflicts.pending_started_at"},
 		{`ALTER TABLE sources ADD COLUMN IF NOT EXISTS sync_config JSONB`, "sync_config"},
+		{`ALTER TABLE sync_runs ADD COLUMN IF NOT EXISTS sync_type TEXT NOT NULL DEFAULT ''`, "sync_runs.sync_type"},
+		{`ALTER TABLE sync_runs ADD COLUMN IF NOT EXISTS request_fingerprint TEXT`, "sync_runs.request_fingerprint"},
+		{`ALTER TABLE sync_runs ADD COLUMN IF NOT EXISTS operation_id TEXT`, "sync_runs.operation_id"},
 		{`ALTER TABLE imap_folder_state ADD COLUMN IF NOT EXISTS highest_modseq NUMERIC(20, 0) NOT NULL DEFAULT 0`, "imap_folder_state.highest_modseq"},
 		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS rfc822_message_id TEXT`, "rfc822_message_id"},
+		{`ALTER TABLE messages ADD COLUMN IF NOT EXISTS list_id TEXT`, "list_id"},
 		{`ALTER TABLE sources ADD COLUMN IF NOT EXISTS oauth_app TEXT`, "oauth_app"},
 		{`ALTER TABLE participants ADD COLUMN IF NOT EXISTS phone_number TEXT`, "phone_number"},
 		{`ALTER TABLE participants ADD COLUMN IF NOT EXISTS canonical_id TEXT`, "canonical_id"},
@@ -616,6 +665,7 @@ func (d *PostgreSQLDialect) LegacyColumnMigrations() []ColumnMigration {
 		{`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS title TEXT`, "title"},
 		{`ALTER TABLE conversations ADD COLUMN IF NOT EXISTS conversation_type TEXT NOT NULL DEFAULT 'email_thread'`, "conversation_type"},
 		{`ALTER TABLE labels ADD COLUMN IF NOT EXISTS system_role TEXT`, "labels.system_role"},
+		{`ALTER TABLE account_identities ADD COLUMN IF NOT EXISTS address_key TEXT NOT NULL DEFAULT ''`, "account_identities.address_key"},
 		{`ALTER TABLE participant_identifiers ADD COLUMN IF NOT EXISTS service_id BIGINT REFERENCES communication_services(id) ON DELETE SET NULL`, "pi_service_id"},
 		{`ALTER TABLE participant_identifiers ADD COLUMN IF NOT EXISTS scope_kind TEXT`, "pi_scope_kind"},
 		{`ALTER TABLE participant_identifiers ADD COLUMN IF NOT EXISTS scope_value TEXT`, "pi_scope_value"},
@@ -668,6 +718,7 @@ func (d *PostgreSQLDialect) LegacyColumnMigrations() []ColumnMigration {
 		{`ALTER TABLE document_extractions ADD COLUMN IF NOT EXISTS document_family TEXT`, "document_extractions.document_family"},
 		{`ALTER TABLE document_extractions ADD COLUMN IF NOT EXISTS unit_kind TEXT`, "document_extractions.unit_kind"},
 		{`ALTER TABLE document_extractions ADD COLUMN IF NOT EXISTS normalized_truncated BOOLEAN NOT NULL DEFAULT FALSE`, "document_extractions.normalized_truncated"},
+		{`ALTER TABLE document_extractions ADD COLUMN IF NOT EXISTS source_media_type TEXT`, "document_extractions.source_media_type"},
 		{`ALTER TABLE document_units ADD COLUMN IF NOT EXISTS heading_marks JSONB NOT NULL DEFAULT '[]'::jsonb`, "document_units.heading_marks"},
 		{`ALTER TABLE document_index_state ADD COLUMN IF NOT EXISTS target_profile_id TEXT`, "document_index_state.target_profile_id"},
 		{`ALTER TABLE attachments ADD COLUMN IF NOT EXISTS attachment_state TEXT`, "attachments.attachment_state"},
@@ -2278,6 +2329,7 @@ var exclusiveLockTables = []string{
 	"activity_events", "activity_event_persons", "person_contact_state",
 	"activity_projection_queue",
 	"collections", "collection_sources", "account_identities", "applied_migrations",
+	"sync_operations",
 	"source_import_items", "sync_run_items", "sync_checkpoints",
 	"imap_folder_state", "imap_message_memberships",
 }

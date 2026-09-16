@@ -75,6 +75,22 @@ func (c *Client) recordMembershipLocked(
 	})
 }
 
+// forgetMembershipLocked drops any observation of one mailbox UID recorded
+// earlier in the run. A UID the server leaves out of a FETCH response is gone
+// from the mailbox, and the run treats that as handled rather than failed. Its
+// observation must not reach the durable commit: nothing ingested the message,
+// so membership resolution finds no row to map it to and rolls back every
+// mailbox cursor in the source. Deletion detection retires the stored
+// membership on the next run.
+func (c *Client) forgetMembershipLocked(mailbox string, uid imap.UID) {
+	c.observedMemberships = slices.DeleteFunc(
+		c.observedMemberships,
+		func(observation MembershipObservation) bool {
+			return observation.Mailbox == mailbox && observation.UID == uint32(uid)
+		},
+	)
+}
+
 // FolderState is the change-detection state of one mailbox.
 type FolderState struct {
 	UIDValidity   uint32
@@ -114,14 +130,45 @@ func WithFolderStates(states map[string]FolderState) Option {
 	}
 }
 
-// WithSourceMessageAliases supplies durable mailbox-UID aliases from the last
-// completed sync. They prevent a changed secondary copy without a Message-ID
-// from being re-imported under its secondary mailbox identity.
-func WithSourceMessageAliases(aliases map[string]string) Option {
-	return func(c *Client) {
-		c.sourceMessageAliases = make(map[string]string, len(aliases))
-		maps.Copy(c.sourceMessageAliases, aliases)
+// WithSourceMessageAliasLoader supplies durable mailbox-UID aliases from the
+// last completed sync. They prevent a changed secondary copy without a
+// Message-ID from being re-imported under its secondary mailbox identity. The
+// client asks for the UIDs one listing touches, which on an incremental run is
+// a handful of the source's stored memberships.
+func WithSourceMessageAliasLoader(
+	load func(mailbox string, uids []uint32) (map[string]string, error),
+) Option {
+	return func(c *Client) { c.aliasLoader = load }
+}
+
+// loadSourceMessageAliases merges the durable aliases of these mailbox UIDs
+// into the session map. A load failure costs the run its aliases and nothing
+// else: an unresolved copy is re-imported under its own identity.
+// Caller must hold mu.
+func (c *Client) loadSourceMessageAliases(mailbox string, uids []imap.UID) {
+	if c.aliasLoader == nil || len(uids) == 0 {
+		return
 	}
+	requested := make([]uint32, len(uids))
+	for i, uid := range uids {
+		requested[i] = uint32(uid)
+	}
+	aliases, err := c.aliasLoader(mailbox, requested)
+	if err != nil {
+		// One unreadable database would otherwise warn once per mailbox and
+		// once per fetch chunk. Later requests still run: an alias this run
+		// misses costs a re-imported copy.
+		if !c.aliasLoadWarned {
+			c.aliasLoadWarned = true
+			c.logger.Warn("failed to load IMAP source message aliases",
+				"mailbox", mailbox, "error", err)
+		}
+		return
+	}
+	if c.sourceMessageAliases == nil {
+		c.sourceMessageAliases = make(map[string]string, len(aliases))
+	}
+	maps.Copy(c.sourceMessageAliases, aliases)
 }
 
 // CanonicalSourceMessageID returns a durable alias only after this session

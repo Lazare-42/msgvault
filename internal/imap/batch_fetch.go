@@ -9,17 +9,35 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	imap "github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-imap/v2/imapclient"
 	gomessage "github.com/emersion/go-message"
 	gomail "github.com/emersion/go-message/mail"
 	gmailapi "go.kenn.io/msgvault/internal/gmail"
+	"go.kenn.io/msgvault/internal/mime"
 )
 
 var errIMAPRawBodyMissing = errors.New("IMAP fetch result did not include raw body")
-var errIMAPFetchResultMissing = errors.New("IMAP fetch result missing from response")
+var errIMAPFetchResultMissing = fmt.Errorf(
+	"IMAP fetch result missing from response: %w", gmailapi.ErrMessageGone)
+
+// errIMAPLabelBodyMissing is the label-fetch counterpart of
+// errIMAPRawBodyMissing. The server returned the UID, so the message is still
+// in the mailbox and only its headers are missing. That is a fetch failure,
+// not the expunge race, and it must not reach gmailapi.ErrMessageGone: a run
+// that acknowledged it would drop a live message from an authoritative
+// snapshot.
+var errIMAPLabelBodyMissing = errors.New("IMAP fetch result did not include message headers")
 var errIMAPSkippedAfterChunkFailed = errors.New("IMAP fetch skipped after earlier chunk failure")
+
+// errIMAPOmittedButPresent marks a UID that no FETCH response returned and
+// that a UID SEARCH then reported as still in the mailbox. The message is
+// there, so this is a fetch failure, and it must not reach
+// gmailapi.ErrMessageGone: acknowledging it would drop a live message.
+var errIMAPOmittedButPresent = errors.New(
+	"IMAP fetch returned no result for a UID the mailbox still reports")
 
 type batchFetchItem struct {
 	idx int
@@ -108,8 +126,17 @@ func (c *Client) applyFetchResults(
 	mailbox string,
 	chunk []batchFetchItem,
 	msgs []*imapclient.FetchMessageBuffer,
-) {
+) []batchFetchItem {
 	seenReturnedUIDs := make(map[imap.UID]bool, len(msgs))
+	// Only a message with no Message-ID header needs a durable alias, so the
+	// chunk's aliases are read once, and only if one turns up.
+	loadAliases := sync.OnceFunc(func() {
+		uids := make([]imap.UID, len(chunk))
+		for i, item := range chunk {
+			uids[i] = item.uid
+		}
+		c.loadSourceMessageAliases(mailbox, uids)
+	})
 	for _, msgBuf := range msgs {
 		idx, ok := uidToIdx[msgBuf.UID]
 		if !ok {
@@ -132,6 +159,18 @@ func (c *Client) applyFetchResults(
 		// skip, not a fetch error.
 		msgID := compositeID(mailbox, msgBuf.UID)
 		rfc822MessageID := rawMIMEMessageID(rawMIME)
+		target, forced := c.relocationTargets[msgID]
+		if state, observed := c.observedFolderStates[mailbox]; forced &&
+			(!observed || c.selectedUIDValidity != state.UIDValidity) {
+			results[idx].Message = nil
+			results[idx].Err = fmt.Errorf("IMAP relocation candidate %q changed mailbox epoch", msgID)
+			continue
+		}
+		if forced && mime.NormalizeMessageID(rfc822MessageID) != target.RFC822MessageID {
+			results[idx].Message = nil
+			results[idx].Err = fmt.Errorf("IMAP relocation candidate %q changed RFC822 identity", msgID)
+			continue
+		}
 		canonicalSourceMessageID := ""
 		var rawSHA256 [32]byte
 		if rfc822MessageID == "" && c.preferredRawSourceIDs != nil {
@@ -151,12 +190,16 @@ func (c *Client) applyFetchResults(
 			} else {
 				priorState, sameMailboxEpoch := c.priorFolderStates[mailbox]
 				if sameMailboxEpoch && priorState.UIDValidity == c.selectedUIDValidity {
+					loadAliases()
 					canonicalSourceMessageID = c.sourceMessageAliases[msgID]
 				}
 				if canonicalSourceMessageID == "" {
 					canonicalSourceMessageID = c.preferredRawSourceIDs[rawSHA256]
 				}
 			}
+		}
+		if forced {
+			canonicalSourceMessageID = msgID
 		}
 		c.recordMembershipLocked(
 			mailbox, msgBuf.UID, canonicalSourceMessageID, rfc822MessageID,
@@ -166,14 +209,31 @@ func (c *Client) applyFetchResults(
 			results[idx].Err = nil
 			continue
 		}
-		if c.seenRFC822IDs != nil &&
+		if !forced && c.seenRFC822IDs != nil &&
 			rfc822MessageID != "" {
 			if c.seenRFC822IDs[rfc822MessageID] {
-				results[idx].Message = &gmailapi.RawMessage{ID: msgID}
-				results[idx].Err = nil
-				continue
+				// A duplicate copy in Sent placement still gets its full
+				// raw — once per identity per run — because that copy may
+				// be the one that must refresh a stale archived snapshot;
+				// an untrusted mirror fetched first must not consume the
+				// only trusted refresh opportunity. Drafts-placement and
+				// further duplicates keep stubbing: a resurrected stale
+				// draft must not overwrite an already-fresh snapshot, and
+				// one row plus the preferred source-key behavior are
+				// preserved.
+				if !c.isSentPlacementMailboxLocked(mailbox) ||
+					c.seenTrustedRFC822IDs[rfc822MessageID] {
+					results[idx].Message = &gmailapi.RawMessage{ID: msgID}
+					results[idx].Err = nil
+					continue
+				}
+				c.seenTrustedRFC822IDs[rfc822MessageID] = true
+			} else {
+				c.seenRFC822IDs[rfc822MessageID] = true
+				if c.isSentPlacementMailboxLocked(mailbox) {
+					c.seenTrustedRFC822IDs[rfc822MessageID] = true
+				}
 			}
-			c.seenRFC822IDs[rfc822MessageID] = true
 		}
 
 		// Merge labels from other mailboxes via the label map built during
@@ -198,14 +258,16 @@ func (c *Client) applyFetchResults(
 		results[idx].Err = nil
 	}
 
+	var omitted []batchFetchItem
 	for _, item := range chunk {
 		if seenReturnedUIDs[item.uid] {
 			continue
 		}
 		if results[item.idx].Message == nil && results[item.idx].Err == nil {
-			results[item.idx].Err = errIMAPFetchResultMissing
+			omitted = append(omitted, item)
 		}
 	}
+	return omitted
 }
 
 // batchMailboxOrder returns the mailboxes sorted by name, except that
@@ -330,9 +392,132 @@ func (c *Client) fetchMailboxBatch(
 			return nil
 		}
 
-		c.applyFetchResults(results, uidToIdx, mailbox, chunk, msgs)
+		omitted := c.applyFetchResults(results, uidToIdx, mailbox, chunk, msgs)
+		if len(omitted) > 0 {
+			var fatalErr error
+			omitted, fatalErr = c.recheckOmittedRaw(
+				ctx, results, uidToIdx, mailbox, omitted, fetchOpts)
+			if fatalErr != nil {
+				return fatalErr
+			}
+		}
+		c.markOmittedOutcome(mailbox, omitted,
+			func(item batchFetchItem, err error) { results[item.idx].Err = err })
 	}
 	return nil
+}
+
+// recheckOmittedRaw re-asks the server for the UIDs a chunk's FETCH response
+// left out, and returns the ones it leaves out a second time.
+//
+// A UID missing from a FETCH response is not an expunge notice. The server can
+// drop a UID for its own reasons, and believing the first omission loses the
+// message outright on a QRESYNC account: the run acknowledges the UID, stores
+// no membership for it, and still advances HIGHESTMODSEQ, so no later
+// CHANGEDSINCE fetch has any reason to report it. Only the paths that
+// reconcile a mailbox by message count recover on their own.
+//
+// The recheck costs one extra FETCH for a chunk that had an omission, and
+// nothing at all for a chunk that did not. When the recheck itself fails
+// nothing was learned, so the UIDs are recorded as fetch errors rather than
+// absences, which holds the commit back instead of acting on a guess.
+func (c *Client) recheckOmittedRaw(
+	ctx context.Context,
+	results []gmailapi.RawMessageBatchResult,
+	uidToIdx map[imap.UID]int,
+	mailbox string,
+	omitted []batchFetchItem,
+	fetchOpts *imap.FetchOptions,
+) ([]batchFetchItem, error) {
+	var uidSet imap.UIDSet
+	for _, item := range omitted {
+		uidSet.AddNum(item.uid)
+	}
+	msgs, fatal, err := c.fetchChunk(ctx, mailbox, uidSet, fetchOpts)
+	if fatal {
+		// The reconnect failed, so there is no connection left to run the next
+		// chunk on. The batch has to end here, exactly as it does when the
+		// first fetch of a chunk hits this.
+		return nil, err
+	}
+	if err != nil {
+		c.logger.Warn("could not recheck UIDs missing from a FETCH response",
+			"mailbox", mailbox, "uids", len(omitted), "error", err)
+		markRawBatchError(results, omitted, err)
+		return nil, nil
+	}
+	return c.applyFetchResults(results, uidToIdx, mailbox, omitted, msgs), nil
+}
+
+// confirmOmittedPresent asks the server which of the UIDs it left out of both
+// FETCH attempts it still holds.
+//
+// Two omissions are still two answers to the same question: both attempts are
+// the same command against the same mailbox, so a server that drops a UID for
+// a structural reason drops it from the retry as well. UID SEARCH is different
+// evidence, and it costs one command for the whole set. A UID it reports is a
+// live message, and calling that gone lets the run acknowledge it, forget its
+// membership and advance the mailbox cursor past it.
+//
+// The search names the omitted UIDs exactly and carries none of the
+// since/before filters enumerateMailbox applies: a date filter here would hide
+// a live message behind the same silence this exists to distrust.
+//
+// An error means nothing was learned. Callers must then record a fetch error
+// rather than an absence, which holds the commit back instead of acting on a
+// guess.
+func (c *Client) confirmOmittedPresent(
+	mailbox string, omitted []imap.UID,
+) (map[imap.UID]bool, error) {
+	present := make(map[imap.UID]bool, len(omitted))
+	if len(omitted) == 0 {
+		return present, nil
+	}
+
+	var uidSet imap.UIDSet
+	for _, uid := range omitted {
+		uidSet.AddNum(uid)
+	}
+	searchData, err := c.conn.UIDSearch(
+		&imap.SearchCriteria{UID: []imap.UIDSet{uidSet}}, nil).Wait()
+	if err != nil {
+		c.logger.Warn("could not confirm UIDs missing from a FETCH response",
+			"mailbox", mailbox, "uids", len(omitted), "error", err)
+		return nil, fmt.Errorf(
+			"UID SEARCH confirming UIDs missing from a FETCH in mailbox %q: %w",
+			mailbox, err)
+	}
+
+	for _, uid := range searchData.AllUIDs() {
+		present[uid] = true
+	}
+	return present, nil
+}
+
+// markOmittedOutcome records what confirmOmittedPresent established about the
+// UIDs no FETCH response returned, and forgets the membership observed during
+// enumeration for the ones the mailbox no longer reports.
+func (c *Client) markOmittedOutcome(
+	mailbox string,
+	omitted []batchFetchItem,
+	setErr func(item batchFetchItem, err error),
+) {
+	uids := make([]imap.UID, len(omitted))
+	for i, item := range omitted {
+		uids[i] = item.uid
+	}
+	present, searchErr := c.confirmOmittedPresent(mailbox, uids)
+	for _, item := range omitted {
+		switch {
+		case searchErr != nil:
+			setErr(item, searchErr)
+		case present[item.uid]:
+			setErr(item, errIMAPOmittedButPresent)
+		default:
+			setErr(item, errIMAPFetchResultMissing)
+			c.forgetMembershipLocked(mailbox, item.uid)
+		}
+	}
 }
 
 // GetMessagesRawBatchWithErrors fetches multiple messages, grouping by mailbox for efficiency.
@@ -406,7 +591,7 @@ func (c *Client) applyLabelFetchResults(
 	mailbox string,
 	chunk []batchFetchItem,
 	msgs []*imapclient.FetchMessageBuffer,
-) {
+) []batchFetchItem {
 	seenUIDs := make(map[imap.UID]bool, len(msgs))
 	for _, msgBuf := range msgs {
 		idx, ok := uidToIdx[msgBuf.UID]
@@ -414,8 +599,10 @@ func (c *Client) applyLabelFetchResults(
 			continue
 		}
 		seenUIDs[msgBuf.UID] = true
-		if len(msgBuf.BodySection) == 0 {
-			results[idx].Err = errIMAPFetchResultMissing
+		// An empty section is as unreadable as an absent one, and the UID was
+		// returned either way, so this is a fetch failure and not an absence.
+		if len(msgBuf.BodySection) == 0 || len(msgBuf.BodySection[0].Bytes) == 0 {
+			results[idx].Err = errIMAPLabelBodyMissing
 			continue
 		}
 		rfc822MessageID := rawMIMEMessageID(msgBuf.BodySection[0].Bytes)
@@ -429,11 +616,13 @@ func (c *Client) applyLabelFetchResults(
 		results[idx].Err = nil
 	}
 
+	var omitted []batchFetchItem
 	for _, item := range chunk {
 		if !seenUIDs[item.uid] && results[item.idx].Err == nil {
-			results[item.idx].Err = errIMAPFetchResultMissing
+			omitted = append(omitted, item)
 		}
 	}
+	return omitted
 }
 
 func (c *Client) selectLabelBatchMailbox(
@@ -498,9 +687,46 @@ func (c *Client) fetchMailboxLabelBatch(
 			markLabelBatchError(results, items[end:], errIMAPSkippedAfterChunkFailed)
 			return nil
 		}
-		c.applyLabelFetchResults(results, uidToIdx, mailbox, chunk, msgs)
+		omitted := c.applyLabelFetchResults(results, uidToIdx, mailbox, chunk, msgs)
+		if len(omitted) > 0 {
+			var fatalErr error
+			omitted, fatalErr = c.recheckOmittedLabels(
+				ctx, results, uidToIdx, mailbox, omitted, fetchOpts)
+			if fatalErr != nil {
+				return fatalErr
+			}
+		}
+		c.markOmittedOutcome(mailbox, omitted,
+			func(item batchFetchItem, err error) { results[item.idx].Err = err })
 	}
 	return nil
+}
+
+// recheckOmittedLabels is recheckOmittedRaw for the label fetch. See that
+// function for why one omission is not enough to call a message gone.
+func (c *Client) recheckOmittedLabels(
+	ctx context.Context,
+	results []gmailapi.MessageLabelsBatchResult,
+	uidToIdx map[imap.UID]int,
+	mailbox string,
+	omitted []batchFetchItem,
+	fetchOpts *imap.FetchOptions,
+) ([]batchFetchItem, error) {
+	var uidSet imap.UIDSet
+	for _, item := range omitted {
+		uidSet.AddNum(item.uid)
+	}
+	msgs, fatal, err := c.fetchChunk(ctx, mailbox, uidSet, fetchOpts)
+	if fatal {
+		return nil, err
+	}
+	if err != nil {
+		c.logger.Warn("could not recheck UIDs missing from a label FETCH response",
+			"mailbox", mailbox, "uids", len(omitted), "error", err)
+		markLabelBatchError(results, omitted, err)
+		return nil, nil
+	}
+	return c.applyLabelFetchResults(results, uidToIdx, mailbox, omitted, msgs), nil
 }
 
 // GetMessageLabelsBatch fetches only the Message-ID header needed to recover
@@ -569,6 +795,9 @@ func (c *Client) sourceMessageMetadata(
 			"source message validation returned %d results", len(results))
 	}
 	if results[0].Err != nil {
+		// Only an absent UID is definitive absence. A returned UID whose
+		// headers are missing is a live message, and reporting it as absent
+		// would let SourceMessageMatches conclude a mismatch and rekey it.
 		if errors.Is(results[0].Err, errIMAPFetchResultMissing) {
 			return "", false, nil
 		}
@@ -703,6 +932,113 @@ func (c *Client) IsPreferredSourceMessageID(messageID string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.allMailFolder != "" && mailbox == c.allMailFolder
+}
+
+// IsSentPlacementMailbox reports whether the mailbox this composite source
+// ID names is a Sent placement: unambiguously advertised \Sent, or
+// explicitly configured as this source's Sent folder. The shared
+// conflicting-role denial applies, and a mailbox advertised as both \Sent
+// and \Drafts is ambiguous and never a Sent placement.
+func (c *Client) IsSentPlacementMailbox(messageID string) bool {
+	mailbox, _, err := parseCompositeID(messageID)
+	if err != nil {
+		return false
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.isSentPlacementMailboxLocked(mailbox)
+}
+
+// IsDraftsPlacementMailbox reports whether the mailbox this composite source
+// ID names is a Drafts placement and nothing stronger: unambiguously
+// advertised \Drafts and not a Sent placement. An advertised \Drafts role
+// keeps its Drafts meaning even when the account also lists the mailbox in
+// its Sent-folder configuration — advertised roles outrank explicit
+// configuration — so configuration cannot suppress the Sent-over-Drafts
+// precedence for such a canonical. The predicate never identifies a
+// destination that could itself authorize a snapshot replacement.
+func (c *Client) IsDraftsPlacementMailbox(messageID string) bool {
+	mailbox, _, err := parseCompositeID(messageID)
+	if err != nil {
+		return false
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.isDraftsPlacementMailboxLocked(mailbox)
+}
+
+// isDraftsPlacementMailboxLocked is the lock-holding form of
+// IsDraftsPlacementMailbox.
+func (c *Client) isDraftsPlacementMailboxLocked(mailbox string) bool {
+	if c.conflictingRoleMailboxes[mailbox] {
+		return false
+	}
+	return c.advertisedDraftsMailboxes[mailbox] &&
+		!c.advertisedSentMailboxes[mailbox]
+}
+
+// IsTrustedOutgoingMailbox reports whether the mailbox this composite source
+// ID names is trusted to hold only mail the account itself authored, either
+// because the authenticated LIST response advertised an unambiguous \Sent or
+// \Drafts special-use role for it, or because the user explicitly configured
+// it for servers without role discovery. This is an explicit trust assumption,
+// not an authorship proof: RFC 6154 roles advise intent, and user filters or
+// client APPEND/COPY can place other mail there. It is still the narrow
+// evidence that authorizes replacing an archived snapshot from that placement,
+// because a sender-controlled RFC822 Message-ID alone never does. Mailbox
+// names alone are never trusted from the server response, and absent
+// advertisement without explicit configuration denies.
+func (c *Client) IsTrustedOutgoingMailbox(messageID string) bool {
+	mailbox, _, err := parseCompositeID(messageID)
+	if err != nil {
+		return false
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.isTrustedOutgoingMailboxLocked(mailbox)
+}
+
+// isSentPlacementMailbox reports whether a mailbox name is a Sent
+// placement: unambiguously advertised \Sent, or explicitly configured as
+// this source's Sent folder (the configuration exists for localized Sent
+// folders without role discovery). The shared conflicting-role denial
+// applies to both sources of Sent semantics, and an advertised \Drafts role
+// outranks explicit configuration: a configured name the server calls
+// Drafts is not a Sent placement, so it cannot gain the trusted dedup
+// bypass. Caller must hold mu.
+func (c *Client) isSentPlacementMailboxLocked(mailbox string) bool {
+	if c.conflictingRoleMailboxes[mailbox] {
+		return false
+	}
+	if c.advertisedSentMailboxes[mailbox] {
+		return true
+	}
+	if c.configuredSentMailboxes[mailbox] {
+		return !c.advertisedDraftsMailboxes[mailbox]
+	}
+	return false
+}
+
+// isTrustedOutgoingMailbox reports whether a mailbox name carries trusted
+// outgoing placement. Caller must hold mu. Explicit trust is honored only
+// where the server's own advertisement does not contradict it: a mailbox the
+// authenticated LIST response shows carrying a received-mail role (\All,
+// \Junk, \Trash) or the INBOX name is never trusted, even when named
+// explicitly. A mailbox the response shows without those roles is honored;
+// one not yet seen is honored until discovery observes a conflict.
+func (c *Client) isTrustedOutgoingMailboxLocked(mailbox string) bool {
+	if strings.EqualFold(mailbox, "INBOX") {
+		// Delivery lands in INBOX; it is never trusted, even before
+		// discovery has observed the LIST response.
+		return false
+	}
+	if c.conflictingRoleMailboxes[mailbox] {
+		return false
+	}
+	return c.trustedOutgoingMailboxes[mailbox] || c.advertisedOutgoingMailboxes[mailbox]
 }
 
 // DefersAuthoritativeLabelReconciliation reports that complete IMAP mailbox

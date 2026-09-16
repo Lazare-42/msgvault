@@ -83,6 +83,9 @@ type AccountIdentity struct {
 	ConfirmedAt  time.Time
 }
 
+// Callers comparing identifiers must use NormalizeIdentifierForCompare or
+// EqualIdentifier; raw string equality violates the case-insensitive email
+// and case-preserving non-email contract.
 // looksLikeEmail returns true for tokens that have the shape of an
 // email address. Emails are matched case-insensitively in the identity
 // store; other identifier shapes (phone E.164, Matrix MXIDs like
@@ -267,6 +270,18 @@ func (s *Store) mergeAccountIdentitySignalsTx(
 // the same writer-locked transaction as the write, so a removal that lands
 // after the caller read the confirmed set cannot be undone. It reports whether
 // a row was inserted and whether one was present to merge into.
+//
+// The lookup keys on address_key, the persisted comparison-canonical form,
+// so both backends match under the same Go-owned rule and the partial unique
+// index on (source_id, address_key) can reject a concurrent case-variant
+// insert (the retry loop in the callers then re-reads and merges). Rows
+// written by binaries that predate the column carry address_key = ” until
+// the next store open repairs them; the fallback predicate matches those
+// under the legacy case-aware rule so an in-session legacy row is merged
+// into (and promoted to keyed) rather than shadowed by an insert that would
+// then collide on the raw-bytes primary key. ORDER BY prefers the keyed row
+// when a legacy duplicate coexists; the unique index guarantees at most one
+// keyed row per key.
 func (s *Store) mergeAccountIdentitySignalsTxWith(
 	ctx context.Context,
 	tx *loggedTx,
@@ -276,11 +291,14 @@ func (s *Store) mergeAccountIdentitySignalsTxWith(
 	match identifierMatch,
 	allowInsert bool,
 ) (inserted, present bool, err error) {
-	whereAddr := match.WhereClause("address")
-	var existing string
-	selectSQL := `SELECT source_signal FROM account_identities
-		WHERE source_id = ? AND ` + whereAddr + s.dialect.SelectForUpdate()
-	err = tx.QueryRowContext(ctx, selectSQL, sourceID, match.BindValue()).Scan(&existing)
+	key := NormalizeIdentifierForCompare(addr)
+	var existingAddr, existingKey, existing string
+	selectSQL := `SELECT address, address_key, source_signal FROM account_identities
+		WHERE source_id = ? AND (address_key = ?
+			OR (address_key = '' AND ` + match.WhereClause("address") + `))
+		ORDER BY address_key DESC LIMIT 1` + s.dialect.SelectForUpdate()
+	err = tx.QueryRowContext(ctx, selectSQL, sourceID, key, match.BindValue()).
+		Scan(&existingAddr, &existingKey, &existing)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		if !allowInsert {
@@ -291,9 +309,9 @@ func (s *Store) mergeAccountIdentitySignalsTxWith(
 			merged = mergeSignalSet(merged, signal)
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO account_identities (source_id, address, source_signal)
-				VALUES (?, ?, ?)`,
-			sourceID, addr, merged,
+			`INSERT INTO account_identities (source_id, address, address_key, source_signal)
+				VALUES (?, ?, ?, ?)`,
+			sourceID, addr, key, merged,
 		); err != nil {
 			return false, false, fmt.Errorf("insert account identity: %w", err)
 		}
@@ -305,11 +323,12 @@ func (s *Store) mergeAccountIdentitySignalsTxWith(
 		for _, signal := range signals {
 			merged = mergeSignalSet(merged, signal)
 		}
-		if merged != existing {
+		wantKey := NormalizeIdentifierForCompare(existingAddr)
+		if merged != existing || existingKey != wantKey {
 			if _, err := tx.ExecContext(ctx,
-				`UPDATE account_identities SET source_signal = ?
-					WHERE source_id = ? AND `+whereAddr,
-				merged, sourceID, match.BindValue(),
+				`UPDATE account_identities SET source_signal = ?, address_key = ?
+					WHERE source_id = ? AND address = ?`,
+				merged, wantKey, sourceID, existingAddr,
 			); err != nil {
 				return false, true, fmt.Errorf("update source_signal: %w", err)
 			}

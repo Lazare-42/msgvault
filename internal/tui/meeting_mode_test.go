@@ -39,7 +39,7 @@ func (meetingModeTextEngine) ListConversationMessages(
 }
 
 func (meetingModeTextEngine) TextSearch(
-	context.Context, string, int, int,
+	context.Context, string, *int64, int, int,
 ) ([]query.MessageSummary, error) {
 	return []query.MessageSummary{{ID: 99, Subject: "Old search result"}}, nil
 }
@@ -98,15 +98,17 @@ func TestMeetingAccountsExcludeUnrelatedSources(t *testing.T) {
 		query.AccountInfo{ID: 3, SourceType: meetingSourceCircleback, Identifier: "team-meetings"},
 		query.AccountInfo{ID: 4, SourceType: "teams", Identifier: "team-chat"},
 		query.AccountInfo{ID: 5, SourceType: meetingSourceImported, Identifier: "local-meetings"},
+		query.AccountInfo{ID: 6, SourceType: meetingSourceNotion, Identifier: "notion-notes"},
 	).Build()
 
 	accounts := model.meetingAccounts()
 
-	require.Len(t, accounts, 3)
-	assert.Equal(t, []string{"work-notes", "team-meetings", "local-meetings"}, []string{
+	require.Len(t, accounts, 4)
+	assert.Equal(t, []string{"work-notes", "team-meetings", "local-meetings", "notion-notes"}, []string{
 		accounts[0].Identifier,
 		accounts[1].Identifier,
 		accounts[2].Identifier,
+		accounts[3].Identifier,
 	})
 }
 
@@ -153,7 +155,7 @@ func TestMeetingAccountSelectionDoesNotReplaceEmailFilter(t *testing.T) {
 		query.AccountInfo{ID: 2, SourceType: meetingSourceGranola, Identifier: "work-notes"},
 	).Build()
 	model.mode = modeMeetings
-	model.accountFilter = &emailID
+	model.sourceScope = accountSourceScope(&emailID)
 	model.modal = modalAccountSelector
 	model.modalCursor = 1
 
@@ -161,8 +163,8 @@ func TestMeetingAccountSelectionDoesNotReplaceEmailFilter(t *testing.T) {
 
 	require.NotNil(updatedModel.meetingState.sourceID)
 	assert.Equal(int64(2), *updatedModel.meetingState.sourceID)
-	require.NotNil(updatedModel.accountFilter)
-	assert.Equal(emailID, *updatedModel.accountFilter)
+	require.NotNil(updatedModel.sourceScope.accountID)
+	assert.Equal(emailID, *updatedModel.sourceScope.accountID)
 }
 
 func TestMeetingAccountSelectionRerunsActiveSearchForNewSource(t *testing.T) {

@@ -3,6 +3,10 @@ package query
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -103,6 +107,68 @@ func TestRegisterViews_BaseViews(t *testing.T) {
 	).Scan(&attachmentMetadata)
 	require.NoError(err, "legacy attachment cache must expose attachment_metadata")
 	assert.False(attachmentMetadata.Valid, "legacy attachment rows default to unclassified")
+}
+
+func TestRegisterViews_ListsCompatibility(t *testing.T) {
+	require := require.New(t)
+	listID := "<announce.example.test>"
+	builder := NewTestDataBuilder(t)
+	builder.AddSource("test@example.com")
+	builder.AddMessage(MessageOpt{Subject: "Current cache", ListID: &listID})
+	dir, cleanup := builder.Build()
+	defer cleanup()
+
+	engine, err := NewDuckDBEngine("", "", nil)
+	require.NoError(err)
+	defer func() { _ = engine.Close() }()
+
+	require.NoError(RegisterViews(engine.db, dir))
+	var got string
+	require.NoError(engine.db.QueryRow("SELECT list_id FROM messages").Scan(&got))
+	assert.Equal(t, listID, got)
+}
+
+func TestRegisterViews_OldMessagesCacheDefaultsListIDToNull(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	builder := NewTestDataBuilder(t)
+	builder.AddSource("test@example.com")
+	builder.AddMessage(MessageOpt{Subject: "Old cache"})
+	dir, cleanup := builder.Build()
+	defer cleanup()
+
+	engine := builder.BuildEngine()
+	defer func() { _ = engine.Close() }()
+
+	messageFile := filepath.Join(dir, "messages", "year=2024", "data.parquet")
+	oldMessageFile := filepath.Join(dir, "messages", "year=2024", "old.parquet")
+	_, err := engine.db.Exec(fmt.Sprintf(
+		"COPY (SELECT * EXCLUDE (list_id) FROM read_parquet('%s')) TO '%s' (FORMAT PARQUET)",
+		escapePath(messageFile), escapePath(oldMessageFile),
+	))
+	require.NoError(err)
+	require.NoError(os.Remove(messageFile))
+	require.NoError(os.Rename(oldMessageFile, messageFile))
+	fingerprint, err := CacheDatasetFingerprint(dir)
+	require.NoError(err)
+	state, err := ReadCacheSyncState(dir)
+	require.NoError(err)
+	state.DatasetFingerprint = fingerprint
+	stateData, err := json.Marshal(state)
+	require.NoError(err)
+	require.NoError(os.WriteFile(CacheStatePath(dir), stateData, 0o600))
+
+	require.NoError(RegisterViews(engine.db, dir))
+	var listID sql.NullString
+	require.NoError(engine.db.QueryRow("SELECT list_id FROM messages").Scan(&listID))
+	assert.False(listID.Valid)
+
+	oldEngine, err := NewDuckDBEngine(dir, "", nil)
+	require.NoError(err)
+	defer func() { _ = oldEngine.Close() }()
+	rows, err := oldEngine.Aggregate(context.Background(), ViewLists, DefaultAggregateOptions())
+	require.NoError(err)
+	assert.Empty(rows)
 }
 
 func TestRegisterViews_ConvenienceViews(t *testing.T) {
@@ -233,5 +299,72 @@ func TestRegisterViews_ConvenienceViews(t *testing.T) {
 		).Scan(&participantEmails, &convTitle, &convType)
 		require.NoError(err, "scan v_threads columns")
 		assert.Equal("email", convType)
+	})
+}
+
+// TestRegisterViews_RecipientAddressColumns proves the message_recipients
+// view exposes both address columns of cache schema v26: envelope_address
+// keeps NULL for rows where no header address was recorded instead of
+// coercing them to the empty string, while email_address resolves those rows
+// to the participant's current address. A legacy cache lacking both columns
+// reads as NULL for each.
+func TestRegisterViews_RecipientAddressColumns(t *testing.T) {
+	type addresses struct {
+		resolved sql.NullString
+		envelope sql.NullString
+	}
+	scan := func(t *testing.T, builder *TestDataBuilder) (populated, absent addresses) {
+		t.Helper()
+		dir, cleanup := builder.Build()
+		t.Cleanup(cleanup)
+		engine := builder.BuildEngine()
+		t.Cleanup(func() { _ = engine.Close() })
+		require.NoError(t, RegisterViews(engine.db, dir), "RegisterViews")
+
+		err := engine.db.QueryRowContext(context.Background(),
+			`SELECT email_address, envelope_address FROM message_recipients WHERE recipient_type = 'from'`,
+		).Scan(&populated.resolved, &populated.envelope)
+		require.NoError(t, err, "scan populated row")
+		err = engine.db.QueryRowContext(context.Background(),
+			`SELECT email_address, envelope_address FROM message_recipients WHERE recipient_type = 'to'`,
+		).Scan(&absent.resolved, &absent.envelope)
+		require.NoError(t, err, "scan absent row")
+		return populated, absent
+	}
+
+	t.Run("current cache", func(t *testing.T) {
+		assert := assert.New(t)
+		builder := NewTestDataBuilder(t)
+		srcID := builder.AddSource("owner@example.com")
+		alice := builder.AddParticipant("alice@example.com", "example.com", "Alice")
+		bob := builder.AddParticipant("bob@example.com", "example.com", "Bob")
+		msgID := builder.AddMessage(MessageOpt{Subject: "Hello", SourceID: srcID})
+		builder.AddRecipientWithEnvelope(msgID, alice, "from", "Alice", "alice-alias@example.com")
+		builder.AddRecipient(msgID, bob, "to", "Bob")
+
+		populated, absent := scan(t, builder)
+		alias := sql.NullString{String: "alice-alias@example.com", Valid: true}
+		assert.Equal(alias, populated.envelope)
+		assert.Equal(alias, populated.resolved,
+			"a recorded header address is also the resolved address")
+		assert.Equal(sql.NullString{}, absent.envelope,
+			"row without a recorded address reads as NULL, not ''")
+		assert.Equal(sql.NullString{String: "bob@example.com", Valid: true}, absent.resolved,
+			"row without a recorded address resolves to the participant's address")
+	})
+
+	t.Run("legacy cache without the columns", func(t *testing.T) {
+		builder := NewTestDataBuilder(t)
+		builder.legacyRecipientSchema = true
+		srcID := builder.AddSource("owner@example.com")
+		alice := builder.AddParticipant("alice@example.com", "example.com", "Alice")
+		bob := builder.AddParticipant("bob@example.com", "example.com", "Bob")
+		msgID := builder.AddMessage(MessageOpt{Subject: "Hello", SourceID: srcID})
+		builder.AddFrom(msgID, alice, "Alice")
+		builder.AddTo(msgID, bob, "Bob")
+
+		populated, absent := scan(t, builder)
+		assert.Equal(t, addresses{}, populated, "legacy cache carries neither column")
+		assert.Equal(t, addresses{}, absent)
 	})
 }

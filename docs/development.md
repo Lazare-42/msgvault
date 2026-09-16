@@ -1,13 +1,17 @@
 ---
-title: Development and Roadmap
+title: Development
 description: Build, test, lint, and code conventions.
 ---
 
 ## Build
 
-Source builds require Go 1.27+, Bun 1.3.14+, and a C/C++ compiler. The Make
-targets install the pinned browser dependencies when `web/package.json` or
-`web/bun.lock` changes, then embed the production UI in the Go binary.
+The macOS and Linux builds require Go 1.27+, Bun 1.3.14+, Node.js (20.19+ on
+20.x, 22.13+ on 22.x, or 24+), and a C/C++ compiler. The Make targets install
+the pinned browser dependencies when `web/package.json` or `web/bun.lock`
+changes, then embed the production UI in the Go binary; Node runs the embed
+validator in that path. On Debian/Ubuntu also install `libsqlite3-dev`, which
+provides the `sqlite3.h` header needed to compile the default `sqlite_vec`
+extension.
 
 ### macOS and Linux
 
@@ -57,6 +61,40 @@ compiles the pinned DuckDB native library, and caches both under
 `MSGVAULT_BUILD_CACHE` to use another cache location, or pass `-RebuildDuckDB`
 to rebuild the cached library.
 
+### Container builds
+
+The repository's `Dockerfile` builds the embedded Web UI and the msgvault
+binary. To build a local image and run its runtime checks:
+
+```bash
+docker buildx build --load --tag msgvault:dev .
+scripts/smoke-container.sh msgvault:dev
+```
+
+For portable image archives, Docker Bake provides an `oci` target:
+
+```bash
+docker buildx bake oci
+```
+
+It exports `dist/amd64.oci.tar` and `dist/arm64.oci.tar` for Linux AMD64 and
+ARM64. The builder needs support for both target architectures, either through
+native workers or emulation. Override `OCI_OUTPUT_DIR` to change the output
+directory. `VERSION`, `COMMIT`, and `BUILD_DATE` set the binary metadata;
+`OCI_VERSION` and `REVISION` set the image's version and source-revision labels.
+Defaults identify a development build.
+
+Image builds run checks against a temporary empty archive: database
+initialization, a DuckDB query, and the embedded Web UI and its JavaScript
+asset. `scripts/smoke-container.sh` repeats these checks in the loaded image
+with networking disabled. These commands build and check local artifacts; they
+do not publish them.
+
+Repository-owned release-publishing workflows and the old release/tagging
+scripts have been removed. Pushing a tag no longer invokes those publishers. The
+Docker inputs, local build commands, installers, and ordinary CI remain
+available.
+
 ## Test
 
 ```bash
@@ -66,6 +104,77 @@ make test
 # Verbose output
 make test-v
 ```
+
+### Build tags and assertions
+
+All Go test runs need `-tags "fts5 sqlite_vec"`; the Make targets supply these
+automatically. Use `assert` and `require` from testify, with expected values
+first. See [AGENTS.md](https://github.com/kenn-io/msgvault/blob/main/AGENTS.md)
+for repository testing rules.
+
+### PostgreSQL tests
+
+`MSGVAULT_TEST_DB=postgres://...` runs PostgreSQL-backed
+tests. pgvector tests require a PostgreSQL instance with the `vector`
+extension and the `pgvector` build tag.
+
+The PostgreSQL deadlock tests also require permission to set
+`deadlock_timeout`. They defer the blocker transaction's deadlock detector
+so the write under test is the deadlock victim. For a non-superuser test
+role, have the database administrator run:
+
+```sql
+GRANT SET ON PARAMETER deadlock_timeout TO test_role;
+```
+
+Replace `test_role` with the role in `MSGVAULT_TEST_DB`. This parameter grant
+is sufficient; the test role does not need superuser access.
+
+There are two PostgreSQL configurations to cover: the pgvector build
+(`make test-pg`) and the shipped build, which has no pgvector tag
+(`make test-pg-shipped`). Run `make test-pg-both` rather than both of those —
+the tag changes the test binary of only the packages listed in
+`PG_SHIPPED_ONLY_PKGS` in the Makefile, so the second full run would reprove
+the first. Each test binary builds the schema once into a template — a
+SQLite file copied per test, or a PostgreSQL template database cloned per
+test with `CREATE DATABASE ... TEMPLATE` (`internal/testutil/sqlite_template.go`,
+`internal/testutil/pg_template.go`) — instead of replaying `InitSchema()` for
+every fixture. Nothing runs in the background, so no fixture ever issues a
+schema statement while a test body is running. Each database is still private
+to its test, still produced by the same `InitSchema()` path, and still dropped
+on cleanup. A PostgreSQL template is owned through a session advisory lock the
+server releases when the binary exits, so the next binary reclaims whatever an
+earlier one left behind; a role without `CREATEDB` falls back to a private
+schema in the configured database.
+
+
+### Local test scheduling
+
+`make test` automatically overlaps the CLI, store, API, and query package shards
+with the remaining SQLite packages when at least 32 CPUs and 64 GiB of available
+memory are detected. The planner reserves four test-process slots for the
+unsharded remainder, then divides the remaining slots across the sharded
+packages, up to 16 shards each. Each slot budgets two Go execution threads
+(`GOMAXPROCS=2`) and a 2 GiB memory allowance. For four sharded packages, a
+32-CPU budget permits three shards per package; 128 CPUs permits fifteen,
+provided memory also permits them. This changes scheduling, not test coverage.
+
+The planner emits the per-process and remainder settings with its shard count,
+so execution uses the same aggregate budget. Shard builds use `go -p=1`; the
+remainder uses `go test -p=4`. Memory allowances guide scheduling and do not
+enforce per-process limits, including native allocations.
+
+Detection accounts for CPU affinity and `GOMAXPROCS`. On Linux it also accounts
+for visible cgroup v2 ancestor CPU quotas and remaining memory under both hard
+and soft limits. macOS uses available system memory. Smaller budgets, cgroup v1,
+other platforms, and unreadable limits retain the standard schedule. Detection
+is a snapshot, not a reservation of resources against other workloads.
+
+Use `TEST_PROFILE=standard` to disable automatic scaling. Setting `TEST_SHARDS`
+explicitly also retains sequential package jobs with the requested shard count.
+The PostgreSQL targets keep their existing connection-oriented concurrency
+limits; setting `MSGVAULT_TEST_DB` disables automatic scaling in `make test` too.
+CI's explicit `test-unsharded` and package-shard jobs keep their existing layout.
 
 ## Lint & Format
 
@@ -139,7 +248,7 @@ WHERE EXISTS (
 | Library | Purpose |
 |---|---|
 | `svelte` | Embedded analytical Web UI |
-| `openapi-fetch` | Typed browser API client |
+| `orval` | Typed browser API client generation |
 | `cobra` | CLI framework |
 | `charmbracelet/bubbletea` | TUI framework |
 | `charmbracelet/lipgloss` | TUI styling |
@@ -147,6 +256,27 @@ WHERE EXISTS (
 | `duckdb/duckdb-go/v2` | DuckDB driver for Parquet |
 | `gogs/chardet` | Character set detection |
 | `golang.org/x/text` | Text encoding conversion |
+
+## Documentation
+
+The site has three reading levels: the product overview at `/`, the archive
+lifecycle at `/guide/`, and task guides and references at `/docs/`. Keep
+technical setup and command details in the documentation tier.
+
+From the repository root:
+
+```bash
+make docs-install
+make docs-build
+make docs-check
+```
+
+`make docs-check` validates Markdown, builds the real site with its asset
+branches, and checks pages, links, metadata, and redirects. Use `make docs-serve`
+to inspect the complete site at `http://127.0.0.1:8000`.
+
+See the [documentation contributor guide](https://github.com/kenn-io/msgvault/blob/main/docs/README.md)
+for content ownership, historical designs, and media maintenance.
 
 ## Community
 

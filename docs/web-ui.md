@@ -1,46 +1,52 @@
 ---
+last_edited: "2026-09-09"
 title: Web UI
-description: Use and securely deploy msgvault's daemon-served analytical interface.
+description: Browse messages and files, maintain people, and monitor archive work from your browser.
 ---
 
 # Web UI
 
-Msgvault's first-party web UI is embedded in every release binary and served by
-`msgvault serve`. It needs no Node/Bun process, hosted service, or external asset
-directory at runtime. The transactional archive remains authoritative while the
-Parquet/DuckDB analytical cache supplies the interactive tables.
+The Web UI lets you search across your archive, read messages, browse files,
+maintain your contact directory, and see whether sync and indexing work has
+finished. It is embedded in the release binary and served by `msgvault serve`;
+you do not need a separate web application process.
 
-These reference captures are hydrated from the orphan `docs-assets` branch when
-the documentation is built. The analytical captures use a compact,
-provenance-documented Enron-derived fixture imported through the real daemon;
-the ordinary browser checks continue to use small synthetic API fixtures.
+| Your question | Workspace |
+|---|---|
+| Where is that message, conversation, or meeting? | Everything |
+| Who have I been in contact with? | Relationships, People, and Domains |
+| Where is an attachment, image, or video? | Files |
+| What do I know about this person? | Directory |
+| Which identity matches or profile facts need my decision? | Reviews |
+| Can I return to this search later? | Saved Views |
+| Did sync, enrichment, or indexing finish? | Operations and Sources |
+| What is staged for deletion? | Deletions |
+| How do I change the daemon's configuration? | Settings |
 
 <figure class="screenshot" data-lightbox>
-  <img src="/assets/static/relationships-dark-comfortable-darwin.png" alt="Experimental Relationships workspace in dark theme with ranked people and activity timeline" loading="lazy">
+  <img src="/docs/assets/static/relationships-dark-comfortable-darwin.png" alt="Experimental Relationships workspace in dark theme with ranked people and activity timeline" loading="lazy">
   <figcaption>Relationships ranked view and selected activity timeline.</figcaption>
 </figure>
 
 <figure class="screenshot" data-lightbox>
-  <img src="/assets/static/relationships-light-compact-darwin.png" alt="Experimental Relationships workspace in light theme with compact density" loading="lazy">
+  <img src="/docs/assets/static/relationships-light-compact-darwin.png" alt="Experimental Relationships workspace in light theme with compact density" loading="lazy">
   <figcaption>Relationships workspace in light theme with compact density.</figcaption>
 </figure>
 
 <figure class="screenshot" data-lightbox>
-  <img src="/assets/static/analytical-dark-comfortable-darwin.png" alt="Experimental analytical web UI in dark theme with comfortable density" loading="lazy">
+  <img src="/docs/assets/static/analytical-dark-comfortable-darwin.png" alt="Experimental analytical web UI in dark theme with comfortable density" loading="lazy">
   <figcaption>Dark theme with comfortable density.</figcaption>
 </figure>
 
 <figure class="screenshot" data-lightbox>
-  <img src="/assets/static/analytical-light-compact-darwin.png" alt="Experimental analytical web UI in light theme with compact density" loading="lazy">
+  <img src="/docs/assets/static/analytical-light-compact-darwin.png" alt="Experimental analytical web UI in light theme with compact density" loading="lazy">
   <figcaption>Light theme with compact density.</figcaption>
 </figure>
 
-The authentic names and message text in these two relationship captures are
-intentional public research data from the controlled `docs-fixtures` branch.
-The branch README and manifest record the CMU/CALO source, attribution,
-selection exclusions, and message-by-message sensitive-content review.
-The relationship captures are Darwin-only; the analytical matrix includes
-Darwin and Linux variants to exercise host-specific rasterization.
+The screenshots use a curated public Enron research-data fixture. Authentic
+names and message text are intentional; the repository's `docs-fixtures`
+branch records provenance, attribution, and the content review. Screenshots
+illustrate the workflows; newer controls may differ from these captures.
 
 ## Start and discover the URL
 
@@ -48,6 +54,10 @@ Darwin and Linux variants to exercise host-specific rasterization.
 msgvault build-cache
 msgvault serve
 ```
+
+`build-cache` prepares the analytical tables before you open the browser. You
+can also run `serve` directly and let the default startup maintenance build a
+missing or stale cache in the background.
 
 Foreground startup prints `API server: http://HOST:PORT`. The default
 `server.api_port = 0` chooses a free port. Local CLI commands discover that
@@ -120,9 +130,24 @@ cannot safely honor the selected search mode. Update or rebuild the named
 component, or deliberately select a supported mode. Msgvault does not quietly
 substitute full-text search for either state.
 
+## Read messages
+
+Click an entry in Everything to open its preview below the results. On wide
+windows, choose **Preview position → Right** to read beside the results.
+Drag the divider to resize either layout, or focus it and use the arrow keys.
+Double-click the divider to reset its size. The browser remembers your layout
+choice and each layout's size. Narrow windows use the preview below the results
+and restore your right-side layout when there is room again.
+
+HTML email follows the app's dark theme by replacing sender-defined text,
+background, and border colors. Images keep their original colors. Choose
+**Use original colors** above a message to see its authored colors on a white
+background, or **Use app colors** to return to dark reading. This override
+applies to the open message. Light mode preserves designed email colors.
+
 ## Cache states
 
-The web tables use one modality-neutral analytical cache. When it is missing,
+The web tables share one analytical cache across message types. When it is missing,
 building, stale, or unavailable, the UI names that state instead of quietly
 switching selected modalities to a different read path. Run `msgvault
 build-cache` for an explicit rebuild, or leave `analytics.auto_build_cache =
@@ -137,6 +162,28 @@ PDFs open in application-controlled viewers. Metadata-only, missing,
 unsupported, and previewable content remain distinct. From a file, navigate to
 its containing item and then its email or chat conversation.
 
+Filter by filename and file type. In a person's Media & Files view, choose a
+media gallery or file table and narrow the relationship to **From them**,
+**To them**, or **Group conversations**. These directions describe the
+containing messages; they do not identify people pictured in an image.
+
+Turn on **Hosted visual search** to describe image or video content, or supply
+a JPEG, PNG, or WebP query image. The UI discloses that the query goes to the
+configured provider. It requires the separate
+[visual index](/docs/usage/vector-search/#visual-attachment-search); ordinary
+filename browsing does not use that provider.
+
+### Images in email
+
+The reader displays archived inline images and leaves remote images unloaded
+until you choose **Load images**. That choice applies to the current item and
+fetches images through the daemon. Moving to another item resets it.
+
+For unattended, offline preservation of remote images, see
+[Archive Remote Email Images](/docs/usage/remote-images/). Reader permission
+to load an image and permission to archive remote images during ingest are
+separate choices.
+
 ## People and domains
 
 People combines identifiers backed by explicit archive identity evidence; it
@@ -148,7 +195,41 @@ and filters continue to scope both the timeline and file table.
 People in this workspace are observed identity clusters. Source identities
 that mean “me,” explicit durable profile promotion, display-name overrides, and
 typed profile attributes are separate curated operations; see [People,
-Profiles, and Source Identities](/usage/people/).
+Profiles, and Source Identities](/docs/usage/people/).
+
+### Directory and Reviews
+
+Directory holds durable people: the profiles you explicitly curate and keep
+across sources. Search by name, email, or organization; filter by contact
+state, category, primary channel, or last-contact dates; and sort by most or
+least recently contacted.
+
+Its person detail keeps
+Overview, Organizations, Relationships, Network, and Media & Files together.
+Edit structured profile information, attributes, employment, and typed
+relationships here. Curated display names also appear in message views,
+analytics, and exports while source identifiers remain available.
+
+The Overview tab's **Last time we talked** card summarizes the person's recent
+chat and text messages. Enroll the person, generate a brief, and expand a
+sentence to check its sources. You can reject a brief or inspect the dates and status of earlier
+versions. Generation requires a consented provider and uses its budget; see
+[person briefs](/docs/usage/people-briefs/)
+for setup and supported sources.
+
+The Network tab can request one, two, or three hops and optionally include
+ended records. It visualizes at most 250 nodes and 500 connections, while an
+always-present list groups the same connections by hop for keyboard and screen
+reader use. Person and organization names in this view come from durable
+profiles. Edges come only from curated typed relationships and employments
+(including shared organizations), never messages, participant co-occurrence,
+or inferred communication activity.
+
+Reviews brings together identity matches, fact review, and imported
+relationships. Inspect the evidence before accepting or rejecting a candidate.
+Conflicts between existing profiles require an explicit merge decision.
+Merge history and reversal follow the boundaries documented in
+[People](/docs/usage/people/).
 
 Domains provides the same activity-and-files analysis for an exact domain
 fact. A domain is not treated as an inferred organization identity. Selecting
@@ -160,8 +241,9 @@ context, including chronologically ordered related files.
 Saved Views persist useful analytical contexts in the daemon, so the same
 library is available from every authenticated browser connected to this
 single-user archive. A view records its query, explicit search mode, filters,
-grouping, presentation, sort, visible columns, and inspector preference.
-Selection is intentionally not saved.
+grouping, presentation, sort, and visible columns.
+Selection is intentionally not saved. The inspector stays pinned; the browser
+does not save or apply inspector pin preferences.
 
 Each record carries a schema version. An incompatible record remains visible,
 but cannot be opened or edited: automatic migration is not attempted. Remove it
@@ -169,6 +251,12 @@ after confirmation and save the current context again. Updates and deletion use
 the record revision as an optimistic-concurrency guard. If another browser
 changes the view first, msgvault reports a conflict and requires you to reload
 and review the latest revision instead of overwriting it.
+
+The daemon validates every definition against the version-1 vocabulary
+before saving it, so any stored view can be opened here, run by an API client
+through `POST /api/v1/saved-views/{id}/run`, or executed by an AI assistant
+with the [MCP server](/docs/usage/chat/#saved-views)'s `run_saved_view` tool.
+All three read the same records and see the same revisions.
 
 ## Sources and sync status
 
@@ -188,10 +276,43 @@ than claiming success. Conflicting runs and unavailable capabilities retain
 their explicit errors or reasons. Full resync, pause/resume, schedule editing,
 and source add/remove are outside this workspace's initial scope.
 
+## Operations
+
+Operations answers two different questions: what is configured and ready now,
+and what happened during a particular run. Its overview groups work into five
+lanes:
+
+| Lane | Work shown |
+|---|---|
+| Messages | Source sync and message embeddings |
+| Facts | People sweeps, person embeddings, and external enrichment |
+| Contacts | CardDAV sync |
+| Documents | Document extraction and document embeddings |
+| Attachments | Visual embeddings |
+
+Filter history by lane, kind of work, state, and start date. Open a run to
+inspect its progress, outcome, timestamps, and available diagnostics. Queued,
+running, succeeded, partial, failed, and cancelled are distinct states.
+Missing history is reported as unavailable instead of looking like no work
+has ever run.
+
+Links open source status, CardDAV settings, or detailed document and visual
+index status. The latter show coverage and the current prerequisites for
+processing. The workspace offers **Start CardDAV sync**, **Build visual
+index**, or **Resume visual index** only when the daemon advertises that
+action. Source **Sync now** remains in Sources. Document extraction still
+requires the explicit CLI upload workflow in
+[Document Indexing](/docs/usage/document-indexing/).
+
+While Operations is visible it refreshes status and run history. The filters
+and selected run are kept in the URL, so browser Back and Forward restore the
+view. If paging history becomes inconsistent after a change, use **Restart
+operation history** to load a fresh snapshot.
+
 ## Deletions
 
 Everything supports explicit row selection and select-all-matching for the
-current canonical filter. `d` and `D` open the Deletions workspace, where the
+current query and filters. `d` and `D` open the Deletions workspace, where the
 daemon first preflights the selection and reports any unavailable action before
 the UI offers a separate staging confirmation. The workspace lists, inspects,
 and cancels manifests; it cannot execute deletion against a provider. Use the
@@ -220,15 +341,87 @@ Shortcuts are suspended while typing and inside message/file content.
 
 ## Settings and restart behavior
 
-Settings exposes the supported browser, server, search, source, and optional
-integration keys. It performs targeted, comment-preserving edits to
-`config.toml`, rejects a stale browser edit after a concurrent hand edit, and
-never displays secret values—only whether they are configured.
+Settings edits the daemon's `config.toml` from the browser. For every
+`config.toml` setting the daemon supplies the category, section, label,
+description, and allowed values, so the browser never decides on its own what
+a setting means. Those categories are Appearance, Daemon, Archive, Search,
+Sources, Attachments, Person enrichment, and Integrations. Larger categories
+split into titled sections, for example Search has separate sections for the
+text embedding provider, the embedding schedule, and visual attachment search.
+The CardDAV account category is a separate browser-owned workflow with its own
+save action; it is not part of the daemon's settings catalog.
 
-Most settings are restart-required by design. After saving, the UI shows a
-pending-restart state until the daemon restarts. An API-key change requires an
-extra confirmation. The current process keeps the active key until restart;
-after restart, old browser sessions are gone and the login screen appears.
+Each row shows the setting name and one sentence about what it does. Limits
+live on the control itself: a number input carries its minimum and maximum,
+and a syntax hint such as the accepted duration format sits under the control
+only when the syntax needs one. Settings where zero means "off", such as an
+attachment size cap that falls back to the provider default, show a switch.
+Switch it off and the row states what happens instead; switch it on and a
+value input appears, starting from a suggested value. Rows you have changed
+carry an amber dot, the footer counts unsaved changes, and Discard throws them
+away. Save is disabled until something changes.
+
+Schedules are one line. A Presets menu offers common schedules such as every
+hour, every day at 03:00, or weekdays at 09:00, plus Off for schedules that
+can be empty and Custom. Choosing Custom opens the expression editor beside
+the menu, starting from the preset you had. The five fields are tinted, and
+while the editor has focus or the pointer is over it a small card names the
+fields (minute, hour, day, month, weekday) and says in plain English when the
+schedule runs; a mistake names the field and the problem before you save. A
+Time zone menu at the end of the line runs the schedule in a chosen IANA zone
+instead of the daemon's own clock, shown as "Server time"; the choice is
+stored as a `CRON_TZ=` prefix on the schedule. The CardDAV account form uses
+the same field, and the Sources and CardDAV status views describe stored
+schedules the same way.
+
+Each category states once how its changes take effect. Appearance settings
+apply right away. Every other `config.toml` category takes effect after the
+daemon restarts, and after a save the page shows "Saved. Restart the daemon to
+apply these changes." until it does. Two exceptions apply right away and say
+so beside their controls: person-enrichment provider API keys, and the CardDAV
+account, which saves through its own form. Saving makes targeted edits to `config.toml`
+while preserving comments. A stale edit is rejected after another browser or
+a hand edit changes the configuration; reload before saving again.
+
+Host-managed values, such as the listener address and the server API key
+(`server.api_key`), show their current value with a Host-managed tag and no
+input. Change them in `config.toml` on the daemon host. After the API key
+changes and the daemon restarts, old browser sessions end and the login
+screen appears.
+
+### Provider policies and credentials
+
+Create or edit named person-enrichment policies for Exa and SixtyFour in
+Settings. Provider checks and consent still govern whether enrichment can
+run; configuration alone does not authorize a provider. The TUI shows these
+policies read-only. See [External Person Enrichment](/docs/usage/people-enrichment/)
+for the provider lifecycle.
+
+Provider credentials for embeddings, enrichment, and sweeps are write-only,
+and so are the task integration key and the daemon's own API key. Each key is
+one line: a read-only box, a pencil button, and a trash button that removes
+a stored key. The box shows `None` when no key is set, or a masked
+hint of the set key, its first three and last three characters, such as
+`sk-…x9Q`, so you can tell which key is in place. A key under twelve
+characters shows as dots instead. The pencil opens a dialog to paste the
+new key, and the dialog says when it takes effect: a person-enrichment key
+applies right away, the text and visual embedding keys are stored at once
+but used after the daemon restarts, and the task integration key is saved
+with the rest of the page. A key that comes from an environment variable
+says so under the line and cannot be cleared from the browser.
+
+Credentials have a separate revision from `config.toml`. When changing both
+an endpoint or model and its credential, save the endpoint/model first, then
+the credential. This binds the key to the destination it was entered for.
+
+### CardDAV contacts
+
+CardDAV settings manage contact accounts and discovered address books. Choose
+which books participate in sync, lookup, and publishing; publishing also
+enables contact sync for that book. The workspace offers incremental and full
+sync, recent run history, and conflict review. A conflict shows local and
+remote versions before you choose which to keep. See
+[People and CardDAV](/docs/usage/people-carddav/) for setup and publishing rules.
 
 ## Optional integration states
 

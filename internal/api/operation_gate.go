@@ -273,7 +273,8 @@ func (g *SerialOperationGate) state() (chan struct{}, chan struct{}) {
 // that fail it pass straight through — without registering as request
 // waiters, triggering scheduler yields, or observing operation state — and
 // are rejected by the API auth layer below. A nil authorized gates every
-// request.
+// request. The cached request security identifies delegated callers so their
+// busy responses omit the holder label.
 func operationGateMiddleware(gate OperationGate, authorized func(*http.Request) bool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		if gate == nil {
@@ -284,7 +285,9 @@ func operationGateMiddleware(gate OperationGate, authorized func(*http.Request) 
 				next.ServeHTTP(w, r)
 				return
 			}
-			shouldGate, label, err := operationGateRequest(r)
+			security, _ := securityFromRequest(r)
+			delegated := security.auth.Mode == AuthModeDelegated
+			shouldGate, label, err := operationGateRequest(r, delegated)
 			if err != nil {
 				if errors.Is(err, errCLIRunGateInspectionBodyTooLarge) {
 					writeError(w, http.StatusRequestEntityTooLarge, "request_too_large",
@@ -300,7 +303,7 @@ func operationGateMiddleware(gate OperationGate, authorized func(*http.Request) 
 			}
 			done, ok := beginGateWorkBounded(r.Context(), gate, label)
 			if !ok {
-				writeOperationGateBusy(w, gate)
+				writeOperationGateBusy(w, r, gate)
 				return
 			}
 			defer done()
@@ -321,7 +324,7 @@ func beginGateWorkBounded(ctx context.Context, gate OperationGate, label string)
 	return gate.BeginWorkContext(waitCtx)
 }
 
-func writeOperationGateBusy(w http.ResponseWriter, gate OperationGate) {
+func writeOperationGateBusy(w http.ResponseWriter, r *http.Request, gate OperationGate) {
 	lg, ok := gate.(LabeledOperationGate)
 	if !ok {
 		writeError(w, http.StatusServiceUnavailable, "server_busy", "server is busy or shutting down")
@@ -332,34 +335,47 @@ func writeOperationGateBusy(w http.ResponseWriter, gate OperationGate) {
 		return
 	}
 	message := "another operation is running"
-	if label, since, held := lg.Holder(); held && label != "" {
-		message = fmt.Sprintf("%s has been running for %s",
-			label, time.Since(since).Round(time.Second))
+	security, _ := securityFromRequest(r)
+	if security.auth.Mode != AuthModeDelegated {
+		if label, since, held := lg.Holder(); held && label != "" {
+			message = fmt.Sprintf("%s has been running for %s",
+				label, time.Since(since).Round(time.Second))
+		}
 	}
 	writeError(w, http.StatusServiceUnavailable, "operation_in_progress", message)
 }
 
 // operationGateExemptPaths bypass the generic mutation gate. Most only read;
-// the session endpoints mutate process-local authentication state. Verify is
-// NOT exempt: its subprocess opens the store read-write and runs schema
-// init/migrations.
+// Session and agent-token endpoints mutate process-local authentication state.
+// Google OAuth endpoints manage pending authorization under their own mutex and
+// write token files without changing the archive. They remain available during
+// archive work. Verify is NOT exempt: its subprocess opens the store read-write
+// and runs schema init/migrations.
 //
-// Backup freeze begin and meeting import coordinate the gate in their handlers.
+// Backup freeze begin, meeting import, and historical import jobs coordinate
+// the gate in their handlers.
 // Meeting import first reads and validates its bounded request body so a slow
 // authenticated upload cannot hold the gate. Backup freeze end bypasses the
 // gate so it can release the freeze held by begin. Routing these through the
 // generic middleware would deadlock their coordination.
+//
+// DELETE /api/v1/agent-tokens/{id} uses a dynamic path; its exemption is
+// handled by the strings.HasPrefix check in operationGateRequest below.
 var operationGateExemptPaths = map[string]bool{
-	queryEndpointPath:                true,
-	sessionPath:                      true,
-	sessionLoginPath:                 true,
-	meetingImportEndpointPath:        true,
-	"/api/v1/cli/add-calendar/plan":  true,
-	"/api/v1/cli/delete-staged/plan": true,
-	"/api/v1/cli/embeddings/plan":    true,
-	"/api/v1/cli/deduplicate/plan":   true,
-	backupFreezeBeginPath:            true,
-	backupFreezeEndPath:              true,
+	"/api/v1/carddav/google/authorize": true,
+	"/api/v1/carddav/google/callback":  true,
+	queryEndpointPath:                  true,
+	sessionPath:                        true,
+	agentTokensPath:                    true,
+	sessionLoginPath:                   true,
+	importJobsEndpointPath:             true,
+	meetingImportEndpointPath:          true,
+	"/api/v1/cli/add-calendar/plan":    true,
+	"/api/v1/cli/delete-staged/plan":   true,
+	"/api/v1/cli/embeddings/plan":      true,
+	"/api/v1/cli/deduplicate/plan":     true,
+	backupFreezeBeginPath:              true,
+	backupFreezeEndPath:                true,
 }
 
 // readOnlyPostRoutePatterns lists the analytical POST routes whose handlers
@@ -385,6 +401,7 @@ var operationGateExemptPaths = map[string]bool{
 const cardDAVAccountTestPath = "/api/v1/carddav/account/test"
 
 var readOnlyPostRoutePatterns = []string{
+	"/api/v1/saved-views/{id}/run",
 	remoteImagePath,
 	cardDAVAccountTestPath,
 	"/api/v1/explore",
@@ -434,7 +451,7 @@ func readOnlyPostRouteRequest(r *http.Request) bool {
 	return pattern != ""
 }
 
-func operationGateRequest(r *http.Request) (bool, string, error) {
+func operationGateRequest(r *http.Request, delegated bool) (bool, string, error) {
 	if r.URL.Path == DaemonShutdownPath {
 		return false, "", nil
 	}
@@ -442,14 +459,24 @@ func operationGateRequest(r *http.Request) (bool, string, error) {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:
 		return false, "", nil
 	}
-	if operationGateExemptPaths[r.URL.Path] {
+	if operationGateExemptPaths[r.URL.Path] || strings.HasPrefix(r.URL.Path, agentTokensPath+"/") {
 		return false, "", nil
 	}
 	if readOnlyPostRouteRequest(r) {
 		return false, "", nil
 	}
+	if r.URL.Path == "/api/v1/cli/repair-message" {
+		label, skip, err := cliRepairMessageGateDecision(r)
+		if err != nil {
+			return false, "", err
+		}
+		if skip {
+			return false, "", nil
+		}
+		return true, label, nil
+	}
 	if r.URL.Path == "/api/v1/cli/run" {
-		label, skip, err := cliRunGateDecision(r)
+		label, skip, err := cliRunGateDecision(r, delegated)
 		if err != nil {
 			return false, "", err
 		}
@@ -459,6 +486,31 @@ func operationGateRequest(r *http.Request) (bool, string, error) {
 		return true, label, nil
 	}
 	return true, operationGateLabelFromPath(r.URL.Path), nil
+}
+
+// cliRepairMessageGateDecision bypasses the mutation gate only for a request
+// body that the handler will accept as read-only audit mode. The body is
+// restored before returning so the Huma handler sees the exact same bytes.
+// Malformed and invalid bodies stay gated and are rejected by the handler.
+func cliRepairMessageGateDecision(r *http.Request) (label string, skip bool, err error) {
+	if r == nil || r.Body == nil {
+		return "msgvault repair-message", false, nil
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, cliRunGateInspectionMaxBytes+1))
+	if err != nil {
+		return "", false, err
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	if len(body) > cliRunGateInspectionMaxBytes {
+		return "", false, errCLIRunGateInspectionBodyTooLarge
+	}
+
+	var req CLIRepairMessageRequest
+	if json.Unmarshal(body, &req) == nil &&
+		req.Audit && strings.TrimSpace(req.Reference) == "" && req.SourceID >= 0 {
+		return "", true, nil
+	}
+	return "msgvault repair-message", false, nil
 }
 
 // cliRunReadOnlyCommands are proxied CLI commands that only read. Keys are
@@ -481,7 +533,7 @@ var cliRunSelfGatedCommands = map[string]bool{
 	"backup create": true,
 }
 
-func cliRunGateDecision(r *http.Request) (label string, skip bool, err error) {
+func cliRunGateDecision(r *http.Request, delegated bool) (label string, skip bool, err error) {
 	if r == nil || r.Body == nil {
 		return "", false, nil
 	}
@@ -500,6 +552,12 @@ func cliRunGateDecision(r *http.Request) (label string, skip bool, err error) {
 		Args []string `json:"args"`
 	}
 	if json.Unmarshal(body, &req) == nil && len(req.Args) > 0 {
+		// Delegated callers may only reach draft-reply; any other command is
+		// rejected by the handler before it does any work, so do not take a
+		// gate slot or surface a label to the owner.
+		if delegated && !IsCLIRunDraftReply(req.Args) {
+			return "", true, nil
+		}
 		command := cliRunCommandWords(req.Args)
 		if cliRunReadOnlyCommands[command] || cliRunSelfGatedCommands[command] {
 			return "", true, nil
@@ -507,6 +565,10 @@ func cliRunGateDecision(r *http.Request) (label string, skip bool, err error) {
 		if command != "" {
 			return "msgvault " + command, false, nil
 		}
+	}
+	if delegated {
+		// Unparseable or empty-args body: the handler rejects it; do not gate.
+		return "", true, nil
 	}
 	return "msgvault CLI command", false, nil
 }

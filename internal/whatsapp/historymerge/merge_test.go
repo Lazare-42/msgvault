@@ -351,7 +351,7 @@ func TestMergeSource(t *testing.T) {
 			assert.Equal(t, tc.wantConvJID, gotConvJID)
 			assert.Equal(t, tc.wantConvType, gotConvType)
 
-			bodyText, _, found, err := f.intoStore.GetMessageBodyText(msgID)
+			bodyText, _, found, err := f.intoStore.GetMessageBodyTextAndHTML(msgID)
 			require.NoError(t, err)
 			require.True(t, found)
 			assert.Equal(t, tc.wantBody, bodyText.String)

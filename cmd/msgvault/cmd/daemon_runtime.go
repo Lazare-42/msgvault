@@ -17,6 +17,7 @@ import (
 	"go.kenn.io/msgvault/internal/api"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonauth"
+	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/update"
 	"golang.org/x/crypto/argon2"
 )
@@ -33,6 +34,7 @@ const (
 	runtimeCreateTime               = "create_time"
 	runtimeShutdownToken            = "shutdown_token"
 	runtimeStartupPhase             = "startup_phase"
+	minimumDaemonAPISchemaVersion   = "2.14.0"
 	runtimeStartupCacheBuildOutcome = "startup_cache_build_outcome"
 	daemonProbeTick                 = 250 * time.Millisecond
 )
@@ -148,10 +150,20 @@ func findCompatibleDaemonRuntimeContext(ctx context.Context, dataDir string) (*D
 // CLI upgrade or downgrade fails the compatibility check, yet it still holds
 // the database open.
 func findAnyDaemonRuntime(dataDir string) *DaemonRuntime {
+	return findAnyDaemonRuntimeContext(context.Background(), dataDir)
+}
+
+// findAnyDaemonRuntimeContext is the context-aware form of
+// findAnyDaemonRuntime. Guards that only need to know whether a live
+// process owns the archive (like the restore-into-home refusal) must use
+// this rather than findDaemonRuntime: a daemon left running across a CLI
+// upgrade or downgrade fails the compatibility check, yet it still holds
+// the database open.
+func findAnyDaemonRuntimeContext(ctx context.Context, dataDir string) *DaemonRuntime {
 	// findRespondingDaemonRuntime returns the accepted runtime's
 	// compatibility error alongside it; an incompatible daemon is exactly
 	// what this lookup must still surface, so only found matters here.
-	rt, found, _ := findRespondingDaemonRuntime(context.Background(), dataDir,
+	rt, found, _ := findRespondingDaemonRuntime(ctx, dataDir,
 		func(*DaemonRuntime, error) bool { return true })
 	if !found {
 		return nil
@@ -224,16 +236,14 @@ func findRespondingDaemonRuntime(
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
-	records, err := listLiveDaemonRuntimeRecords(dataDir)
+	records, err := listLiveDaemonRuntimeRecordsContext(ctx, dataDir)
 	if err != nil {
 		return nil, false, err
 	}
 	for _, rec := range records {
 		switch runtimeRecordIdentity(rec) {
 		case createTimeMatch:
-		case createTimeMismatch:
-			continue
-		case createTimeSkew, createTimeUnknown:
+		case createTimeMismatch, createTimeSkew, createTimeUnknown:
 			proved, proofErr := proveDaemonRuntimeIdentity(ctx, rec)
 			if proofErr != nil {
 				if ctxErr := ctx.Err(); ctxErr != nil {
@@ -265,6 +275,16 @@ func findRespondingDaemonRuntime(
 }
 
 func listLiveDaemonRuntimeRecords(dataDir string) ([]daemon.RuntimeRecord, error) {
+	return listLiveDaemonRuntimeRecordsContext(context.Background(), dataDir)
+}
+
+func listLiveDaemonRuntimeRecordsContext(ctx context.Context, dataDir string) ([]daemon.RuntimeRecord, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	store := daemonRuntimeStore(dataDir)
 	_, _ = store.CleanupDead()
 	records, err := store.List()
@@ -283,9 +303,21 @@ func listLiveDaemonRuntimeRecords(dataDir string) ([]daemon.RuntimeRecord, error
 		if !daemon.ProcessAlive(rec.PID) {
 			continue
 		}
-		if runtimeRecordIdentityMismatched(rec) &&
-			(!ownershipHeld || rec.Metadata[runtimeStartupPhase] == "") {
-			continue
+		if runtimeRecordIdentityMismatched(rec) {
+			if ownershipHeld && rec.Metadata[runtimeStartupPhase] != "" {
+				alive = append(alive, rec)
+				continue
+			}
+			proved, proofErr := proveDaemonRuntimeIdentity(ctx, rec)
+			if proofErr != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, ctxErr
+				}
+				continue
+			}
+			if !proved {
+				continue
+			}
 		}
 		alive = append(alive, rec)
 	}
@@ -358,6 +390,12 @@ func apiSchemaCompatibilityError(peerVersion string) error {
 		return fmt.Errorf(
 			"daemon API schema version %q is incompatible with client API schema version %q",
 			peerVersion, api.APISchemaVersion,
+		)
+	}
+	if !daemonclient.APISchemaVersionAtLeast(peerVersion, minimumDaemonAPISchemaVersion) {
+		return fmt.Errorf(
+			"daemon API schema version %q is incompatible: this CLI requires API schema %s or newer",
+			peerVersion, minimumDaemonAPISchemaVersion,
 		)
 	}
 	return nil

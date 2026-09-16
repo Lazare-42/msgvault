@@ -18,6 +18,8 @@ import (
 // ErrMediaTooLarge classifies hosted media that exceeds its configured cap.
 var ErrMediaTooLarge = errors.New("teams hosted media exceeds the configured size cap")
 
+var errGraphNotFound = errors.New("graph resource not found")
+
 const (
 	maxRetries    = 8
 	maxRetryAfter = httpretry.ProviderMaxRetryAfter
@@ -100,6 +102,8 @@ func (c *Client) getLimited(ctx context.Context, rawURL string, maxBytes int64) 
 				return nil, ErrMediaTooLarge
 			}
 			return body, nil
+		case resp.StatusCode == http.StatusNotFound:
+			return nil, fmt.Errorf("graph GET %s: status %d: %s: %w", reqURL, resp.StatusCode, string(body), errGraphNotFound)
 		case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
 			wait := httpretry.RetryAfter(resp.Header.Get("Retry-After"), attempt, maxRetryAfter)
 			timer := time.NewTimer(wait)
@@ -205,6 +209,14 @@ func pageThroughLimit[T any](ctx context.Context, c *Client, startURL string, li
 		return page.DeltaLink, false, nil
 	}
 }
+
+// SelfChatID is the Teams chat a user holds with themselves. Graph never
+// returns it from /me/chats, and a metadata read of /chats/48:notes fails with
+// "Call made for a thread which is not a ChatThread". Its messages endpoint
+// answers normally, including the incremental lastModifiedDateTime filter, so
+// once the chat is in the list it syncs through the same path as every other
+// chat.
+const SelfChatID = "48:notes"
 
 func (c *Client) ListChats(ctx context.Context) ([]Chat, error) {
 	var out []Chat

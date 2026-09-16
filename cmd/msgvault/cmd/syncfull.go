@@ -28,6 +28,7 @@ var (
 	syncBefore      string
 	syncAfter       string
 	syncLimit       int
+	syncOperationID string
 	syncFolders     []string // folder names to include (from --folder flag)
 	syncSkipFolders []string // folder names to exclude (from --skip-folder flag)
 )
@@ -108,7 +109,7 @@ func runSyncFullLocal(cmd *cobra.Command, args []string) error {
 			return err
 		}
 		for _, src := range allMatches {
-			if src.SourceType == sourceTypeGmail || src.SourceType == sourceTypeIMAP {
+			if src.SourceType == sourceTypeGmail || src.SourceType == sourceTypeIMAP || src.SourceType == "" {
 				sources = append(sources, src)
 			}
 		}
@@ -345,6 +346,19 @@ func buildIMAPAPIClient(ctx context.Context, identifier, syncConfigJSON string, 
 	}
 }
 
+// configuredTrustedSentMailboxes exposes the explicit Sent-folder trust
+// configured for exactly this IMAP source, keyed by its identifier (the
+// ACCOUNT value printed by `msgvault list-accounts`). Trust never crosses
+// accounts: another source with a same-named mailbox gets no entry. Nil-safe
+// because several command tests run without a loaded global config; a
+// missing entry means no explicit trust.
+func configuredTrustedSentMailboxes(identifier string) []string {
+	if cfg == nil {
+		return nil
+	}
+	return cfg.Sync.TrustedIMAPSentMailboxes[identifier]
+}
+
 // loadIMAPFolderStates returns the saved per-mailbox states in the map
 // form the IMAP client consumes.
 func loadIMAPFolderStates(s *store.Store, sourceID int64) (map[string]imaplib.FolderState, error) {
@@ -386,12 +400,29 @@ func imapFolderStateOptions(
 	} else if len(states) > 0 {
 		opts = append(opts, imaplib.WithFolderStates(states))
 	}
-	aliases, err := s.GetIMAPSourceMessageAliases(src.ID)
-	if err != nil {
-		logger.Warn("failed to load IMAP source message aliases", "source", src.Identifier, "error", err)
-	} else if len(aliases) > 0 {
-		opts = append(opts, imaplib.WithSourceMessageAliases(aliases))
-	}
+	opts = append(opts, imaplib.WithSourceMessageAliasLoader(
+		func(mailbox string, uids []uint32) (map[string]string, error) {
+			return s.GetIMAPSourceMessageAliases(src.ID, mailbox, uids)
+		}), imaplib.WithRelocationCandidateLoader(
+		func(ctx context.Context, lost []string) ([]imaplib.RelocationCandidate, error) {
+			candidates, err := s.GetIMAPRelocationCandidatesContext(ctx, src.ID, lost)
+			if err != nil {
+				return nil, err
+			}
+			result := make([]imaplib.RelocationCandidate, 0, len(candidates))
+			for _, candidate := range candidates {
+				result = append(result, imaplib.RelocationCandidate{
+					Target: gmail.MessageRelocationTarget{
+						InternalID: candidate.ID, SourceID: candidate.SourceID,
+						SourceMessageID: candidate.SourceMessageID,
+						RFC822MessageID: candidate.RFC822MessageID,
+					},
+					Mailbox: candidate.Mailbox, UIDValidity: candidate.UIDValidity, UID: candidate.UID,
+				})
+			}
+			return result, nil
+		}),
+		imaplib.WithTrustedSentMailboxes(configuredTrustedSentMailboxes(src.Identifier)))
 	if forceRescan {
 		opts = append(opts, imaplib.WithForceFullEnumeration())
 	}
@@ -569,6 +600,7 @@ func runFullSync(ctx context.Context, s *store.Store, getOAuthMgr func(string) (
 	opts.Query = query
 	opts.NoResume = syncNoResume
 	opts.Limit = syncLimit
+	opts.OperationID = syncOperationID
 	opts.AttachmentsDir = cfg.AttachmentsDir()
 
 	// IMAP page tokens are numeric offsets into a message list
@@ -596,8 +628,33 @@ func runFullSync(ctx context.Context, s *store.Store, getOAuthMgr func(string) (
 		fmt.Printf("Query: %s\n", query)
 	}
 	fmt.Println()
+	syncSource := src
+	if syncSource.ID == 0 {
+		sourceType := syncSource.SourceType
+		if sourceType == "" {
+			sourceType = sourceTypeGmail
+		}
+		syncSource, err = s.GetOrCreateSource(sourceType, syncSource.Identifier)
+		if err != nil {
+			return fmt.Errorf("get/create source: %w", err)
+		}
+	}
 
-	summary, err := syncer.Full(ctx, src.Identifier)
+	summary, err := syncer.FullWithFinalizer(
+		ctx,
+		syncSource,
+		func(summary *gmail.SyncSummary) error {
+			if src.SourceType != sourceTypeIMAP {
+				return nil
+			}
+			if err := saveIMAPFolderStates(
+				ctx, s, src, apiClient, summary, opts.Limit,
+			); err != nil {
+				return fmt.Errorf("save IMAP incremental state: %w", err)
+			}
+			return nil
+		},
+	)
 	if err != nil {
 		if ctx.Err() != nil {
 			if opts.NoResume {
@@ -608,12 +665,6 @@ func runFullSync(ctx context.Context, s *store.Store, getOAuthMgr func(string) (
 			return nil
 		}
 		return fmt.Errorf("sync failed: %w", err)
-	}
-
-	if src.SourceType == sourceTypeIMAP {
-		if err := saveIMAPFolderStates(ctx, s, src, apiClient, summary, opts.Limit); err != nil {
-			return fmt.Errorf("save IMAP incremental state: %w", err)
-		}
 	}
 
 	// Print summary; skip the spacer when no progress lines were
@@ -926,6 +977,8 @@ func imapSkipReason(src *store.Source) (string, error) {
 
 func init() {
 	syncFullCmd.Flags().Int64("source-id", 0, "Exact source ID to sync")
+	syncFullCmd.Flags().StringVar(&syncOperationID, "sync-operation-id", "", "Attribute runs to a daemon sync operation")
+	_ = syncFullCmd.Flags().MarkHidden("sync-operation-id")
 	syncFullCmd.Flags().StringVar(&syncQuery, "query", "", "Gmail search query")
 	syncFullCmd.Flags().BoolVar(&syncNoResume, "noresume", false, "Force fresh sync (don't resume; re-enumerates all IMAP folders)")
 	syncFullCmd.Flags().StringVar(&syncBefore, "before", "", "Only messages before this date (YYYY-MM-DD)")
