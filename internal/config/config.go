@@ -251,9 +251,10 @@ func (s *ServerConfig) ValidateSecure() error {
 
 // AccountSchedule defines sync schedule for a single account.
 type AccountSchedule struct {
-	Email    string `toml:"email"`    // Gmail account email
-	Schedule string `toml:"schedule"` // Cron expression (e.g., "0 2 * * *" for 2am daily)
-	Enabled  bool   `toml:"enabled"`  // Whether scheduled sync is active
+	Email       string   `toml:"email"`        // Account identifier or display name
+	Schedule    string   `toml:"schedule"`     // Cron expression (e.g., "0 2 * * *" for 2am daily)
+	Enabled     bool     `toml:"enabled"`      // Whether scheduled sync is active
+	SkipFolders []string `toml:"skip_folders"` // IMAP folders excluded from scheduled syncs
 }
 
 // CardDAVConfig contains non-secret connection settings for the external
@@ -1349,6 +1350,7 @@ func (c *Config) GetAccountSchedule(email string) *AccountSchedule {
 	for i := range c.Accounts {
 		if c.Accounts[i].Email == email {
 			acc := c.Accounts[i]
+			acc.SkipFolders = slices.Clone(acc.SkipFolders)
 			return &acc
 		}
 	}

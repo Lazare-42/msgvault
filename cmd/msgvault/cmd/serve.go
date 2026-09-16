@@ -26,6 +26,7 @@ import (
 	"go.kenn.io/msgvault/internal/discord"
 	"go.kenn.io/msgvault/internal/gmail"
 	"go.kenn.io/msgvault/internal/granola"
+	imaplib "go.kenn.io/msgvault/internal/imap"
 	"go.kenn.io/msgvault/internal/meetingimport"
 	"go.kenn.io/msgvault/internal/microsoft"
 	"go.kenn.io/msgvault/internal/oauth"
@@ -3054,7 +3055,7 @@ func runScheduledSync(ctx context.Context, identifier string, s *store.Store, ge
 		case sourceTypeGmail:
 			summary, err = runScheduledGmailSync(ctx, identifier, src, s, getOAuthMgr)
 		case sourceTypeIMAP:
-			summary, err = runScheduledIMAPSync(ctx, src, s)
+			summary, err = runScheduledIMAPSync(ctx, src, s, identifier)
 		case sourceTypeTeams:
 			err = runScheduledTeamsSync(ctx, src, s)
 		case sourceTypeDiscord:
@@ -3251,8 +3252,16 @@ func runScheduledGmailSync(ctx context.Context, email string, src *store.Source,
 // and relying on the store to dedupe by message-id. NoResume is forced
 // on because IMAP page tokens are numeric offsets that don't survive
 // across processes (see syncfull.go).
-func runScheduledIMAPSync(ctx context.Context, src *store.Source, s *store.Store) (*gmail.SyncSummary, error) {
+func runScheduledIMAPSync(
+	ctx context.Context,
+	src *store.Source,
+	s *store.Store,
+	scheduleIdentifier string,
+) (*gmail.SyncSummary, error) {
 	imapOpts := imapFolderStateOptions(s, src, false)
+	if account := cfg.GetAccountSchedule(scheduleIdentifier); account != nil && len(account.SkipFolders) > 0 {
+		imapOpts = append(imapOpts, imaplib.WithFolderFilter(nil, account.SkipFolders))
+	}
 	apiClient, err := buildAPIClient(ctx, src, nil, nil, imapOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("build IMAP client: %w", err)

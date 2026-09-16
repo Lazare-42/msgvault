@@ -30,6 +30,7 @@ import (
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
 
@@ -271,6 +272,7 @@ api_key = "test-key"
 email = "user1@gmail.com"
 schedule = "0 2 * * *"
 enabled = true
+skip_folders = ["Calendar", "Contacts"]
 
 [[accounts]]
 email = "user2@gmail.com"
@@ -300,6 +302,7 @@ enabled = false
 	acc := cfg.GetAccountSchedule("user1@gmail.com")
 	require.NotNil(acc, "GetAccountSchedule(user1)")
 	assert.Equal("0 2 * * *", acc.Schedule, "user1 schedule")
+	assert.Equal([]string{"Calendar", "Contacts"}, acc.SkipFolders, "user1 skipped folders")
 
 	// Disabled account should still be retrievable but not in scheduled list
 	disabled := cfg.GetAccountSchedule("disabled@gmail.com")
@@ -2034,6 +2037,63 @@ func TestRunScheduledIMAPSync_DispatchByDisplayName(t *testing.T) {
 	assert.False(strings.Contains(msg, "refresh token") || strings.Contains(msg, "token may be expired"),
 		"dispatch fell through to Gmail path: %q", msg)
 	assert.Contains(msg, "IMAP", "error %q does not mention IMAP — dispatch likely missed the source", msg)
+}
+
+func TestRunScheduledIMAPSync_AppliesConfiguredSkipFolders(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	savedCfg := cfg
+	t.Cleanup(func() { cfg = savedCfg })
+
+	addr, _ := testutil.StartIMAPMemServer(t, map[string]int{
+		"INBOX":    1,
+		"Metadata": 2,
+	})
+	host, portString, err := net.SplitHostPort(addr)
+	require.NoError(err)
+	port, err := strconv.Atoi(portString)
+	require.NoError(err)
+
+	dataDir := t.TempDir()
+	cfg = &config.Config{
+		Data: config.DataConfig{DataDir: dataDir},
+		Accounts: []config.AccountSchedule{{
+			Email:       "user@example.com",
+			Schedule:    "0 * * * *",
+			Enabled:     true,
+			SkipFolders: []string{"metadata"},
+		}},
+	}
+	s, err := store.Open(filepath.Join(dataDir, "msgvault.db"))
+	require.NoError(err)
+	t.Cleanup(func() { _ = s.Close() })
+	require.NoError(s.InitSchema())
+
+	imapCfg := &imaplib.Config{
+		Host: host, Port: port, Username: testutil.IMAPTestUsername,
+	}
+	src, err := s.GetOrCreateSource(sourceTypeIMAP, imapCfg.Identifier())
+	require.NoError(err)
+	require.NoError(s.UpdateSourceDisplayName(src.ID, "user@example.com"))
+	configJSON, err := imapCfg.ToJSON()
+	require.NoError(err)
+	require.NoError(s.UpdateSourceSyncConfig(src.ID, configJSON))
+	require.NoError(imaplib.SaveCredentials(
+		cfg.TokensDir(), imapCfg.Identifier(), testutil.IMAPTestPassword))
+
+	src, err = s.GetSourceByID(src.ID)
+	require.NoError(err)
+	summary, err := runScheduledIMAPSync(
+		context.Background(), src, s, "user@example.com")
+	require.NoError(err)
+	assert.Equal(int64(1), summary.MessagesFound)
+	assert.Equal(int64(1), summary.MessagesAdded)
+	assert.Empty(summary.Errors)
+
+	counts, err := s.CountMessagesPerMailbox(src.ID)
+	require.NoError(err)
+	assert.Equal(int64(1), counts["INBOX"])
+	assert.NotContains(counts, "Metadata")
 }
 
 // TestRunScheduledIMAPSync_DefaultIdentityIsDisplayName verifies the

@@ -495,6 +495,10 @@ and may be duplicated.
 | `email` | (required) | Account identifier/display name, or exact Discord guild ID, to sync |
 | `schedule` | — | Cron expression for sync schedule (e.g., `0 * * * *`) |
 | `enabled` | `true` | Whether scheduled sync is active for this account |
+| `skip_folders` | `[]` | IMAP folder names to exclude, matched case-insensitively |
+
+For IMAP accounts, exclusions apply only to scheduled syncs. Manual syncs can
+use `--skip-folder` independently.
 
 For example, schedule one previously registered Discord guild independently:
 

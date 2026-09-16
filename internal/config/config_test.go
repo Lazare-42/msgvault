@@ -633,7 +633,10 @@ func TestGetAccountScheduleReturnsCopy(t *testing.T) {
 	assert := assert.New(t)
 	cfg := &Config{
 		Accounts: []AccountSchedule{
-			{Email: "test@gmail.com", Schedule: "0 2 * * *", Enabled: true},
+			{
+				Email: "test@gmail.com", Schedule: "0 2 * * *", Enabled: true,
+				SkipFolders: []string{"Calendar"},
+			},
 		},
 	}
 
@@ -645,9 +648,11 @@ func TestGetAccountScheduleReturnsCopy(t *testing.T) {
 	acc.Schedule = "modified"
 	acc.Enabled = false
 	acc.Email = "hacked@gmail.com"
+	acc.SkipFolders[0] = "mutated"
 
 	// Original config must be unchanged
 	assert.Equal("0 2 * * *", cfg.Accounts[0].Schedule, "original Schedule (mutation leaked)")
+	assert.Equal([]string{"Calendar"}, cfg.Accounts[0].SkipFolders, "original SkipFolders (mutation leaked)")
 	assert.True(cfg.Accounts[0].Enabled, "original Enabled (mutation leaked)")
 	assert.Equal("test@gmail.com", cfg.Accounts[0].Email, "original Email (mutation leaked)")
 }
