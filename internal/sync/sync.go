@@ -1963,24 +1963,6 @@ func labelIDsFor(sourceLabelIDs []string, labelMap map[string]int64) []int64 {
 	return labelIDs
 }
 
-// folderLabelIDsFor is labelIDsFor with flag-derived labels (UNREAD,
-// STARRED, ...) excluded. IMAP relocation/adoption snapshots a message's
-// mailbox membership, not its per-message flag state; flag state is the
-// regular incremental sync's concern, reconciled separately from wherever
-// the message happens to land during a relocation.
-func folderLabelIDsFor(sourceLabelIDs, flagLabels []string, labelMap map[string]int64) []int64 {
-	labelIDs := make([]int64, 0, len(sourceLabelIDs))
-	for _, label := range sourceLabelIDs {
-		if slices.Contains(flagLabels, label) {
-			continue
-		}
-		if id, ok := labelMap[label]; ok {
-			labelIDs = append(labelIDs, id)
-		}
-	}
-	return labelIDs
-}
-
 // ingestMessage parses and stores a single message. The boolean reports
 // whether RFC822 dedup reconciliation changed an existing message. It returns
 // errDuplicateRFC822 or errDeferredIMAPIdentity for IMAP deduplication skips.

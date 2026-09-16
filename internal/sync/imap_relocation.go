@@ -91,7 +91,7 @@ func (s *Syncer) adoptIMAPRelocationLocation(
 		ctx,
 		target.InternalID, target.SourceMessageID, target.NewSourceMessageID,
 		!s.defersAuthoritativeLabelReconciliation(),
-		folderLabelIDsFor(raw.LabelIDs, raw.FlagLabels, labelMap),
+		labelIDsFor(raw.LabelIDs, labelMap),
 		s.labelsSnapshotComplete(),
 	)
 	if err != nil {
@@ -109,7 +109,7 @@ func (s *Syncer) persistPreparedIMAPRelocation(
 		return err
 	}
 	participants, participantIndex := preparedMessageParticipants(prepared)
-	labelIDs := folderLabelIDsFor(prepared.gmailLabelIDs, prepared.flagLabels, labelMap)
+	labelIDs := labelIDsFor(prepared.gmailLabelIDs, labelMap)
 
 	messageID, err := s.store.PersistIMAPRelocationWithParticipantsContext(
 		ctx,
