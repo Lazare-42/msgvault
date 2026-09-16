@@ -63,6 +63,14 @@ type GetAttachmentContentErrorResponseJSON500 = ErrorResponse
 
 type GetAttachmentContentErrorResponseJSON503 = ErrorResponse
 
+type GetAttachmentTextResponse = OCRResult
+
+type GetAttachmentTextErrorResponse = ErrorResponse
+
+type RequestAttachmentTextResponse = OCRResult
+
+type RequestAttachmentTextErrorResponse = ErrorResponse
+
 type GetAttachmentResponse = AttachmentInfo
 
 type GetAttachmentErrorResponse = ErrorResponse
@@ -1275,6 +1283,10 @@ func (s *SearchFilesErrorResponseJSON503) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+type SearchAttachmentTextResponse = OcrSearchResponse
+
+type SearchAttachmentTextErrorResponse = ErrorResponse
+
 type GetFileResponse = FileMetadataResponse
 
 type GetFileErrorResponse = ErrorResponse
@@ -1514,6 +1526,10 @@ type ResumeVisualAttachmentBuildErrorResponse = ErrorResponse
 type GetVisualAttachmentStatusResponse = Status
 
 type GetVisualAttachmentStatusErrorResponse = ErrorResponse
+
+type GetOCRStatusResponse = OCRRuntimeStatus
+
+type GetOCRStatusErrorResponse = ErrorResponse
 
 type ListOperationRunsResponse = OperationRunsResponse
 
@@ -2983,6 +2999,20 @@ type GetAttachmentContentResp struct {
 	JSON503      *GetAttachmentContentErrorResponseJSON503
 }
 
+type GetAttachmentTextResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *GetAttachmentTextResponse
+}
+
+type RequestAttachmentTextResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON202      *RequestAttachmentTextResponse
+}
+
 type GetAttachmentResp struct {
 	HTTPResponse *http.Response
 	Body         []byte
@@ -4020,6 +4050,13 @@ type SearchFilesResp struct {
 	JSON503      *SearchFilesErrorResponseJSON503
 }
 
+type SearchAttachmentTextResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *SearchAttachmentTextResponse
+}
+
 type GetFileResp struct {
 	HTTPResponse *http.Response
 	Body         []byte
@@ -4248,6 +4285,13 @@ type GetVisualAttachmentStatusResp struct {
 	Body         []byte
 	StatusCode   int
 	JSON200      *GetVisualAttachmentStatusResponse
+}
+
+type GetOCRStatusResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *GetOCRStatusResponse
 }
 
 type ListOperationRunsResp struct {
