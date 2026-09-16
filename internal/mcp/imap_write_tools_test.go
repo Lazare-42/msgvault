@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/base64"
 	"io"
 	"log"
 	"net"
@@ -14,6 +15,9 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/gmail"
 	imaplib "go.kenn.io/msgvault/internal/imap"
+	msgmime "go.kenn.io/msgvault/internal/mime"
+	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/query/querytest"
 )
 
 const (
@@ -189,4 +193,135 @@ func TestDraftToolsWithoutFactoryReportError(t *testing.T) {
 	h := &handlers{}
 	r := runToolExpectError(t, ToolListDrafts, h.listDrafts, map[string]any{"account": testIMAPAccount})
 	assert.Contains(t, resultText(t, r), "live mail API not configured")
+}
+
+// TestCreateDraftWithNewAttachmentOverIMAP drives create_draft's
+// "new_attachments" argument through the same real, production path as
+// TestDraftAndLabelToolsOverIMAP: the MCP handler resolves the base64
+// content, gmail.BuildDraftMIME encodes it into the message, and the IMAP
+// client APPENDs it to the real in-memory server. The test then fetches the
+// draft's raw bytes back over IMAP (the same GetMessageRaw the production
+// sync path uses) and parses them with the production MIME parser to prove
+// the attachment survives the full round trip with the right filename,
+// content type, and bytes — not just that some in-memory struct was built.
+//
+// This exercises the concrete blocker that motivated the feature: attaching
+// a file that was never part of any archived email (e.g. a document just
+// scanned to local disk) to an outgoing draft.
+func TestCreateDraftWithNewAttachmentOverIMAP(t *testing.T) {
+	require := require.New(t)
+	port := startIMAPTestServer(t)
+	h := &handlers{gmailFactory: imapFactory(t, port)}
+
+	content := []byte("%PDF-1.4 fake but nontrivial pdf content for the attachment round trip test\n")
+
+	created := runTool[struct {
+		DraftID     string `json:"draft_id"`
+		Attachments int    `json:"attachments"`
+	}](t, ToolCreateDraft, h.createDraft, map[string]any{
+		"account": testIMAPAccount,
+		"to":      "insurance@example.com",
+		"subject": "Supporting documents",
+		"body":    "Please find the scanned document attached.",
+		"new_attachments": []any{
+			map[string]any{
+				"filename":       "policy-scan.pdf",
+				"mime_type":      "application/pdf",
+				"content_base64": base64.StdEncoding.EncodeToString(content),
+			},
+		},
+	})
+	require.NotEmpty(created.DraftID, "create_draft should return a draft ID")
+	assert.Equal(t, 1, created.Attachments)
+
+	// Fetch the draft's raw MIME back over IMAP with a fresh client, the same
+	// way the production sync path would, and parse it with the production
+	// MIME parser to confirm the attachment actually made it into the
+	// message on the wire.
+	client, err := imapFactory(t, port)(context.Background(), testIMAPAccount)
+	require.NoError(err)
+	defer func() { _ = client.Close() }()
+
+	raw, err := client.GetMessageRaw(context.Background(), created.DraftID)
+	require.NoError(err)
+
+	parsed, err := msgmime.Parse(raw.Raw)
+	require.NoError(err)
+	require.Len(parsed.Attachments, 1)
+	assert.Equal(t, "policy-scan.pdf", parsed.Attachments[0].Filename)
+	assert.Equal(t, "application/pdf", parsed.Attachments[0].ContentType)
+	assert.Equal(t, content, parsed.Attachments[0].Content)
+}
+
+// TestCreateDraftWithArchivedAndNewAttachmentOverIMAP proves a single
+// create_draft call can combine an already-archived attachment
+// (attachment_ids, resolved from the local archive via the query engine and
+// attachment reader) with a brand-new upload (new_attachments) and have both
+// land correctly in the same outgoing draft.
+func TestCreateDraftWithArchivedAndNewAttachmentOverIMAP(t *testing.T) {
+	require := require.New(t)
+	port := startIMAPTestServer(t)
+
+	archivedHash := "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+	archivedContent := []byte("previously archived attachment content, from an earlier synced email")
+	newContent := []byte("brand new content that has never been archived")
+
+	h := &handlers{
+		gmailFactory: imapFactory(t, port),
+		engine: &querytest.MockEngine{
+			Attachments: map[int64]*query.AttachmentInfo{
+				9001: {ID: 9001, Filename: "id-card.jpg", MimeType: "image/jpeg", Size: int64(len(archivedContent)), ContentHash: archivedHash},
+			},
+		},
+		attachmentReader: attachmentReaderFunc(func(_ context.Context, contentHash string) ([]byte, error) {
+			require.Equal(archivedHash, contentHash)
+			return archivedContent, nil
+		}),
+	}
+
+	created := runTool[struct {
+		DraftID     string `json:"draft_id"`
+		Attachments int    `json:"attachments"`
+	}](t, ToolCreateDraft, h.createDraft, map[string]any{
+		"account":        testIMAPAccount,
+		"to":             "insurance@example.com",
+		"subject":        "ID and supporting document",
+		"body":           "Attaching both the archived ID copy and the new scan.",
+		"attachment_ids": "9001",
+		"new_attachments": []any{
+			map[string]any{
+				"filename":       "insurance-form.pdf",
+				"mime_type":      "application/pdf",
+				"content_base64": base64.StdEncoding.EncodeToString(newContent),
+			},
+		},
+	})
+	require.NotEmpty(created.DraftID)
+	assert.Equal(t, 2, created.Attachments)
+
+	client, err := imapFactory(t, port)(context.Background(), testIMAPAccount)
+	require.NoError(err)
+	defer func() { _ = client.Close() }()
+
+	raw, err := client.GetMessageRaw(context.Background(), created.DraftID)
+	require.NoError(err)
+
+	parsed, err := msgmime.Parse(raw.Raw)
+	require.NoError(err)
+	require.Len(parsed.Attachments, 2)
+
+	byFilename := make(map[string]msgmime.Attachment, len(parsed.Attachments))
+	for _, a := range parsed.Attachments {
+		byFilename[a.Filename] = a
+	}
+
+	archived, ok := byFilename["id-card.jpg"]
+	require.True(ok, "archived attachment present")
+	assert.Equal(t, "image/jpeg", archived.ContentType)
+	assert.Equal(t, archivedContent, archived.Content)
+
+	fresh, ok := byFilename["insurance-form.pdf"]
+	require.True(ok, "new attachment present")
+	assert.Equal(t, "application/pdf", fresh.ContentType)
+	assert.Equal(t, newContent, fresh.Content)
 }

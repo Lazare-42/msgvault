@@ -4982,3 +4982,223 @@ func TestResolveDraftAttachments_NeitherReaderNorDirectoryConfigured(t *testing.
 	require.Error(err)
 	assert.Contains(t, err.Error(), "attachments directory not configured")
 }
+
+// TestResolveDraftAttachments_NewAttachmentBase64 proves a brand-new file
+// that has never been archived — the real blocker this feature fixes, e.g.
+// a scan that only ever existed on local disk — can be attached to a draft
+// via "new_attachments" base64 content, producing a gmail.DraftAttachment
+// with the caller-supplied filename, MIME type, and decoded bytes. It also
+// locks in that no archive access (engine/attachmentsDir/attachmentReader)
+// is required when only new_attachments are supplied: a draft with no
+// attachment_ids reference should never need the local archive at all.
+func TestResolveDraftAttachments_NewAttachmentBase64(t *testing.T) {
+	require := require.New(t)
+	content := []byte("brand new pdf bytes, never archived")
+
+	h := &handlers{} // deliberately no engine, attachmentsDir, or attachmentReader
+
+	atts, err := h.resolveDraftAttachments(context.Background(), map[string]any{
+		"new_attachments": []any{
+			map[string]any{
+				"filename":       "policy-scan.pdf",
+				"mime_type":      "application/pdf",
+				"content_base64": base64.StdEncoding.EncodeToString(content),
+			},
+		},
+	})
+	require.NoError(err)
+	require.Len(atts, 1)
+	assert.Equal(t, "policy-scan.pdf", atts[0].Filename)
+	assert.Equal(t, "application/pdf", atts[0].ContentType)
+	assert.Equal(t, content, atts[0].Content)
+}
+
+// TestResolveDraftAttachments_NewAttachmentDefaultsMimeType proves mime_type
+// is optional: writeDraftAttachment already defaults an empty ContentType to
+// application/octet-stream at MIME build time, so resolveDraftAttachments
+// must not invent a default itself.
+func TestResolveDraftAttachments_NewAttachmentDefaultsMimeType(t *testing.T) {
+	require := require.New(t)
+	h := &handlers{}
+
+	atts, err := h.resolveDraftAttachments(context.Background(), map[string]any{
+		"new_attachments": []any{
+			map[string]any{
+				"filename":       "notes.txt",
+				"content_base64": base64.StdEncoding.EncodeToString([]byte("hello")),
+			},
+		},
+	})
+	require.NoError(err)
+	require.Len(atts, 1)
+	assert.Empty(t, atts[0].ContentType)
+}
+
+func TestResolveDraftAttachments_NewAttachmentValidation(t *testing.T) {
+	validBase64 := base64.StdEncoding.EncodeToString([]byte("x"))
+
+	tests := []struct {
+		name    string
+		args    map[string]any
+		wantErr string
+	}{
+		{
+			name:    "not an array",
+			args:    map[string]any{"new_attachments": "policy.pdf"},
+			wantErr: "new_attachments must be an array",
+		},
+		{
+			name:    "item not an object",
+			args:    map[string]any{"new_attachments": []any{"policy.pdf"}},
+			wantErr: "new_attachments[0]: must be an object",
+		},
+		{
+			name: "missing filename",
+			args: map[string]any{"new_attachments": []any{
+				map[string]any{"content_base64": validBase64},
+			}},
+			wantErr: "new_attachments[0]: filename is required",
+		},
+		{
+			name: "blank filename",
+			args: map[string]any{"new_attachments": []any{
+				map[string]any{"filename": "   ", "content_base64": validBase64},
+			}},
+			wantErr: "new_attachments[0]: filename is required",
+		},
+		{
+			name: "missing content_base64",
+			args: map[string]any{"new_attachments": []any{
+				map[string]any{"filename": "a.txt"},
+			}},
+			wantErr: "new_attachments[0]: content_base64 is required",
+		},
+		{
+			name: "invalid base64",
+			args: map[string]any{"new_attachments": []any{
+				map[string]any{"filename": "a.txt", "content_base64": "not-valid-base64!!"},
+			}},
+			wantErr: "new_attachments[0]: content_base64 is invalid",
+		},
+		{
+			name: "invalid mime_type",
+			args: map[string]any{"new_attachments": []any{
+				map[string]any{"filename": "a.txt", "content_base64": validBase64, "mime_type": "totally not a mime type"},
+			}},
+			wantErr: "new_attachments[0]: invalid mime_type",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := &handlers{}
+			_, err := h.resolveDraftAttachments(context.Background(), tc.args)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+		})
+	}
+}
+
+// TestResolveDraftAttachments_NewAttachmentSizeLimits proves new_attachments
+// bytes are checked against the same maxAttachmentSize (per file) and
+// maxDraftAttachmentsSize (combined) caps as archived attachment_ids, per
+// file — not a separate, looser budget for freshly uploaded content.
+func TestResolveDraftAttachments_NewAttachmentSizeLimits(t *testing.T) {
+	t.Run("single file over the combined draft cap", func(t *testing.T) {
+		require := require.New(t)
+		h := &handlers{}
+		content := make([]byte, maxDraftAttachmentsSize+1)
+
+		_, err := h.resolveDraftAttachments(context.Background(), map[string]any{
+			"new_attachments": []any{
+				map[string]any{"filename": "huge.bin", "content_base64": base64.StdEncoding.EncodeToString(content)},
+			},
+		})
+		require.Error(err)
+		assert.Contains(t, err.Error(), "total attachment size exceeds")
+	})
+
+	t.Run("single file over the absolute per-file cap", func(t *testing.T) {
+		require := require.New(t)
+		h := &handlers{}
+		content := make([]byte, maxAttachmentSize+1)
+
+		_, err := h.resolveDraftAttachments(context.Background(), map[string]any{
+			"new_attachments": []any{
+				map[string]any{"filename": "huge.bin", "content_base64": base64.StdEncoding.EncodeToString(content)},
+			},
+		})
+		require.Error(err)
+		assert.Contains(t, err.Error(), "attachment too large")
+	})
+
+	t.Run("archived plus new together trip the combined cap", func(t *testing.T) {
+		require := require.New(t)
+		hash := "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+		archivedContent := make([]byte, maxDraftAttachmentsSize-100)
+		h := &handlers{
+			engine: &querytest.MockEngine{
+				Attachments: map[int64]*query.AttachmentInfo{
+					1: {ID: 1, Filename: "big.zip", MimeType: "application/zip", Size: int64(len(archivedContent)), ContentHash: hash},
+				},
+			},
+			attachmentReader: attachmentReaderFunc(func(context.Context, string) ([]byte, error) {
+				return archivedContent, nil
+			}),
+		}
+		newContent := make([]byte, 1000) // pushes the running total over the cap
+
+		_, err := h.resolveDraftAttachments(context.Background(), map[string]any{
+			"attachment_ids": "1",
+			"new_attachments": []any{
+				map[string]any{"filename": "extra.bin", "content_base64": base64.StdEncoding.EncodeToString(newContent)},
+			},
+		})
+		require.Error(err)
+		assert.Contains(t, err.Error(), "total attachment size exceeds")
+	})
+}
+
+// TestResolveDraftAttachments_ArchivedAndNewCombined proves a draft can
+// attach both an already-archived file (attachment_ids) and a brand-new
+// upload (new_attachments) in the same call, each resolved through its own
+// path but landing in one combined attachment list.
+func TestResolveDraftAttachments_ArchivedAndNewCombined(t *testing.T) {
+	require := require.New(t)
+	hash := "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
+	archivedContent := []byte("previously archived attachment bytes")
+	newContent := []byte("brand new never-archived attachment bytes")
+
+	var gotHash string
+	h := &handlers{
+		engine: &querytest.MockEngine{
+			Attachments: map[int64]*query.AttachmentInfo{
+				9001: {ID: 9001, Filename: "id-card.jpg", MimeType: "image/jpeg", Size: int64(len(archivedContent)), ContentHash: hash},
+			},
+		},
+		attachmentReader: attachmentReaderFunc(func(_ context.Context, contentHash string) ([]byte, error) {
+			gotHash = contentHash
+			return archivedContent, nil
+		}),
+	}
+
+	atts, err := h.resolveDraftAttachments(context.Background(), map[string]any{
+		"attachment_ids": "9001",
+		"new_attachments": []any{
+			map[string]any{
+				"filename":       "insurance-form.pdf",
+				"mime_type":      "application/pdf",
+				"content_base64": base64.StdEncoding.EncodeToString(newContent),
+			},
+		},
+	})
+	require.NoError(err)
+	require.Len(atts, 2)
+	assert.Equal(t, hash, gotHash)
+	assert.Equal(t, "id-card.jpg", atts[0].Filename)
+	assert.Equal(t, "image/jpeg", atts[0].ContentType)
+	assert.Equal(t, archivedContent, atts[0].Content)
+	assert.Equal(t, "insurance-form.pdf", atts[1].Filename)
+	assert.Equal(t, "application/pdf", atts[1].ContentType)
+	assert.Equal(t, newContent, atts[1].Content)
+}
