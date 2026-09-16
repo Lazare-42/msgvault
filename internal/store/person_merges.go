@@ -326,6 +326,10 @@ func (s *Store) mergePersonsOnce(
 			return err
 		}
 
+		inferenceBefore, err := s.captureInferenceExportPeopleTx(ctx, tx, survivor.ID)
+		if err != nil {
+			return err
+		}
 		snapshot, err := s.capturePersonMergeSnapshotTx(ctx, tx, survivor.ID, absorbed.ID)
 		if err != nil {
 			return err
@@ -451,6 +455,9 @@ func (s *Store) mergePersonsOnce(
 		if err := s.invalidatePersonEnrichmentIdentitiesAfterRevisionTx(
 			ctx, tx, survivor.ID,
 		); err != nil {
+			return err
+		}
+		if err := s.invalidateInferenceExportChangesTx(ctx, tx, inferenceBefore); err != nil {
 			return err
 		}
 		if err := s.recordPersonMergePostRowsTx(
@@ -612,7 +619,8 @@ func ensurePersonMergeCardDAVStateTx(
 	var published bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
 		SELECT 1 FROM carddav_publications WHERE person_id IN (?, ?)
-	)`, survivorID, absorbedID).Scan(&published); err != nil {
+ UNION ALL SELECT 1 FROM carddav_conflicts c JOIN carddav_resources r ON r.address_book_id=c.address_book_id AND r.href=c.href WHERE c.status='unresolved' AND c.local_mutation_intent IS NOT NULL AND r.person_id IN (?,?)
+	)`, survivorID, absorbedID, survivorID, absorbedID).Scan(&published); err != nil {
 		return fmt.Errorf("check person merge CardDAV publications: %w", err)
 	}
 	if published {
@@ -878,6 +886,10 @@ func (s *Store) moveCorePersonProfileTx(
 	if err := s.reconcilePersonTrackingTx(ctx, tx, mergeID, survivorID, absorbedID); err != nil {
 		return err
 	}
+	if err := s.reconcilePersonBriefEnrollmentTx(
+		ctx, tx, mergeID, survivorID, absorbedID); err != nil {
+		return err
+	}
 	projectionPersonIDs, err := personMergeRowIDsTx(ctx, tx, `SELECT person_id
 		FROM person_attribute_values
 		WHERE value_record_type = 'person' AND value_record_id = ?
@@ -953,6 +965,43 @@ func (s *Store) reconcilePersonTrackingTx(
 	}
 	return s.setPersonMergeRowDispositionTx(
 		ctx, tx, mergeID, "person_tracking", absorbedID, "moved", &survivorID,
+	)
+}
+
+// reconcilePersonBriefEnrollmentTx moves the absorbed person's brief
+// enrollment to the survivor when the survivor has none, and deduplicates it
+// otherwise. It runs after tracking reconciliation, so the tracking row the
+// enrollment depends on has already moved with it.
+func (s *Store) reconcilePersonBriefEnrollmentTx(
+	ctx context.Context, tx *loggedTx, mergeID, survivorID, absorbedID int64,
+) error {
+	var survivorEnrolled, absorbedEnrolled bool
+	if err := tx.QueryRowContext(ctx, `SELECT
+		EXISTS (SELECT 1 FROM person_brief_enrollments WHERE person_id = ?),
+		EXISTS (SELECT 1 FROM person_brief_enrollments WHERE person_id = ?)`,
+		survivorID, absorbedID,
+	).Scan(&survivorEnrolled, &absorbedEnrolled); err != nil {
+		return fmt.Errorf("inspect person brief enrollment before merge: %w", err)
+	}
+	if !absorbedEnrolled {
+		return nil
+	}
+	if survivorEnrolled {
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM person_brief_enrollments WHERE person_id = ?`, absorbedID); err != nil {
+			return fmt.Errorf("deduplicate absorbed person brief enrollment: %w", err)
+		}
+		return s.setPersonMergeRowDispositionTx(
+			ctx, tx, mergeID, "person_brief_enrollments", absorbedID,
+			personMergeActionDeduplicated, &survivorID,
+		)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE person_brief_enrollments
+		SET person_id = ? WHERE person_id = ?`, survivorID, absorbedID); err != nil {
+		return fmt.Errorf("move absorbed person brief enrollment: %w", err)
+	}
+	return s.setPersonMergeRowDispositionTx(
+		ctx, tx, mergeID, "person_brief_enrollments", absorbedID, "moved", &survivorID,
 	)
 }
 

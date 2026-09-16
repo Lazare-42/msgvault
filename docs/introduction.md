@@ -1,7 +1,18 @@
 ---
+last_edited: "2026-08-30"
 title: Introduction
 description: Why msgvault was created and what problem it solves.
 ---
+
+msgvault is a local-first archive for communications and relationships. To
+start using it, follow [Setup](setup.md) or [Choose a Source](guides/sources.md).
+For the current product overview, visit [msgvault.io](https://msgvault.io/).
+
+## Why I built msgvault
+
+The story below explains the project's origin. Current capabilities and release
+status are maintained in the [documentation index](index.md) and
+[changelog](changelog.md).
 
 I have been living in my e-mail inbox for more than 30 years since the
 beginning of the internet in the mid-1990s.
@@ -25,7 +36,7 @@ This means:
 
 I started with Gmail but I want all my life's messages in this system,
 including Google Calendar, Microsoft Teams, Discord guilds, Slack workspaces,
-Beeper Desktop chats, Granola and Circleback meeting notes, WhatsApp, iMessage,
+Beeper Desktop chats, Granola, Circleback, and Notion meeting notes, WhatsApp, iMessage,
 Google Voice, Facebook Messenger,
 SMS Backup & Restore archives, and old local email
 archives.

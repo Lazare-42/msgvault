@@ -342,6 +342,40 @@ func TestParse(t *testing.T) {
 	}
 }
 
+// TestParseListIDOperators catches the List-Id aliases being treated as
+// Gmail-only text instead of ordered local structured filters.
+func TestParseListIDOperators(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{name: "list alias", query: "list:alerts.example.test", want: []string{"alerts.example.test"}},
+		{name: "list id alias", query: "list-id:alerts.example.test", want: []string{"alerts.example.test"}},
+		{name: "quoted value", query: `list:"alerts.example.test"`, want: []string{"alerts.example.test"}},
+		{name: "repeated values retain order", query: "list:first list-id:second list:third", want: []string{"first", "second", "third"}},
+		{name: "empty value is ignored", query: `list: list-id:""`, want: nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			q := Parse(tc.query)
+			assert.Equal(tc.want, q.ListIDs, "ListIDs")
+			assert.Empty(q.UnsupportedOperators, "List-Id aliases must be locally supported")
+			assert.Empty(q.TextTerms, "List-Id aliases must not be retained as text")
+			assert.NoError(q.Err(), "List-Id aliases accept free-text values")
+		})
+	}
+}
+
+func TestParseListIDOperatorsRejectParenthesizedSyntax(t *testing.T) {
+	q := Parse("list:(alerts.example.test)")
+
+	require.ErrorContains(t, q.Err(), "parenthesized")
+	assert.Empty(t, q.ListIDs)
+}
+
 func TestParse_RelativeDates(t *testing.T) {
 	fixedNow := time.Date(2025, 6, 15, 0, 0, 0, 0, time.UTC)
 	p := &Parser{Now: func() time.Time { return fixedNow }}
@@ -399,6 +433,10 @@ func TestParse_InvalidOperatorValues(t *testing.T) {
 		{"smaller bad size", "smaller:abc", "abc", "smaller:"},
 		{"older_than bad age", "older_than:99q", "99q", "older_than:"},
 		{"newer_than bad age", "newer_than:7z", "7z", "newer_than:"},
+		{"empty from", "from:", "non-empty address", "from:"},
+		{"empty to with text", `receipt to:""`, "non-empty address", "to:"},
+		{"whitespace cc", `cc:"   "`, "non-empty address", "cc:"},
+		{"empty bcc", "bcc:", "non-empty address", "bcc:"},
 		{"has bad value", "has:banana", "banana", "has:"},
 	}
 	for _, tc := range cases {
@@ -426,7 +464,7 @@ func TestParse_ValidOperatorValues_NoError(t *testing.T) {
 		"subject:",  // empty value: intentional no-op, not an error
 		"label:",    // empty value: intentional no-op, not an error
 		"foo:bar",   // unknown operator: kept as text, not an error
-		"list:name", // recognized-but-unsupported operator: kept as text
+		"list:name", // supported List-Id filter
 	}
 	for _, q := range queries {
 		t.Run(q, func(t *testing.T) {
@@ -476,6 +514,7 @@ func TestQuery_IsEmpty(t *testing.T) {
 	}{
 		{"", true},
 		{"from:alice@example.com", false},
+		{"list:alerts.example.test", false},
 		{"hello", false},
 		{"has:attachment", false},
 	}
@@ -493,4 +532,33 @@ func TestQuery_IsEmpty(t *testing.T) {
 		q.AccountIDs = []int64{id}
 		assert.False(t, q.IsEmpty(), "IsEmpty() = true for query with AccountIDs set")
 	})
+}
+
+func TestParseConversationID(t *testing.T) {
+	assert := assert.New(t)
+	q := Parse("conversation_id:42 conversation_id:84")
+
+	require.NoError(t, q.Err())
+	assert.Equal([]int64{42, 84}, q.ConversationIDs)
+	assert.False(q.IsEmpty())
+	assert.True(q.HasOperators())
+}
+
+func TestQueryHasOperatorsPreservesExplicitEmptyConversationScope(t *testing.T) {
+	q := &Query{ConversationIDs: []int64{}}
+
+	assert.True(t, q.HasOperators())
+	assert.False(t, q.IsEmpty())
+}
+
+func TestParseConversationIDRejectsNonPositiveAndInvalidValues(t *testing.T) {
+	for _, value := range []string{"0", "-1", "abc", ""} {
+		t.Run(value, func(t *testing.T) {
+			q := Parse("conversation_id:" + value)
+
+			require.Error(t, q.Err())
+			assert.Empty(t, q.ConversationIDs)
+			assert.Empty(t, q.TextTerms, "known invalid operator must not widen into text search")
+		})
+	}
 }

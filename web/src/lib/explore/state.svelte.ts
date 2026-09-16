@@ -15,12 +15,20 @@ import type {
   PersonFileDirection,
   ExploreURLState,
   ExploreWorkspace,
-  RelationshipFacet
+  DirectoryReviewKind,
+  IdentityReviewState,
+  RelationshipReviewState,
+  RelationshipFacet,
+  OperationKind,
+  OperationLane,
+  OperationStatusAuthority,
+  OperationState
 } from './models';
 import { DEFAULT_EXPLORE_COLUMNS, isValidSourceID } from './models';
 import { isGroupingDimension, validateGroupingChain } from '../grouping/catalog';
 import { hasValidSearchAuthority, predicateFingerprint } from './selection';
 import { parseAttachmentSelection } from './attachment-authority';
+import { normalizeSettingsNavigationAuthority } from '../carddav/navigation';
 import {
   availableSearchModeStorage,
   explicitSearchModeFromURL,
@@ -35,6 +43,7 @@ const FILTER_DIMENSIONS = new Set([
   'identity',
   'participant',
   'domain',
+  'mailing_list',
   'message_type',
   'after',
   'before',
@@ -49,6 +58,18 @@ const TRANSIENT_HISTORY_FIELDS = [
 ] as const satisfies ReadonlyArray<keyof ExploreURLState>;
 const RESTORATION_INVALIDATING_FIELDS = new Set<keyof ExploreURLState>([
   'workspace',
+  'directoryQuery',
+  'directoryContactState',
+  'directoryCategory',
+  'directoryOrganization',
+  'directoryPrimaryChannel',
+  'directoryLastContactAfter',
+  'directoryLastContactBefore',
+  'directorySort',
+  'directoryPersonID',
+  'reviewKind',
+  'identityState',
+  'relationshipReviewState',
   'query',
   'searchMode',
   'filters',
@@ -65,16 +86,69 @@ const RESTORATION_INVALIDATING_FIELDS = new Set<keyof ExploreURLState>([
   'analysisTarget',
   'selectedIdentifier',
   'relationshipFacet',
-  'relationshipTarget'
+  'relationshipTarget',
+  'operationLane',
+  'operationKind',
+  'operationState',
+  'operationStartedFrom',
+  'operationStartedBefore',
+  'operationStatus',
+  'settingsAuthority'
 ]);
 const FILE_MIME_FAMILIES = new Set<FileMIMEFamily>([
   'image', 'pdf', 'audio', 'video', 'text', 'document', 'archive', 'other'
 ]);
 const PERSON_FILE_DIRECTIONS = new Set<PersonFileDirection>(['from_person', 'to_person', 'group']);
+const OPERATION_LANES = new Set<OperationLane>([
+  'messages', 'person_facts', 'contacts', 'documents', 'visual_attachments'
+]);
+const OPERATION_KINDS = new Set<OperationKind>([
+  'carddav_sync',
+  'document_embedding',
+  'document_extraction',
+  'message_embedding',
+  'person_embedding',
+  'person_enrichment',
+  'person_sweep',
+  'source_sync',
+  'visual_embedding'
+]);
+const OPERATION_STATES = new Set<OperationState>([
+  'cancelled', 'failed', 'partial', 'queued', 'running', 'succeeded'
+]);
+const OPERATION_STATUS_AUTHORITIES = new Set<OperationStatusAuthority>([
+  'getDocumentIndexStatus', 'getDocumentVectorStatus', 'getVisualAttachmentStatus'
+]);
+const OPERATION_KINDS_BY_LANE: Record<OperationLane, ReadonlySet<OperationKind>> = {
+  messages: new Set(['source_sync', 'message_embedding']),
+  person_facts: new Set(['person_sweep', 'person_embedding', 'person_enrichment']),
+  contacts: new Set(['carddav_sync']),
+  documents: new Set(['document_extraction', 'document_embedding']),
+  visual_attachments: new Set(['visual_embedding'])
+};
+const OPERATION_FILTER_FIELDS = [
+  'operationLane',
+  'operationKind',
+  'operationState',
+  'operationStartedFrom',
+  'operationStartedBefore'
+] as const satisfies ReadonlyArray<keyof ExploreURLState>;
 
 export const defaultExploreURLState: ExploreURLState = {
   schemaVersion: 2,
   workspace: 'relationships',
+  directoryQuery: '',
+  directoryContactState: '',
+  directoryCategory: '',
+  directoryOrganization: '',
+  directoryPrimaryChannel: '',
+  directoryLastContactAfter: '',
+  directoryLastContactBefore: '',
+  directorySort: 'name',
+  directoryPersonID: null,
+  reviewKind: 'identity',
+  identityState: 'candidate',
+  relationshipReviewState: 'pending',
   query: '',
   searchMode: 'full_text',
   filters: [],
@@ -94,6 +168,14 @@ export const defaultExploreURLState: ExploreURLState = {
   relationshipTarget: null,
   relationshipShowAll: false,
   relationshipFiles: false,
+  operationLane: '',
+  operationKind: '',
+  operationState: '',
+  operationStartedFrom: '',
+  operationStartedBefore: '',
+  operationRunID: null,
+  operationStatus: '',
+  settingsAuthority: '',
   columns: [...DEFAULT_EXPLORE_COLUMNS],
   columnWidths: {},
   activeRow: null,
@@ -235,6 +317,43 @@ function relationshipTargetValue(value: unknown): string | null {
     : null;
 }
 
+function directoryPersonID(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : null;
+}
+
+function operationDateBound(value: unknown): string {
+  if (typeof value !== 'string' ||
+    !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{0,8}[1-9])?Z$/.test(value)) return '';
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed)) return '';
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/.exec(value);
+  if (!match) return '';
+  const [, year, month, day, hour, minute, second] = match;
+  const date = new Date(parsed);
+  return date.getUTCFullYear() === Number(year) &&
+    date.getUTCMonth() + 1 === Number(month) &&
+    date.getUTCDate() === Number(day) &&
+    date.getUTCHours() === Number(hour) &&
+    date.getUTCMinutes() === Number(minute) &&
+    date.getUTCSeconds() === Number(second)
+    ? value
+    : '';
+}
+
+function operationDateSortKey(value: string): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?Z$/.exec(value);
+  if (!match) return '';
+  const [, year, month, day, hour, minute, second, fraction = ''] = match;
+  return `${year}${month}${day}${hour}${minute}${second}${fraction.padEnd(9, '0')}`;
+}
+
+function operationRunID(value: unknown): string | null {
+  return typeof value === 'string' && value.length <= 4096 &&
+    /^op2\.[a-f0-9]{32}\.[A-Za-z0-9_-]+$/.test(value)
+    ? value
+    : null;
+}
+
 function legacyRelationshipTarget(
   analysisTarget: string | null,
   facet: RelationshipFacet
@@ -251,7 +370,12 @@ function legacyRelationshipTarget(
 
 function normalize(value: unknown): ExploreURLState {
   if (!isRecord(value)) return freshDefaults();
-  const { selection: _selection, bulkSelection: _bulkSelection, ...knownAndFuture } = value;
+  const {
+    selection: _selection,
+    bulkSelection: _bulkSelection,
+    operationCursor: _operationCursor,
+    ...knownAndFuture
+  } = value;
   const searchMode =
     value.searchMode === 'full_text' ||
     value.searchMode === 'semantic' ||
@@ -266,10 +390,10 @@ function normalize(value: unknown): ExploreURLState {
       : defaultExploreURLState.presentation;
   const legacyFacet: RelationshipFacet | undefined =
     value.workspace === 'people' ? 'people' : value.workspace === 'domains' ? 'domains' : undefined;
-  const workspace = value.workspace === 'everything' || value.workspace === 'settings' ||
+  const workspace = value.workspace === 'everything' || value.workspace === 'directory' || value.workspace === 'directory_review' || value.workspace === 'settings' ||
     value.workspace === 'files' || value.workspace === 'relationships' ||
     value.workspace === 'saved_views' || value.workspace === 'sources' ||
-    value.workspace === 'deletions'
+    value.workspace === 'deletions' || value.workspace === 'operations'
     ? value.workspace
     : 'relationships';
   const analysisTarget = typeof value.analysisTarget === 'string' &&
@@ -282,6 +406,40 @@ function normalize(value: unknown): ExploreURLState {
   const relationshipTarget = legacyFacet
     ? legacyRelationshipTarget(analysisTarget, legacyFacet)
     : relationshipTargetValue(value.relationshipTarget);
+  const reviewKind: DirectoryReviewKind = value.reviewKind === 'fact' || value.reviewKind === 'relationship'
+    ? value.reviewKind
+    : 'identity';
+  const identityState: IdentityReviewState =
+    value.identityState === 'conflict' || value.identityState === 'accepted' || value.identityState === 'rejected'
+      ? value.identityState
+      : 'candidate';
+  const relationshipReviewState: RelationshipReviewState =
+    value.relationshipReviewState === 'accepted' || value.relationshipReviewState === 'rejected'
+      ? value.relationshipReviewState
+      : 'pending';
+  const operationLane = typeof value.operationLane === 'string' &&
+    OPERATION_LANES.has(value.operationLane as OperationLane)
+    ? value.operationLane as OperationLane
+    : '';
+  const candidateOperationKind = typeof value.operationKind === 'string' &&
+    OPERATION_KINDS.has(value.operationKind as OperationKind)
+    ? value.operationKind as OperationKind
+    : '';
+  const operationKind = operationLane !== '' && candidateOperationKind !== '' &&
+    !OPERATION_KINDS_BY_LANE[operationLane].has(candidateOperationKind)
+    ? ''
+    : candidateOperationKind;
+  const operationState = typeof value.operationState === 'string' &&
+    OPERATION_STATES.has(value.operationState as OperationState)
+    ? value.operationState as OperationState
+    : '';
+  let operationStartedFrom = operationDateBound(value.operationStartedFrom);
+  let operationStartedBefore = operationDateBound(value.operationStartedBefore);
+  if (operationStartedFrom !== '' && operationStartedBefore !== '' &&
+    operationDateSortKey(operationStartedFrom) >= operationDateSortKey(operationStartedBefore)) {
+    operationStartedFrom = '';
+    operationStartedBefore = '';
+  }
 
   return {
     ...knownAndFuture,
@@ -291,6 +449,18 @@ function normalize(value: unknown): ExploreURLState {
         ? value.schemaVersion
         : defaultExploreURLState.schemaVersion,
     workspace,
+    directoryQuery: typeof value.directoryQuery === 'string' ? value.directoryQuery : '',
+    directoryContactState: typeof value.directoryContactState === 'string' ? value.directoryContactState : '',
+    directoryCategory: typeof value.directoryCategory === 'string' ? value.directoryCategory : '',
+    directoryOrganization: typeof value.directoryOrganization === 'string' ? value.directoryOrganization : '',
+    directoryPrimaryChannel: typeof value.directoryPrimaryChannel === 'string' ? value.directoryPrimaryChannel : '',
+    directoryLastContactAfter: typeof value.directoryLastContactAfter === 'string' ? value.directoryLastContactAfter : '',
+    directoryLastContactBefore: typeof value.directoryLastContactBefore === 'string' ? value.directoryLastContactBefore : '',
+    directorySort: value.directorySort === 'last_contact_desc' || value.directorySort === 'last_contact_asc' ? value.directorySort : 'name',
+    directoryPersonID: directoryPersonID(value.directoryPersonID),
+    reviewKind,
+    identityState,
+    relationshipReviewState,
     query: typeof value.query === 'string' ? value.query : '',
     searchMode,
     filters: filters(value.filters),
@@ -316,6 +486,17 @@ function normalize(value: unknown): ExploreURLState {
     relationshipTarget,
     relationshipShowAll: value.relationshipShowAll === true,
     relationshipFiles: value.relationshipFiles === true,
+    operationLane,
+    operationKind,
+    operationState,
+    operationStartedFrom,
+    operationStartedBefore,
+    operationRunID: operationRunID(value.operationRunID),
+    operationStatus: typeof value.operationStatus === 'string' &&
+      OPERATION_STATUS_AUTHORITIES.has(value.operationStatus as OperationStatusAuthority)
+      ? value.operationStatus as OperationStatusAuthority
+      : '',
+    settingsAuthority: normalizeSettingsNavigationAuthority(value.settingsAuthority),
     columns: columns(value.columns),
     columnWidths: widths(value.columnWidths),
     activeRow:
@@ -453,7 +634,9 @@ export class ExploreState {
       activeRow: null,
       selectedRow: null,
       conversationAnchor: null,
-      scrollAnchor: null
+      scrollAnchor: null,
+      operationStatus: '',
+      settingsAuthority: ''
     }, 'push');
   }
 
@@ -526,9 +709,14 @@ export class ExploreState {
     patch: Partial<ExploreURLState>,
     mode: 'push' | 'replace'
   ): void {
+    let effectivePatch = patch;
+    if (mode === 'push' && OPERATION_FILTER_FIELDS.some((key) =>
+      key in patch && normalize({ ...this.current, ...patch })[key] !== this.current[key])) {
+      effectivePatch = { ...patch, operationRunID: null };
+    }
     if (
       mode === 'push' ||
-      Object.keys(patch).some((key) => RESTORATION_INVALIDATING_FIELDS.has(key as keyof ExploreURLState))
+      Object.keys(effectivePatch).some((key) => RESTORATION_INVALIDATING_FIELDS.has(key as keyof ExploreURLState))
     ) {
       this.pendingRestorationEpoch = undefined;
     }
@@ -544,10 +732,14 @@ export class ExploreState {
       const committedURL = `${this.browser.location.pathname}${serializeExploreURLState(priorEntry, baseSearch)}${this.browser.location.hash}`;
       this.browser.history.replaceState(null, '', committedURL);
     }
-    const next = normalize({ ...this.current, ...patch });
+    const next = normalize({ ...this.current, ...effectivePatch });
     // Preserve per-field reactivity: transient scroll/column changes must not
     // invalidate consumers that only read the canonical server predicate.
-    for (const key of Object.keys(patch)) {
+    const patchKeys = Object.keys(effectivePatch);
+    const keysToApply = OPERATION_FILTER_FIELDS.some((key) => key in effectivePatch)
+      ? [...new Set([...patchKeys, ...OPERATION_FILTER_FIELDS, 'operationRunID'])]
+      : patchKeys;
+    for (const key of keysToApply) {
       if (key in next) this.current[key] = next[key];
     }
     const url = `${this.browser.location.pathname}${serializeExploreURLState(this.current, baseSearch)}${this.browser.location.hash}`;

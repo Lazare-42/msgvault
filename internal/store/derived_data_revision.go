@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -65,13 +66,6 @@ func (s *Store) MarkMigrationAppliedWithDerivedDataRevision(name string) error {
 		if err := s.bumpDerivedDataRevision(tx); err != nil {
 			return err
 		}
-		_, err := tx.Exec(
-			s.dialect.InsertOrIgnore(`INSERT OR IGNORE INTO applied_migrations (name) VALUES (?)`),
-			name,
-		)
-		if err != nil {
-			return fmt.Errorf("mark migration %q applied: %w", name, err)
-		}
-		return nil
+		return s.markMigrationAppliedContext(context.Background(), tx, name, 1)
 	})
 }

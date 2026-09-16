@@ -16,7 +16,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	docbankdocument "go.kenn.io/docbank/document"
-	docembedding "go.kenn.io/docbank/document/embedding"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector/embed"
 )
@@ -34,8 +33,8 @@ func TestPrepareDocbankClaimInputsUsesValidatedRawPlan(t *testing.T) {
 		}},
 	}, policy)
 	require.NoError(err)
-	recipe, err := docembedding.NewRecipe(docembedding.RecipeConfig{
-		Mode: docembedding.RepresentationRaw, MaxInputRunes: 1000,
+	recipe, err := NewRecipe(RecipeConfig{
+		Mode: RepresentationRaw, MaxInputRunes: 1000,
 	})
 	require.NoError(err)
 	claim := workerClaim("extract-a", 1, normalized.Chunks[0].Text, strings.Repeat("a", 64))
@@ -137,6 +136,9 @@ func TestWorkerRunPreservesExactTextAndExtractionBoundaries(t *testing.T) {
 	assertions.Equal(3, result.Claimed)
 	assertions.Equal(3, result.Embedded)
 	assertions.Equal(3, result.Published)
+	assertions.Equal(3, result.Attempted)
+	assertions.Equal(3, result.Succeeded)
+	assertions.Zero(result.Failed)
 	assertions.Equal(1, result.ProviderCalls)
 	assertions.Equal(2, result.ProviderDocuments)
 	assertions.Equal(3, result.ProviderChunks)
@@ -160,8 +162,8 @@ func TestWorkerRunCapsProviderInputOnRuneBoundary(t *testing.T) {
 	provider := &fakeDocumentVectorProvider{vectors: [][][]float32{{{1, 2, 3}}}}
 	worker := newFakeWorker(ledger, provider, &fakeDocumentVectorBackend{})
 	worker.deps.MaxInputChars = 3
-	recipe, err := docembedding.NewRecipe(docembedding.RecipeConfig{
-		Mode: docembedding.RepresentationRaw, MaxInputRunes: 3,
+	recipe, err := NewRecipe(RecipeConfig{
+		Mode: RepresentationRaw, MaxInputRunes: 3,
 	})
 	requirements.NoError(err)
 	worker.deps.Recipe = recipe
@@ -362,6 +364,10 @@ func TestWorkerRunPublishesCompletedProviderPrefixAndRetriesOnlySuffix(t *testin
 	assertions.Equal(1, result.Published)
 	assertions.Equal(1, result.Retry)
 	assertions.Zero(result.Terminal)
+	assertions.Equal(2, result.Attempted)
+	assertions.Equal(1, result.Succeeded)
+	assertions.Equal(1, result.Failed,
+		"a retryable transition is one final chunk failure, not a retry-attempt count")
 	assertions.Equal([]string{"token-a"}, ledger.committed)
 	requirements.Len(ledger.failures, 1)
 	assertions.Equal("token-b", ledger.failures[0].token)
@@ -514,7 +520,7 @@ func TestWorkerRunRecordsPreparationFailureAndPublishesHealthyExtraction(t *test
 	)
 	provider := &fakeDocumentVectorProvider{vectors: [][][]float32{{{1, 2, 3}}}}
 	worker := newFakeWorker(ledger, provider, &fakeDocumentVectorBackend{})
-	worker.deps.prepareInputs = func(_ context.Context, _ Ledger, _ docembedding.Recipe, claims []*store.DocumentVectorChunkClaim) (map[string]string, error) {
+	worker.deps.prepareInputs = func(_ context.Context, _ Ledger, _ Recipe, claims []*store.DocumentVectorChunkClaim) (map[string]string, error) {
 		if claims[0].ExtractionID == "extract-b" {
 			return nil, errors.New("normalized document is corrupt")
 		}
@@ -542,7 +548,7 @@ func TestWorkerRunPreparationFailureHonorsAttemptCeiling(t *testing.T) {
 	ledger := newFakeDocumentVectorLedger(claim)
 	provider := &fakeDocumentVectorProvider{}
 	worker := newFakeWorker(ledger, provider, &fakeDocumentVectorBackend{})
-	worker.deps.prepareInputs = func(context.Context, Ledger, docembedding.Recipe, []*store.DocumentVectorChunkClaim) (map[string]string, error) {
+	worker.deps.prepareInputs = func(context.Context, Ledger, Recipe, []*store.DocumentVectorChunkClaim) (map[string]string, error) {
 		return nil, errors.New("normalized document is corrupt")
 	}
 
@@ -593,6 +599,10 @@ func TestWorkerRunDeletesOnlySourceChangedTokens(t *testing.T) {
 	requirements.ErrorIs(err, store.ErrDocumentVectorClaimLost)
 	assertions.Zero(result.Published)
 	assertions.Equal(1, result.SourceChanged)
+	assertions.Equal(1, result.Attempted)
+	assertions.Zero(result.Succeeded)
+	assertions.Equal(1, result.Failed,
+		"the claim-lost chunk had no durable final decision and must not inflate attempted")
 	assertions.Equal([][]string{{"token-source"}}, backend.deletes)
 	assertions.NotContains(backend.deletes[0], "token-lost")
 }
@@ -1119,7 +1129,7 @@ func newFakeWorker(ledger *fakeDocumentVectorLedger, provider Provider, backend 
 		Owner: "worker-a", Dimension: 3, MaxInputChars: 1000, LeaseDuration: time.Minute,
 		HeartbeatInterval: 10 * time.Second, RetryDelay: time.Minute,
 		MaxAttempts: 3, Now: func() time.Time { return workerNow },
-		prepareInputs: func(_ context.Context, _ Ledger, recipe docembedding.Recipe, claims []*store.DocumentVectorChunkClaim) (map[string]string, error) {
+		prepareInputs: func(_ context.Context, _ Ledger, recipe Recipe, claims []*store.DocumentVectorChunkClaim) (map[string]string, error) {
 			inputs := make(map[string]string, len(claims))
 			for _, claim := range claims {
 				runes := []rune(claim.Text)

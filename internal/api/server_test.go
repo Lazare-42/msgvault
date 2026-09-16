@@ -63,7 +63,7 @@ func (e *participantFilterTextEngine) ListConversationMessages(_ context.Context
 	return nil, nil
 }
 
-func (*participantFilterTextEngine) TextSearch(context.Context, string, int, int) ([]query.MessageSummary, error) {
+func (*participantFilterTextEngine) TextSearch(context.Context, string, *int64, int, int) ([]query.MessageSummary, error) {
 	return nil, nil
 }
 
@@ -342,23 +342,25 @@ type mockStore struct {
 	needsFTSBackfillQuick bool
 	// needsFTSBackfillFunc overrides the needsFTSBackfill field when set, so
 	// tests can block inside the probe or vary its answer per call.
-	needsFTSBackfillFunc  func() bool
-	backfillFTSFunc       func(func(done, total int64)) (int64, error)
-	rebuildFTSFunc        func(func(done, total int64)) (int64, error)
-	buildCacheFunc        func(context.Context, bool, func(CLICacheBuildEvent) error) error
-	syncFunc              func(context.Context, CLISyncRequest, func(CLISyncEvent) error) error
-	verifyFunc            func(context.Context, CLIVerifyRequest, func(CLIVerifyEvent) error) error
-	repairFunc            func(context.Context, func(CLIRepairEncodingEvent) error) error
-	runFunc               func(context.Context, CLIRunRequest, func(CLIRunEvent) error) error
-	planCalendarFunc      func(context.Context, CLIAddCalendarPlanRequest) (CLIAddCalendarPlanResponse, error)
-	planEmbedsFunc        func(context.Context, CLIEmbeddingsPlanRequest) (CLIEmbeddingsPlanResponse, error)
-	planDeleteFunc        func(context.Context, CLIDeleteStagedPlanRequest) (CLIDeleteStagedPlanResponse, error)
-	planDedupFunc         func(context.Context, CLIDeduplicatePlanRequest) (CLIDeduplicatePlanResponse, error)
-	saveManifestFunc      func(context.Context, *deletion.Manifest) error
-	documentSearchFunc    func(context.Context, store.DocumentSearchRequest) (store.DocumentSearchResponse, error)
-	documentStatusFunc    func(context.Context, string, string, []string, []string) (store.DocumentIndexStatus, error)
-	documentRebuildFunc   func(context.Context, string, string) (store.DocumentExtractionRebuild, error)
-	documentRemainingFunc func(
+	needsFTSBackfillFunc     func() bool
+	backfillFTSFunc          func(func(done, total int64)) (int64, error)
+	rebuildFTSFunc           func(func(done, total int64)) (int64, error)
+	buildCacheFunc           func(context.Context, bool, func(CLICacheBuildEvent) error) error
+	syncFunc                 func(context.Context, CLISyncRequest, func(CLISyncEvent) error) error
+	verifyFunc               func(context.Context, CLIVerifyRequest, func(CLIVerifyEvent) error) error
+	repairFunc               func(context.Context, func(CLIRepairEncodingEvent) error) error
+	runFunc                  func(context.Context, CLIRunRequest, func(CLIRunEvent) error) error
+	repairMessageFunc        func(context.Context, CLIRepairMessageRequest, func(CLIRepairMessageEvent) error) error
+	planCalendarFunc         func(context.Context, CLIAddCalendarPlanRequest) (CLIAddCalendarPlanResponse, error)
+	planEmbedsFunc           func(context.Context, CLIEmbeddingsPlanRequest) (CLIEmbeddingsPlanResponse, error)
+	planDeleteFunc           func(context.Context, CLIDeleteStagedPlanRequest) (CLIDeleteStagedPlanResponse, error)
+	planDedupFunc            func(context.Context, CLIDeduplicatePlanRequest) (CLIDeduplicatePlanResponse, error)
+	saveManifestFunc         func(context.Context, *deletion.Manifest) error
+	documentSearchFunc       func(context.Context, store.DocumentSearchRequest) (store.DocumentSearchResponse, error)
+	documentCurrentScopeFunc func(context.Context) (string, []string, error)
+	documentStatusFunc       func(context.Context, string, string, []string, []string) (store.DocumentIndexStatus, error)
+	documentRebuildFunc      func(context.Context, string, string) (store.DocumentExtractionRebuild, error)
+	documentRemainingFunc    func(
 		context.Context, store.DocumentExtractionRebuild, []string, []string,
 	) (int64, error)
 	documentReconcileFunc func(context.Context) error
@@ -429,6 +431,15 @@ func (m *mockStore) GetDocumentIndexStatusForScope(
 	return m.documentStatusFunc(
 		ctx, profileID, extractionInputKey, allowedMediaTypes, allowedMessageTypes,
 	)
+}
+
+func (m *mockStore) GetCurrentDocumentIndexStatusScope(
+	ctx context.Context,
+) (string, []string, error) {
+	if m.documentCurrentScopeFunc == nil {
+		return "", nil, store.ErrDocumentIndexStatusScopeUnavailable
+	}
+	return m.documentCurrentScopeFunc(ctx)
 }
 
 func (m *mockStore) GetActiveDocumentExtractionRebuild(
@@ -731,6 +742,17 @@ func (m *mockStore) RunCLICommand(
 ) error {
 	if m.runFunc != nil {
 		return m.runFunc(ctx, req, emit)
+	}
+	return nil
+}
+
+func (m *mockStore) RunCLIRepairMessage(
+	ctx context.Context,
+	req CLIRepairMessageRequest,
+	emit func(CLIRepairMessageEvent) error,
+) error {
+	if m.repairMessageFunc != nil {
+		return m.repairMessageFunc(ctx, req, emit)
 	}
 	return nil
 }
@@ -1444,6 +1466,248 @@ func TestCLIRequestDurationPolicy(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCLIRepairMessageRouteParsesDedicatedRequestAndStreamsNDJSON(t *testing.T) {
+	assert := assert.New(t)
+	var got CLIRepairMessageRequest
+	store := &mockStore{repairMessageFunc: func(
+		_ context.Context,
+		req CLIRepairMessageRequest,
+		emit func(CLIRepairMessageEvent) error,
+	) error {
+		got = req
+		return emit(CLIRepairMessageEvent{Type: "stdout", Data: "repaired\n"})
+	}}
+	srv := NewServer(&config.Config{Server: config.ServerConfig{APIPort: 8080}}, store, newMockScheduler(), testLogger())
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/repair-message",
+		strings.NewReader(`{"reference":"gmail-42","source_id":7}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	assert.Equal(http.StatusOK, w.Code)
+	assert.Equal("application/x-ndjson", w.Header().Get("Content-Type"))
+	assert.Equal(CLIRepairMessageRequest{Reference: "gmail-42", SourceID: 7}, got)
+	body, terminated := strings.CutSuffix(w.Body.String(), "\n")
+	if assert.True(terminated, "NDJSON response must end with a newline") {
+		lines := strings.Split(body, "\n")
+		if assert.Len(lines, 2) {
+			assert.JSONEq(`{"type":"stdout","data":"repaired\n"}`, lines[0])
+			assert.JSONEq(`{"type":"complete"}`, lines[1])
+		}
+	}
+}
+
+func TestCLIRepairMessageRouteRejectsInvalidModeBeforeRunning(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{name: "missing reference", body: `{}`, want: "reference is required unless audit is true"},
+		{name: "audit with reference", body: `{"audit":true,"reference":"gmail-42"}`, want: "audit does not accept a reference"},
+		{name: "negative source", body: `{"audit":true,"source_id":-1}`, want: "source_id must be positive"},
+		{name: "repair json", body: `{"reference":"gmail-42","json":true}`, want: "json requires audit"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			called := false
+			store := &mockStore{repairMessageFunc: func(
+				context.Context, CLIRepairMessageRequest, func(CLIRepairMessageEvent) error,
+			) error {
+				called = true
+				return nil
+			}}
+			srv := NewServer(&config.Config{Server: config.ServerConfig{APIPort: 8080}}, store, newMockScheduler(), testLogger())
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/repair-message", strings.NewReader(test.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+
+			srv.Router().ServeHTTP(w, req)
+
+			assert.Equal(t, http.StatusBadRequest, w.Code)
+			assert.Contains(t, w.Body.String(), test.want)
+			assert.False(t, called)
+		})
+	}
+}
+
+func TestCLIRepairMessageRoutePropagatesCancellation(t *testing.T) {
+	started := make(chan struct{})
+	stopped := make(chan error, 1)
+	store := &mockStore{repairMessageFunc: func(
+		ctx context.Context, _ CLIRepairMessageRequest, _ func(CLIRepairMessageEvent) error,
+	) error {
+		close(started)
+		<-ctx.Done()
+		stopped <- ctx.Err()
+		return ctx.Err()
+	}}
+	srv := NewServer(&config.Config{Server: config.ServerConfig{APIPort: 8080}}, store, newMockScheduler(), testLogger())
+	ctx, cancel := context.WithCancel(t.Context())
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/repair-message",
+		strings.NewReader(`{"audit":true}`)).WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	done := make(chan struct{})
+	go func() {
+		srv.Router().ServeHTTP(httptest.NewRecorder(), req)
+		close(done)
+	}()
+	<-started
+	cancel()
+
+	assert.ErrorIs(t, <-stopped, context.Canceled)
+	<-done
+}
+
+func TestCLIRepairMessageRepairWaitsForOperationGate(t *testing.T) {
+	gate := NewSerialOperationGate()
+	release, ok := gate.BeginWorkContext(t.Context())
+	require.True(t, ok)
+	called := make(chan struct{})
+	store := &mockStore{repairMessageFunc: func(
+		context.Context, CLIRepairMessageRequest, func(CLIRepairMessageEvent) error,
+	) error {
+		close(called)
+		return nil
+	}}
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
+		Store:  store, Scheduler: newMockScheduler(), Logger: testLogger(), OperationGate: gate,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/repair-message",
+		strings.NewReader(`{"reference":"gmail-42"}`))
+	req.Header.Set("Content-Type", "application/json")
+	done := make(chan struct{})
+	go func() {
+		srv.Router().ServeHTTP(httptest.NewRecorder(), req)
+		close(done)
+	}()
+
+	select {
+	case <-called:
+		require.FailNow(t, "repair ran while another archive operation held the gate")
+	case <-time.After(30 * time.Millisecond):
+	}
+	release()
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		require.FailNow(t, "repair did not run after the operation gate was released")
+	}
+	<-done
+}
+
+func TestCLIRepairMessageValidAuditBypassesOperationGateAndPreservesBody(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	gate := NewSerialOperationGate()
+	release, ok := gate.BeginWorkContext(t.Context())
+	require.True(ok)
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(release) }
+	defer releaseGate()
+
+	got := make(chan CLIRepairMessageRequest, 1)
+	store := &mockStore{repairMessageFunc: func(
+		_ context.Context, req CLIRepairMessageRequest, _ func(CLIRepairMessageEvent) error,
+	) error {
+		got <- req
+		return nil
+	}}
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
+		Store:  store, Scheduler: newMockScheduler(), Logger: testLogger(), OperationGate: gate,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/repair-message",
+		strings.NewReader(`{"audit":true,"source_id":7,"json":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		srv.Router().ServeHTTP(w, req)
+		close(done)
+	}()
+
+	select {
+	case request := <-got:
+		assert.Equal(CLIRepairMessageRequest{Audit: true, SourceID: 7, JSON: true}, request)
+	case <-time.After(250 * time.Millisecond):
+		releaseGate()
+		<-done
+		require.FailNow("valid read-only audit waited on the mutation gate")
+	}
+	<-done
+	assert.Equal(http.StatusOK, w.Code)
+}
+
+func TestCLIRepairMessageInvalidAuditBodiesDoNotBypassOperationGate(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+	}{
+		{name: "audit with repair reference", body: `{"audit":true,"reference":"gmail-42"}`},
+		{name: "audit with negative source", body: `{"audit":true,"source_id":-1}`},
+		{name: "malformed JSON", body: `{"audit":true`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert := assert.New(t)
+			gate := &recordingOperationGate{allow: true}
+			called := make(chan struct{}, 1)
+			store := &mockStore{repairMessageFunc: func(
+				context.Context, CLIRepairMessageRequest, func(CLIRepairMessageEvent) error,
+			) error {
+				called <- struct{}{}
+				return nil
+			}}
+			srv := NewServerWithOptions(ServerOptions{
+				Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
+				Store:  store, Scheduler: newMockScheduler(), Logger: testLogger(), OperationGate: gate,
+			})
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/repair-message", strings.NewReader(test.body))
+			req.Header.Set("Content-Type", "application/json")
+			w := httptest.NewRecorder()
+			srv.Router().ServeHTTP(w, req)
+
+			assert.Equal(http.StatusBadRequest, w.Code)
+			begin, done := gate.counts()
+			assert.Equal(1, begin, "invalid audit body must remain gated")
+			assert.Equal(1, done, "gate must be released after handler rejection")
+			select {
+			case <-called:
+				require.FailNow(t, "invalid audit body reached the repair runner")
+			default:
+			}
+		})
+	}
+}
+
+func TestCLIRepairMessageWholeArchiveAuditHasNoOrdinaryRequestDeadline(t *testing.T) {
+	deadline := make(chan bool, 1)
+	store := &mockStore{repairMessageFunc: func(
+		ctx context.Context, req CLIRepairMessageRequest, _ func(CLIRepairMessageEvent) error,
+	) error {
+		assert.True(t, req.Audit)
+		assert.Zero(t, req.SourceID)
+		_, ok := ctx.Deadline()
+		deadline <- ok
+		return nil
+	}}
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}},
+		Store:  store, Scheduler: newMockScheduler(), Logger: testLogger(), RequestTimeout: time.Millisecond,
+	})
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/cli/repair-message", strings.NewReader(`{"audit":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+
+	srv.Router().ServeHTTP(w, req)
+
+	assert.False(t, <-deadline)
+	assert.Equal(t, http.StatusOK, w.Code)
 }
 
 func TestTimeoutMiddlewareMarkedRequestPreservesCallerCancellation(t *testing.T) {

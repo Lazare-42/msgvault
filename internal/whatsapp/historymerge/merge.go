@@ -331,7 +331,7 @@ func mergeMessage(
 		intoMessageID = id
 	}
 
-	bodyText, bodyHTML, hasBody, err := opts.From.GetMessageBodyText(m.ID)
+	bodyText, bodyHTML, hasBody, err := opts.From.GetMessageBodyTextAndHTML(m.ID)
 	if err != nil {
 		return fmt.Errorf("read message body: %w", err)
 	}

@@ -23,6 +23,10 @@ const (
 	apiValueCount   = "count"
 	apiValueLabels  = "labels"
 	apiValueSubject = "subject"
+
+	// listIDMinAPISchemaVersion is the first daemon contract that guarantees
+	// exact List-ID filtering on every MessageFilter endpoint.
+	listIDMinAPISchemaVersion = "2.14.0"
 )
 
 // Engine implements query.Engine by making HTTP calls to a msgvault daemon.
@@ -33,8 +37,13 @@ type Engine struct {
 // Compile-time check that Engine implements query.Engine.
 var _ query.Engine = (*Engine)(nil)
 var _ query.TextEngine = (*Engine)(nil)
+var _ query.CollectionScopeLister = (*Engine)(nil)
 var _ query.MessageBodySearcher = (*Engine)(nil)
 var _ query.SemanticMessageSearcher = (*Engine)(nil)
+var _ query.DeletionTargetSearchResolver = (*Engine)(nil)
+var _ query.DeletionTargetAggregateSearchResolver = (*Engine)(nil)
+
+const tuiSearchContractMinAPISchemaVersion = "2.16.0"
 
 // NewEngine creates a new daemon-backed query engine.
 func NewEngine(cfg Config) (*Engine, error) {
@@ -75,24 +84,38 @@ func (e *Engine) SearchSemanticMessages(
 		return nil, errors.New("semantic TUI search does not support multi-account source scope")
 	}
 	if !query.SemanticMessageSearchSupportsFilter(filter) {
-		return nil, errors.New("semantic TUI search cannot preserve the current display-name, conversation, or empty-value scope")
+		return nil, errors.New("semantic TUI search cannot preserve the current display-name or empty-value scope")
 	}
-	parsed := search.Parse(request.Query)
-	if err := parsed.Err(); err != nil {
-		return nil, err
-	}
-	if len(parsed.TextTerms) == 0 {
+	transportQuery := strings.TrimSpace(request.Query)
+	if transportQuery == "" {
 		return nil, errors.New("semantic search requires a query")
 	}
-	messageTypes, noMessageTypeMatches := query.ScopedMessageTypes(parsed.MessageTypes, filter.MessageType)
+
+	parsedQuery := search.Parse(transportQuery)
+	parseErr := parsedQuery.Err()
+	queryMessageTypes := parsedQuery.MessageTypes
+	if parseErr != nil {
+		// Semantic input is natural language. Quote the complete input so the
+		// daemon parser treats operator-shaped text literally instead of
+		// rejecting it before hybrid search can embed it.
+		transportQuery = search.Format(&search.Query{TextTerms: []string{transportQuery}})
+		queryMessageTypes = nil
+	}
+
+	messageTypes, noMessageTypeMatches := query.ScopedMessageTypes(queryMessageTypes, filter.MessageType)
 	if noMessageTypeMatches {
 		return &query.SemanticMessageSearchResult{}, nil
 	}
-	// Carry the canonical intersection as the HTTP parameter and remove the
-	// user-authored operators from q. Leaving both in place would make the
-	// hybrid backend OR them and widen an Email-mode query back to SMS/MMS.
-	parsed.MessageTypes = nil
-	transportQuery := search.Format(parsed)
+	if parseErr == nil && len(parsedQuery.TextTerms) == 0 {
+		return nil, errors.New("semantic search requires free text")
+	}
+	if parseErr == nil {
+		// Carry message types through the structured API parameter after
+		// intersecting them with the TUI view. Removing them from q prevents
+		// the daemon from combining the query and view scopes as a union.
+		parsedQuery.MessageTypes = nil
+		transportQuery = search.Format(parsedQuery)
+	}
 
 	response, err := e.store.GetCLIHybridSearch(ctx, CLIHybridSearchRequest{
 		Query:        transportQuery,
@@ -131,6 +154,8 @@ func viewTypeToString(v query.ViewType) string {
 		return "domains"
 	case query.ViewLabels:
 		return apiValueLabels
+	case query.ViewLists:
+		return "lists"
 	case query.ViewTime:
 		return "time"
 	default:
@@ -271,6 +296,10 @@ func emptyValueTargetsString(filter query.MessageFilter) *string {
 }
 
 func generatedFilterMessagesQuery(filter query.MessageFilter, paginated bool) generated.FilterMessagesQuery {
+	sourceID := filter.SourceID
+	if filter.SourceIDs != nil {
+		sourceID = nil
+	}
 	out := generated.FilterMessagesQuery{
 		Sender:          optionalString(filter.Sender),
 		SenderName:      optionalString(filter.SenderName),
@@ -278,11 +307,13 @@ func generatedFilterMessagesQuery(filter query.MessageFilter, paginated bool) ge
 		RecipientName:   optionalString(filter.RecipientName),
 		Domain:          optionalString(filter.Domain),
 		Label:           optionalString(filter.Label),
+		ListID:          optionalString(filter.ListID),
 		MessageType:     optionalString(filter.MessageType),
 		TimePeriod:      optionalString(filter.TimeRange.Period),
 		TimeGranularity: optionalString(timeGranularityToString(filter.TimeRange.Granularity)),
 		ConversationID:  filter.ConversationID,
-		SourceID:        filter.SourceID,
+		SourceID:        sourceID,
+		SourceIds:       copyInt64sPreserveNil(filter.SourceIDs),
 		AttachmentsOnly: optionalBool(filter.WithAttachmentsOnly),
 		HideDeleted:     optionalBool(filter.HideDeletedFromSource),
 		After:           optionalTimeRFC3339(filter.After),
@@ -300,7 +331,16 @@ func generatedFilterMessagesQuery(filter query.MessageFilter, paginated bool) ge
 
 func gmailIDsFilterQuery(filter query.MessageFilter) *generated.GetGmailIDsByFilterQuery {
 	base := generatedFilterMessagesQuery(filter, false)
-	out := generated.GetGmailIDsByFilterQuery(base)
+	out := generated.GetGmailIDsByFilterQuery{
+		Sender: base.Sender, SenderName: base.SenderName,
+		Recipient: base.Recipient, RecipientName: base.RecipientName,
+		Domain: base.Domain, Label: base.Label, ListID: base.ListID, MessageType: base.MessageType,
+		TimePeriod: base.TimePeriod, TimeGranularity: base.TimeGranularity,
+		ConversationID: base.ConversationID, SourceID: base.SourceID, SourceIds: copyInt64sPreserveNil(base.SourceIds),
+		AttachmentsOnly: base.AttachmentsOnly, HideDeleted: base.HideDeleted,
+		After: base.After, Before: base.Before, EmptyTargets: base.EmptyTargets,
+		Offset: base.Offset, Sort: base.Sort, Direction: base.Direction,
+	}
 	out.Limit = optionalPositiveInt64(filter.Pagination.Limit)
 	return &out
 }
@@ -382,11 +422,12 @@ func fastSearchQuery(queryStr string, filter query.MessageFilter, statsGroupBy q
 		RecipientName:   fields.RecipientName,
 		Domain:          fields.Domain,
 		Label:           fields.Label,
+		ListID:          fields.ListID,
 		TimePeriod:      fields.TimePeriod,
 		TimeGranularity: fields.TimeGranularity,
 		ConversationID:  fields.ConversationID,
 		SourceID:        fields.SourceID,
-		SourceIds:       append([]int64(nil), filter.SourceIDs...),
+		SourceIds:       copyInt64sPreserveNil(filter.SourceIDs),
 		AttachmentsOnly: fields.AttachmentsOnly,
 		HideDeleted:     fields.HideDeleted,
 		After:           fields.After,
@@ -590,13 +631,14 @@ func textConversationRowsFromGenerated(rows []generated.TextConversationRow) []q
 	return out
 }
 
-func queryMessageSummariesFromCLIGenerated(msgs []generated.CLIQueryMessageSummary) []query.MessageSummary {
+func (c *Client) queryMessageSummariesFromCLIGenerated(msgs []generated.CLIQueryMessageSummary) []query.MessageSummary {
 	if msgs == nil {
 		return nil
 	}
 	out := make([]query.MessageSummary, len(msgs))
 	for i, msg := range msgs {
 		out[i] = queryMessageSummaryFromGenerated(msg)
+		out[i].WebURL = c.messageWebURL(msg.ID)
 	}
 	return out
 }
@@ -607,6 +649,12 @@ func queryMessageSummariesFromCLIGenerated(msgs []generated.CLIQueryMessageSumma
 
 // Aggregate performs grouping based on the provided ViewType.
 func (e *Engine) Aggregate(ctx context.Context, groupBy query.ViewType, opts query.AggregateOptions) ([]query.AggregateRow, error) {
+	if opts.SourceIDs != nil && len(opts.SourceIDs) == 0 {
+		return []query.AggregateRow{}, nil
+	}
+	if err := e.requireListIDCapability(ctx, search.Parse(opts.SearchQuery), query.MessageFilter{}, groupBy); err != nil {
+		return nil, err
+	}
 	resp, err := APIResponse(e.store, func(client *apiclient.Client) (*generated.GetAggregatesResp, error) {
 		return client.GetAggregatesWithResponse(ctx, &generated.GetAggregatesRequestOptions{
 			Query: &generated.GetAggregatesQuery{
@@ -615,7 +663,8 @@ func (e *Engine) Aggregate(ctx context.Context, groupBy query.ViewType, opts que
 				Direction:       optionalString(sortDirectionToString(opts.SortDirection)),
 				Limit:           optionalPositiveInt64(opts.Limit),
 				TimeGranularity: optionalString(timeGranularityToString(opts.TimeGranularity)),
-				SourceID:        opts.SourceID,
+				SourceID:        sourceIDForSourceIDs(opts.SourceID, opts.SourceIDs),
+				SourceIds:       copyInt64sPreserveNil(opts.SourceIDs),
 				AttachmentsOnly: optionalBool(opts.WithAttachmentsOnly),
 				HideDeleted:     optionalBool(opts.HideDeletedFromSource),
 				SearchQuery:     optionalString(opts.SearchQuery),
@@ -627,12 +676,26 @@ func (e *Engine) Aggregate(ctx context.Context, groupBy query.ViewType, opts que
 	if err != nil {
 		return nil, err
 	}
-
+	if err := requireAppliedSourceIDs(opts.SourceIDs, resp.JSON200.AppliedSourceIds, "aggregate"); err != nil {
+		return nil, err
+	}
 	return aggregateRowsFromGenerated(resp.JSON200), nil
 }
 
 // SubAggregate performs aggregation on a filtered subset of messages.
 func (e *Engine) SubAggregate(ctx context.Context, filter query.MessageFilter, groupBy query.ViewType, opts query.AggregateOptions) ([]query.AggregateRow, error) {
+	sourceID, sourceIDs := filter.SourceID, filter.SourceIDs
+	if opts.SourceIDs != nil {
+		sourceID, sourceIDs = opts.SourceID, opts.SourceIDs
+	} else if opts.SourceID != nil {
+		sourceID, sourceIDs = opts.SourceID, nil
+	}
+	if sourceIDs != nil && len(sourceIDs) == 0 {
+		return []query.AggregateRow{}, nil
+	}
+	if err := e.requireListIDCapability(ctx, search.Parse(opts.SearchQuery), filter, groupBy); err != nil {
+		return nil, err
+	}
 	limit := optionalPositiveInt64(filter.Pagination.Limit)
 	if opts.Limit > 0 {
 		limit = optionalPositiveInt64(opts.Limit)
@@ -647,11 +710,13 @@ func (e *Engine) SubAggregate(ctx context.Context, filter query.MessageFilter, g
 				RecipientName:   optionalString(filter.RecipientName),
 				Domain:          optionalString(filter.Domain),
 				Label:           optionalString(filter.Label),
+				ListID:          optionalString(filter.ListID),
 				MessageType:     optionalString(filter.MessageType),
 				TimePeriod:      optionalString(filter.TimeRange.Period),
 				TimeGranularity: optionalString(timeGranularityToString(opts.TimeGranularity)),
 				ConversationID:  filter.ConversationID,
-				SourceID:        filter.SourceID,
+				SourceID:        sourceIDForSourceIDs(sourceID, sourceIDs),
+				SourceIds:       copyInt64sPreserveNil(sourceIDs),
 				AttachmentsOnly: optionalBool(filter.WithAttachmentsOnly),
 				HideDeleted:     optionalBool(filter.HideDeletedFromSource),
 				After:           optionalTimeRFC3339(filter.After),
@@ -668,12 +733,20 @@ func (e *Engine) SubAggregate(ctx context.Context, filter query.MessageFilter, g
 	if err != nil {
 		return nil, err
 	}
-
+	if err := requireAppliedSourceIDs(sourceIDs, resp.JSON200.AppliedSourceIds, "sub-aggregate"); err != nil {
+		return nil, err
+	}
 	return aggregateRowsFromGenerated(resp.JSON200), nil
 }
 
 // ListMessages returns messages matching the filter criteria.
 func (e *Engine) ListMessages(ctx context.Context, filter query.MessageFilter) ([]query.MessageSummary, error) {
+	if filter.SourceIDs != nil && len(filter.SourceIDs) == 0 {
+		return []query.MessageSummary{}, nil
+	}
+	if err := e.requireListIDCapability(ctx, nil, filter); err != nil {
+		return nil, err
+	}
 	resp, err := APIResponse(e.store, func(client *apiclient.Client) (*generated.FilterMessagesResp, error) {
 		return client.FilterMessagesWithResponse(ctx, &generated.FilterMessagesRequestOptions{
 			Query: filterMessagesQuery(filter),
@@ -682,7 +755,10 @@ func (e *Engine) ListMessages(ctx context.Context, filter query.MessageFilter) (
 	if err != nil {
 		return nil, err
 	}
-	return messageSummariesFromGenerated(resp.JSON200.Messages), nil
+	if err := requireAppliedSourceIDs(filter.SourceIDs, resp.JSON200.AppliedSourceIds, "message filter"); err != nil {
+		return nil, err
+	}
+	return e.store.messageSummariesWithURLs(resp.JSON200.Messages), nil
 }
 
 // GetMessage returns a single message by ID.
@@ -695,7 +771,11 @@ func (e *Engine) GetMessage(ctx context.Context, id int64) (*query.MessageDetail
 		return nil, err
 	}
 
-	return queryDetailFromAPIMessage(msg), nil
+	detail := queryDetailFromAPIMessage(msg)
+	if detail != nil {
+		detail.WebURL = e.store.messageWebURL(detail.ID)
+	}
+	return detail, nil
 }
 
 func queryDetailFromAPIMessage(msg *store.APIMessage) *query.MessageDetail {
@@ -790,6 +870,7 @@ func (e *Engine) GetMessageSummariesByIDs(ctx context.Context, ids []int64) ([]q
 		}
 		summary := query.MessageSummary{
 			ID:                   md.ID,
+			WebURL:               md.WebURL,
 			SourceID:             md.SourceID,
 			SourceMessageID:      md.SourceMessageID,
 			ConversationID:       md.ConversationID,
@@ -855,6 +936,9 @@ func (e *Engine) Search(ctx context.Context, q *search.Query, limit, offset int)
 	if err := validateParsedSearchQuery(q); err != nil {
 		return nil, err
 	}
+	if err := e.requireListIDCapability(ctx, q, query.MessageFilter{}); err != nil {
+		return nil, err
+	}
 	if hasExplicitEmptyAccountScope(q) {
 		return []query.MessageSummary{}, nil
 	}
@@ -876,7 +960,91 @@ func (e *Engine) Search(ctx context.Context, q *search.Query, limit, offset int)
 	if err != nil {
 		return nil, err
 	}
-	return messageSummariesFromGenerated(resp.JSON200.Messages), nil
+	return e.store.messageSummariesWithURLs(resp.JSON200.Messages), nil
+}
+
+// SearchDeep preserves the TUI's complete view filter across the daemon
+// boundary instead of reducing it to search.Query fields.
+func (e *Engine) SearchDeep(
+	ctx context.Context, q *search.Query, filter query.MessageFilter, limit, offset int,
+) ([]query.MessageSummary, error) {
+	result, err := e.SearchDeepWithStats(ctx, q, filter, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	return result.Messages, nil
+}
+
+// SearchDeepWithStats preserves the TUI's complete view filter and returns the
+// daemon's metrics for that same match set.
+func (e *Engine) SearchDeepWithStats(
+	ctx context.Context, q *search.Query, filter query.MessageFilter, limit, offset int,
+) (*query.SearchFastResult, error) {
+	compatible, err := e.store.SupportsAPISchemaVersion(ctx, tuiSearchContractMinAPISchemaVersion)
+	if err != nil {
+		return nil, fmt.Errorf("check deep-search capability: %w", err)
+	}
+	if !compatible {
+		return nil, fmt.Errorf("deep search with statistics requires daemon API schema %s or newer", tuiSearchContractMinAPISchemaVersion)
+	}
+	if err := e.requireListIDCapability(ctx, q, filter); err != nil {
+		return nil, err
+	}
+	if err := validateParsedSearchQuery(q); err != nil {
+		return nil, err
+	}
+	if filter.SourceIDs != nil {
+		if len(filter.SourceIDs) == 0 {
+			return &query.SearchFastResult{Stats: &query.TotalStats{}}, nil
+		}
+		if len(filter.SourceIDs) > 1 {
+			return nil, errors.New("daemon deep search does not support multiple source IDs")
+		}
+		filter.SourceID = &filter.SourceIDs[0]
+		filter.SourceIDs = nil
+	}
+
+	transportScope := query.MergeFilterIntoQuery(q, filter)
+	if hasExplicitEmptyAccountScope(transportScope) {
+		return &query.SearchFastResult{Stats: &query.TotalStats{}}, nil
+	}
+	queryStr := search.Format(q)
+	if queryStr == "" {
+		return &query.SearchFastResult{Stats: &query.TotalStats{}}, nil
+	}
+	queryParams, err := deepSearchQuery(queryStr, transportScope, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	fields := generatedFilterMessagesQuery(filter, false)
+	queryParams.Sender = fields.Sender
+	queryParams.SenderName = fields.SenderName
+	queryParams.Recipient = fields.Recipient
+	queryParams.RecipientName = fields.RecipientName
+	queryParams.Domain = fields.Domain
+	queryParams.Label = fields.Label
+	queryParams.ListID = fields.ListID
+	queryParams.MessageType = fields.MessageType
+	queryParams.TimePeriod = fields.TimePeriod
+	queryParams.TimeGranularity = fields.TimeGranularity
+	queryParams.ConversationID = fields.ConversationID
+	queryParams.AttachmentsOnly = fields.AttachmentsOnly
+	queryParams.HideDeleted = optionalBool(q.HideDeleted || filter.HideDeletedFromSource)
+	queryParams.After = fields.After
+	queryParams.Before = fields.Before
+	queryParams.EmptyTargets = fields.EmptyTargets
+
+	resp, err := APIResponse(e.store, func(client *apiclient.Client) (*generated.DeepSearchResp, error) {
+		return client.DeepSearchWithResponse(ctx, &generated.DeepSearchRequestOptions{Query: queryParams})
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &query.SearchFastResult{
+		Messages:   e.store.messageSummariesWithURLs(resp.JSON200.Messages),
+		TotalCount: resp.JSON200.TotalCount,
+		Stats:      totalStatsFromGenerated(resp.JSON200.Stats),
+	}, nil
 }
 
 // SearchMessageBodies requests the daemon's exact body-only search scope and
@@ -885,6 +1053,9 @@ func (e *Engine) Search(ctx context.Context, q *search.Query, limit, offset int)
 // otherwise return generic composite-search false positives.
 func (e *Engine) SearchMessageBodies(ctx context.Context, q *search.Query, limit, offset int) ([]query.MessageSummary, error) {
 	if err := validateParsedSearchQuery(q); err != nil {
+		return nil, err
+	}
+	if err := e.requireListIDCapability(ctx, q, query.MessageFilter{}); err != nil {
 		return nil, err
 	}
 	if q == nil || len(q.TextTerms) == 0 {
@@ -909,7 +1080,11 @@ func (e *Engine) SearchMessageBodies(ctx context.Context, q *search.Query, limit
 	if resp.JSON200.Scope == nil || *resp.JSON200.Scope != "body" {
 		return nil, errors.New("daemon did not confirm body-only search scope; upgrade the daemon to API schema 1.3.0 or newer")
 	}
-	return bodySearchSummariesFromGenerated(resp.JSON200.Messages, resp.JSON200.BodyContexts)
+	messages, err := bodySearchSummariesFromGenerated(resp.JSON200.Messages, resp.JSON200.BodyContexts)
+	for i := range messages {
+		messages[i].WebURL = e.store.messageWebURL(messages[i].ID)
+	}
+	return messages, err
 }
 
 // SearchFast searches message metadata only (no body text).
@@ -935,11 +1110,23 @@ func (e *Engine) SearchFastCount(ctx context.Context, q *search.Query, filter qu
 // total count, and aggregate stats in a single operation.
 func (e *Engine) SearchFastWithStats(ctx context.Context, q *search.Query, queryStr string,
 	filter query.MessageFilter, statsGroupBy query.ViewType, limit, offset int) (*query.SearchFastResult, error) {
+	if err := e.requireListIDCapability(ctx, q, filter, statsGroupBy); err != nil {
+		return nil, err
+	}
 	if err := validateParsedSearchQuery(q); err != nil {
 		return nil, err
 	}
 	if filter.SourceIDs != nil && len(filter.SourceIDs) == 0 {
 		return &query.SearchFastResult{Stats: &query.TotalStats{}}, nil
+	}
+	if filter.SenderName != "" || filter.RecipientName != "" || filter.HasEmptyTargets() {
+		compatible, err := e.store.SupportsAPISchemaVersion(ctx, tuiSearchContractMinAPISchemaVersion)
+		if err != nil {
+			return nil, fmt.Errorf("check complete fast-search filter capability: %w", err)
+		}
+		if !compatible {
+			return nil, fmt.Errorf("fast search with complete filters requires daemon API schema %s or newer", tuiSearchContractMinAPISchemaVersion)
+		}
 	}
 	scopedQueryStr, noMatches := fastSearchScopedQueryString(q, queryStr, filter)
 	if noMatches {
@@ -954,18 +1141,23 @@ func (e *Engine) SearchFastWithStats(ctx context.Context, q *search.Query, query
 	if err != nil {
 		return nil, err
 	}
-	if len(filter.SourceIDs) > 0 &&
-		!slices.Equal(normalizedSourceIDs(filter.SourceIDs), normalizedSourceIDs(resp.JSON200.AppliedSourceIds)) {
-		return nil, errors.New("daemon did not confirm fast-search source IDs; upgrade the daemon to API schema 1.5.0 or newer")
+	if err := requireAppliedSourceIDs(filter.SourceIDs, resp.JSON200.AppliedSourceIds, "fast-search"); err != nil {
+		return nil, err
 	}
 	return &query.SearchFastResult{
-		Messages:   messageSummariesFromGenerated(resp.JSON200.Messages),
+		Messages:   e.store.messageSummariesWithURLs(resp.JSON200.Messages),
 		TotalCount: resp.JSON200.TotalCount,
 		Stats:      totalStatsFromGenerated(resp.JSON200.Stats),
 	}, nil
 }
 
 func (e *Engine) GetDeletionTargetsByFilter(ctx context.Context, filter query.MessageFilter) ([]query.DeletionTarget, error) {
+	if filter.SourceIDs != nil && len(filter.SourceIDs) == 0 {
+		return []query.DeletionTarget{}, nil
+	}
+	if err := e.requireListIDCapability(ctx, nil, filter); err != nil {
+		return nil, err
+	}
 	resp, err := APIResponse(e.store, func(client *apiclient.Client) (*generated.GetGmailIDsByFilterResp, error) {
 		return client.GetGmailIDsByFilterWithResponse(ctx, &generated.GetGmailIDsByFilterRequestOptions{
 			Query: gmailIDsFilterQuery(filter),
@@ -974,11 +1166,108 @@ func (e *Engine) GetDeletionTargetsByFilter(ctx context.Context, filter query.Me
 	if err != nil {
 		return nil, err
 	}
-	if len(resp.JSON200.Targets) == 0 && len(resp.JSON200.GmailIds) > 0 {
+	if err := requireAppliedSourceIDs(filter.SourceIDs, resp.JSON200.AppliedSourceIds, "deletion-target"); err != nil {
+		return nil, err
+	}
+	return deletionTargetsFromGenerated(resp.JSON200)
+}
+
+func (e *Engine) GetDeletionTargetsBySearch(
+	ctx context.Context,
+	searchQuery *search.Query,
+	filter query.MessageFilter,
+	mode query.DeletionSearchMode,
+) ([]query.DeletionTarget, error) {
+	if filter.SourceIDs != nil && len(filter.SourceIDs) == 0 {
+		return []query.DeletionTarget{}, nil
+	}
+	if err := validateParsedSearchQuery(searchQuery); err != nil {
+		return nil, err
+	}
+	queryString := search.Format(searchQuery)
+	if queryString == "" {
+		return e.GetDeletionTargetsByFilter(ctx, filter)
+	}
+	compatible, err := e.store.SupportsAPISchemaVersion(ctx, tuiSearchContractMinAPISchemaVersion)
+	if err != nil {
+		return nil, fmt.Errorf("check daemon search-aware deletion capability: %w", err)
+	}
+	if !compatible {
+		return nil, fmt.Errorf("search-aware deletion resolution requires daemon API schema %s or newer", tuiSearchContractMinAPISchemaVersion)
+	}
+	modeString := string(mode)
+	params := gmailIDsFilterQuery(filter)
+	params.Q = &queryString
+	params.SearchMode = &modeString
+	resp, err := APIResponse(e.store, func(client *apiclient.Client) (*generated.GetGmailIDsByFilterResp, error) {
+		return client.GetGmailIDsByFilterWithResponse(ctx, &generated.GetGmailIDsByFilterRequestOptions{Query: params})
+	})
+	if err != nil {
+		return nil, err
+	}
+	if stringValue(resp.JSON200.SearchQuery) != queryString || stringValue(resp.JSON200.SearchMode) != modeString {
+		return nil, errors.New("daemon did not confirm the deletion search scope; upgrade the daemon and retry")
+	}
+	if err := requireAppliedSourceIDs(filter.SourceIDs, resp.JSON200.AppliedSourceIds, "deletion-target"); err != nil {
+		return nil, err
+	}
+	return deletionTargetsFromGenerated(resp.JSON200)
+}
+
+func (e *Engine) GetDeletionTargetsByAggregateSearch(
+	ctx context.Context,
+	searchQuery string,
+	filter query.MessageFilter,
+	groupBy query.ViewType,
+	key string,
+) ([]query.DeletionTarget, error) {
+	if filter.SourceIDs != nil && len(filter.SourceIDs) == 0 {
+		return []query.DeletionTarget{}, nil
+	}
+	parsed := search.Parse(searchQuery)
+	if err := validateParsedSearchQuery(parsed); err != nil {
+		return nil, err
+	}
+	queryString := search.Format(parsed)
+	if queryString == "" {
+		return e.GetDeletionTargetsByFilter(ctx, filter)
+	}
+	compatible, err := e.store.SupportsAPISchemaVersion(ctx, tuiSearchContractMinAPISchemaVersion)
+	if err != nil {
+		return nil, fmt.Errorf("check daemon aggregate deletion capability: %w", err)
+	}
+	if !compatible {
+		return nil, fmt.Errorf("aggregate deletion resolution requires daemon API schema %s or newer", tuiSearchContractMinAPISchemaVersion)
+	}
+
+	modeString := string(query.DeletionSearchAggregate)
+	viewType := viewTypeToString(groupBy)
+	params := gmailIDsFilterQuery(filter)
+	params.Q = &queryString
+	params.SearchMode = &modeString
+	params.ViewType = &viewType
+	params.AggregateKey = &key
+	resp, err := APIResponse(e.store, func(client *apiclient.Client) (*generated.GetGmailIDsByFilterResp, error) {
+		return client.GetGmailIDsByFilterWithResponse(ctx, &generated.GetGmailIDsByFilterRequestOptions{Query: params})
+	})
+	if err != nil {
+		return nil, err
+	}
+	if stringValue(resp.JSON200.SearchQuery) != queryString || stringValue(resp.JSON200.SearchMode) != modeString {
+		return nil, errors.New("daemon did not confirm the aggregate deletion search scope; upgrade the daemon and retry")
+	}
+	if err := requireAppliedSourceIDs(filter.SourceIDs, resp.JSON200.AppliedSourceIds, "deletion-target"); err != nil {
+		return nil, err
+	}
+	return deletionTargetsFromGenerated(resp.JSON200)
+}
+
+func deletionTargetsFromGenerated(resp *generated.GmailIDsResponse) ([]query.DeletionTarget, error) {
+	if len(resp.Targets) == 0 && len(resp.GmailIds) > 0 {
 		return nil, errors.New("daemon did not return deletion source provenance; upgrade the daemon and retry")
 	}
-	targets := make([]query.DeletionTarget, len(resp.JSON200.Targets))
-	for i, target := range resp.JSON200.Targets {
+	targets := make([]query.DeletionTarget, len(resp.Targets))
+	for i, target := range resp.Targets {
 		targets[i] = query.DeletionTarget{
 			MessageID: target.MessageID, SourceID: target.SourceID,
 			SourceType: target.SourceType, SourceIdentifier: target.SourceIdentifier,
@@ -986,6 +1275,29 @@ func (e *Engine) GetDeletionTargetsByFilter(ctx context.Context, filter query.Me
 		}
 	}
 	return targets, nil
+}
+
+func (e *Engine) requireListIDCapability(
+	ctx context.Context, q *search.Query, filter query.MessageFilter, groupBy ...query.ViewType,
+) error {
+	return e.store.requireListIDCapability(ctx, q, filter, groupBy...)
+}
+
+func (c *Client) requireListIDCapability(
+	ctx context.Context, q *search.Query, filter query.MessageFilter, groupBy ...query.ViewType,
+) error {
+	if filter.ListID == "" && (q == nil || len(q.ListIDs) == 0) &&
+		!slices.Contains(groupBy, query.ViewLists) {
+		return nil
+	}
+	supported, err := c.SupportsAPISchemaVersion(ctx, listIDMinAPISchemaVersion)
+	if err != nil {
+		return fmt.Errorf("check daemon List-ID filter capability: %w", err)
+	}
+	if !supported {
+		return fmt.Errorf("List-ID filter requires daemon API schema %s or newer", listIDMinAPISchemaVersion)
+	}
+	return nil
 }
 
 func (e *Engine) SearchByDomains(ctx context.Context, domains []string, after, before *time.Time, limit, offset int) ([]query.MessageSummary, error) {
@@ -1006,7 +1318,7 @@ func (e *Engine) SearchByDomains(ctx context.Context, domains []string, after, b
 	if resp.JSON200 == nil {
 		return nil, nil
 	}
-	return messageSummariesFromGenerated(resp.JSON200.Messages), nil
+	return e.store.messageSummariesWithURLs(resp.JSON200.Messages), nil
 }
 
 // ListAccounts returns all archive source accounts.
@@ -1026,6 +1338,26 @@ func (e *Engine) ListAccounts(ctx context.Context) ([]query.AccountInfo, error) 
 		}
 	}
 	return result, nil
+}
+
+// ListCollectionScopes returns the user-managed collection projections used
+// by the TUI. The daemon-owned All collection is not a selectable scope.
+func (e *Engine) ListCollectionScopes(ctx context.Context) ([]query.CollectionScope, error) {
+	collections, err := e.store.GetCLICollections(ctx)
+	if err != nil {
+		return nil, err
+	}
+	scopes := make([]query.CollectionScope, 0, len(collections))
+	for _, collection := range collections {
+		if collection.Name == store.DefaultCollectionName {
+			continue
+		}
+		scopes = append(scopes, query.CollectionScope{
+			Name:      collection.Name,
+			SourceIDs: append([]int64{}, collection.SourceIDs...),
+		})
+	}
+	return scopes, nil
 }
 
 func (e *Engine) ListConversations(ctx context.Context, filter query.TextFilter) ([]query.ConversationRow, error) {
@@ -1062,23 +1394,27 @@ func (e *Engine) ListConversationMessages(ctx context.Context, convID int64, fil
 	if err != nil {
 		return nil, err
 	}
-	return queryMessageSummariesFromCLIGenerated(resp.JSON200.Messages), nil
+	return e.store.queryMessageSummariesFromCLIGenerated(resp.JSON200.Messages), nil
 }
 
-func (e *Engine) TextSearch(ctx context.Context, queryStr string, limit, offset int) ([]query.MessageSummary, error) {
+func (e *Engine) TextSearch(ctx context.Context, queryStr string, sourceID *int64, limit, offset int) ([]query.MessageSummary, error) {
 	resp, err := APIResponse(e.store, func(client *apiclient.Client) (*generated.SearchTextMessagesResp, error) {
 		return client.SearchTextMessagesWithResponse(ctx, &generated.SearchTextMessagesRequestOptions{
 			Query: &generated.SearchTextMessagesQuery{
-				Q:      queryStr,
-				Limit:  optionalPositiveInt64(limit),
-				Offset: optionalPositiveInt64(offset),
+				Q:        queryStr,
+				SourceID: copyInt64(sourceID),
+				Limit:    optionalPositiveInt64(limit),
+				Offset:   optionalPositiveInt64(offset),
 			},
 		})
 	})
 	if err != nil {
 		return nil, err
 	}
-	return queryMessageSummariesFromCLIGenerated(resp.JSON200.Messages), nil
+	if sourceID != nil && (resp.JSON200.AppliedSourceID == nil || *resp.JSON200.AppliedSourceID != *sourceID) {
+		return nil, errors.New("daemon did not confirm text-search source ID; upgrade the daemon and retry")
+	}
+	return e.store.queryMessageSummariesFromCLIGenerated(resp.JSON200.Messages), nil
 }
 
 func (e *Engine) GetTextStats(ctx context.Context, opts query.TextStatsOptions) (*query.TotalStats, error) {
@@ -1098,20 +1434,62 @@ func (e *Engine) GetTextStats(ctx context.Context, opts query.TextStatsOptions) 
 
 // GetTotalStats returns overall database statistics.
 func (e *Engine) GetTotalStats(ctx context.Context, opts query.StatsOptions) (*query.TotalStats, error) {
-	if opts.SourceIDs != nil && len(opts.SourceIDs) == 0 {
+	var filter query.MessageFilter
+	if opts.Filter != nil {
+		filter = opts.Filter.Clone()
+	}
+	sourceID, sourceIDs := opts.SourceID, opts.SourceIDs
+	if opts.SourceIDs == nil && opts.SourceID == nil && opts.Filter != nil {
+		sourceID, sourceIDs = filter.SourceID, filter.SourceIDs
+	}
+	if sourceIDs != nil && len(sourceIDs) == 0 {
 		return &query.TotalStats{}, nil
+	}
+	if opts.Filter != nil {
+		compatible, err := e.store.SupportsAPISchemaVersion(ctx, tuiSearchContractMinAPISchemaVersion)
+		if err != nil {
+			return nil, fmt.Errorf("check filtered-stats capability: %w", err)
+		}
+		if !compatible {
+			return nil, fmt.Errorf("complete filtered statistics require daemon API schema %s or newer", tuiSearchContractMinAPISchemaVersion)
+		}
+	}
+	if err := e.requireListIDCapability(ctx, search.Parse(opts.SearchQuery), filter, opts.GroupBy); err != nil {
+		return nil, err
+	}
+	params := &generated.GetTotalStatsQuery{
+		SourceID:        sourceIDForSourceIDs(sourceID, sourceIDs),
+		SourceIds:       copyInt64sPreserveNil(sourceIDs),
+		AttachmentsOnly: optionalBool(opts.WithAttachmentsOnly),
+		HideDeleted:     optionalBool(opts.HideDeletedFromSource),
+		SearchQuery:     optionalString(opts.SearchQuery),
+		SearchScope:     optionalBool(opts.SearchScope),
+		GroupBy:         optionalStatsGroupBy(opts.GroupBy),
+	}
+	if opts.Filter != nil {
+		fields := generatedFilterMessagesQuery(filter, false)
+		params.Sender = fields.Sender
+		params.SenderName = fields.SenderName
+		params.Recipient = fields.Recipient
+		params.RecipientName = fields.RecipientName
+		params.Domain = fields.Domain
+		params.Label = fields.Label
+		params.ListID = fields.ListID
+		params.MessageType = fields.MessageType
+		params.TimePeriod = fields.TimePeriod
+		params.TimeGranularity = fields.TimeGranularity
+		params.ConversationID = fields.ConversationID
+		params.After = fields.After
+		params.Before = fields.Before
+		params.EmptyTargets = fields.EmptyTargets
+		params.SourceID = sourceIDForSourceIDs(sourceID, sourceIDs)
+		params.SourceIds = copyInt64sPreserveNil(sourceIDs)
+		params.AttachmentsOnly = optionalBool(opts.WithAttachmentsOnly || filter.WithAttachmentsOnly)
+		params.HideDeleted = optionalBool(opts.HideDeletedFromSource || filter.HideDeletedFromSource)
 	}
 	resp, err := APIResponse(e.store, func(client *apiclient.Client) (*generated.GetTotalStatsResp, error) {
 		return client.GetTotalStatsWithResponse(ctx, &generated.GetTotalStatsRequestOptions{
-			Query: &generated.GetTotalStatsQuery{
-				SourceID:        opts.SourceID,
-				SourceIds:       append([]int64(nil), opts.SourceIDs...),
-				AttachmentsOnly: optionalBool(opts.WithAttachmentsOnly),
-				HideDeleted:     optionalBool(opts.HideDeletedFromSource),
-				SearchQuery:     optionalString(opts.SearchQuery),
-				SearchScope:     optionalBool(opts.SearchScope),
-				GroupBy:         optionalStatsGroupBy(opts.GroupBy),
-			},
+			Query: params,
 		})
 	})
 	if err != nil {
@@ -1120,9 +1498,8 @@ func (e *Engine) GetTotalStats(ctx context.Context, opts query.StatsOptions) (*q
 	if opts.SearchScope && (resp.JSON200.AppliedSearchScope == nil || !*resp.JSON200.AppliedSearchScope) {
 		return nil, errors.New("daemon did not confirm total-stats search scope; upgrade the daemon to API schema 1.5.0 or newer")
 	}
-	if len(opts.SourceIDs) > 0 &&
-		!slices.Equal(normalizedSourceIDs(opts.SourceIDs), normalizedSourceIDs(resp.JSON200.AppliedSourceIds)) {
-		return nil, errors.New("daemon did not confirm total-stats source IDs; upgrade the daemon to API schema 1.5.0 or newer")
+	if err := requireAppliedSourceIDs(sourceIDs, resp.JSON200.AppliedSourceIds, "total-stats"); err != nil {
+		return nil, err
 	}
 	return totalStatsFromGenerated(resp.JSON200), nil
 }
@@ -1141,9 +1518,36 @@ func normalizedSourceIDs(ids []int64) []int64 {
 	if ids == nil {
 		return nil
 	}
-	normalized := append([]int64(nil), ids...)
+	normalized := append(make([]int64, 0, len(ids)), ids...)
 	slices.Sort(normalized)
 	return slices.Compact(normalized)
+}
+
+func copyInt64sPreserveNil(ids []int64) []int64 {
+	if ids == nil {
+		return nil
+	}
+	return append(make([]int64, 0, len(ids)), ids...)
+}
+
+func sourceIDForSourceIDs(sourceID *int64, sourceIDs []int64) *int64 {
+	if sourceIDs != nil {
+		return nil
+	}
+	return sourceID
+}
+
+func requireAppliedSourceIDs(requested, applied []int64, surface string) error {
+	if requested == nil {
+		return nil
+	}
+	if applied == nil {
+		return fmt.Errorf("daemon did not confirm %s source IDs; upgrade the daemon to API schema 2.17.0 or newer", surface)
+	}
+	if !slices.Equal(normalizedSourceIDs(requested), normalizedSourceIDs(applied)) {
+		return fmt.Errorf("daemon did not confirm %s source IDs; upgrade the daemon to API schema 2.17.0 or newer", surface)
+	}
+	return nil
 }
 
 func hasExplicitEmptyAccountScope(q *search.Query) bool {

@@ -173,16 +173,6 @@ func (m MultimodalConfig) ImageQueriesEnabled() bool {
 	return m.Enabled && m.configuredImageQueries()
 }
 
-// APIKey resolves the configured key without making its presence an
-// enablement signal. Callers must pass the independent enablement and consent
-// gates before using the returned value.
-func (m MultimodalConfig) APIKey() string {
-	if m.APIKeyEnv == "" {
-		return ""
-	}
-	return lookupEnv(m.APIKeyEnv)
-}
-
 // EmbeddingsConfig configures the external embedding endpoint used to convert
 // message text into vectors.
 type EmbeddingsConfig struct {
@@ -228,7 +218,16 @@ func (e EmbeddingsConfig) Validate() error {
 	}
 	u, err := url.Parse(e.Endpoint)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		return fmt.Errorf("vector.embeddings.endpoint: must be an http or https URL with a host (got %q)", e.Endpoint)
+		return errors.New("vector.embeddings.endpoint: must be an http or https URL with a host")
+	}
+	if u.User != nil {
+		return errors.New("vector.embeddings.endpoint: must not contain credentials")
+	}
+	if u.RawQuery != "" {
+		return errors.New("vector.embeddings.endpoint: must not contain a query")
+	}
+	if u.Fragment != "" {
+		return errors.New("vector.embeddings.endpoint: must not contain a fragment")
 	}
 	if e.Model == "" {
 		return fmt.Errorf("vector.embeddings.model: required (the index generation fingerprint is %q, which is ambiguous without a model name)", e.Fingerprint())
@@ -370,6 +369,11 @@ type SearchConfig struct {
 	SubjectBoost      float64 `toml:"subject_boost"`
 	MaxPageSizeHybrid *int    `toml:"max_page_size_hybrid"`
 }
+
+// DefaultMaxPageSizeHybrid is the hybrid page cap applied when config.toml
+// omits max_page_size_hybrid. Settings suggests the same value when the cap
+// is switched back on, so the two cannot drift apart.
+const DefaultMaxPageSizeHybrid = 50
 
 // MaxPageSizeHybridClamp returns the effective per-request limit
 // clamp: zero means "no clamp", a positive value means "clamp to N".
@@ -659,7 +663,7 @@ func (c *Config) ApplyDefaults() {
 		c.Search.SubjectBoost = 2.0
 	}
 	if c.Search.MaxPageSizeHybrid == nil {
-		v := 50
+		v := DefaultMaxPageSizeHybrid
 		c.Search.MaxPageSizeHybrid = &v
 	}
 	c.Multimodal.Provider = strings.ToLower(strings.TrimSpace(c.Multimodal.Provider))
@@ -689,13 +693,4 @@ func (c *Config) ApplyDefaults() {
 	// without overwriting an explicit false from the config file. The
 	// StripQuotesEnabled / StripSignaturesEnabled helpers resolve the
 	// effective value.
-}
-
-// APIKey resolves the API key from the env var named in APIKeyEnv.
-// Returns "" if APIKeyEnv is empty or the variable is unset.
-func (e EmbeddingsConfig) APIKey() string {
-	if e.APIKeyEnv == "" {
-		return ""
-	}
-	return lookupEnv(e.APIKeyEnv)
 }

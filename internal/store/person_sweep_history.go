@@ -13,10 +13,89 @@ import (
 	"go.kenn.io/msgvault/internal/peoplesweep"
 )
 
+// RecoverPersonSweepRunsContext reclaims daemon-owned sweep leases through
+// the same fence and abandoned-attempt finalizer used by ordinary lease
+// takeover. It leaves dirty work available for a fresh claim.
+func (s *Store) RecoverPersonSweepRunsContext(ctx context.Context) (int64, error) {
+	var recovered int64
+	err := s.withTxContext(ctx, func(tx *loggedTx) error {
+		var runningBefore int64
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM person_sweep_runs
+			WHERE status = 'running'`).Scan(&runningBefore); err != nil {
+			return fmt.Errorf("count running person sweep runs before recovery: %w", err)
+		}
+		rows, err := tx.QueryContext(ctx, `SELECT person_id, lease_fence
+			FROM person_sweep_work WHERE COALESCE(lease_owner, '') <> '' ORDER BY person_id`)
+		if err != nil {
+			return fmt.Errorf("list person sweep leases for recovery: %w", err)
+		}
+		type staleLease struct{ personID, fence int64 }
+		leases := make([]staleLease, 0)
+		for rows.Next() {
+			var lease staleLease
+			if err := rows.Scan(&lease.personID, &lease.fence); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("scan person sweep lease for recovery: %w", err)
+			}
+			leases = append(leases, lease)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("iterate person sweep leases for recovery: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("close person sweep leases for recovery: %w", err)
+		}
+		for _, lease := range leases {
+			currentFence := lease.fence + 1
+			result, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE person_sweep_work SET
+				lease_fence = ?, updated_at = %s
+				WHERE person_id = ? AND lease_fence = ? AND COALESCE(lease_owner, '') <> ''`,
+				s.dialect.Now()), currentFence, lease.personID, lease.fence)
+			if err != nil {
+				return fmt.Errorf("fence person sweep lease for recovery: %w", err)
+			}
+			changed, err := result.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("count fenced person sweep lease: %w", err)
+			}
+			if changed == 0 {
+				continue
+			}
+			if err := s.finalizeReclaimedPersonSweepAttempts(ctx, tx, lease.personID, currentFence); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, fmt.Sprintf(`UPDATE person_sweep_work SET
+				lease_owner = '', lease_until = NULL, updated_at = %s WHERE person_id = ?`,
+				s.dialect.Now()), lease.personID); err != nil {
+				return fmt.Errorf("release recovered person sweep lease: %w", err)
+			}
+		}
+		_, err = tx.ExecContext(ctx, fmt.Sprintf(`UPDATE person_sweep_runs SET
+			status = CASE WHEN success_count > 0 THEN 'partial' ELSE 'failed' END,
+			completed_at = %s
+			WHERE status = 'running' AND NOT EXISTS (
+				SELECT 1 FROM person_sweep_attempts a
+				WHERE a.run_id = person_sweep_runs.id AND a.status = 'running')`, s.dialect.Now()))
+		if err != nil {
+			return fmt.Errorf("finish orphaned person sweep runs: %w", err)
+		}
+		var runningAfter int64
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM person_sweep_runs
+			WHERE status = 'running'`).Scan(&runningAfter); err != nil {
+			return fmt.Errorf("count running person sweep runs after recovery: %w", err)
+		}
+		recovered = runningBefore - runningAfter
+		return nil
+	})
+	return recovered, err
+}
+
 func (s *Store) ListPersonSweepRuns(
 	ctx context.Context, filter peoplesweep.RunFilter,
 ) ([]peoplesweep.RunSummary, error) {
-	if filter.Limit < 1 || filter.Limit > 200 || filter.PersonID < 0 {
+	if filter.Limit < 1 || filter.Limit > 200 || filter.PersonID < 0 ||
+		(filter.ProviderFingerprint != "" && !validLowerSHA256(filter.ProviderFingerprint)) {
 		return nil, errors.New("list person sweep runs: limit must be 1-200 and person ID nonnegative")
 	}
 	query := `SELECT r.id, r.kind, r.mode, r.status, r.program_fingerprint,
@@ -25,11 +104,19 @@ func (s *Store) ListPersonSweepRuns(
 	                 r.actual_requests, r.actual_input_tokens, r.actual_output_tokens,
 	                 r.actual_cost_micro_usd, r.started_at, r.completed_at
 	          FROM person_sweep_runs r`
-	args := make([]any, 0, 2)
+	conditions := make([]string, 0, 2)
+	args := make([]any, 0, 3)
 	if filter.PersonID > 0 {
-		query += ` WHERE EXISTS (SELECT 1 FROM person_sweep_attempts a
-		                          WHERE a.run_id = r.id AND a.person_id = ?)`
+		conditions = append(conditions, `EXISTS (SELECT 1 FROM person_sweep_attempts a
+		                          WHERE a.run_id = r.id AND a.person_id = ?)`)
 		args = append(args, filter.PersonID)
+	}
+	if filter.ProviderFingerprint != "" {
+		conditions = append(conditions, "r.provider_fingerprint = ?")
+		args = append(args, filter.ProviderFingerprint)
+	}
+	if len(conditions) > 0 {
+		query += " WHERE " + strings.Join(conditions, " AND ")
 	}
 	query += ` ORDER BY r.started_at DESC, r.id DESC LIMIT ?`
 	args = append(args, filter.Limit)
@@ -66,10 +153,11 @@ func (s *Store) ListPersonSweepRuns(
 func (s *Store) ListPersonSweepAttempts(
 	ctx context.Context, filter peoplesweep.AttemptFilter,
 ) ([]peoplesweep.AttemptSummary, error) {
-	if filter.Limit < 1 || filter.Limit > 200 || filter.PersonID < 0 {
+	if filter.Limit < 1 || filter.Limit > 200 || filter.PersonID < 0 ||
+		(filter.ProviderFingerprint != "" && !validLowerSHA256(filter.ProviderFingerprint)) {
 		return nil, errors.New("list person sweep attempts: limit must be 1-200 and person ID nonnegative")
 	}
-	query := `SELECT id, run_id, person_id, status, failure_class,
+	query := `SELECT id, run_id, person_id, status, failure_class, brief_failure_class,
 	                 cursor_envelope_json, envelope_hash, program_fingerprint,
 	                 catalog_fingerprint, provider_fingerprint, generation_id,
 	                 generation_key, seed_count, context_count, claim_count,
@@ -77,8 +165,8 @@ func (s *Store) ListPersonSweepAttempts(
 	                 request_count, input_tokens,
 	                 output_tokens, estimated_cost_micro_usd, latency_milliseconds
 	          FROM person_sweep_attempts`
-	conditions := make([]string, 0, 2)
-	args := make([]any, 0, 3)
+	conditions := make([]string, 0, 3)
+	args := make([]any, 0, 4)
 	if strings.TrimSpace(filter.RunID) != "" {
 		conditions = append(conditions, "run_id = ?")
 		args = append(args, filter.RunID)
@@ -86,6 +174,10 @@ func (s *Store) ListPersonSweepAttempts(
 	if filter.PersonID > 0 {
 		conditions = append(conditions, "person_id = ?")
 		args = append(args, filter.PersonID)
+	}
+	if filter.ProviderFingerprint != "" {
+		conditions = append(conditions, "provider_fingerprint = ?")
+		args = append(args, filter.ProviderFingerprint)
 	}
 	if len(conditions) > 0 {
 		query += " WHERE " + strings.Join(conditions, " AND ")
@@ -104,7 +196,8 @@ func (s *Store) ListPersonSweepAttempts(
 		var generationID sql.NullInt64
 		var latencyMS int64
 		if err := rows.Scan(&attempt.ID, &attempt.RunID, &attempt.PersonID,
-			&attempt.Status, &attempt.FailureClass, &envelope, &attempt.EnvelopeHash,
+			&attempt.Status, &attempt.FailureClass, &attempt.BriefFailureClass,
+			&envelope, &attempt.EnvelopeHash,
 			&attempt.ProgramFingerprint, &attempt.CatalogFingerprint,
 			&attempt.ProviderFingerprint, &generationID, &attempt.GenerationKey,
 			&attempt.SeedCount, &attempt.ContextCount, &attempt.ClaimCount,

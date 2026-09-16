@@ -978,11 +978,39 @@ func TestSearchMetadata(t *testing.T) {
 		runToolExpectError(t, "search_metadata", h.searchMetadata, map[string]any{})
 	})
 
-	t.Run("unsupported Gmail list operator rejected", func(t *testing.T) {
-		r := runToolExpectError(t, "search_metadata", h.searchMetadata, map[string]any{"query": "list:(alerts.example.com)"})
-		txt := resultText(t, r)
-		assert.Contains(t, txt, "unsupported_search_operator", "expected unsupported-operator error, got: %s")
-		assert.Contains(t, txt, "list:", "expected list operator context, got: %s")
+	for _, tc := range []struct {
+		name  string
+		query string
+	}{
+		{name: "list alias", query: "list:alerts.example.test"},
+		{name: "list id alias", query: "list-id:alerts.example.test"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			var got *search.Query
+			eng := &querytest.MockEngine{
+				SearchFastFunc: func(_ context.Context, q *search.Query, _ query.MessageFilter, _, _ int) ([]query.MessageSummary, error) {
+					got = q
+					return []query.MessageSummary{testutil.NewMessageSummary(1).Build()}, nil
+				},
+				SearchFastCountFunc: func(_ context.Context, _ *search.Query, _ query.MessageFilter) (int64, error) {
+					return 1, nil
+				},
+			}
+
+			resp := runTool[paginatedSearchMessages](t, "search_metadata", newTestHandlers(eng).searchMetadata, map[string]any{"query": tc.query})
+			require.Len(resp.Data, 1, "search_metadata result")
+			require.NotNil(got, "search_metadata must call local metadata search")
+			assert.Equal([]string{"alerts.example.test"}, got.ListIDs, "forwarded List-Id filter")
+			assert.Empty(got.UnsupportedOperators, "List-Id aliases must not be rejected")
+		})
+	}
+
+	t.Run("parenthesized list syntax rejected", func(t *testing.T) {
+		r := runToolExpectError(t, "search_metadata", h.searchMetadata,
+			map[string]any{"query": "list:(alerts.example.test)"})
+		assert.Contains(t, resultText(t, r), "parenthesized values are not supported")
 	})
 }
 
@@ -1159,7 +1187,6 @@ func TestSearchRejectsInvalidQueryBeforeDispatch(t *testing.T) {
 		want []string
 	}{
 		{name: "invalid typed value", text: "needle before:not-a-date", want: []string{"invalid value", "before:"}},
-		{name: "unsupported operator", text: "needle list:alerts.example.com", want: []string{"unsupported_search_operator", "list:"}},
 	}
 	paths := []string{"metadata", "local hybrid", "daemon hybrid"}
 	for _, queryCase := range queries {
@@ -3012,12 +3039,26 @@ func TestAggregate(t *testing.T) {
 	}
 	h := newTestHandlers(eng)
 
-	for _, groupBy := range []string{"sender", "recipient", "domain", "label", "time"} {
+	for _, groupBy := range []string{"sender", "recipient", "domain", "label", "list", "time"} {
 		t.Run(groupBy, func(t *testing.T) {
 			response := runTool[dataResponse[query.AggregateRow]](t, "aggregate", h.aggregate, map[string]any{"group_by": groupBy})
 			assert.Len(t, response.Data, 2, "rows")
 		})
 	}
+
+	t.Run("list uses mailing-list dimension", func(t *testing.T) {
+		f := storetest.New(t)
+		messageID := f.NewMessage().WithSourceMessageID("mcp-list-aggregate").Create(t, f.Store)
+		_, err := f.Store.DB().Exec(f.Store.Rebind(`UPDATE messages SET list_id = ? WHERE id = ?`),
+			"<announce.example.test>", messageID)
+		require.NoError(t, err)
+		realHandlers := newTestHandlers(query.NewEngine(f.Store.DB(), f.Store.IsPostgreSQL()))
+
+		response := runTool[dataResponse[query.AggregateRow]](t, "aggregate", realHandlers.aggregate,
+			map[string]any{"group_by": "list"})
+		require.Len(t, response.Data, 1)
+		assert.Equal(t, "<announce.example.test>", response.Data[0].Key)
+	})
 
 	errorCases := []struct {
 		name string
@@ -3913,19 +3954,6 @@ func TestStageDeletion(t *testing.T) {
 		assert.Contains(t, txt, "not both", "expected mutual exclusion error, got: %s")
 	})
 
-	t.Run("query with unsupported Gmail list operator rejected", func(t *testing.T) {
-		dataDir := t.TempDir()
-		h := &handlers{engine: eng, dataDir: dataDir}
-
-		r := runToolExpectError(
-			t, "stage_deletion", h.stageDeletion,
-			map[string]any{"query": "list:(alerts.example.com)"},
-		)
-		txt := resultText(t, r)
-		assert.Contains(t, txt, "unsupported_search_operator", "expected unsupported-operator error, got: %s")
-		assert.Contains(t, txt, "list:", "expected list operator context, got: %s")
-	})
-
 	t.Run("no filters rejected", func(t *testing.T) {
 		dataDir := t.TempDir()
 		h := &handlers{engine: eng, dataDir: dataDir}
@@ -4037,6 +4065,31 @@ func TestStageDeletion(t *testing.T) {
 		)
 		assert.Equal(t, maxStageDeletionResults, capturedFilter.Pagination.Limit, "limit")
 	})
+}
+
+func TestStageDeletionRejectsInvalidOrEmptyParsedQuery(t *testing.T) {
+	f := storetest.New(t)
+	messageID := f.NewMessage().
+		WithSourceMessageID("unrelated-message").
+		WithSubject("Unrelated message").
+		Create(t, f.Store)
+	h := &handlers{
+		engine: query.NewEngine(f.Store.DB(), f.Store.IsPostgreSQL()),
+	}
+
+	for _, queryText := range []string{"list:", "list:(example.org)"} {
+		t.Run(queryText, func(t *testing.T) {
+			saver := &captureDeletionManifestSaver{}
+			h.manifestSaver = saver
+
+			result := callToolDirect(t, "stage_deletion", h.stageDeletion,
+				map[string]any{"query": queryText})
+
+			assert.True(t, result.isError, "invalid query must be rejected")
+			assert.Nil(t, saver.manifest,
+				"invalid query must not stage unrelated message %d", messageID)
+		})
+	}
 }
 
 // fakeBackend is a minimal vector.Backend used to exercise
@@ -4981,4 +5034,11 @@ func TestResolveDraftAttachments_NeitherReaderNorDirectoryConfigured(t *testing.
 	_, err := h.resolveDraftAttachments(context.Background(), map[string]any{"attachment_ids": "1"})
 	require.Error(err)
 	assert.Contains(t, err.Error(), "attachments directory not configured")
+}
+
+func TestGetMessagePreservesBrowserURL(t *testing.T) {
+	const link = "https://archive.example/?explore=%7B%22workspace%22%3A%22everything%22%2C%22selectedRow%22%3A%22message%3A42%22%7D"
+	h := newTestHandlers(&querytest.MockEngine{Messages: map[int64]*query.MessageDetail{42: {ID: 42, WebURL: link}}})
+	result := runTool[map[string]any](t, "get_message", h.getMessage, map[string]any{"id": float64(42)})
+	assert.Equal(t, link, result["web_url"])
 }

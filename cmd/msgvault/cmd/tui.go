@@ -48,9 +48,10 @@ Navigation:
   Enter       Drill down / view message
   Esc         Go back
   m           Cycle Email / Texts / Meetings / People
+  ,           Open Settings
   g           Cycle aggregate view (Email and Texts)
   /           Search; Tab adds active-message-only Semantic mode when enabled
-  A           Filter by account, or meeting source in Meetings mode
+  A           Filter by account or named Email collection
   s           Cycle sort field
   r           Reverse sort direction
   t           Toggle time granularity (Time view only)
@@ -58,7 +59,8 @@ Navigation:
 Email selection:
   Space       Toggle selection
   x           Clear selection
-  d           Stage selected messages for deletion
+  d           Stage selected/current messages for deletion
+  D           Stage all current row/filter matches for deletion
 
 Meeting browsing is read-only; selection and deletion keys are disabled.
 Press '?' in any mode for its complete key reference, or 'q' to quit.
@@ -94,15 +96,19 @@ HTTP Mode:
 
 		// Create and run TUI
 		semanticSearch := tuiSemanticSearcher(cmd.Context(), backend.client, backend.engine)
+		collectionScopes := tuiCollectionScopes(cmd.Context(), backend.client, backend.engine)
 		model := tui.New(backend.engine, tui.Options{
-			DataDir:          cfg.Data.DataDir,
-			Version:          Version,
-			TextEngine:       textEngine,
-			PeopleBackend:    peopleBackend,
-			ManifestSaver:    backend.client,
-			AttachmentReader: tuiAttachmentOpener{client: backend.client},
-			SemanticSearch:   semanticSearch,
-			AnalyticsNotice:  notice,
+			DataDir:               cfg.Data.DataDir,
+			ExportDir:             cfg.ExportDir(),
+			Version:               Version,
+			TextEngine:            textEngine,
+			PeopleBackend:         peopleBackend,
+			ManifestSaver:         backend.client,
+			AttachmentReader:      tuiAttachmentOpener{client: backend.client},
+			SemanticSearch:        semanticSearch,
+			AnalyticsNotice:       notice,
+			SettingsBackend:       backend.settings,
+			CollectionScopeLister: collectionScopes,
 		})
 		p := tea.NewProgram(model)
 		noticeCtx, stopNoticeRefresh := context.WithCancel(cmd.Context())
@@ -156,11 +162,16 @@ func tuiSemanticSearcher(
 	return searcher
 }
 
+// tuiPeopleBackend returns the People backend for the selected daemon, or nil
+// when the daemon is too old to serve People at all. The brief routes arrived
+// later than People itself, so a daemon between the two schema versions gets a
+// backend without the brief surfaces: the People browser then hides the brief
+// rather than reporting a failed read on every contact.
 func tuiPeopleBackend(
 	ctx context.Context,
 	client *daemonclient.Client,
 	engine *daemonclient.Engine,
-) *daemonclient.PeopleBrowser {
+) peoplebrowser.Backend {
 	if client == nil || engine == nil {
 		return nil
 	}
@@ -168,14 +179,38 @@ func tuiPeopleBackend(
 	if err != nil || !compatible {
 		return nil
 	}
-	return daemonclient.NewPeopleBrowser(engine)
+	browser := daemonclient.NewPeopleBrowser(engine)
+	briefs, err := client.SupportsAPISchemaVersion(ctx, briefMinAPISchemaVersion)
+	if err != nil || !briefs {
+		return daemonclient.NewPeopleBrowserWithoutBriefs(browser)
+	}
+	return browser
 }
 
 const (
-	semanticSearchMinAPISchemaVersion = "2.7.0"
-	peopleMinAPISchemaVersion         = "2.10.0"
-	tuiSemanticMessageType            = "email"
+	semanticSearchMinAPISchemaVersion   = "2.7.0"
+	peopleMinAPISchemaVersion           = "2.10.0"
+	directoryPeopleMinAPISchemaVersion  = "2.13.0"
+	collectionScopesMinAPISchemaVersion = "2.17.0"
+	briefMinAPISchemaVersion            = "2.20.0"
+	tuiSemanticMessageType              = "email"
 )
+
+func tuiCollectionScopes(
+	ctx context.Context,
+	client *daemonclient.Client,
+	engine query.Engine,
+) query.CollectionScopeLister {
+	if client == nil || engine == nil {
+		return nil
+	}
+	compatible, err := client.SupportsAPISchemaVersion(ctx, collectionScopesMinAPISchemaVersion)
+	if err != nil || !compatible {
+		return nil
+	}
+	lister, _ := engine.(query.CollectionScopeLister)
+	return lister
+}
 
 type tuiAttachmentOpener struct {
 	client *daemonclient.Client
@@ -186,10 +221,11 @@ func (o tuiAttachmentOpener) OpenAttachment(ctx context.Context, contentHash str
 }
 
 type tuiBackend struct {
-	engine  *daemonclient.Engine
-	client  *daemonclient.Client
-	info    HTTPStoreInfo
-	cleanup func()
+	engine   *daemonclient.Engine
+	client   *daemonclient.Client
+	settings tui.SettingsBackend
+	info     HTTPStoreInfo
+	cleanup  func()
 }
 
 const (
@@ -270,10 +306,11 @@ func openTUIBackend(ctx context.Context) (*tuiBackend, error) {
 	}
 	engine := daemonclient.NewEngineAdapter(st)
 	return &tuiBackend{
-		engine:  engine,
-		client:  st,
-		info:    info,
-		cleanup: func() { _ = engine.Close() },
+		engine:   engine,
+		client:   st,
+		settings: newTUISettingsBackend(st),
+		info:     info,
+		cleanup:  func() { _ = engine.Close() },
 	}, nil
 }
 

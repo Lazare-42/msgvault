@@ -70,6 +70,45 @@ func TestPersonEnrichmentScheduleResumesRunningRunsAcrossSecondPage(t *testing.T
 	assert.Equal(1, scheduled)
 }
 
+func TestPersonEnrichmentScheduleClaimsQueuedRunsBeforeNewOccurrence(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := storetest.New(t)
+	occurrence := time.Date(2026, 8, 30, 19, 0, 0, 0, time.UTC)
+	var oldestID, newerID int64
+	for _, seed := range []struct {
+		key     string
+		started time.Time
+		id      *int64
+	}{
+		{"newer", occurrence.Add(-time.Hour), &newerID},
+		{"oldest", occurrence.Add(-2 * time.Hour), &oldestID},
+	} {
+		require.NoError(f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(`
+			INSERT INTO person_enrichment_runs
+				(kind, requested_by, requested_at, started_at, state)
+			VALUES ('scheduled', ?, ?, ?, 'queued') RETURNING id`),
+			seed.key, seed.started, seed.started).Scan(seed.id))
+	}
+	calls := make([]int64, 0, 3)
+	runner := &personEnrichmentSchedule{
+		Store: f.Store, CatchUpLimit: 200,
+		Worker: scheduleEnrichmentWorkerFunc(func(_ context.Context, runID int64) (bool, error) {
+			calls = append(calls, runID)
+			return false, nil
+		}),
+	}
+
+	require.NoError(runner.Wake(t.Context(), occurrence))
+	require.Len(calls, 3)
+	assert.Equal([]int64{oldestID, newerID}, calls[:2])
+	var scheduledID int64
+	require.NoError(f.Store.DB().QueryRowContext(t.Context(), f.Store.Rebind(`
+		SELECT id FROM person_enrichment_runs WHERE kind = 'scheduled' AND requested_by = ?`),
+		canonicalPersonEnrichmentOccurrence(occurrence)).Scan(&scheduledID))
+	assert.Equal(scheduledID, calls[2])
+}
+
 func TestPersonEnrichmentScheduleResumesRunningRunAfterCrash(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -188,7 +227,8 @@ func TestPersonEnrichmentScheduleRegistersWithoutResolvingProviderCredentials(t 
 		},
 	}
 	sched := scheduler.New(nil)
-	require.NoError(registerPersonEnrichmentJob(t.Context(), sched, f.Store, config))
+	require.NoError(registerPersonEnrichmentJob(t.Context(), sched, f.Store, config,
+		testPersonEnrichmentRuntimeCredentials(t)))
 	assert.True(sched.IsJobScheduled(personEnrichmentJob))
 
 	var profiles int
@@ -435,7 +475,7 @@ func TestRegisterPersonEnrichmentJobCancelsWorkForUnavailableProfiles(t *testing
 			requirements.NoError(registerPersonEnrichmentJob(t.Context(), sched, f.Store, personenrichment.Config{
 				Enabled: enrichmentEnabled, Schedule: "*/15 * * * *", BatchSize: 25, LeaseDuration: time.Minute,
 				SuppressionKeyEnv: "UNAVAILABLE_PROFILE_SUPPRESSION_KEY", Providers: providers,
-			}))
+			}, testPersonEnrichmentRuntimeCredentials(t)))
 
 			stored, err := f.Store.GetPersonEnrichmentAttemptContext(t.Context(), attempt.ID)
 			requirements.NoError(err)

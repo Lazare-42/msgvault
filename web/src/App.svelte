@@ -1,34 +1,40 @@
 <script lang="ts">
+  import { getSettings as generatedGetSettings } from './lib/api/generated/api/api';
   import { Button } from '@kenn-io/kit-ui';
   import { onMount } from 'svelte';
-
+  import { receiveGoogleContactsCallback } from './lib/settings/google-authorization';
   import { createSessionController, type SessionController } from './lib/api/session.svelte';
   import Login from './lib/components/auth/Login.svelte';
   import SettingsWorkspace from './lib/components/settings/SettingsWorkspace.svelte';
   import AppShell from './lib/components/shell/AppShell.svelte';
+  import MessagePage from './lib/components/reader/MessagePage.svelte';
   import type { ExploreSearchMode } from './lib/explore/models';
   import { parseSearchMode } from './lib/search/modes';
   import { createAppearancePreferences, type AppearanceDefaults } from './lib/theme/preferences.svelte';
-
-  let { session = createSessionController() }: { session?: SessionController } = $props();
+  let {
+    session = createSessionController(),
+  }: {
+    session?: SessionController;
+  } = $props();
+  let oauthCallback = $state(false);
+  let pathname = $state(window.location.pathname);
+  const messageID = $derived(Number(/^\/messages\/([1-9]\d*)\/?$/.exec(pathname)?.[1]) || undefined);
   let appearanceDefaults = $state<AppearanceDefaults>({ theme: 'system', density: 'compact' });
   let shellMounted = $derived(session.status !== undefined && session.authMode !== 'required');
   let searchModeDefault = $state<ExploreSearchMode | undefined>();
   let authenticated = false;
   let browserDefaultsRequestGeneration = 0;
-
   onMount(() => {
-    void session.bootstrap();
+    oauthCallback = receiveGoogleContactsCallback();
+    if (!oauthCallback) void session.bootstrap();
   });
-
   // AppShell owns appearance while mounted; the boot and login screens apply
   // the same defaults and stored override so they render in the right theme.
   $effect(() => {
-    if (shellMounted) return;
+    if (shellMounted && messageID === undefined) return;
     const appearance = createAppearancePreferences(appearanceDefaults);
     return () => appearance.destroy();
   });
-
   $effect(() => {
     const isAuthenticated = session.authMode !== undefined && session.authMode !== 'required';
     if (!isAuthenticated) {
@@ -41,26 +47,30 @@
     const generation = ++browserDefaultsRequestGeneration;
     void loadBrowserDefaults(generation);
   });
-
   async function loadBrowserDefaults(generation: number): Promise<void> {
     try {
-      const { data } = await session.client.GET('/api/v1/settings');
+      const { data } = await generatedGetSettings(session.client);
       if (generation !== browserDefaultsRequestGeneration || session.authMode === 'required') return;
       const theme = settingString(data?.settings.find(({ key }) => key === 'web.theme'));
       const density = settingString(data?.settings.find(({ key }) => key === 'web.density'));
       appearanceDefaults = {
         theme: theme === 'light' || theme === 'dark' || theme === 'system' ? theme : 'system',
-        density: density === 'comfortable' ? density : 'compact'
+        density: density === 'comfortable' ? density : 'compact',
       };
       searchModeDefault = parseSearchMode(
-        settingString(data?.settings.find(({ key }) => key === 'web.default_search_mode'))
+        settingString(data?.settings.find(({ key }) => key === 'web.default_search_mode')),
       );
     } catch {
       // Keep the safe fallback when settings authority is temporarily unavailable.
     }
   }
-
-  function settingString(setting: { value?: unknown } | undefined): string | undefined {
+  function settingString(
+    setting:
+      | {
+          value?: unknown;
+        }
+      | undefined,
+  ): string | undefined {
     const value = setting?.value;
     return value && typeof value === 'object' && 'string' in value && typeof value.string === 'string'
       ? value.string
@@ -68,18 +78,32 @@
   }
 </script>
 
+<svelte:window onpopstate={() => pathname = window.location.pathname} />
+
 <svelte:head>
   <title>Everything · msgvault</title>
 </svelte:head>
 
-{#if session.authMode === 'required'}
+{#if oauthCallback}
+  <main class="boot"><p>Return to CardDAV settings to finish connecting. You can close this window.</p></main>
+{:else if session.authMode === 'required'}
   <Login {session} />
 {:else if shellMounted}
+  {#if messageID !== undefined}
+    <MessagePage client={session.client} {messageID} />
+  {:else}
   <AppShell client={session.client} {appearanceDefaults} {searchModeDefault}>
-    {#snippet settings()}
-      <SettingsWorkspace client={session.client} plainHTTPWarning={session.status?.plain_http_warning ?? false} />
+    {#snippet settings(cardDAVRequest, onCardDAVRequestConsumed, navigationTarget)}
+      <SettingsWorkspace
+        client={session.client}
+        plainHTTPWarning={session.status?.plain_http_warning ?? false}
+        {cardDAVRequest}
+        {onCardDAVRequestConsumed}
+        {navigationTarget}
+      />
     {/snippet}
   </AppShell>
+  {/if}
 {:else if session.error !== undefined}
   <main class="boot" aria-label="Connection error">
     <p class="eyebrow">msgvault</p>

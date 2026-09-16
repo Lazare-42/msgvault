@@ -19,8 +19,9 @@ import (
 
 func newFilterTestDB(t *testing.T) *sql.DB {
 	t.Helper()
+	require := require.New(t)
 	db, err := sql.Open("sqlite3", ":memory:")
-	require.NoError(t, err, "open")
+	require.NoError(err, "open")
 	t.Cleanup(func() { _ = db.Close() })
 
 	schema := `
@@ -36,7 +37,7 @@ CREATE TABLE labels (
 );
 `
 	_, err = db.Exec(schema)
-	require.NoError(t, err, "schema")
+	require.NoError(err, "schema")
 	participants := []string{
 		"alice@example.com",
 		"bob@example.com",
@@ -46,11 +47,11 @@ CREATE TABLE labels (
 	for _, p := range participants {
 		domain := p[strings.LastIndex(p, "@")+1:]
 		_, err := db.Exec(`INSERT INTO participants (email_address, domain) VALUES (?, ?)`, p, domain)
-		require.NoError(t, err, "insert participant")
+		require.NoError(err, "insert participant")
 	}
 	for _, l := range []string{"INBOX", "Work", "Archive"} {
 		_, err := db.Exec(`INSERT INTO labels (name) VALUES (?)`, l)
-		require.NoError(t, err, "insert label")
+		require.NoError(err, "insert label")
 	}
 	return db
 }
@@ -62,10 +63,12 @@ func TestApplyMessageFilterPreservesExactTUIScope(t *testing.T) {
 	_, err := db.Exec(`INSERT INTO labels (name) VALUES (?)`, "Work Notes")
 	require.NoError(err)
 	sourceID := int64(7)
+	conversationID := int64(42)
 	filter := vector.Filter{}
 
 	err = ApplyMessageFilter(t.Context(), db, nil, &filter, query.MessageFilter{
 		SourceID:            &sourceID,
+		ConversationID:      &conversationID,
 		Sender:              "alice@example.com",
 		Recipient:           "bob@example.com",
 		Domain:              "example.com",
@@ -77,6 +80,7 @@ func TestApplyMessageFilterPreservesExactTUIScope(t *testing.T) {
 	require.NoError(err)
 
 	assert.Equal([]int64{7}, filter.SourceIDs)
+	assert.Equal([]int64{42}, filter.ConversationIDs)
 	require.Len(filter.SenderExactGroups, 1)
 	assert.Equal([]int64{1}, filter.SenderExactGroups[0], "sender equality must not include substring matches")
 	require.Len(filter.RecipientAnyGroups, 1)
@@ -98,21 +102,39 @@ func TestApplyMessageFilterPreservesExactTUIScope(t *testing.T) {
 }
 
 func TestApplyMessageFilterIntersectsExistingScope(t *testing.T) {
+	assert := assert.New(t)
 	db := newFilterTestDB(t)
 	sourceID := int64(7)
+	conversationID := int64(7)
 	filter := vector.Filter{
-		SourceIDs:    []int64{8},
-		MessageTypes: []string{"sms"},
+		SourceIDs:       []int64{8},
+		ConversationIDs: []int64{8},
+		MessageTypes:    []string{"sms"},
 	}
 
 	err := ApplyMessageFilter(t.Context(), db, nil, &filter, query.MessageFilter{
-		SourceID:    &sourceID,
-		MessageType: "email",
+		SourceID:       &sourceID,
+		ConversationID: &conversationID,
+		MessageType:    "email",
 	})
 	require.NoError(t, err)
 
-	assert.Equal(t, []int64{noMatchSentinel}, filter.SourceIDs)
-	assert.Equal(t, []string{"__msgvault_no_matching_message_type__"}, filter.MessageTypes)
+	assert.Equal([]int64{noMatchSentinel}, filter.SourceIDs)
+	assert.Equal([]int64{noMatchSentinel}, filter.ConversationIDs)
+	assert.Equal([]string{"__msgvault_no_matching_message_type__"}, filter.MessageTypes)
+}
+
+func TestApplyMessageFilterListIDIsNotDropped(t *testing.T) {
+	db := newFilterTestDB(t)
+	filter := vector.Filter{}
+
+	err := ApplyMessageFilter(t.Context(), db, nil, &filter, query.MessageFilter{
+		ListID: "<Dev@Example.Test>",
+	})
+
+	require.NoError(t, err)
+	assert.False(t, filter.IsEmpty(), "the exact List-ID must restrict hybrid candidates")
+	assert.Equal(t, "<Dev@Example.Test>", filter.ListID)
 }
 
 func TestApplyMessageFilterRejectsInvalidTimePeriod(t *testing.T) {
@@ -195,6 +217,16 @@ func TestBuildFilter_MessageType(t *testing.T) {
 	assert.Equal(t, []string{"sms", "mms"}, f.MessageTypes, "MessageTypes")
 }
 
+// TestBuildFilter_ListIDs catches hybrid search dropping repeated list:
+// operators before they reach the candidate backend.
+func TestBuildFilter_ListIDs(t *testing.T) {
+	db := newFilterTestDB(t)
+
+	f, err := BuildFilter(t.Context(), db, nil, search.Parse(`list:announce list-id:shared`))
+	require.NoError(t, err, "BuildFilter")
+	assert.Equal(t, []string{"announce", "shared"}, f.ListIDSubstrings)
+}
+
 func TestBuildFilter_SourceIDs(t *testing.T) {
 	ctx := context.Background()
 	db := newFilterTestDB(t)
@@ -205,6 +237,27 @@ func TestBuildFilter_SourceIDs(t *testing.T) {
 	require.NoError(t, err, "BuildFilter")
 
 	assert.Equal(t, []int64{17, 23}, f.SourceIDs, "SourceIDs")
+}
+
+func TestBuildFilter_ConversationIDs(t *testing.T) {
+	ctx := context.Background()
+	db := newFilterTestDB(t)
+	q := search.Parse(`conversation_id:17 conversation_id:23 lunch`)
+
+	f, err := BuildFilter(ctx, db, nil, q)
+	require.NoError(t, err, "BuildFilter")
+
+	assert.Equal(t, []int64{17, 23}, f.ConversationIDs)
+}
+
+func TestBuildFilter_ExplicitEmptyConversationIDsMatchNothing(t *testing.T) {
+	db := newFilterTestDB(t)
+	q := &search.Query{ConversationIDs: []int64{}}
+
+	f, err := BuildFilter(t.Context(), db, nil, q)
+
+	require.NoError(t, err, "BuildFilter")
+	assert.Equal(t, []int64{noMatchSentinel}, f.ConversationIDs)
 }
 
 // TestBuildFilter_LabelsAndAttachments checks the label: and

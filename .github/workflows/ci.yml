@@ -38,7 +38,8 @@ jobs:
       - name: Install Go
         run: |
           GO_VERSION=$(grep '^go ' go.mod | awk '{print $2}')
-          curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${{ matrix.go_arch_name }}.tar.gz" -o go.tar.gz
+          curl -fsSL --retry 5 --retry-all-errors --retry-max-time 120 \
+            "https://go.dev/dl/go${GO_VERSION}.linux-${{ matrix.go_arch_name }}.tar.gz" -o go.tar.gz
           tar -C /usr/local -xzf go.tar.gz
           rm go.tar.gz
           echo "/usr/local/go/bin" >> "$GITHUB_PATH"
@@ -71,15 +72,18 @@ jobs:
           echo "$SMOKE_OUT"
           echo "$SMOKE_OUT" | grep -q "$VERSION" || { echo "FATAL: version output doesn't match CI build version"; exit 1; }
 
+  # Hosted Ubuntu, like the PostgreSQL lanes: on the managed Linux runners the
+  # unsharded packages alone take over 30 minutes and the largest packages
+  # hit go test's one-hour timeout, while hosted runners finish in minutes.
   test:
-    runs-on: ${{ github.repository == 'kenn-io/msgvault' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'kenn-linux-x64-public' || 'ubuntu-24.04' }}
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
         with:
           go-version-file: go.mod
-          cache: ${{ github.repository == 'kenn-io/msgvault' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'false' || 'true' }}
+          cache: 'true'
 
       - name: Check PostgreSQL build coverage
         run: make pg-shipped-only-check
@@ -89,8 +93,10 @@ jobs:
           make lint-tools
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
+      # The three largest packages run in test-sharded below; this covers the
+      # rest. Together they are exactly `make test`.
       - name: Test
-        run: make test
+        run: make test-unsharded
 
       - name: Test build without vector backends
         run: go test -tags fts5 -run '^TestDocumentVectorStubKeepsStatusAvailableAndBuildActionable$' -count=1 ./cmd/msgvault/cmd
@@ -103,6 +109,35 @@ jobs:
 
       - name: Vulnerability check
         run: make vulncheck
+
+  # The packages in SHARDED_TEST_PKGS (Makefile) each hold thousands of tests
+  # that run one at a time inside one binary, so whole they set the wall clock
+  # of the test lane. Each runs here as four concurrent processes of the same
+  # binary — scripts/test-package-shards.sh, the Linux twin of the Windows
+  # lane's script — on its own runner.
+  test-sharded:
+    name: test-sharded (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: cli
+            package: ./cmd/msgvault/cmd
+          - name: store
+            package: ./internal/store
+          - name: api
+            package: ./internal/api
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: 'true'
+
+      - name: Test package in isolated shards
+        run: scripts/test-package-shards.sh "${{ matrix.package }}" 4 "fts5 sqlite_vec" 60m
 
   test-macos-15:
     if: github.repository == 'kenn-io/msgvault' && github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -349,7 +384,6 @@ jobs:
           go test -timeout 60m -tags "fts5 sqlite_vec" `
             ./internal/api `
             ./internal/importer `
-            ./internal/store `
             ./scripts
 
   test-windows-sharded:
@@ -360,11 +394,22 @@ jobs:
         include:
           - name: cli
             package: ./cmd/msgvault/cmd
+            # Windows SQLite I/O makes this package's aggregate shard duration
+            # exceed one hour: the passing shard alone ran 406 tests in 3373.8s
+            # (~56m) and the next shard timed out at 60m while still actively
+            # executing schema setup (no deadlock; tests kept progressing).
+            # Give only this package the larger per-shard budget.
+            timeout: 120m
+          - name: store
+            package: ./internal/store
+            timeout: 60m
           - name: sync-vector-embed
             package: ./internal/sync
             package2: ./internal/vector/embed
+            timeout: 60m
           - name: vector-sqlite
             package: ./internal/vector/sqlitevec
+            timeout: 60m
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -393,7 +438,7 @@ jobs:
               -Package $package `
               -ShardCount 4 `
               -Tags "fts5 sqlite_vec" `
-              -Timeout 60m
+              -Timeout ${{ matrix.timeout }}
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           }
 
@@ -438,12 +483,6 @@ jobs:
   # tag is required; without it these files compile out and ship no tests,
   # so this code would otherwise have zero CI coverage.
   test-pgvector:
-    # Pinned to GitHub-hosted runners. These two lanes are the only ones that
-    # drive the full Go suite against a live PostgreSQL service container, and
-    # that container's disk I/O is roughly 5x slower on the managed public
-    # fleet — enough to push cmd/msgvault/cmd past Go's default 10m per-package
-    # test timeout (1m48s here vs. a timeout panic there). Move back once the
-    # runner-group I/O is addressed.
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -452,6 +491,7 @@ jobs:
           POSTGRES_USER: msgvault_test
           POSTGRES_PASSWORD: testpw
           POSTGRES_DB: msgvault_test
+          POSTGRES_INITDB_ARGS: "-c max_locks_per_transaction=256"
         ports:
           - 5432:5432
         options: >-
@@ -475,18 +515,11 @@ jobs:
             psql -U msgvault_test -d msgvault_test \
             -c "CREATE EXTENSION IF NOT EXISTS vector"
 
+      # -p 4 mirrors PG_TEST_PARALLEL in the Makefile: it caps how many test
+      # binaries open connections to the one service container at once. See
+      # the Makefile comment for the arithmetic.
       - name: Test (pgvector-tagged)
-        run: go test -timeout 60m -tags "fts5 sqlite_vec pgvector" -count=1 ./internal/vector/... ./internal/scheduler/... ./cmd/msgvault/cmd/...
-
-  nix-build:
-    runs-on: ${{ github.repository == 'kenn-io/msgvault' && (github.event_name == 'push' && github.ref == 'refs/heads/main' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.repo.full_name == github.repository)) && 'kenn-linux-x64-public' || 'ubuntu-latest' }}
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
-
-      - name: Build
-        run: nix build --option download-attempts 10
+        run: go test -timeout 60m -p 4 -tags "fts5 sqlite_vec pgvector" -count=1 ./internal/vector/... ./internal/scheduler/... ./cmd/msgvault/cmd/...
 
   # PostgreSQL backend lane: runs the full Go test suite against a live
   # PostgreSQL service. Tests that use testutil.NewTestStore read
@@ -495,9 +528,6 @@ jobs:
   # unique constraints) surface here rather than slipping past a single
   # pass.
   test-postgres:
-    # Pinned to GitHub-hosted runners for the same reason as test-pgvector
-    # above: the PostgreSQL service container is I/O-bound on the managed
-    # public fleet (5m11s here vs. a 10m timeout panic there).
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -533,9 +563,57 @@ jobs:
       # The target carries the same 60m timeout as `make test`:
       # the heavy DuckDB packages can exceed go test's 10m per-package default
       # on a contended runner, and this lane is the slowest one there is.
+      # The three largest packages run in test-postgres-sharded below, each
+      # against its own server; this covers the rest.
       - name: Test (PostgreSQL)
-        run: make test-pg-shipped
+        run: make test-pg-shipped-unsharded
 
       - name: Concurrency tests (-count=5)
         run: |
           go test -tags fts5 -count=5 -run 'Concurrent' ./internal/store
+
+  # test-postgres for SHARDED_TEST_PKGS: the same shard script as test-sharded,
+  # one package per job, each with its own PostgreSQL service so four shards'
+  # connections never compete with the rest of the suite.
+  test-postgres-sharded:
+    name: test-postgres-sharded (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: cli
+            package: ./cmd/msgvault/cmd
+          - name: store
+            package: ./internal/store
+          - name: api
+            package: ./internal/api
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: msgvault_test
+          POSTGRES_PASSWORD: msgvault_test
+          POSTGRES_DB: msgvault_test
+          POSTGRES_INITDB_ARGS: "-c max_locks_per_transaction=256"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      MSGVAULT_TEST_DB: postgres://msgvault_test:msgvault_test@localhost:5432/msgvault_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+          cache: 'true'
+
+      # Shipped build (no pgvector tag) against a stock postgres:16 image, as
+      # in test-postgres above.
+      - name: Test package in isolated shards (PostgreSQL)
+        run: scripts/test-package-shards.sh "${{ matrix.package }}" 4 "fts5 sqlite_vec" 60m

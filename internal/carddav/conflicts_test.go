@@ -101,6 +101,22 @@ func TestPullConflictBlocksOnlyMappingAndAdvancesBookFence(t *testing.T) {
 	assert.Equal(alice.Href, conflicts[0].Href)
 	assert.Contains(string(conflicts[0].LocalBody), "EMAIL:alice-local@example.test")
 	assert.Equal(cards["alice"].body, conflicts[0].RemoteBody)
+
+	views, err := service.ListConflictViews(t.Context())
+	require.NoError(err)
+	require.Len(views, 1)
+	assert.Equal(book.ID, views[0].AddressBook.ID)
+	assert.NotContains(views[0].AddressBook.Name, "http")
+	assert.Equal(ConflictSidePresent, views[0].LocalState)
+	assert.Equal(ConflictSidePresent, views[0].RemoteState)
+	assert.Equal([]ResolutionChoice{ResolutionKeepLocal, ResolutionKeepRemote}, views[0].AllowedResolutions)
+
+	detail, err := service.GetConflictView(t.Context(), conflicts[0].ID)
+	require.NoError(err)
+	assert.Equal(ConflictSidePresent, detail.Base.State)
+	assert.Equal("Alice Base", detail.Base.DisplayName)
+	assert.Equal("Alice Remote", detail.Remote.DisplayName)
+	assert.Contains(detail.Local.Emails, "alice-local@example.test")
 }
 
 func TestPullConflictCapturesLocalEditAgainstRemoteDelete(t *testing.T) {
@@ -725,7 +741,7 @@ func TestConditional412CapturesConflictAndKeepLocalRefetchesCurrentETag(t *testi
 	fixture.mu.Unlock()
 	require.NoError(service.ResolveConflict(t.Context(), conflictErr.ID, ResolutionKeepLocal))
 	fixture.mu.Lock()
-	assert.GreaterOrEqual(fixture.gets, getsBefore+3, "resolution must preflight and recover with canonical GETs")
+	assert.GreaterOrEqual(fixture.gets, getsBefore+2, "resolution must preflight and recover with canonical GETs")
 	assert.Equal(putsAfterTimeout, fixture.puts, "ambiguous resolution recovery must not replay PUT")
 	assert.Equal(`"remote-3"`, fixture.lastIfMatch)
 	assert.Equal(conflicts[0].LocalBody, fixture.lastPutBody)

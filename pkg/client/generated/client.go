@@ -55,6 +55,18 @@ type ClientInterface interface {
 	AddAccount(ctx context.Context, options *AddAccountRequestOptions, reqEditors ...runtime.RequestEditorFn) (*AddAccountResponseJSON, error)
 	AddAccountWithResponse(ctx context.Context, options *AddAccountRequestOptions, reqEditors ...runtime.RequestEditorFn) (*AddAccountResp, error)
 
+	// ListAgentTokens List active agent grants
+	ListAgentTokens(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*ListAgentTokensResponse, error)
+	ListAgentTokensWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*ListAgentTokensResp, error)
+
+	// IssueAgentToken Issue a restricted agent grant
+	IssueAgentToken(ctx context.Context, options *IssueAgentTokenRequestOptions, reqEditors ...runtime.RequestEditorFn) (*IssueAgentTokenResponse, error)
+	IssueAgentTokenWithResponse(ctx context.Context, options *IssueAgentTokenRequestOptions, reqEditors ...runtime.RequestEditorFn) (*IssueAgentTokenResp, error)
+
+	// RevokeAgentToken Revoke an agent grant by ID
+	RevokeAgentToken(ctx context.Context, options *RevokeAgentTokenRequestOptions, reqEditors ...runtime.RequestEditorFn) (*struct{}, error)
+	RevokeAgentTokenWithResponse(ctx context.Context, options *RevokeAgentTokenRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RevokeAgentTokenResp, error)
+
 	// GetAggregates Get aggregate rows
 	GetAggregates(ctx context.Context, options *GetAggregatesRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetAggregatesResponse, error)
 	GetAggregatesWithResponse(ctx context.Context, options *GetAggregatesRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetAggregatesResp, error)
@@ -139,6 +151,14 @@ type ClientInterface interface {
 	ResolveCardDAVConflict(ctx context.Context, options *ResolveCardDAVConflictRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ResolveCardDAVConflictResponse, error)
 	ResolveCardDAVConflictWithResponse(ctx context.Context, options *ResolveCardDAVConflictRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ResolveCardDAVConflictResp, error)
 
+	// BeginGoogleCardDAVAuthorization Start Google Contacts authorization in a browser
+	BeginGoogleCardDAVAuthorization(ctx context.Context, options *BeginGoogleCardDAVAuthorizationRequestOptions, reqEditors ...runtime.RequestEditorFn) (*BeginGoogleCardDAVAuthorizationResponse, error)
+	BeginGoogleCardDAVAuthorizationWithResponse(ctx context.Context, options *BeginGoogleCardDAVAuthorizationRequestOptions, reqEditors ...runtime.RequestEditorFn) (*BeginGoogleCardDAVAuthorizationResp, error)
+
+	// CompleteGoogleCardDAVAuthorization Complete Google Contacts authorization
+	CompleteGoogleCardDAVAuthorization(ctx context.Context, options *CompleteGoogleCardDAVAuthorizationRequestOptions, reqEditors ...runtime.RequestEditorFn) (*CompleteGoogleCardDAVAuthorizationResponse, error)
+	CompleteGoogleCardDAVAuthorizationWithResponse(ctx context.Context, options *CompleteGoogleCardDAVAuthorizationRequestOptions, reqEditors ...runtime.RequestEditorFn) (*CompleteGoogleCardDAVAuthorizationResp, error)
+
 	// UnpublishCardDAVPerson Unpublish a person from CardDAV
 	UnpublishCardDAVPerson(ctx context.Context, options *UnpublishCardDAVPersonRequestOptions, reqEditors ...runtime.RequestEditorFn) (*UnpublishCardDAVPersonResponse, error)
 	UnpublishCardDAVPersonWithResponse(ctx context.Context, options *UnpublishCardDAVPersonRequestOptions, reqEditors ...runtime.RequestEditorFn) (*UnpublishCardDAVPersonResp, error)
@@ -150,6 +170,22 @@ type ClientInterface interface {
 	// PublishCardDAVPerson Publish a person to CardDAV
 	PublishCardDAVPerson(ctx context.Context, options *PublishCardDAVPersonRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PublishCardDAVPersonResponse, error)
 	PublishCardDAVPersonWithResponse(ctx context.Context, options *PublishCardDAVPersonRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PublishCardDAVPersonResp, error)
+
+	// ApproveCardDAVPublication Approve a publication preview; conflicts require explicit resolution
+	ApproveCardDAVPublication(ctx context.Context, options *ApproveCardDAVPublicationRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ApproveCardDAVPublicationResponse, error)
+	ApproveCardDAVPublicationWithResponse(ctx context.Context, options *ApproveCardDAVPublicationRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ApproveCardDAVPublicationResp, error)
+
+	// PreviewCardDAVPublication Preview the exact vCard and approval token for a person's publication
+	PreviewCardDAVPublication(ctx context.Context, options *PreviewCardDAVPublicationRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PreviewCardDAVPublicationResponse, error)
+	PreviewCardDAVPublicationWithResponse(ctx context.Context, options *PreviewCardDAVPublicationRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PreviewCardDAVPublicationResp, error)
+
+	// ListCardDAVRuns List CardDAV synchronization runs
+	ListCardDAVRuns(ctx context.Context, options *ListCardDAVRunsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListCardDAVRunsResponse, error)
+	ListCardDAVRunsWithResponse(ctx context.Context, options *ListCardDAVRunsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListCardDAVRunsResp, error)
+
+	// GetCardDAVStatus Get CardDAV synchronization status
+	GetCardDAVStatus(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetCardDAVStatusResponse, error)
+	GetCardDAVStatusWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetCardDAVStatusResp, error)
 
 	// SyncCardDAV Trigger CardDAV synchronization
 	SyncCardDAV(ctx context.Context, options *SyncCardDAVRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SyncCardDAVResponse, error)
@@ -267,6 +303,10 @@ type ClientInterface interface {
 	RepairEncodingCLI(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*RepairEncodingCLIResponse, error)
 	RepairEncodingCLIWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*RepairEncodingCLIResp, error)
 
+	// RepairMessageCLI Repair or audit Gmail message snapshots
+	RepairMessageCLI(ctx context.Context, options *RepairMessageCLIRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RepairMessageCLIResponse, error)
+	RepairMessageCLIWithResponse(ctx context.Context, options *RepairMessageCLIRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RepairMessageCLIResp, error)
+
 	// RunCLI Run an allowlisted CLI command
 	RunCLI(ctx context.Context, options *RunCLIRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RunCLIResponse, error)
 	RunCLIWithResponse(ctx context.Context, options *RunCLIRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RunCLIResp, error)
@@ -346,6 +386,10 @@ type ClientInterface interface {
 	// GetDocumentIndexStatus Get extracted document index status
 	GetDocumentIndexStatus(ctx context.Context, options *GetDocumentIndexStatusRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetDocumentIndexStatusResponse, error)
 	GetDocumentIndexStatusWithResponse(ctx context.Context, options *GetDocumentIndexStatusRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetDocumentIndexStatusResp, error)
+
+	// GetCurrentDocumentIndexStatus Get extracted document index status for the selected durable profile
+	GetCurrentDocumentIndexStatus(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetCurrentDocumentIndexStatusResponse, error)
+	GetCurrentDocumentIndexStatusWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetCurrentDocumentIndexStatusResp, error)
 
 	// GetDocumentVectorStatus Get document vector generation, consent, usage, and failure status
 	GetDocumentVectorStatus(ctx context.Context, options *GetDocumentVectorStatusRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetDocumentVectorStatusResponse, error)
@@ -463,6 +507,14 @@ type ClientInterface interface {
 	ImportMeeting(ctx context.Context, options *ImportMeetingRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ImportMeetingResponseJSON, error)
 	ImportMeetingWithResponse(ctx context.Context, options *ImportMeetingRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ImportMeetingResp, error)
 
+	// CreateImportJob Start a bounded historical import
+	CreateImportJob(ctx context.Context, options *CreateImportJobRequestOptions, reqEditors ...runtime.RequestEditorFn) (*CreateImportJobResponse, error)
+	CreateImportJobWithResponse(ctx context.Context, options *CreateImportJobRequestOptions, reqEditors ...runtime.RequestEditorFn) (*CreateImportJobResp, error)
+
+	// GetImportJob Get historical import status
+	GetImportJob(ctx context.Context, options *GetImportJobRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetImportJobResponse, error)
+	GetImportJobWithResponse(ctx context.Context, options *GetImportJobRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetImportJobResp, error)
+
 	// SearchIntegrationTasks Search tasks in the configured project
 	SearchIntegrationTasks(ctx context.Context, options *SearchIntegrationTasksRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SearchIntegrationTasksResponse, error)
 	SearchIntegrationTasksWithResponse(ctx context.Context, options *SearchIntegrationTasksRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SearchIntegrationTasksResp, error)
@@ -534,6 +586,18 @@ type ClientInterface interface {
 	// GetOCRStatus Get attachment text extraction status
 	GetOCRStatus(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetOCRStatusResponse, error)
 	GetOCRStatusWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetOCRStatusResp, error)
+
+	// ListOperationRuns List normalized operation history
+	ListOperationRuns(ctx context.Context, options *ListOperationRunsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListOperationRunsResponse, error)
+	ListOperationRunsWithResponse(ctx context.Context, options *ListOperationRunsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListOperationRunsResp, error)
+
+	// GetOperationRun Get one normalized operation run
+	GetOperationRun(ctx context.Context, options *GetOperationRunRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetOperationRunResponse, error)
+	GetOperationRunWithResponse(ctx context.Context, options *GetOperationRunRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetOperationRunResp, error)
+
+	// GetOperationStatus Get normalized operation lane status
+	GetOperationStatus(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetOperationStatusResponse, error)
+	GetOperationStatusWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetOperationStatusResp, error)
 
 	// ListOrganizations List organizations
 	ListOrganizations(ctx context.Context, options *ListOrganizationsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListOrganizationsResponse, error)
@@ -623,6 +687,10 @@ type ClientInterface interface {
 	CreatePerson(ctx context.Context, options *CreatePersonRequestOptions, reqEditors ...runtime.RequestEditorFn) (*CreatePersonResponseJSON, error)
 	CreatePersonWithResponse(ctx context.Context, options *CreatePersonRequestOptions, reqEditors ...runtime.RequestEditorFn) (*CreatePersonResp, error)
 
+	// ListDirectoryPeople Query durable people for the Directory
+	ListDirectoryPeople(ctx context.Context, options *ListDirectoryPeopleRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListDirectoryPeopleResponse, error)
+	ListDirectoryPeopleWithResponse(ctx context.Context, options *ListDirectoryPeopleRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListDirectoryPeopleResp, error)
+
 	// SearchPeople Search durable people semantically
 	SearchPeople(ctx context.Context, options *SearchPeopleRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SearchPeopleResponse, error)
 	SearchPeopleWithResponse(ctx context.Context, options *SearchPeopleRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SearchPeopleResp, error)
@@ -650,6 +718,30 @@ type ClientInterface interface {
 	// SetPersonAttribute Set a person's attribute value
 	SetPersonAttribute(ctx context.Context, options *SetPersonAttributeRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SetPersonAttributeResponse, error)
 	SetPersonAttributeWithResponse(ctx context.Context, options *SetPersonAttributeRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SetPersonAttributeResp, error)
+
+	// GetPersonBrief Get a person's current brief version
+	GetPersonBrief(ctx context.Context, options *GetPersonBriefRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetPersonBriefResponse, error)
+	GetPersonBriefWithResponse(ctx context.Context, options *GetPersonBriefRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetPersonBriefResp, error)
+
+	// GetPersonBriefEnrollment Get a person's brief enrollment
+	GetPersonBriefEnrollment(ctx context.Context, options *GetPersonBriefEnrollmentRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetPersonBriefEnrollmentResponse, error)
+	GetPersonBriefEnrollmentWithResponse(ctx context.Context, options *GetPersonBriefEnrollmentRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetPersonBriefEnrollmentResp, error)
+
+	// SetPersonBriefEnrollment Replace a person's brief enrollment
+	SetPersonBriefEnrollment(ctx context.Context, options *SetPersonBriefEnrollmentRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SetPersonBriefEnrollmentResponse, error)
+	SetPersonBriefEnrollmentWithResponse(ctx context.Context, options *SetPersonBriefEnrollmentRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SetPersonBriefEnrollmentResp, error)
+
+	// GeneratePersonBrief Generate a person's brief now
+	GeneratePersonBrief(ctx context.Context, options *GeneratePersonBriefRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GeneratePersonBriefResponse, error)
+	GeneratePersonBriefWithResponse(ctx context.Context, options *GeneratePersonBriefRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GeneratePersonBriefResp, error)
+
+	// RejectPersonBrief Reject a person's current brief version
+	RejectPersonBrief(ctx context.Context, options *RejectPersonBriefRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RejectPersonBriefResponse, error)
+	RejectPersonBriefWithResponse(ctx context.Context, options *RejectPersonBriefRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RejectPersonBriefResp, error)
+
+	// ListPersonBriefVersions List a person's brief version history
+	ListPersonBriefVersions(ctx context.Context, options *ListPersonBriefVersionsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListPersonBriefVersionsResponse, error)
+	ListPersonBriefVersionsWithResponse(ctx context.Context, options *ListPersonBriefVersionsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListPersonBriefVersionsResp, error)
 
 	// GetPersonContactState Get computed contact state for a person
 	GetPersonContactState(ctx context.Context, options *GetPersonContactStateRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetPersonContactStateResponse, error)
@@ -702,6 +794,10 @@ type ClientInterface interface {
 	// ListPersonMerges List merge history for a durable person
 	ListPersonMerges(ctx context.Context, options *ListPersonMergesRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListPersonMergesResponse, error)
 	ListPersonMergesWithResponse(ctx context.Context, options *ListPersonMergesRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListPersonMergesResp, error)
+
+	// GetPersonNetwork Get a bounded curated person network
+	GetPersonNetwork(ctx context.Context, options *GetPersonNetworkRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetPersonNetworkResponse, error)
+	GetPersonNetworkWithResponse(ctx context.Context, options *GetPersonNetworkRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetPersonNetworkResp, error)
 
 	// AppendPersonNote Append to a person's notes
 	AppendPersonNote(ctx context.Context, options *AppendPersonNoteRequestOptions, reqEditors ...runtime.RequestEditorFn) (*AppendPersonNoteResponse, error)
@@ -831,6 +927,10 @@ type ClientInterface interface {
 	PatchSavedView(ctx context.Context, options *PatchSavedViewRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PatchSavedViewResponse, error)
 	PatchSavedViewWithResponse(ctx context.Context, options *PatchSavedViewRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PatchSavedViewResp, error)
 
+	// RunSavedView Run a shared analytical Saved View through its canonical Explore definition
+	RunSavedView(ctx context.Context, options *RunSavedViewRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RunSavedViewResponseJSON, error)
+	RunSavedViewWithResponse(ctx context.Context, options *RunSavedViewRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RunSavedViewResp, error)
+
 	// GetSchedulerStatus Get scheduler status
 	GetSchedulerStatus(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetSchedulerStatusResponse, error)
 	GetSchedulerStatusWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetSchedulerStatusResp, error)
@@ -870,6 +970,18 @@ type ClientInterface interface {
 	// PatchSettings Update browser-managed settings
 	PatchSettings(ctx context.Context, options *PatchSettingsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PatchSettingsResponse, error)
 	PatchSettingsWithResponse(ctx context.Context, options *PatchSettingsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PatchSettingsResp, error)
+
+	// PutSettingsPersonEnrichmentProvider Create or update one named person-enrichment provider
+	PutSettingsPersonEnrichmentProvider(ctx context.Context, options *PutSettingsPersonEnrichmentProviderRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PutSettingsPersonEnrichmentProviderResponse, error)
+	PutSettingsPersonEnrichmentProviderWithResponse(ctx context.Context, options *PutSettingsPersonEnrichmentProviderRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PutSettingsPersonEnrichmentProviderResp, error)
+
+	// DeleteSettingsProviderCredential Clear a stored provider credential
+	DeleteSettingsProviderCredential(ctx context.Context, options *DeleteSettingsProviderCredentialRequestOptions, reqEditors ...runtime.RequestEditorFn) (*DeleteSettingsProviderCredentialResponse, error)
+	DeleteSettingsProviderCredentialWithResponse(ctx context.Context, options *DeleteSettingsProviderCredentialRequestOptions, reqEditors ...runtime.RequestEditorFn) (*DeleteSettingsProviderCredentialResp, error)
+
+	// PutSettingsProviderCredential Set a write-only provider credential
+	PutSettingsProviderCredential(ctx context.Context, options *PutSettingsProviderCredentialRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PutSettingsProviderCredentialResponse, error)
+	PutSettingsProviderCredentialWithResponse(ctx context.Context, options *PutSettingsProviderCredentialRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PutSettingsProviderCredentialResp, error)
 
 	// ListSourceStatus List source sync status
 	ListSourceStatus(ctx context.Context, options *ListSourceStatusRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListSourceStatusResponse, error)
@@ -1275,6 +1387,161 @@ func (c *Client) AddAccount(ctx context.Context, options *AddAccountRequestOptio
 	}
 
 	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/accounts")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// ListAgentTokens List active agent grants
+func (c *Client) ListAgentTokens(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*ListAgentTokensResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/agent-tokens",
+		Method:     "GET",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*ListAgentTokensResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(ListAgentTokensErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "ListAgentTokensErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(ListAgentTokensResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "ListAgentTokensResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/agent-tokens")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// IssueAgentToken Issue a restricted agent grant
+func (c *Client) IssueAgentToken(ctx context.Context, options *IssueAgentTokenRequestOptions, reqEditors ...runtime.RequestEditorFn) (*IssueAgentTokenResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/v1/agent-tokens",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*IssueAgentTokenResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 201 {
+			target := new(IssueAgentTokenErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "IssueAgentTokenErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(IssueAgentTokenResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "IssueAgentTokenResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/agent-tokens")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// RevokeAgentToken Revoke an agent grant by ID
+func (c *Client) RevokeAgentToken(ctx context.Context, options *RevokeAgentTokenRequestOptions, reqEditors ...runtime.RequestEditorFn) (*struct{}, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/agent-tokens/{id}",
+		Method:     "DELETE",
+		Options:    options,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*struct{}, error) {
+		if resp.StatusCode != 204 {
+			return nil, runtime.NewClientAPIError(fmt.Errorf("unexpected status code: %d", resp.StatusCode),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		return nil, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/agent-tokens/{id}")
 	if err != nil {
 		return nil, fmt.Errorf("error executing request: %w", err)
 	}
@@ -2580,6 +2847,134 @@ func (c *Client) ResolveCardDAVConflict(ctx context.Context, options *ResolveCar
 	return responseParser(ctx, resp)
 }
 
+// BeginGoogleCardDAVAuthorization Start Google Contacts authorization in a browser
+func (c *Client) BeginGoogleCardDAVAuthorization(ctx context.Context, options *BeginGoogleCardDAVAuthorizationRequestOptions, reqEditors ...runtime.RequestEditorFn) (*BeginGoogleCardDAVAuthorizationResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/v1/carddav/google/authorize",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*BeginGoogleCardDAVAuthorizationResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(BeginGoogleCardDAVAuthorizationErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "BeginGoogleCardDAVAuthorizationErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(BeginGoogleCardDAVAuthorizationResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "BeginGoogleCardDAVAuthorizationResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/carddav/google/authorize")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// CompleteGoogleCardDAVAuthorization Complete Google Contacts authorization
+func (c *Client) CompleteGoogleCardDAVAuthorization(ctx context.Context, options *CompleteGoogleCardDAVAuthorizationRequestOptions, reqEditors ...runtime.RequestEditorFn) (*CompleteGoogleCardDAVAuthorizationResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/v1/carddav/google/callback",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*CompleteGoogleCardDAVAuthorizationResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(CompleteGoogleCardDAVAuthorizationErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "CompleteGoogleCardDAVAuthorizationErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(CompleteGoogleCardDAVAuthorizationResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "CompleteGoogleCardDAVAuthorizationResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/carddav/google/callback")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
 // UnpublishCardDAVPerson Unpublish a person from CardDAV
 func (c *Client) UnpublishCardDAVPerson(ctx context.Context, options *UnpublishCardDAVPersonRequestOptions, reqEditors ...runtime.RequestEditorFn) (*UnpublishCardDAVPersonResponse, error) {
 	var err error
@@ -2763,6 +3158,258 @@ func (c *Client) PublishCardDAVPerson(ctx context.Context, options *PublishCardD
 	}
 
 	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/carddav/publications/{person_id}")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// ApproveCardDAVPublication Approve a publication preview; conflicts require explicit resolution
+func (c *Client) ApproveCardDAVPublication(ctx context.Context, options *ApproveCardDAVPublicationRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ApproveCardDAVPublicationResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/v1/carddav/publications/{person_id}/approve",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*ApproveCardDAVPublicationResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(ApproveCardDAVPublicationErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "ApproveCardDAVPublicationErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(ApproveCardDAVPublicationResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "ApproveCardDAVPublicationResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/carddav/publications/{person_id}/approve")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// PreviewCardDAVPublication Preview the exact vCard and approval token for a person's publication
+func (c *Client) PreviewCardDAVPublication(ctx context.Context, options *PreviewCardDAVPublicationRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PreviewCardDAVPublicationResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/carddav/publications/{person_id}/preview",
+		Method:     "GET",
+		Options:    options,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*PreviewCardDAVPublicationResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(PreviewCardDAVPublicationErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "PreviewCardDAVPublicationErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(PreviewCardDAVPublicationResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "PreviewCardDAVPublicationResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/carddav/publications/{person_id}/preview")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// ListCardDAVRuns List CardDAV synchronization runs
+func (c *Client) ListCardDAVRuns(ctx context.Context, options *ListCardDAVRunsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListCardDAVRunsResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/carddav/runs",
+		Method:     "GET",
+		Options:    options,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*ListCardDAVRunsResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(ListCardDAVRunsErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "ListCardDAVRunsErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(ListCardDAVRunsResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "ListCardDAVRunsResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/carddav/runs")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// GetCardDAVStatus Get CardDAV synchronization status
+func (c *Client) GetCardDAVStatus(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetCardDAVStatusResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/carddav/status",
+		Method:     "GET",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*GetCardDAVStatusResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(GetCardDAVStatusErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "GetCardDAVStatusErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(GetCardDAVStatusResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "GetCardDAVStatusResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/carddav/status")
 	if err != nil {
 		return nil, fmt.Errorf("error executing request: %w", err)
 	}
@@ -4544,6 +5191,56 @@ func (c *Client) RepairEncodingCLI(ctx context.Context, reqEditors ...runtime.Re
 	return responseParser(ctx, resp)
 }
 
+// RepairMessageCLI Repair or audit Gmail message snapshots
+func (c *Client) RepairMessageCLI(ctx context.Context, options *RepairMessageCLIRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RepairMessageCLIResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/v1/cli/repair-message",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*RepairMessageCLIResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(RepairMessageCLIErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "RepairMessageCLIErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		result := RepairMessageCLIResponse(bodyBytes)
+		return &result, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/cli/repair-message")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
 // RunCLI Run an allowlisted CLI command
 func (c *Client) RunCLI(ctx context.Context, options *RunCLIRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RunCLIResponse, error) {
 	var err error
@@ -5718,6 +6415,68 @@ func (c *Client) GetDocumentIndexStatus(ctx context.Context, options *GetDocumen
 	}
 
 	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/documents/status")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// GetCurrentDocumentIndexStatus Get extracted document index status for the selected durable profile
+func (c *Client) GetCurrentDocumentIndexStatus(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetCurrentDocumentIndexStatusResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/documents/status/current",
+		Method:     "GET",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*GetCurrentDocumentIndexStatusResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(GetCurrentDocumentIndexStatusErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "GetCurrentDocumentIndexStatusErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(GetCurrentDocumentIndexStatusResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "GetCurrentDocumentIndexStatusResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/documents/status/current")
 	if err != nil {
 		return nil, fmt.Errorf("error executing request: %w", err)
 	}
@@ -7541,6 +8300,133 @@ func (c *Client) ImportMeeting(ctx context.Context, options *ImportMeetingReques
 	return responseParser(ctx, resp)
 }
 
+// CreateImportJob Start a bounded historical import
+func (c *Client) CreateImportJob(ctx context.Context, options *CreateImportJobRequestOptions, reqEditors ...runtime.RequestEditorFn) (*CreateImportJobResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/v1/imports",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*CreateImportJobResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 202 {
+			target := new(CreateImportJobErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "CreateImportJobErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(CreateImportJobResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "CreateImportJobResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/imports")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// GetImportJob Get historical import status
+func (c *Client) GetImportJob(ctx context.Context, options *GetImportJobRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetImportJobResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/imports/{job_id}",
+		Method:     "GET",
+		Options:    options,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*GetImportJobResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(GetImportJobErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "GetImportJobErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(GetImportJobResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "GetImportJobResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/imports/{job_id}")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
 // SearchIntegrationTasks Search tasks in the configured project
 func (c *Client) SearchIntegrationTasks(ctx context.Context, options *SearchIntegrationTasksRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SearchIntegrationTasksResponse, error) {
 	var err error
@@ -8634,6 +9520,194 @@ func (c *Client) GetOCRStatus(ctx context.Context, reqEditors ...runtime.Request
 	}
 
 	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/ocr/status")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// ListOperationRuns List normalized operation history
+func (c *Client) ListOperationRuns(ctx context.Context, options *ListOperationRunsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListOperationRunsResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/operations/runs",
+		Method:     "GET",
+		Options:    options,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*ListOperationRunsResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(ListOperationRunsErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "ListOperationRunsErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(ListOperationRunsResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "ListOperationRunsResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/operations/runs")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// GetOperationRun Get one normalized operation run
+func (c *Client) GetOperationRun(ctx context.Context, options *GetOperationRunRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetOperationRunResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/operations/runs/{id}",
+		Method:     "GET",
+		Options:    options,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*GetOperationRunResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(GetOperationRunErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "GetOperationRunErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(GetOperationRunResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "GetOperationRunResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/operations/runs/{id}")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// GetOperationStatus Get normalized operation lane status
+func (c *Client) GetOperationStatus(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetOperationStatusResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/operations/status",
+		Method:     "GET",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*GetOperationStatusResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(GetOperationStatusErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "GetOperationStatusErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(GetOperationStatusResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "GetOperationStatusResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/operations/status")
 	if err != nil {
 		return nil, fmt.Errorf("error executing request: %w", err)
 	}
@@ -10007,6 +11081,69 @@ func (c *Client) CreatePerson(ctx context.Context, options *CreatePersonRequestO
 	return responseParser(ctx, resp)
 }
 
+// ListDirectoryPeople Query durable people for the Directory
+func (c *Client) ListDirectoryPeople(ctx context.Context, options *ListDirectoryPeopleRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListDirectoryPeopleResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/people/directory",
+		Method:     "GET",
+		Options:    options,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*ListDirectoryPeopleResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(ListDirectoryPeopleErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "ListDirectoryPeopleErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(ListDirectoryPeopleResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "ListDirectoryPeopleResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/people/directory")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
 // SearchPeople Search durable people semantically
 func (c *Client) SearchPeople(ctx context.Context, options *SearchPeopleRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SearchPeopleResponse, error) {
 	var err error
@@ -10430,6 +11567,386 @@ func (c *Client) SetPersonAttribute(ctx context.Context, options *SetPersonAttri
 	}
 
 	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/people/{id}/attributes/{slug}")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// GetPersonBrief Get a person's current brief version
+func (c *Client) GetPersonBrief(ctx context.Context, options *GetPersonBriefRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetPersonBriefResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/people/{id}/brief",
+		Method:     "GET",
+		Options:    options,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*GetPersonBriefResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(GetPersonBriefErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "GetPersonBriefErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(GetPersonBriefResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "GetPersonBriefResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/people/{id}/brief")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// GetPersonBriefEnrollment Get a person's brief enrollment
+func (c *Client) GetPersonBriefEnrollment(ctx context.Context, options *GetPersonBriefEnrollmentRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetPersonBriefEnrollmentResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/people/{id}/brief-enrollment",
+		Method:     "GET",
+		Options:    options,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*GetPersonBriefEnrollmentResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(GetPersonBriefEnrollmentErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "GetPersonBriefEnrollmentErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(GetPersonBriefEnrollmentResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "GetPersonBriefEnrollmentResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/people/{id}/brief-enrollment")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// SetPersonBriefEnrollment Replace a person's brief enrollment
+func (c *Client) SetPersonBriefEnrollment(ctx context.Context, options *SetPersonBriefEnrollmentRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SetPersonBriefEnrollmentResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/v1/people/{id}/brief-enrollment",
+		Method:      "PUT",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*SetPersonBriefEnrollmentResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(SetPersonBriefEnrollmentErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "SetPersonBriefEnrollmentErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(SetPersonBriefEnrollmentResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "SetPersonBriefEnrollmentResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/people/{id}/brief-enrollment")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// GeneratePersonBrief Generate a person's brief now
+func (c *Client) GeneratePersonBrief(ctx context.Context, options *GeneratePersonBriefRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GeneratePersonBriefResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/people/{id}/brief/generate",
+		Method:     "POST",
+		Options:    options,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*GeneratePersonBriefResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(GeneratePersonBriefErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "GeneratePersonBriefErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(GeneratePersonBriefResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "GeneratePersonBriefResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/people/{id}/brief/generate")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// RejectPersonBrief Reject a person's current brief version
+func (c *Client) RejectPersonBrief(ctx context.Context, options *RejectPersonBriefRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RejectPersonBriefResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/v1/people/{id}/brief/reject",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*RejectPersonBriefResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(RejectPersonBriefErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "RejectPersonBriefErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(RejectPersonBriefResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "RejectPersonBriefResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/people/{id}/brief/reject")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// ListPersonBriefVersions List a person's brief version history
+func (c *Client) ListPersonBriefVersions(ctx context.Context, options *ListPersonBriefVersionsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*ListPersonBriefVersionsResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/people/{id}/brief/versions",
+		Method:     "GET",
+		Options:    options,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*ListPersonBriefVersionsResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(ListPersonBriefVersionsErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "ListPersonBriefVersionsErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(ListPersonBriefVersionsResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "ListPersonBriefVersionsResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/people/{id}/brief/versions")
 	if err != nil {
 		return nil, fmt.Errorf("error executing request: %w", err)
 	}
@@ -11252,6 +12769,69 @@ func (c *Client) ListPersonMerges(ctx context.Context, options *ListPersonMerges
 	}
 
 	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/people/{id}/merges")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// GetPersonNetwork Get a bounded curated person network
+func (c *Client) GetPersonNetwork(ctx context.Context, options *GetPersonNetworkRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetPersonNetworkResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/people/{id}/network",
+		Method:     "GET",
+		Options:    options,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*GetPersonNetworkResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(GetPersonNetworkErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "GetPersonNetworkErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(GetPersonNetworkResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "GetPersonNetworkResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/people/{id}/network")
 	if err != nil {
 		return nil, fmt.Errorf("error executing request: %w", err)
 	}
@@ -13228,6 +14808,70 @@ func (c *Client) PatchSavedView(ctx context.Context, options *PatchSavedViewRequ
 	return responseParser(ctx, resp)
 }
 
+// RunSavedView Run a shared analytical Saved View through its canonical Explore definition
+func (c *Client) RunSavedView(ctx context.Context, options *RunSavedViewRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RunSavedViewResponseJSON, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/v1/saved-views/{id}/run",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*RunSavedViewResponseJSON, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(RunSavedViewErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "RunSavedViewErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(RunSavedViewResponseJSON)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "RunSavedViewResponseJSON",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/saved-views/{id}/run")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
 // GetSchedulerStatus Get scheduler status
 func (c *Client) GetSchedulerStatus(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetSchedulerStatusResponse, error) {
 	var err error
@@ -13853,6 +15497,197 @@ func (c *Client) PatchSettings(ctx context.Context, options *PatchSettingsReques
 	}
 
 	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/settings")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// PutSettingsPersonEnrichmentProvider Create or update one named person-enrichment provider
+func (c *Client) PutSettingsPersonEnrichmentProvider(ctx context.Context, options *PutSettingsPersonEnrichmentProviderRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PutSettingsPersonEnrichmentProviderResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/v1/settings/person-enrichment/providers/{name}",
+		Method:      "PUT",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*PutSettingsPersonEnrichmentProviderResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(PutSettingsPersonEnrichmentProviderErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "PutSettingsPersonEnrichmentProviderErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(PutSettingsPersonEnrichmentProviderResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "PutSettingsPersonEnrichmentProviderResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/settings/person-enrichment/providers/{name}")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// DeleteSettingsProviderCredential Clear a stored provider credential
+func (c *Client) DeleteSettingsProviderCredential(ctx context.Context, options *DeleteSettingsProviderCredentialRequestOptions, reqEditors ...runtime.RequestEditorFn) (*DeleteSettingsProviderCredentialResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/settings/provider-credentials/{credential_id}",
+		Method:     "DELETE",
+		Options:    options,
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*DeleteSettingsProviderCredentialResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(DeleteSettingsProviderCredentialErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "DeleteSettingsProviderCredentialErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(DeleteSettingsProviderCredentialResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "DeleteSettingsProviderCredentialResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/settings/provider-credentials/{credential_id}")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+	return responseParser(ctx, resp)
+}
+
+// PutSettingsProviderCredential Set a write-only provider credential
+func (c *Client) PutSettingsProviderCredential(ctx context.Context, options *PutSettingsProviderCredentialRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PutSettingsProviderCredentialResponse, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/v1/settings/provider-credentials/{credential_id}",
+		Method:      "PUT",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	responseParser := func(ctx context.Context, resp *runtime.Response) (*PutSettingsProviderCredentialResponse, error) {
+		bodyBytes := resp.Content
+		if resp.StatusCode != 200 {
+			target := new(PutSettingsProviderCredentialErrorResponse)
+			// Handle empty error response body gracefully - skip unmarshal if no content
+			if len(bodyBytes) > 0 {
+				if err = json.Unmarshal(bodyBytes, target); err != nil {
+					return nil, &runtime.ResponseDecodeError{
+						StatusCode:    resp.StatusCode,
+						ContentType:   resp.Headers.Get("Content-Type"),
+						ContentLength: len(bodyBytes),
+						TargetType:    "PutSettingsProviderCredentialErrorResponse",
+						Body:          bodyBytes,
+						Err:           err,
+					}
+				}
+			}
+			// Return error with (possibly empty) target
+			if errTarget, ok := any(*target).(error); ok {
+				return nil, runtime.NewClientAPIError(errTarget, runtime.WithStatusCode(resp.StatusCode))
+			}
+			return nil, runtime.NewClientAPIError(fmt.Errorf("API error (status %d): %v", resp.StatusCode, *target),
+				runtime.WithStatusCode(resp.StatusCode))
+		}
+		target := new(PutSettingsProviderCredentialResponse)
+		// Handle empty response body gracefully
+		if len(bodyBytes) == 0 {
+			return target, nil
+		}
+		if err = json.Unmarshal(bodyBytes, target); err != nil {
+			return nil, &runtime.ResponseDecodeError{
+				StatusCode:    resp.StatusCode,
+				ContentType:   resp.Headers.Get("Content-Type"),
+				ContentLength: len(bodyBytes),
+				TargetType:    "PutSettingsProviderCredentialResponse",
+				Body:          bodyBytes,
+				Err:           err,
+			}
+		}
+		return target, nil
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/settings/provider-credentials/{credential_id}")
 	if err != nil {
 		return nil, fmt.Errorf("error executing request: %w", err)
 	}

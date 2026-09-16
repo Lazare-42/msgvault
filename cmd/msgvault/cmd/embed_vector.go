@@ -11,7 +11,10 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
+	"go.kenn.io/msgvault/internal/operations"
+	"go.kenn.io/msgvault/internal/providercredentials"
 	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
@@ -150,6 +153,17 @@ func runEmbed(cmd *cobra.Command) error {
 	personGate := vector.NewPinnedExactSemanticPersonEmbeddingGate(
 		cfg.Vector, currentSemanticPersonVectorConfigSource(), s,
 	)
+	credentialSnapshot, err := providercredentials.Read(cfg.TokensDir())
+	if err != nil {
+		return fmt.Errorf("load provider credentials: %w", err)
+	}
+	embeddingAPIKey, err := resolveProviderCredentialFromSnapshot(
+		credentialSnapshot, providercredentials.VectorEmbeddingsID,
+		cfg.Vector.Embeddings.Endpoint, cfg.Vector.Embeddings.APIKeyEnv,
+	)
+	if err != nil {
+		return fmt.Errorf("resolve text embedding credential: %w", err)
+	}
 
 	runtime, err := newEmbeddingRuntime(cfg.Vector, embeddingRuntimeDeps{
 		Backend: backend, VectorsDB: vectorsDB, MainDB: s.DB(), Store: s,
@@ -157,6 +171,7 @@ func runEmbed(cmd *cobra.Command) error {
 		TotalPending: totalPending,
 		Progress:     newProgressPrinter(errOut, totalPending, cfg.Vector.Embeddings.ETAWindow),
 		PersonGate:   personGate,
+		APIKey:       embeddingAPIKey,
 	})
 	if err != nil {
 		return fmt.Errorf("configure embedding runtime: %w", err)
@@ -200,10 +215,18 @@ func runEmbeddingPasses(
 	for {
 		var pass embed.RunResult
 		var err error
+		phase := "forward"
 		if first && backstop {
-			pass, err = runner.RunBackstop(ctx, gen)
+			phase = "backstop"
+		}
+		scope := operations.PassScope{
+			Key:     fmt.Sprintf("cli:%s:g:%d:%s", uuid.NewString(), gen, phase),
+			Trigger: operations.TriggerManual, StartedAt: time.Now().UTC(),
+		}
+		if first && backstop {
+			pass, err = runner.RunBackstop(ctx, gen, scope)
 		} else {
-			pass, err = runner.RunOnce(ctx, gen)
+			pass, err = runner.RunOnce(ctx, gen, scope)
 		}
 		if generationErr, ok := errors.AsType[*embed.GenerationRunError](err); ok {
 			if generationErr.Person != nil {

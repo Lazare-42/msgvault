@@ -63,6 +63,7 @@ type Filters struct {
 	SenderDomains []string `json:"sender_domains,omitempty"`
 	Recipients    []string `json:"recipients,omitempty"`
 	Labels        []string `json:"labels,omitempty"`
+	ListIDs       []string `json:"list_ids,omitempty"`
 	After         string   `json:"after,omitempty"`  // ISO date
 	Before        string   `json:"before,omitempty"` // ISO date
 	Account       string   `json:"account,omitempty"`
@@ -117,10 +118,10 @@ type Manifest struct {
 	Status      Status           `json:"status"`
 	Execution   *Execution       `json:"execution,omitempty"`
 	Source      *SourceReference `json:"source,omitempty"`
-	// RawFilter records the serialized HTTP API staging request fields for
-	// provenance — Filters cannot represent every request field
-	// (sender_name, recipient_name, source_id). Absent on manifests created
-	// by the TUI/CLI.
+	// RawFilter records the serialized staging criteria for provenance. Filters
+	// cannot represent every request field (search query, sender_name,
+	// recipient_name, source_id), so API and all-match TUI staging preserve the
+	// complete input here. It remains absent for explicit TUI/CLI selections.
 	RawFilter json.RawMessage `json:"raw_filter,omitempty"`
 }
 

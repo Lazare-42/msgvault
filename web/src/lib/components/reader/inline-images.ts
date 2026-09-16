@@ -1,66 +1,62 @@
+import { getMessageInlinePart as generatedGetMessageInlinePart } from '../../api/generated/api/api';
 import type { APIClient } from '../../api/client';
 import type { ArchivedInlineImage } from '../../content/sanitize';
 import { hardBoundedLimit, imagePlaceholderBlock, inertTemplate } from '../../content/sanitize';
-
+import {
+  MAX_ARCHIVED_REMOTE_IMAGE_URLS,
+  MAX_ARCHIVED_REMOTE_IMAGE_BYTES,
+  MAX_ARCHIVED_REMOTE_IMAGE_TOTAL_BYTES,
+  MAX_ARCHIVED_REMOTE_IMAGE_OCCURRENCES,
+  MAX_ARCHIVED_REMOTE_IMAGE_SERIALIZED_BYTES,
+} from './remote-image-limits';
 export { hardBoundedLimit };
-
 export const MAX_ARCHIVED_INLINE_IMAGE_CIDS = 32;
 export const MAX_ARCHIVED_INLINE_IMAGE_BYTES = 5 * 1024 * 1024;
 export const MAX_ARCHIVED_INLINE_IMAGE_TOTAL_BYTES = 20 * 1024 * 1024;
 export const MAX_ARCHIVED_INLINE_IMAGE_CONCURRENCY = 1;
 export const MAX_ARCHIVED_INLINE_IMAGE_OCCURRENCES = 128;
 export const MAX_ARCHIVED_INLINE_IMAGE_SERIALIZED_BYTES = 24 * 1024 * 1024;
-
 /** Image MIME types the shell will decode into data: URIs — for CID inline
  * parts and proxied remote images alike. */
 export const ARCHIVED_IMAGE_TYPES = new Set(['image/gif', 'image/jpeg', 'image/png', 'image/webp']);
-
 interface InlineOccurrence {
   alt: string;
   cid: string | undefined;
   placeholder: HTMLElement;
 }
-
 interface InlineGroup {
   cid: string;
+  remote: boolean;
   bytes?: Uint8Array;
   mimeType?: string;
   dataURL?: string;
 }
-
 export interface DecodedByteBudget {
   used: number;
 }
-
 /** Per-image and cumulative decoded-byte caps for one bounded stream read. */
 export interface DecodedByteLimits {
   imageBytes: number;
   totalBytes: number;
 }
-
 interface InlineImagePublicationLimits {
   occurrences?: number;
   dataURLBytes?: number;
 }
-
 export function abortError(): DOMException {
   return new DOMException('Aborted', 'AbortError');
 }
-
 export function throwIfAborted(signal: AbortSignal): void {
   if (signal.aborted) throw abortError();
 }
-
 function normalizedCID(value: string): string {
   let cid = value.trim();
   if (cid.startsWith('<') && cid.endsWith('>')) cid = cid.slice(1, -1).trim();
   return cid;
 }
-
 function unavailableInlineImage(alt: string): HTMLElement {
   return imagePlaceholderBlock(document, `Inline image unavailable${alt ? `: ${alt}` : ''}`);
 }
-
 export function bytesToDataURL(bytes: Uint8Array, mimeType: string): string {
   let binary = '';
   const chunkSize = 0x8000;
@@ -69,12 +65,11 @@ export function bytesToDataURL(bytes: Uint8Array, mimeType: string): string {
   }
   return `data:${mimeType};base64,${btoa(binary)}`;
 }
-
 export async function readBoundedStream(
   stream: ReadableStream<Uint8Array>,
   budget: DecodedByteBudget,
   signal: AbortSignal,
-  limits: DecodedByteLimits
+  limits: DecodedByteLimits,
 ): Promise<Uint8Array> {
   const reader = stream.getReader();
   const chunks: Uint8Array[] = [];
@@ -93,8 +88,7 @@ export async function readBoundedStream(
       if (done) break;
       const nextImageTotal = total + value.byteLength;
       const nextAggregateTotal = budget.used + value.byteLength;
-      if (nextImageTotal > limits.imageBytes ||
-        nextAggregateTotal > limits.totalBytes) {
+      if (nextImageTotal > limits.imageBytes || nextAggregateTotal > limits.totalBytes) {
         budget.used = Math.min(limits.totalBytes, nextAggregateTotal);
         await reader.cancel();
         throw new Error('Inline image exceeds decoded byte budget');
@@ -115,20 +109,26 @@ export async function readBoundedStream(
   }
   return bytes;
 }
-
 async function fetchInlineImage(
   client: APIClient,
   messageId: number,
   cid: string,
   budget: DecodedByteBudget,
-  signal: AbortSignal
-): Promise<{ bytes: Uint8Array; mimeType: string }> {
+  signal: AbortSignal,
+  limits: DecodedByteLimits,
+): Promise<{
+  bytes: Uint8Array;
+  mimeType: string;
+}> {
   throwIfAborted(signal);
-  const { data, response } = await client.GET('/api/v1/messages/{id}/inline', {
-    params: { path: { id: messageId }, query: { cid } },
-    parseAs: 'stream',
-    signal
-  });
+  const { data, response } = await generatedGetMessageInlinePart(
+    { id: messageId },
+    { cid },
+    {
+      ...client,
+      signal,
+    },
+  );
   if (signal.aborted) {
     if (data instanceof ReadableStream) await data.cancel();
     throw abortError();
@@ -140,23 +140,23 @@ async function fetchInlineImage(
     throw new Error('Inline image type is not permitted');
   }
   const contentLength = response.headers.get('Content-Length');
-  const remainingBytes = MAX_ARCHIVED_INLINE_IMAGE_TOTAL_BYTES - budget.used;
+  const remainingBytes = limits.totalBytes - budget.used;
   if (contentLength !== null) {
     const declaredSize = Number(contentLength);
-    if (!Number.isFinite(declaredSize) || declaredSize < 0 ||
-      declaredSize > MAX_ARCHIVED_INLINE_IMAGE_BYTES || declaredSize > remainingBytes) {
+    if (
+      !Number.isFinite(declaredSize) ||
+      declaredSize < 0 ||
+      declaredSize > limits.imageBytes ||
+      declaredSize > remainingBytes
+    ) {
       await data.cancel();
       throw new Error('Inline image exceeds decoded byte budget');
     }
   }
-  const bytes = await readBoundedStream(data, budget, signal, {
-    imageBytes: MAX_ARCHIVED_INLINE_IMAGE_BYTES,
-    totalBytes: MAX_ARCHIVED_INLINE_IMAGE_TOTAL_BYTES
-  });
+  const bytes = await readBoundedStream(data, budget, signal, limits);
   throwIfAborted(signal);
   return { bytes, mimeType };
 }
-
 export async function resolveArchivedInlineImages(options: {
   html: string;
   inlineImages: ArchivedInlineImage[];
@@ -173,8 +173,8 @@ export async function resolveArchivedInlineImages(options: {
     const index = Number(element.dataset.archivedInlineImage);
     if (Number.isSafeInteger(index) && index >= 0) placeholders.set(index, element);
   }
-
   const groups = new Map<string, InlineGroup>();
+  const counts = { inline: 0, remote: 0 };
   const orderedOccurrences: InlineOccurrence[] = [];
   options.inlineImages.forEach((inline, index) => {
     const loadingPlaceholder = placeholders.get(index);
@@ -182,27 +182,29 @@ export async function resolveArchivedInlineImages(options: {
     const placeholder = unavailableInlineImage(inline.alt);
     loadingPlaceholder.replaceWith(placeholder);
     const cid = normalizedCID(inline.cid);
+    const remote = /^remote-image:[0-9a-f]{64}$/.test(cid);
+    const kind = remote ? 'remote' : 'inline';
+    const maxCIDs = remote ? MAX_ARCHIVED_REMOTE_IMAGE_URLS : MAX_ARCHIVED_INLINE_IMAGE_CIDS;
     let admittedCID: string | undefined;
     if (cid && groups.has(cid)) admittedCID = cid;
-    else if (cid && groups.size < MAX_ARCHIVED_INLINE_IMAGE_CIDS) {
-      groups.set(cid, { cid });
+    else if (cid && counts[kind] < maxCIDs) {
+      groups.set(cid, { cid, remote });
+      counts[kind] += 1;
       admittedCID = cid;
     }
     orderedOccurrences.push({ alt: inline.alt, cid: admittedCID, placeholder });
   });
-
-  const budget: DecodedByteBudget = { used: 0 };
+  const budgets = { inline: { used: 0 }, remote: { used: 0 } };
   for (const group of groups.values()) {
     throwIfAborted(options.signal);
-    if (!options.client || budget.used >= MAX_ARCHIVED_INLINE_IMAGE_TOTAL_BYTES) continue;
+    const budget = budgets[group.remote ? 'remote' : 'inline'];
+    const limits = {
+      imageBytes: group.remote ? MAX_ARCHIVED_REMOTE_IMAGE_BYTES : MAX_ARCHIVED_INLINE_IMAGE_BYTES,
+      totalBytes: group.remote ? MAX_ARCHIVED_REMOTE_IMAGE_TOTAL_BYTES : MAX_ARCHIVED_INLINE_IMAGE_TOTAL_BYTES,
+    };
+    if (!options.client || budget.used >= limits.totalBytes) continue;
     try {
-      const decoded = await fetchInlineImage(
-        options.client,
-        options.messageId,
-        group.cid,
-        budget,
-        options.signal
-      );
+      const decoded = await fetchInlineImage(options.client, options.messageId, group.cid, budget, options.signal, limits);
       group.bytes = decoded.bytes;
       group.mimeType = decoded.mimeType;
     } catch (error) {
@@ -213,17 +215,25 @@ export async function resolveArchivedInlineImages(options: {
   }
   const maxPublishedOccurrences = hardBoundedLimit(
     options.publicationLimits?.occurrences,
-    MAX_ARCHIVED_INLINE_IMAGE_OCCURRENCES
+    MAX_ARCHIVED_INLINE_IMAGE_OCCURRENCES,
   );
   const maxSerializedBytes = hardBoundedLimit(
     options.publicationLimits?.dataURLBytes,
-    MAX_ARCHIVED_INLINE_IMAGE_SERIALIZED_BYTES
+    MAX_ARCHIVED_INLINE_IMAGE_SERIALIZED_BYTES,
   );
-  let publishedOccurrences = 0;
-  let serializedBytes = 0;
+  const publication = {
+    inline: { occurrences: 0, bytes: 0, maxOccurrences: maxPublishedOccurrences, maxBytes: maxSerializedBytes },
+    remote: {
+      occurrences: 0,
+      bytes: 0,
+      maxOccurrences: hardBoundedLimit(options.publicationLimits?.occurrences, MAX_ARCHIVED_REMOTE_IMAGE_OCCURRENCES),
+      maxBytes: hardBoundedLimit(options.publicationLimits?.dataURLBytes, MAX_ARCHIVED_REMOTE_IMAGE_SERIALIZED_BYTES),
+    },
+  };
   for (const occurrence of orderedOccurrences) {
-    if (publishedOccurrences >= maxPublishedOccurrences) break;
     const group = occurrence.cid ? groups.get(occurrence.cid) : undefined;
+    const budget = publication[group?.remote ? 'remote' : 'inline'];
+    if (budget.occurrences >= budget.maxOccurrences) continue;
     if (group && !group.dataURL && group.bytes && group.mimeType) {
       group.dataURL = bytesToDataURL(group.bytes, group.mimeType);
       group.bytes = undefined;
@@ -232,13 +242,13 @@ export async function resolveArchivedInlineImages(options: {
     if (!dataURL) continue;
     // Data URLs produced above are ASCII, so string length is also their exact
     // UTF-8 serialized byte charge, including MIME prefix and base64 expansion.
-    if (serializedBytes + dataURL.length > maxSerializedBytes) continue;
+    if (budget.bytes + dataURL.length > budget.maxBytes) continue;
     const image = document.createElement('img');
     image.alt = occurrence.alt;
     image.src = dataURL;
     occurrence.placeholder.replaceWith(image);
-    publishedOccurrences += 1;
-    serializedBytes += dataURL.length;
+    budget.occurrences += 1;
+    budget.bytes += dataURL.length;
   }
   throwIfAborted(options.signal);
   return template.innerHTML;

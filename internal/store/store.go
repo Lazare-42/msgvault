@@ -44,12 +44,17 @@ const HNSWEfSearch = 1000
 // methods, existing store code that does s.db.Query(...) compiles
 // unchanged and automatically routes through the logger.
 type Store struct {
-	db            *loggedDB
-	dbPath        string
-	dialect       Dialect
-	readOnly      bool // Opened via OpenReadOnly; skips WAL checkpoint on close
-	fts5Available bool // Whether FTS5 is available for full-text search
-	closeCleanup  func()
+	db                   *loggedDB
+	dbPath               string
+	sqliteFilesystemPath string
+	dialect              Dialect
+	readOnly             bool // Opened via OpenReadOnly; skips WAL checkpoint on close
+	fts5Available        bool // Whether FTS5 is available for full-text search
+	closeCleanup         func()
+	// directoryProjectionReady becomes true only after InitSchema has created
+	// the projection tables and dirty-marking triggers. Every writable Store
+	// transaction then refreshes its affected Directory rows before commit.
+	directoryProjectionReady bool
 
 	// syncGeneration is immutable metadata on a per-run Store view.
 	// Mutating transactions on that view fence the exact running source
@@ -58,11 +63,17 @@ type Store struct {
 	// share mutable run state.
 	syncGeneration *syncGeneration
 	syncBase       *Store
+	// syncExecutionLocks is shared with sync-scoped views. Each held lock is
+	// owned by the worker process, not by a durable sync_runs row.
+	syncExecutionLocks *syncExecutionLockState
+
+	cardDAVPersonOperationsMu sync.Mutex
+	cardDAVPersonOperations   map[int64]*cardDAVPersonOperation
 
 	sqliteOptimizeMu          sync.Mutex
 	documentVectorOperationMu sync.Mutex
 	// Test-only seams into migration, backfill, and transaction paths, nil in
-	// production and settable only from export_test.go. They belong to the
+	// production and settable only from test files. They belong to the
 	// Store rather than the package because more than one Store can be
 	// active at once inside a single test binary — test fixtures build their
 	// schemas concurrently — and a hook installed by one test must never fire
@@ -70,13 +81,22 @@ type Store struct {
 	// they were also a data race between a test that installs one and any
 	// concurrent migration that reads it.
 	initSchemaWindowHook                  func()
+	beforeLargeIndexBuildHook             func()
 	attributeSeedReadHook                 func(slug string)
 	contentChangedBackfillBatchHook       func(fromID, toID int64) error
 	backfillFTSBatchErrHook               func(fromID, toID int64) error
 	attachmentRoleRepairPreparedHook      func()
+	listIDRepairBeforeApplyHook           func()
+	listIDRepairAfterScanHook             func(context.Context, *loggedTx, []listIDRepairUpdate) error
+	listIDRepairAfterFingerprintLockHook  func()
+	imapLabelRepairPerMessageHook         func(messageID int64)
 	cardDAVConflictResolveSnapshotHook    func()
 	cardDAVTombstonePrepareSnapshotHook   func()
+	cardDAVReviewPersonLockHook           func()
+	cardDAVCollisionIdentityLockHook      func()
+	cardDAVPublicationStateReadHook       func()
 	identityMatchAcceptBeforeDecisionHook func()
+	senderRepairMessageLockHook           func()
 	personOperationBeforeIdentityLockHook func()
 	personMergeAfterSnapshotHook          func()
 	personEnrichmentClock                 func() time.Time
@@ -84,10 +104,15 @@ type Store struct {
 	personEnrichmentRunBarrier            func(phase string)
 	personEnrichmentTxBarrier             func(phase string)
 	personEnrichmentOwnershipBarrier      func(phase string, tx *loggedTx)
+	personNetworkSourceReadHook           func(limit, count int)
+	operationHistoryAfterAdapterReadHook  func(kind string)
+	operationHistoryStatusAfterActiveHook func(kind string)
 
 	// Zero means "use the production batch size"; see
-	// contentChangedBackfillBatch. Per-Store for the same reason.
+	// contentChangedBackfillBatch and rfc822IDBackfillBatch. Per-Store for
+	// the same reason.
 	contentChangedBackfillBatchSizeOverride int64
+	rfc822IDBackfillBatchSizeOverride       int
 }
 
 // synchronous=NORMAL in WAL mode cannot corrupt the database file on crash or
@@ -171,16 +196,20 @@ func OpenForTest(dbPath string) (*Store, error) {
 // openSQLite opens a SQLite database at the given file path with the
 // supplied DSN parameters appended.
 func openSQLite(dbPath, params string) (*Store, error) {
+	normalizedDSN, filesystemPath, err := sqliteutil.ResolveDSN(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve SQLite database path: %w", err)
+	}
 	// Ensure directory exists (skip for in-memory databases)
 	if dbPath != ":memory:" && !strings.Contains(dbPath, ":memory:") {
-		dir := filepath.Dir(dbPath)
+		dir := filepath.Dir(filesystemPath)
 		// #nosec G703 -- dbPath is the caller-selected database location; creating its parent is intentional.
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return nil, fmt.Errorf("create db directory: %w", err)
 		}
 	}
 
-	dsn := dbPath + params
+	dsn := appendSQLiteParams(normalizedDSN, params)
 	db, err := sql.Open(sqliteutil.DriverName(), dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
@@ -209,9 +238,11 @@ func openSQLite(dbPath, params string) (*Store, error) {
 	}
 
 	s := &Store{
-		db:      newLoggedDB(db, dialect.Rebind),
-		dbPath:  dbPath,
-		dialect: dialect,
+		db:                   newLoggedDB(db, dialect.Rebind),
+		dbPath:               dbPath,
+		sqliteFilesystemPath: filesystemPath,
+		dialect:              dialect,
+		syncExecutionLocks:   newSyncExecutionLockState(),
 	}
 
 	// Probe like the read-only opens do: a Store must know whether full-text
@@ -228,8 +259,22 @@ func openSQLite(dbPath, params string) (*Store, error) {
 		return nil, fmt.Errorf("probe FTS availability: %w", err)
 	}
 	s.fts5Available = available
+	if err := s.detectDirectoryProjectionReadiness(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	return s, nil
+}
+
+func appendSQLiteParams(dsn, params string) string {
+	if params == "" {
+		return dsn
+	}
+	if strings.Contains(dsn, "?") {
+		return dsn + "&" + strings.TrimPrefix(params, "?")
+	}
+	return dsn + params
 }
 
 // openPostgres opens a PostgreSQL database using the given connection URL.
@@ -258,10 +303,11 @@ func openPostgres(dbURL string) (*Store, error) {
 	}
 
 	s := &Store{
-		db:           newLoggedDB(db, dialect.Rebind),
-		dbPath:       dbURL,
-		dialect:      dialect,
-		closeCleanup: cleanup,
+		db:                 newLoggedDB(db, dialect.Rebind),
+		dbPath:             dbURL,
+		dialect:            dialect,
+		closeCleanup:       cleanup,
+		syncExecutionLocks: newSyncExecutionLockState(),
 	}
 
 	// See openSQLite: availability is a property of the database, not of
@@ -273,8 +319,29 @@ func openPostgres(dbURL string) (*Store, error) {
 		return nil, fmt.Errorf("probe FTS availability: %w", err)
 	}
 	s.fts5Available = available
+	if err := s.detectDirectoryProjectionReadiness(context.Background()); err != nil {
+		_ = db.Close()
+		cleanup()
+		return nil, err
+	}
 
 	return s, nil
+}
+
+// detectDirectoryProjectionReadiness distinguishes an old database without
+// the optional Directory projection from one whose dirty queue must be
+// respected by a read-only Store. It does not create or migrate anything.
+func (s *Store) detectDirectoryProjectionReadiness(ctx context.Context) error {
+	var installed bool
+	query := `SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'directory_projection_dirty')`
+	if s.IsPostgreSQL() {
+		query = `SELECT to_regclass('directory_projection_dirty') IS NOT NULL`
+	}
+	if err := s.db.QueryRowContext(ctx, query).Scan(&installed); err != nil {
+		return fmt.Errorf("detect directory projection: %w", err)
+	}
+	s.directoryProjectionReady = installed
+	return nil
 }
 
 // OpenReadOnly opens an existing database in read-only mode. Suitable for
@@ -286,7 +353,11 @@ func OpenReadOnly(dbPath string) (*Store, error) {
 		return openPostgresReadOnly(dbPath)
 	}
 
-	if _, err := os.Stat(dbPath); err != nil {
+	normalizedDSN, filesystemPath, err := sqliteutil.ResolveDSN(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("resolve SQLite database path: %w", err)
+	}
+	if _, err := os.Stat(filesystemPath); err != nil {
 		return nil, fmt.Errorf(
 			"database not found: %s "+
 				"(run 'msgvault init-db' first)", dbPath,
@@ -297,7 +368,7 @@ func OpenReadOnly(dbPath string) (*Store, error) {
 	// to create or update -wal/-shm sidecar files on open, which fails
 	// under SQLITE_OPEN_READONLY. _query_only opens normally (so SQLite
 	// can manage sidecars) but rejects all write SQL at the query layer.
-	dsn := dbPath + "?_query_only=true&_busy_timeout=5000"
+	dsn := appendSQLiteParams(normalizedDSN, "?_query_only=true&_busy_timeout=5000")
 	db, err := sql.Open(sqliteutil.DriverName(), dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database (read-only): %w", err)
@@ -317,10 +388,12 @@ func OpenReadOnly(dbPath string) (*Store, error) {
 	}
 
 	s := &Store{
-		db:       newLoggedDB(db, dialect.Rebind),
-		dbPath:   dbPath,
-		dialect:  dialect,
-		readOnly: true,
+		db:                   newLoggedDB(db, dialect.Rebind),
+		dbPath:               dbPath,
+		sqliteFilesystemPath: filesystemPath,
+		dialect:              dialect,
+		readOnly:             true,
+		syncExecutionLocks:   newSyncExecutionLockState(),
 	}
 
 	// OpenReadOnly takes no context, so the probe cannot be cancelled and its
@@ -332,6 +405,10 @@ func OpenReadOnly(dbPath string) (*Store, error) {
 		return nil, fmt.Errorf("probe FTS availability: %w", err)
 	}
 	s.fts5Available = available
+	if err := s.detectDirectoryProjectionReadiness(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 
 	return s, nil
 }
@@ -368,11 +445,12 @@ func openPostgresReadOnly(dbURL string) (*Store, error) {
 	}
 
 	s := &Store{
-		db:           newLoggedDB(db, dialect.Rebind),
-		dbPath:       dbURL,
-		dialect:      dialect,
-		readOnly:     true,
-		closeCleanup: cleanup,
+		db:                 newLoggedDB(db, dialect.Rebind),
+		dbPath:             dbURL,
+		dialect:            dialect,
+		readOnly:           true,
+		closeCleanup:       cleanup,
+		syncExecutionLocks: newSyncExecutionLockState(),
 	}
 
 	// As in OpenReadOnly: no context to honour here, but the error is checked
@@ -384,6 +462,11 @@ func openPostgresReadOnly(dbURL string) (*Store, error) {
 		return nil, fmt.Errorf("probe FTS availability: %w", err)
 	}
 	s.fts5Available = available
+	if err := s.detectDirectoryProjectionReadiness(context.Background()); err != nil {
+		_ = db.Close()
+		cleanup()
+		return nil, err
+	}
 
 	return s, nil
 }
@@ -464,12 +547,13 @@ func (s *Store) Close() error {
 		// reduces the risk of corruption from stale WAL entries.
 		_ = s.CheckpointWAL()
 	}
+	lockErr := s.releaseAllSyncExecutionLocks()
 	err := s.db.Close()
 	if s.closeCleanup != nil {
 		s.closeCleanup()
 		s.closeCleanup = nil
 	}
-	return err
+	return errors.Join(lockErr, err)
 }
 
 // CheckpointWAL forces a WAL checkpoint, folding the WAL back into the main
@@ -710,6 +794,12 @@ func (s *Store) withTxOptionsContext(
 		}
 		return err
 	}
+	if s.directoryProjectionReady && !s.readOnly && (opts == nil || !opts.ReadOnly) {
+		if err := s.refreshDirectoryProjectionsBeforeCommitTx(ctx, tx); err != nil {
+			_ = tx.Rollback()
+			return err
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		_ = tx.Rollback()
 		return err
@@ -856,6 +946,8 @@ func (s *Store) buildLargeIndexesConcurrently(ctx context.Context) {
 	// under the pool-wide statement_timeout and could fail InitSchema outright.
 	concurrentIndexes := []struct{ name, definition string }{
 		{"idx_messages_source_id", "ON messages(source_id, id)"},
+		{"idx_messages_reply_to_message_id", "ON messages(reply_to_message_id) WHERE reply_to_message_id IS NOT NULL"},
+		{rfc822CanonicalIndexName, s.dialect.RFC822CanonicalIDIndexDefinition()},
 		{"idx_participants_email_lower", "ON participants(LOWER(email_address))"},
 		{"idx_participant_identifiers_value_lower", "ON participant_identifiers(LOWER(identifier_value))"},
 	}
@@ -1141,6 +1233,30 @@ func (s *Store) InitSchema() error {
 // for the other ledger-gated migrations: a cancelled one is not marked applied,
 // so the next open runs it again.
 func (s *Store) InitSchemaContext(ctx context.Context) error {
+	// A missing messages table identifies a fresh PostgreSQL schema. Build the
+	// canonical Message-ID expression index inline after the schema files create
+	// the empty table: CREATE INDEX is cheap there, while making every fresh test
+	// schema pay CREATE INDEX CONCURRENTLY adds the multi-phase coordination cost
+	// that concurrent DDL exists to tolerate on populated archives. Existing
+	// schemas deliberately skip the inline build; if their index is missing or
+	// INVALID, buildLargeIndexesConcurrently repairs it without blocking writers.
+	freshPostgreSQLSchema := false
+	if s.IsPostgreSQL() {
+		var messagesTableExists bool
+		if err := s.db.QueryRowContext(ctx, `
+			SELECT EXISTS (
+				SELECT 1
+				FROM pg_class
+				WHERE relname = 'messages'
+				  AND relnamespace = current_schema()::regnamespace
+				  AND relkind IN ('r', 'p')
+			)
+		`).Scan(&messagesTableExists); err != nil {
+			return fmt.Errorf("inspect PostgreSQL schema freshness: %w", err)
+		}
+		freshPostgreSQLSchema = !messagesTableExists
+	}
+
 	// Load and execute schema files provided by the dialect.
 	for _, filename := range s.dialect.SchemaFiles() {
 		schema, err := schemaFS.ReadFile(filename)
@@ -1154,6 +1270,60 @@ func (s *Store) InitSchemaContext(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, string(schema)); err != nil {
 			return fmt.Errorf("execute %s: %w", filename, err)
 		}
+	}
+	if freshPostgreSQLSchema {
+		if _, err := s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS `+
+			rfc822CanonicalIndexName+` `+s.dialect.RFC822CanonicalIDIndexDefinition()); err != nil {
+			return fmt.Errorf("create fresh-schema canonical RFC822 Message-ID index: %w", err)
+		}
+	}
+	if err := s.ensureMigrationLedgerVersionColumn(ctx); err != nil {
+		return fmt.Errorf("ensure migration ledger version column: %w", err)
+	}
+	if err := s.runOnceMigration(
+		ctx, migrationPersonInferenceProviderV2, 1, false,
+		s.migratePersonInferenceProviderV2,
+	); err != nil {
+		return fmt.Errorf("migrate people inference provider profiles: %w", err)
+	}
+	if err := s.runOnceMigration(
+		ctx, migrationPersonSweepCallsV2, 1, false,
+		s.migratePersonSweepCallsV2,
+	); err != nil {
+		return fmt.Errorf("migrate person sweep call journal: %w", err)
+	}
+	if err := s.runOnceMigration(
+		ctx, migrationPersonSweepBatchPurposeV2, 1, false,
+		s.migratePersonSweepBatchPurposeV2,
+	); err != nil {
+		return fmt.Errorf("migrate person sweep call journal purposes: %w", err)
+	}
+	if err := s.runOnceMigration(
+		ctx, migrationPersonFactClaimOriginBrief, 1, false,
+		s.migratePersonFactClaimOriginBrief,
+	); err != nil {
+		return fmt.Errorf("migrate person fact claim origins: %w", err)
+	}
+	if err := s.runOnceMigration(
+		ctx, migrationPersonSweepAttemptBriefFailure, 1, false,
+		s.migratePersonSweepAttemptBriefFailure,
+	); err != nil {
+		return fmt.Errorf("migrate person sweep attempt brief failure class: %w", err)
+	}
+	if err := s.ensureDirectoryProjectionInfrastructure(ctx); err != nil {
+		return err
+	}
+	// The Directory projection is derived from the person tables, so an
+	// archive that predates it gets every person marked dirty and refreshed
+	// once. Later opens find the ledger entry and skip the backfill; triggers
+	// keep the projection current from then on.
+	if err := s.runOnceMigration(
+		ctx, migrationDirectoryProjectionV1, 1, false,
+		func(ctx context.Context) error {
+			return s.backfillDirectoryProjectionContext(ctx)
+		},
+	); err != nil {
+		return err
 	}
 	// Legacy databases may hold duplicate (message_id, content_hash)
 	// attachment rows from the old SELECT-then-INSERT UpsertAttachment.
@@ -1169,7 +1339,7 @@ func (s *Store) InitSchemaContext(ctx context.Context) error {
 	// so the index is built against the just-deduped table. No-op timeout
 	// reset on SQLite.
 	if err := s.runOnceMigration(
-		ctx, migrationAttachmentsContentHashUnique, false,
+		ctx, migrationAttachmentsContentHashUnique, 1, false,
 		func(ctx context.Context) error {
 			return s.runMaintenance(ctx, func(ctx context.Context, tx *loggedTx) error {
 				if err := s.dedupeAttachmentsBeforeUniqueIndex(ctx, tx); err != nil {
@@ -1196,7 +1366,7 @@ func (s *Store) InitSchemaContext(ctx context.Context) error {
 		return fmt.Errorf("prepare identity match source support provenance: %w", err)
 	}
 	if err := s.runOnceMigration(
-		ctx, migrationIdentityMatchSourceSupport, false,
+		ctx, migrationIdentityMatchSourceSupport, 1, false,
 		func(ctx context.Context) error {
 			return s.runMaintenance(ctx, func(ctx context.Context, tx *loggedTx) error {
 				return s.backfillLegacyIdentityMatchSourceSupport(ctx, tx)
@@ -1254,6 +1424,26 @@ func (s *Store) InitSchemaContext(ctx context.Context) error {
 			lastModifiedColumnAdded = true
 		}
 	}
+	// Older runs predate typed checkpoints. Restore types only when the source
+	// or pinned Gmail handoff cursor identifies them unambiguously, then tag
+	// unfinished Gmail recovery runs for the strict resume matcher.
+	if err := s.runOnceMigration(
+		ctx, migrationSyncRunResumeMetadata, 1, false,
+		func(ctx context.Context) error {
+			return s.withTxContext(ctx, func(tx *loggedTx) error {
+				return s.backfillSyncRunResumeMetadata(ctx, tx)
+			})
+		},
+	); err != nil {
+		return fmt.Errorf("backfill sync run resume metadata: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		CREATE INDEX IF NOT EXISTS idx_sync_runs_operation
+		ON sync_runs(operation_id, id)
+		WHERE operation_id IS NOT NULL
+	`); err != nil {
+		return fmt.Errorf("create sync operation index: %w", err)
+	}
 	if err := s.ensureCardDAVConflictPendingInvariant(ctx); err != nil {
 		return fmt.Errorf("migrate CardDAV conflict pending state: %w", err)
 	}
@@ -1264,7 +1454,7 @@ func (s *Store) InitSchemaContext(ctx context.Context) error {
 	// Unicode. Canonicalize them before fact resolution compares incoming ASCII
 	// references with persisted roots and identifiers.
 	if err := s.runOnceMigration(
-		ctx, migrationOrganizationDomainIDNA, false,
+		ctx, migrationOrganizationDomainIDNA, 1, false,
 		func(ctx context.Context) error {
 			return s.runMaintenance(ctx, func(ctx context.Context, tx *loggedTx) error {
 				return s.canonicalizeLegacyOrganizationDomains(ctx, tx)
@@ -1362,12 +1552,12 @@ func (s *Store) InitSchemaContext(ctx context.Context) error {
 		return fmt.Errorf("validate message watermarks: %w", err)
 	}
 	watermarkTriggersAlreadyApplied, err := s.IsMigrationAppliedContext(
-		ctx, migrationMessageWatermarkTriggers)
+		ctx, migrationMessageWatermarkTriggers, 1)
 	if err != nil {
 		return fmt.Errorf("check message watermark trigger migration: %w", err)
 	}
 	if err := s.runOnceMigration(
-		ctx, migrationMessageWatermarkTriggers, false,
+		ctx, migrationMessageWatermarkTriggers, 1, false,
 		func(ctx context.Context) error {
 			return s.runMaintenance(ctx, func(ctx context.Context, tx *loggedTx) error {
 				return s.dialect.EnsureTriggers(boundQuerier{ctx: ctx, q: tx})
@@ -1377,7 +1567,7 @@ func (s *Store) InitSchemaContext(ctx context.Context) error {
 		return fmt.Errorf("ensure message watermark triggers: %w", err)
 	}
 	if err := s.runOnceMigration(
-		ctx, migrationEmbeddingChangeJournalTriggers, false,
+		ctx, migrationEmbeddingChangeJournalTriggers, 1, false,
 		func(ctx context.Context) error {
 			// A fresh archive (or a pre-watermark archive) just ran the current
 			// EnsureTriggers above, which already includes the journal definitions.
@@ -1394,7 +1584,7 @@ func (s *Store) InitSchemaContext(ctx context.Context) error {
 		return fmt.Errorf("ensure embedding change journal triggers: %w", err)
 	}
 	if err := s.runOnceMigration(
-		ctx, migrationPersonSweepChangeTriggers, false,
+		ctx, migrationPersonSweepChangeTriggers, 1, false,
 		func(ctx context.Context) error {
 			// Fresh archives installed the current definitions with the watermark
 			// triggers above. Existing archives and explicit repair runs need a
@@ -1410,7 +1600,7 @@ func (s *Store) InitSchemaContext(ctx context.Context) error {
 		return fmt.Errorf("ensure person sweep change triggers: %w", err)
 	}
 	if err := s.runOnceMigration(
-		ctx, migrationActivityProjectionTriggers, false,
+		ctx, migrationActivityProjectionTriggers, 1, false,
 		func(ctx context.Context) error {
 			return s.runMaintenance(ctx, func(ctx context.Context, tx *loggedTx) error {
 				return s.dialect.EnsureActivityProjectionTriggers(
@@ -1428,7 +1618,7 @@ func (s *Store) InitSchemaContext(ctx context.Context) error {
 	// after the message and activity triggers exist so reclassified rows
 	// invalidate analytical and relationship projections like a normal update.
 	if err := s.runOnceMigration(
-		ctx, migrationGmailChatClassification, false,
+		ctx, migrationGmailChatClassification, 1, false,
 		func(ctx context.Context) error {
 			return s.runMaintenance(ctx, func(ctx context.Context, tx *loggedTx) error {
 				return s.classifyLegacyGmailChats(ctx, tx)
@@ -1448,7 +1638,7 @@ func (s *Store) InitSchemaContext(ctx context.Context) error {
 	// actually changes instead of rewriting an entire source to initialize NULL
 	// provenance.
 	if err := s.runOnceMigration(
-		ctx, migrationMessageAttributionProvenance, false,
+		ctx, migrationMessageAttributionProvenance, 1, false,
 		func(ctx context.Context) error {
 			return s.runMaintenance(
 				ctx,
@@ -1481,17 +1671,32 @@ func (s *Store) InitSchemaContext(ctx context.Context) error {
 		return err
 	}
 
+	// Runs after the legacy-column loop (upgraded archives need the
+	// address_key column before it is read, backfilled, and uniquely
+	// indexed) and after the attribution-provenance migration above: a
+	// duplicate collapse refreshes message attribution, and that refresh
+	// folds identity matches into is_from_me. On a pre-provenance archive
+	// the backfill would then read those identity-derived values as
+	// source-native, permanently mislabeling ownership provenance.
+	if err := s.ensureAccountIdentityAddressKeys(ctx); err != nil {
+		return fmt.Errorf("ensure account identity address keys: %w", err)
+	}
+
 	// Identity discovery scans one source in message-ID order. On SQLite the
 	// plain idx_messages_source index already orders ties by rowid, so no
 	// separate composite index is needed there (see schema.sql). PostgreSQL
-	// still needs the explicit composite index, built via CREATE INDEX
-	// CONCURRENTLY on a dedicated connection so a one-time build over an
-	// existing archive never blocks writers or needs the pool-wide
+	// still needs the explicit composite indexes. Fresh schemas build the
+	// canonical RFC822 index inline above while messages is empty; the helper's
+	// IF NOT EXISTS is then a no-op. Missing indexes on existing archives are
+	// built via CREATE INDEX CONCURRENTLY on a dedicated connection so the
+	// one-time build never blocks writers or needs the pool-wide
 	// statement_timeout escape hatch (CONCURRENTLY cannot run inside a
-	// transaction at all, so runMaintenance does not apply here). Carries
-	// ctx like every other statement in this method: a cancelled build
-	// leaves at worst an INVALID leftover, which the next start drops and
-	// rebuilds.
+	// transaction at all, so runMaintenance does not apply here). Carries ctx
+	// like every other statement in this method: a cancelled build leaves at
+	// worst an INVALID leftover, which the next start drops and rebuilds.
+	if s.beforeLargeIndexBuildHook != nil {
+		s.beforeLargeIndexBuildHook()
+	}
 	s.buildLargeIndexesConcurrently(ctx)
 
 	// Partial expression indexes for live-message listing and date filtering.
@@ -1611,25 +1816,47 @@ func (s *Store) InitSchemaContext(ctx context.Context) error {
 		}
 	}
 
-	// Index over rfc822_message_id serves dedup's per-group message lookup
-	// (GetDuplicateGroupMessages / GetDuplicateGroupMessagesBatch). Without
-	// it, each lookup was a full scan of the messages table — measured at
-	// ~190ms/lookup, with one lookup per duplicate group, so a scan with
-	// 22k groups burned the entire 30-minute CLI plan-request timeout
-	// before content-hash comparison even started (kenn-io/msgvault#510).
-	// Plain (non-partial) index: a partial WHERE rfc822_message_id IS NOT
-	// NULL AND != '' form is not usable by the planner for this table's
-	// bound `= ?` / `IN (...)` lookups — SQLite can't prove col = ? implies
-	// col != '' since ? could bind to '' — so it would silently fall back
-	// to SCAN (verified via EXPLAIN QUERY PLAN before writing this).
-	// Identical DDL on both backends; runMaintenance already handles the
-	// PostgreSQL statement_timeout exemption internally (finding S1). IF
-	// NOT EXISTS is idempotent per start.
+	// Indexes over rfc822_message_id serve dedup. The plain index serves the
+	// per-group message lookup (GetDuplicateGroupMessages /
+	// GetDuplicateGroupMessagesBatch). Without it, each lookup was a full
+	// scan of the messages table — measured at ~190ms/lookup, with one
+	// lookup per duplicate group, so a scan with 22k groups burned the
+	// entire 30-minute CLI plan-request timeout before content-hash
+	// comparison even started (kenn-io/msgvault#510). Plain (non-partial)
+	// index: a partial WHERE rfc822_message_id IS NOT NULL AND != '' form is
+	// not usable by the planner for this table's bound `= ?` / `IN (...)`
+	// lookups — SQLite can't prove col = ? implies col != '' since ? could
+	// bind to '' — so it would silently fall back to SCAN (verified via
+	// EXPLAIN QUERY PLAN before writing this).
+	//
+	// The composite expression/source index serves duplicate discovery
+	// (FindDuplicatesByRFC822ID), whose GROUP BY runs the canonical
+	// (bracket-unwrapped) Message-ID expression — a computed CASE/SUBSTR the
+	// plain index cannot serve. Canonical ID leads the index so grouping can
+	// stream in index order; source_id lets Engine.Scan's mandatory source scope
+	// be evaluated from the same index. The indexed expression is generated by
+	// the same dialect method as the query, keeping them byte-identical so the
+	// planner matches them; dedup_index_test.go and dedup_index_pg_test.go pin
+	// scoped query plans against drift.
+	//
+	// PostgreSQL creates this index inline near the start of InitSchema when the
+	// messages table did not exist beforehand. Existing archives build it earlier
+	// through buildLargeIndexesConcurrently: CREATE INDEX CONCURRENTLY must run
+	// outside a transaction to avoid blocking writers, and that path also drops
+	// INVALID leftovers before retrying. SQLite has no concurrent DDL and creates
+	// it here. IF NOT EXISTS keeps every path idempotent.
 	if err := s.runMaintenance(ctx, func(ctx context.Context, tx *loggedTx) error {
-		_, err := tx.ExecContext(ctx, `
+		if _, err := tx.ExecContext(ctx, `
 			CREATE INDEX IF NOT EXISTS idx_messages_rfc822_message_id
 			    ON messages(rfc822_message_id)
-		`)
+		`); err != nil {
+			return err
+		}
+		if s.IsPostgreSQL() {
+			return nil
+		}
+		_, err := tx.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS `+
+			rfc822CanonicalIndexName+` `+s.dialect.RFC822CanonicalIDIndexDefinition())
 		return err
 	}); err != nil {
 		return fmt.Errorf("create rfc822 message id index: %w", err)
@@ -1650,7 +1877,7 @@ func (s *Store) InitSchemaContext(ctx context.Context) error {
 	// full-table UPDATE on a large archive is not cut off by the pool-wide
 	// statement_timeout (no-op reset on SQLite).
 	if err := s.runOnceMigration(
-		ctx, migrationMessagesLastModifiedBackfill, lastModifiedColumnAdded,
+		ctx, migrationMessagesLastModifiedBackfill, 1, lastModifiedColumnAdded,
 		func(ctx context.Context) error {
 			if err := s.runMaintenance(ctx, func(ctx context.Context, tx *loggedTx) error {
 				_, err := tx.ExecContext(ctx,
@@ -1674,7 +1901,7 @@ func (s *Store) InitSchemaContext(ctx context.Context) error {
 	// after every batch has committed, so an interrupted upgrade re-enters the
 	// loop on the next open rather than declaring itself done.
 	if err := s.runOnceMigration(
-		ctx, migrationMessagesContentChangedAtBackfill, false,
+		ctx, migrationMessagesContentChangedAtBackfill, 1, false,
 		func(ctx context.Context) error {
 			if err := s.backfillContentChangedAt(ctx); err != nil {
 				return fmt.Errorf("backfill content_changed_at: %w", err)
@@ -1779,6 +2006,17 @@ func (s *Store) InitSchemaContext(ctx context.Context) error {
 		return fmt.Errorf("ensure seeded attribute definitions: %w", err)
 	}
 
+	// The CardDAV inference export backfill projects every person's vCard
+	// attributes, so it must run after LegacyColumnMigrations has added the
+	// attribute_definitions columns it selects and after seeding has installed
+	// the vCard mappings that decide which inferred facts are exportable.
+	if err := s.runOnceMigration(
+		ctx, migrationCardDAVInferenceExportState, 1, false,
+		s.backfillCardDAVInferenceExportState,
+	); err != nil {
+		return fmt.Errorf("backfill CardDAV inference export state: %w", err)
+	}
+
 	// Reconcile the system relationship type catalog on every open: insert
 	// missing seeds, repair structural drift, and leave user-owned labels,
 	// vCard mappings, colours, icons, and descriptions alone. See
@@ -1800,11 +2038,10 @@ func (s *Store) InitSchemaContext(ctx context.Context) error {
 	return nil
 }
 
-// runOnceMigration runs fn at most once per archive, gated on the
-// applied_migrations ledger: fn runs when the ledger has no entry for name (or
-// when force overrides that), and the entry is written only after fn returns
-// successfully, so a migration that failed or was cancelled runs again on the
-// next open.
+// runOnceMigration runs fn when the applied_migrations ledger has no entry for
+// name or records a version below the requested minimum (or when force
+// overrides that), and writes the entry only after fn returns successfully, so
+// a migration that failed or was cancelled runs again on the next open.
 //
 // It is the single owner of the ledger statements for every one-time step in
 // InitSchemaContext, and both of them carry ctx. That is not incidental. The
@@ -1815,9 +2052,9 @@ func (s *Store) InitSchemaContext(ctx context.Context) error {
 // one place is what stops the next migration added to InitSchemaContext from
 // reintroducing a contextless pair.
 func (s *Store) runOnceMigration(
-	ctx context.Context, name string, force bool, fn func(ctx context.Context) error,
+	ctx context.Context, name string, version int, force bool, fn func(ctx context.Context) error,
 ) error {
-	applied, err := s.IsMigrationAppliedContext(ctx, name)
+	applied, err := s.IsMigrationAppliedContext(ctx, name, version)
 	if err != nil {
 		return err
 	}
@@ -1827,7 +2064,7 @@ func (s *Store) runOnceMigration(
 	if err := fn(ctx); err != nil {
 		return err
 	}
-	return s.MarkMigrationAppliedContext(ctx, name)
+	return s.markMigrationAppliedContext(ctx, s.db, name, version)
 }
 
 // contentChangedBackfillBatchSize is how many ROWS one backfill batch stamps —
@@ -2109,7 +2346,7 @@ func (s *Store) ensureAttachmentOccurrenceUniqueIndexes(ctx context.Context) err
 	return s.runOnceMigration(
 		ctx,
 		migrationAttachmentOccurrenceUnique,
-		false,
+		1, false,
 		func(ctx context.Context) error {
 			return s.runMaintenance(ctx, func(ctx context.Context, tx *loggedTx) error {
 				if _, err := tx.ExecContext(ctx,

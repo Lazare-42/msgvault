@@ -6,6 +6,15 @@ import (
 	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
 )
 
+type RevokeAgentTokenPath struct {
+	// ID Agent grant ID to revoke
+	ID string `json:"id" validate:"required"`
+}
+
+func (r RevokeAgentTokenPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(r))
+}
+
 type GetAttachmentContentPath struct {
 	// Hash Attachment SHA-256 content hash
 	Hash string `json:"hash" validate:"required"`
@@ -107,6 +116,22 @@ type PublishCardDAVPersonPath struct {
 }
 
 func (p PublishCardDAVPersonPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type ApproveCardDAVPublicationPath struct {
+	PersonID int64 `json:"person_id" validate:"gte=1"`
+}
+
+func (a ApproveCardDAVPublicationPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(a))
+}
+
+type PreviewCardDAVPublicationPath struct {
+	PersonID int64 `json:"person_id" validate:"gte=1"`
+}
+
+func (p PreviewCardDAVPublicationPath) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(p))
 }
 
@@ -277,6 +302,15 @@ type RejectIdentityMatchCandidatePath struct {
 	ID int64 `json:"id"`
 }
 
+type GetImportJobPath struct {
+	// JobID Historical import job ID
+	JobID string `json:"job_id" validate:"required"`
+}
+
+func (g GetImportJobPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(g))
+}
+
 type GetMessagePath struct {
 	// ID Message ID
 	ID int64 `json:"id"`
@@ -307,6 +341,15 @@ type UnlinkMessageTaskPath struct {
 
 func (u UnlinkMessageTaskPath) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(u))
+}
+
+type GetOperationRunPath struct {
+	// ID Opaque archive-bound operation run ID
+	ID string `json:"id" validate:"required"`
+}
+
+func (g GetOperationRunPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(g))
 }
 
 type DeleteOrganizationPath struct {
@@ -443,6 +486,36 @@ func (s SetPersonAttributePath) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(s))
 }
 
+type GetPersonBriefPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type GetPersonBriefEnrollmentPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type SetPersonBriefEnrollmentPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type GeneratePersonBriefPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type RejectPersonBriefPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type ListPersonBriefVersionsPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
 type GetPersonContactStatePath struct {
 	// ID Positive durable identifier
 	ID int64 `json:"id" validate:"gte=1"`
@@ -541,6 +614,11 @@ type MergePersonsPath struct {
 }
 
 type ListPersonMergesPath struct {
+	// ID Durable person ID
+	ID int64 `json:"id"`
+}
+
+type GetPersonNetworkPath struct {
 	// ID Durable person ID
 	ID int64 `json:"id"`
 }
@@ -673,6 +751,35 @@ type GetSavedViewPath struct {
 type PatchSavedViewPath struct {
 	// ID Saved View ID
 	ID int64 `json:"id"`
+}
+
+type RunSavedViewPath struct {
+	// ID Saved View ID
+	ID int64 `json:"id"`
+}
+
+type PutSettingsPersonEnrichmentProviderPath struct {
+	Name string `json:"name" validate:"required"`
+}
+
+func (p PutSettingsPersonEnrichmentProviderPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type DeleteSettingsProviderCredentialPath struct {
+	CredentialID string `json:"credential_id" validate:"required"`
+}
+
+func (d DeleteSettingsProviderCredentialPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(d))
+}
+
+type PutSettingsProviderCredentialPath struct {
+	CredentialID string `json:"credential_id" validate:"required"`
+}
+
+func (p PutSettingsProviderCredentialPath) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
 }
 
 type ListSourceIdentitiesPath struct {

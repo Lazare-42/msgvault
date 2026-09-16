@@ -26,10 +26,13 @@ import (
 	"go.kenn.io/msgvault/internal/discord"
 	"go.kenn.io/msgvault/internal/gmail"
 	"go.kenn.io/msgvault/internal/granola"
+	imaplib "go.kenn.io/msgvault/internal/imap"
 	"go.kenn.io/msgvault/internal/meetingimport"
 	"go.kenn.io/msgvault/internal/microsoft"
+	"go.kenn.io/msgvault/internal/notionmeetings"
 	"go.kenn.io/msgvault/internal/oauth"
 	"go.kenn.io/msgvault/internal/ocr"
+	"go.kenn.io/msgvault/internal/operations"
 	"go.kenn.io/msgvault/internal/personenrichment"
 	"go.kenn.io/msgvault/internal/personfacts"
 	"go.kenn.io/msgvault/internal/query"
@@ -243,7 +246,18 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err := s.InitSchemaContext(cmd.Context()); err != nil {
 		return fmt.Errorf("init schema: %w", err)
 	}
+	failedUnfinishedImports, err := s.FailUnfinishedSyncOperationsContext(cmd.Context())
+	if err != nil {
+		return fmt.Errorf("recover unfinished historical imports: %w", err)
+	}
+	if failedUnfinishedImports > 0 {
+		logger.Warn("marked historical imports abandoned by the previous daemon as failed",
+			"count", failedUnfinishedImports)
+	}
 	logger.Info("daemon startup step complete", "step", "init_archive_schema")
+	if err := recoverNativeOperationRunsAtStartup(cmd.Context(), s, logger); err != nil {
+		return err
+	}
 	// Legacy [identity] migration is deferred to the first scheduled sync's
 	// runPostSourceCreateMigrations call, which fires AFTER that sync's
 	// confirmDefaultIdentity. Calling the migration here would race
@@ -333,14 +347,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// Create and configure scheduler
 	sched := scheduler.New(syncFunc).WithLogger(logger).
 		WithWorkTracker(combineWorkTrackers(idleTracker, labelWorkTracker(operationGate, "a scheduled sync")))
-	cardDAVController, err := api.NewCardDAVController(cfg, s)
+	cardDAVController, err := api.NewCardDAVController(cfg, s, logger)
 	if err != nil {
 		return fmt.Errorf("configure CardDAV: %w", err)
 	}
 	cardDAVController.SetScheduleReconciler(func(cardDAVConfig config.CardDAVConfig, service api.CardDAVOperations) error {
 		return reconcileCardDAVSchedulerJob(sched, cardDAVConfig, service, logger)
 	})
-	if err := reconcileCardDAVSchedulerJob(sched, cfg.CardDAV, cardDAVController.Current(), logger); err != nil {
+	if err := cardDAVController.ReconcileSchedule(); err != nil {
 		return err
 	}
 
@@ -453,12 +467,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}
 	if err := addPeopleSweepJob(
-		sched, cfg.People.Sweep, newPeopleSweepScheduledRun(cfg.People.Sweep, s),
+		sched, cfg.People.Sweep, newPeopleSweepScheduledRun(cfg, s),
 	); err != nil {
 		return fmt.Errorf("schedule people sweep: %w", err)
 	}
 	if err := registerPersonEnrichmentJob(
-		ctx, sched, s, cfg.People.Enrichment); err != nil {
+		ctx, sched, s, cfg.People.Enrichment, personEnrichmentRuntimeCredentials{
+			Suppression: personEnrichmentEnvironmentLookup(cfg),
+			Provider:    personEnrichmentProviderCredentialLookup(cfg),
+		}); err != nil {
 		return fmt.Errorf("schedule person enrichment: %w", err)
 	}
 
@@ -556,6 +573,32 @@ func runServe(cmd *cobra.Command, args []string) error {
 			logger.Info("scheduled circleback source", "source", source.Identifier, "schedule", source.Schedule)
 		}
 	}
+	for _, src := range cfg.NotionMeetings {
+		if src.Enabled && src.Schedule == "" {
+			logger.Warn("notion meeting source is enabled but has no schedule — the daemon will not sync it; its freshness will eventually go stale",
+				"source", src.Identifier,
+				"hint", `set a cron schedule (e.g. "15 */6 * * *") on the [[notion_meetings]] entry`)
+		}
+	}
+	for _, src := range cfg.ScheduledNotionMeetingsSources() {
+		source := src
+		jobName, ok := api.SchedulerJobNameForSource(notionmeetings.SourceType, source.Identifier)
+		if !ok {
+			logger.Error("no scheduler job mapping for notion meeting source", "source", source.Identifier)
+			continue
+		}
+		if err := sched.AddJob(scheduler.Job{
+			Name:     jobName,
+			Schedule: source.Schedule,
+			Run: func(ctx context.Context) error {
+				return runConfiguredNotionMeetingsSync(ctx, s, source)
+			},
+		}); err != nil {
+			logger.Error("failed to schedule notion meeting source", "source", source.Identifier, "error", err)
+		} else {
+			logger.Info("scheduled notion meeting source", "source", source.Identifier, "schedule", source.Schedule)
+		}
+	}
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
@@ -564,23 +607,26 @@ func runServe(cmd *cobra.Command, args []string) error {
 	sched.Start()
 
 	// Create adapters for the API interfaces
+	refreshCacheAfterWrite := func(_ context.Context, label string) error {
+		// The write is already durable. Keep the refresh independent of the
+		// client, but let daemon shutdown stop it before the store closes.
+		return daemonCacheRefreshError(ctx, rebuildCacheAfterScheduledSync(ctx, label))
+	}
 	meetingImporter := meetingimport.NewImporter(s, meetingimport.Hooks{
 		AfterSourceSetup: func() error {
 			return runPostSourceCreateMigrations(s)
 		},
-		RefreshCache: func(_ context.Context, label string) error {
-			// The import is already durable. Keep the refresh independent of the
-			// client, but let daemon shutdown stop it before the store closes.
-			return daemonCacheRefreshError(ctx, rebuildCacheAfterScheduledSync(ctx, label))
-		},
+		RefreshCache: refreshCacheAfterWrite,
 	}).WithLogger(logger)
 	storeAdapter := &storeAPIAdapter{
 		store:                  s,
+		draftPolicy:            snapshotIMAPDraftPolicy(cfg),
+		draftCacheRefresh:      refreshCacheAfterWrite,
 		attachmentMaintenance:  attachmentMaint,
 		meetingImporter:        meetingImporter,
 		analyticsDir:           cfg.AnalyticsDir(),
 		personEnrichmentConfig: cfg.People.Enrichment,
-		lookupEnv:              os.LookupEnv,
+		lookupEnv:              personEnrichmentEnvironmentLookup(cfg),
 	}
 	schedAdapter := &schedulerAdapter{scheduler: sched}
 
@@ -608,6 +654,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		AnalyticsInitializationActive: analyticsAsync,
 		IdleTracker:                   idleTracker,
 		OperationGate:                 operationGate,
+		OperationHistoryReader:        storeAdapter,
 		BlobStore:                     blobStore,
 	}
 	applyServerRuntimeConfig(&apiOpts, cfg)
@@ -615,6 +662,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 		apiOpts.VectorStatus = api.VectorStatusInitializing
 	}
 	apiServer = api.NewServerWithOptions(apiOpts)
+	if cfg.People.Sweep.Enabled {
+		// The daemon owns the people sweep worker, so it owns manual brief
+		// generation: POST /api/v1/people/{id}/brief/generate reports
+		// unavailable in every process that does not.
+		apiServer.SetPersonBriefGenerator(newPersonBriefManualRun(cfg, s))
+	}
 
 	// Start API server in goroutine
 	apiAddr := apiListener.Addr().String()
@@ -649,17 +702,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if analyticsAsync {
 			analyticsInit = startDaemonAnalyticsInitializer(
 				ctx, cfg, s, startupCacheIntent, apiServer, ownership,
-				combineWorkTrackers(
-					idleTracker,
-					labelWorkTracker(operationGate, "analytics cache initialization"),
-				),
+				daemonAnalyticsCacheWorkTracker(idleTracker),
 			)
 		} else {
 			analyticsInit = completedDaemonAnalyticsInitHandle()
 		}
-		// Analytics must acquire the serial mutation gate before vector
-		// initialization can compete for it. This keeps an explicit cache
-		// request from waiting behind a long vector migration or backfill.
+		// Wait for the initializer to publish its startup barrier before vector
+		// initialization can compete for shared archive resources.
 		_ = analyticsInit.WaitStarted(ctx)
 		if idleTracker != nil {
 			idleTracker.Touch()
@@ -755,6 +804,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
+func snapshotIMAPDraftPolicy(cfg *config.Config) []config.IMAPDraftSource {
+	if cfg == nil {
+		return nil
+	}
+	return append([]config.IMAPDraftSource(nil), cfg.IMAP.Drafts...)
+}
+
 func reconcileCardDAVSchedulerJob(sched *scheduler.Scheduler, cardDAVConfig config.CardDAVConfig, service api.CardDAVOperations, logger *slog.Logger) error {
 	if !cardDAVConfig.Enabled || cardDAVConfig.Schedule == "" {
 		sched.RemoveJob(api.CardDAVJobName)
@@ -766,18 +822,61 @@ func reconcileCardDAVSchedulerJob(sched *scheduler.Scheduler, cardDAVConfig conf
 	}
 	if service == nil {
 		sched.RemoveJob(api.CardDAVJobName)
+		hint := "save the CardDAV account with its password to repair the connection"
+		if cardDAVConfig.Provider == "google" {
+			hint = "connect Google in CardDAV account settings, then test and save the account"
+		}
 		logger.Warn("carddav credentials are unavailable or do not match saved discovery; skipping scheduled sync",
-			"hint", "save the CardDAV account with its password to repair the connection")
+			"hint", hint)
 		return nil
 	}
 	if err := sched.AddJob(scheduler.Job{
 		Name: api.CardDAVJobName, Schedule: cardDAVConfig.Schedule,
 		Run: func(ctx context.Context) error {
-			_, err := service.Sync(ctx, carddav.SyncOptions{})
+			_, err := service.Sync(ctx, carddav.SyncOptions{Trigger: store.CardDAVSyncTriggerScheduled})
 			return err
 		},
 	}); err != nil {
 		return fmt.Errorf("schedule CardDAV sync: %w", err)
+	}
+	return nil
+}
+
+func recoverCardDAVSyncRunsAtStartup(ctx context.Context, st *store.Store, logger *slog.Logger) error {
+	recovered, err := st.RecoverCardDAVSyncRunsContext(ctx)
+	if err != nil {
+		return fmt.Errorf("recover CardDAV sync runs at daemon startup: %w", err)
+	}
+	if recovered > 0 {
+		logger.Info("recovered orphaned CardDAV sync runs", "count", recovered)
+	}
+	return nil
+}
+
+func recoverNativeOperationRunsAtStartup(ctx context.Context, st *store.Store, logger *slog.Logger) error {
+	recoveredAt := time.Now().UTC()
+	sourceRuns, err := st.RecoverSyncRunsContext(ctx, recoveredAt)
+	if err != nil {
+		return fmt.Errorf("recover source sync runs at daemon startup: %w", err)
+	}
+	if err := recoverCardDAVSyncRunsAtStartup(ctx, st, logger); err != nil {
+		return err
+	}
+	if err := st.RecoverOperationInvocations(ctx, recoveredAt); err != nil {
+		return fmt.Errorf("recover operation invocations at daemon startup: %w", err)
+	}
+	sweepRuns, err := st.RecoverPersonSweepRunsContext(ctx)
+	if err != nil {
+		return fmt.Errorf("recover person sweep runs at daemon startup: %w", err)
+	}
+	enrichmentRuns, err := st.RecoverPersonEnrichmentRunsContext(ctx, recoveredAt)
+	if err != nil {
+		return fmt.Errorf("recover person enrichment runs at daemon startup: %w", err)
+	}
+	if sourceRuns+sweepRuns+enrichmentRuns > 0 {
+		logger.Info("recovered orphaned operation runs",
+			"source_sync", sourceRuns, "person_sweep", sweepRuns,
+			"person_enrichment", enrichmentRuns)
 	}
 	return nil
 }
@@ -1115,6 +1214,9 @@ func openDaemonDuckDBEngine(c *config.Config, s *store.Store) (*query.DuckDBEngi
 			DisableSQLiteScanner: true,
 			TempDirectory:        tempDirectory,
 			OwnTempDirectory:     true,
+			MemoryLimit:          c.Analytics.QueryMemoryLimit,
+			Threads:              c.Analytics.QueryThreads,
+			MaxTempDirectorySize: c.Analytics.QueryTempLimit,
 		},
 	)
 }
@@ -1155,7 +1257,12 @@ func newDaemonIdleTracker(c *config.Config, stop context.CancelFunc) *api.IdleTr
 // Since api.APIMessage, api.StoreStats, etc. are type aliases for store types,
 // the adapter methods are simple pass-throughs with no conversion needed.
 type storeAPIAdapter struct {
-	store                 *store.Store
+	store              *store.Store
+	draftPolicy        []config.IMAPDraftSource
+	draftClientFactory func(context.Context, *store.Source) (*imaplib.Client, error)
+	// draftCacheRefresh rebuilds the analytics cache after a draft is durable,
+	// the same best-effort hook the meeting importer uses.
+	draftCacheRefresh     func(context.Context, string) error
 	attachmentMaintenance *attachmentMaintenance
 	meetingImporter       *meetingimport.Importer
 	// analyticsDir is the daemon's Parquet analytics cache directory, used
@@ -1169,6 +1276,7 @@ var _ api.MessageStore = (*storeAPIAdapter)(nil)
 var _ api.CtxMessageStore = (*storeAPIAdapter)(nil)
 var _ api.MessageIdentityStore = (*storeAPIAdapter)(nil)
 var _ api.PersonFactStore = (*storeAPIAdapter)(nil)
+var _ api.PersonBriefStore = (*storeAPIAdapter)(nil)
 var _ api.MeetingImporter = (*storeAPIAdapter)(nil)
 var _ api.SourceStatusStore = (*storeAPIAdapter)(nil)
 var _ api.CLIStore = (*storeAPIAdapter)(nil)
@@ -1178,6 +1286,7 @@ var _ api.CLICacheBuilder = (*storeAPIAdapter)(nil)
 var _ api.CLISyncRunner = (*storeAPIAdapter)(nil)
 var _ api.CLIVerifyRunner = (*storeAPIAdapter)(nil)
 var _ api.CLIRepairEncodingRunner = (*storeAPIAdapter)(nil)
+var _ api.CLIRepairMessageRunner = (*storeAPIAdapter)(nil)
 var _ api.CLIRunner = (*storeAPIAdapter)(nil)
 var _ api.CLIAddCalendarPlanner = (*storeAPIAdapter)(nil)
 var _ api.CLIDeleteStagedPlanner = (*storeAPIAdapter)(nil)
@@ -1193,6 +1302,7 @@ var _ api.IdentityMatchStore = (*storeAPIAdapter)(nil)
 var _ api.PersonProfileStore = (*storeAPIAdapter)(nil)
 var _ api.PersonCompletionStore = (*storeAPIAdapter)(nil)
 var _ api.PersonTrackingStore = (*storeAPIAdapter)(nil)
+var _ api.PersonNetworkStore = (*storeAPIAdapter)(nil)
 var _ api.PersonProfileValueStore = (*storeAPIAdapter)(nil)
 var _ api.CommunicationServiceStore = (*storeAPIAdapter)(nil)
 var _ api.AttributeDefinitionStore = (*storeAPIAdapter)(nil)
@@ -1205,6 +1315,7 @@ var _ api.ClusterLookupStore = (*storeAPIAdapter)(nil)
 var _ api.ConversationWindowStore = (*storeAPIAdapter)(nil)
 var _ api.ChangedMessageLister = (*storeAPIAdapter)(nil)
 var _ api.ArchiveIdentifier = (*storeAPIAdapter)(nil)
+var _ operations.HistoryReader = (*storeAPIAdapter)(nil)
 var _ api.DocumentSearchStore = (*storeAPIAdapter)(nil)
 var _ api.DocumentStatusStore = (*storeAPIAdapter)(nil)
 var _ api.DocumentVectorStatusStore = (*storeAPIAdapter)(nil)
@@ -1282,6 +1393,34 @@ func (a *storeAPIAdapter) ArchiveUIDContext(ctx context.Context) (string, error)
 	return a.store.ArchiveUIDContext(ctx)
 }
 
+func (a *storeAPIAdapter) ActiveOperationTokenKey(ctx context.Context) (store.OperationTokenKey, error) {
+	return a.store.ActiveOperationTokenKey(ctx)
+}
+
+func (a *storeAPIAdapter) OperationTokenKey(
+	ctx context.Context, keyID string,
+) (store.OperationTokenKey, error) {
+	return a.store.OperationTokenKey(ctx, keyID)
+}
+
+func (a *storeAPIAdapter) Kinds() []operations.Kind {
+	return a.store.Kinds()
+}
+
+func (a *storeAPIAdapter) ListRuns(ctx context.Context, query operations.Query) (operations.HistorySnapshot, error) {
+	return a.store.ListRuns(ctx, query)
+}
+
+func (a *storeAPIAdapter) GetRun(ctx context.Context, id operations.StableID) (operations.Run, error) {
+	return a.store.GetRun(ctx, id)
+}
+
+func (a *storeAPIAdapter) LaneStatus(
+	ctx context.Context, kind operations.Kind,
+) (operations.LaneHistoryStatus, error) {
+	return a.store.LaneStatus(ctx, kind)
+}
+
 func (a *storeAPIAdapter) SearchDocuments(
 	ctx context.Context,
 	request store.DocumentSearchRequest,
@@ -1306,6 +1445,12 @@ func (a *storeAPIAdapter) GetDocumentIndexStatusForScope(
 	return a.store.GetDocumentIndexStatusForScope(
 		ctx, profileID, extractionInputKey, allowedMediaTypes, allowedMessageTypes,
 	)
+}
+
+func (a *storeAPIAdapter) GetCurrentDocumentIndexStatusScope(
+	ctx context.Context,
+) (string, []string, error) {
+	return a.store.GetCurrentDocumentIndexStatusScope(ctx)
 }
 
 func (a *storeAPIAdapter) GetActiveDocumentExtractionRebuild(
@@ -1413,6 +1558,10 @@ func (a *storeAPIAdapter) GetMessage(id int64) (*api.APIMessage, error) {
 	return a.store.GetMessage(id)
 }
 
+func (a *storeAPIAdapter) MessageRemoteImages(id int64) (map[string]store.AttachmentRef, error) {
+	return a.store.MessageRemoteImages(id)
+}
+
 func (a *storeAPIAdapter) GetMessagesSummariesByIDs(ids []int64) ([]api.APIMessage, error) {
 	return a.store.GetMessagesSummariesByIDs(ids)
 }
@@ -1480,7 +1629,30 @@ func (a *storeAPIAdapter) RunCLISync(
 	req api.CLISyncRequest,
 	emit func(api.CLISyncEvent) error,
 ) error {
-	return a.runCLISyncWithRunner(ctx, req, emit, runDaemonCLISubprocessStream)
+	return a.runCLISyncOperationWithRunner(ctx, req, emit, runDaemonCLISubprocessStream)
+}
+
+func (a *storeAPIAdapter) runCLISyncOperationWithRunner(
+	ctx context.Context,
+	req api.CLISyncRequest,
+	emit func(api.CLISyncEvent) error,
+	run cliSyncSubprocessRunner,
+) error {
+	err := a.runCLISyncWithRunner(ctx, req, emit, run)
+	if err == nil && ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	if req.OperationID == "" {
+		return err
+	}
+	status := "done"
+	if err != nil {
+		status = "failed"
+	}
+	if finishErr := a.store.FinishSyncOperation(req.OperationID, status); finishErr != nil {
+		return errors.Join(err, fmt.Errorf("finish sync operation: %w", finishErr))
+	}
+	return err
 }
 
 type cliSyncSubprocessRunner func(
@@ -1527,6 +1699,9 @@ func cliSyncSubprocessArgs(req api.CLISyncRequest) []string {
 		args := []string{"sync-full"}
 		if req.SourceIDSet {
 			args = append(args, "--source-id", strconv.FormatInt(req.SourceID, 10))
+		}
+		if req.OperationID != "" {
+			args = append(args, "--sync-operation-id", req.OperationID)
 		}
 		if req.Query != "" {
 			args = append(args, "--query", req.Query)
@@ -1602,6 +1777,60 @@ func (a *storeAPIAdapter) RunCLIRepairEncoding(
 	})
 }
 
+func (a *storeAPIAdapter) RunCLIRepairMessage(
+	ctx context.Context,
+	req api.CLIRepairMessageRequest,
+	emit func(api.CLIRepairMessageEvent) error,
+) error {
+	return a.runCLIRepairMessageWithRunner(ctx, req, emit, runDaemonCLISubprocessStream)
+}
+
+func (a *storeAPIAdapter) runCLIRepairMessageWithRunner(
+	ctx context.Context,
+	req api.CLIRepairMessageRequest,
+	emit func(api.CLIRepairMessageEvent) error,
+	run cliSyncSubprocessRunner,
+) error {
+	emitSubprocess := func(stream, data string) error {
+		if emit == nil {
+			return nil
+		}
+		return emit(api.CLIRepairMessageEvent{Type: stream, Data: data})
+	}
+	runRepair := func(ctx context.Context) error {
+		return run(ctx, cliRepairMessageSubprocessArgs(req), emitSubprocess)
+	}
+	if req.Audit {
+		return runRepair(ctx)
+	}
+	emitWarning := func(message string) error {
+		if emit == nil {
+			return nil
+		}
+		return emit(api.CLIRepairMessageEvent{Type: "stderr", Data: message})
+	}
+	return runAfterSuccessfulAttachmentIngest(ctx, a.attachmentMaintenance, runRepair, emitWarning)
+}
+
+func cliRepairMessageSubprocessArgs(req api.CLIRepairMessageRequest) []string {
+	args := []string{"repair-message", "--local"}
+	if req.Audit {
+		args = append(args, "--audit")
+	}
+	if req.SourceID > 0 {
+		args = append(args, "--source-id", strconv.FormatInt(req.SourceID, 10))
+	}
+	if req.JSON {
+		args = append(args, "--json")
+	}
+	if req.Reference != "" {
+		// The reference is user data. Terminate flag parsing so a value such
+		// as "--audit" reaches the subprocess as a positional argument.
+		args = append(args, "--", req.Reference)
+	}
+	return args
+}
+
 func (a *storeAPIAdapter) RunCLICommand(
 	ctx context.Context,
 	req api.CLIRunRequest,
@@ -1629,6 +1858,9 @@ func (a *storeAPIAdapter) runCLICommandWithRunner(
 			return nil
 		}
 		return emit(api.CLIRunEvent{Type: stream, Data: data})
+	}
+	if api.IsCLIRunDraftReply(req.Args) {
+		return a.runCLIReplyDraft(ctx, req, emit)
 	}
 	runSubprocess := func(ctx context.Context) error {
 		args := req.Args
@@ -1690,6 +1922,9 @@ func attachmentRemovalCommand(args []string) bool {
 		return false
 	}
 	if args[0] == removeAccountCommandName {
+		return true
+	}
+	if args[0] == "gc" {
 		return true
 	}
 	if args[0] != purgeExcludedMediaCommandName {
@@ -2158,6 +2393,42 @@ func (a *storeAPIAdapter) SetPersonTrackingContext(
 	return a.store.SetPersonTrackingContext(ctx, id, tracked)
 }
 
+func (a *storeAPIAdapter) GetPersonBriefContext(
+	ctx context.Context, personID int64, version int,
+) (*store.PersonBrief, error) {
+	return a.store.GetPersonBriefContext(ctx, personID, version)
+}
+
+func (a *storeAPIAdapter) ListPersonBriefVersionsContext(
+	ctx context.Context, personID int64, limit int,
+) ([]store.PersonBrief, error) {
+	return a.store.ListPersonBriefVersionsContext(ctx, personID, limit)
+}
+
+func (a *storeAPIAdapter) ListPersonBriefEvidenceContext(
+	ctx context.Context, briefID int64,
+) ([]store.PersonBriefEvidencePointer, error) {
+	return a.store.ListPersonBriefEvidenceContext(ctx, briefID)
+}
+
+func (a *storeAPIAdapter) RejectPersonBriefContext(
+	ctx context.Context, personID int64, reason string, at time.Time,
+) (*store.PersonBrief, error) {
+	return a.store.RejectPersonBriefContext(ctx, personID, reason, at)
+}
+
+func (a *storeAPIAdapter) GetPersonBriefEnrollmentContext(
+	ctx context.Context, personID int64,
+) (*store.PersonBriefEnrollment, error) {
+	return a.store.GetPersonBriefEnrollmentContext(ctx, personID)
+}
+
+func (a *storeAPIAdapter) SetPersonBriefEnrollmentContext(
+	ctx context.Context, personID int64, enabled bool, actor string, track bool,
+) (*store.PersonBriefEnrollment, error) {
+	return a.store.SetPersonBriefEnrollmentContext(ctx, personID, enabled, actor, track)
+}
+
 func (a *storeAPIAdapter) BuildPersonFactCatalogContext(
 	ctx context.Context, includeSensitive bool,
 ) (personfacts.Catalog, error) {
@@ -2203,6 +2474,18 @@ func (a *storeAPIAdapter) SetPersonFactPinContext(
 
 func (a *storeAPIAdapter) ListPersonsContext(ctx context.Context) ([]store.Person, error) {
 	return a.store.ListPersonsContext(ctx)
+}
+
+func (a *storeAPIAdapter) DirectoryPeoplePageContext(
+	ctx context.Context, query store.DirectoryPeopleQuery,
+) (*store.DirectoryPeoplePage, error) {
+	return a.store.DirectoryPeoplePageContext(ctx, query)
+}
+
+func (a *storeAPIAdapter) GetPersonNetworkContext(
+	ctx context.Context, personID int64, opts store.PersonNetworkOptions,
+) (store.PersonNetwork, error) {
+	return a.store.GetPersonNetworkContext(ctx, personID, opts)
 }
 
 func (a *storeAPIAdapter) UpdatePersonDisplayNameContext(
@@ -2752,6 +3035,14 @@ func (a *storeAPIAdapter) GetLatestSync(sourceID int64) (*store.SyncRun, error) 
 	return a.store.GetLatestSync(sourceID)
 }
 
+func (a *storeAPIAdapter) GetSyncOperation(operationID string) (*store.SyncOperation, error) {
+	return a.store.GetSyncOperation(operationID)
+}
+
+func (a *storeAPIAdapter) CreateSyncOperation(sourceID int64, operationID string) (*store.SyncOperation, error) {
+	return a.store.CreateSyncOperation(sourceID, operationID)
+}
+
 func (a *storeAPIAdapter) GetLastSuccessfulSync(sourceID int64) (*store.SyncRun, error) {
 	return a.store.GetLastSuccessfulSync(sourceID)
 }
@@ -2806,6 +3097,27 @@ func (r *personEnrichmentSchedule) Wake(ctx context.Context, occurrence time.Tim
 			return err
 		}
 	}
+	for {
+		queued, err := r.Store.ListQueuedPersonEnrichmentRunsContext(ctx, 200)
+		if err != nil {
+			return fmt.Errorf("list queued person enrichment runs: %w", err)
+		}
+		if len(queued) == 0 {
+			break
+		}
+		for _, queuedRun := range queued {
+			claimed, ok, err := r.Store.ClaimQueuedPersonEnrichmentRunContext(ctx, queuedRun.ID)
+			if err != nil {
+				return fmt.Errorf("claim queued person enrichment run %d: %w", queuedRun.ID, err)
+			}
+			if !ok {
+				continue
+			}
+			if err := r.drainRun(ctx, claimed.ID); err != nil {
+				return err
+			}
+		}
+	}
 
 	requestedAt := occurrence.UTC().Truncate(time.Minute)
 	run, _, err := r.Store.StartRun(ctx, personenrichment.RunStart{
@@ -2857,11 +3169,17 @@ func canonicalPersonEnrichmentOccurrence(occurrence time.Time) string {
 	return occurrence.UTC().Truncate(time.Minute).Format(time.RFC3339)
 }
 
+type personEnrichmentRuntimeCredentials struct {
+	Suppression personenrichment.CredentialLookup
+	Provider    personenrichment.ProviderCredentialLookup
+}
+
 func registerPersonEnrichmentJob(
 	ctx context.Context,
 	sched *scheduler.Scheduler,
 	st *store.Store,
 	enrichmentConfig personenrichment.Config,
+	credentials personEnrichmentRuntimeCredentials,
 ) error {
 	if !enrichmentConfig.Enabled {
 		if st == nil {
@@ -2878,7 +3196,10 @@ func registerPersonEnrichmentJob(
 	if err := enrichmentConfig.Validate(); err != nil {
 		return err
 	}
-	suppressionKey, ok := os.LookupEnv(enrichmentConfig.SuppressionKeyEnv)
+	if credentials.Suppression == nil || credentials.Provider == nil {
+		return errors.New("person enrichment schedule requires suppression and provider credential lookups")
+	}
+	suppressionKey, ok := credentials.Suppression(enrichmentConfig.SuppressionKeyEnv)
 	if !ok || suppressionKey == "" {
 		return fmt.Errorf("person enrichment suppression key environment %q is not set",
 			enrichmentConfig.SuppressionKeyEnv)
@@ -2927,7 +3248,7 @@ func registerPersonEnrichmentJob(
 	if err := st.CancelPersonEnrichmentWorkOutsideProfilesContext(ctx, activeFingerprints); err != nil {
 		return fmt.Errorf("cancel unavailable person enrichment work: %w", err)
 	}
-	gate, err := personenrichment.NewEgressGate(st, st, hasher, os.LookupEnv)
+	gate, err := personenrichment.NewProviderBoundEgressGate(st, st, hasher, credentials.Provider)
 	if err != nil {
 		return fmt.Errorf("configure person enrichment egress: %w", err)
 	}
@@ -3201,9 +3522,9 @@ func runScheduledGmailSync(ctx context.Context, email string, src *store.Source,
 				return nil, fmt.Errorf("get token source: %w (transient network error; will retry on next schedule)", tsErr)
 			}
 			if oauthMgr.HasToken(email) {
-				return nil, fmt.Errorf("get token source: %w (token may be expired; run 'sync %s' or 'verify %s' from an interactive terminal to re-authorize)", tsErr, email, email)
+				return nil, fmt.Errorf("get token source: %w (token may be expired; %s)", tsErr, gmailReauthHint(email, accountIsNarrowed(oauthMgr, email)))
 			}
-			return nil, fmt.Errorf("get token source: %w (run 'add-account %s' first)", tsErr, email)
+			return nil, fmt.Errorf("get token source: %w (run 'msgvault add-account %s' first)", tsErr, email)
 		}
 	}
 
@@ -3284,12 +3605,18 @@ func runScheduledIMAPSync(ctx context.Context, src *store.Source, s *store.Store
 		return nil, fmt.Errorf("post-source-create migrations: %w", err)
 	}
 
-	summary, err := syncer.Full(ctx, src.Identifier)
+	summary, err := syncer.FullWithFinalizer(
+		ctx,
+		src,
+		func(summary *gmail.SyncSummary) error {
+			if err := saveIMAPFolderStates(ctx, s, src, apiClient, summary, 0); err != nil {
+				return fmt.Errorf("save IMAP incremental state: %w", err)
+			}
+			return nil
+		},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("IMAP sync failed: %w", err)
-	}
-	if err := saveIMAPFolderStates(ctx, s, src, apiClient, summary, 0); err != nil {
-		return nil, fmt.Errorf("save IMAP incremental state: %w", err)
 	}
 	return summary, nil
 }

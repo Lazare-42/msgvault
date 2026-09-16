@@ -36,6 +36,14 @@ func (d *SQLiteDialect) DriverName() string { return sqliteutil.DriverName() }
 // Rebind is a no-op for SQLite — it uses ? placeholders natively.
 func (d *SQLiteDialect) Rebind(query string) string { return query }
 
+func (d *SQLiteDialect) UnicodeLowerExpression(expr string) string {
+	return sqliteutil.UnicodeLowerFunction + "(" + expr + ")"
+}
+
+func (d *SQLiteDialect) BlobPrefixSQL(column string) string {
+	return "SUBSTR(" + column + ", 1, ?)"
+}
+
 // Now returns the SQLite expression for the current UTC timestamp.
 func (d *SQLiteDialect) Now() string { return "datetime('now')" }
 
@@ -300,6 +308,34 @@ func (d *SQLiteDialect) InsertOrIgnore(sql string) string { return sql }
 
 // BoolTrueExpr returns "col = 1" — SQLite stores booleans as 0/1 INTEGER.
 func (d *SQLiteDialect) BoolTrueExpr(col string) string { return col + " = 1" }
+
+// RFC822CanonicalIDExpr strips one clean angle-bracket pair from a stored
+// Message-ID. Every CASE result remains a BLOB so SQLite compares and groups
+// the complete byte string, including bytes after an embedded NUL. The
+// one-byte guards are cast back to TEXT solely to compare with ASCII literals.
+func (d *SQLiteDialect) RFC822CanonicalIDExpr(col string) string {
+	blob := fmt.Sprintf("CAST(%s AS BLOB)", col)
+	return fmt.Sprintf(`CASE
+		WHEN LENGTH(%[1]s) > 2
+		 AND CAST(SUBSTR(%[1]s, 1, 1) AS TEXT) = '<'
+		 AND CAST(SUBSTR(%[1]s, LENGTH(%[1]s), 1) AS TEXT) = '>'
+		 AND CAST(SUBSTR(%[1]s, 2, 1) AS TEXT) NOT IN ('<', '>', ' ')
+		 AND CAST(SUBSTR(%[1]s, LENGTH(%[1]s) - 1, 1) AS TEXT) NOT IN ('<', '>', ' ')
+			THEN SUBSTR(%[1]s, 2, LENGTH(%[1]s) - 2)
+			ELSE %[1]s
+	END`, blob)
+}
+
+// RFC822CanonicalIDIndexDefinition defines the composite expression/source
+// index. SQLite groups BLOB bytes, so the indexed CASE results preserve bytes
+// after embedded NUL. Canonical ID leads the index so GROUP BY streams in index
+// order; source_id lets the production scope filter use the same index.
+func (d *SQLiteDialect) RFC822CanonicalIDIndexDefinition() string {
+	return fmt.Sprintf(
+		"ON messages(%s, source_id)",
+		d.RFC822CanonicalIDExpr("rfc822_message_id"),
+	)
+}
 
 // JSONBindExpr is "?" on SQLite — JSON columns are plain TEXT.
 func (d *SQLiteDialect) JSONBindExpr() string { return "?" }
@@ -1886,6 +1922,10 @@ func (d *SQLiteDialect) contentChangedAtDefaultStamps(q querier) (bool, error) {
 // silences these when the column already exists (idempotent migrations).
 func (d *SQLiteDialect) LegacyColumnMigrations() []ColumnMigration {
 	return []ColumnMigration{
+		{`ALTER TABLE carddav_publications ADD COLUMN outgoing_envelope_metadata BLOB`, "carddav_publications.outgoing_envelope_metadata"},
+		{`ALTER TABLE carddav_publications ADD COLUMN approved_body_sha256 TEXT`, "carddav_publications.approved_body_sha256"},
+		{`ALTER TABLE carddav_publications ADD COLUMN approved_inference_revision INTEGER`, "carddav_publications.approved_inference_revision"},
+		{`ALTER TABLE carddav_publications ADD COLUMN approved_mutation_revision INTEGER`, "carddav_publications.approved_mutation_revision"},
 		{`ALTER TABLE person_sweep_cursors ADD COLUMN backstop_upper_key TEXT NOT NULL DEFAULT ''`, "person_sweep_cursors.backstop_upper_key"},
 		{`ALTER TABLE person_sweep_cursors ADD COLUMN backstop_after_key TEXT NOT NULL DEFAULT ''`, "person_sweep_cursors.backstop_after_key"},
 		{`ALTER TABLE person_sweep_cursors ADD COLUMN optimistic_document_key TEXT NOT NULL DEFAULT ''`, "person_sweep_cursors.optimistic_document_key"},
@@ -1893,14 +1933,25 @@ func (d *SQLiteDialect) LegacyColumnMigrations() []ColumnMigration {
 		{`ALTER TABLE person_sweep_cursors ADD COLUMN backstop_document_key TEXT NOT NULL DEFAULT ''`, "person_sweep_cursors.backstop_document_key"},
 		{`ALTER TABLE carddav_address_books ADD COLUMN needs_full_reconcile BOOLEAN NOT NULL DEFAULT FALSE`, "carddav_address_books.needs_full_reconcile"},
 		{`ALTER TABLE carddav_address_books ADD COLUMN sync_token TEXT NOT NULL DEFAULT ''`, "carddav_address_books.sync_token"},
+		{`ALTER TABLE carddav_conflicts ADD COLUMN review_revision INTEGER NOT NULL DEFAULT 1`, "carddav_conflicts.review_revision"},
+		{`ALTER TABLE carddav_conflicts ADD COLUMN local_inference_revision INTEGER`, "carddav_conflicts.local_inference_revision"},
+		{`ALTER TABLE carddav_conflicts ADD COLUMN approved_local_body_sha256 TEXT`, "carddav_conflicts.approved_local_body_sha256"},
+		{`ALTER TABLE carddav_conflicts ADD COLUMN approved_local_inference_revision INTEGER`, "carddav_conflicts.approved_local_inference_revision"},
+		{`ALTER TABLE carddav_conflicts ADD COLUMN approved_conflict_revision INTEGER`, "carddav_conflicts.approved_conflict_revision"},
+		{`ALTER TABLE carddav_conflicts ADD COLUMN local_envelope_metadata BLOB`, "carddav_conflicts.local_envelope_metadata"},
+		{`ALTER TABLE carddav_conflicts ADD COLUMN local_mutation_intent BLOB`, "carddav_conflicts.local_mutation_intent"},
 		{`ALTER TABLE carddav_conflicts ADD COLUMN pending_operation TEXT CHECK (pending_operation IN ('delete'))`, "carddav_conflicts.pending_operation"},
 		{`ALTER TABLE carddav_conflicts ADD COLUMN connection_generation INTEGER`, "carddav_conflicts.connection_generation"},
 		{`ALTER TABLE carddav_conflicts ADD COLUMN book_sync_revision INTEGER`, "carddav_conflicts.book_sync_revision"},
 		{`ALTER TABLE carddav_conflicts ADD COLUMN previous_mapping_revision INTEGER`, "carddav_conflicts.previous_mapping_revision"},
 		{`ALTER TABLE carddav_conflicts ADD COLUMN pending_started_at DATETIME`, "carddav_conflicts.pending_started_at"},
 		{`ALTER TABLE sources ADD COLUMN sync_config JSON`, "sync_config"},
+		{`ALTER TABLE sync_runs ADD COLUMN sync_type TEXT NOT NULL DEFAULT ''`, "sync_runs.sync_type"},
+		{`ALTER TABLE sync_runs ADD COLUMN request_fingerprint TEXT`, "sync_runs.request_fingerprint"},
+		{`ALTER TABLE sync_runs ADD COLUMN operation_id TEXT`, "sync_runs.operation_id"},
 		{`ALTER TABLE imap_folder_state ADD COLUMN highest_modseq TEXT NOT NULL DEFAULT '0'`, "imap_folder_state.highest_modseq"},
 		{`ALTER TABLE messages ADD COLUMN rfc822_message_id TEXT`, "rfc822_message_id"},
+		{`ALTER TABLE messages ADD COLUMN list_id TEXT`, "list_id"},
 		{`ALTER TABLE sources ADD COLUMN oauth_app TEXT`, "oauth_app"},
 		{`ALTER TABLE participants ADD COLUMN phone_number TEXT`, "phone_number"},
 		{`ALTER TABLE participants ADD COLUMN canonical_id TEXT`, "canonical_id"},
@@ -1915,6 +1966,7 @@ func (d *SQLiteDialect) LegacyColumnMigrations() []ColumnMigration {
 		{`ALTER TABLE conversations ADD COLUMN title TEXT`, "title"},
 		{`ALTER TABLE conversations ADD COLUMN conversation_type TEXT NOT NULL DEFAULT 'email_thread'`, "conversation_type"},
 		{`ALTER TABLE labels ADD COLUMN system_role TEXT`, "labels.system_role"},
+		{`ALTER TABLE account_identities ADD COLUMN address_key TEXT NOT NULL DEFAULT ''`, "account_identities.address_key"},
 		{`ALTER TABLE participant_identifiers ADD COLUMN service_id INTEGER REFERENCES communication_services(id) ON DELETE SET NULL`, "pi_service_id"},
 		{`ALTER TABLE participant_identifiers ADD COLUMN scope_kind TEXT`, "pi_scope_kind"},
 		{`ALTER TABLE participant_identifiers ADD COLUMN scope_value TEXT`, "pi_scope_value"},
@@ -1967,6 +2019,7 @@ func (d *SQLiteDialect) LegacyColumnMigrations() []ColumnMigration {
 		{`ALTER TABLE document_extractions ADD COLUMN document_family TEXT`, "document_extractions.document_family"},
 		{`ALTER TABLE document_extractions ADD COLUMN unit_kind TEXT`, "document_extractions.unit_kind"},
 		{`ALTER TABLE document_extractions ADD COLUMN normalized_truncated BOOLEAN NOT NULL DEFAULT FALSE`, "document_extractions.normalized_truncated"},
+		{`ALTER TABLE document_extractions ADD COLUMN source_media_type TEXT`, "document_extractions.source_media_type"},
 		{`ALTER TABLE document_units ADD COLUMN heading_marks JSON NOT NULL DEFAULT '[]'`, "document_units.heading_marks"},
 		{`ALTER TABLE document_index_state ADD COLUMN target_profile_id TEXT`, "document_index_state.target_profile_id"},
 		{`ALTER TABLE attachments ADD COLUMN attachment_state TEXT`, "attachments.attachment_state"},

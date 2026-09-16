@@ -43,8 +43,9 @@ const defaultThreadMessageLimit = 1000
 
 // Options configuration for TUI.
 type Options struct {
-	DataDir string
-	Version string
+	DataDir   string
+	ExportDir string
+	Version   string
 
 	// AggregateLimit overrides the maximum number of aggregate rows to load.
 	// Zero uses the default (50,000).
@@ -79,6 +80,145 @@ type Options struct {
 	// the daemon falling back to live SQL because no analytics cache is
 	// built for the archive).
 	AnalyticsNotice string
+
+	// SettingsBackend reads and writes the same daemon-owned settings catalog
+	// used by the Web UI. When nil, the Settings surface reports unavailable.
+	SettingsBackend SettingsBackend
+
+	// CollectionScopeLister optionally supplies named Email source scopes. The
+	// command root gates this capability on the daemon API schema version.
+	CollectionScopeLister query.CollectionScopeLister
+}
+
+type sourceScopeKind uint8
+
+const (
+	sourceScopeAll sourceScopeKind = iota
+	sourceScopeAccount
+	sourceScopeCollection
+)
+
+type sourceScope struct {
+	kind           sourceScopeKind
+	accountID      *int64
+	collectionName string
+	sourceIDs      []int64
+}
+
+type scopeOptionKind uint8
+
+const (
+	scopeOptionAll scopeOptionKind = iota
+	scopeOptionAccount
+	scopeOptionCollection
+)
+
+type scopeOption struct {
+	kind       scopeOptionKind
+	label      string
+	accountID  *int64
+	collection query.CollectionScope
+}
+
+func allSourceScope() sourceScope { return sourceScope{} }
+
+func accountSourceScope(id *int64) sourceScope {
+	if id == nil {
+		return allSourceScope()
+	}
+	idCopy := *id
+	return sourceScope{kind: sourceScopeAccount, accountID: &idCopy}
+}
+
+func collectionSourceScope(collection query.CollectionScope) sourceScope {
+	return sourceScope{
+		kind:           sourceScopeCollection,
+		collectionName: collection.Name,
+		sourceIDs:      copySourceIDs(collection.SourceIDs),
+	}
+}
+
+func (s sourceScope) title(accounts []query.AccountInfo) string {
+	if s.kind == sourceScopeCollection {
+		return "Collection: " + s.collectionName
+	}
+	if s.accountID == nil {
+		return "All Accounts"
+	}
+	for _, account := range accounts {
+		if account.ID == *s.accountID {
+			return account.Identifier
+		}
+	}
+	return "All Accounts"
+}
+
+func (s sourceScope) apply(filter *query.MessageFilter) {
+	filter.SourceID = nil
+	filter.SourceIDs = nil
+	switch s.kind {
+	case sourceScopeAll:
+		return
+	case sourceScopeAccount:
+		if s.accountID != nil {
+			id := *s.accountID
+			filter.SourceID = &id
+		}
+	case sourceScopeCollection:
+		filter.SourceIDs = copySourceIDs(s.sourceIDs)
+	}
+}
+
+func copySourceIDs(ids []int64) []int64 {
+	if ids == nil {
+		return nil
+	}
+	return append(make([]int64, 0, len(ids)), ids...)
+}
+
+func (m Model) scopeTitle() string {
+	if m.mode != modeEmail {
+		return accountSourceScope(m.textState.sourceID).title(m.accounts)
+	}
+	return m.sourceScope.title(m.accounts)
+}
+
+func (m Model) scopeOptions() []scopeOption {
+	options := []scopeOption{{kind: scopeOptionAll, label: "All Accounts"}}
+	for _, account := range m.accounts {
+		id := account.ID
+		options = append(options, scopeOption{kind: scopeOptionAccount, label: account.Identifier, accountID: &id})
+	}
+	for _, collection := range m.collectionScopes {
+		options = append(options, scopeOption{kind: scopeOptionCollection, label: collection.Name,
+			collection: query.CollectionScope{Name: collection.Name, SourceIDs: copySourceIDs(collection.SourceIDs)}})
+	}
+	return options
+}
+
+func (m Model) selectorOptions() []scopeOption {
+	if m.mode == modeEmail {
+		return m.scopeOptions()
+	}
+	options := []scopeOption{{kind: scopeOptionAll}}
+	for _, account := range m.selectableAccounts() {
+		id := account.ID
+		options = append(options, scopeOption{kind: scopeOptionAccount, label: account.Identifier, accountID: &id})
+	}
+	return options
+}
+
+func (s sourceScope) matches(option scopeOption) bool {
+	switch option.kind {
+	case scopeOptionAll:
+		return s.kind == sourceScopeAll
+	case scopeOptionAccount:
+		return s.kind == sourceScopeAccount && s.accountID != nil && option.accountID != nil && *s.accountID == *option.accountID
+	case scopeOptionCollection:
+		return s.kind == sourceScopeCollection && s.collectionName == option.collection.Name
+	default:
+		return false
+	}
 }
 
 // modalType represents the type of modal dialog.
@@ -157,6 +297,12 @@ type Model struct {
 	peopleBackend peoplebrowser.Backend
 	peopleState   peopleState
 
+	// Settings is a global shell surface, deliberately separate from the
+	// content-mode cycle so opening it cannot disturb content navigation.
+	settingsBackend   SettingsBackend
+	settings          settingsState
+	settingsRequestID uint64
+
 	// Version info for title bar
 	version string
 
@@ -180,11 +326,11 @@ type Model struct {
 	breadcrumbs []navigationSnapshot
 
 	// Global Stats (not view specific)
-	stats    *query.TotalStats // Global stats
-	accounts []query.AccountInfo
-
-	// Account filter (nil = all accounts)
-	accountFilter *int64
+	stats                 *query.TotalStats // Global stats
+	accounts              []query.AccountInfo
+	collectionScopeLister query.CollectionScopeLister
+	collectionScopes      []query.CollectionScope
+	sourceScope           sourceScope
 
 	// Content filters
 	filters struct {
@@ -214,16 +360,21 @@ type Model struct {
 	height int
 
 	// Loading state
-	loading       bool
-	err           error
-	spinnerFrame  int  // Current frame index into spinnerFrames
-	spinnerActive bool // True when spinner tick is running
+	loading         bool
+	savingMessage   bool
+	deletionLoading bool // True while resolving every message matching the current filter
+	deletionCancel  context.CancelFunc
+	err             error
+	spinnerFrame    int  // Current frame index into spinnerFrames
+	spinnerActive   bool // True when spinner tick is running
 
 	// Request tracking to ignore stale async results
 	aggregateRequestID     uint64 // Current request ID for aggregate data
+	statsRequestID         uint64 // Current request ID for total statistics
 	loadRequestID          uint64 // Current request ID for message list
 	detailRequestID        uint64 // Current request ID for message detail
 	searchRequestID        uint64 // Current request ID for search results
+	deletionRequestID      uint64 // Current request ID for bulk deletion target resolution
 	presentationGeneration uint64 // Mode activation owning shared presentation
 	textRequestID          uint64 // Latest Text navigation/data request
 
@@ -242,6 +393,10 @@ type Model struct {
 	inlineSearchActive   bool   // True when inline search bar is active
 	inlineSearchDebounce uint64 // Increment to cancel pending debounce timers
 	inlineSearchLoading  bool   // True when a debounced search query is in-flight
+	inlineSearchError    string // Non-modal validation feedback for incomplete/invalid input
+	searchHistory        []string
+	searchHistoryIndex   int
+	searchHistoryDraft   string
 
 	// Pre-search snapshot: cached message list state before search began,
 	// so Esc can restore instantly without re-querying.
@@ -311,13 +466,18 @@ func New(engine query.Engine, opts Options) Model {
 	}
 
 	return Model{
-		engine:        engine,
-		textEngine:    textEngine,
-		peopleBackend: opts.PeopleBackend,
+		engine:                engine,
+		textEngine:            textEngine,
+		collectionScopeLister: opts.CollectionScopeLister,
+		sourceScope:           allSourceScope(),
+		peopleBackend:         opts.PeopleBackend,
+		settingsBackend:       opts.SettingsBackend,
+		settings:              newSettingsState(),
 		actions: NewActionControllerWithOptions(engine, ActionControllerOptions{
-			DataDir:          opts.DataDir,
-			ManifestSaver:    opts.ManifestSaver,
-			AttachmentReader: opts.AttachmentReader,
+			DataDir:             opts.DataDir,
+			AttachmentOutputDir: opts.ExportDir,
+			ManifestSaver:       opts.ManifestSaver,
+			AttachmentReader:    opts.AttachmentReader,
 		}),
 		semanticSearch:     opts.SemanticSearch,
 		version:            opts.Version,
@@ -361,6 +521,7 @@ func (m Model) Init() tea.Cmd {
 		m.loadData(),
 		m.loadStats(),
 		m.loadAccounts(),
+		m.loadCollectionScopes(),
 		m.checkForUpdate(),
 		spinnerTick(), // Start spinner for initial load
 	)
@@ -389,8 +550,10 @@ type dataLoadedMsg struct {
 
 // statsLoadedMsg is sent when stats are loaded.
 type statsLoadedMsg struct {
-	stats *query.TotalStats
-	err   error
+	stats                  *query.TotalStats
+	err                    error
+	requestID              uint64
+	presentationGeneration uint64
 }
 
 // accountsLoadedMsg is sent when accounts are loaded.
@@ -399,12 +562,17 @@ type accountsLoadedMsg struct {
 	err      error
 }
 
+type collectionScopesLoadedMsg struct {
+	scopes []query.CollectionScope
+	err    error
+}
+
 // scopeLabelForLog returns a short, stable string describing the
 // current account scope so it can be attached to log records.
 // Uses "filtered" rather than the account identifier to avoid
 // persisting email addresses in the log file.
 func (m Model) scopeLabelForLog() string {
-	if m.accountFilter != nil {
+	if m.sourceScope.kind != sourceScopeAll {
 		return "filtered"
 	}
 	return "all"
@@ -433,7 +601,6 @@ func (m Model) loadData() tea.Cmd {
 	return safeCmdWithPanic(
 		func() tea.Msg {
 			opts := query.AggregateOptions{
-				SourceID:              m.accountFilter,
 				SortField:             m.sortField,
 				SortDirection:         m.sortDirection,
 				Limit:                 m.aggregateLimit,
@@ -442,6 +609,9 @@ func (m Model) loadData() tea.Cmd {
 				HideDeletedFromSource: m.filters.hideDeletedFromSource,
 				SearchQuery:           m.searchQuery,
 			}
+			scope := m.sourceScope
+			opts.SourceID = scope.accountID
+			opts.SourceIDs = copySourceIDs(scope.sourceIDs)
 
 			start := time.Now()
 			ctx := context.Background()
@@ -453,7 +623,7 @@ func (m Model) loadData() tea.Cmd {
 			// generic Aggregate call, lets the TUI's mode constraint intersect
 			// an explicit message_type search instead of being overridden by it.
 			aggregateFilter := emailScopedMessageFilter(m.drillFilter)
-			aggregateFilter.SourceID = m.accountFilter
+			m.sourceScope.apply(&aggregateFilter)
 			aggregateFilter.WithAttachmentsOnly = m.filters.attachmentsOnly
 			aggregateFilter.HideDeletedFromSource = m.filters.hideDeletedFromSource
 			rows, err = m.engine.SubAggregate(ctx, aggregateFilter, m.viewType, opts)
@@ -485,12 +655,15 @@ func (m Model) loadData() tea.Cmd {
 					filteredStats = &query.TotalStats{}
 				} else {
 					statsOpts := query.StatsOptions{
-						SourceID:              m.accountFilter,
+						Filter:                &aggregateFilter,
 						WithAttachmentsOnly:   m.filters.attachmentsOnly,
 						HideDeletedFromSource: m.filters.hideDeletedFromSource,
 						SearchQuery:           scopedQuery,
+						SearchScope:           true,
 						GroupBy:               m.viewType,
 					}
+					statsOpts.SourceID = m.sourceScope.accountID
+					statsOpts.SourceIDs = copySourceIDs(m.sourceScope.sourceIDs)
 					filteredStats, _ = m.engine.GetTotalStats(ctx, statsOpts)
 				}
 			}
@@ -509,20 +682,29 @@ func (m Model) loadData() tea.Cmd {
 	)
 }
 
+// refreshStats supersedes previous totals whenever a new statistics read is scheduled.
+func (m *Model) refreshStats() tea.Cmd {
+	m.statsRequestID++
+	return m.loadStats()
+}
+
 // loadStats fetches total statistics.
 func (m Model) loadStats() tea.Cmd {
+	requestID := m.statsRequestID
+	presentationGeneration := m.presentationGeneration
 	return safeCmdWithPanic(
 		func() tea.Msg {
 			opts := query.StatsOptions{
-				SourceID:              m.accountFilter,
 				WithAttachmentsOnly:   m.filters.attachmentsOnly,
 				HideDeletedFromSource: m.filters.hideDeletedFromSource,
 			}
+			opts.SourceID = m.sourceScope.accountID
+			opts.SourceIDs = copySourceIDs(m.sourceScope.sourceIDs)
 			stats, err := m.engine.GetTotalStats(context.Background(), opts)
-			return statsLoadedMsg{stats: stats, err: err}
+			return statsLoadedMsg{stats: stats, err: err, requestID: requestID, presentationGeneration: presentationGeneration}
 		},
 		func(r any) tea.Msg {
-			return statsLoadedMsg{err: fmt.Errorf("stats panic: %v", r)}
+			return statsLoadedMsg{err: fmt.Errorf("stats panic: %v", r), requestID: requestID, presentationGeneration: presentationGeneration}
 		},
 	)
 }
@@ -544,6 +726,30 @@ func (m Model) loadAccounts() tea.Cmd {
 		},
 		func(r any) tea.Msg {
 			return accountsLoadedMsg{err: fmt.Errorf("accounts panic: %v", r)}
+		},
+	)
+}
+
+func (m Model) loadCollectionScopes() tea.Cmd {
+	lister := m.collectionScopeLister
+	return safeCmdWithPanic(
+		func() tea.Msg {
+			if lister == nil {
+				return collectionScopesLoadedMsg{}
+			}
+			scopes, err := lister.ListCollectionScopes(context.Background())
+			if err != nil {
+				slog.Warn("tui loadCollectionScopes failed", "error", err)
+				return collectionScopesLoadedMsg{err: err}
+			}
+			out := make([]query.CollectionScope, len(scopes))
+			for i, scope := range scopes {
+				out[i] = query.CollectionScope{Name: scope.Name, SourceIDs: copySourceIDs(scope.SourceIDs)}
+			}
+			return collectionScopesLoadedMsg{scopes: out}
+		},
+		func(r any) tea.Msg {
+			return collectionScopesLoadedMsg{err: fmt.Errorf("collections panic: %v", r)}
 		},
 	)
 }
@@ -576,6 +782,14 @@ type searchResultsMsg struct {
 	presentationGeneration uint64
 }
 
+// deletionPreparedMsg is sent when asynchronous bulk deletion target
+// resolution has built a manifest or failed.
+type deletionPreparedMsg struct {
+	manifest  *deletion.Manifest
+	err       error
+	requestID uint64
+}
+
 // threadMessagesLoadedMsg is sent when thread messages are loaded.
 type threadMessagesLoadedMsg struct {
 	messages               []query.MessageSummary
@@ -604,6 +818,9 @@ type exportResultMsg = ExportResultMsg
 
 // inlineSearchDebounceDelay is the delay before executing inline search (fast mode).
 const inlineSearchDebounceDelay = 100 * time.Millisecond
+
+// inlineSearchHistoryLimit bounds session-only search history.
+const inlineSearchHistoryLimit = 100
 
 // deepSearchDebounceDelay is the delay before executing inline search (deep FTS mode).
 const deepSearchDebounceDelay = 500 * time.Millisecond
@@ -656,6 +873,7 @@ func (m Model) loadSearchWithOffset(queryStr string, offset int, appendResults b
 			ctx := context.Background()
 			q := search.Parse(queryStr)
 			searchFilter := emailScopedMessageFilter(m.searchFilter)
+			m.sourceScope.apply(&searchFilter)
 
 			start := time.Now()
 			var results []query.MessageSummary
@@ -685,7 +903,6 @@ func (m Model) loadSearchWithOffset(queryStr string, offset int, appendResults b
 					"duration_ms", time.Since(start).Milliseconds(),
 				)
 			}()
-
 			switch m.searchMode {
 			case searchModeFast:
 				// Fast search: single-scan with temp table materialization
@@ -699,32 +916,15 @@ func (m Model) loadSearchWithOffset(queryStr string, offset int, appendResults b
 				}
 				err = fastErr
 			case searchModeDeep:
-				// Deep search: FTS5 body search
-				// Merge context filter into query to honor drill-down context
-				mergedQuery := query.MergeFilterIntoQuery(q, searchFilter)
-				results, err = m.engine.Search(ctx, mergedQuery, searchPageSize, offset)
-				// For deep search, estimate total from result count (no separate count query)
-				if err == nil && offset == 0 {
-					totalCount = int64(len(results))
-					if len(results) == searchPageSize {
-						totalCount = -1 // Indicate more results available
-					}
-				}
-
-				// Fetch aggregate stats (size, attachments) for the search results
-				// on the initial page load so the header metrics are accurate.
-				if err == nil && !appendResults {
-					statsOpts, noMatches := deepSearchStatsOptions(mergedQuery, m.viewType)
-					if noMatches {
-						stats = &query.TotalStats{}
-					} else {
-						var statsErr error
-						stats, statsErr = m.engine.GetTotalStats(ctx, statsOpts)
-						if statsErr != nil {
-							slog.Warn("tui deep search stats failed",
-								"query_len", len(queryStr),
-								"error", statsErr.Error(),
-							)
+				// Deep search returns results and header metrics from one complete
+				// view filter so names, conversations, and empty buckets stay scoped.
+				result, deepErr := m.engine.SearchDeepWithStats(ctx, q, searchFilter, searchPageSize, offset)
+				if deepErr == nil {
+					results = result.Messages
+					totalCount = result.TotalCount
+					if !appendResults {
+						stats = result.Stats
+						if stats == nil {
 							fallbackCount := totalCount
 							if fallbackCount < 0 {
 								fallbackCount = int64(len(results))
@@ -733,6 +933,7 @@ func (m Model) loadSearchWithOffset(queryStr string, offset int, appendResults b
 						}
 					}
 				}
+				err = deepErr
 			case searchModeSemantic:
 				if m.semanticSearch == nil {
 					err = errors.New("semantic search is not enabled")
@@ -781,35 +982,6 @@ func (m Model) loadSearchWithOffset(queryStr string, offset int, appendResults b
 	)
 }
 
-// deepSearchStatsOptions derives stats from the already-merged query used for
-// deep results. Search.Query cannot represent SenderName, RecipientName,
-// ConversationID, or empty aggregate buckets; MergeFilterIntoQuery deliberately
-// leaves those unsupported contexts out of both paths. A non-nil empty account
-// scope is the shared match-nothing signal for conflicting message types or an
-// explicitly empty collection.
-func deepSearchStatsOptions(merged *search.Query, groupBy query.ViewType) (query.StatsOptions, bool) {
-	opts := query.StatsOptions{
-		SearchQuery: search.Format(merged),
-		SearchScope: true,
-		GroupBy:     groupBy,
-	}
-	if merged == nil {
-		return opts, false
-	}
-	if merged.AccountIDs != nil && len(merged.AccountIDs) == 0 {
-		return opts, true
-	}
-	if len(merged.AccountIDs) == 1 {
-		sourceID := merged.AccountIDs[0]
-		opts.SourceID = &sourceID
-	} else if len(merged.AccountIDs) > 1 {
-		opts.SourceIDs = append([]int64(nil), merged.AccountIDs...)
-	}
-	opts.WithAttachmentsOnly = merged.HasAttachment != nil && *merged.HasAttachment
-	opts.HideDeletedFromSource = merged.HideDeleted
-	return opts, false
-}
-
 // buildMessageFilter constructs a MessageFilter from the current model state.
 func (m Model) buildMessageFilter() query.MessageFilter {
 	// Start with drillFilter if set, otherwise build fresh filter
@@ -819,7 +991,7 @@ func (m Model) buildMessageFilter() query.MessageFilter {
 	}
 
 	// Override sorting and pagination
-	filter.SourceID = m.accountFilter
+	m.sourceScope.apply(&filter)
 	filter.Sorting.Field = m.msgSortField
 	filter.Sorting.Direction = m.msgSortDirection
 	filter.WithAttachmentsOnly = m.filters.attachmentsOnly
@@ -849,6 +1021,8 @@ func (m Model) buildMessageFilter() query.MessageFilter {
 			if m.filterKey == "" {
 				filter.SetEmptyTarget(query.ViewLabels)
 			}
+		case query.ViewLists:
+			filter.ListID = m.filterKey
 		case query.ViewTime:
 			filter.TimeRange.Period = m.filterKey
 			filter.TimeRange.Granularity = m.timeGranularity
@@ -921,6 +1095,8 @@ func (m Model) hasDrillFilter() bool {
 		m.drillFilter.RecipientName != "" ||
 		m.drillFilter.Domain != "" ||
 		m.drillFilter.Label != "" ||
+		m.drillFilter.ConversationID != nil ||
+		m.drillFilter.ListID != "" ||
 		m.drillFilter.TimeRange.Period != "" ||
 		m.drillFilter.HasEmptyTargets()
 }
@@ -943,6 +1119,8 @@ func (m Model) drillFilterKey() string {
 		return m.drillFilter.Domain
 	case query.ViewLabels:
 		return m.drillFilter.Label
+	case query.ViewLists:
+		return m.drillFilter.ListID
 	case query.ViewTime:
 		return m.drillFilter.TimeRange.Period
 	default:
@@ -963,6 +1141,7 @@ func (m Model) loadThreadMessages(conversationID int64) tea.Cmd {
 				Sorting:        query.MessageSorting{Field: query.MessageSortByDate, Direction: query.SortAsc},
 				Pagination:     query.Pagination{Limit: threadLimit + 1}, // Request one extra to detect truncation
 			}
+			m.sourceScope.apply(&filter)
 			messages, err := m.engine.ListMessages(context.Background(), filter)
 
 			// Check if truncated (more messages than limit)
@@ -1067,11 +1246,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleStatsLoaded(msg)
 	case accountsLoadedMsg:
 		return m.handleAccountsLoaded(msg)
+	case collectionScopesLoadedMsg:
+		return m.handleCollectionScopesLoaded(msg)
 	case updateCheckMsg:
 		return m.handleUpdateCheck(msg)
 	case AnalyticsNoticeMsg:
 		m.analyticsNotice = msg.Notice
 		return m, nil
+	case settingsLoadedMsg:
+		return m.handleSettingsLoaded(msg)
+	case settingsSavedMsg:
+		return m.handleSettingsSaved(msg)
 	// People messages are delegated before the shared Email handlers.
 	case peopleSearchDebounceMsg:
 		return m.handlePeopleSearchDebounce(msg)
@@ -1087,6 +1272,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handlePeoplePromoted(msg)
 	case peopleAttributesLoadedMsg:
 		return m.handlePeopleAttributesLoaded(msg)
+	case peopleBriefLoadedMsg:
+		return m.handlePeopleBriefLoaded(msg)
+	case peopleBriefCommandMsg:
+		return m.handlePeopleBriefCommand(msg)
 	case peopleFieldCreatedMsg:
 		return m.handlePeopleFieldCreated(msg)
 	case peopleAttributeSetMsg:
@@ -1115,6 +1304,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handlePeopleActivityMessageLoaded(msg)
 	case ExportResultMsg:
 		return m.handleExportResult(msg)
+	case saveMessageResultMsg:
+		m.savingMessage = false
+		return m.showExportResult(ExportResultMsg(msg))
 	case messagesLoadedMsg:
 		return m.handleMessagesLoaded(msg)
 	case messageDetailLoadedMsg:
@@ -1123,6 +1315,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleThreadMessagesLoaded(msg)
 	case searchResultsMsg:
 		return m.handleSearchResults(msg)
+	case deletionPreparedMsg:
+		return m.handleDeletionPrepared(msg)
 	case flashClearMsg:
 		return m.handleFlashClear()
 	case searchDebounceMsg:
@@ -1367,6 +1561,9 @@ func (m Model) sumRowStats(rows []query.AggregateRow) *query.TotalStats {
 
 // handleStatsLoaded processes stats load completion.
 func (m Model) handleStatsLoaded(msg statsLoadedMsg) (tea.Model, tea.Cmd) {
+	if msg.requestID != m.statsRequestID || msg.presentationGeneration != m.presentationGeneration {
+		return m, nil
+	}
 	if msg.err == nil {
 		m.stats = msg.stats
 	}
@@ -1377,6 +1574,13 @@ func (m Model) handleStatsLoaded(msg statsLoadedMsg) (tea.Model, tea.Cmd) {
 func (m Model) handleAccountsLoaded(msg accountsLoadedMsg) (tea.Model, tea.Cmd) {
 	if msg.err == nil {
 		m.accounts = msg.accounts
+	}
+	return m, nil
+}
+
+func (m Model) handleCollectionScopesLoaded(msg collectionScopesLoadedMsg) (tea.Model, tea.Cmd) {
+	if msg.err == nil {
+		m.collectionScopes = msg.scopes
 	}
 	return m, nil
 }
@@ -1597,9 +1801,13 @@ func (m Model) handleFlashClear() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// handleExportResult processes attachment export completion.
+// handleExportResult processes message and attachment action completion.
 func (m Model) handleExportResult(msg exportResultMsg) (tea.Model, tea.Cmd) {
 	m.loading = false
+	return m.showExportResult(msg)
+}
+
+func (m Model) showExportResult(msg ExportResultMsg) (tea.Model, tea.Cmd) {
 	m.modal = modalExportResult
 	m.modalResultTitle = msg.Title
 	if msg.Err != nil && msg.Result == "" {
@@ -1621,6 +1829,14 @@ func (m Model) handleSearchDebounce(msg searchDebounceMsg) (tea.Model, tea.Cmd) 
 		return m, nil
 	}
 
+	if err := m.searchInputValidationError(msg.query); err != nil {
+		m.invalidateInlineSearchRequests()
+		m.inlineSearchLoading = false
+		m.inlineSearchError = err.Error()
+		return m, nil
+	}
+
+	m.inlineSearchError = ""
 	m.searchQuery = msg.query
 	if m.searchQuery == "" {
 		m.contextStats = nil
@@ -1631,8 +1847,7 @@ func (m Model) handleSearchDebounce(msg searchDebounceMsg) (tea.Model, tea.Cmd) 
 	if m.level == levelMessageList {
 		// Message list: use search engine for live results
 		m.syncSearchScope()
-		m.searchRequestID++
-		m.loadRequestID++ // Invalidate any in-flight loadMessages to prevent overwriting search results
+		m.invalidateInlineSearchRequests()
 		if msg.query == "" {
 			// Empty query: reload unfiltered messages
 			return m, tea.Batch(spinCmd, m.loadMessages())
@@ -1648,7 +1863,7 @@ func (m Model) handleSearchDebounce(msg searchDebounceMsg) (tea.Model, tea.Cmd) 
 // handleSpinnerTick processes spinner animation ticks.
 func (m Model) handleSpinnerTick() (tea.Model, tea.Cmd) {
 	// Only advance if still loading (any loading state)
-	if m.loading || m.inlineSearchLoading || m.searchLoadingMore {
+	if m.isLoading() {
 		m.spinnerFrame = (m.spinnerFrame + 1) % len(spinnerFrames)
 		return m, spinnerTick()
 	}
@@ -1658,6 +1873,28 @@ func (m Model) handleSpinnerTick() (tea.Model, tea.Cmd) {
 
 // handleKeyPress processes keyboard input.
 func (m Model) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	if m.settings.active {
+		return m.handleSettingsKeyPress(msg)
+	}
+
+	// Resolving every deletion match is view-independent. Keep the current
+	// scope stable until it finishes, while still allowing cancellation and
+	// the normal quit flow from every mode.
+	if m.deletionLoading {
+		switch msg.String() {
+		case keyNameEsc:
+			m.cancelDeletionResolution()
+			return m.showFlash("Deletion match resolution canceled")
+		case "q", keyNameCtrlC:
+			m.cancelDeletionResolution()
+		default:
+			return m, nil
+		}
+	}
+
+	if msg.String() == "," && m.settingsShortcutAvailable() {
+		return m.openSettings()
+	}
 	if m.mode == modePeople {
 		return m.handlePeopleKeyPress(msg)
 	}
@@ -1807,21 +2044,99 @@ func (m *Model) updateDetailLineCount() {
 
 // stageForDeletion prepares messages for deletion via the ActionController.
 func (m Model) stageForDeletion() (tea.Model, tea.Cmd) {
+	return m.stageForDeletionContext(false)
+}
+
+func (m Model) stageAllMatchesForDeletion() (tea.Model, tea.Cmd) {
+	return m.stageAllMatchesForDeletionContext(m.deletionContext(true))
+}
+
+func (m Model) stageAllMatchesForDeletionContext(ctx DeletionContext) (tea.Model, tea.Cmd) {
+	if m.deletionLoading {
+		return m, nil
+	}
+
+	m.deletionRequestID++
+	requestID := m.deletionRequestID
+	m.deletionLoading = true
+	resolveContext, cancel := context.WithCancel(context.Background())
+	m.deletionCancel = cancel
+	spinCmd := m.startSpinner()
+	resolveCmd := safeCmdWithPanic(
+		func() tea.Msg {
+			manifest, err := m.actions.StageForDeletionContext(resolveContext, ctx)
+			return deletionPreparedMsg{manifest: manifest, err: err, requestID: requestID}
+		},
+		func(r any) tea.Msg {
+			return deletionPreparedMsg{
+				err: fmt.Errorf("bulk deletion target resolution panic: %v", r), requestID: requestID,
+			}
+		},
+	)
+	return m, tea.Batch(spinCmd, resolveCmd)
+}
+
+func (m Model) stageForDeletionContext(allMatches bool) (tea.Model, tea.Cmd) {
+	manifest, err := m.actions.StageForDeletion(m.deletionContext(allMatches))
+	return m.applyPreparedDeletion(manifest, err)
+}
+
+func (m Model) deletionContext(allMatches bool) DeletionContext {
+	scope := m.sourceScope
 	var drillFilter *query.MessageFilter
 	if m.hasDrillFilter() {
 		f := m.drillFilter
 		drillFilter = &f
 	}
-	manifest, err := m.actions.StageForDeletion(DeletionContext{
+	dctx := DeletionContext{
 		AggregateSelection: m.selection.aggregateKeys,
 		MessageSelection:   m.selection.messageIDs,
 		AggregateViewType:  m.selection.aggregateViewType,
-		AccountFilter:      m.accountFilter,
+		AccountFilter:      scope.accountID,
+		SourceIDs:          copySourceIDs(scope.sourceIDs),
 		Accounts:           m.accounts,
 		TimeGranularity:    m.timeGranularity,
 		Messages:           m.messages,
 		DrillFilter:        drillFilter,
-	})
+		AllMatches:         allMatches,
+		SearchQuery:        m.searchQuery,
+		SearchMode:         m.searchMode,
+		MatchFilter:        m.currentSearchFilter(),
+	}
+	if allMatches {
+		// Space selections are a different command scope. Keep them out of both
+		// resolution and the manifest audit record for uppercase D.
+		dctx.AggregateSelection = nil
+		dctx.MessageSelection = nil
+	}
+	return dctx
+}
+
+func (m Model) handleDeletionPrepared(msg deletionPreparedMsg) (tea.Model, tea.Cmd) {
+	if msg.requestID != m.deletionRequestID {
+		return m, nil
+	}
+	m.finishDeletionResolution()
+	return m.applyPreparedDeletion(msg.manifest, msg.err)
+}
+
+func (m *Model) finishDeletionResolution() {
+	if m.deletionCancel != nil {
+		m.deletionCancel()
+		m.deletionCancel = nil
+	}
+	m.deletionLoading = false
+}
+
+func (m *Model) cancelDeletionResolution() {
+	if !m.deletionLoading {
+		return
+	}
+	m.deletionRequestID++
+	m.finishDeletionResolution()
+}
+
+func (m Model) applyPreparedDeletion(manifest *deletion.Manifest, err error) (tea.Model, tea.Cmd) {
 	if err != nil {
 		m.modal = modalDeleteResult
 		m.modalResult = err.Error()
@@ -1849,7 +2164,7 @@ func (m Model) confirmDeletion() (tea.Model, tea.Cmd) {
 
 	// Show success
 	m.modal = modalDeleteResult
-	m.modalResult = fmt.Sprintf("Staged %d messages for deletion.\nBatch ID: %s\nInspect: msgvault delete-staged --list\nExecute: MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged",
+	m.modalResult = fmt.Sprintf("Staged %d messages for deletion.\nBatch ID: %s\nInspect: msgvault delete-staged --list\nDurable execution consent in invoking CLI config: [deletion] remote_enabled = true\nExecute: msgvault delete-staged\nOne-command alternative: MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged",
 		len(m.pendingManifest.GmailIDs), m.pendingManifest.ID)
 
 	// Clear selection
@@ -1896,6 +2211,10 @@ func (m Model) View() tea.View {
 		content = ""
 	} else if m.width == 0 {
 		content = "Loading..."
+	} else if m.settings.active {
+		// Settings is a shell layer above content transitions. Keep the frozen
+		// content frame intact underneath so Esc restores it exactly.
+		content = m.renderSettingsView()
 	} else if m.transitionBuffer != "" {
 		// If view is frozen (during level transitions), return the cached view
 		// to prevent flashing while async data loads complete.
@@ -1913,6 +2232,9 @@ func (m Model) View() tea.View {
 // Separated from View() so transitions can capture the current output
 // before changing state (for the transitionBuffer pattern).
 func (m Model) renderView() string {
+	if m.settings.active {
+		return m.renderSettingsView()
+	}
 	if m.mode == modePeople {
 		return m.renderPeopleView()
 	}

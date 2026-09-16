@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -36,13 +37,11 @@ var mcpCmd = &cobra.Command{
 	Short: "Run MCP server for Claude Desktop integration",
 	Long: `Start an MCP (Model Context Protocol) server over stdio.
 
-This allows Claude Desktop (or any MCP client) to query your email archive
-using tools like search_metadata, search_message_bodies, semantic_search_messages,
-get_message, list_messages, get_stats, aggregate, stage_deletion, and draft
-management (list, create, update, send, delete drafts).
 This allows Claude Desktop (or any MCP client) to query your archive
-using tools like search_metadata, search_message_bodies, search_document_attachments, semantic_search_messages, get_message, list_messages, get_stats,
-aggregate, and stage_deletion.
+using tools like search_metadata, search_message_bodies, search_document_attachments,
+semantic_search_messages, get_message, list_messages, get_stats, aggregate,
+list_saved_views, run_saved_view, stage_deletion, and draft management
+(list, create, update, send, delete drafts).
 
 Add to Claude Desktop config:
   {
@@ -54,7 +53,7 @@ Add to Claude Desktop config:
 	    }
 	  }`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		st, _, err := OpenHTTPStore(cmd.Context())
+		st, info, err := OpenHTTPStore(cmd.Context())
 		if err != nil {
 			return fmt.Errorf("open daemon: %w", err)
 		}
@@ -88,14 +87,20 @@ Add to Claude Desktop config:
 				return usageErr(cmd, err)
 			}
 			return serveMCPHTTPWithOptions(ctx, opts, mcpserver.HTTPOptions{
-				Addr:        normalized,
-				APIKey:      cfg.Server.APIKey,
-				AllowWrites: mcpHTTPAllowWrites,
+				Addr:               normalized,
+				DiscoveryDirectory: filepath.Join(cfg.HomeDir, "mcp"),
+				BackendURL:         info.URL,
+				APIKey:             cfg.Server.APIKey,
+				AllowWrites:        mcpHTTPAllowWrites,
 			})
 		}
 		return mcpserver.ServeWithOptions(ctx, opts)
 	},
 }
+
+// savedViewsMinAPISchemaVersion is the first daemon API schema that runs Saved
+// Views through POST /api/v1/saved-views/{id}/run.
+const savedViewsMinAPISchemaVersion = "2.21.0"
 
 func daemonMCPServeOptions(ctx context.Context, st *daemonclient.Client) (mcpserver.ServeOptions, error) {
 	engine := daemonclient.NewEngineAdapter(st)
@@ -109,11 +114,22 @@ func daemonMCPServeOptions(ctx context.Context, st *daemonclient.Client) (mcpser
 		OCR:                st,
 		DataDir:            cfg.Data.DataDir,
 	}
-	compatible, capabilityErr := st.SupportsAPISchemaVersion(ctx, peopleMinAPISchemaVersion)
+	schemaVersion, capabilityErr := st.APISchemaVersion(ctx)
 	if capabilityErr != nil {
 		logger.Warn("people tools disabled because the daemon capability probe failed", "error", capabilityErr)
-	} else if compatible {
-		opts.PeopleBackend = daemonclient.NewPeopleBrowser(engine)
+	} else if daemonclient.APISchemaVersionAtLeast(schemaVersion, peopleMinAPISchemaVersion) {
+		people := daemonclient.NewPeopleBrowser(engine)
+		if daemonclient.APISchemaVersionAtLeast(schemaVersion, directoryPeopleMinAPISchemaVersion) {
+			opts.DirectoryBackend = people
+		}
+		opts.PeopleBackend = people
+	}
+	// The daemon executes Saved Views itself, so the tools need a daemon that
+	// serves the run endpoint; an older daemon simply omits them.
+	if capabilityErr != nil {
+		logger.Warn("Saved View tools disabled because the daemon capability probe failed", "error", capabilityErr)
+	} else if daemonclient.APISchemaVersionAtLeast(schemaVersion, savedViewsMinAPISchemaVersion) {
+		opts.SavedViews = st
 	}
 
 	vectorAvailable, err := st.VectorSearchAvailable(ctx)
@@ -414,6 +430,7 @@ func buildGoogleDocsFactory() mcpserver.GoogleDocsClientFactory {
 }
 
 func init() {
+	mcpCmd.AddCommand(newMCPStatusCommand())
 	rootCmd.AddCommand(mcpCmd)
 	mcpCmd.Flags().BoolVar(&mcpForceSQL, "force-sql", false, "Deprecated in 0.17.0: set [analytics].engine = \"sql\" in config.toml")
 	mcpCmd.Flags().BoolVar(&mcpNoSQLiteScanner, "no-sqlite-scanner", false, "Deprecated in 0.17.0: cache engine selection is daemon-managed")
@@ -429,7 +446,7 @@ func init() {
 			"a trusted network boundary or authenticating reverse proxy.")
 	mcpCmd.Flags().BoolVar(&mcpHTTPAllowWrites, "http-allow-writes", false,
 		"Expose write-class MCP tools over HTTP. This permits attachment exports, "+
-			"deletion manifests, and profile writes separately enabled with "+
+			"deletion manifests, Saved View management, and profile writes separately enabled with "+
 			"--allow-profile-writes; enable it only for trusted, authenticated clients.")
 	mcpCmd.Flags().BoolVar(&mcpAllowProfileWrites, "allow-profile-writes", false,
 		"Expose person promotion and private Notes writes. Model tool calls "+

@@ -1189,11 +1189,118 @@ func TestLabelMapSelectReconnectsAfterDroppedConnection(t *testing.T) {
 	// client holding a dead socket it has not noticed yet.
 	require.NoError(client.conn.Close())
 
-	labels, unidentified, err := client.fetchMailboxMessageIDs(
+	labels, unidentified, missing, err := client.fetchMailboxMessageIDs(
 		ctx, "Archive", []imapv2.UID{1})
 
 	require.NoError(err,
 		"a dropped connection must not fail the label map, which discards the run")
 	assert.Equal(map[string]bool{messageID: true}, labels)
 	assert.Empty(unidentified)
+	assert.Empty(missing)
+}
+
+// TestSourceMessageExistsIsNotDefiniteWhenHeadersMissing pins the boundary of
+// "definitive absence". Only a UID the server leaves out of the response is
+// absent. A UID it returns without headers is a live message, and reporting it
+// as absent lets SourceMessageMatches conclude a mismatch and rekey it.
+func TestSourceMessageExistsIsNotDefiniteWhenHeadersMissing(t *testing.T) {
+	require := require.New(t)
+	addr, _ := testutil.StartIMAPMemServer(t, map[string]int{"INBOX": 2})
+	client := newTestClient(t, addr)
+
+	// Select INBOX first. The in-memory server then answers a FETCH of a UID
+	// another session expunged with an empty body, rather than leaving it out.
+	exists, err := client.SourceMessageExists(context.Background(), "INBOX|1")
+	require.NoError(err)
+	require.True(exists)
+	testutil.ExpungeIMAPMessage(t, addr, "INBOX", imapv2.UID(2))
+
+	_, err = client.SourceMessageExists(context.Background(), "INBOX|2")
+	require.Error(err, "a live message without headers is not definitive absence")
+	require.NotErrorIs(err, errIMAPFetchResultMissing)
+}
+
+// TestAllMailSnapshotSavesUIDNextAboveKnownUIDs covers the third place a
+// baseline is saved. The \All snapshot rebuilds every folder state from
+// STATUS, whose UIDNEXT was read before the enumeration that produced the
+// UIDs, so a message delivered between the two commands leaves a baseline the
+// saved UIDNEXT does not cover.
+func TestAllMailSnapshotSavesUIDNextAboveKnownUIDs(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	// STATUS reports UIDNEXT 4. The SEARCH that follows reports UID 4.
+	addr, _ := startQresyncTestServer(t, qresyncServerConfig{
+		capabilities:  []string{"IMAP4rev1"},
+		mailboxes:     []string{"All Mail", "Projects"},
+		uidValidity:   77,
+		uidNext:       4,
+		highestModSeq: 20,
+		searchUIDs:    []imapv2.UID{1, 2, 3, 4},
+	})
+	client := newQresyncTestClient(t, addr, map[string]FolderState{})
+	client.mailboxCache = []string{"All Mail", "Projects"}
+	client.allMailFolder = "All Mail"
+
+	listAllMessages(t, client)
+
+	saved := client.ObservedFolderStates()
+	require.Contains(saved, "All Mail")
+	require.Contains(saved["All Mail"].KnownUIDs, uint32(4))
+	assert.Greater(saved["All Mail"].UIDNext, uint32(4),
+		"the snapshot must not save a UIDNEXT its own baseline exceeds")
+}
+
+type aliasLoadCall struct {
+	mailbox string
+	uids    []uint32
+}
+
+func TestSourceMessageAliasLoaderRequestsOnlyListedUIDs(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	addr, user := testutil.StartIMAPMemServer(t, map[string]int{"INBOX": 2, "Archive": 3})
+
+	first := newTestClient(t, addr)
+	require.Len(listAllMessages(t, first), 5)
+	saved := first.ObservedFolderStates()
+	require.NoError(first.Close())
+
+	testutil.AppendIMAPMessage(t, user, "INBOX")
+
+	var calls []aliasLoadCall
+	second := newTestClient(t, addr,
+		WithFolderStates(saved),
+		WithSourceMessageAliasLoader(
+			func(mailbox string, uids []uint32) (map[string]string, error) {
+				calls = append(calls, aliasLoadCall{mailbox: mailbox, uids: uids})
+				return map[string]string{"INBOX|3": "[Gmail]/All Mail|9"}, nil
+			}))
+	require.Equal([]string{"INBOX|3"}, listAllMessages(t, second))
+
+	// The run listed one UID, so it must ask for that UID alone. Loading every
+	// stored alias of the source reads the whole membership table to use one.
+	require.Len(calls, 1)
+	assert.Equal("INBOX", calls[0].mailbox)
+	assert.Equal([]uint32{3}, calls[0].uids)
+
+	canonical, ok := second.CanonicalSourceMessageID("INBOX|3")
+	assert.True(ok)
+	assert.Equal("[Gmail]/All Mail|9", canonical)
+}
+
+// Explicit Sent-folder configuration must survive connection rediscovery:
+// the configured set is persistent per source, and only advertised roles are
+// re-derived from the LIST response.
+func TestConfiguredSentPlacementSurvivesDiscoveryReset(t *testing.T) {
+	client := NewClient(&Config{Host: "imap.example.test", Port: 993}, "password",
+		WithTrustedSentMailboxes([]string{"Gesendete Elemente"}))
+
+	client.mu.Lock()
+	defer client.mu.Unlock()
+	require.True(t, client.isSentPlacementMailboxLocked("Gesendete Elemente"))
+
+	client.clearMailboxDiscoveryLocked()
+	assert.True(t, client.isSentPlacementMailboxLocked("Gesendete Elemente"),
+		"rediscovery must not discard the per-source Sent configuration")
+	assert.False(t, client.isSentPlacementMailboxLocked("INBOX"))
 }

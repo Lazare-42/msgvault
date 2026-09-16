@@ -3,6 +3,7 @@ package gmail
 
 import (
 	"context"
+	"errors"
 
 	"go.kenn.io/msgvault/internal/store"
 )
@@ -166,6 +167,13 @@ type RawMessageBatchResult struct {
 	Err     error
 }
 
+// ErrMessageGone reports that a message listed earlier in the run was gone from
+// the mailbox when the run tried to fetch it. It is an ordinary race with the
+// mail server, not a failure: the message was moved or deleted, and deletion
+// detection retires it. A batch result carrying this error is handled, not
+// failed.
+var ErrMessageGone = errors.New("message no longer present in the mailbox")
+
 // MessageLabelsBatchResult is one per-message result from a batch label fetch.
 // LabelIDs is nil when the fetch failed; Err preserves the per-message cause.
 type MessageLabelsBatchResult struct {
@@ -260,4 +268,14 @@ type SentMessage struct {
 	ID       string
 	ThreadID string
 	LabelIDs []string
+}
+
+// MessageRelocationTarget retains the archived identity selected for adopting
+// a fetched snapshot after its previous IMAP location disappears.
+type MessageRelocationTarget struct {
+	InternalID         int64
+	SourceID           int64
+	SourceMessageID    string // Expected old archived composite ID.
+	RFC822MessageID    string
+	NewSourceMessageID string
 }

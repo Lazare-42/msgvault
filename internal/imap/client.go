@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -31,6 +32,30 @@ type smtpSendFunc func(ctx context.Context, from string, to []string, raw []byte
 // WithLogger sets the logger.
 func WithLogger(logger *slog.Logger) Option {
 	return func(c *Client) { c.logger = logger }
+}
+
+// WithTrustedSentMailboxes names this source's Sent-folder mailboxes the
+// user explicitly configured, for servers whose (possibly localized) Sent
+// folder advertises no RFC 6154 \Sent role. This is an opt-in trust
+// assumption for servers without role discovery, not provider evidence: it
+// extends snapshot-refresh authorization to these mailboxes exactly like an
+// unambiguous advertised \Sent role. The configuration is derived from the
+// per-source sync configuration by the caller and is never cleared by
+// connection rediscovery.
+func WithTrustedSentMailboxes(names []string) Option {
+	return func(c *Client) {
+		if len(names) == 0 {
+			return
+		}
+		trusted := make(map[string]bool, len(names))
+		for _, name := range names {
+			if name = strings.TrimSpace(name); name != "" {
+				trusted[name] = true
+			}
+		}
+		c.trustedOutgoingMailboxes = trusted
+		c.configuredSentMailboxes = trusted
+	}
 }
 
 // WithTokenSource sets a callback that provides OAuth2 access tokens
@@ -93,29 +118,44 @@ type Client struct {
 	tokenSource func(ctx context.Context) (string, error) // XOAUTH2 token callback
 	logger      *slog.Logger
 
-	mu                    sync.Mutex
-	conn                  *imapclient.Client
-	selectedMailbox       string               // currently selected mailbox
-	selectedUIDValidity   uint32               // UIDVALIDITY from the last SELECT
-	selectedNumMessages   uint32               // EXISTS count from the last SELECT
-	mailboxCache          []string             // cached list of selectable mailboxes
-	messageListCache      []gmailapi.MessageID // full message ID list, built once per session
-	trashMailbox          string               // cached trash mailbox name
-	junkMailbox           string               // cached junk/spam mailbox name
-	allMailFolder         string               // mailbox with \All attribute (empty if not detected)
-	archiveMailbox        string               // mailbox with \Archive attribute (empty if not detected)
-	draftsMailbox         string               // mailbox with \Drafts attribute (empty if not detected)
-	sentMailbox           string               // mailbox with \Sent attribute (empty if not detected)
-	msgIDToLabels         map[string][]string  // RFC822 Message-ID → mailbox memberships
-	seenRFC822IDs         map[string]bool      // dedup overlapping mailbox copies
-	preferredRawSourceIDs map[[32]byte]string  // raw digest → canonical \All source ID
-	sourceMessageAliases  map[string]string    // mailbox UID source ID → durable canonical source ID
-	activeSourceAliases   map[string]string    // aliases validated by this session's QRESYNC SELECTs
-	labelMapComplete      bool                 // latest listing collected every mailbox membership
-	since                 time.Time            // IMAP SINCE date filter (zero = no filter)
-	before                time.Time            // IMAP BEFORE date filter (zero = no filter)
-	smtpAddr              string               // SMTP submission addr host:port, optional
-	smtpSend              smtpSendFunc         // test hook; nil uses real SMTP
+	mu                          sync.Mutex
+	conn                        *imapclient.Client
+	selectedMailbox             string               // currently selected mailbox
+	selectedUIDValidity         uint32               // UIDVALIDITY from the last SELECT
+	selectedNumMessages         uint32               // EXISTS count from the last SELECT
+	mailboxCache                []string             // cached list of selectable mailboxes
+	messageListCache            []gmailapi.MessageID // full message ID list, built once per session
+	trashMailbox                string               // cached trash mailbox name
+	junkMailbox                 string               // cached junk/spam mailbox name
+	allMailFolder               string               // mailbox with \All attribute (empty if not detected)
+	archiveMailbox              string               // mailbox with \Archive attribute (empty if not detected)
+	draftsMailbox               string               // mailbox with \Drafts attribute (empty if not detected)
+	sentMailbox                 string               // mailbox with \Sent attribute (empty if not detected)
+	advertisedOutgoingMailboxes map[string]bool      // unambiguous LIST-advertised \Sent or \Drafts placement
+	advertisedSentMailboxes     map[string]bool      // unambiguous LIST-advertised \Sent placement
+	advertisedDraftsMailboxes   map[string]bool      // unambiguous LIST-advertised \Drafts placement
+	conflictingRoleMailboxes    map[string]bool      // LIST-advertised \All/\Junk/\Trash roles, or INBOX
+	trustedOutgoingMailboxes    map[string]bool      // explicit user-configured outgoing mailboxes
+	configuredSentMailboxes     map[string]bool      // explicit per-source Sent-folder configuration (never cleared)
+	msgIDToLabels               map[string][]string  // RFC822 Message-ID → mailbox memberships
+	seenRFC822IDs               map[string]bool      // dedup overlapping mailbox copies
+	seenTrustedRFC822IDs        map[string]bool      // identities already carried by a trusted full raw this run
+	preferredRawSourceIDs       map[[32]byte]string  // raw digest → canonical \All source ID
+	sourceMessageAliases        map[string]string    // mailbox UID source ID → durable canonical source ID
+	activeSourceAliases         map[string]string    // aliases validated by this session's QRESYNC SELECTs
+	labelMapComplete            bool                 // latest listing collected every mailbox membership
+	since                       time.Time            // IMAP SINCE date filter (zero = no filter)
+	before                      time.Time            // IMAP BEFORE date filter (zero = no filter)
+	smtpAddr                    string               // SMTP submission addr host:port, optional
+	smtpSend                    smtpSendFunc         // test hook; nil uses real SMTP
+
+	relocationCandidateLoader func(context.Context, []string) ([]RelocationCandidate, error)
+	relocationTargets         map[string]gmailapi.MessageRelocationTarget
+
+	// aliasLoader resolves durable aliases for the mailbox UIDs a listing
+	// actually touches. Nil when the caller keeps no durable state.
+	aliasLoader     func(mailbox string, uids []uint32) (map[string]string, error)
+	aliasLoadWarned bool // one failing load must not warn once per request
 
 	// folderFilter overrides which mailboxes are included in the sync.
 	// Zero-valued (empty include and exclude) means "all mailboxes".
@@ -142,6 +182,14 @@ type Client struct {
 	// unchanged the running count of mailboxes skipped via saved
 	// folder state.
 	listProgress func(done, total int, mailbox string, found, unchanged int)
+	sleep        func(context.Context, time.Duration) error
+	tlsConfig    *tls.Config
+}
+
+var connectRetryDelays = [...]time.Duration{
+	5 * time.Second,
+	15 * time.Second,
+	45 * time.Second,
 }
 
 // NewClient creates a new IMAP client.
@@ -151,6 +199,7 @@ func NewClient(cfg *Config, password string, opts ...Option) *Client {
 		password:         password,
 		logger:           slog.Default(),
 		labelMapComplete: true,
+		sleep:            sleepContext,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -192,38 +241,114 @@ func (c *Client) labelsSnapshotFilteredLocked() bool {
 			len(c.folderFilterExclude) > 0)
 }
 
+func sleepContext(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// transportProbe records the first zero-byte transport error seen on the
+// connection. The pinned IMAP client reports a clean close before the
+// greeting as a plain "connection closed" error without the socket cause, so
+// the retry decision reads the cause from here instead.
+type transportProbe struct {
+	net.Conn
+
+	mu  sync.Mutex
+	err error
+}
+
+func (c *transportProbe) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	c.record(n, err)
+	return n, err //nolint:wrapcheck // net.Conn errors retain their typed transport cause
+}
+
+func (c *transportProbe) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	c.record(n, err)
+	return n, err //nolint:wrapcheck // net.Conn errors retain their typed transport cause
+}
+
+func (c *transportProbe) record(n int, err error) {
+	if n > 0 || err == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.err == nil {
+		c.err = err
+	}
+}
+
+func (c *transportProbe) transportError() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err
+}
+
+// isProtocolFailure reports whether the server answered and refused: an IMAP
+// status response, a TLS alert, or a certificate the client rejected. These
+// never get a retry, whatever the socket did afterwards.
+func isProtocolFailure(err error) bool {
+	if _, ok := errors.AsType[*imap.Error](err); ok {
+		return true
+	}
+	if _, ok := errors.AsType[tls.AlertError](err); ok {
+		return true
+	}
+	if _, ok := errors.AsType[tls.RecordHeaderError](err); ok {
+		return true
+	}
+	if _, ok := errors.AsType[*tls.CertificateVerificationError](err); ok {
+		return true
+	}
+	return false
+}
+
+// retryableConnect decides whether a failed connection attempt gets a retry.
+// The returned error usually carries the transport cause; the probe covers
+// the case where the IMAP client dropped it.
+func retryableConnect(err error, probe *transportProbe) bool {
+	if isProtocolFailure(err) {
+		return false
+	}
+	if isRetryableTransportError(err) {
+		return true
+	}
+	return probe != nil && isRetryableTransportError(probe.transportError())
+}
+
+func isRetryableTransportError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && (netErr.Timeout() || netErr.Temporary()) { //nolint:staticcheck // legacy net.Error implementations can mark transient transport failures.
+		return true
+	}
+	return slices.ContainsFunc(transportErrnos, func(errno syscall.Errno) bool {
+		return errors.Is(err, errno)
+	})
+}
+
 // connect establishes and authenticates the IMAP connection. Caller must hold mu.
 func (c *Client) connect(ctx context.Context) error {
 	if c.conn != nil {
 		return nil
 	}
 
-	addr := c.config.Addr()
-	c.logger.Debug("connecting to IMAP server", "addr", addr, "tls", c.config.TLS, "starttls", c.config.STARTTLS)
-
-	imapOpts := &imapclient.Options{
-		UnilateralDataHandler: &imapclient.UnilateralDataHandler{
-			Vanished: c.captureQresyncVanished,
-		},
-	}
-	var (
-		conn *imapclient.Client
-		err  error
-	)
-	if c.config.TLS {
-		conn, err = imapclient.DialTLS(addr, imapOpts)
-	} else if c.config.STARTTLS {
-		conn, err = imapclient.DialStartTLS(addr, imapOpts)
-	} else {
-		conn, err = imapclient.DialInsecure(addr, imapOpts)
-	}
+	conn, err := c.connectTransport(ctx)
 	if err != nil {
-		return fmt.Errorf("dial IMAP %s: %w", addr, err)
-	}
-
-	if err := conn.WaitGreeting(); err != nil {
-		_ = conn.Close()
-		return fmt.Errorf("IMAP greeting from %s: %w", addr, err)
+		return err
 	}
 
 	switch c.config.EffectiveAuthMethod() {
@@ -232,18 +357,26 @@ func (c *Client) connect(ctx context.Context) error {
 			_ = conn.Close()
 			return errors.New("XOAUTH2 auth requires a token source (use WithTokenSource)")
 		}
-		token, err := c.tokenSource(ctx)
-		if err != nil {
+		var token string
+		if err := waitAuthenticationContext(ctx, conn, func() error {
+			var err error
+			token, err = c.tokenSource(ctx)
+			return err
+		}); err != nil {
 			_ = conn.Close()
 			return fmt.Errorf("get XOAUTH2 token: %w", err)
 		}
 		saslClient := NewXOAuth2Client(c.config.Username, token)
-		if err := conn.Authenticate(saslClient); err != nil {
+		if err := waitAuthenticationContext(ctx, conn, func() error {
+			return conn.Authenticate(saslClient)
+		}); err != nil {
 			_ = conn.Close()
 			return fmt.Errorf("XOAUTH2 authenticate: %w", err)
 		}
 	default:
-		if err := conn.Login(c.config.Username, c.password).Wait(); err != nil {
+		if err := waitAuthenticationContext(ctx, conn, func() error {
+			return conn.Login(c.config.Username, c.password).Wait()
+		}); err != nil {
 			_ = conn.Close()
 			return fmt.Errorf("IMAP login: %w", err)
 		}
@@ -255,6 +388,151 @@ func (c *Client) connect(ctx context.Context) error {
 	c.qresyncEnabled = false
 	c.logger.Debug("connected and authenticated", "user", c.config.Username)
 	return nil
+}
+
+func (c *Client) connectTransport(ctx context.Context) (*imapclient.Client, error) {
+	for attempt := 0; ; attempt++ {
+		conn, retry, err := c.connectTransportOnce(ctx)
+		if err == nil {
+			return conn, nil
+		}
+		if !retry || ctx.Err() != nil || attempt == len(connectRetryDelays) {
+			return nil, err
+		}
+
+		delay := connectRetryDelays[attempt]
+		c.logger.Warn("retrying IMAP connection",
+			"addr", c.config.Addr(),
+			"attempt", attempt+2,
+			"limit", len(connectRetryDelays)+1,
+			"delay", delay,
+			"error", err,
+		)
+		if err := c.sleep(ctx, delay); err != nil {
+			return nil, err
+		}
+	}
+}
+
+func (c *Client) connectTransportOnce(ctx context.Context) (*imapclient.Client, bool, error) {
+	addr := c.config.Addr()
+	c.logger.Debug("connecting to IMAP server", "addr", addr, "tls", c.config.TLS, "starttls", c.config.STARTTLS)
+
+	imapOpts := &imapclient.Options{
+		UnilateralDataHandler: &imapclient.UnilateralDataHandler{
+			Vanished: c.captureQresyncVanished,
+		},
+	}
+	rawConn, err := (&net.Dialer{Timeout: 30 * time.Second}).DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, isRetryableTransportError(err), fmt.Errorf("dial IMAP %s: %w", addr, err)
+	}
+
+	if c.config.STARTTLS {
+		probe := &transportProbe{Conn: rawConn}
+		startTLSOpts := *imapOpts
+		startTLSOpts.TLSConfig = c.newTLSConfig(false)
+		conn, err := newStartTLSContext(ctx, probe, &startTLSOpts)
+		if err != nil {
+			_ = rawConn.Close()
+			return nil, retryableConnect(err, probe), fmt.Errorf("IMAP STARTTLS from %s: %w", addr, err)
+		}
+		return conn, false, nil
+	}
+
+	greetingConn := rawConn
+	if c.config.TLS {
+		tlsConn := tls.Client(rawConn, c.newTLSConfig(true))
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			_ = rawConn.Close()
+			return nil, retryableConnect(err, nil), fmt.Errorf("TLS handshake with %s: %w", addr, err)
+		}
+		greetingConn = tlsConn
+	}
+	probe := &transportProbe{Conn: greetingConn}
+	conn := imapclient.New(probe, imapOpts)
+	if err := waitGreetingContext(ctx, conn); err != nil {
+		_ = conn.Close()
+		return nil, retryableConnect(err, probe), fmt.Errorf("IMAP greeting from %s: %w", addr, err)
+	}
+	return conn, false, nil
+}
+
+func (c *Client) newTLSConfig(implicit bool) *tls.Config {
+	var config *tls.Config
+	if c.tlsConfig == nil {
+		config = &tls.Config{}
+	} else {
+		config = c.tlsConfig.Clone()
+	}
+	if config.ServerName == "" {
+		config.ServerName = normalizeHost(c.config.Host)
+	}
+	if implicit && config.NextProtos == nil {
+		config.NextProtos = []string{"imap"}
+	}
+	return config
+}
+
+func waitGreetingContext(ctx context.Context, conn *imapclient.Client) error {
+	result := make(chan error, 1)
+	go func() { result <- conn.WaitGreeting() }()
+	select {
+	case err := <-result:
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return err
+	case <-ctx.Done():
+		_ = conn.Close()
+		return ctx.Err()
+	}
+}
+
+func newStartTLSContext(
+	ctx context.Context, rawConn net.Conn, options *imapclient.Options,
+) (*imapclient.Client, error) {
+	result := make(chan struct {
+		conn *imapclient.Client
+		err  error
+	}, 1)
+	go func() {
+		conn, err := imapclient.NewStartTLS(rawConn, options)
+		result <- struct {
+			conn *imapclient.Client
+			err  error
+		}{conn: conn, err: err}
+	}()
+	select {
+	case result := <-result:
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if result.conn != nil {
+				_ = result.conn.Close()
+			}
+			return nil, ctxErr
+		}
+		return result.conn, result.err
+	case <-ctx.Done():
+		_ = rawConn.Close()
+		return nil, ctx.Err()
+	}
+}
+
+func waitAuthenticationContext(
+	ctx context.Context, conn *imapclient.Client, authenticate func() error,
+) error {
+	result := make(chan error, 1)
+	go func() { result <- authenticate() }()
+	select {
+	case err := <-result:
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return err
+	case <-ctx.Done():
+		_ = conn.Close()
+		return ctx.Err()
+	}
 }
 
 // reconnect closes the current connection and re-establishes it.
@@ -348,6 +626,50 @@ func (c *Client) listMailboxesLocked() ([]string, error) {
 			continue
 		}
 		names = append(names, item.Mailbox)
+		// Received-mail roles deny outgoing trust regardless of how the
+		// mailbox is advertised or configured. RFC 6154 roles describe
+		// intended use, not authorship proof, so this records every LIST
+		// entry carrying \All, \Junk, or \Trash — independently of any
+		// \Sent or \Drafts role — a mailbox advertised with BOTH \Sent
+		// and \Drafts (the roles conflict, so the entry is ambiguous), and
+		// the INBOX name, where placement carries no outgoing assumption at
+		// all. The evidence always comes from the authenticated LIST
+		// response, never the mailbox name alone; the trust predicate
+		// additionally rejects INBOX before discovery has run.
+		if strings.EqualFold(item.Mailbox, "INBOX") ||
+			hasAttr(item.Attrs, imap.MailboxAttrAll) ||
+			hasAttr(item.Attrs, imap.MailboxAttrJunk) ||
+			hasAttr(item.Attrs, imap.MailboxAttrTrash) ||
+			(hasAttr(item.Attrs, imap.MailboxAttrSent) &&
+				hasAttr(item.Attrs, imap.MailboxAttrDrafts)) {
+			if c.conflictingRoleMailboxes == nil {
+				c.conflictingRoleMailboxes = map[string]bool{}
+			}
+			c.conflictingRoleMailboxes[item.Mailbox] = true
+		}
+		if hasAttr(item.Attrs, imap.MailboxAttrSent) || hasAttr(item.Attrs, imap.MailboxAttrDrafts) {
+			// An unambiguous \Sent or \Drafts advertisement is the narrow
+			// trust assumption that authorizes refreshing an archived
+			// snapshot from that placement.
+			if !c.conflictingRoleMailboxes[item.Mailbox] {
+				if c.advertisedOutgoingMailboxes == nil {
+					c.advertisedOutgoingMailboxes = map[string]bool{}
+				}
+				c.advertisedOutgoingMailboxes[item.Mailbox] = true
+				if hasAttr(item.Attrs, imap.MailboxAttrSent) {
+					if c.advertisedSentMailboxes == nil {
+						c.advertisedSentMailboxes = map[string]bool{}
+					}
+					c.advertisedSentMailboxes[item.Mailbox] = true
+				}
+				if hasAttr(item.Attrs, imap.MailboxAttrDrafts) {
+					if c.advertisedDraftsMailboxes == nil {
+						c.advertisedDraftsMailboxes = map[string]bool{}
+					}
+					c.advertisedDraftsMailboxes[item.Mailbox] = true
+				}
+			}
+		}
 		if c.trashMailbox == "" && hasAttr(item.Attrs, imap.MailboxAttrTrash) {
 			c.trashMailbox = item.Mailbox
 		}
@@ -480,6 +802,10 @@ func (c *Client) clearMailboxDiscoveryLocked() {
 	c.trashMailbox = ""
 	c.junkMailbox = ""
 	c.allMailFolder = ""
+	c.advertisedOutgoingMailboxes = nil
+	c.advertisedSentMailboxes = nil
+	c.advertisedDraftsMailboxes = nil
+	c.conflictingRoleMailboxes = nil
 }
 
 // enumerateMailboxSearchCriteria always constrains the search with an
@@ -751,66 +1077,138 @@ func (c *Client) enumerateMailbox(
 // UIDs in the given mailbox. Returns the valid Message-IDs and the UIDs whose
 // header had no usable Message-ID, so callers can fetch those copies raw.
 // Caller must hold mu.
+// fetchMailboxMessageIDs reads the Message-ID header of every supplied UID and
+// returns the membership map for the mailbox, the UIDs whose header was empty,
+// and the UIDs the server never returned at all.
+//
+// The last of those three is not the same as the second. A UID with an empty
+// header is a live message this run could not identify. A UID left out of the
+// response is a message the run learned nothing about, and reading that
+// silence as absence removes the message from the published topology.
 func (c *Client) fetchMailboxMessageIDs(
 	ctx context.Context, mailbox string, uids []imap.UID,
-) (map[string]bool, []imap.UID, error) {
+) (map[string]bool, []imap.UID, []imap.UID, error) {
 	if len(uids) == 0 {
-		return nil, nil, nil
+		return nil, nil, nil, nil
 	}
 
 	if err := c.selectMailbox(mailbox); err != nil {
 		if !isNetworkError(err) {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		c.logger.Warn("network error selecting mailbox for label map, reconnecting",
 			"mailbox", mailbox, "error", err)
 		if reconErr := c.reconnect(ctx); reconErr != nil {
-			return nil, nil, fmt.Errorf(
+			return nil, nil, nil, fmt.Errorf(
 				"reconnect failed building label map for %q: %w",
 				mailbox, reconErr)
 		}
 		if err := c.selectMailbox(mailbox); err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 	}
 
 	result := make(map[string]bool, len(uids))
 	var unidentified []imap.UID
+	var missing []imap.UID
 	fetchOpts := messageIDHeaderFetchOptions()
 
 	for chunkStart := 0; chunkStart < len(uids); chunkStart += fetchChunkSize {
 		if ctx.Err() != nil {
-			return result, unidentified, ctx.Err()
+			return result, unidentified, missing, ctx.Err()
 		}
 
 		end := min(chunkStart+fetchChunkSize, len(uids))
+		chunk := uids[chunkStart:end]
 
 		var uidSet imap.UIDSet
-		for _, uid := range uids[chunkStart:end] {
+		for _, uid := range chunk {
 			uidSet.AddNum(uid)
 		}
 
 		msgs, _, err := c.fetchChunk(ctx, mailbox, uidSet, fetchOpts)
 		if err != nil {
-			return result, unidentified, fmt.Errorf(
+			return result, unidentified, missing, fmt.Errorf(
 				"message-ID fetch failed in %q: %w", mailbox, err)
 		}
+		seen := c.recordMessageIDResults(mailbox, result, &unidentified, msgs)
 
-		for _, msg := range msgs {
-			var rfc822MessageID string
-			if len(msg.BodySection) > 0 {
-				rfc822MessageID = rawMIMEMessageID(msg.BodySection[0].Bytes)
-			}
-			c.recordMembershipLocked(
-				mailbox, msg.UID, "", rfc822MessageID, [32]byte{}, 0, msg.Flags)
-			if rfc822MessageID == "" {
-				unidentified = append(unidentified, msg.UID)
-			} else {
-				result[rfc822MessageID] = true
+		omitted := uidsNotIn(chunk, seen)
+		if len(omitted) == 0 {
+			continue
+		}
+		// The server left these out of a response it answered successfully.
+		// Ask once more before concluding anything: an omission is a fact
+		// about the response, not about the mailbox.
+		var recheckSet imap.UIDSet
+		for _, uid := range omitted {
+			recheckSet.AddNum(uid)
+		}
+		recheckMsgs, _, err := c.fetchChunk(ctx, mailbox, recheckSet, fetchOpts)
+		if err != nil {
+			return result, unidentified, missing, fmt.Errorf(
+				"message-ID recheck failed in %q: %w", mailbox, err)
+		}
+		seenAgain := c.recordMessageIDResults(mailbox, result, &unidentified, recheckMsgs)
+		withheld := uidsNotIn(omitted, seenAgain)
+		present, err := c.confirmOmittedPresent(mailbox, withheld)
+		if err != nil {
+			// The search proved nothing, so the map cannot claim to describe
+			// every message in the mailbox.
+			missing = append(missing, withheld...)
+			continue
+		}
+		// A UID the mailbox no longer reports left it, and deletion detection
+		// retires its stored membership. Only a UID the mailbox still holds is
+		// a hole in the map.
+		for _, uid := range withheld {
+			if present[uid] {
+				missing = append(missing, uid)
 			}
 		}
 	}
-	return result, unidentified, nil
+	if len(missing) > 0 {
+		c.logger.Warn("label map is missing UIDs the server did not return",
+			"mailbox", mailbox, "uids", len(missing))
+	}
+	return result, unidentified, missing, nil
+}
+
+// recordMessageIDResults records a membership for every message the server
+// returned and reports which UIDs those were.
+func (c *Client) recordMessageIDResults(
+	mailbox string,
+	result map[string]bool,
+	unidentified *[]imap.UID,
+	msgs []*imapclient.FetchMessageBuffer,
+) map[imap.UID]bool {
+	seen := make(map[imap.UID]bool, len(msgs))
+	for _, msg := range msgs {
+		seen[msg.UID] = true
+		var rfc822MessageID string
+		if len(msg.BodySection) > 0 {
+			rfc822MessageID = rawMIMEMessageID(msg.BodySection[0].Bytes)
+		}
+		c.recordMembershipLocked(
+			mailbox, msg.UID, "", rfc822MessageID, [32]byte{}, 0, msg.Flags)
+		if rfc822MessageID == "" {
+			*unidentified = append(*unidentified, msg.UID)
+		} else {
+			result[rfc822MessageID] = true
+		}
+	}
+	return seen
+}
+
+// uidsNotIn returns the UIDs of want that seen does not contain.
+func uidsNotIn(want []imap.UID, seen map[imap.UID]bool) []imap.UID {
+	var absent []imap.UID
+	for _, uid := range want {
+		if !seen[uid] {
+			absent = append(absent, uid)
+		}
+	}
+	return absent
 }
 
 // buildLabelMap enumerates every mailbox except \All (whose memberships come
@@ -861,12 +1259,20 @@ func (c *Client) buildLabelMap(
 			continue
 		}
 
-		msgIDs, unidentifiedUIDs, err := c.fetchMailboxMessageIDs(ctx, mailbox, uids)
+		msgIDs, unidentifiedUIDs, missingUIDs, err := c.fetchMailboxMessageIDs(ctx, mailbox, uids)
 		if err != nil {
 			complete = false
 			c.logger.Warn("failed to fetch envelopes for label map",
 				"mailbox", mailbox, "error", err)
 			continue
+		}
+		if len(missingUIDs) > 0 {
+			// The map does not describe every message in this mailbox, so the
+			// topology built from it is not authoritative. Saying so is what
+			// stops a republish deleting the rows of the messages that are
+			// absent from it, which for a label-only mailbox is the only
+			// record of their membership.
+			complete = false
 		}
 		for _, uid := range unidentifiedUIDs {
 			unidentified = append(unidentified, gmailapi.MessageID{
@@ -898,6 +1304,8 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 	// this listing additive rather than authoritative.
 	c.labelMapComplete = false
 	c.seenRFC822IDs = nil
+	c.seenTrustedRFC822IDs = nil
+	c.relocationTargets = nil
 	c.preferredRawSourceIDs = nil
 	c.activeSourceAliases = nil
 	c.observedMailboxDeltas = nil
@@ -974,7 +1382,7 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 		requireQresync := !c.forceFullEnumeration &&
 			!c.labelsSnapshotFilteredLocked() &&
 			len(c.priorFolderStates) > 0
-		handled, deltaErr := c.tryBuildQresyncMessageList(ctx, allMailboxes, folderStatuses)
+		qresyncMessages, handled, deltaErr := c.tryBuildQresyncMessageList(ctx, allMailboxes, folderStatuses)
 		switch {
 		case deltaErr != nil:
 			// A failed attempt has already issued ENABLE and CONDSTORE SELECTs
@@ -1005,7 +1413,7 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 			c.logger.Info("QRESYNC unavailable, enumerating fully")
 			qresyncFallback = true
 		case handled:
-			return nil
+			return c.finalizeMessageListLocked(ctx, allMailboxes, qresyncMessages)
 		}
 	}
 	if trackFolders && !c.labelsSnapshotFilteredLocked() {
@@ -1061,6 +1469,7 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 			// A complete membership map lets the first raw result carry every
 			// mailbox label before overlapping copies become dedup stubs.
 			c.seenRFC822IDs = make(map[string]bool)
+			c.seenTrustedRFC822IDs = make(map[string]bool)
 		}
 	}
 
@@ -1126,11 +1535,17 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 		}
 		if observed != nil {
 			observed.KnownUIDs = knownUIDs
+			observed.UIDNext = baselineUIDNext(observed.UIDNext, knownUIDs)
 			c.observedFolderStates[mailbox] = *observed
 		}
 		if canTrackFolder {
 			trackState.KnownUIDs = knownUIDs
+			trackState.UIDNext = baselineUIDNext(trackState.UIDNext, knownUIDs)
 			c.trackFolderMessages(mailbox, trackState, uids)
+		}
+		if prior, ok := c.priorFolderStates[mailbox]; ok &&
+			prior.UIDValidity == trackState.UIDValidity {
+			c.loadSourceMessageAliases(mailbox, uids)
 		}
 		for _, uid := range uids {
 			sourceMessageID := compositeID(mailbox, uid)
@@ -1201,10 +1616,10 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 			}
 			for _, mailbox := range allMailboxes {
 				state := folderStatuses[mailbox]
-				if deltaIndex, ok := deltaByMailbox[mailbox]; ok {
+				deltaIndex, hasDelta := deltaByMailbox[mailbox]
+				if hasDelta {
 					state.KnownUIDs = append(
 						[]uint32(nil), c.observedMailboxDeltas[deltaIndex].State.KnownUIDs...)
-					c.observedMailboxDeltas[deltaIndex].State = state
 				} else {
 					state.KnownUIDs = make([]uint32, 0)
 					for _, observation := range c.observedMemberships {
@@ -1213,6 +1628,15 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 						}
 					}
 					slices.Sort(state.KnownUIDs)
+				}
+				// The snapshot rebuilds the state from STATUS, whose UIDNEXT was
+				// read before the enumeration that produced these UIDs. A message
+				// delivered in between belongs to the baseline and sits at or
+				// above that mark, so the saved UIDNEXT has to cover it.
+				state.UIDNext = baselineUIDNext(state.UIDNext, state.KnownUIDs)
+				if hasDelta {
+					c.observedMailboxDeltas[deltaIndex].State = state
+				} else {
 					c.observedMailboxDeltas = append(c.observedMailboxDeltas, MailboxDelta{
 						Mailbox: mailbox,
 						State:   state,
@@ -1240,10 +1664,9 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 			"unchanged", unchangedFolders, "total", len(listMailboxes))
 	}
 
-	c.messageListCache = messages
 	c.activeSourceAliases = activeSourceAliases
 	c.labelMapComplete = labelMapComplete && enumerationComplete
-	return nil
+	return c.finalizeMessageListLocked(ctx, allMailboxes, messages)
 }
 
 // deltasCoverMailboxes reports whether every current mailbox appears in the
@@ -1282,6 +1705,9 @@ func folderStatusesCoverMailboxes(
 func isNetworkError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if _, ok := errors.AsType[net.Error](err); ok {
+		return true
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "use of closed network connection") ||

@@ -27,6 +27,7 @@ import (
 	"go.kenn.io/msgvault/internal/duckdbutil"
 	"go.kenn.io/msgvault/internal/identityindex"
 	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/sqliteutil"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -167,6 +168,10 @@ var buildCacheBeforeStateWriteHook func()
 // buildCacheBeforeMessagesExportHook is a deterministic test seam for staged
 // export failures before the messages COPY begins.
 var buildCacheBeforeMessagesExportHook func() error
+
+// cacheSnapshotGOOS selects the platform branch in openCacheSourceSnapshot.
+// Tests override it to exercise platform-specific snapshot behavior.
+var cacheSnapshotGOOS = runtime.GOOS
 
 // buildCacheWriteStateFile persists the cache sync state; a test seam for
 // simulating state persistence failures.
@@ -375,15 +380,19 @@ func runBuildCacheLocal(fullRebuild, auto bool) error {
 }
 
 func runBuildCacheLocalMode(mode buildCacheMode) error {
-	dbPath := cfg.DatabaseDSN()
+	dbDSN := cfg.DatabaseDSN()
 	analyticsDir := cfg.AnalyticsDir()
 	builderOverrides := analyticsBuilderOverrides(cfg.Analytics)
 
 	// The Parquet cache is a SQLite -> DuckDB ETL; feeding a postgres:// DSN to
 	// the SQLite driver inside buildCache fails immediately with a confusing
 	// driver error.
-	if store.IsPostgresURL(dbPath) {
+	if store.IsPostgresURL(dbDSN) {
 		return errors.New("build-cache is SQLite-only; PostgreSQL backends do not use the Parquet analytics cache")
+	}
+	dbPath, err := resolveCacheSQLitePath(dbDSN)
+	if err != nil {
+		return err
 	}
 
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
@@ -458,10 +467,23 @@ func firstBuilderOverrides(overrides []duckdbutil.BuilderOverrides) duckdbutil.B
 	return overrides[0]
 }
 
+func resolveCacheSQLitePath(dsn string) (string, error) {
+	_, path, err := sqliteutil.ResolveDSN(dsn)
+	if err != nil {
+		return "", fmt.Errorf("resolve SQLite database path for cache build: %w", err)
+	}
+	return path, nil
+}
+
 func buildCacheDerivedOnly(
 	dbPath, analyticsDir string,
 	builderOverrides ...duckdbutil.BuilderOverrides,
 ) (*buildResult, error) {
+	var err error
+	dbPath, err = resolveCacheSQLitePath(dbPath)
+	if err != nil {
+		return nil, err
+	}
 	buildCacheMu.Lock()
 	defer buildCacheMu.Unlock()
 
@@ -655,6 +677,11 @@ func buildCacheScheduled(
 	now func() time.Time,
 	builderOverrides ...duckdbutil.BuilderOverrides,
 ) (*buildResult, error) {
+	var err error
+	dbPath, err = resolveCacheSQLitePath(dbPath)
+	if err != nil {
+		return nil, err
+	}
 	buildCacheMu.Lock()
 	defer buildCacheMu.Unlock()
 
@@ -778,8 +805,16 @@ func participantsExportSelectSQL() string {
 		FROM sqlite_db.participants`
 }
 
+// personDisplayNamesExportSelectSQL keeps full and derived-only exports identical.
+func personDisplayNamesExportSelectSQL() string {
+	return `SELECT pp.participant_id, pp.person_id,
+		COALESCE(TRY_CAST(p.display_name AS VARCHAR), '') AS display_name
+		FROM sqlite_db.person_participants pp
+		JOIN sqlite_db.persons p ON p.id = pp.person_id`
+}
+
 // derivedDriftOnly reports whether participant-link, conversation-membership,
-// conversation-type, participant-identifier, or participant display-name drift
+// conversation-type, participant-identifier, participant or person display-name drift
 // is the only staleness signal. The index-only refresh rebuilds the four
 // relationship datasets from committed base Parquet while re-staging any
 // drifted replaceable base dataset.
@@ -793,7 +828,7 @@ func participantsExportSelectSQL() string {
 func derivedDriftOnly(staleness cacheStaleness) bool {
 	return (staleness.HasIdentityDrift || staleness.HasConversationParticipantDrift ||
 		staleness.HasConversationTypeDrift || staleness.HasParticipantIdentifierDrift ||
-		staleness.HasParticipantDisplayNameDrift) &&
+		staleness.HasParticipantDisplayNameDrift || staleness.HasPersonDisplayNameDrift) &&
 		!staleness.HasNew && !staleness.HasDeleted &&
 		!staleness.HasUpdated && !staleness.HasAccountIdentityDrift &&
 		!staleness.HasDerivedDataDrift
@@ -825,6 +860,14 @@ func buildCacheLocked(
 	locking cachePublishLocking,
 	builderOverrides ...duckdbutil.BuilderOverrides,
 ) (*buildResult, error) {
+	// Callers pass the configured DSN, which may be a file: URI; everything
+	// below (sqlite ?mode=ro opens, the DuckDB attach, filepath.Dir for the
+	// staging dir) needs a plain filesystem path.
+	var err error
+	dbPath, err = resolveCacheSQLitePath(dbPath)
+	if err != nil {
+		return nil, err
+	}
 	if err := cleanupStaleCacheStaging(analyticsDir); err != nil {
 		return nil, err
 	}
@@ -907,6 +950,11 @@ func buildCacheLocked(
 	if err != nil {
 		_ = identityStore.Close()
 		return nil, fmt.Errorf("read participant display-name revision: %w", err)
+	}
+	personDisplayNameRevision, err := identityStore.PersonDisplayNameRevision()
+	if err != nil {
+		_ = identityStore.Close()
+		return nil, fmt.Errorf("read person display-name revision: %w", err)
 	}
 	participantClusters, err := identityStore.ParticipantClusters()
 	if err != nil {
@@ -1082,26 +1130,32 @@ func buildCacheLocked(
 	// Junction rows are searchable exactly when their parent message is
 	// exportable. This includes calendar invitees and meeting attendees while
 	// excluding hidden rows and messages without a timestamp.
-	exportableJunctionWhere := fmt.Sprintf(
-		"TRY_CAST(message_id AS BIGINT) IN (SELECT CAST(m.id AS BIGINT) FROM sqlite_db.messages m WHERE %s AND TRY_CAST(m.id AS BIGINT) <= %d)",
-		exportableMessageWhere("m"), maxID,
-	)
-	junctionFilter := func(incremental string) string {
+	exportableJunctionWhereFor := func(messageIDColumn string) string {
+		return fmt.Sprintf(
+			"TRY_CAST(%s AS BIGINT) IN (SELECT CAST(m.id AS BIGINT) FROM sqlite_db.messages m WHERE %s AND TRY_CAST(m.id AS BIGINT) <= %d)",
+			messageIDColumn, exportableMessageWhere("m"), maxID,
+		)
+	}
+	junctionFilterFor := func(messageIDColumn, incremental string) string {
+		where := exportableJunctionWhereFor(messageIDColumn)
 		if incremental != "" {
-			return incremental + " AND " + exportableJunctionWhere
+			return incremental + " AND " + where
 		}
-		return " WHERE " + exportableJunctionWhere
+		return " WHERE " + where
+	}
+	junctionFilter := func(incremental string) string {
+		return junctionFilterFor("message_id", incremental)
 	}
 
 	junctionFile := "data.parquet"
 
 	// runExport executes a COPY query and prints timing info.
-	runExport := func(label, query string) error {
+	runExport := func(label, copyQuery string) error {
 		start := time.Now()
 		fmt.Printf("  %-25s", label+"...")
-		if _, err := exportDB.Exec(query); err != nil {
+		if _, err := exportDB.Exec(copyQuery); err != nil {
 			fmt.Println()
-			return err
+			return query.HintRepairEncoding(err)
 		}
 		fmt.Printf(" done (%s)\n", time.Since(start).Round(time.Millisecond))
 		return nil
@@ -1113,28 +1167,39 @@ func buildCacheLocked(
 	// 1. Export message_recipients (large junction table)
 	recipientsDir := filepath.Join(staging.root, "message_recipients")
 	escapedRecipientsDir := strings.ReplaceAll(recipientsDir, "'", "''")
+	// This export joins participants, so every column reference is alias
+	// qualified and the incremental predicate names mr.message_id rather
+	// than the bare column the shared junctionFilter helper produces.
 	recipientsFilter := ""
 	if !replaceAll && lastMessageID > 0 {
-		recipientsFilter = fmt.Sprintf(" WHERE message_id > %d", lastMessageID)
+		recipientsFilter = fmt.Sprintf(" WHERE mr.message_id > %d", lastMessageID)
 	}
-	recipientsFilter = junctionFilter(recipientsFilter)
-	// Databases from before the envelope snapshot column export '' so the
-	// dataset always carries email_address and identity filters degrade to
-	// participant matching for every legacy row.
-	recipientEnvelopeExpression := "'' as email_address"
+	recipientsFilter = junctionFilterFor("mr.message_id", recipientsFilter)
+	// Two address columns leave here. envelope_address is the header address
+	// exactly as the store recorded it (NULL when none was — chat, calendar,
+	// and mail ingested before the column existed); identity filters key on
+	// its presence. email_address is the resolved recipient address: the
+	// envelope when present, otherwise the participant's current address, so
+	// an address filter over this dataset finds pre-upgrade mail too. Only a
+	// participant with no email address at all (phone or handle only) leaves
+	// email_address NULL. Databases from before the envelope column export
+	// NULL envelopes for every row.
+	recipientEnvelopeExpression := "NULL::VARCHAR"
 	if sourceSnapshot.hasRecipientEnvelope {
-		recipientEnvelopeExpression = "COALESCE(TRY_CAST(email_address AS VARCHAR), '') as email_address"
+		recipientEnvelopeExpression = "NULLIF(TRY_CAST(mr.email_address AS VARCHAR), '')"
 	}
 	if err := runExport("message_recipients", fmt.Sprintf(`
 	COPY (
 		SELECT
-			message_id,
-			participant_id,
-			recipient_type,
-			COALESCE(TRY_CAST(display_name AS VARCHAR), '') as display_name,
-			%s
-		FROM sqlite_db.message_recipients%s
-	) TO '%s/%s' (
+			mr.message_id,
+			mr.participant_id,
+			mr.recipient_type,
+			COALESCE(TRY_CAST(mr.display_name AS VARCHAR), '') as display_name,
+			COALESCE(%[1]s, NULLIF(TRY_CAST(p.email_address AS VARCHAR), '')) as email_address,
+			%[1]s as envelope_address
+		FROM sqlite_db.message_recipients mr
+		LEFT JOIN sqlite_db.participants p ON p.id = mr.participant_id%[2]s
+	) TO '%[3]s/%[4]s' (
 		FORMAT PARQUET,
 		COMPRESSION 'zstd'
 	)
@@ -1224,6 +1289,13 @@ func buildCacheLocked(
 	)
 	`, participantIdentifiersExportSelectSQL(), escapedParticipantIdentifiersDir)); err != nil {
 		return nil, fmt.Errorf("export participant identifiers: %w", err)
+	}
+
+	personDisplayNamesDir := filepath.Join(staging.root, tablePersonDisplayNames)
+	if err := runExport(tablePersonDisplayNames, fmt.Sprintf(
+		`COPY (%s) TO '%s/person_display_names.parquet' (FORMAT PARQUET, COMPRESSION 'zstd')`,
+		personDisplayNamesExportSelectSQL(), quoteCacheSQL(personDisplayNamesDir))); err != nil {
+		return nil, fmt.Errorf("export person names: %w", err)
 	}
 
 	// Owner participants: every participant row that a confirmed
@@ -1374,6 +1446,7 @@ func buildCacheLocked(
 			m.id,
 			m.source_id,
 			m.source_message_id,
+			TRY_CAST(m.rfc822_message_id AS VARCHAR) AS rfc822_message_id,
 			m.conversation_id,
 			CASE WHEN m.subject IS NULL THEN NULL ELSE COALESCE(TRY_CAST(m.subject AS VARCHAR), '') END as subject,
 			CASE WHEN m.snippet IS NULL THEN NULL ELSE COALESCE(TRY_CAST(m.snippet AS VARCHAR), '') END as snippet,
@@ -1385,6 +1458,7 @@ func buildCacheLocked(
 			m.sender_id,
 			%s AS owner_participant_id,
 			COALESCE(TRY_CAST(m.message_type AS VARCHAR), '') as message_type,
+			TRY_CAST(m.list_id AS VARCHAR) AS list_id,
 			%s AS is_from_me,
 			CAST(EXTRACT(YEAR FROM m.sent_at) AS INTEGER) as year,
 			CAST(EXTRACT(MONTH FROM m.sent_at) AS INTEGER) as month
@@ -1422,6 +1496,7 @@ func buildCacheLocked(
 				m.id,
 				m.source_id,
 				m.source_message_id,
+				TRY_CAST(m.rfc822_message_id AS VARCHAR) AS rfc822_message_id,
 				m.conversation_id,
 				CASE WHEN m.subject IS NULL THEN NULL ELSE COALESCE(TRY_CAST(m.subject AS VARCHAR), '') END as subject,
 				CASE WHEN m.snippet IS NULL THEN NULL ELSE COALESCE(TRY_CAST(m.snippet AS VARCHAR), '') END as snippet,
@@ -1433,6 +1508,7 @@ func buildCacheLocked(
 				m.sender_id,
 				%s AS owner_participant_id,
 				COALESCE(TRY_CAST(m.message_type AS VARCHAR), '') as message_type,
+				TRY_CAST(m.list_id AS VARCHAR) AS list_id,
 				%s AS is_from_me,
 				CAST(EXTRACT(MONTH FROM m.sent_at) AS INTEGER) as month
 			FROM sqlite_db.messages m
@@ -1531,6 +1607,7 @@ func buildCacheLocked(
 		AccountIdentityRevision:             accountIdentityRevision,
 		ParticipantIdentifierRevision:       participantIdentifierRevision,
 		ParticipantDisplayNameRevision:      participantDisplayNameRevision,
+		PersonDisplayNameRevision:           personDisplayNameRevision,
 		ConversationParticipantsFingerprint: derived.ConversationParticipantsFingerprint,
 		ConversationTypesFingerprint:        typesFingerprint,
 		Stats:                               derived.Stats,
@@ -1765,9 +1842,10 @@ type cacheSnapshotTable struct {
 
 func openCacheSourceSnapshot(duckDB *sql.DB, dbPath string) (*cacheSourceSnapshot, error) {
 	// MSGVAULT_FORCE_CSV_SNAPSHOT lets tests exercise the CSV fallback that
-	// Windows always takes, so drift between the COPY queries and the CSV
-	// views fails on every platform instead of only on Windows CI.
-	if runtime.GOOS != "windows" && os.Getenv("MSGVAULT_FORCE_CSV_SNAPSHOT") == "" {
+	// Windows and macOS always use, so drift between the COPY queries and the
+	// CSV views fails on every platform instead of only on Windows CI.
+	if cacheSnapshotGOOS != "windows" && cacheSnapshotGOOS != "darwin" &&
+		os.Getenv("MSGVAULT_FORCE_CSV_SNAPSHOT") == "" {
 		// Try sqlite_scanner; fall back to CSV when the extension is unavailable
 		// (for example in an air-gapped installation). Parallel scanner workers
 		// open independent SQLite connections, so disable only that parallelism
@@ -1881,12 +1959,16 @@ func (s *cacheSourceSnapshot) tables() []cacheSnapshotTable {
 	}
 	attachmentQuery := "SELECT id, message_id, size, filename, " + attachmentMIMEColumn +
 		", " + attachmentMetadataColumn + " FROM attachments"
-	recipientEnvelopeColumn := "'' AS email_address"
+	// This is the store's raw envelope column, which the export reads as
+	// mr.email_address to derive both cache columns. NULL travels through
+	// the CSV fallback as the \N sentinel, so a row with no recorded header
+	// address stays distinguishable from one carrying an empty value.
+	recipientEnvelopeColumn := "NULL AS email_address"
 	if s.hasRecipientEnvelope {
 		recipientEnvelopeColumn = "email_address"
 	}
-	messageColumns := "id, source_id, source_message_id, conversation_id, subject, snippet, sent_at, size_estimate, has_attachments, attachment_count, deleted_from_source_at, deleted_at, sender_id, message_type, is_from_me"
-	messageTypes := "types={'id': 'BIGINT', 'source_id': 'BIGINT', 'source_message_id': 'VARCHAR', 'conversation_id': 'BIGINT', 'subject': 'VARCHAR', 'snippet': 'VARCHAR', 'sent_at': 'TIMESTAMP', 'size_estimate': 'BIGINT', 'has_attachments': 'BOOLEAN', 'attachment_count': 'INTEGER', 'deleted_from_source_at': 'TIMESTAMP', 'deleted_at': 'TIMESTAMP', 'sender_id': 'BIGINT', 'message_type': 'VARCHAR', 'is_from_me': 'BOOLEAN'"
+	messageColumns := "id, source_id, source_message_id, rfc822_message_id, conversation_id, subject, snippet, sent_at, size_estimate, has_attachments, attachment_count, deleted_from_source_at, deleted_at, sender_id, message_type, list_id, is_from_me"
+	messageTypes := "types={'id': 'BIGINT', 'source_id': 'BIGINT', 'source_message_id': 'VARCHAR', 'rfc822_message_id': 'VARCHAR', 'conversation_id': 'BIGINT', 'subject': 'VARCHAR', 'snippet': 'VARCHAR', 'sent_at': 'TIMESTAMP', 'size_estimate': 'BIGINT', 'has_attachments': 'BOOLEAN', 'attachment_count': 'INTEGER', 'deleted_from_source_at': 'TIMESTAMP', 'deleted_at': 'TIMESTAMP', 'sender_id': 'BIGINT', 'message_type': 'VARCHAR', 'list_id': 'VARCHAR', 'is_from_me': 'BOOLEAN'"
 	if s.hasMessageSourceAttribution {
 		messageColumns += ", source_is_from_me"
 		messageTypes += ", 'source_is_from_me': 'BOOLEAN'"
@@ -1909,6 +1991,8 @@ func (s *cacheSourceSnapshot) tables() []cacheSnapshotTable {
 			"types={'message_id': 'BIGINT', 'label_id': 'BIGINT'}"},
 		{tableAttachments, attachmentQuery,
 			"types={'id': 'BIGINT', 'message_id': 'BIGINT', 'size': 'BIGINT', 'filename': 'VARCHAR', 'mime_type': 'VARCHAR', 'attachment_metadata': 'VARCHAR'}"},
+		{"persons", "SELECT id, display_name FROM persons", "types={'id': 'BIGINT', 'display_name': 'VARCHAR'}"},
+		{"person_participants", "SELECT person_id, participant_id FROM person_participants", "types={'person_id': 'BIGINT', 'participant_id': 'BIGINT'}"},
 		{tableParticipants, "SELECT id, email_address, domain, display_name, phone_number FROM participants",
 			"types={'id': 'BIGINT', 'email_address': 'VARCHAR', 'domain': 'VARCHAR', 'display_name': 'VARCHAR', 'phone_number': 'VARCHAR'}"},
 		{"account_identities", "SELECT source_id, address FROM account_identities",
@@ -1959,7 +2043,9 @@ func (s *cacheSourceSnapshot) prepareTables(tables []cacheSnapshotTable) error {
 			t.name, escaped, csvOpts,
 		)
 		if _, err := s.duckDB.Exec(viewSQL); err != nil {
-			return fmt.Errorf("create view sqlite_db.%s: %w", t.name, err)
+			return query.HintRepairEncoding(
+				fmt.Errorf("create view sqlite_db.%s: %w", t.name, err),
+			)
 		}
 	}
 

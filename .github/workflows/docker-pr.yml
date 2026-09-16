@@ -7,15 +7,16 @@ on:
   pull_request:
     paths:
       - 'Dockerfile'
+      - 'docker-bake.hcl'
+      - 'scripts/smoke-container.sh'
+      - 'scripts/smoke-image.sh'
       - '.dockerignore'
       - '.github/workflows/docker.yml'
-      - '.github/workflows/docker-publish.yml'
       - 'go.mod'
       - 'go.sum'
       - 'Makefile'
       - 'api/openapi.yaml'
       - 'pkg/client/openapi.yaml'
-      - 'scripts/generate-web-client.mjs'
       - 'web/**'
       - 'internal/web/**'
       - '**/*.go'
@@ -56,16 +57,4 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Smoke test (amd64)
-        run: |
-          docker run --rm msgvault:test version
-          docker run --rm msgvault:test --help
-
-          tmpdir="$(mktemp -d)"
-          trap 'sudo rm -rf "$tmpdir"' EXIT
-          sudo chown 1000:1000 "$tmpdir"
-          docker run --rm -v "$tmpdir:/data" msgvault:test init-db
-          sudo test -f "$tmpdir/msgvault.db" || { sudo ls -la "$tmpdir"; echo "FATAL: database not created"; exit 1; }
-
-          # Runtime is binary-only: no frontend toolchain or external asset tree.
-          docker run --rm --entrypoint sh msgvault:test -c \
-            'test ! -e /usr/local/bin/bun && test ! -e /usr/local/bin/node && test ! -d /usr/share/msgvault/web'
+        run: scripts/smoke-container.sh msgvault:test

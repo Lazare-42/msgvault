@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -133,6 +134,42 @@ func TestStageForDeletion_FromAggregateSelection(t *testing.T) {
 	assert.Equal("tui", manifest.CreatedBy)
 }
 
+func TestStageForDeletion_FromEmptyAggregateSelection(t *testing.T) {
+	tests := []struct {
+		name string
+		view query.ViewType
+	}{
+		{name: "sender", view: query.ViewSenders},
+		{name: "sender name", view: query.ViewSenderNames},
+		{name: "recipient", view: query.ViewRecipients},
+		{name: "recipient name", view: query.ViewRecipientNames},
+		{name: "domain", view: query.ViewDomains},
+		{name: "label", view: query.ViewLabels},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			engine := &querytest.MockEngine{
+				GetDeletionTargetsByFilterFunc: func(_ context.Context, filter query.MessageFilter) ([]query.DeletionTarget, error) {
+					assert.True(t, filter.MatchesEmpty(tt.view))
+					return []query.DeletionTarget{{
+						MessageID: 1, SourceID: 1, SourceType: "gmail",
+						SourceIdentifier: "test@example.com", SourceMessageID: "gid-empty",
+					}}, nil
+				},
+			}
+			env := NewControllerTestEnv(t, engine)
+
+			manifest := env.StageForDeletion(stageArgs{
+				aggregates: map[string]bool{"": true},
+				view:       tt.view,
+			})
+
+			assert.Equal(t, []string{"gid-empty"}, manifest.GmailIDs)
+		})
+	}
+}
+
 func TestStageForDeletionRejectsMultipleSources(t *testing.T) {
 	engine := &querytest.MockEngine{DeletionTargets: []query.DeletionTarget{
 		{MessageID: 1, SourceID: 1, SourceType: "gmail", SourceIdentifier: "one@example.invalid", SourceMessageID: "gm-1"},
@@ -179,6 +216,27 @@ func TestStageForDeletion_FromMessageSelection(t *testing.T) {
 	assert.ElementsMatch(t, []string{"gid_a", "gid_c"}, manifest.GmailIDs)
 }
 
+func TestStageForDeletion_MessageSelectionRespectsSourceScope(t *testing.T) {
+	env := newTestEnv(t)
+	accounts := []query.AccountInfo{
+		{ID: 1, SourceType: "gmail", Identifier: "one@example.invalid"},
+		{ID: 2, SourceType: "gmail", Identifier: "two@example.invalid"},
+	}
+	messages := []query.MessageSummary{
+		{ID: 10, SourceID: 1, SourceMessageID: "in-scope"},
+		{ID: 20, SourceID: 2, SourceMessageID: "out-of-scope"},
+	}
+
+	manifest, err := env.Ctrl.StageForDeletion(DeletionContext{
+		MessageSelection: map[int64]bool{10: true, 20: true},
+		SourceIDs:        []int64{1},
+		Accounts:         accounts,
+		Messages:         messages,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"in-scope"}, manifest.GmailIDs)
+}
+
 func TestStageForDeletion_NoSelection(t *testing.T) {
 	env := newTestEnv(t)
 
@@ -223,6 +281,10 @@ func TestStageForDeletion_ViewTypes(t *testing.T) {
 			t.Helper()
 			assert.Equal(t, []string{"INBOX"}, f.Labels)
 		}},
+		{"lists", query.ViewLists, "<announce.example.test>", func(t *testing.T, f deletion.Filters) {
+			t.Helper()
+			assert.Equal(t, []string{"<announce.example.test>"}, f.ListIDs)
+		}},
 	}
 
 	for _, tt := range tests {
@@ -236,6 +298,127 @@ func TestStageForDeletion_ViewTypes(t *testing.T) {
 			tt.check(t, manifest.Filters)
 		})
 	}
+}
+
+// TestStageForDeletion_ListSelectionUsesExactListID verifies the controller
+// resolves a list selection through the real query engine and preserves the
+// selected scalar as manifest provenance.
+func TestStageForDeletion_ListSelectionUsesExactListID(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	tdb := dbtest.NewTestDB(t, "../store/schema.sql")
+	tdb.SeedStandardDataSet()
+	matchingID := tdb.AddMessage(dbtest.MessageOpts{Subject: "matching list"})
+	nonMatchingID := tdb.AddMessage(dbtest.MessageOpts{Subject: "other list"})
+	_, err := tdb.DB.Exec(`UPDATE messages SET list_id = ? WHERE id = ?`, "<announce.example.test>", matchingID)
+	require.NoError(err)
+	_, err = tdb.DB.Exec(`UPDATE messages SET list_id = ? WHERE id = ?`, "<digest.example.test>", nonMatchingID)
+	require.NoError(err)
+
+	var matchingGmailID, nonMatchingGmailID string
+	err = tdb.DB.QueryRow(`SELECT source_message_id FROM messages WHERE id = ?`, matchingID).Scan(&matchingGmailID)
+	require.NoError(err)
+	err = tdb.DB.QueryRow(`SELECT source_message_id FROM messages WHERE id = ?`, nonMatchingID).Scan(&nonMatchingGmailID)
+	require.NoError(err)
+
+	controller := NewActionController(query.NewSQLiteEngine(tdb.DB), t.TempDir(), nil)
+	manifest, err := controller.StageForDeletion(DeletionContext{
+		AggregateSelection: map[string]bool{"<announce.example.test>": true},
+		AggregateViewType:  query.ViewLists,
+	})
+	require.NoError(err)
+	assert.Equal([]string{matchingGmailID}, manifest.GmailIDs)
+	assert.NotContains(manifest.GmailIDs, nonMatchingGmailID)
+	assert.Equal([]string{"<announce.example.test>"}, manifest.Filters.ListIDs)
+}
+
+func TestStageAllMatchesListScopeRecordsExactProvenance(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	tdb := dbtest.NewTestDB(t, "../store/schema.sql")
+	tdb.SeedStandardDataSet()
+	matchingID := tdb.AddMessage(dbtest.MessageOpts{Subject: "matching list"})
+	nonMatchingID := tdb.AddMessage(dbtest.MessageOpts{Subject: "other list"})
+	listID := "<announce.example.test>"
+	_, err := tdb.DB.Exec(`UPDATE messages SET list_id = ? WHERE id = ?`, listID, matchingID)
+	requirements.NoError(err)
+	_, err = tdb.DB.Exec(`UPDATE messages SET list_id = ? WHERE id = ?`, "<digest.example.test>", nonMatchingID)
+	requirements.NoError(err)
+
+	var matchingGmailID, nonMatchingGmailID string
+	err = tdb.DB.QueryRow(`SELECT source_message_id FROM messages WHERE id = ?`, matchingID).Scan(&matchingGmailID)
+	requirements.NoError(err)
+	err = tdb.DB.QueryRow(`SELECT source_message_id FROM messages WHERE id = ?`, nonMatchingID).Scan(&nonMatchingGmailID)
+	requirements.NoError(err)
+
+	controller := NewActionController(query.NewSQLiteEngine(tdb.DB), t.TempDir(), nil)
+	manifest, err := controller.StageForDeletion(DeletionContext{
+		AllMatches:  true,
+		MatchFilter: query.MessageFilter{ListID: listID},
+	})
+	requirements.NoError(err)
+	assertions.Equal([]string{matchingGmailID}, manifest.GmailIDs)
+	assertions.NotContains(manifest.GmailIDs, nonMatchingGmailID)
+	assertions.Equal([]string{listID}, manifest.Filters.ListIDs)
+
+	var provenance struct {
+		MatchFilter struct {
+			ListID string `json:"list_id"`
+		} `json:"match_filter"`
+	}
+	requirements.NoError(json.Unmarshal(manifest.RawFilter, &provenance))
+	assertions.Equal(listID, provenance.MatchFilter.ListID)
+}
+
+// TestStageForDeletion_MultipleListSelectionsAreExactAndStable verifies that
+// aggregate list staging keeps each selected scalar population, sorts manifest
+// provenance, and emits deterministic message IDs despite map iteration.
+func TestStageForDeletion_MultipleListSelectionsAreExactAndStable(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	tdb := dbtest.NewTestDB(t, "../store/schema.sql")
+	tdb.SeedStandardDataSet()
+	announceFirstID := tdb.AddMessage(dbtest.MessageOpts{Subject: "announce first"})
+	digestID := tdb.AddMessage(dbtest.MessageOpts{Subject: "digest"})
+	announceSecondID := tdb.AddMessage(dbtest.MessageOpts{Subject: "announce second"})
+	unselectedID := tdb.AddMessage(dbtest.MessageOpts{Subject: "unselected"})
+	for _, update := range []struct {
+		messageID int64
+		listID    string
+	}{
+		{announceFirstID, "<announce.example.test>"},
+		{digestID, "<digest.example.test>"},
+		{announceSecondID, "<announce.example.test>"},
+		{unselectedID, "<unselected.example.test>"},
+	} {
+		_, err := tdb.DB.Exec(`UPDATE messages SET list_id = ? WHERE id = ?`, update.listID, update.messageID)
+		require.NoError(err)
+	}
+
+	sourceMessageID := func(messageID int64) string {
+		var sourceMessageID string
+		err := tdb.DB.QueryRow(`SELECT source_message_id FROM messages WHERE id = ?`, messageID).Scan(&sourceMessageID)
+		require.NoError(err)
+		return sourceMessageID
+	}
+	wantGmailIDs := []string{
+		sourceMessageID(announceFirstID),
+		sourceMessageID(digestID),
+		sourceMessageID(announceSecondID),
+	}
+
+	controller := NewActionController(query.NewSQLiteEngine(tdb.DB), t.TempDir(), nil)
+	manifest, err := controller.StageForDeletion(DeletionContext{
+		AggregateSelection: map[string]bool{
+			"<digest.example.test>":   true,
+			"<announce.example.test>": true,
+		},
+		AggregateViewType: query.ViewLists,
+	})
+	require.NoError(err)
+	assert.Equal(wantGmailIDs, manifest.GmailIDs)
+	assert.Equal([]string{"<announce.example.test>", "<digest.example.test>"}, manifest.Filters.ListIDs)
+	assert.NotContains(manifest.GmailIDs, sourceMessageID(unselectedID))
 }
 
 func TestStageForDeletion_AccountFilter(t *testing.T) {
@@ -342,6 +525,96 @@ func TestStageForDeletion_EmailScopeExcludesMixedMessageTypes(t *testing.T) {
 	)
 }
 
+func TestStageAllMatchesKeepsAttachmentOnlyScope(t *testing.T) {
+	tdb := dbtest.NewTestDB(t, "../store/schema.sql")
+	tdb.SeedStandardDataSet()
+	controller := NewActionController(query.NewSQLiteEngine(tdb.DB), t.TempDir(), nil)
+
+	manifest, err := controller.StageForDeletion(DeletionContext{
+		AllMatches:  true,
+		MatchFilter: query.MessageFilter{WithAttachmentsOnly: true},
+	})
+
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"msg2", "msg4"}, manifest.GmailIDs)
+}
+
+func TestStageSelectedAggregateKeepsAttachmentOnlyScope(t *testing.T) {
+	tdb := dbtest.NewTestDB(t, "../store/schema.sql")
+	tdb.SeedStandardDataSet()
+	controller := NewActionController(query.NewSQLiteEngine(tdb.DB), t.TempDir(), nil)
+
+	manifest, err := controller.StageForDeletion(DeletionContext{
+		AggregateSelection: map[string]bool{"alice@example.com": true},
+		AggregateViewType:  query.ViewSenders,
+		MatchFilter:        query.MessageFilter{WithAttachmentsOnly: true},
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"msg2"}, manifest.GmailIDs)
+}
+
+func TestStageAggregateSearchUsesDisplayedAggregateScope(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	tdb := dbtest.NewTestDB(t, "../store/schema.sql")
+	tdb.SeedStandardDataSet()
+	_, err := tdb.DB.Exec(`UPDATE message_bodies SET body_text = 'aggregatebodyneedle' WHERE message_id = 1`)
+	requirements.NoError(err)
+	tdb.EnableFTS()
+	engine := query.NewSQLiteEngine(tdb.DB)
+
+	rows, err := engine.SubAggregate(t.Context(), query.MessageFilter{MessageType: emailMessageType}, query.ViewSenders,
+		query.AggregateOptions{SearchQuery: "aggregatebodyneedle"})
+	requirements.NoError(err)
+	requirements.Len(rows, 1, "aggregate row must be visible before staging")
+	assertions.Equal("alice@example.com", rows[0].Key)
+
+	key := rows[0].Key
+	controller := NewActionController(engine, t.TempDir(), nil)
+	manifest, err := controller.StageForDeletion(DeletionContext{
+		AllMatches:        true,
+		AggregateViewType: query.ViewSenders,
+		AggregateMatchKey: &key,
+		SearchQuery:       "aggregatebodyneedle",
+		SearchMode:        searchModeFast,
+		MatchFilter:       query.MessageFilter{Sender: key, MessageType: emailMessageType},
+	})
+	requirements.NoError(err)
+	assertions.Equal([]string{"msg1"}, manifest.GmailIDs)
+	var provenance allMatchesManifestProvenance
+	requirements.NoError(json.Unmarshal(manifest.RawFilter, &provenance))
+	assertions.Equal("aggregate", provenance.SearchMode)
+}
+
+func TestStageAggregateSelectionUsesDisplayedSearchScope(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	tdb := dbtest.NewTestDB(t, "../store/schema.sql")
+	tdb.SeedStandardDataSet()
+	_, err := tdb.DB.Exec(`UPDATE message_bodies SET body_text = 'aggregatebodyneedle' WHERE message_id = 1`)
+	requirements.NoError(err)
+	tdb.EnableFTS()
+	engine := query.NewSQLiteEngine(tdb.DB)
+
+	rows, err := engine.SubAggregate(t.Context(), query.MessageFilter{MessageType: emailMessageType}, query.ViewSenders,
+		query.AggregateOptions{SearchQuery: "aggregatebodyneedle"})
+	requirements.NoError(err)
+	requirements.Len(rows, 1, "aggregate row must be visible before staging")
+	assertions.Equal("alice@example.com", rows[0].Key)
+
+	controller := NewActionController(engine, t.TempDir(), nil)
+	manifest, err := controller.StageForDeletion(DeletionContext{
+		AggregateSelection: map[string]bool{rows[0].Key: true},
+		AggregateViewType:  query.ViewSenders,
+		SearchQuery:        "aggregatebodyneedle",
+		SearchMode:         searchModeFast,
+		MatchFilter:        query.MessageFilter{MessageType: emailMessageType},
+	})
+	requirements.NoError(err)
+	assertions.Equal([]string{"msg1"}, manifest.GmailIDs)
+}
+
 func TestSaveManifest_UsesInjectedSaver(t *testing.T) {
 	dir := t.TempDir()
 	saver := &captureManifestSaver{}
@@ -434,10 +707,8 @@ func TestExportAttachments_PartialSuccess(t *testing.T) {
 	// Partial success: one valid file exports, one missing file fails.
 	// Err should be nil because stats.Count > 0 (some files succeeded).
 	env := newTestEnv(t)
-
-	// Clean up the zip file that gets created in current directory.
-	// TODO: ExportAttachments should write to a configurable output directory.
-	t.Cleanup(func() { _ = os.Remove("Test_1.zip") })
+	outputDir := filepath.Join(env.Dir, "exports")
+	env.Ctrl.attachmentOutputDir = outputDir
 
 	// Create a valid attachment file (must be valid 64-char hex SHA-256 hash)
 	validHash := "abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
@@ -469,6 +740,7 @@ func TestExportAttachments_PartialSuccess(t *testing.T) {
 
 	// Result should contain both success info and error details
 	assert.NotEmpty(result.Result)
+	assert.FileExists(filepath.Join(outputDir, "Test_1.zip"))
 }
 
 func TestExportAttachments_FullSuccess(t *testing.T) {
@@ -476,10 +748,8 @@ func TestExportAttachments_FullSuccess(t *testing.T) {
 	assert := assert.New(t)
 	// Full success: all attachments export without errors.
 	env := newTestEnv(t)
-
-	// Clean up the zip file that gets created in current directory.
-	// TODO: ExportAttachments should write to a configurable output directory.
-	t.Cleanup(func() { _ = os.Remove("Test_1.zip") })
+	outputDir := filepath.Join(env.Dir, "exports")
+	env.Ctrl.attachmentOutputDir = outputDir
 
 	// Create a valid attachment file (must be valid 64-char hex SHA-256 hash)
 	validHash := "abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
@@ -506,6 +776,7 @@ func TestExportAttachments_FullSuccess(t *testing.T) {
 
 	require.NoError(result.Err, "expected Err to be nil for full success")
 	assert.NotEmpty(result.Result)
+	assert.FileExists(filepath.Join(outputDir, "Test_1.zip"))
 }
 
 func TestExportAttachments_UsesInjectedAttachmentReader(t *testing.T) {
@@ -513,10 +784,10 @@ func TestExportAttachments_UsesInjectedAttachmentReader(t *testing.T) {
 	assert := assert.New(t)
 	const contentHash = "abc123def456abc123def456abc123def456abc123def456abc123def456abc1"
 	outputDir := t.TempDir()
-	t.Chdir(outputDir)
 
 	ctrl := NewActionControllerWithOptions(&querytest.MockEngine{}, ActionControllerOptions{
-		DataDir: t.TempDir(),
+		DataDir:             t.TempDir(),
+		AttachmentOutputDir: outputDir,
 		AttachmentReader: mapAttachmentReader{data: map[string][]byte{
 			contentHash: []byte("daemon bytes"),
 		}},
@@ -601,7 +872,7 @@ func TestDownloadAttachmentDefaultsToPrivateDataDirectory(t *testing.T) {
 	result, ok := msg.(ExportResultMsg)
 	require.True(ok, "expected ExportResultMsg, got %T", msg)
 	require.NoError(result.Err)
-	downloadPath := filepath.Join(dataDir, "downloads", ".zshenv")
+	downloadPath := filepath.Join(dataDir, "exports", ".zshenv")
 	assert.Contains(result.Result, downloadPath)
 	assert.FileExists(downloadPath)
 	if runtime.GOOS != "windows" {

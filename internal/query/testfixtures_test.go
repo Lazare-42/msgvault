@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -40,6 +41,7 @@ type MessageFixture struct {
 	SenderID            *int64     // nil = NULL (direct sender for WhatsApp/chat messages)
 	OwnerParticipantID  *int64     // nil = NULL (message-relative owner identity)
 	MessageType         string     // e.g. "email", "whatsapp"; "" defaults to "email"
+	ListID              *string    // nil = NULL (RFC 2919 List-Id for email messages)
 	// LegacyEmptyMessageType writes '' instead of the "email" default,
 	// modeling rows imported before message_type existed.
 	LegacyEmptyMessageType bool
@@ -90,9 +92,11 @@ type RecipientFixture struct {
 	ParticipantID int64
 	Type          string // "from", "to", "cc", "bcc"
 	DisplayName   string
-	// EmailAddress is the envelope address snapshot written at email
-	// ingest. Empty models rows without a snapshot (legacy ingests,
-	// non-email writers).
+	// EmailAddress is the header address recorded at email ingest. Empty
+	// models rows where none was recorded (legacy ingests, non-email
+	// writers): the shard then carries NULL in envelope_address and the
+	// participant's current address in email_address, matching what the
+	// exporter writes for cache schema v26.
 	EmailAddress string
 }
 
@@ -152,13 +156,14 @@ type ParticipantClusterFixture struct {
 
 // TestDataBuilder accumulates typed fixture data and generates Parquet files.
 type TestDataBuilder struct {
-	t           testing.TB
-	nextMsgID   int64
-	nextSrcID   int64
-	nextPartID  int64
-	nextLabelID int64
-	nextConvID  int64
-	nextAttID   int64
+	personDisplayNames []string
+	t                  testing.TB
+	nextMsgID          int64
+	nextSrcID          int64
+	nextPartID         int64
+	nextLabelID        int64
+	nextConvID         int64
+	nextAttID          int64
 
 	sources                  []SourceFixture
 	messages                 []MessageFixture
@@ -175,7 +180,7 @@ type TestDataBuilder struct {
 
 	emptyAttachments bool // if true, write empty attachments file
 	// legacyRecipientSchema writes message_recipients without the
-	// email_address envelope column, modeling a pre-v17 cache.
+	// email_address and envelope_address columns, modeling a pre-v17 cache.
 	legacyRecipientSchema bool
 }
 
@@ -254,8 +259,9 @@ type MessageOpt struct {
 	// LegacyEmptyMessageType writes '' instead of the "email" default,
 	// modeling rows imported before message_type existed.
 	LegacyEmptyMessageType bool
-	SenderID               *int64 // nil = NULL (direct sender for text/chat messages)
-	OwnerParticipantID     *int64 // nil defaults to SenderID for outbound messages
+	SenderID               *int64  // nil = NULL (direct sender for text/chat messages)
+	OwnerParticipantID     *int64  // nil defaults to SenderID for outbound messages
+	ListID                 *string // nil = NULL
 	IsFromMe               bool
 	ConversationType       string // defaults from MessageType
 	ConversationTitle      string
@@ -301,6 +307,7 @@ func (b *TestDataBuilder) AddMessage(opt MessageOpt) int64 {
 		SenderID:               opt.SenderID,
 		OwnerParticipantID:     opt.OwnerParticipantID,
 		MessageType:            opt.MessageType,
+		ListID:                 opt.ListID,
 		LegacyEmptyMessageType: opt.LegacyEmptyMessageType,
 		IsFromMe:               opt.IsFromMe,
 		Year:                   sentAt.Year(),
@@ -463,7 +470,7 @@ func joinRows[T any](items []T, format func(T) string) string {
 }
 
 // toSQL converts a MessageFixture to a SQL VALUES row string.
-func (m MessageFixture) toSQL() string {
+func (m MessageFixture) sqlValues() []string {
 	deletedFromSourceAt := "NULL::TIMESTAMP"
 	if m.DeletedFromSourceAt != nil {
 		deletedFromSourceAt = fmt.Sprintf("TIMESTAMP '%s'", m.DeletedFromSourceAt.Format("2006-01-02 15:04:05"))
@@ -481,15 +488,33 @@ func (m MessageFixture) toSQL() string {
 		ownerParticipantID = senderID
 	}
 	msgType := m.resolvedMessageType()
-	return fmt.Sprintf("(%d::BIGINT, %d::BIGINT, %s, %d::BIGINT, %s, %s, TIMESTAMP '%s', %d::BIGINT, %v, %d, %s, %s, %s, %s, %v, %d, %d)",
-		m.ID, m.SourceID, sqlStr(m.SourceMessageID), m.ConversationID,
-		sqlStr(m.Subject), sqlStr(m.Snippet),
-		m.SentAt.Format("2006-01-02 15:04:05"), m.SizeEstimate,
-		m.HasAttachments, m.AttachmentCount, deletedFromSourceAt, senderID, ownerParticipantID, sqlStr(msgType), m.IsFromMe, m.Year, m.Month,
-	)
+	listID := "NULL::VARCHAR"
+	if m.ListID != nil {
+		listID = sqlStr(*m.ListID)
+	}
+	return []string{
+		fmt.Sprintf("%d::BIGINT", m.ID),
+		fmt.Sprintf("%d::BIGINT", m.SourceID),
+		sqlStr(m.SourceMessageID),
+		fmt.Sprintf("%d::BIGINT", m.ConversationID),
+		sqlStr(m.Subject),
+		sqlStr(m.Snippet),
+		fmt.Sprintf("TIMESTAMP '%s'", m.SentAt.Format("2006-01-02 15:04:05")),
+		fmt.Sprintf("%d::BIGINT", m.SizeEstimate),
+		strconv.FormatBool(m.HasAttachments),
+		strconv.Itoa(m.AttachmentCount),
+		deletedFromSourceAt,
+		senderID,
+		ownerParticipantID,
+		sqlStr(msgType),
+		listID,
+		strconv.FormatBool(m.IsFromMe),
+		strconv.Itoa(m.Year),
+		strconv.Itoa(m.Month),
+	}
 }
 
-func (m MessageFixture) toSQLWithInternalDeletion() string {
+func (m MessageFixture) sqlValuesWithInternalDeletion() []string {
 	internalDeletedAt := "NULL::TIMESTAMP"
 	if m.InternalDeletedAt != nil {
 		internalDeletedAt = fmt.Sprintf("TIMESTAMP '%s'", m.InternalDeletedAt.Format("2006-01-02 15:04:05"))
@@ -511,12 +536,31 @@ func (m MessageFixture) toSQLWithInternalDeletion() string {
 		ownerParticipantID = senderID
 	}
 	msgType := m.resolvedMessageType()
-	return fmt.Sprintf("(%d::BIGINT, %d::BIGINT, %s, %d::BIGINT, %s, %s, TIMESTAMP '%s', %d::BIGINT, %v, %d, %s, %s, %s, %s, %s, %v, %d, %d)",
-		m.ID, m.SourceID, sqlStr(m.SourceMessageID), m.ConversationID,
-		sqlStr(m.Subject), sqlStr(m.Snippet),
-		m.SentAt.Format("2006-01-02 15:04:05"), m.SizeEstimate,
-		m.HasAttachments, m.AttachmentCount, internalDeletedAt, deletedFromSourceAt, senderID, ownerParticipantID, sqlStr(msgType), m.IsFromMe, m.Year, m.Month,
-	)
+	listID := "NULL::VARCHAR"
+	if m.ListID != nil {
+		listID = sqlStr(*m.ListID)
+	}
+	return []string{
+		fmt.Sprintf("%d::BIGINT", m.ID),
+		fmt.Sprintf("%d::BIGINT", m.SourceID),
+		sqlStr(m.SourceMessageID),
+		fmt.Sprintf("%d::BIGINT", m.ConversationID),
+		sqlStr(m.Subject),
+		sqlStr(m.Snippet),
+		fmt.Sprintf("TIMESTAMP '%s'", m.SentAt.Format("2006-01-02 15:04:05")),
+		fmt.Sprintf("%d::BIGINT", m.SizeEstimate),
+		strconv.FormatBool(m.HasAttachments),
+		strconv.Itoa(m.AttachmentCount),
+		internalDeletedAt,
+		deletedFromSourceAt,
+		senderID,
+		ownerParticipantID,
+		sqlStr(msgType),
+		listID,
+		strconv.FormatBool(m.IsFromMe),
+		strconv.Itoa(m.Year),
+		strconv.Itoa(m.Month),
+	}
 }
 
 func (b *TestDataBuilder) sourcesSQL() string {
@@ -552,9 +596,32 @@ func (b *TestDataBuilder) recipientsSQL() string {
 		})
 	}
 	return joinRows(b.recipients, func(r RecipientFixture) string {
-		return fmt.Sprintf("(%d::BIGINT, %d::BIGINT, %s, %s, %s)",
-			r.MessageID, r.ParticipantID, sqlStr(r.Type), sqlStr(r.DisplayName), sqlStr(r.EmailAddress))
+		// Mirror the exporter: envelope_address is the recorded header
+		// address or NULL, and email_address resolves to the envelope when
+		// present, else the participant's current address, else NULL.
+		envelope := "NULL::VARCHAR"
+		resolved := "NULL::VARCHAR"
+		if r.EmailAddress != "" {
+			envelope = sqlStr(r.EmailAddress)
+			resolved = envelope
+		} else if email := b.participantEmail(r.ParticipantID); email != "" {
+			resolved = sqlStr(email)
+		}
+		return fmt.Sprintf("(%d::BIGINT, %d::BIGINT, %s, %s, %s, %s)",
+			r.MessageID, r.ParticipantID, sqlStr(r.Type), sqlStr(r.DisplayName),
+			resolved, envelope)
 	})
+}
+
+// participantEmail returns the fixture participant's current email address,
+// or an empty string when the participant is absent or carries none.
+func (b *TestDataBuilder) participantEmail(participantID int64) string {
+	for _, p := range b.participants {
+		if p.ID == participantID {
+			return p.Email
+		}
+	}
+	return ""
 }
 
 func (b *TestDataBuilder) labelsSQL() string {
@@ -607,16 +674,16 @@ func (b *TestDataBuilder) participantClustersSQL() string {
 
 // column definitions (coupled to SQL generation methods above).
 const (
-	messagesCols               = "id, source_id, source_message_id, conversation_id, subject, snippet, sent_at, size_estimate, has_attachments, attachment_count, deleted_from_source_at, sender_id, owner_participant_id, message_type, is_from_me, year, month"
-	messagesColsWithDeletedAt  = "id, source_id, source_message_id, conversation_id, subject, snippet, sent_at, size_estimate, has_attachments, attachment_count, deleted_at, deleted_from_source_at, sender_id, owner_participant_id, message_type, is_from_me, year, month"
+	messagesCols               = "id, source_id, source_message_id, conversation_id, subject, snippet, sent_at, size_estimate, has_attachments, attachment_count, deleted_from_source_at, sender_id, owner_participant_id, message_type, list_id, is_from_me, year, month"
+	messagesColsWithDeletedAt  = "id, source_id, source_message_id, conversation_id, subject, snippet, sent_at, size_estimate, has_attachments, attachment_count, deleted_at, deleted_from_source_at, sender_id, owner_participant_id, message_type, list_id, is_from_me, year, month"
 	sourcesCols                = "id, account_email, source_type"
 	participantsCols           = "id, email_address, domain, display_name, phone_number"
 	participantIdentifiersCols = "participant_id, identifier_type, identifier_value, display_value, is_primary"
 	messageRecipientsCols      = "message_id, participant_id, recipient_type, display_name"
-	// messageRecipientsColsWithEnvelope adds the envelope address snapshot
-	// (cache schema v17). messageRecipientsCols stays for fixtures that
-	// model pre-v17 caches without the column.
-	messageRecipientsColsWithEnvelope = "message_id, participant_id, recipient_type, display_name, email_address"
+	// messageRecipientsColsWithEnvelope adds the resolved recipient address
+	// and the raw header address (cache schema v26). messageRecipientsCols
+	// stays for fixtures that model pre-v17 caches without either column.
+	messageRecipientsColsWithEnvelope = "message_id, participant_id, recipient_type, display_name, email_address, envelope_address"
 	labelsCols                        = "id, name"
 	messageLabelsCols                 = "message_id, label_id"
 	attachmentsCols                   = "attachment_id, message_id, size, filename, mime_type"
@@ -625,6 +692,19 @@ const (
 	ownerParticipantsCols             = "source_id, participant_id"
 	participantClustersCols           = "participant_id, canonical_id"
 )
+
+var (
+	messagesColumns              = strings.Split(messagesCols, ", ")
+	messagesColumnsWithDeletedAt = strings.Split(messagesColsWithDeletedAt, ", ")
+)
+
+func formatMessageFixture(tb testing.TB, columns, values []string) string {
+	tb.Helper()
+	require.Lenf(tb, values, len(columns),
+		"messages fixture has %d columns but %d values; update MessageFixture SQL generation",
+		len(columns), len(values))
+	return "(" + strings.Join(values, ", ") + ")"
+}
 
 // Build generates Parquet files from the accumulated data and returns the
 // analytics directory path and a cleanup function.
@@ -643,7 +723,7 @@ func (b *TestDataBuilder) Build() (string, func()) {
 func (b *TestDataBuilder) addMessageTables(pb *parquetBuilder) {
 	if len(b.messages) == 0 {
 		pb.addEmptyTable("messages", "messages/year=0", "empty.parquet", messagesCols,
-			"(0::BIGINT, 0::BIGINT, '', 0::BIGINT, '', '', TIMESTAMP '1970-01-01', 0::BIGINT, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', false, 0, 0)")
+			formatMessageFixture(b.t, messagesColumns, MessageFixture{SentAt: time.Unix(0, 0).UTC(), MessageType: "email"}.sqlValues()))
 		return
 	}
 	byYear := map[int][]MessageFixture{}
@@ -652,10 +732,16 @@ func (b *TestDataBuilder) addMessageTables(pb *parquetBuilder) {
 	}
 	for year, msgs := range byYear {
 		cols := messagesCols
-		rowFormatter := MessageFixture.toSQL
+		columns := messagesColumns
+		rowFormatter := func(message MessageFixture) string {
+			return formatMessageFixture(b.t, columns, message.sqlValues())
+		}
 		if slices.ContainsFunc(msgs, func(message MessageFixture) bool { return message.InternalDeletedAt != nil }) {
 			cols = messagesColsWithDeletedAt
-			rowFormatter = MessageFixture.toSQLWithInternalDeletion
+			columns = messagesColumnsWithDeletedAt
+			rowFormatter = func(message MessageFixture) string {
+				return formatMessageFixture(b.t, columns, message.sqlValuesWithInternalDeletion())
+			}
 		}
 		rows := joinRows(msgs, rowFormatter)
 		pb.addTable("messages",
@@ -678,7 +764,7 @@ func (b *TestDataBuilder) recipientDummyRow() string {
 	if b.legacyRecipientSchema {
 		return "(0::BIGINT, 0::BIGINT, '', '')"
 	}
-	return "(0::BIGINT, 0::BIGINT, '', '', '')"
+	return "(0::BIGINT, 0::BIGINT, '', '', '', '')"
 }
 
 // addAuxiliaryTables adds sources, participants, recipients, labels, message_labels, and conversations.
@@ -688,6 +774,7 @@ func (b *TestDataBuilder) addAuxiliaryTables(pb *parquetBuilder) {
 		empty                                bool
 	}{
 		{"sources", "sources", "sources.parquet", sourcesCols, "(0::BIGINT, '', 'gmail')", b.sourcesSQL(), len(b.sources) == 0},
+		{datasetPersonDisplayNames, datasetPersonDisplayNames, "person_display_names.parquet", "participant_id, person_id, display_name", "(0::BIGINT, 0::BIGINT, NULL::VARCHAR)", strings.Join(b.personDisplayNames, ","), len(b.personDisplayNames) == 0},
 		{"participants", "participants", "participants.parquet", participantsCols, "(0::BIGINT, '', '', '', '')", b.participantsSQL(), len(b.participants) == 0},
 		{"participant_identifiers", "participant_identifiers", "participant_identifiers.parquet", participantIdentifiersCols, "(0::BIGINT, '', '', '', false)", b.participantIdentifiersSQL(), len(b.participantIdentifiers) == 0},
 		{"message_recipients", "message_recipients", "message_recipients.parquet", b.recipientCols(), b.recipientDummyRow(), b.recipientsSQL(), len(b.recipients) == 0},
@@ -788,6 +875,7 @@ func (b *parquetBuilder) build() (string, func()) {
 	b.ensureParticipantIdentifiersTable()
 	b.ensureOwnerParticipantsTable()
 	b.ensureParticipantClustersTable()
+	b.ensurePersonDisplayNamesTable()
 
 	tmpDir := b.createTempDirs()
 
@@ -831,6 +919,16 @@ func (b *parquetBuilder) ensureParticipantIdentifiersTable() {
 	b.addEmptyTable(datasetParticipantIdentifiers, datasetParticipantIdentifiers,
 		datasetParticipantIdentifiers+".parquet", participantIdentifiersCols,
 		"(0::BIGINT, '', '', '', false)")
+}
+
+func (b *parquetBuilder) ensurePersonDisplayNamesTable() {
+	for _, table := range b.tables {
+		if table.name == datasetPersonDisplayNames {
+			return
+		}
+	}
+	b.addEmptyTable(datasetPersonDisplayNames, datasetPersonDisplayNames, "person_display_names.parquet",
+		"participant_id, person_id, display_name", "(0::BIGINT, 0::BIGINT, NULL::VARCHAR)")
 }
 
 func (b *parquetBuilder) ensureOwnerParticipantsTable() {
@@ -904,6 +1002,16 @@ func escapePath(p string) string {
 // writeTableParquet writes a single table's data to a Parquet file using DuckDB.
 func writeTableParquet(tb testing.TB, db *sql.DB, path, columns, values string, empty bool) {
 	tb.Helper()
+	valueRows, err := db.Query("SELECT * FROM (VALUES " + values + ") LIMIT 0")
+	require.NoError(tb, err, "parse fixture values for %s", path)
+	defer func() { _ = valueRows.Close() }()
+	valueColumns, err := valueRows.Columns()
+	require.NoError(tb, err, "read fixture value arity for %s", path)
+	require.NoError(tb, valueRows.Err(), "inspect fixture values for %s", path)
+	expectedColumns := strings.Split(columns, ", ")
+	require.Lenf(tb, valueColumns, len(expectedColumns),
+		"fixture values for %s have %d columns but %d are declared; update its messages row",
+		path, len(valueColumns), len(expectedColumns))
 
 	whereClause := ""
 	if empty {
@@ -915,7 +1023,7 @@ func writeTableParquet(tb testing.TB, db *sql.DB, path, columns, values string, 
 			) TO '%s' (FORMAT PARQUET)
 		`, values, columns, whereClause, path)
 
-	_, err := db.Exec(query)
+	_, err = db.Exec(query)
 	require.NoError(tb, err, "create parquet %s", path)
 }
 

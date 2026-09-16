@@ -3,6 +3,7 @@ package importer
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -166,6 +167,42 @@ func TestImportMbox_NoAttachmentsStillRecordsAttachmentMetadata(t *testing.T) {
 	require.NoError(st.DB().QueryRow(`SELECT has_attachments, attachment_count FROM messages WHERE subject = 'Hello' LIMIT 1`).Scan(&hasAttachments, &attachmentCount), "select message attachment metadata")
 	require.True(hasAttachments, "has_attachments")
 	require.Equal(1, attachmentCount, "attachment_count")
+}
+
+// TestImportMboxPersistsListID catches an offline MIME import that parses the
+// List-Id header but drops it before the shared message persistence boundary.
+func TestImportMboxPersistsListID(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	tmp := t.TempDir()
+	st, err := store.Open(filepath.Join(tmp, "msgvault.db"))
+	require.NoError(err, "open store")
+	t.Cleanup(func() { _ = st.Close() })
+	require.NoError(st.InitSchema(), "initialize schema")
+
+	raw := email.NewMessage().
+		From("Alice <alice@example.com>").
+		To("Bob <bob@example.com>").
+		Subject("List announcement").
+		Header("List-Id", "Example <announce.example.org>").
+		Body("Body text.\n").
+		Bytes()
+	mboxPath := filepath.Join(tmp, "list-id.mbox")
+	mboxData := "From alice@example.com Mon Jan 1 12:00:00 2024\n" + string(raw)
+	require.NoError(os.WriteFile(mboxPath, []byte(mboxData), 0600), "write mbox")
+
+	_, err = ImportMbox(context.Background(), st, mboxPath, MboxImportOptions{
+		SourceType: "mbox",
+		Identifier: "owner@example.com",
+		NoResume:   true,
+	})
+	require.NoError(err, "import mbox")
+
+	var listID sql.NullString
+	require.NoError(st.DB().QueryRow(`SELECT list_id FROM messages`).Scan(&listID),
+		"read imported list ID")
+	assert.True(listID.Valid, "list ID should be present")
+	assert.Equal("<announce.example.org>", listID.String, "list ID")
 }
 
 func TestImportMbox_IsIdempotentAcrossPathChanges(t *testing.T) {
@@ -728,6 +765,7 @@ func TestImportMbox_InvalidResumeOffsetBeyondEOF_FailsSync(t *testing.T) {
 
 	cp := store.Checkpoint{}
 	require.NoError(saveMboxCheckpoint(st, syncID, absPath, fi.Size()+1, 0, &cp), "save checkpoint")
+	require.NoError(st.FailSync(syncID, "worker stopped"), "fail prior sync")
 
 	_, err = ImportMbox(context.Background(), st, absPath, MboxImportOptions{
 		SourceType: "mbox",
@@ -744,6 +782,64 @@ func TestImportMbox_InvalidResumeOffsetBeyondEOF_FailsSync(t *testing.T) {
 	var messageCount int
 	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&messageCount), "count messages")
 	require.Equal(0, messageCount, "messageCount")
+}
+
+func TestImportMbox_RejectsLiveSyncOwner(t *testing.T) {
+	require := require.New(t)
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "msgvault.db")
+	st, err := store.Open(dbPath)
+	require.NoError(err)
+	t.Cleanup(func() { _ = st.Close() })
+	require.NoError(st.InitSchema())
+
+	mboxPath := filepath.Join(tmp, "export.mbox")
+	require.NoError(os.WriteFile(mboxPath, []byte(
+		"From sender@example.com Mon Jan 1 00:00:00 2024\nSubject: One\n\nBody\n",
+	), 0o600))
+	src, err := st.GetOrCreateSource("mbox", "user@example.com")
+	require.NoError(err)
+	_, err = st.StartSync(src.ID, "import-mbox")
+	require.NoError(err)
+
+	_, err = ImportMbox(t.Context(), st, mboxPath, MboxImportOptions{
+		Identifier: "user@example.com",
+	})
+
+	require.ErrorIs(err, store.ErrSyncAlreadyActive)
+}
+
+func TestImportMbox_ResumesCheckpointAfterWorkerExit(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	tmp := t.TempDir()
+	dbPath := filepath.Join(tmp, "msgvault.db")
+	mboxPath := filepath.Join(tmp, "export.mbox")
+	mboxData := []byte("From sender@example.com Mon Jan 1 00:00:00 2024\nSubject: One\n\nBody\n")
+	require.NoError(os.WriteFile(mboxPath, mboxData, 0o600))
+
+	first, err := store.Open(dbPath)
+	require.NoError(err)
+	require.NoError(first.InitSchema())
+	src, err := first.GetOrCreateSource("mbox", "user@example.com")
+	require.NoError(err)
+	runID, err := first.StartSync(src.ID, "import-mbox")
+	require.NoError(err)
+	require.NoError(saveMboxCheckpoint(
+		first, runID, mboxPath, int64(len(mboxData)), 1,
+		&store.Checkpoint{MessagesProcessed: 1, MessagesAdded: 1},
+	))
+	require.NoError(first.Close())
+
+	second, err := store.Open(dbPath)
+	require.NoError(err)
+	t.Cleanup(func() { _ = second.Close() })
+	summary, err := ImportMbox(t.Context(), second, mboxPath, MboxImportOptions{
+		Identifier: "user@example.com",
+	})
+	require.NoError(err)
+	assert.True(summary.WasResumed)
+	assert.Equal(int64(len(mboxData)), summary.ResumedOffset)
 }
 
 func TestImportMbox_HardErrorsStopsMultiFileLoop(t *testing.T) {

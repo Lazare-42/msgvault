@@ -24,6 +24,15 @@ func (p PatchAttributeDefinitionHeaders) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(p))
 }
 
+type BeginGoogleCardDAVAuthorizationHeaders struct {
+	// Origin Origin of the msgvault Web UI, matching redirect_uri
+	Origin string `json:"Origin" validate:"required"`
+}
+
+func (b BeginGoogleCardDAVAuthorizationHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(b))
+}
+
 type DeleteEmploymentHeaders struct {
 	// IfMatch Strong ETag returned by the latest employment read
 	IfMatch string `json:"If-Match" validate:"required"`
@@ -225,5 +234,32 @@ type PatchSettingsHeaders struct {
 }
 
 func (p PatchSettingsHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type PutSettingsPersonEnrichmentProviderHeaders struct {
+	// IfMatch Strong config ETag returned by the latest settings read
+	IfMatch string `json:"If-Match" validate:"required"`
+}
+
+func (p PutSettingsPersonEnrichmentProviderHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(p))
+}
+
+type DeleteSettingsProviderCredentialHeaders struct {
+	// IfMatch Strong ETag for the provider credential store
+	IfMatch string `json:"If-Match" validate:"required"`
+}
+
+func (d DeleteSettingsProviderCredentialHeaders) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(d))
+}
+
+type PutSettingsProviderCredentialHeaders struct {
+	// IfMatch Strong ETag for the provider credential store
+	IfMatch string `json:"If-Match" validate:"required"`
+}
+
+func (p PutSettingsProviderCredentialHeaders) Validate() error {
 	return runtime.ConvertValidatorError(typesValidator.Struct(p))
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -35,6 +36,237 @@ type PersonInferenceConsentStatus struct {
 const personInferenceConsentColumns = `
 	id, profile_fingerprint, granted_by, granted_at, revoked_by, revoked_at`
 
+type personInferenceProfileProjection struct {
+	Fingerprint           string         `db:"fingerprint" profile:"fingerprint"`
+	Protocol              string         `db:"provider_kind" profile:"protocol"`
+	Endpoint              string         `db:"endpoint" profile:"endpoint"`
+	Model                 string         `db:"model" profile:"model"`
+	APIKeyEnv             string         `db:"api_key_env" profile:"credential_ref"`
+	AllowAnonymous        bool           `db:"allow_anonymous" profile:"auth,anonymous"`
+	Auth                  string         `db:"auth_scheme" profile:"auth"`
+	Credential            string         `db:"credential_source" profile:"credential"`
+	CredentialRef         string         `db:"credential_ref" profile:"credential_ref"`
+	OutputMode            string         `db:"output_mode" profile:"output_mode"`
+	TokenLimit            string         `db:"token_limit_parameter" profile:"token_limit_parameter"`
+	ReasoningEffort       string         `db:"reasoning_effort" profile:"reasoning_effort"`
+	ReasoningMode         string         `db:"reasoning_mode" profile:"reasoning_mode"`
+	DriverVersion         string         `db:"driver_version" profile:"driver_version"`
+	Retention             string         `db:"retention_posture" profile:"retention_posture"`
+	Training              string         `db:"training_posture" profile:"training_posture"`
+	AllowedSources        string         `db:"allowed_sources,json" profile:"allowed_sources,json"`
+	SourceSince           string         `db:"source_since" profile:"source_since"`
+	SourceUntil           sql.NullString `db:"source_until" profile:"source_until,null"`
+	AllowSensitive        bool           `db:"allow_sensitive" profile:"allow_sensitive"`
+	ExecutionBoundary     string         `db:"execution_boundary" profile:"execution_boundary"`
+	PacketRendererPolicy  string         `db:"packet_renderer_policy" profile:"packet_renderer_policy"`
+	ProgramFingerprint    string         `db:"program_fingerprint" profile:"program_fingerprint"`
+	DisclosedPacketFields string         `db:"disclosed_packet_fields,json" profile:"disclosed_packet_fields,json"`
+	PolicyJSON            string         `db:"policy_json,json" profile:"policy_json,raw"`
+}
+
+var personInferenceProfileColumns = personInferenceProfileSelectColumns()
+
+func personInferenceProfileSelectColumns() string {
+	return personInferenceProfileColumnsFor(func(name string, isJSON bool) string {
+		if isJSON {
+			return "CAST(" + name + " AS TEXT)"
+		}
+		return name
+	})
+}
+
+func personInferenceProfileInsertColumns() string {
+	return personInferenceProfileColumnsFor(func(name string, _ bool) string { return name })
+}
+
+func personInferenceProfileInsertValues(jsonBindExpr string) string {
+	return personInferenceProfileColumnsFor(func(_ string, isJSON bool) string {
+		if isJSON {
+			return jsonBindExpr
+		}
+		return "?"
+	})
+}
+
+func personInferenceProfileColumnsFor(render func(name string, isJSON bool) string) string {
+	typeOfProjection := reflect.TypeFor[personInferenceProfileProjection]()
+	indexes := personInferenceProfileDBFieldIndexes(typeOfProjection)
+	columns := make([]string, len(indexes))
+	for columnIndex, fieldIndex := range indexes {
+		field := typeOfProjection.Field(fieldIndex)
+		tag := field.Tag.Get("db")
+		name, options, _ := strings.Cut(tag, ",")
+		columns[columnIndex] = render(name, options == "json")
+	}
+	return strings.Join(columns, ", ")
+}
+
+func personInferenceProfileDBFieldIndexes(typeOfProjection reflect.Type) []int {
+	indexes := make([]int, 0, typeOfProjection.NumField())
+	for index := range typeOfProjection.NumField() {
+		name, _, _ := strings.Cut(typeOfProjection.Field(index).Tag.Get("db"), ",")
+		if name != "" && name != "-" {
+			indexes = append(indexes, index)
+		}
+	}
+	return indexes
+}
+
+func newPersonInferenceProfileProjection(
+	profile peoplesweep.ProviderProfile,
+) (personInferenceProfileProjection, error) {
+	profileValue := reflect.ValueOf(profile)
+	profileFields := make(map[string]reflect.Value, profileValue.NumField())
+	for index := range profileValue.NumField() {
+		field := reflect.TypeOf(profile).Field(index)
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+		if field.Name == "PolicyJSON" {
+			profileFields["policy_json"] = profileValue.Field(index)
+		} else if name != "" && name != "-" {
+			profileFields[name] = profileValue.Field(index)
+		}
+	}
+
+	projection := personInferenceProfileProjection{}
+	projectionValue := reflect.ValueOf(&projection).Elem()
+	projectionType := projectionValue.Type()
+	for index := range projectionValue.NumField() {
+		field := projectionType.Field(index)
+		name, option, _ := strings.Cut(field.Tag.Get("profile"), ",")
+		if name == "" || name == "-" {
+			return personInferenceProfileProjection{}, fmt.Errorf(
+				"people inference profile projection field %q has no profile tag", field.Name)
+		}
+		source, ok := profileFields[name]
+		if !ok {
+			return personInferenceProfileProjection{}, fmt.Errorf(
+				"people inference profile projection field %q maps to unknown profile field %q", field.Name, name)
+		}
+		target := projectionValue.Field(index)
+		switch option {
+		case "anonymous":
+			target.SetBool(source.String() == string(peoplesweep.AuthNone))
+		case "json":
+			encoded, err := json.Marshal(source.Interface())
+			if err != nil {
+				return personInferenceProfileProjection{}, fmt.Errorf(
+					"encode people inference %s: %w", name, err)
+			}
+			target.SetString(string(encoded))
+		case "null":
+			target.Set(reflect.ValueOf(sql.NullString{
+				String: source.String(), Valid: source.String() != "",
+			}))
+		case "raw":
+			target.SetString(string(source.Bytes()))
+		default:
+			if target.Kind() == reflect.Bool && source.Kind() == reflect.Bool {
+				target.SetBool(source.Bool())
+				continue
+			}
+			if target.Kind() != reflect.String || source.Kind() != reflect.String {
+				return personInferenceProfileProjection{}, fmt.Errorf(
+					"people inference profile projection field %q has incompatible profile field %q", field.Name, name)
+			}
+			target.SetString(source.String())
+		}
+	}
+	return projection, nil
+}
+
+func (p *personInferenceProfileProjection) scanDestinations() []any {
+	value := reflect.ValueOf(p).Elem()
+	indexes := personInferenceProfileDBFieldIndexes(value.Type())
+	destinations := make([]any, len(indexes))
+	for destinationIndex, fieldIndex := range indexes {
+		destinations[destinationIndex] = value.Field(fieldIndex).Addr().Interface()
+	}
+	return destinations
+}
+
+func (p *personInferenceProfileProjection) insertValues() []any {
+	value := reflect.ValueOf(p).Elem()
+	indexes := personInferenceProfileDBFieldIndexes(value.Type())
+	values := make([]any, len(indexes))
+	for valueIndex, fieldIndex := range indexes {
+		values[valueIndex] = value.Field(fieldIndex).Interface()
+	}
+	return values
+}
+
+func (p *personInferenceProfileProjection) equal(expected personInferenceProfileProjection) bool {
+	value, expectedValue := reflect.ValueOf(p).Elem(), reflect.ValueOf(expected)
+	indexes := personInferenceProfileDBFieldIndexes(value.Type())
+	for _, fieldIndex := range indexes {
+		field := value.Type().Field(fieldIndex)
+		actual, want := value.Field(fieldIndex).Interface(), expectedValue.Field(fieldIndex).Interface()
+		if field.Type == reflect.TypeFor[sql.NullString]() {
+			actualUntil, actualOK := actual.(sql.NullString)
+			expectedUntil, expectedOK := want.(sql.NullString)
+			if !actualOK || !expectedOK {
+				return false
+			}
+			if actualUntil.String != expectedUntil.String {
+				return false
+			}
+			continue
+		}
+		_, options, _ := strings.Cut(field.Tag.Get("db"), ",")
+		if options == "json" {
+			actualString, actualOK := actual.(string)
+			wantString, wantOK := want.(string)
+			if !actualOK || !wantOK || !equalJSON([]byte(actualString), []byte(wantString)) {
+				return false
+			}
+			continue
+		}
+		if !reflect.DeepEqual(actual, want) {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *personInferenceProfileProjection) profile() (peoplesweep.ProviderProfile, error) {
+	// Validate each entire JSON array before comparing it. equalJSON reads
+	// only the first JSON value and would accept trailing garbage in SQLite.
+	var storedSources []peoplesweep.SourceClass
+	if err := json.Unmarshal([]byte(p.AllowedSources), &storedSources); err != nil {
+		return peoplesweep.ProviderProfile{}, fmt.Errorf("decode allowed sources: %w", err)
+	}
+	var storedDisclosedFields []string
+	if err := json.Unmarshal([]byte(p.DisclosedPacketFields), &storedDisclosedFields); err != nil {
+		return peoplesweep.ProviderProfile{}, fmt.Errorf("decode disclosed packet fields: %w", err)
+	}
+	var profile peoplesweep.ProviderProfile
+	if err := json.Unmarshal([]byte(p.PolicyJSON), &profile); err != nil {
+		return peoplesweep.ProviderProfile{}, fmt.Errorf("decode people inference policy: %w", err)
+	}
+	if profile.Protocol == "" {
+		return peoplesweep.ProviderProfile{}, errors.New(
+			"stored people inference profile policy has no protocol")
+	}
+	profile.Fingerprint = p.Fingerprint
+	profile.PolicyJSON = json.RawMessage(p.PolicyJSON)
+	expected, err := newPersonInferenceProfileProjection(profile)
+	if err != nil {
+		return peoplesweep.ProviderProfile{}, err
+	}
+	if !p.equal(expected) {
+		return peoplesweep.ProviderProfile{}, errors.New(
+			"stored people inference profile does not match its immutable policy")
+	}
+	canonical, err := peoplesweep.CanonicalStoredProviderProfile(profile)
+	if err != nil {
+		return peoplesweep.ProviderProfile{}, err
+	}
+	if !equalJSON(profile.PolicyJSON, canonical.PolicyJSON) {
+		return peoplesweep.ProviderProfile{}, errors.New(
+			"stored people inference profile does not match its immutable policy")
+	}
+	return canonical, nil
+}
+
 // EnsurePersonInferenceProfile persists one immutable canonical policy or
 // verifies the already-stored row has the same content.
 func (s *Store) EnsurePersonInferenceProfile(
@@ -44,27 +276,15 @@ func (s *Store) EnsurePersonInferenceProfile(
 	if err := profile.Validate(); err != nil {
 		return false, err
 	}
-	allowedSources, err := json.Marshal(profile.AllowedSources)
+	projection, err := newPersonInferenceProfileProjection(profile)
 	if err != nil {
-		return false, fmt.Errorf("encode people inference allowed sources: %w", err)
-	}
-	var sourceUntil any
-	if profile.SourceUntil != "" {
-		sourceUntil = profile.SourceUntil
+		return false, err
 	}
 	result, err := s.db.ExecContext(ctx, `
 		INSERT INTO person_inference_profiles
-			(fingerprint, provider_kind, endpoint, model, api_key_env,
-			 allow_anonymous, retention_posture, training_posture,
-			 allowed_sources, source_since, source_until, allow_sensitive,
-			 policy_json)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, `+s.dialect.JSONBindExpr()+`, ?, ?, ?, `+s.dialect.JSONBindExpr()+`)
-		ON CONFLICT (fingerprint) DO NOTHING`,
-		profile.Fingerprint, profile.Kind, profile.Endpoint, profile.Model,
-		profile.APIKeyEnv, profile.AllowAnonymous, profile.RetentionPosture,
-		profile.TrainingPosture, string(allowedSources), profile.SourceSince,
-		sourceUntil, profile.AllowSensitive, string(profile.PolicyJSON),
-	)
+			(`+personInferenceProfileInsertColumns()+`)
+		VALUES (`+personInferenceProfileInsertValues(s.dialect.JSONBindExpr())+`)
+		ON CONFLICT (fingerprint) DO NOTHING`, projection.insertValues()...)
 	if err != nil {
 		return false, fmt.Errorf("insert people inference profile: %w", err)
 	}
@@ -72,7 +292,7 @@ func (s *Store) EnsurePersonInferenceProfile(
 	if err != nil {
 		return false, fmt.Errorf("read people inference profile insert result: %w", err)
 	}
-	if err := s.verifyPersonInferenceProfile(ctx, profile, allowedSources); err != nil {
+	if err := s.verifyPersonInferenceProfile(ctx, profile, projection); err != nil {
 		return false, err
 	}
 	return rows == 1, nil
@@ -81,40 +301,16 @@ func (s *Store) EnsurePersonInferenceProfile(
 func (s *Store) verifyPersonInferenceProfile(
 	ctx context.Context,
 	profile peoplesweep.ProviderProfile,
-	allowedSources []byte,
+	expected personInferenceProfileProjection,
 ) error {
-	var (
-		fingerprint, kind, endpoint, model, apiKeyEnv string
-		retention, training, storedSources, since     string
-		storedPolicy                                  string
-		anonymous, sensitive                          bool
-		until                                         sql.NullString
-	)
+	var stored personInferenceProfileProjection
 	err := s.db.QueryRowContext(ctx, `
-		SELECT fingerprint, provider_kind, endpoint, model, api_key_env,
-		       allow_anonymous, retention_posture, training_posture,
-		       CAST(allowed_sources AS TEXT), source_since, source_until,
-		       allow_sensitive, CAST(policy_json AS TEXT)
-		FROM person_inference_profiles WHERE fingerprint = ?`, profile.Fingerprint).Scan(
-		&fingerprint, &kind, &endpoint, &model, &apiKeyEnv, &anonymous,
-		&retention, &training, &storedSources, &since, &until, &sensitive,
-		&storedPolicy,
-	)
+		SELECT `+personInferenceProfileColumns+`
+		FROM person_inference_profiles WHERE fingerprint = ?`, profile.Fingerprint).Scan(stored.scanDestinations()...)
 	if err != nil {
 		return fmt.Errorf("read people inference profile: %w", err)
 	}
-	storedUntil := ""
-	if until.Valid {
-		storedUntil = until.String
-	}
-	if fingerprint != profile.Fingerprint || kind != profile.Kind ||
-		endpoint != profile.Endpoint || model != profile.Model ||
-		apiKeyEnv != profile.APIKeyEnv || anonymous != profile.AllowAnonymous ||
-		retention != profile.RetentionPosture || training != profile.TrainingPosture ||
-		since != profile.SourceSince || storedUntil != profile.SourceUntil ||
-		sensitive != profile.AllowSensitive ||
-		!equalJSON([]byte(storedSources), allowedSources) ||
-		!equalJSON([]byte(storedPolicy), profile.PolicyJSON) {
+	if !stored.equal(expected) {
 		return errors.New("people inference profile fingerprint already has different immutable policy")
 	}
 	return nil
@@ -127,10 +323,7 @@ func (s *Store) ListPersonInferenceProfiles(
 	ctx context.Context,
 ) ([]peoplesweep.ProviderProfile, error) {
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT fingerprint, provider_kind, endpoint, model, api_key_env,
-		       allow_anonymous, retention_posture, training_posture,
-		       CAST(allowed_sources AS TEXT), source_since, source_until,
-		       allow_sensitive, CAST(policy_json AS TEXT)
+		SELECT `+personInferenceProfileColumns+`
 		FROM person_inference_profiles
 		ORDER BY fingerprint`)
 	if err != nil {
@@ -362,56 +555,11 @@ func scanPersonInferenceConsent(row scanner) (*PersonInferenceConsent, error) {
 }
 
 func scanPersonInferenceProfile(row scanner) (peoplesweep.ProviderProfile, error) {
-	var (
-		profile                    peoplesweep.ProviderProfile
-		allowedSources, policyJSON string
-		sourceUntil                sql.NullString
-	)
-	if err := row.Scan(
-		&profile.Fingerprint, &profile.Kind, &profile.Endpoint, &profile.Model,
-		&profile.APIKeyEnv, &profile.AllowAnonymous, &profile.RetentionPosture,
-		&profile.TrainingPosture, &allowedSources, &profile.SourceSince,
-		&sourceUntil, &profile.AllowSensitive, &policyJSON,
-	); err != nil {
+	var projection personInferenceProfileProjection
+	if err := row.Scan(projection.scanDestinations()...); err != nil {
 		return peoplesweep.ProviderProfile{}, err
 	}
-	if sourceUntil.Valid {
-		profile.SourceUntil = sourceUntil.String
-	}
-	if err := json.Unmarshal([]byte(allowedSources), &profile.AllowedSources); err != nil {
-		return peoplesweep.ProviderProfile{}, fmt.Errorf("decode allowed sources: %w", err)
-	}
-	var codexPolicy struct {
-		ReasoningEffort   string `json:"reasoning_effort"`
-		ExecutionBoundary string `json:"execution_boundary"`
-	}
-	if err := json.Unmarshal([]byte(policyJSON), &codexPolicy); err != nil {
-		return peoplesweep.ProviderProfile{}, fmt.Errorf("decode people inference policy: %w", err)
-	}
-	profileConfig := peoplesweep.Config{Enabled: true, Provider: peoplesweep.ProviderConfig{
-		Kind: profile.Kind, Endpoint: profile.Endpoint, Model: profile.Model,
-		APIKeyEnv: profile.APIKeyEnv, AllowAnonymous: profile.AllowAnonymous,
-		RetentionPosture: profile.RetentionPosture, TrainingPosture: profile.TrainingPosture,
-		AllowedSources: profile.AllowedSources, SourceSince: profile.SourceSince,
-		SourceUntil: profile.SourceUntil, AllowSensitive: profile.AllowSensitive,
-		ReasoningEffort: codexPolicy.ReasoningEffort, ExecutionBoundary: codexPolicy.ExecutionBoundary,
-		RequestTimeout: time.Second,
-	}}
-	profileConfig.ApplyDefaults()
-	canonical, err := profileConfig.Profile()
-	if err != nil {
-		return peoplesweep.ProviderProfile{}, err
-	}
-	if profile.Fingerprint != canonical.Fingerprint ||
-		!equalJSON([]byte(policyJSON), canonical.PolicyJSON) {
-		return peoplesweep.ProviderProfile{}, errors.New(
-			"stored people inference profile does not match its immutable policy")
-	}
-	profile = canonical
-	if err := profile.Validate(); err != nil {
-		return peoplesweep.ProviderProfile{}, err
-	}
-	return profile, nil
+	return projection.profile()
 }
 
 func validatePersonInferenceConsentInput(fingerprint, actor string) (string, error) {

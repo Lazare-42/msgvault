@@ -6,7 +6,6 @@ WORKDIR /src
 COPY web/package.json web/bun.lock ./web/
 RUN cd web && bun install --frozen-lockfile
 COPY api/openapi.yaml ./api/openapi.yaml
-COPY scripts/generate-web-client.mjs ./scripts/generate-web-client.mjs
 COPY web/ ./web/
 RUN cd web && bun run generate && bun run build
 
@@ -79,6 +78,10 @@ VOLUME /data
 # Switch to non-root user
 USER msgvault
 WORKDIR /data
+
+# Exercise this runtime before exporting it, without shipping smoke data/scripts.
+RUN --network=none --mount=type=bind,source=scripts/smoke-image.sh,target=/tmp/smoke-image.sh \
+    sh /tmp/smoke-image.sh
 
 # Health check using wget (curl not included to keep image small)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

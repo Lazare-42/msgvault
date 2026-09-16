@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil/dbtest"
 )
 
@@ -275,6 +276,76 @@ func TestDuckDBEngine_SearchFromAddrs(t *testing.T) {
 	for _, msg := range results {
 		assert.Equal(t, "alice@example.com", msg.FromEmail)
 	}
+}
+
+// TestDuckDBEngine_SearchListIDFallback catches the sqlite_scan fallback
+// silently ignoring List-Id predicates before it ranks result rows.
+func TestDuckDBEngine_SearchListIDFallback(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "list-id.db")
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(err, "open SQLite fixture")
+	t.Cleanup(func() { _ = db.Close() })
+
+	schema, err := os.ReadFile("../store/schema.sql")
+	require.NoError(err, "read schema")
+	_, err = db.Exec(string(schema))
+	require.NoError(err, "initialize schema")
+	_, err = db.Exec(`
+		INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'list@example.test');
+		INSERT INTO conversations (id, source_id, source_conversation_id, conversation_type, title)
+			VALUES (1, 1, 'list-thread', 'email_thread', 'List thread');
+		INSERT INTO messages (
+			id, conversation_id, source_id, source_message_id, message_type,
+			sent_at, subject, snippet, size_estimate, has_attachments, attachment_count, list_id
+		) VALUES
+			(1, 1, 1, 'matching', 'email', '2024-04-10 10:00:00', 'shared list announcement', '', 1, 0, 0, '<Announce.Shared.example.org>'),
+			(2, 1, 1, 'announce-only', 'email', '2024-04-11 10:00:00', 'shared list digest', '', 1, 0, 0, '<announce.example.net>'),
+			(3, 1, 1, 'literal', 'email', '2024-04-12 10:00:00', 'literal list marker', '', 1, 0, 0, '<Ops%_Team\Archive.example.org>'),
+			(4, 1, 1, 'unicode', 'email', '2024-04-13 10:00:00', 'unicode list marker', '', 1, 0, 0, '<ÉCOLE.example.org>'),
+			(5, 1, 1, 'missing', 'email', '2024-04-14 10:00:00', 'without list id', '', 1, 0, 0, NULL);`)
+	require.NoError(err, "seed messages")
+
+	engine, err := NewDuckDBEngine("", dbPath, nil)
+	require.NoError(err, "NewDuckDBEngine")
+	t.Cleanup(func() { _ = engine.Close() })
+	if !engine.hasSQLite() {
+		t.Skip("DuckDB sqlite_scanner extension unavailable")
+	}
+
+	assertIDs := func(q *search.Query, want ...int64) {
+		t.Helper()
+		results, err := engine.Search(ctx, q, 100, 0)
+		require.NoError(err, "Search")
+		got := make([]int64, len(results))
+		for i, result := range results {
+			got[i] = result.ID
+		}
+		assert.ElementsMatch(want, got)
+	}
+
+	assertIDs(&search.Query{ListIDs: []string{"ANNOUNCE"}}, 1, 2)
+	assertIDs(&search.Query{ListIDs: []string{"announce", "shared"}}, 1)
+	assertIDs(&search.Query{ListIDs: []string{"ops%_team"}}, 3)
+	assertIDs(&search.Query{ListIDs: []string{"ops%_team\\archive"}}, 3)
+	assertIDs(&search.Query{ListIDs: []string{"école"}}, 4)
+
+	before, err := engine.Search(ctx, &search.Query{TextTerms: []string{"shared"}}, 100, 0)
+	require.NoError(err, "Search before List-Id narrowing")
+	after, err := engine.Search(ctx, &search.Query{TextTerms: []string{"shared"}, ListIDs: []string{"announce"}}, 100, 0)
+	require.NoError(err, "Search after List-Id narrowing")
+	beforeIDs := make([]int64, len(before))
+	afterIDs := make([]int64, len(after))
+	for i, result := range before {
+		beforeIDs[i] = result.ID
+	}
+	for i, result := range after {
+		afterIDs[i] = result.ID
+	}
+	assert.Equal([]int64{2, 1}, beforeIDs)
+	assert.Equal(beforeIDs, afterIDs, "List-Id narrowing preserves DuckDB fallback order")
 }
 
 // TestDuckDBEngine_SQLiteEngineFTSCacheReuse verifies that the FTS availability
@@ -692,6 +763,99 @@ func TestDuckDBEngine_SubAggregateBySenderName(t *testing.T) {
 	}
 }
 
+func TestDuckDBEngine_SubAggregateSourceIDsTakePrecedence(t *testing.T) {
+	b := NewTestDataBuilder(t)
+	sourceOne := b.AddSource("one@example.com")
+	sourceTwo := b.AddSource("two@example.com")
+	aliceID := b.AddParticipant("alice@example.com", "example.com", "Alice")
+	bobID := b.AddParticipant("bob@example.com", "example.com", "Bob")
+
+	messageOne := b.AddMessage(MessageOpt{SourceID: sourceOne, SenderID: &aliceID})
+	b.AddFrom(messageOne, aliceID, "Alice")
+	messageTwo := b.AddMessage(MessageOpt{SourceID: sourceTwo, SenderID: &bobID})
+	b.AddFrom(messageTwo, bobID, "Bob")
+	b.SetEmptyAttachments()
+	engine := b.BuildEngine()
+
+	selectedSource := sourceOne
+	opts := DefaultAggregateOptions()
+	opts.SourceID = &selectedSource
+	opts.SourceIDs = []int64{sourceTwo}
+	results, err := engine.SubAggregate(context.Background(), MessageFilter{}, ViewSenders, opts)
+	require.NoError(t, err, "SubAggregate")
+
+	assertAggregateCounts(t, results, map[string]int64{"bob@example.com": 1})
+}
+
+func TestDuckDBEngine_SubAggregateSourceScopePrecedence(t *testing.T) {
+	b := NewTestDataBuilder(t)
+	sourceOne := b.AddSource("one@example.com")
+	sourceTwo := b.AddSource("two@example.com")
+	senderID := b.AddParticipant("scope-sender@example.com", "example.com", "Scope Sender")
+	messageID := b.AddMessage(MessageOpt{SourceID: sourceTwo, SenderID: &senderID})
+	b.AddFrom(messageID, senderID, "Scope Sender")
+	b.SetEmptyAttachments()
+	engine := b.BuildEngine()
+
+	sourceTwoID := sourceTwo
+	cases := []struct {
+		name   string
+		filter MessageFilter
+		opts   AggregateOptions
+		want   map[string]int64
+	}{
+		{
+			name:   "option multi overrides filter single",
+			filter: MessageFilter{SourceID: &sourceOne, Sender: "scope-sender@example.com"},
+			opts:   AggregateOptions{SourceIDs: []int64{sourceTwo}},
+			want:   map[string]int64{"scope-sender@example.com": 1},
+		},
+		{
+			name:   "option single overrides filter multi",
+			filter: MessageFilter{SourceIDs: []int64{sourceOne}, Sender: "scope-sender@example.com"},
+			opts:   AggregateOptions{SourceID: &sourceTwoID},
+			want:   map[string]int64{"scope-sender@example.com": 1},
+		},
+		{
+			name:   "option single overrides empty filter",
+			filter: MessageFilter{SourceIDs: []int64{}, Sender: "scope-sender@example.com"},
+			opts:   AggregateOptions{SourceID: &sourceTwoID},
+			want:   map[string]int64{"scope-sender@example.com": 1},
+		},
+		{
+			name:   "explicit empty option overrides filter",
+			filter: MessageFilter{SourceID: &sourceTwo, Sender: "scope-sender@example.com"},
+			opts:   AggregateOptions{SourceIDs: []int64{}},
+			want:   map[string]int64{},
+		},
+		{
+			name:   "filter remains when options are nil",
+			filter: MessageFilter{SourceID: &sourceTwo, Sender: "scope-sender@example.com"},
+			opts:   DefaultAggregateOptions(),
+			want:   map[string]int64{"scope-sender@example.com": 1},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			filter := tc.filter
+			opts := DefaultAggregateOptions()
+			opts.SourceID = tc.opts.SourceID
+			opts.SourceIDs = tc.opts.SourceIDs
+			rows, err := engine.SubAggregate(context.Background(), filter, ViewSenders, opts)
+			require.NoError(err, "SubAggregate")
+			assertAggregateCounts(t, rows, tc.want)
+			if tc.filter.SourceID != nil {
+				require.NotNil(filter.SourceID)
+				assert.Equal(*tc.filter.SourceID, *filter.SourceID)
+			}
+			assert.Equal(tc.filter.SourceIDs, filter.SourceIDs)
+		})
+	}
+}
+
 func TestDuckDBEngine_ListMessages_SenderNameFilter(t *testing.T) {
 	engine := newParquetEngine(t)
 	ctx := context.Background()
@@ -828,6 +992,37 @@ func TestDuckDBEngine_RecipientEmailAndName_SameToRow(t *testing.T) {
 	require.NoError(err, "GetDeletionTargetsByFilter same-row")
 	assert.Contains(sameIDs, gmailID,
 		"same-row recipient email+name must still match in GetDeletionTargetsByFilter")
+}
+
+func TestDuckDBEngine_RecipientPhoneFilter(t *testing.T) {
+	require := require.New(t)
+	ctx := context.Background()
+
+	b := NewTestDataBuilder(t)
+	b.AddSource("test@gmail.com")
+	recipient := b.AddPhoneParticipant("+15551234567", "Phone Recipient")
+	messageID := b.AddMessage(MessageOpt{Subject: "Phone recipient", SentAt: makeDate(6, 10), SizeEstimate: 1000})
+	b.AddTo(messageID, recipient, "Phone Recipient")
+	b.SetEmptyAttachments()
+	engine := b.BuildEngine()
+
+	for _, filter := range []MessageFilter{
+		{Recipient: "+15551234567"},
+		{Recipient: "+15551234567", RecipientName: "Phone Recipient"},
+	} {
+		messages, err := engine.SearchFast(ctx, &search.Query{}, filter, 100, 0)
+		require.NoError(err, "SearchFast")
+		assertMessageIDs(t, messages, []int64{messageID})
+
+		count, err := engine.SearchFastCount(ctx, &search.Query{}, filter)
+		require.NoError(err, "SearchFastCount")
+		assert.Equal(t, int64(1), count)
+
+		targets, err := engine.GetDeletionTargetsByFilter(ctx, filter)
+		require.NoError(err, "GetDeletionTargetsByFilter")
+		require.Len(targets, 1)
+		assert.Equal(t, messageID, targets[0].MessageID)
+	}
 }
 
 func TestDuckDBEngine_GetDeletionTargetsByFilter_SenderName(t *testing.T) {
@@ -1157,6 +1352,118 @@ func TestDuckDBEngine_AggregateByTime(t *testing.T) {
 	assertDescendingOrder(t, results)
 }
 
+func TestDuckDBEngine_ListsAggregateAndDrill(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	announce := "<dev_1@example.test>"
+	digest := "<devA1@example.test>"
+	empty := ""
+	builder := NewTestDataBuilder(t)
+	sourceID := builder.AddSource("test@example.com")
+	inbox := builder.AddLabel("INBOX")
+	work := builder.AddLabel("Work")
+
+	first := builder.AddMessage(MessageOpt{SourceID: sourceID, Subject: "First", SizeEstimate: 100, ListID: &announce})
+	announceVariant := "<DEV_1@EXAMPLE.TEST>"
+	second := builder.AddMessage(MessageOpt{SourceID: sourceID, Subject: "Second", SizeEstimate: 200, ListID: &announceVariant})
+	third := builder.AddMessage(MessageOpt{SourceID: sourceID, Subject: "Third", ListID: &digest})
+	fourth := builder.AddMessage(MessageOpt{SourceID: sourceID, Subject: "Empty", ListID: &empty})
+	builder.AddMessage(MessageOpt{SourceID: sourceID, Subject: "Missing"})
+	builder.AddMessageLabel(first, inbox)
+	builder.AddMessageLabel(first, work)
+	builder.AddMessageLabel(second, work)
+	builder.AddMessageLabel(third, inbox)
+	builder.AddMessageLabel(fourth, work)
+	builder.AddAttachment(first, 30, "first.txt")
+	builder.AddAttachment(second, 70, "second.txt")
+
+	engine := builder.BuildEngine()
+	defer func() { _ = engine.Close() }()
+
+	rows, err := engine.Aggregate(context.Background(), ViewLists, DefaultAggregateOptions())
+	require.NoError(err)
+	assertAggregateCounts(t, rows, map[string]int64{announceVariant: 2, digest: 1})
+	announceRow := requireAggregateRow(t, rows, announceVariant)
+	assert.Equal(int64(300), announceRow.TotalSize)
+	assert.Equal(int64(100), announceRow.AttachmentSize)
+	assert.Equal(int64(2), announceRow.AttachmentCount)
+	assert.Equal(int64(2), announceRow.TotalUnique)
+
+	listSearchOpts := DefaultAggregateOptions()
+	listSearchOpts.SearchQuery = "list:dev_1@example.test"
+	filteredRows, err := engine.Aggregate(context.Background(), ViewLists, listSearchOpts)
+	require.NoError(err)
+	assertAggregateCounts(t, filteredRows, map[string]int64{announceVariant: 2})
+
+	filteredLabels, err := engine.SubAggregate(
+		context.Background(),
+		MessageFilter{},
+		ViewLabels,
+		listSearchOpts,
+	)
+	require.NoError(err)
+	assertAggregateCounts(t, filteredLabels, map[string]int64{"INBOX": 1, "Work": 2})
+
+	filteredStats, err := engine.GetTotalStats(context.Background(), StatsOptions{
+		SearchQuery: listSearchOpts.SearchQuery,
+	})
+	require.NoError(err)
+	assert.Equal(int64(2), filteredStats.MessageCount)
+	assert.Equal(int64(300), filteredStats.TotalSize)
+
+	filter := MessageFilter{ListID: "<DEV_1@EXAMPLE.TEST>"}
+	messages, err := engine.ListMessages(context.Background(), filter)
+	require.NoError(err)
+	assert.Len(messages, 2)
+	assert.ElementsMatch([]int64{first, second}, []int64{messages[0].ID, messages[1].ID})
+
+	labels, err := engine.SubAggregate(context.Background(), filter, ViewLabels, DefaultAggregateOptions())
+	require.NoError(err)
+	assertAggregateCounts(t, labels, map[string]int64{"INBOX": 1, "Work": 2})
+
+	q := search.Parse("")
+	fast, err := engine.SearchFast(context.Background(), q, filter, 100, 0)
+	require.NoError(err)
+	require.Len(fast, 2)
+	assert.ElementsMatch([]int64{first, second}, []int64{fast[0].ID, fast[1].ID})
+
+	count, err := engine.SearchFastCount(context.Background(), q, filter)
+	require.NoError(err)
+	assert.Equal(int64(2), count)
+
+	withStats, err := engine.SearchFastWithStats(context.Background(), q, "", filter, ViewLists, 100, 0)
+	require.NoError(err)
+	require.Len(withStats.Messages, 2)
+	assert.ElementsMatch([]int64{first, second}, []int64{withStats.Messages[0].ID, withStats.Messages[1].ID})
+	assert.Equal(int64(2), withStats.TotalCount)
+	require.NotNil(withStats.Stats)
+	assert.Equal(int64(2), withStats.Stats.MessageCount)
+
+	listQuery := search.Parse("list:dev_1@example.test")
+	fast, err = engine.SearchFast(context.Background(), listQuery, MessageFilter{}, 100, 0)
+	require.NoError(err)
+	require.Len(fast, 2)
+	assert.ElementsMatch([]int64{first, second}, []int64{fast[0].ID, fast[1].ID})
+
+	count, err = engine.SearchFastCount(context.Background(), listQuery, MessageFilter{})
+	require.NoError(err)
+	assert.Equal(int64(2), count)
+
+	withStats, err = engine.SearchFastWithStats(
+		context.Background(), listQuery, "list:dev_1@example.test", MessageFilter{}, ViewLists, 100, 0,
+	)
+	require.NoError(err)
+	require.Len(withStats.Messages, 2)
+	assert.ElementsMatch([]int64{first, second}, []int64{withStats.Messages[0].ID, withStats.Messages[1].ID})
+	assert.Equal(int64(2), withStats.TotalCount)
+	require.NotNil(withStats.Stats)
+	assert.Equal(int64(2), withStats.Stats.MessageCount)
+
+	targets, err := deletionTargetSourceMessageIDs(engine.GetDeletionTargetsByFilter(context.Background(), filter))
+	require.NoError(err)
+	assert.ElementsMatch([]string{"msg1", "msg2"}, targets)
+}
+
 // TestDuckDBEngine_SearchFast verifies SearchFast with various query types,
 // filters, and context filters using table-driven subtests.
 func TestDuckDBEngine_SearchFast(t *testing.T) {
@@ -1177,8 +1484,6 @@ func TestDuckDBEngine_SearchFast(t *testing.T) {
 		{"LabelFilter_CaseInsensitive", "label:work", MessageFilter{}, []string{"Hello World", "Question"}},
 		{"LabelFilter_Substring", "label:wor", MessageFilter{}, []string{"Hello World", "Question"}},
 		{"HasAttachment", "has:attachment", MessageFilter{}, []string{"Re: Hello", "Question"}},
-		{"ToFilter_Bob", "to:bob", MessageFilter{}, []string{"Hello World", "Re: Hello", "Follow up"}},
-		{"ToFilter_Carol", "to:carol", MessageFilter{}, []string{"Hello World"}},
 
 		// Context filters (search + MessageFilter)
 		{"ContextFilter_SenderAlice", "Hello", MessageFilter{Sender: "alice@example.com"}, []string{"Hello World", "Re: Hello"}},
@@ -1228,6 +1533,82 @@ func TestDuckDBEngine_SearchFast(t *testing.T) {
 		}
 		assert.True(t, foundFromBob, "expected at least one message from bob@company.org")
 	})
+}
+
+func TestDuckDBEngine_SearchFastRecipientOperatorParity(t *testing.T) {
+	requirements := require.New(t)
+	ctx := t.Context()
+
+	tdb := dbtest.NewTestDB(t, "../store/schema.sql")
+	tdb.SeedStandardDataSet()
+	_, err := tdb.DB.Exec(`
+		INSERT INTO participants (id, email_address, display_name, domain)
+		VALUES (4, 'recipient@example.net', 'Test Recipient', 'example.net');
+		INSERT INTO participants (id, phone_number, display_name)
+		VALUES (5, '+15551234567', 'Phone Recipient');
+		INSERT INTO message_recipients (message_id, participant_id, recipient_type, display_name)
+		VALUES (1, 4, 'to', 'Test Recipient'),
+		       (2, 4, 'cc', 'Test Recipient'),
+		       (3, 4, 'bcc', 'Test Recipient'),
+		       (1, 5, 'to', 'Phone Recipient'),
+		       (2, 5, 'cc', 'Phone Recipient'),
+		       (3, 5, 'bcc', 'Phone Recipient');
+	`)
+	requirements.NoError(err)
+	sqliteEngine := NewSQLiteEngine(tdb.DB)
+
+	builder := buildStandardTestData(t)
+	recipientID := builder.AddParticipant("recipient@example.net", "example.net", "Test Recipient")
+	phoneRecipientID := builder.AddPhoneParticipant("+15551234567", "Phone Recipient")
+	builder.AddTo(1, recipientID, "Test Recipient")
+	builder.AddCc(2, recipientID, "Test Recipient")
+	builder.AddRecipient(3, recipientID, "bcc", "Test Recipient")
+	builder.AddTo(1, phoneRecipientID, "Phone Recipient")
+	builder.AddCc(2, phoneRecipientID, "Phone Recipient")
+	builder.AddRecipient(3, phoneRecipientID, "bcc", "Phone Recipient")
+	duckDBEngine := builder.BuildEngine()
+
+	for _, testCase := range []struct {
+		query string
+		want  []int64
+	}{
+		{query: "to:recipient@example.net", want: []int64{1}},
+		{query: "cc:recipient@example.net", want: []int64{2}},
+		{query: "bcc:recipient@example.net", want: []int64{3}},
+		{query: "to:example.net", want: []int64{1}},
+		{query: "cc:example.net", want: []int64{2}},
+		{query: "bcc:example.net", want: []int64{3}},
+		{query: "to:+15551234567", want: []int64{1}},
+		{query: "cc:+15551234567", want: []int64{2}},
+		{query: "bcc:+15551234567", want: []int64{3}},
+	} {
+		t.Run(testCase.query, func(t *testing.T) {
+			requirements := require.New(t)
+			parsed := search.Parse(testCase.query)
+			sqliteResults, err := sqliteEngine.SearchFast(ctx, parsed, MessageFilter{}, 100, 0)
+			requirements.NoError(err)
+			duckDBResults, err := duckDBEngine.SearchFast(ctx, parsed, MessageFilter{}, 100, 0)
+			requirements.NoError(err)
+			sqliteCount, err := sqliteEngine.SearchFastCount(ctx, parsed, MessageFilter{})
+			requirements.NoError(err)
+			duckDBCount, err := duckDBEngine.SearchFastCount(ctx, parsed, MessageFilter{})
+			requirements.NoError(err)
+			deletionTargets, err := sqliteEngine.GetDeletionTargetsBySearch(
+				ctx, parsed, MessageFilter{}, DeletionSearchFast,
+			)
+			requirements.NoError(err)
+
+			assertMessageIDs(t, sqliteResults, testCase.want)
+			assertMessageIDs(t, duckDBResults, testCase.want)
+			assert.Equal(t, int64(len(testCase.want)), sqliteCount)
+			assert.Equal(t, int64(len(testCase.want)), duckDBCount)
+			deletionIDs := make([]int64, len(deletionTargets))
+			for i, target := range deletionTargets {
+				deletionIDs[i] = target.MessageID
+			}
+			assertSetEqual(t, deletionIDs, testCase.want)
+		})
+	}
 }
 
 func TestDuckDBEngine_SearchFast_MessageTypeFilter(t *testing.T) {
@@ -2045,6 +2426,7 @@ func TestDuckDBEngine_ListMessages_Filters(t *testing.T) {
 func TestDuckDBEngine_GetDeletionTargetsByFilter(t *testing.T) {
 	engine := newParquetEngine(t)
 	ctx := context.Background()
+	conversationID := int64(101)
 
 	tests := []struct {
 		name    string
@@ -2097,6 +2479,16 @@ func TestDuckDBEngine_GetDeletionTargetsByFilter(t *testing.T) {
 			wantIDs: []string{"msg1", "msg4"},
 		},
 		{
+			name:    "conversation=101",
+			filter:  MessageFilter{ConversationID: &conversationID},
+			wantIDs: []string{"msg1", "msg2"},
+		},
+		{
+			name:    "attachments",
+			filter:  MessageFilter{WithAttachmentsOnly: true},
+			wantIDs: []string{"msg2", "msg4"},
+		},
+		{
 			name:    "time_period=2024-01",
 			filter:  MessageFilter{TimeRange: TimeRange{Period: "2024-01", Granularity: TimeMonth}},
 			wantIDs: []string{"msg1", "msg2"},
@@ -2139,6 +2531,140 @@ func TestDuckDBEngine_GetDeletionTargetsByFilter_MessageTypeEmailIncludesLegacy(
 		[]string{fmt.Sprintf("msg%d", typedEmailID), fmt.Sprintf("msg%d", legacyEmailID)},
 		ids,
 	)
+}
+
+func TestDuckDBEngine_GetDeletionTargetsByAggregateSearch(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	builder := buildStandardTestData(t)
+	listID := "<dev@example.test>"
+	builder.messages[0].ListID = &listID
+	builder.messages[1].ListID = &listID
+	analyticsDir, cleanup := builder.Build()
+	t.Cleanup(cleanup)
+	tdb := dbtest.NewTestDB(t, "../store/schema.sql")
+	tdb.SeedStandardDataSet()
+	_, err := tdb.DB.Exec(`UPDATE messages SET list_id = ? WHERE id IN (1, 2)`, listID)
+	requirements.NoError(err)
+	engine, err := NewDuckDBEngine(analyticsDir, "", tdb.DB)
+	requirements.NoError(err)
+	t.Cleanup(func() { _ = engine.Close() })
+
+	filter := MessageFilter{Sender: "alice@example.com", MessageType: messageTypeEmail}
+	rows, err := engine.SubAggregate(t.Context(), MessageFilter{MessageType: messageTypeEmail}, ViewSenders,
+		AggregateOptions{SearchQuery: "Hello"})
+	requirements.NoError(err)
+	requirements.NotEmpty(rows)
+
+	targets, err := engine.GetDeletionTargetsByAggregateSearch(
+		t.Context(), "Hello", filter, ViewSenders, "alice@example.com")
+	requirements.NoError(err)
+	ids, err := deletionTargetSourceMessageIDs(targets, nil)
+	requirements.NoError(err)
+	assertions.ElementsMatch([]string{"msg1", "msg2"}, ids)
+
+	targets, err = engine.GetDeletionTargetsByAggregateSearch(
+		t.Context(), "Hello", MessageFilter{MessageType: messageTypeEmail}, ViewLists, listID)
+	requirements.NoError(err)
+	ids, err = deletionTargetSourceMessageIDs(targets, nil)
+	requirements.NoError(err)
+	assertions.ElementsMatch([]string{"msg1", "msg2"}, ids)
+}
+
+func TestDuckDBEngine_AggregateSearchAndDeletionShareBodyScope(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	builder := buildStandardTestData(t)
+	analyticsDir, cleanup := builder.Build()
+	t.Cleanup(cleanup)
+	tdb := dbtest.NewTestDB(t, "../store/schema.sql")
+	tdb.SeedStandardDataSet()
+	_, err := tdb.DB.Exec(`UPDATE message_bodies SET body_text = 'aggregatebodyneedle' WHERE message_id = 1`)
+	requirements.NoError(err)
+	tdb.EnableFTS()
+	engine, err := NewDuckDBEngine(analyticsDir, "", tdb.DB)
+	requirements.NoError(err)
+	t.Cleanup(func() { _ = engine.Close() })
+
+	filter := MessageFilter{MessageType: messageTypeEmail}
+	rows, err := engine.SubAggregate(t.Context(), filter, ViewSenders,
+		AggregateOptions{SearchQuery: "aggregatebodyneedle"})
+	requirements.NoError(err)
+	requirements.Len(rows, 1)
+	assertions.Equal("alice@example.com", rows[0].Key)
+	assertions.Equal(int64(1), rows[0].Count)
+
+	filter.Sender = rows[0].Key
+	targets, err := engine.GetDeletionTargetsByAggregateSearch(
+		t.Context(), "aggregatebodyneedle", filter, ViewSenders, rows[0].Key)
+	requirements.NoError(err)
+	ids, err := deletionTargetSourceMessageIDs(targets, nil)
+	requirements.NoError(err)
+	assertions.Equal([]string{"msg1"}, ids)
+}
+
+func TestDuckDBEngine_GetDeletionTargetsUseAuthoritativeSQLiteScope(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	builder := buildStandardTestData(t)
+	analyticsDir, cleanup := builder.Build()
+	t.Cleanup(cleanup)
+	tdb := dbtest.NewTestDB(t, "../store/schema.sql")
+	tdb.SeedStandardDataSet()
+	engine, err := NewDuckDBEngine(analyticsDir, "", tdb.DB)
+	requirements.NoError(err)
+	t.Cleanup(func() { _ = engine.Close() })
+
+	_, err = tdb.DB.Exec(`UPDATE messages SET
+		subject = CASE id
+			WHEN 1 THEN 'No longer matches'
+			WHEN 2 THEN 'No longer matches either'
+			WHEN 3 THEN 'Hello from live SQLite'
+			ELSE subject END,
+		has_attachments = CASE id
+			WHEN 1 THEN 1
+			WHEN 2 THEN 0
+			WHEN 4 THEN 0
+			ELSE has_attachments END,
+		deleted_from_source_at = CASE id
+			WHEN 5 THEN '2026-09-03 12:00:00'
+			ELSE deleted_from_source_at END`)
+	requirements.NoError(err)
+	q := search.Parse("Hello")
+	filter := MessageFilter{MessageType: messageTypeEmail}
+
+	visible, err := engine.SearchFast(t.Context(), q, filter, 100, 0)
+	requirements.NoError(err)
+	requirements.Len(visible, 2)
+	assertions.ElementsMatch([]int64{1, 2}, []int64{visible[0].ID, visible[1].ID})
+
+	targets, err := engine.GetDeletionTargetsBySearch(t.Context(), q, filter, DeletionSearchFast)
+	requirements.NoError(err)
+	ids, err := deletionTargetSourceMessageIDs(targets, nil)
+	requirements.NoError(err)
+	assertions.Equal([]string{"msg3"}, ids)
+
+	attachmentFilter := MessageFilter{MessageType: messageTypeEmail, WithAttachmentsOnly: true}
+	visible, err = engine.ListMessages(t.Context(), attachmentFilter)
+	requirements.NoError(err)
+	requirements.Len(visible, 2)
+	assertions.ElementsMatch([]int64{2, 4}, []int64{visible[0].ID, visible[1].ID})
+
+	targets, err = engine.GetDeletionTargetsByFilter(t.Context(), attachmentFilter)
+	requirements.NoError(err)
+	ids, err = deletionTargetSourceMessageIDs(targets, nil)
+	requirements.NoError(err)
+	assertions.Equal([]string{"msg1"}, ids)
+
+	limitedFilter := MessageFilter{
+		MessageType: messageTypeEmail,
+		Pagination:  Pagination{Limit: 1},
+	}
+	targets, err = engine.GetDeletionTargetsByFilter(t.Context(), limitedFilter)
+	requirements.NoError(err)
+	ids, err = deletionTargetSourceMessageIDs(targets, nil)
+	requirements.NoError(err)
+	assertions.Equal([]string{"msg4"}, ids)
 }
 
 // buildEmptyBucketsTestData creates a TestDataBuilder with messages that have
@@ -2487,6 +3013,33 @@ func TestDuckDBEngine_GetDeletionTargetsByFilter_EmptyFilter(t *testing.T) {
 	assertSetEqual(t, ids, []string{"msg1", "msg2", "msg3", "msg4", "msg5"})
 }
 
+func TestDuckDBEngine_GetDeletionTargetsByFilter_EmptyBuckets(t *testing.T) {
+	engine := newEmptyBucketsEngine(t)
+
+	tests := []struct {
+		name string
+		view ViewType
+		want []string
+	}{
+		{name: "sender", view: ViewSenders, want: []string{"msg3"}},
+		{name: "sender name", view: ViewSenderNames, want: []string{"msg3"}},
+		{name: "recipient", view: ViewRecipients, want: []string{"msg4"}},
+		{name: "recipient name", view: ViewRecipientNames, want: []string{"msg4"}},
+		{name: "domain", view: ViewDomains, want: []string{"msg3", "msg6"}},
+		{name: "label", view: ViewLabels, want: []string{"msg5"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ids, err := deletionTargetSourceMessageIDs(engine.GetDeletionTargetsByFilter(
+				context.Background(), MessageFilter{EmptyValueTargets: map[ViewType]bool{tt.view: true}},
+			))
+			require.NoError(t, err)
+			assert.ElementsMatch(t, tt.want, ids)
+		})
+	}
+}
+
 // TestDuckDBEngine_GetDeletionTargetsByFilter_CombinedNoMatch verifies empty results for
 // combined filters that match nothing.
 func TestDuckDBEngine_GetDeletionTargetsByFilter_CombinedNoMatch(t *testing.T) {
@@ -2578,8 +3131,8 @@ func TestBuildWhereClause_SearchOperators(t *testing.T) {
 		},
 		{
 			name:        "to operator",
-			searchQuery: "to:bob",
-			wantClauses: []string{"recipient_type IN ('to', 'cc', 'bcc')", "email_address ILIKE"},
+			searchQuery: "to:recipient@example.net",
+			wantClauses: []string{"recipient_type = ?", "LOWER(p_recipient.email_address) = ?"},
 		},
 		{
 			name:        "subject operator",
@@ -2755,6 +3308,29 @@ func TestAggregateByLabel_WithLabelSearch(t *testing.T) {
 	assert.Len(rows, 1, "expected 1 label row")
 }
 
+func TestDuckDBEngine_AggregateLabelSearchStatsCorrelateFilterAndText(t *testing.T) {
+	b := buildStandardTestData(t)
+	needle := b.AddLabel("Needle")
+	b.AddMessageLabel(1, needle)
+	workNeedle := b.AddLabel("Work Needle")
+	b.AddMessageLabel(2, workNeedle)
+	engine := b.BuildEngine()
+	ctx := context.Background()
+	searchQuery := "label:Work Needle"
+
+	rows, err := engine.Aggregate(ctx, ViewLabels,
+		AggregateOptions{SearchQuery: searchQuery})
+	require.NoError(t, err)
+	assertAggregateCounts(t, rows, map[string]int64{"Work Needle": 1})
+
+	stats, err := engine.GetTotalStats(ctx, StatsOptions{
+		SearchQuery: searchQuery,
+		GroupBy:     ViewLabels,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), stats.MessageCount)
+}
+
 // TestBuildSearchConditions_EscapedWildcards verifies that buildSearchConditions
 // escapes wildcards: ILIKE ESCAPE for TextTerms and operators.
 func TestBuildSearchConditions_EscapedWildcards(t *testing.T) {
@@ -2781,14 +3357,6 @@ func TestBuildSearchConditions_EscapedWildcards(t *testing.T) {
 			},
 			wantClauses: []string{"p.email_address ILIKE", "ESCAPE"},
 			wantInArgs:  []string{"test\\_user\\%"},
-		},
-		{
-			name: "to: with wildcards",
-			query: &search.Query{
-				ToAddrs: []string{"bob_smith%"},
-			},
-			wantClauses: []string{"email_address ILIKE", "ESCAPE"},
-			wantInArgs:  []string{"bob\\_smith\\%"},
 		},
 		{
 			name: "subject: with wildcards",
@@ -2823,6 +3391,53 @@ func TestBuildSearchConditions_EscapedWildcards(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDuckDBEngine_SearchFastConversationIDFilter(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	engine := buildStandardTestData(t).BuildEngine()
+
+	results, err := engine.SearchFast(context.Background(), &search.Query{
+		ConversationIDs: []int64{101, 104},
+	}, MessageFilter{}, 100, 0)
+	require.NoError(err, "SearchFast")
+	require.Len(results, 3, "messages in conversations 101 and 104")
+	for _, result := range results {
+		assert.Contains([]int64{101, 104}, result.ConversationID,
+			"result conversation ID")
+	}
+
+	conversationID := int64(103)
+	results, err = engine.SearchFast(context.Background(), &search.Query{}, MessageFilter{
+		ConversationID: &conversationID,
+	}, 100, 0)
+	require.NoError(err, "SearchFast drill-down")
+	require.Len(results, 1, "message in drill-down conversation")
+	assert.Equal(conversationID, results[0].ConversationID,
+		"drill-down result conversation ID")
+}
+
+func TestDuckDBEngine_ConversationIDFilterScopesAggregatesAndStats(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	engine := buildStandardTestData(t).BuildEngine()
+	ctx := context.Background()
+	const query = "conversation_id:101"
+
+	opts := DefaultAggregateOptions()
+	opts.SearchQuery = query
+	rows, err := engine.Aggregate(ctx, ViewSenders, opts)
+	require.NoError(err, "Aggregate")
+	var aggregateCount int64
+	for _, row := range rows {
+		aggregateCount += row.Count
+	}
+	assert.Equal(int64(2), aggregateCount, "aggregate message count")
+
+	stats, err := engine.GetTotalStats(ctx, StatsOptions{SearchQuery: query})
+	require.NoError(err, "GetTotalStats")
+	assert.Equal(int64(2), stats.MessageCount, "stats message count")
 }
 
 // TestBuildSearchConditions_UsesILIKENotRegex verifies that the fast search
@@ -2928,8 +3543,8 @@ func TestDuckDBEngine_AggregateByRecipientName_EmptyStringFallback(t *testing.T)
 	// Build Parquet data with empty-string and whitespace display_names on recipients
 	engine := createEngineFromBuilder(t, newParquetBuilder(t).
 		addTable("messages", "messages/year=2024", "data.parquet", messagesCols, `
-			(1::BIGINT, 1::BIGINT, 'msg1', 100::BIGINT, 'Hello', 'Snippet', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, 0, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', false, 2024, 1),
-			(2::BIGINT, 1::BIGINT, 'msg2', 101::BIGINT, 'World', 'Snippet', TIMESTAMP '2024-01-16 10:00:00', 1000::BIGINT, false, 0, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', false, 2024, 1)
+			(1::BIGINT, 1::BIGINT, 'msg1', 100::BIGINT, 'Hello', 'Snippet', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, 0, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', NULL::VARCHAR, false, 2024, 1),
+			(2::BIGINT, 1::BIGINT, 'msg2', 101::BIGINT, 'World', 'Snippet', TIMESTAMP '2024-01-16 10:00:00', 1000::BIGINT, false, 0, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', NULL::VARCHAR, false, 2024, 1)
 		`).
 		addTable("sources", "sources", "sources.parquet", sourcesCols, `
 			(1::BIGINT, 'test@gmail.com', 'gmail')
@@ -2976,8 +3591,8 @@ func TestDuckDBEngine_ListMessages_MatchEmptyRecipientName(t *testing.T) {
 	// Build Parquet data with a message that has no recipients
 	engine := createEngineFromBuilder(t, newParquetBuilder(t).
 		addTable("messages", "messages/year=2024", "data.parquet", messagesCols, `
-			(1::BIGINT, 1::BIGINT, 'msg1', 100::BIGINT, 'Has Recipient', 'Snippet', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, 0, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', false, 2024, 1),
-			(2::BIGINT, 1::BIGINT, 'msg2', 101::BIGINT, 'No Recipient', 'Snippet', TIMESTAMP '2024-01-16 10:00:00', 1000::BIGINT, false, 0, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', false, 2024, 1)
+			(1::BIGINT, 1::BIGINT, 'msg1', 100::BIGINT, 'Has Recipient', 'Snippet', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, 0, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', NULL::VARCHAR, false, 2024, 1),
+			(2::BIGINT, 1::BIGINT, 'msg2', 101::BIGINT, 'No Recipient', 'Snippet', TIMESTAMP '2024-01-16 10:00:00', 1000::BIGINT, false, 0, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', NULL::VARCHAR, false, 2024, 1)
 		`).
 		addTable("sources", "sources", "sources.parquet", sourcesCols, `
 			(1::BIGINT, 'test@gmail.com', 'gmail')
@@ -3016,14 +3631,15 @@ func TestDuckDBEngine_GetTotalStats_GroupByRecipients(t *testing.T) {
 	}
 	engine := newParquetEngine(t)
 
-	// Search "bob" with GroupBy=ViewRecipients should search recipient key columns.
-	// Bob is a recipient (to) on msgs 1,2,3 — searching "bob" should match those.
+	// Search "bob" with GroupBy=ViewRecipients should search message metadata and
+	// recipient key columns. Bob is the recipient on msgs 1,2,3 and the sender on
+	// msgs 4,5, so all five messages match the displayed aggregate scope.
 	stats, err := engine.GetTotalStats(context.Background(), StatsOptions{
 		SearchQuery: "bob",
 		GroupBy:     ViewRecipients,
 	})
 	require.NoError(t, err, "GetTotalStats")
-	assert.Equal(t, int64(3), stats.MessageCount, "recipient search 'bob'")
+	assert.Equal(t, int64(5), stats.MessageCount, "recipient search 'bob'")
 }
 
 func TestDuckDBEngine_GetTotalStats_GroupByLabels(t *testing.T) {
@@ -3055,6 +3671,111 @@ func TestDuckDBEngine_GetTotalStats_GroupByDefault(t *testing.T) {
 	})
 	require.NoError(t, err, "GetTotalStats")
 	assert.Equal(t, int64(3), stats.MessageCount, "sender search 'alice'")
+}
+
+func TestDuckDBEngine_GetTotalStats_GroupedSearchMatchesVisibleRows(t *testing.T) {
+	tests := []struct {
+		name             string
+		query            string
+		groupBy          ViewType
+		wantRow          string
+		wantRowCount     int64
+		wantMessageCount int64
+	}{
+		{
+			name:             "recipient view subject match",
+			query:            "follow",
+			groupBy:          ViewRecipients,
+			wantRow:          "bob@company.org",
+			wantRowCount:     1,
+			wantMessageCount: 1,
+		},
+		{
+			name:             "label view sender match",
+			query:            "alice",
+			groupBy:          ViewLabels,
+			wantRow:          "INBOX",
+			wantRowCount:     3,
+			wantMessageCount: 3,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			engine := newParquetEngine(t)
+			ctx := context.Background()
+			opts := DefaultAggregateOptions()
+			opts.SearchQuery = tc.query
+
+			rows, err := engine.Aggregate(ctx, tc.groupBy, opts)
+			require.NoError(err, "Aggregate")
+			assert.Equal(tc.wantRowCount, requireAggregateRow(t, rows, tc.wantRow).Count)
+
+			stats, err := engine.GetTotalStats(ctx, StatsOptions{
+				SearchQuery: tc.query,
+				GroupBy:     tc.groupBy,
+			})
+			require.NoError(err, "GetTotalStats")
+			assert.Equal(tc.wantMessageCount, stats.MessageCount)
+		})
+	}
+}
+
+func TestDuckDBEngine_GetTotalStats_NameGroupSearchMatchesVisibleRows(t *testing.T) {
+	b := NewTestDataBuilder(t)
+	b.AddSource("test@gmail.com")
+	listSender := b.AddParticipant("list@example.org", "example.org", "List Sender")
+	phoneRecipient := b.AddPhoneParticipant("+15551234567", "")
+
+	senderNameMessage := b.AddMessage(MessageOpt{Subject: "Sender name", SizeEstimate: 1000})
+	b.AddFrom(senderNameMessage, listSender, "Alice via List")
+	recipientNameMessage := b.AddMessage(MessageOpt{Subject: "Recipient name", SizeEstimate: 2000})
+	b.AddTo(recipientNameMessage, phoneRecipient, "")
+	b.SetEmptyAttachments()
+	engine := b.BuildEngine()
+
+	tests := []struct {
+		name    string
+		query   string
+		groupBy ViewType
+		wantRow string
+	}{
+		{
+			name:    "sender per-message display name",
+			query:   "Alice via List",
+			groupBy: ViewSenderNames,
+			wantRow: "Alice via List",
+		},
+		{
+			name:    "recipient phone fallback",
+			query:   "+15551234567",
+			groupBy: ViewRecipientNames,
+			wantRow: "+15551234567",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			ctx := context.Background()
+			opts := DefaultAggregateOptions()
+			opts.SearchQuery = tc.query
+
+			rows, err := engine.Aggregate(ctx, tc.groupBy, opts)
+			require.NoError(err, "Aggregate")
+			assert.Equal(int64(1), requireAggregateRow(t, rows, tc.wantRow).Count)
+
+			stats, err := engine.GetTotalStats(ctx, StatsOptions{
+				SearchQuery: tc.query,
+				GroupBy:     tc.groupBy,
+			})
+			require.NoError(err, "GetTotalStats")
+			assert.Equal(int64(1), stats.MessageCount)
+		})
+	}
 }
 
 // TestBuildStatsSearchConditions_PlaceholderArgCount is a regression test for
@@ -3604,8 +4325,8 @@ func TestDuckDBEngine_VARCHARParquetColumns(t *testing.T) {
 	// string, to reproduce type mismatches in COALESCE, JOINs, and TRY_CAST paths.
 	engine := createEngineFromBuilder(t, newParquetBuilder(t).
 		addTable("messages", "messages/year=2024", "data.parquet", messagesCols, `
-			(1::BIGINT, 1::BIGINT, 'msg1', '100', 'Hello World', 'snippet1', TIMESTAMP '2024-01-15 10:00:00', '1000', '0', '0', NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', false, 2024, 1),
-			(2::BIGINT, 1::BIGINT, 'msg2', '101', 'Goodbye', 'snippet2', TIMESTAMP '2024-01-16 10:00:00', '2000', '1', '0', NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', false, 2024, 1)
+			(1::BIGINT, 1::BIGINT, 'msg1', '100', 'Hello World', 'snippet1', TIMESTAMP '2024-01-15 10:00:00', '1000', '0', '0', NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', NULL::VARCHAR, false, 2024, 1),
+			(2::BIGINT, 1::BIGINT, 'msg2', '101', 'Goodbye', 'snippet2', TIMESTAMP '2024-01-16 10:00:00', '2000', '1', '0', NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', NULL::VARCHAR, false, 2024, 1)
 		`).
 		addTable("sources", "sources", "sources.parquet", sourcesCols, `
 			(1::BIGINT, 'test@gmail.com', 'gmail')
@@ -3956,8 +4677,8 @@ func TestDuckDBEngine_StaleParquetSchema(t *testing.T) {
 
 	pb := newParquetBuilder(t).
 		addTable("messages", "messages/year=2024", "data.parquet", messagesCols, `
-			(1::BIGINT, 1::BIGINT, 'msg1', 100::BIGINT, 'Stale Hello', 'snip1', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', false, 2024, 1),
-			(2::BIGINT, 1::BIGINT, 'msg2', 101::BIGINT, 'Stale Goodbye', 'snip2', TIMESTAMP '2024-01-16 10:00:00', 2000::BIGINT, true, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', false, 2024, 1)
+			(1::BIGINT, 1::BIGINT, 'msg1', 100::BIGINT, 'Stale Hello', 'snip1', TIMESTAMP '2024-01-15 10:00:00', 1000::BIGINT, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', NULL::VARCHAR, false, 2024, 1),
+			(2::BIGINT, 1::BIGINT, 'msg2', 101::BIGINT, 'Stale Goodbye', 'snip2', TIMESTAMP '2024-01-16 10:00:00', 2000::BIGINT, true, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', NULL::VARCHAR, false, 2024, 1)
 		`).
 		addTable("sources", "sources", "sources.parquet", sourcesCols, `
 			(1::BIGINT, 'test@gmail.com', 'gmail')
@@ -4097,6 +4818,27 @@ func TestDuckDBEngine_GetDeletionTargetsByMessageIDs(t *testing.T) {
 		assert.Equal("test@gmail.com", targets[0].SourceIdentifier)
 		assert.Equal("msg1", targets[0].SourceMessageID)
 	}
+}
+
+func TestDuckDBEngine_GetDeletionTargetsByMessageIDsExcludesNonEmailAndEmptyProviderID(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	b := NewTestDataBuilder(t)
+	b.AddSource("test@example.com")
+	typedEmailID := b.AddMessage(MessageOpt{Subject: "typed email", MessageType: "email"})
+	legacyEmailID := b.AddMessage(MessageOpt{Subject: "legacy email", LegacyEmptyMessageType: true})
+	chatID := b.AddMessage(MessageOpt{Subject: "Google Chat", MessageType: store.MessageTypeGoogleChat})
+	emptyProviderID := b.AddMessage(MessageOpt{Subject: "missing provider ID"})
+	b.messages[len(b.messages)-1].SourceMessageID = ""
+	engine := b.BuildEngine()
+
+	targets, err := engine.GetDeletionTargetsByMessageIDs(context.Background(), []int64{typedEmailID, legacyEmailID, chatID, emptyProviderID})
+
+	require.NoError(err)
+	ids, err := deletionTargetSourceMessageIDs(targets, nil)
+	require.NoError(err)
+	assert.ElementsMatch([]string{fmt.Sprintf("msg%d", typedEmailID), fmt.Sprintf("msg%d", legacyEmailID)}, ids,
+		"Gmail Chat and provider-ID-less messages must be dropped")
 }
 
 func TestDuckDBEngine_GetDeletionTargetsByMessageIDs_ChunkedLargeSelection(t *testing.T) {

@@ -1,8 +1,12 @@
 package store_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -18,25 +22,49 @@ import (
 func inferenceTestProfile(t *testing.T) peoplesweep.ProviderProfile {
 	t.Helper()
 	config := peoplesweep.Config{
-		Enabled: true,
-		Provider: peoplesweep.ProviderConfig{
-			Kind:             peoplesweep.ProviderOpenAICompatible,
-			Endpoint:         "https://api.example.test/v1",
-			Model:            "gpt-test",
-			APIKeyEnv:        "TEST_KEY",
-			RetentionPosture: "zero_retention",
-			TrainingPosture:  "no_training",
+		Enabled:  true,
+		Provider: peoplesweep.ProviderSelection{Name: "default"},
+		Providers: map[string]peoplesweep.ProviderConfig{"default": {
+			Protocol:            peoplesweep.ProtocolOpenAIChat,
+			Endpoint:            "https://api.example.test/v1",
+			Model:               "gpt-test",
+			Auth:                peoplesweep.AuthBearer,
+			Credential:          peoplesweep.CredentialEnv,
+			CredentialEnv:       "TEST_KEY",
+			OutputMode:          peoplesweep.OutputModeNativeJSONSchema,
+			TokenLimitParameter: "max_completion_tokens",
+			RetentionPosture:    "zero_retention",
+			TrainingPosture:     "no_training",
 			AllowedSources: []peoplesweep.SourceClass{
 				peoplesweep.SourceConversationText,
 			},
 			SourceSince:    "2025-01-01",
 			RequestTimeout: time.Minute,
-		},
+		}},
 	}
 	config.ApplyDefaults()
 	profile, err := config.Profile()
 	require.NoError(t, err)
 	return profile
+}
+
+func TestPersonInferenceProfileNormalizesNullAndEmptySourceUntil(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	st := testutil.NewTestStore(t)
+	profile := inferenceTestProfile(t)
+	_, err := st.EnsurePersonInferenceProfile(t.Context(), profile)
+	require.NoError(err)
+
+	_, err = st.DB().Exec(st.Rebind(`
+		UPDATE person_inference_profiles SET source_until = '' WHERE fingerprint = ?`),
+		profile.Fingerprint)
+	require.NoError(err)
+
+	profiles, err := st.ListPersonInferenceProfiles(t.Context())
+	require.NoError(err)
+	require.Len(profiles, 1)
+	assert.Equal(profile.Fingerprint, profiles[0].Fingerprint)
 }
 
 func TestPersonInferenceConsentLifecycle(t *testing.T) {
@@ -178,17 +206,96 @@ func TestPersonInferenceProfilesCanBeListedAndRevokedWithoutRuntimeConfig(t *tes
 	assert.False(active)
 }
 
+func TestPersonInferenceProfilesCanBeListedAfterProgramChange(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	st := testutil.NewTestStore(t)
+	current := inferenceTestProfile(t)
+	_, err := st.EnsurePersonInferenceProfile(t.Context(), current)
+	require.NoError(err)
+	require.NoError(st.RecordPersonInferenceCheck(t.Context(), store.PersonInferenceCheck{
+		ProfileFingerprint: current.Fingerprint, CheckedAt: time.Now().UTC(),
+		DriverVersion: current.DriverVersion, OutputMode: current.OutputMode,
+		ModelVersion: "test-model-v1",
+	}))
+	_, _, err = st.GrantPersonInferenceConsent(t.Context(), current.Fingerprint, "cli")
+	require.NoError(err)
+	historical := current
+	historical.ProgramFingerprint = strings.Repeat("b", len(current.ProgramFingerprint))
+	historical.PolicyJSON = bytes.Replace(
+		current.PolicyJSON, []byte(current.ProgramFingerprint), []byte(historical.ProgramFingerprint), 1)
+	digest := sha256.Sum256(historical.PolicyJSON)
+	historical.Fingerprint = hex.EncodeToString(digest[:])
+	_, err = st.DB().Exec(st.Rebind(`
+		DELETE FROM person_inference_checks WHERE profile_fingerprint = ?`), current.Fingerprint)
+	require.NoError(err)
+	_, err = st.DB().Exec(st.Rebind(`
+		DELETE FROM person_inference_consents WHERE profile_fingerprint = ?`), current.Fingerprint)
+	require.NoError(err)
+	_, err = st.DB().Exec(st.Rebind(`
+		UPDATE person_inference_profiles
+		SET fingerprint = ?, program_fingerprint = ?, policy_json = ?
+		WHERE fingerprint = ?`),
+		historical.Fingerprint, historical.ProgramFingerprint, string(historical.PolicyJSON), current.Fingerprint)
+	require.NoError(err)
+	_, err = st.DB().Exec(st.Rebind(`
+		INSERT INTO person_inference_checks
+			(profile_fingerprint, checked_at, driver_version, output_mode, model_version)
+		VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?)`), historical.Fingerprint,
+		historical.DriverVersion, historical.OutputMode, "test-model-v1")
+	require.NoError(err)
+	_, err = st.DB().Exec(st.Rebind(`
+		INSERT INTO person_inference_consents (profile_fingerprint, granted_by)
+		VALUES (?, ?)`), historical.Fingerprint, "cli")
+	require.NoError(err)
+
+	profiles, err := st.ListPersonInferenceProfiles(t.Context())
+	require.NoError(err)
+	require.Len(profiles, 1)
+	assert.Equal(historical.Fingerprint, profiles[0].Fingerprint)
+	assert.Equal(historical.ProgramFingerprint, profiles[0].ProgramFingerprint)
+	assert.Equal(historical.DisclosedPacketFields, profiles[0].DisclosedPacketFields)
+	assert.JSONEq(string(historical.PolicyJSON), string(profiles[0].PolicyJSON))
+	check, err := st.GetPersonInferenceCheck(t.Context(), historical.Fingerprint)
+	require.NoError(err)
+	require.NotNil(check)
+	consent, err := st.GetPersonInferenceConsentStatus(t.Context(), historical.Fingerprint)
+	require.NoError(err)
+	assert.True(consent.Active)
+}
+
+func TestPersonInferenceProfilesRejectChangedIndexedProjection(t *testing.T) {
+	require := require.New(t)
+	st := testutil.NewTestStore(t)
+	profile := inferenceTestProfile(t)
+	_, err := st.EnsurePersonInferenceProfile(t.Context(), profile)
+	require.NoError(err)
+	_, err = st.DB().Exec(st.Rebind(`
+		UPDATE person_inference_profiles SET model = ? WHERE fingerprint = ?`),
+		"changed-model", profile.Fingerprint)
+	require.NoError(err)
+
+	_, err = st.ListPersonInferenceProfiles(t.Context())
+	require.ErrorContains(err, "does not match its immutable policy")
+}
+
 func TestPersonInferenceProfilesRestoreCodexPolicyFields(t *testing.T) {
 	requirements := require.New(t)
 	checks := assert.New(t)
 	st := testutil.NewTestStore(t)
-	config := peoplesweep.Config{Enabled: true, Provider: peoplesweep.ProviderConfig{
-		Kind: peoplesweep.ProviderCodexAppServer, Model: "gpt-test",
-		ReasoningEffort: "high", ExecutionBoundary: peoplesweep.CodexExecutionBoundaryV1,
-		RetentionPosture: "zero_retention", TrainingPosture: "no_training",
-		AllowedSources: []peoplesweep.SourceClass{peoplesweep.SourceConversationText},
-		SourceSince:    "2025-01-01", RequestTimeout: time.Minute,
-	}}
+	config := peoplesweep.Config{
+		Enabled:  true,
+		Provider: peoplesweep.ProviderSelection{Name: "codex"},
+		Providers: map[string]peoplesweep.ProviderConfig{"codex": {
+			Protocol: peoplesweep.ProtocolCodexAppServer, Model: "gpt-test",
+			Auth: peoplesweep.AuthNone, Credential: peoplesweep.CredentialNone,
+			OutputMode:      peoplesweep.OutputModeNativeJSONSchema,
+			ReasoningEffort: "high", ExecutionBoundary: peoplesweep.CodexExecutionBoundaryV1,
+			RetentionPosture: "zero_retention", TrainingPosture: "no_training",
+			AllowedSources: []peoplesweep.SourceClass{peoplesweep.SourceConversationText},
+			SourceSince:    "2025-01-01", RequestTimeout: time.Minute,
+		}},
+	}
 	config.ApplyDefaults()
 	profile, err := config.Profile()
 	requirements.NoError(err)

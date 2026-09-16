@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -41,6 +42,33 @@ func TestRunBuildCacheSubprocessCommandStreamsStderrOnSuccess(t *testing.T) {
 	assert.Equal(t, "cache build warning\n", stderr.String())
 }
 
+func TestBuildCacheAcceptsSQLiteFileURI(t *testing.T) {
+	tmpDir := setupTestSQLite(t)
+	dbPath := filepath.Join(tmpDir, "test.db")
+	dbURI := (&url.URL{Scheme: "file", Path: filepath.ToSlash(dbPath)}).String()
+
+	result, err := buildCache(dbURI, filepath.Join(tmpDir, "analytics"), true)
+
+	require.NoError(t, err, "buildCache with file URI")
+	assert.NotNil(t, result)
+}
+
+// TestBuildCacheLockedAcceptsSQLiteFileURI guards the callers that hold the
+// build lock themselves (repair-dates, repair-encoding, remove-account) and
+// pass the configured DSN straight to buildCacheLocked.
+func TestBuildCacheLockedAcceptsSQLiteFileURI(t *testing.T) {
+	tmpDir := setupTestSQLite(t)
+	dbPath := filepath.Join(tmpDir, "test.db")
+	dbURI := (&url.URL{Scheme: "file", Path: filepath.ToSlash(dbPath)}).String()
+
+	result, err := buildCacheLocked(
+		dbURI, filepath.Join(tmpDir, "analytics"), true, false, acquirePublishLock,
+	)
+
+	require.NoError(t, err, "buildCacheLocked with file URI")
+	assert.NotNil(t, result)
+}
+
 // setupTestSQLite creates a test SQLite database with realistic email data.
 func setupTestSQLite(t *testing.T) string {
 	t.Helper()
@@ -65,6 +93,7 @@ func setupTestSQLite(t *testing.T) string {
 			id INTEGER PRIMARY KEY,
 			source_id INTEGER NOT NULL REFERENCES sources(id),
 			source_message_id TEXT NOT NULL,
+			rfc822_message_id TEXT,
 			conversation_id INTEGER,
 			subject TEXT,
 			snippet TEXT,
@@ -74,6 +103,7 @@ func setupTestSQLite(t *testing.T) string {
 			has_attachments BOOLEAN DEFAULT FALSE,
 			attachment_count INTEGER DEFAULT 0,
 			deleted_from_source_at TIMESTAMP,
+			list_id TEXT,
 			sender_id INTEGER,
 			message_type TEXT NOT NULL DEFAULT 'email',
 			is_from_me BOOLEAN DEFAULT FALSE,
@@ -977,41 +1007,135 @@ func TestBuildCache_PublishesConversationParticipants(t *testing.T) {
 	assert.Equal(t, int64(9), count)
 }
 
-// TestBuildCache_ExportsRecipientEnvelopeAddress verifies the envelope
-// address snapshot reaches the message_recipients Parquet dataset (cache
-// schema v17): identity filters compare against it, so an export that drops
-// the column would silently degrade every filter to participant matching.
+// TestBuildCache_ExportsRecipientEnvelopeAddress verifies both address
+// columns of the message_recipients Parquet dataset (cache schema v26).
+// envelope_address is the header address exactly as the store recorded it and
+// stays NULL for rows that never recorded one: identity filters compare
+// against it, so an export that drops the column would silently degrade every
+// filter to participant matching, and one that coerces absence to an empty
+// string would make "no address recorded" indistinguishable from a recorded
+// but empty value. email_address is the resolved address, so a row without a
+// header address still carries its participant's current address and ad-hoc
+// address filters find pre-upgrade mail.
+// Both snapshot readers are covered because they build the address columns
+// from separate SQL: the sqlite_scanner path resolves them inside the Parquet
+// COPY and the CSV fallback carries the raw column through the \N null
+// sentinel first.
 func TestBuildCache_ExportsRecipientEnvelopeAddress(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	tmpDir := setupTestSQLite(t)
-	dbPath := filepath.Join(tmpDir, "test.db")
-	analyticsDir := filepath.Join(tmpDir, "analytics")
+	for _, tc := range []struct {
+		name     string
+		forceCSV bool
+	}{
+		{name: "sqlite scanner"},
+		{name: "CSV snapshot", forceCSV: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			if tc.forceCSV {
+				t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", "1")
+			}
+			tmpDir := setupTestSQLite(t)
+			dbPath := filepath.Join(tmpDir, "test.db")
+			analyticsDir := filepath.Join(tmpDir, "analytics")
 
-	_, err := buildCache(dbPath, analyticsDir, false)
-	require.NoError(err)
+			_, err := buildCache(dbPath, analyticsDir, false)
+			require.NoError(err)
 
-	duckdb, err := sql.Open("duckdb", "")
-	require.NoError(err)
-	defer func() { _ = duckdb.Close() }()
-	glob := filepath.Join(analyticsDir, "message_recipients", "*.parquet")
+			duckdb, err := sql.Open("duckdb", "")
+			require.NoError(err)
+			defer func() { _ = duckdb.Close() }()
+			glob := filepath.Join(analyticsDir, "message_recipients", "*.parquet")
 
-	var envelope string
-	err = duckdb.QueryRow(
-		`SELECT email_address FROM read_parquet(?)
-		 WHERE message_id = 1 AND recipient_type = 'from'`, glob,
-	).Scan(&envelope)
-	require.NoError(err, "exported message_recipients must carry email_address")
-	assert.Equal("alice-envelope@example.com", envelope)
+			var envelope, resolved string
+			err = duckdb.QueryRow(
+				`SELECT envelope_address, email_address FROM read_parquet(?)
+				 WHERE message_id = 1 AND recipient_type = 'from'`, glob,
+			).Scan(&envelope, &resolved)
+			require.NoError(err, "exported message_recipients must carry both address columns")
+			assert.Equal("alice-envelope@example.com", envelope)
+			assert.Equal("alice-envelope@example.com", resolved,
+				"a recorded header address is also the resolved address")
 
-	var withoutSnapshot int64
-	err = duckdb.QueryRow(
-		`SELECT COUNT(*) FROM read_parquet(?)
-		 WHERE COALESCE(email_address, '') = ''`, glob,
-	).Scan(&withoutSnapshot)
-	require.NoError(err)
-	assert.Equal(int64(11), withoutSnapshot,
-		"rows without a snapshot export as empty, keeping the participant fallback")
+			var withoutSnapshot int64
+			err = duckdb.QueryRow(
+				`SELECT COUNT(*) FROM read_parquet(?)
+				 WHERE envelope_address IS NULL`, glob,
+			).Scan(&withoutSnapshot)
+			require.NoError(err)
+			assert.Equal(int64(11), withoutSnapshot,
+				"rows without a snapshot export a NULL envelope so readers can tell absence from an empty value")
+
+			// Message 4's from row recorded no header address, so it resolves
+			// to the sending participant's current address.
+			var resolvedFallback string
+			err = duckdb.QueryRow(
+				`SELECT email_address FROM read_parquet(?)
+				 WHERE message_id = 4 AND recipient_type = 'from'`, glob,
+			).Scan(&resolvedFallback)
+			require.NoError(err)
+			assert.Equal("bob@company.org", resolvedFallback,
+				"a row without a header address resolves to its participant's address")
+
+			var unresolved int64
+			err = duckdb.QueryRow(
+				`SELECT COUNT(*) FROM read_parquet(?)
+				 WHERE email_address IS NULL`, glob,
+			).Scan(&unresolved)
+			require.NoError(err)
+			assert.Equal(int64(0), unresolved,
+				"every fixture participant carries an email address, so every row resolves")
+
+			var emptyString int64
+			err = duckdb.QueryRow(
+				`SELECT COUNT(*) FROM read_parquet(?)
+				 WHERE envelope_address = '' OR email_address = ''`, glob,
+			).Scan(&emptyString)
+			require.NoError(err)
+			assert.Equal(int64(0), emptyString, "no row exports an empty-string address")
+		})
+	}
+}
+
+// TestBuildCache_ExportsListID proves the cache retains the scalar List-Id
+// value exactly as SQLite stored it, including its RFC-style brackets.
+func TestBuildCache_ExportsListID(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		forceCSV bool
+	}{
+		{name: "sqlite scanner"},
+		{name: "CSV snapshot", forceCSV: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			if tc.forceCSV {
+				t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", "1")
+			}
+			tmpDir := setupTestSQLite(t)
+			dbPath := filepath.Join(tmpDir, "test.db")
+			analyticsDir := filepath.Join(tmpDir, "analytics")
+
+			db, err := sql.Open("sqlite3", dbPath)
+			require.NoError(err)
+			_, err = db.Exec(`UPDATE messages SET list_id = '<announce.example.test>' WHERE id = 1`)
+			require.NoError(err)
+			require.NoError(db.Close())
+
+			_, err = buildCache(dbPath, analyticsDir, false)
+			require.NoError(err)
+
+			duckdb, err := sql.Open("duckdb", "")
+			require.NoError(err)
+			defer func() { _ = duckdb.Close() }()
+			var listID string
+			err = duckdb.QueryRow(`SELECT list_id FROM read_parquet(?) WHERE id = 1`,
+				filepath.Join(analyticsDir, "messages", "**", "*.parquet")).Scan(&listID)
+			require.NoError(err)
+			assert.Equal("<announce.example.test>", listID)
+		})
+	}
 }
 
 // TestBuildCache_DataIntegrity verifies the exported Parquet data matches SQLite.
@@ -2159,6 +2283,75 @@ func TestBuildCache_UTF8Handling(t *testing.T) {
 	assert.Equal("Test émoji 🎉 and unicode", subject, "unicode should be preserved")
 }
 
+func TestBuildCacheCSVInvalidUTF8ExplainsRepairPath(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", "1")
+	tmpDir := setupTestSQLite(t)
+	dbPath := filepath.Join(tmpDir, "test.db")
+
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(err)
+	_, err = db.Exec(`UPDATE attachments SET filename = CAST(X'80' AS TEXT) WHERE id = 1`)
+	require.NoError(err)
+	require.NoError(db.Close())
+
+	_, err = buildCache(dbPath, filepath.Join(tmpDir, "analytics"), true)
+	require.Error(err)
+	assert.Contains(err.Error(), "msgvault repair-encoding")
+	assert.Contains(err.Error(), "not a msgvault option")
+}
+
+func TestBuildCacheCSVInvalidUTF8InUnrepairedFieldScopesGuidance(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", "1")
+	tmpDir := setupTestSQLite(t)
+	dbPath := filepath.Join(tmpDir, "test.db")
+
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(err)
+	_, err = db.Exec(`UPDATE messages SET source_message_id = CAST(X'80' AS TEXT) WHERE id = 1`)
+	require.NoError(err)
+	require.NoError(db.Close())
+
+	_, err = buildCache(dbPath, filepath.Join(tmpDir, "analytics"), true)
+	require.Error(err)
+	assert.Contains(err.Error(), "msgvault repair-encoding")
+	assert.Contains(err.Error(), "common archived text fields")
+	assert.Contains(err.Error(), "if the cache rebuild still fails")
+	assert.Contains(err.Error(), "messages")
+}
+
+// TestBuildCacheCSVInvalidUTF8PastSampleExplainsRepairPath covers the case
+// where DuckDB's CSV sniffer does not reach the invalid row, so the error
+// surfaces during the Parquet export instead of view creation.
+func TestBuildCacheCSVInvalidUTF8PastSampleExplainsRepairPath(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", "1")
+	tmpDir := setupTestSQLite(t)
+	dbPath := filepath.Join(tmpDir, "test.db")
+
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(err)
+	_, err = db.Exec(`
+		INSERT INTO messages (source_id, source_message_id, sent_at)
+		WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 30000)
+		SELECT 1, 'bulk-' || i, datetime('2024-04-01', '+' || i || ' minutes') FROM seq;
+	`)
+	require.NoError(err)
+	_, err = db.Exec(`UPDATE messages SET subject = CAST(X'80' AS TEXT) WHERE id = (SELECT MAX(id) FROM messages)`)
+	require.NoError(err)
+	require.NoError(db.Close())
+
+	_, err = buildCache(dbPath, filepath.Join(tmpDir, "analytics"), true)
+	require.Error(err)
+	assert.Contains(err.Error(), "export messages")
+	assert.Contains(err.Error(), "msgvault repair-encoding")
+	assert.Contains(err.Error(), "not a msgvault option")
+}
+
 func TestBuildCacheExportsAttachmentMetadataForRawQuery(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -2185,6 +2378,8 @@ func TestBuildCacheExportsAttachmentMetadataForRawQuery(t *testing.T) {
 			require.NoError(err, "add attachment metadata column")
 			_, err = db.Exec(`UPDATE attachments SET attachment_metadata = '{"shared_url":"https://example.com/post"}' WHERE id = 1`)
 			require.NoError(err, "set link-preview metadata")
+			_, err = db.Exec(`UPDATE attachments SET attachment_metadata = '{"source_transcript":{"provider":"beeper","text":"voice note"}}' WHERE id = 2`)
+			require.NoError(err, "set transcript metadata")
 			_, err = db.Exec(`UPDATE messages SET message_type = 'beeper' WHERE id = 2`)
 			require.NoError(err, "mark fixture message as Beeper")
 			require.NoError(db.Close(), "close SQLite fixture")
@@ -2196,14 +2391,14 @@ func TestBuildCacheExportsAttachmentMetadataForRawQuery(t *testing.T) {
 			defer func() { _ = engine.Close() }()
 
 			result, err := engine.QuerySQL(context.Background(), `
-				SELECT COALESCE(a.attachment_metadata IS NOT NULL, 0) AS is_share,
+				SELECT CASE WHEN COALESCE(json_extract_string(a.attachment_metadata, '$.shared_url'), '') <> '' THEN 1 ELSE 0 END AS is_share,
 				       COUNT(*), SUM(a.size)
 				FROM attachments a
 				JOIN messages m ON m.id = a.message_id
 				WHERE m.message_type = 'beeper'
 				GROUP BY is_share
 				ORDER BY is_share`)
-			require.NoError(err, "run documented link-preview query")
+			require.NoError(err, "run documented shared URL query")
 			assert.Equal([]string{"is_share", "count_star()", "sum(a.size)"}, result.Columns)
 			require.Len(result.Rows, 2)
 			assert.Equal("0", fmt.Sprint(result.Rows[0][0]))
@@ -2229,7 +2424,7 @@ func TestBuildCache_EmptyDatabase(t *testing.T) {
 	db, _ := sql.Open("sqlite3", dbPath)
 	_, _ = db.Exec(`
 		CREATE TABLE sources (id INTEGER PRIMARY KEY, source_type TEXT NOT NULL DEFAULT 'gmail', identifier TEXT);
-		CREATE TABLE messages (id INTEGER PRIMARY KEY, source_id INTEGER, source_message_id TEXT, sent_at TIMESTAMP, size_estimate INTEGER, has_attachments BOOLEAN, subject TEXT, snippet TEXT, conversation_id INTEGER, deleted_from_source_at TIMESTAMP, attachment_count INTEGER DEFAULT 0, sender_id INTEGER, message_type TEXT NOT NULL DEFAULT 'email', is_from_me BOOLEAN DEFAULT FALSE, deleted_at DATETIME);
+		CREATE TABLE messages (id INTEGER PRIMARY KEY, source_id INTEGER, source_message_id TEXT, rfc822_message_id TEXT, sent_at TIMESTAMP, size_estimate INTEGER, has_attachments BOOLEAN, subject TEXT, snippet TEXT, conversation_id INTEGER, deleted_from_source_at TIMESTAMP, attachment_count INTEGER DEFAULT 0, list_id TEXT, sender_id INTEGER, message_type TEXT NOT NULL DEFAULT 'email', is_from_me BOOLEAN DEFAULT FALSE, deleted_at DATETIME);
 		CREATE TABLE participants (id INTEGER PRIMARY KEY, email_address TEXT, domain TEXT, display_name TEXT, phone_number TEXT);
 		CREATE TABLE participant_identifiers (participant_id INTEGER, identifier_type TEXT, identifier_value TEXT, display_value TEXT, is_primary BOOLEAN);
 		CREATE TABLE message_recipients (message_id INTEGER, participant_id INTEGER, recipient_type TEXT, display_name TEXT);
@@ -2241,6 +2436,20 @@ func TestBuildCache_EmptyDatabase(t *testing.T) {
 		CREATE TABLE archive_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 		CREATE TABLE account_identities (source_id INTEGER, address TEXT, source_signal TEXT NOT NULL DEFAULT '', confirmed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (source_id, address));
 		CREATE TABLE participant_links (participant_a INTEGER, participant_b INTEGER, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (participant_a, participant_b));
+		CREATE TABLE persons (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			vcard_uid TEXT NOT NULL UNIQUE,
+			display_name TEXT,
+			revision INTEGER NOT NULL DEFAULT 1,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE TABLE person_participants (
+			person_id INTEGER NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+			participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+			PRIMARY KEY (person_id, participant_id),
+			UNIQUE(participant_id)
+		);
 	`)
 	_ = db.Close()
 
@@ -2414,7 +2623,7 @@ func BenchmarkBuildCache(b *testing.B) {
 	// Create schema
 	_, _ = db.Exec(`
 		CREATE TABLE sources (id INTEGER PRIMARY KEY, identifier TEXT);
-		CREATE TABLE messages (id INTEGER PRIMARY KEY, source_id INTEGER, source_message_id TEXT, sent_at TIMESTAMP, size_estimate INTEGER, has_attachments BOOLEAN, subject TEXT, snippet TEXT, conversation_id INTEGER, deleted_from_source_at TIMESTAMP, attachment_count INTEGER DEFAULT 0, sender_id INTEGER, message_type TEXT NOT NULL DEFAULT 'email', deleted_at DATETIME);
+		CREATE TABLE messages (id INTEGER PRIMARY KEY, source_id INTEGER, source_message_id TEXT, rfc822_message_id TEXT, sent_at TIMESTAMP, size_estimate INTEGER, has_attachments BOOLEAN, subject TEXT, snippet TEXT, conversation_id INTEGER, deleted_from_source_at TIMESTAMP, attachment_count INTEGER DEFAULT 0, list_id TEXT, sender_id INTEGER, message_type TEXT NOT NULL DEFAULT 'email', deleted_at DATETIME);
 		CREATE TABLE participants (id INTEGER PRIMARY KEY, email_address TEXT UNIQUE, domain TEXT, display_name TEXT, phone_number TEXT);
 		CREATE TABLE participant_identifiers (participant_id INTEGER, identifier_type TEXT, identifier_value TEXT, display_value TEXT, is_primary BOOLEAN);
 		CREATE TABLE message_recipients (message_id INTEGER, participant_id INTEGER, recipient_type TEXT, display_name TEXT);
@@ -2492,6 +2701,7 @@ func setupTestSQLiteEmpty(t *testing.T) string {
 			id INTEGER PRIMARY KEY,
 			source_id INTEGER NOT NULL REFERENCES sources(id),
 			source_message_id TEXT NOT NULL,
+			rfc822_message_id TEXT,
 			conversation_id INTEGER,
 			subject TEXT,
 			snippet TEXT,
@@ -2501,6 +2711,7 @@ func setupTestSQLiteEmpty(t *testing.T) string {
 			has_attachments BOOLEAN DEFAULT FALSE,
 			attachment_count INTEGER DEFAULT 0,
 			deleted_from_source_at TIMESTAMP,
+			list_id TEXT,
 			sender_id INTEGER,
 			message_type TEXT NOT NULL DEFAULT 'email',
 			is_from_me BOOLEAN DEFAULT FALSE,
@@ -2694,6 +2905,169 @@ func TestBuildCacheCSVSnapshotFallback(t *testing.T) {
 		result, err := buildCache(filepath.Join(tmpDir, "test.db"), filepath.Join(tmpDir, "analytics"), true)
 		require.NoError(t, err)
 		assert.Equal(t, int64(0), result.ExportedCount)
+	})
+}
+
+func TestOpenCacheSourceSnapshotPlatformPolicy(t *testing.T) {
+	newRequire := require.New
+	newAssert := assert.New
+	openSnapshot := func(t *testing.T, goos, forceCSV string) (*cacheSourceSnapshot, string) {
+		t.Helper()
+		require := newRequire(t)
+		oldGOOS := cacheSnapshotGOOS
+		cacheSnapshotGOOS = goos
+		t.Cleanup(func() { cacheSnapshotGOOS = oldGOOS })
+		t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", forceCSV)
+
+		tmpDir := setupTestSQLite(t)
+		dbPath := filepath.Join(tmpDir, "test.db")
+		duckDB, err := sql.Open("duckdb", "")
+		require.NoError(err, "open duckdb")
+		require.NoError(duckDB.Close(), "close duckdb before snapshot open")
+
+		var snapshot *cacheSourceSnapshot
+		var snapshotErr error
+		stderr := captureStderrDuring(t, func() {
+			snapshot, snapshotErr = openCacheSourceSnapshot(duckDB, dbPath)
+		})
+		require.NoError(snapshotErr, "open cache source snapshot")
+		require.NotNil(snapshot)
+		t.Cleanup(func() { _ = snapshot.Close() })
+		return snapshot, stderr
+	}
+
+	readMessageCount := func(t *testing.T, snapshot *cacheSourceSnapshot) int64 {
+		t.Helper()
+		require := newRequire(t)
+		var count int64
+		require.NoError(snapshot.QueryRow("SELECT COUNT(*) FROM messages").Scan(&count))
+		return count
+	}
+
+	t.Run("darwin", func(t *testing.T) {
+		require := newRequire(t)
+		assert := newAssert(t)
+		snapshot, stderr := openSnapshot(t, "darwin", "")
+		assert.Empty(stderr)
+		assert.Equal(int64(5), readMessageCount(t, snapshot))
+
+		tmpDir := snapshot.tmpDir
+		require.NotEmpty(tmpDir)
+		require.NoError(snapshot.Close())
+		_, err := os.Stat(tmpDir)
+		assert.True(os.IsNotExist(err), "CSV snapshot directory should be removed after Close")
+	})
+
+	t.Run("linux", func(t *testing.T) {
+		require := newRequire(t)
+		assert := newAssert(t)
+		snapshot, stderr := openSnapshot(t, "linux", "")
+		assert.Contains(stderr, "sqlite_scanner unavailable, using CSV fallback")
+		assert.Equal(int64(5), readMessageCount(t, snapshot))
+		require.NoError(snapshot.Close())
+	})
+
+	t.Run("force_nonempty", func(t *testing.T) {
+		require := newRequire(t)
+		assert := newAssert(t)
+		snapshot, stderr := openSnapshot(t, "linux", "0")
+		assert.Empty(stderr)
+		assert.Equal(int64(5), readMessageCount(t, snapshot))
+		require.NoError(snapshot.Close())
+	})
+
+	t.Run("darwin parity with forced CSV", func(t *testing.T) {
+		assert := newAssert(t)
+		oldGOOS := cacheSnapshotGOOS
+		cacheSnapshotGOOS = "darwin"
+		t.Cleanup(func() { cacheSnapshotGOOS = oldGOOS })
+
+		type cachedMessage struct {
+			id              int64
+			sourceID        int64
+			sourceMessageID string
+			subject         string
+			snippet         string
+			sentAt          string
+			sizeEstimate    int64
+			hasAttachments  bool
+			attachmentCount int64
+		}
+
+		readCache := func(t *testing.T, analyticsDir string) ([]cachedMessage, map[string]int64) {
+			t.Helper()
+			require := newRequire(t)
+			duckDB, err := sql.Open("duckdb", "")
+			require.NoError(err, "open duckdb for cache parity")
+			defer func() { require.NoError(duckDB.Close()) }()
+
+			messagePattern := filepath.ToSlash(filepath.Join(
+				analyticsDir, tableMessages, "**", "*.parquet"))
+			rows, err := duckDB.Query(`
+				SELECT id, source_id, source_message_id, subject, snippet,
+					CAST(sent_at AS VARCHAR), size_estimate, has_attachments,
+					attachment_count
+				FROM read_parquet(?, hive_partitioning=true)
+				ORDER BY id`, messagePattern)
+			require.NoError(err, "query cached messages")
+			defer func() { require.NoError(rows.Close()) }()
+			var messages []cachedMessage
+			for rows.Next() {
+				var message cachedMessage
+				require.NoError(rows.Scan(
+					&message.id, &message.sourceID, &message.sourceMessageID,
+					&message.subject, &message.snippet, &message.sentAt,
+					&message.sizeEstimate, &message.hasAttachments,
+					&message.attachmentCount,
+				))
+				messages = append(messages, message)
+			}
+			require.NoError(rows.Err())
+
+			counts := make(map[string]int64, len(query.RequiredParquetDirs))
+			for _, dataset := range query.RequiredParquetDirs {
+				var count int64
+				err := filepath.Walk(filepath.Join(analyticsDir, dataset),
+					func(path string, info os.FileInfo, walkErr error) error {
+						if walkErr != nil {
+							return walkErr
+						}
+						if info.IsDir() || !strings.EqualFold(filepath.Ext(info.Name()), ".parquet") {
+							return nil
+						}
+						var fileCount int64
+						if err := duckDB.QueryRow(
+							"SELECT COUNT(*) FROM read_parquet(?)",
+							filepath.ToSlash(path),
+						).Scan(&fileCount); err != nil {
+							return err
+						}
+						count += fileCount
+						return nil
+					})
+				require.NoError(err, "count %s rows", dataset)
+				counts[dataset] = count
+			}
+			return messages, counts
+		}
+
+		build := func(t *testing.T, forceCSV string) ([]cachedMessage, map[string]int64) {
+			t.Helper()
+			require := newRequire(t)
+			assert := newAssert(t)
+			t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", forceCSV)
+			tmpDir := setupTestSQLite(t)
+			analyticsDir := filepath.Join(tmpDir, "analytics")
+			result, err := buildCache(filepath.Join(tmpDir, "test.db"), analyticsDir, true)
+			require.NoError(err, "build cache for parity")
+			assert.Equal(int64(5), result.ExportedCount)
+			return readCache(t, analyticsDir)
+		}
+
+		darwinMessages, darwinCounts := build(t, "")
+		forcedMessages, forcedCounts := build(t, "1")
+		assert.Equal(forcedMessages, darwinMessages)
+		assert.Equal(forcedCounts, darwinCounts)
 	})
 }
 
@@ -3455,7 +3829,7 @@ func TestCacheNeedsBuild_IgnoresAlreadyProcessedUpdatedSyncRun(t *testing.T) {
 // schema version other than the current one now forces a full rebuild.
 func TestCacheNeedsBuild_SchemaVersionMismatch(t *testing.T) {
 	require := require.New(t)
-	require.Equal(24, cacheSchemaVersion, "relationship temperatures require cache v24")
+	require.Equal(query.CacheSchemaVersion, cacheSchemaVersion, "cache schema version must mirror query")
 	tmpDir := setupTestSQLiteEmpty(t)
 
 	dbPath := filepath.Join(tmpDir, "test.db")
@@ -3627,7 +4001,7 @@ func BenchmarkBuildCacheIncremental(b *testing.B) {
 	// Create schema and initial data (10000 messages)
 	_, _ = db.Exec(`
 		CREATE TABLE sources (id INTEGER PRIMARY KEY, identifier TEXT);
-		CREATE TABLE messages (id INTEGER PRIMARY KEY, source_id INTEGER, source_message_id TEXT, sent_at TIMESTAMP, size_estimate INTEGER, has_attachments BOOLEAN, subject TEXT, snippet TEXT, conversation_id INTEGER, deleted_from_source_at TIMESTAMP, attachment_count INTEGER DEFAULT 0, sender_id INTEGER, message_type TEXT NOT NULL DEFAULT 'email', deleted_at DATETIME);
+		CREATE TABLE messages (id INTEGER PRIMARY KEY, source_id INTEGER, source_message_id TEXT, rfc822_message_id TEXT, sent_at TIMESTAMP, size_estimate INTEGER, has_attachments BOOLEAN, subject TEXT, snippet TEXT, conversation_id INTEGER, deleted_from_source_at TIMESTAMP, attachment_count INTEGER DEFAULT 0, list_id TEXT, sender_id INTEGER, message_type TEXT NOT NULL DEFAULT 'email', deleted_at DATETIME);
 		CREATE TABLE participants (id INTEGER PRIMARY KEY, email_address TEXT UNIQUE, domain TEXT, display_name TEXT, phone_number TEXT);
 		CREATE TABLE participant_identifiers (participant_id INTEGER, identifier_type TEXT, identifier_value TEXT, display_value TEXT, is_primary BOOLEAN);
 		CREATE TABLE message_recipients (message_id INTEGER, participant_id INTEGER, recipient_type TEXT, display_name TEXT);

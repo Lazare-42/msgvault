@@ -28,9 +28,15 @@ import (
 // version 23 adds typed search primitives to relationship people for bounded,
 // explainable contact completion without reopening archive tables; version 24
 // adds graph-relative current and annual relationship temperature summaries to
-// the compact relationship people dataset.
-// Schema bumps force a full rebuild before readers use an older publication.
-const CacheSchemaVersion = 24
+// the compact relationship people dataset; version 25 adds the scalar list_id
+// message dimension; version 26 adds envelope_address (the header address as
+// recorded, NULL when absent) to message_recipients and makes email_address
+// the resolved recipient address (envelope, else participant), never an empty
+// string. Version 27 adds curated person display names.
+// Version 28 projects RFC Message-ID into every messages cache shard.
+// Schema bumps force a full rebuild before readers use an older publication,
+// so committed caches never mix shards of different shapes.
+const CacheSchemaVersion = 28
 
 // CacheSyncState is the commit marker written after a complete analytics
 // cache publication. SQLite remains authoritative; these watermarks only
@@ -70,9 +76,11 @@ type CacheSyncState struct {
 	// labels/search values, but not into message facts, so drift here is
 	// repaired by the derived-dataset refresh without rewriting message
 	// shards.
-	ParticipantDisplayNameRevision int64     `json:"participant_display_name_revision,omitempty"`
-	PublishedAt                    time.Time `json:"published_at"`
-	DatasetFingerprint             string    `json:"dataset_fingerprint"`
+	ParticipantDisplayNameRevision int64 `json:"participant_display_name_revision,omitempty"`
+	// PersonDisplayNameRevision tracks curated names in replaceable derived datasets.
+	PersonDisplayNameRevision int64     `json:"person_display_name_revision,omitempty"`
+	PublishedAt               time.Time `json:"published_at"`
+	DatasetFingerprint        string    `json:"dataset_fingerprint"`
 
 	ConversationParticipantsFingerprint string `json:"conversation_participants_fingerprint,omitempty"`
 	// ConversationTypesFingerprint hashes (id, conversation_type, title) for
@@ -113,7 +121,7 @@ func (e *CacheUnavailableError) Unwrap() error { return ErrCacheUnavailable }
 // Revision identifies one committed cache publication. It intentionally uses
 // only commit-marker fields, never ambient filesystem state.
 func (s CacheSyncState) Revision() string {
-	payload := fmt.Sprintf("v=%d|message=%d|watermark=%s|run=%d|add=%d|update=%d|fail_count=%d|fail_sum=%d|identity=%d|derived_data=%d|account_identity=%d|participant_identifier=%d|participant_display_name=%d|published=%s",
+	payload := fmt.Sprintf("v=%d|message=%d|watermark=%s|run=%d|add=%d|update=%d|fail_count=%d|fail_sum=%d|identity=%d|derived_data=%d|account_identity=%d|participant_identifier=%d|participant_display_name=%d|person_display_name=%d|published=%s",
 		s.SchemaVersion,
 		s.LastMessageID,
 		s.LastSyncAt.UTC().Format(time.RFC3339Nano),
@@ -127,6 +135,7 @@ func (s CacheSyncState) Revision() string {
 		s.AccountIdentityRevision,
 		s.ParticipantIdentifierRevision,
 		s.ParticipantDisplayNameRevision,
+		s.PersonDisplayNameRevision,
 		s.PublishedAt.UTC().Format(time.RFC3339Nano),
 	)
 	return fmt.Sprintf("cache-%x", sha256.Sum256([]byte(payload)))

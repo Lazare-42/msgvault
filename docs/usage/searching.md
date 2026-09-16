@@ -1,7 +1,24 @@
 ---
+last_edited: "2026-09-08"
 title: Searching
-description: Gmail-like search syntax with full-text search and JSON output.
+description: Find archived messages by words, meaning, account, conversation, or message type.
 ---
+
+Use `msgvault search` to find archived email, chats, calendar events, and
+meeting transcripts. Keyword search works without an embedding provider.
+Combine words with filters to narrow the result, then use `msgvault show-message <id>`
+to read a message.
+
+| What you want to find | Where to search |
+|---|---|
+| Words in a message or its subject | `msgvault search "quarterly report"` |
+| A topic, even with different wording | [Vector or hybrid message search](/docs/usage/vector-search/) |
+| Words or topics inside an attached document | [Document attachment search](/docs/usage/document-indexing/#search-and-inspect-status) |
+| An image or video by its visual content | [Visual attachment search](/docs/usage/vector-search/#visual-attachment-search) |
+| A person by their curated profile | [Semantic person search](/docs/usage/people/#find-a-person-by-what-you-remember) |
+
+Message search does not search extracted document text or attachment pixels.
+Those have separate indexes and setup steps.
 
 ## Basic Usage
 
@@ -18,10 +35,7 @@ msgvault search <query>
 
 ## Search Operators
 
-msgvault supports a local subset of Gmail-like search syntax. Gmail-only
-operators that depend on fields msgvault does not index locally, such as
-`list:` / `List-ID`, are not available in local search or MCP search. Use a
-Gmail connector query when you need Gmail itself to evaluate those operators.
+msgvault supports a local subset of Gmail-like search syntax.
 
 | Operator | Description | Example |
 |---|---|---|
@@ -31,6 +45,7 @@ Gmail connector query when you need Gmail itself to evaluate those operators.
 | `bcc:` | BCC recipient | `bcc:admin@example.com` |
 | `subject:` | Subject text | `subject:meeting` |
 | `label:` | Gmail label | `label:INBOX`, `label:SENT` |
+| `list:` / `list-id:` | RFC 2919 List-Id literal substring | `list:announce.example.org` |
 | `has:attachment` | Has attachments | `has:attachment` |
 | `before:` | Before date | `before:2024-06-01` |
 | `after:` | After date | `after:2024-01-01` |
@@ -39,8 +54,14 @@ Gmail connector query when you need Gmail itself to evaluate those operators.
 | `larger:` | Minimum size | `larger:5M`, `100K` |
 | `smaller:` | Maximum size | `smaller:1M` |
 | `message_type:` | Stored message type | `message_type:teams`, `message_type=calendar_event` |
+| `conversation_id:` | Local conversation ID | `conversation_id:123` |
 
 Bare words and `"quoted phrases"` perform full-text search across message subjects and bodies.
+
+List-Id matching is case-insensitive and treats `%`, `_`, and `\` literally.
+Quote a value when it contains spaces, for example
+`list-id:"Example Announcements"`. Repeating `list:` or `list-id:` uses AND
+semantics: every supplied substring must occur in the stored List-Id.
 
 ### Domain Search
 
@@ -70,12 +91,37 @@ msgvault search has:attachment
 # By label
 msgvault search label:INBOX
 
+# By mailing list (both aliases are equivalent)
+msgvault search 'list:"<announce.example.org>"'
+msgvault search 'list-id:announce list-id:example.org'
+
 # Combined filters
 msgvault search "from:boss@company.com has:attachment after:2024-01-01"
 
 # Full-text search
 msgvault search "quarterly report"
+
+# Search within one archived conversation
+msgvault search "conversation_id:123 budget"
 ```
+
+`conversation_id:` takes the positive local conversation ID shown in message
+metadata, not the provider's thread or room ID. It works with keyword, vector,
+and hybrid search. Vector and hybrid queries still need free text.
+
+## Repairing Existing Archives
+
+Fresh email ingest indexes `List-Id` automatically. For messages archived by
+an older msgvault version, preview the offline backfill first, then apply it:
+
+```bash
+msgvault repair-list-ids
+msgvault repair-list-ids --apply
+```
+
+The default dry run reports what would change without modifying the archive.
+`--apply` writes the repaired values from stored raw MIME and marks derived
+analytics stale for the normal rebuild path; neither mode contacts the provider.
 
 ## Account and Collection Filters
 
@@ -92,7 +138,7 @@ msgvault search --collection Work
 
 The two flags are mutually exclusive. Collection filters work in full-text, vector, and hybrid local search modes.
 
-SQLite FTS ranking is weighted to better match PostgreSQL-backed search behavior, so subject/body weighting should feel more consistent across local tools. The rankers are still different; see [Search Ranking Across Backends](/architecture/search-ranking/).
+SQLite FTS ranking is weighted to better match PostgreSQL-backed search behavior, so subject/body weighting should feel more consistent across local tools. The rankers are still different; see [Search Ranking Across Backends](/docs/architecture/search-ranking/).
 
 ## Source-Deleted Messages
 
@@ -112,6 +158,14 @@ applies to source deletion (`deleted_from_source_at`); rows hidden internally by
 deduplication are never returned. It is available only with `--mode fts` because
 the vector index intentionally covers active messages only. Vector and hybrid
 search reject non-active deletion scopes instead of returning incomplete results.
+
+Gmail incremental sync records History API deletion events. When the saved
+history cursor has expired, msgvault reconciles deletion metadata only after an
+unfiltered, unlimited snapshot of the complete mailbox succeeds. A regular
+`sync-full` result, including one narrowed by a query, limit, or date range, is
+not treated as proof that omitted messages were deleted. In either path, the
+archive retains the message and raw MIME data; only its source-presence metadata
+changes.
 
 HTTP clients can pass the same values as `deletion_scope` on
 `GET /api/v1/cli/search`.
@@ -138,8 +192,8 @@ msgvault search "release planning" --message-type discord
 msgvault search "dinner" --message-type sms --message-type mms
 ```
 
-Valid values are `email`, `calendar_event`, `meeting_transcript`, `beeper`,
-`sms`, `mms`, `whatsapp`, `imessage`, `teams`, `discord`, `fbmessenger`,
+Valid values are `email`, `google_chat`, `calendar_event`, `meeting_transcript`,
+`beeper`, `sms`, `mms`, `rcs`, `whatsapp`, `imessage`, `teams`, `discord`, `slack`, `fbmessenger`,
 `synctech_sms_call`, `google_voice_text`, `google_voice_call`, and
 `google_voice_voicemail`. `message_type:email` also includes legacy rows whose
 type is empty because older msgvault versions created them before the column
@@ -165,5 +219,5 @@ The same `msgvault search` command supports semantic search when the
 selected local daemon or remote server has `[vector]` configured with
 an embedding endpoint. Pass
 `--mode vector` for pure semantic search, or `--mode hybrid` to fuse
-BM25 and vector ranking. See [Vector Search](/usage/vector-search/)
+BM25 and vector ranking. See [Vector Search](/docs/usage/vector-search/)
 for setup, initial embedding, and incremental update workflows.

@@ -1,16 +1,17 @@
 ---
+last_edited: "2026-09-08"
 title: Vector Search
-description: Semantic and hybrid search over your archive using a configured embedding endpoint.
+description: Find messages by meaning and set up separate people, visual, and document search indexes.
 ---
 
-
-Semantic search finds messages by meaning, not just keyword overlap:
+Semantic search finds messages by meaning:
 a query like "planning offsite agenda" can surface a message titled
 "Q2 team kickoff" if the bodies discuss the same topic, even when
 none of the query words appear in the result. msgvault builds that
-capability on top of the default keyword search by sending message
-text to an embedding endpoint you configure, then storing the
-vectors locally. SQLite archives store vectors in `vectors.db`.
+capability on top of keyword search. An embedding is a numeric representation
+of text that lets msgvault rank related content. Msgvault sends text to an
+embedding endpoint you configure, then stores the vectors in your archive.
+SQLite archives store vectors in `vectors.db`.
 PostgreSQL archives store them in pgvector tables inside the same
 database as the message archive.
 
@@ -25,25 +26,29 @@ by a third party, message text and semantic query text are sent there;
 use a local or self-hosted endpoint when you need the workflow to stay
 on your own machine or network.
 
-!!! note
-    Vector indexing operates over msgvault's shared `messages` table. A
-    full rebuild embeds every non-deleted message row, including imported
-    chat messages. Chat import commands do not run the embed worker after
-    import, so run
-    `msgvault embeddings build --full-rebuild --yes` after importing
-    local files or chat/text data if you want those messages in
-    the vector index. Chat-specific preprocessing and ranking are not
-    separate yet.
+Choose the index for the thing you want to find:
+
+| Content | Search command | Setup |
+|---|---|---|
+| Messages, chats, and meeting transcripts | `search --mode vector` or `--mode hybrid` | This page |
+| Curated people | `person search` | [People](/docs/usage/people/#find-a-person-by-what-you-remember) |
+| Image and video content | `multimodal search` | [Visual attachment search](#visual-attachment-search) |
+| Extracted document text | `documents search --mode semantic` or `--mode hybrid` | [Document indexing](/docs/usage/document-indexing/#semantic-and-hybrid-document-search) |
+
+Message embeddings do not include attachment pixels or extracted document
+text. Those indexes have separate builds and consent. For a guided setup using
+the provider keys you have, start with
+[Recommended Configuration](/docs/usage/recommended-configuration/).
 
 ## Prerequisites
 
-1. **A running OpenAI-compatible embedding endpoint.** msgvault does
+1. **A running embedding endpoint.** msgvault does
    not host a model. Point it at a local, self-hosted, or hosted
    endpoint that you trust. Common local options include [Ollama](https://ollama.com),
    [llama.cpp's `server`](https://github.com/ggerganov/llama.cpp/tree/master/examples/server),
    and [LM Studio](https://lmstudio.ai). On an Apple Silicon Mac,
-   [`afm`](https://github.com/scouzi1966/maclocal-api) is the fastest path
-   (see the tip below). The endpoint must accept
+   [`afm`](https://github.com/scouzi1966/maclocal-api) is another option
+   (see the tip below). For `api_format = "openai"`, the endpoint must accept
    `POST /embeddings` with an OpenAI-style JSON body and return
    indexed data rows such as
    `{"data": [{"index": 0, "embedding": [...]}]}`.
@@ -58,9 +63,9 @@ on your own machine or network.
    `pgvector` build tag, for example
    `go build -tags "fts5 sqlite_vec pgvector" ./cmd/msgvault`.
 
-!!! tip "Fastest path to using embeddings on Mac"
-    On a Mac, the quickest endpoint is [`afm`](https://github.com/scouzi1966/maclocal-api):
-    it serves OpenAI-compatible embeddings from Apple's on-device NaturalLanguage model
+!!! tip "Local embeddings on Apple Silicon"
+    [`afm`](https://github.com/scouzi1966/maclocal-api)
+    serves OpenAI-compatible embeddings from Apple's on-device NaturalLanguage model
     over Metal, with no Python, no cloud, and no API key. Requires macOS 26 (Tahoe) or
     later on an Apple Silicon Mac with Apple Intelligence enabled.
 
@@ -98,7 +103,16 @@ go build -tags "fts5 sqlite_vec" -o msgvault.exe ./cmd/msgvault
 
 ## Enable
 
-Add a `[vector]` block to `~/.msgvault/config.toml`:
+Use `msgvault setup providers` to select defaults, or add a `[vector]` block
+to `~/.msgvault/config.toml`.
+
+Guided Ollama setup uses a conservative `max_input_chars = 2000`, leaving
+more room for token-dense content. To use `6000` as shown below, first
+check representative content with the [sizing guidance](#matching-max_input_chars-to-your-embedders-context-window),
+then change `max_input_chars` under `[vector.embeddings]` in
+`~/.msgvault/config.toml`.
+
+This manual example uses an OpenAI-compatible endpoint:
 
 ```toml
 [vector]
@@ -108,7 +122,7 @@ backend = "sqlite-vec"
 # db_path = "/path/to/vectors.db"
 
 [vector.embeddings]
-endpoint = "http://tailnet-host:11434/v1"
+endpoint = "http://127.0.0.1:11434/v1"
 api_key_env = "OLLAMA_API_KEY"           # optional; omit for anonymous endpoints
 model = "nomic-embed-text"
 dimension = 768
@@ -117,7 +131,7 @@ query_prefix = "search_query: "        # required by nomic-embed-text
 batch_size = 32                          # embeddings per HTTP call
 timeout = "30s"
 max_retries = 3
-max_input_chars = 2000                   # per-chunk cap; see sizing guidance below
+max_input_chars = 6000                   # per-chunk cap; see sizing guidance below
 eta_window = 10                          # progress ETA smoothing window
 
 [vector.preprocess]
@@ -140,7 +154,7 @@ run_after_sync = true                    # run a pass after every successful sch
 
 [vector.embed.scope]
 # Optional: leave empty for the full archive, or restrict new generations.
-message_types = ["teams"]
+# message_types = ["teams"]
 ```
 
 The `[vector]` section only takes effect when `enabled = true` **and**
@@ -149,6 +163,30 @@ missing, msgvault behaves as before. Disabled vector search returns
 `vector_not_enabled` from server surfaces; a binary built without the
 needed backend reports a rebuild-with-vector-backend error when vector
 features are requested.
+
+### Contextual chat and meeting embeddings
+
+With `api_format = "voyage-contextual"`, Beeper messages are embedded with
+nearby messages from the same conversation. This helps retrieve short replies
+whose meaning depends on what came before. Meetings are split along speaker
+turns with their meeting context. Other message types, including email and
+chat imports outside Beeper, remain individual documents with overlapping
+chunks when needed.
+
+```toml
+[vector.embeddings]
+api_format = "voyage-contextual"
+endpoint = "https://api.voyageai.com/v1"
+api_key_env = "VOYAGE_API_KEY"
+model = "voyage-context-4"
+dimension = 1024
+```
+
+This API format requires `voyage-context-4`. Switching from an
+OpenAI-compatible endpoint changes the index policy and requires a full
+rebuild. Results still refer to the original messages and matching text.
+The worker tracks edits, late-arriving messages, and deletions so affected
+conversation windows can be refreshed.
 
 ### PostgreSQL and pgvector
 
@@ -174,7 +212,7 @@ query_prefix = "search_query: "
 
 pgvector embeddings live in the PostgreSQL database. `db_path` and
 `vectors.db` apply only to the SQLite sqlite-vec backend. See
-[PostgreSQL Backend](/architecture/postgresql/) for database setup.
+[PostgreSQL Backend](/docs/architecture/postgresql/) for database setup.
 
 ### Model task prefixes
 
@@ -194,26 +232,69 @@ with an index built from unprefixed documents.
 
 `max_input_chars` is an upper bound in characters per embedding
 chunk; the embedder converts this to tokens on its own. Set it below
-the embedder's maximum context or individual chunks can fail with
-HTTP 400 during `msgvault embeddings build`.
+the embedder's token limit after conversion, with room for any
+`document_prefix`. Oversized chunks can be rejected or silently truncated
+during `msgvault embeddings build`.
 
 Long post-preprocess messages are split into overlapping chunks
 instead of being truncated to one embedding input. Chunk boundaries
 prefer paragraph breaks, then sentence breaks, then word boundaries,
 falling back to a hard rune boundary only when needed.
 
+Size it to the context window rather than defensively low. The value
+is not only a correctness ceiling — it sets how many chunks each
+message becomes, and every chunk is a separate embedding input. Halving
+`max_input_chars` roughly doubles the chunk count for long messages.
+More chunks add per-input overhead and can slow `embeddings build`; the
+effect on build time depends on the model, batching, and message lengths.
+Confirm the real context window before starting a full rebuild.
+
 Practical guidance:
 
-- **2k-token embedding models:** start around `max_input_chars = 2000`
-  and raise only after confirming the endpoint accepts longer inputs.
+- **Characters are not tokens.** The values below assume 3 characters
+  per token. The ratio varies by tokenizer and content; code, markup,
+  and non-Latin scripts may need a lower cap. Treat these values as
+  starting points and check representative content.
+- **2k-token embedding models:** start around `max_input_chars = 6000`.
 - **8k-token embedding models:** start around `max_input_chars = 24000`.
 - **Self-hosted models:** match the actual context window exposed by
   your server, not just the upstream model card.
 
-If `msgvault embeddings build` logs `HTTP 400`, msgvault now includes
-the response body from the embedder when available. Check both the
-CLI log and the embedder's own logs. `the input length exceeds the
-context length` confirms you need to lower `max_input_chars`.
+To check a candidate cap, take `max_input_chars` characters of representative
+preprocessed content, then prepend your configured `document_prefix` and
+send the combined input to your embedder. The prefix does not consume the
+chunking budget. Ollama's
+[native API](https://docs.ollama.com/api/embed) reports the token count.
+Set `truncate: false` so an oversized input returns an error instead of
+a count for truncated text:
+
+```bash
+curl -sS http://127.0.0.1:11434/api/embed \
+  -d '{"model":"nomic-embed-text","input":"search_document: <chunk text>","truncate":false}' \
+  | jq '.error // .prompt_eval_count'
+```
+
+Lower the cap if this reports a context-length error. Repeat with
+representative content before starting a full rebuild.
+
+!!! warning "Ollama truncates instead of rejecting"
+    Through its OpenAI-compatible `/v1/embeddings` endpoint, which
+    msgvault uses, Ollama truncates over-limit inputs by default. The
+    ceiling is the smaller of the model's trained context length and
+    `num_ctx`, with room needed for special tokens. Ollama embeds only
+    the beginning of an oversized chunk and returns a normal response,
+    which can silently degrade recall. The trained
+    length is the hard ceiling: Ollama's `nomic-embed-text` ships with
+    `num_ctx = 8192` but a trained context of 2048 tokens, so raising
+    `num_ctx` does not help. Check both with `ollama show <model>`
+    before raising `max_input_chars`.
+
+If `msgvault embeddings build` logs `HTTP 400`, msgvault includes the
+response body from the embedder when available. Check both the CLI log
+and the embedder's own logs. A body such as `the input length exceeds
+the context length` confirms you need to lower `max_input_chars`.
+Do not rely on this error to detect oversized inputs through Ollama's
+OpenAI-compatible endpoint; see the warning above.
 
 ## Initial Embedding
 
@@ -225,7 +306,7 @@ msgvault embeddings build --full-rebuild --yes
 ```
 
 This creates a new **building generation**, scans every non-deleted
-message in your archive, embeds missing rows in batches through your
+message in the configured scope, embeds missing rows in batches through your
 configured embedder, and atomically activates the generation once
 coverage reaches zero. During the
 first build, when no active generation exists yet, HTTP and MCP
@@ -304,15 +385,19 @@ trigger).
 |---|---|
 | Manual `sync-full` / `sync` (Gmail, IMAP) | No. Run `msgvault embeddings build` afterward |
 | Manual `sync-calendar` / `sync-teams` / `sync-discord` | No. Run `msgvault embeddings build` afterward |
-| Manual `sync-beeper` / `sync-granola` / `sync-circleback` | No. Run `msgvault embeddings build` afterward |
+| Manual `sync-slack` / `sync-beeper` / `sync-granola` / `sync-circleback` / `sync-notion` | No. Run `msgvault embeddings build` afterward |
 | Scheduled account syncs in `msgvault serve` (Gmail, IMAP, Teams, Discord) | Yes, when `[vector.embed.schedule].run_after_sync = true` |
-| Scheduled calendar, Slack, Beeper, Granola, and Circleback syncs in `msgvault serve` | No immediate post-sync run. Picked up by the embed worker's `[vector.embed.schedule].cron` schedule |
-| `import-pst`, `import-emlx`, `import-mbox` | No. Re-run `--full-rebuild` after large imports |
-| Chat/text imports (iMessage, WhatsApp, Google Voice, Messenger, SyncTech SMS) | No. Run a full rebuild after importing if you want chats included |
+| Scheduled calendar, Slack, Beeper, Granola, Circleback, and Notion syncs in `msgvault serve` | No immediate post-sync run. Picked up by the embed worker's `[vector.embed.schedule].cron` schedule |
+| Local email imports (`import-pst`, `import-emlx`, `import-eml`, `import-mbox`) | No. Run `msgvault embeddings build` afterward |
+| Local chat/text imports | No. Run `msgvault embeddings build` afterward |
 
 For ingest paths that do not immediately schedule embedding work, running
-`msgvault embeddings build --full-rebuild --yes` rebuilds the index over the
-full archive including the newly-imported messages. A same-model full
+`msgvault embeddings build` fills missing coverage in the current index. Use
+`msgvault embeddings resume --backstop` to recover older coverage gaps that a
+normal incremental pass skips. A full rebuild is needed when the model or
+index policy changes, or when you want to replace the whole generation.
+
+A same-model full
 rebuild is atomic from the searcher's perspective: vector and hybrid
 queries keep answering from the previous active generation until the
 new one is ready. That previous active generation is intentionally frozen
@@ -342,6 +427,61 @@ self-recovers: the next edit to that message bumps `last_modified` (and
 `repair-encoding` clears its coverage stamp outright), and a full rebuild
 (`embeddings build --full-rebuild`) or the periodic full-scan backstop
 re-embeds it regardless.
+
+## Upgrading an existing archive
+
+Archives that already had embeddings before the generation-based coverage
+tracking landed are migrated in place on the first writable open. There is no
+expected data loss: existing active vectors are preserved. They keep serving
+vector and hybrid search only if their fingerprint matches the current embedding
+policy and configuration. For example, generations built by v0.14 use an older
+fingerprint and require a full rebuild even with unchanged configuration; see
+[When a full rebuild is required](#when-a-full-rebuild-is-required).
+
+The migration runs the first time you start a writable daemon or run an
+embeddings command against an older database. It:
+
+- adds and stamps `messages.embed_gen`, then backfills coverage from the
+  active vector generation, so messages that already have active embeddings are
+  marked covered. This backfill does not re-queue the active generation's corpus.
+- leaves messages that had a pending re-embed against the active generation
+  uncovered rather than marking them covered, so they stay missing and the
+  scan-based worker can find and re-embed them, including below-watermark rows
+  on a backstop pass. The legacy `pending_embeddings` table is consulted for this, then
+  dropped once the migration completes.
+
+Only the active generation is backfilled. A rebuild already in flight at upgrade
+time receives no coverage stamps for its existing vectors and re-embeds those
+messages when resumed.
+
+After the upgrade, coverage is tracked entirely through `messages.embed_gen`:
+a new or changed message becomes "missing" by clearing its `embed_gen` rather
+than by being queued in a separate table. The scan-and-fill worker finds those
+rows and tops up the active generation.
+
+For a generation whose fingerprint still matches, `msgvault serve` with an embed
+schedule runs a backstop automatically on its first embed pass for each generation
+and then at the first pass after each backstop interval (24 hours by default,
+unless disabled). To finish coverage manually for stragglers left after the
+migration, run:
+
+```bash
+msgvault embeddings resume --backstop
+```
+
+`--backstop` runs a full-scan pass that ignores the per-generation watermark, so
+it catches below-watermark rows a normal incremental resume would skip. It tops
+up an already-active generation; if a rebuild is in flight, it activates the
+building generation once missing coverage reaches zero.
+
+### When a full rebuild is required
+
+If the active generation's fingerprint no longer matches the current embedding
+policy or configuration, including a policy change shipped in an upgrade, vector
+and hybrid search report `index_stale`; run
+`msgvault embeddings build --full-rebuild --yes` to build a matching generation.
+See [Model Rotation](#model-rotation) for fingerprint inputs and search behavior
+while the rebuild runs.
 
 ## Scoped Generations
 
@@ -444,7 +584,7 @@ curl "http://localhost:8080/api/v1/search?q=planning+offsite&mode=vector&explain
 ```
 
 Response shape differs from the FTS path; see the
-[Web UI & API Server](/api-server/#get-apiv1search) reference for details.
+[Web UI & API Server](/docs/api-server/#get-apiv1search) reference for details.
 HTTP vector/hybrid responses support only the first page; bump
 `page_size` (capped at `max_page_size_hybrid`) to retrieve a larger
 candidate page.
@@ -490,8 +630,8 @@ msgvault embeddings build --full-rebuild --yes
 
 This builds a new generation with the new fingerprint and activates
 it atomically when the build completes. The fingerprint includes the
-model, dimension, task prefixes, preprocessing policy, `max_input_chars`, and
-embedding output policy. While the rebuild is in flight,
+API format, model, dimension, task prefixes, preprocessing policy, `max_input_chars`,
+embedding output policy, and [scope](#scoped-generations). While the rebuild is in flight,
 `mode=vector` and `mode=hybrid` return `index_stale` (the
 previously-active generation no longer matches the configured
 fingerprint, so search refuses to serve potentially-mismatched
@@ -548,8 +688,9 @@ Check index health via the stats endpoint:
 curl -H "X-API-Key: ..." http://localhost:8080/api/v1/stats | jq .vector_search
 ```
 
-The `active_generation.message_count` should roughly match
-`total_messages` when no rebuild is in flight. During a rebuild it reports
+Compare coverage with eligible, active messages in the configured scope;
+source-deleted and out-of-scope messages are excluded. During a rebuild,
+`active_generation.message_count` reports
 the frozen serving index, while `building_generation.progress` reports the
 replacement index. `missing_embeddings_total` shows how many live messages
 still need embedding for the generation the worker will target next: the
@@ -557,7 +698,7 @@ building generation during a rebuild, otherwise the active generation.
 
 ## What Gets Embedded
 
-The embedder processes one or more vectors per message. Per-message
+The OpenAI-compatible embedder processes one or more vectors per message. Per-message
 input is assembled from `subject` and `body_text`. HTML-only messages
 fall back to `body_html` converted to text. After preprocessing, long
 messages are split into overlapping chunks; each chunk becomes one
@@ -577,8 +718,89 @@ Messages deleted at the source (`deleted_from_source_at IS NOT NULL`)
 are skipped entirely. Messages that become empty after preprocessing
 are marked complete and not sent to the embedding endpoint.
 
+The [contextual API format](#contextual-chat-and-meeting-embeddings) uses
+conversation windows for Beeper and meeting-aware chunks for transcripts.
+The configured account and message-type scope applies before their content is
+assembled. Curated people are an optional, separately consented input to the
+same generation; see [semantic person search](/docs/usage/people/#find-a-person-by-what-you-remember).
+
+## Visual attachment search
+
+Visual search finds archived images and videos from a description such as
+"a whiteboard with a project timeline", or from a similar image you supply.
+It returns the attachment and its containing message. It uses a separate
+Voyage index; enabling message search does not enable visual uploads.
+
+An authenticated capability probe establishes which formats and query types
+the configured provider can process. JPEG, PNG, WebP, and direct MP4 are the
+configured defaults, subject to the probe results. Animated GIFs are a separate
+opt-in. Msgvault sends eligible attachment bytes and bounded containing-message
+text to the provider. Search sends your query text or query image there too.
+
+### Enable and build
+
+The guided path is `msgvault setup providers` with `VOYAGE_API_KEY` set. Setup
+leaves visual indexing pending until a probe manifest exists. To create one,
+prepare a private directory containing synthetic files named
+`image_webp.webp`, `image_webp_alt.webp`, `video_mp4.mp4`, and
+`video_mp4_alt.mp4`. Each alternate should have visibly different content
+from its primary file. The probe generates the remaining synthetic fixtures.
+
+```bash
+msgvault multimodal probe \
+  --seeds /private/msgvault/visual-seeds \
+  --out ~/.msgvault/voyage-capabilities.json --yes
+msgvault setup providers
+msgvault daemon restart
+msgvault multimodal build --yes
+msgvault multimodal status --json
+```
+
+Review the probe manifest before enabling the lane. For manual configuration,
+set `[vector.multimodal].enabled = true` and `capabilities_file` to its path;
+the [configuration reference](/docs/configuration/#vectormultimodal) lists the
+provider, format, scope, context-size, and schedule settings. The manifest
+must be accessible on the daemon host.
+
+`multimodal build --yes` records consent for the exact capability profile and
+builds the index. Use `multimodal resume` after an interrupted build. Changes
+to configuration or capability evidence require matching consent again.
+Status reports coverage, stale items, retryable work, and pending changes.
+
+### Search and maintain
+
+```bash
+msgvault multimodal search "a whiteboard with a project timeline"
+msgvault multimodal search --image ./reference.png
+msgvault multimodal search "a receipt" --person 123 --direction from_person
+msgvault multimodal search "a diagram" --source 4 --after 2026-01-01 --json
+```
+
+Supply exactly one text query or `--image`. Query images must be JPEG, PNG,
+or WebP, at most 20 MiB, and allowed by the configured capability profile.
+Use `--limit` (1–100, default 20) and the returned `--cursor` for paging.
+Other filters include `--message`, `--filename`, `--mime-prefix`, and
+`--before`.
+
+`--person` and `--participant` are mutually exclusive. `--direction` requires
+one of them and accepts `from_person`, `to_person`, or `group`. The narrower
+`--sender-person` filter cannot be combined with those three flags. Person
+filters use archive identity bindings, not a similarity guess about who
+appears in an image.
+
+Use `multimodal retry --message <id> --hash <sha256>` for one failed attachment
+and `multimodal resume` to continue processing. `multimodal retire
+<generation-id> --yes` retires that generation and deletes its vectors.
+Original attachments remain in the archive.
+
+MCP clients use `search_visual_attachments` for visual queries,
+`search_document_attachments` for document text, and `search_person_files` for
+attachment metadata. The CLI `person files --lane all` combines those search
+paths for one person. The Web UI's [Operations workspace](/docs/web-ui/#operations) shows
+visual coverage and the build or resume actions the daemon currently allows.
+
 ## See Also
 
-- [Web UI & API Server](/api-server/): browser interface and HTTP API reference.
-- [Searching](/usage/searching/): Full-text search syntax.
-- [Search Ranking Across Backends](/architecture/search-ranking/): Ranking differences between SQLite, PostgreSQL, sqlite-vec, and pgvector.
+- [Web UI & API Server](/docs/api-server/): browser interface and HTTP API reference.
+- [Searching](/docs/usage/searching/): Full-text search syntax.
+- [Search Ranking Across Backends](/docs/architecture/search-ranking/): Ranking differences between SQLite, PostgreSQL, sqlite-vec, and pgvector.

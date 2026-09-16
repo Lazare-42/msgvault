@@ -25,6 +25,7 @@ const (
 	peopleOverlayNone peopleOverlay = iota
 	peopleOverlayNewField
 	peopleOverlayAttributeValue
+	peopleOverlayBriefCommand
 )
 
 type peopleFieldFocus uint8
@@ -45,6 +46,7 @@ type peopleFormState struct {
 	fieldKindIndex   int
 	cardinalityIndex int
 
+	commandInput       textinput.Model
 	valueInput         textinput.Model
 	valueTextarea      textarea.Model
 	longText           bool
@@ -63,6 +65,7 @@ type peopleFormState struct {
 
 func (f *peopleFormState) close() {
 	f.nameInput.Blur()
+	f.commandInput.Blur()
 	f.valueInput.Blur()
 	if f.longText {
 		f.valueTextarea.Blur()
@@ -166,6 +169,8 @@ func (m Model) handlePeopleFormKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m.handlePeopleNewFieldKey(msg)
 	case peopleOverlayAttributeValue:
 		return m.handlePeopleAttributeValueKey(msg)
+	case peopleOverlayBriefCommand:
+		return m.handlePeopleBriefCommandKey(msg)
 	default:
 		return m, nil
 	}
@@ -175,7 +180,7 @@ func (m Model) handlePeopleNewFieldKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd)
 	form := &m.peopleState.form
 	if form.fieldFocus == peopleFieldFocusName && !form.submitting {
 		switch msg.String() {
-		case keyNameEsc, "ctrl+c", keyNameTab, "shift+tab", keyNameEnter:
+		case keyNameEsc, keyNameCtrlC, keyNameTab, "shift+tab", keyNameEnter:
 		default:
 			var cmd tea.Cmd
 			form.nameInput, cmd = form.nameInput.Update(msg)
@@ -186,11 +191,11 @@ func (m Model) handlePeopleNewFieldKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd)
 	switch msg.String() {
 	case keyNameEsc:
 		if form.submitting {
-			m.peopleState.requestID++
+			m.peopleState.bumpRequestID()
 		}
 		form.close()
 		return m, nil
-	case "ctrl+c":
+	case keyNameCtrlC:
 		m.quitting = true
 		return m, tea.Quit
 	case keyNameTab:
@@ -204,7 +209,7 @@ func (m Model) handlePeopleNewFieldKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd)
 	case "left", "h":
 		m.changePeopleFieldChoice(-1)
 		return m, nil
-	case "right", "l", "j", "down":
+	case keyNameRight, "l", "j", "down":
 		m.changePeopleFieldChoice(1)
 		return m, nil
 	case "k", "up":
@@ -262,7 +267,7 @@ func (m Model) submitPeopleNewField() (tea.Model, tea.Cmd) {
 	}
 	form.notice = ""
 	form.submitting = true
-	m.peopleState.requestID++
+	m.peopleState.bumpRequestID()
 	return m, m.createPeopleField(field)
 }
 
@@ -271,11 +276,11 @@ func (m Model) handlePeopleAttributeValueKey(msg tea.KeyPressMsg) (tea.Model, te
 	switch msg.String() {
 	case keyNameEsc:
 		if form.submitting {
-			m.peopleState.requestID++
+			m.peopleState.bumpRequestID()
 		}
 		form.close()
 		return m, nil
-	case "ctrl+c":
+	case keyNameCtrlC:
 		m.quitting = true
 		return m, tea.Quit
 	case "ctrl+s":
@@ -316,7 +321,7 @@ func (m Model) submitPeopleAttribute() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		form.notice = "Reloading the current server value before resubmission..."
-		m.peopleState.requestID++
+		m.peopleState.bumpRequestID()
 		m.peopleState.attributesLoading = true
 		m.loading = true
 		return m, m.loadPeopleAttributes(
@@ -344,7 +349,7 @@ func (m Model) submitPeopleAttribute() (tea.Model, tea.Cmd) {
 	}
 	form.notice = ""
 	form.submitting = true
-	m.peopleState.requestID++
+	m.peopleState.bumpRequestID()
 	return m, m.setPeopleAttribute(request)
 }
 
@@ -707,6 +712,8 @@ func (m Model) peopleFormView() string {
 		return m.peopleNewFieldFormView()
 	case peopleOverlayAttributeValue:
 		return m.peopleAttributeValueFormView()
+	case peopleOverlayBriefCommand:
+		return m.peopleBriefCommandFormView()
 	default:
 		return ""
 	}

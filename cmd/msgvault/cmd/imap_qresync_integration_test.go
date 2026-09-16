@@ -25,11 +25,16 @@ import (
 )
 
 type scriptedRFC7162Message struct {
-	UID       imapapi.UID
-	MessageID string
-	Subject   string
-	Flags     []imapapi.Flag
-	ModSeq    uint64
+	UID        imapapi.UID
+	MessageID  string
+	Subject    string
+	Body       string
+	MissingRaw bool
+	Flags      []imapapi.Flag
+	ModSeq     uint64
+	// Raw overrides the synthesized message bytes verbatim (already CRLF
+	// encoded) so tests can vary recipients, attachments, and HTML.
+	Raw string
 }
 
 type scriptedRFC7162Mailbox struct {
@@ -383,31 +388,43 @@ func writeScriptedRFC7162Fetch(
 	command string,
 	mailbox scriptedRFC7162Mailbox,
 ) {
-	headerOnly := strings.Contains(strings.ToUpper(command), "HEADER.FIELDS")
+	upper := strings.ToUpper(command)
+	headerOnly := strings.Contains(upper, "HEADER.FIELDS")
 	for _, uid := range parseScriptedRFC7162UIDSet(command) {
 		message, ok := scriptedRFC7162MessageByUID(mailbox.Messages, uid)
 		if !ok {
 			continue
 		}
 		sequence := scriptedRFC7162Sequence(mailbox.Messages, uid)
+		modSeq := ""
+		if strings.Contains(upper, "MODSEQ") {
+			modSeq = fmt.Sprintf(" MODSEQ (%d)", message.ModSeq)
+		}
 		if headerOnly {
 			body := "\r\n"
 			if message.MessageID != "" {
 				body = fmt.Sprintf("Message-ID: <%s>\r\n\r\n", message.MessageID)
 			}
 			_, _ = fmt.Fprintf(w,
-				"* %d FETCH (UID %d FLAGS (%s) BODY[HEADER.FIELDS (MESSAGE-ID)] {%d}\r\n%s)\r\n",
-				sequence, uid, formatScriptedRFC7162Flags(message.Flags), len(body), body)
+				"* %d FETCH (UID %d FLAGS (%s)%s BODY[HEADER.FIELDS (MESSAGE-ID)] {%d}\r\n%s)\r\n",
+				sequence, uid, formatScriptedRFC7162Flags(message.Flags), modSeq, len(body), body)
+			continue
+		}
+		if message.MissingRaw {
+			_, _ = fmt.Fprintf(w, "* %d FETCH (UID %d FLAGS (%s))\r\n", sequence, uid, formatScriptedRFC7162Flags(message.Flags))
 			continue
 		}
 		raw := scriptedRFC7162RawMessage(message)
 		_, _ = fmt.Fprintf(w,
-			"* %d FETCH (UID %d FLAGS (%s) INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" RFC822.SIZE %d BODY[] {%d}\r\n%s)\r\n",
-			sequence, uid, formatScriptedRFC7162Flags(message.Flags), len(raw), len(raw), raw)
+			"* %d FETCH (UID %d FLAGS (%s)%s INTERNALDATE \"01-Jan-2024 00:00:00 +0000\" RFC822.SIZE %d BODY[] {%d}\r\n%s)\r\n",
+			sequence, uid, formatScriptedRFC7162Flags(message.Flags), modSeq, len(raw), len(raw), raw)
 	}
 }
 
 func scriptedRFC7162RawMessage(message scriptedRFC7162Message) string {
+	if message.Raw != "" {
+		return message.Raw
+	}
 	subject := message.Subject
 	if subject == "" {
 		subject = "Synthetic message"
@@ -416,9 +433,13 @@ func scriptedRFC7162RawMessage(message scriptedRFC7162Message) string {
 	if message.MessageID != "" {
 		messageIDHeader = fmt.Sprintf("Message-ID: <%s>\r\n", message.MessageID)
 	}
+	body := message.Body
+	if body == "" {
+		body = "Synthetic body."
+	}
 	return fmt.Sprintf(
-		"From: sender@example.test\r\nTo: recipient@example.test\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n%sSubject: %s\r\n\r\nSynthetic body.\r\n",
-		messageIDHeader, subject)
+		"From: sender@example.test\r\nTo: recipient@example.test\r\nDate: Mon, 1 Jan 2024 00:00:00 +0000\r\n%sSubject: %s\r\n\r\n%s\r\n",
+		messageIDHeader, subject, body)
 }
 
 func newScriptedRFC7162Client(
@@ -927,7 +948,13 @@ func TestIMAPQresyncEndToEndMoveAndFinalExpunge(t *testing.T) {
 			queryScriptedRFC7162Memberships(t, st, source.ID))
 		_, deleted, _ := queryScriptedRFC7162MessageState(t, st, source.ID, "move@example.test")
 		assertions.False(deleted)
-		assertions.NotContains(server.commandsFor(2), "UID SEARCH")
+		// The message left INBOX mid-run, so no FETCH returns UID 1 and the run
+		// confirms that with a UID SEARCH naming it. What QRESYNC must not do
+		// is enumerate the mailbox, which is an open-ended range search.
+		assertions.NotRegexp(`UID SEARCH UID \d+:\*`, server.commandsFor(2),
+			"valid QRESYNC must not fall back to enumerating a mailbox")
+		assertions.Contains(server.commandsFor(2), "UID SEARCH UID 1",
+			"a UID no FETCH returned is confirmed before it counts as gone")
 	})
 
 	t.Run("final expunge tombstones the archived message", func(t *testing.T) {
@@ -1404,7 +1431,7 @@ func TestIMAPQresyncEndToEndGmailAllIncrementalUnidentifiedMembershipUsesDurable
 	})
 	second, _ := requireScriptedRFC7162Sync(t, st, identifier, addr)
 	requirements.NoError(second.Close())
-	aliases, err := st.GetIMAPSourceMessageAliases(source.ID)
+	aliases, err := st.GetIMAPSourceMessageAliases(source.ID, "INBOX", []uint32{1})
 	requirements.NoError(err)
 	assertions.Equal("[Gmail]/All Mail|1", aliases["INBOX|1"])
 

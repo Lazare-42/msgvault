@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"go.kenn.io/msgvault/internal/accountops"
+	"go.kenn.io/msgvault/internal/agentgrant"
 	"go.kenn.io/msgvault/internal/apiprotocol"
 	"go.kenn.io/msgvault/internal/cacheops"
 	"go.kenn.io/msgvault/internal/clirun"
@@ -304,6 +305,10 @@ type CLIVerifyRunner interface {
 	RunCLIVerify(ctx context.Context, req CLIVerifyRequest, emit func(CLIVerifyEvent) error) error
 }
 
+type CLIRepairMessageRunner interface {
+	RunCLIRepairMessage(ctx context.Context, req CLIRepairMessageRequest, emit func(CLIRepairMessageEvent) error) error
+}
+
 type CLIRunner interface {
 	RunCLICommand(ctx context.Context, req CLIRunRequest, emit func(CLIRunEvent) error) error
 }
@@ -465,6 +470,7 @@ type CLISyncRequest struct {
 	Before      string
 	After       string
 	Limit       int
+	OperationID string
 	Folders     []string
 	SkipFolders []string
 }
@@ -494,11 +500,26 @@ type CLIRepairEncodingEvent struct {
 	Error string `json:"error,omitempty"`
 }
 
+type CLIRepairMessageRequest struct {
+	Reference string `json:"reference,omitempty"`
+	SourceID  int64  `json:"source_id,omitempty"`
+	Audit     bool   `json:"audit,omitempty"`
+	JSON      bool   `json:"json,omitempty"`
+}
+
+type CLIRepairMessageEvent struct {
+	Type  string `json:"type"`
+	Data  string `json:"data,omitempty"`
+	Error string `json:"error,omitempty"`
+}
+
 type CLIRunRequest struct {
 	Args         []string          `json:"args"`
 	Env          map[string]string `json:"env,omitempty"`
 	Cwd          string            `json:"cwd,omitempty"`
 	GrantDecided bool              `json:"-"`
+	// Grant carries the authenticated agent grant when classified AuthModeDelegated. Never decoded from the wire.
+	Grant *agentgrant.Grant `json:"-"`
 }
 
 type CLIAddCalendarPlanRequest struct {
@@ -573,6 +594,7 @@ type CLIDeletionManifestResponse struct {
 }
 
 type CLIDeduplicatePlanRequest struct {
+	PlanProtocol               string `json:"plan_protocol" enum:"explicit-backfill-v1"`
 	Account                    string `json:"account,omitempty"`
 	Collection                 string `json:"collection,omitempty"`
 	Prefer                     string `json:"prefer,omitempty"`
@@ -587,14 +609,14 @@ type CLIDeduplicatePlanResponse struct {
 }
 
 type CLIDeduplicatePlanItem struct {
-	SourceID          int64  `json:"source_id,omitempty"`
-	ScopeLabel        string `json:"scope_label,omitempty"`
-	ScopeIsCollection bool   `json:"scope_is_collection,omitempty"`
-	Stdout            string `json:"stdout,omitempty"`
-	DuplicateMessages int    `json:"duplicate_messages,omitempty"`
-	BackfilledCount   int64  `json:"backfilled_count,omitempty"`
-	PlanFingerprint   string `json:"plan_fingerprint,omitempty"`
-	NeedsConfirmation bool   `json:"needs_confirmation"`
+	SourceID             int64  `json:"source_id,omitempty"`
+	ScopeLabel           string `json:"scope_label,omitempty"`
+	ScopeIsCollection    bool   `json:"scope_is_collection,omitempty"`
+	Stdout               string `json:"stdout,omitempty"`
+	DuplicateMessages    int    `json:"duplicate_messages,omitempty"`
+	PendingBackfillCount int64  `json:"pending_backfill_count,omitempty"`
+	PlanFingerprint      string `json:"plan_fingerprint,omitempty"`
+	NeedsConfirmation    bool   `json:"needs_confirmation"`
 }
 
 type CLIRunEvent struct {
@@ -623,7 +645,7 @@ type cliDeleteDedupedExecuteRequest struct {
 	NoBackup           bool                            `json:"no_backup,omitempty"`
 	ExpectedTotal      *int64                          `json:"expected_total" nullable:"false"`
 	ExpectedBatchCount *int64                          `json:"expected_batch_count" nullable:"false"`
-	ExpectedBatches    []cliDeleteDedupedBatchResponse `json:"expected_batches" nullable:"false"`
+	ExpectedBatches    []cliDeleteDedupedBatchResponse `json:"expected_batches"`
 }
 
 func (r cliDeleteDedupedExecuteRequest) scope() cliDeleteDedupedScopeRequest {
@@ -810,6 +832,7 @@ type cliAccountResponse struct {
 type cliMessageResponse struct {
 	ID                   int64                  `json:"id"`
 	SourceMessageID      string                 `json:"source_message_id"`
+	RFC822MessageID      string                 `json:"rfc822_message_id,omitempty"`
 	ConversationID       int64                  `json:"conversation_id"`
 	SourceConversationID string                 `json:"source_conversation_id"`
 	Subject              string                 `json:"subject"`
@@ -1219,6 +1242,53 @@ func (s *Server) handleCLIRepairEncoding(w http.ResponseWriter, r *http.Request)
 	}
 }
 
+func (s *Server) handleCLIRepairMessage(w http.ResponseWriter, r *http.Request) {
+	runner, ok := s.store.(CLIRepairMessageRunner)
+	if !ok {
+		writeAPIHTTPError(w, cliStoreUnavailableError())
+		return
+	}
+	var req CLIRepairMessageRequest
+	dec := json.NewDecoder(r.Body)
+	if err := dec.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "invalid JSON request body")
+		return
+	}
+	if !requireSingleJSONValue(w, dec, "invalid_request") {
+		return
+	}
+	req.Reference = strings.TrimSpace(req.Reference)
+	if req.Audit {
+		if req.Reference != "" {
+			writeError(w, http.StatusBadRequest, "invalid_request", "audit does not accept a reference")
+			return
+		}
+	} else if req.Reference == "" {
+		writeError(w, http.StatusBadRequest, "invalid_request", "reference is required unless audit is true")
+		return
+	}
+	if req.SourceID < 0 {
+		writeError(w, http.StatusBadRequest, "invalid_request", "source_id must be positive")
+		return
+	}
+	if req.JSON && !req.Audit {
+		writeError(w, http.StatusBadRequest, "invalid_request", "json requires audit")
+		return
+	}
+
+	writeEvent := newCLINDJSONEventWriter[CLIRepairMessageEvent](w)
+	if err := runner.RunCLIRepairMessage(r.Context(), req, writeEvent); err != nil {
+		s.logger.Error("failed to run CLI repair-message", "audit", req.Audit, "source_id", req.SourceID, "error", err)
+		if writeErr := writeEvent(CLIRepairMessageEvent{Type: cliStreamEventTypeError, Error: err.Error()}); writeErr != nil {
+			s.logger.Error("failed to stream CLI repair-message error event", "error", writeErr)
+		}
+		return
+	}
+	if err := writeEvent(CLIRepairMessageEvent{Type: cliStreamEventTypeComplete}); err != nil {
+		s.logger.Error("failed to stream CLI repair-message completion event", "error", err)
+	}
+}
+
 func (s *Server) handleCLIRun(w http.ResponseWriter, r *http.Request) {
 	runner, ok := s.store.(CLIRunner)
 	if !ok {
@@ -1242,6 +1312,14 @@ func (s *Server) handleCLIRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "command_not_allowed", "command is not allowed through the daemon CLI runner")
 		return
 	}
+	auth := s.requestAuthentication(r)
+	if auth.Mode == AuthModeDelegated {
+		if !IsCLIRunDraftReply(req.Args) {
+			writeError(w, http.StatusBadRequest, "command_not_allowed", "command is not allowed through the daemon CLI runner")
+			return
+		}
+		req.Grant = auth.Grant
+	}
 	if cliRunArgsContainFlag(req.Args, "grant-decided") {
 		writeError(w, http.StatusBadRequest, "invalid_args", "--grant-decided is not accepted through the daemon CLI runner")
 		return
@@ -1263,7 +1341,11 @@ func (s *Server) handleCLIRun(w http.ResponseWriter, r *http.Request) {
 
 	writeEvent := newCLINDJSONEventWriter[CLIRunEvent](w)
 	if err := runner.RunCLICommand(r.Context(), req, writeEvent); err != nil {
-		s.logger.Error("failed to run CLI command", "args", req.Args, "error", err)
+		if coded, ok := errors.AsType[*CLIRunCodedError](err); ok {
+			s.logger.Error("failed to run CLI command", "command", req.Args[0], "error_code", coded.Code, "cause", coded.Err)
+		} else {
+			s.logger.Error("failed to run CLI command", "args", req.Args, "error", err)
+		}
 		if writeErr := writeEvent(CLIRunEvent{Type: cliStreamEventTypeError, Error: err.Error()}); writeErr != nil {
 			s.logger.Error("failed to stream CLI run error event", "error", writeErr)
 		}
@@ -1275,12 +1357,18 @@ func (s *Server) handleCLIRun(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) cliRunEnvAllowedForCommand(args []string, name string) bool {
+	if IsCLIRunDraftReply(args) {
+		return false
+	}
 	if len(args) >= 3 && args[0] == cliRunPersonCommand {
 		providerCall := args[1] == "provider" && args[2] == "check"
 		sweepCall := args[1] == "sweep" && args[2] == "run"
-		if providerCall || sweepCall {
+		if sweepCall {
 			keyEnv := s.configuredPeopleProviderKeyEnv()
 			return keyEnv != "" && keyEnv == name
+		}
+		if providerCall {
+			return s.cliRunSavedProviderCheckEnvAllowed(args, name)
 		}
 		enrichmentRun := args[1] == "enrichment" && args[2] == "run"
 		if enrichmentRun {
@@ -1296,6 +1384,33 @@ func (s *Server) cliRunEnvAllowedForCommand(args []string, name string) bool {
 		return false
 	}
 	return s.cliRunEnvAllowed(name)
+}
+
+// Local onboarding may supply the selected profile's key for one synthetic
+// check. Ordinary checks continue to use daemon-owned credentials.
+func (s *Server) cliRunSavedProviderCheckEnvAllowed(args []string, name string) bool {
+	fingerprint, ok := cliRunFlagValue(args, "if-fingerprint")
+	if !ok || !cliRunPersonProviderArgsAllowed("check", args[3:]) {
+		return false
+	}
+	var profileName string
+	for i := 3; i < len(args); i++ {
+		if args[i] == "--if-fingerprint" {
+			i++
+		} else if !strings.HasPrefix(args[i], "--") {
+			profileName = args[i]
+		}
+	}
+	sweep, ok := s.currentPeopleSweepConfig()
+	if !ok || profileName == "" {
+		return false
+	}
+	sweep.Enabled = true
+	sweep.Provider = peoplesweep.ProviderSelection{Name: profileName}
+	profile, err := sweep.Profile()
+	return err == nil && profile.Fingerprint == fingerprint &&
+		profile.Auth != peoplesweep.AuthNone && profile.Credential == peoplesweep.CredentialEnv &&
+		profile.CredentialRef == name
 }
 
 func (s *Server) cliRunPersonEnrichmentRunEnvAllowed(args []string, name string) bool {
@@ -1483,6 +1598,9 @@ func cliRunCommandAllowed(args []string) bool {
 	if len(args) == 0 {
 		return false
 	}
+	if IsCLIRunDraftReply(args) {
+		return len(args) >= 2
+	}
 	if args[0] == "backup" {
 		return len(args) >= 2 && args[1] == "create"
 	}
@@ -1517,10 +1635,7 @@ func cliRunCommandAllowed(args []string) bool {
 		}
 		switch args[1] {
 		case "provider":
-			switch args[2] {
-			case "status", "consent", "revoke", "check", "login", "models":
-				return true
-			}
+			return cliRunPersonProviderArgsAllowed(args[2], args[3:])
 		case "sweep":
 			switch args[2] {
 			case "run", "status", "history":
@@ -1531,6 +1646,7 @@ func cliRunCommandAllowed(args []string) bool {
 	}
 	switch args[0] {
 	case "add-account",
+		"archive-remote-images",
 		"activity",
 		"add-beeper",
 		"add-calendar",
@@ -1538,6 +1654,7 @@ func cliRunCommandAllowed(args []string) bool {
 		"add-discord",
 		"add-granola",
 		"add-imap",
+		"add-notion-meetings",
 		"add-o365",
 		"add-slack",
 		"add-synctech-sms-drive",
@@ -1554,13 +1671,17 @@ func cliRunCommandAllowed(args []string) bool {
 		"embeddings",
 		"export-discord",
 		"export-messages",
+		"gc",
 		"import",
+		"import-maildir",
+		"import-eml",
 		"import-emlx",
 		"import-gvoice",
 		"import-imessage",
 		"import-mbox",
 		"import-messenger",
 		"import-pst",
+		"import-slackdump",
 		"import-synctech-sms",
 		"import-whatsapp",
 		"list-deletions",
@@ -1570,6 +1691,9 @@ func cliRunCommandAllowed(args []string) bool {
 		"purge-excluded-media",
 		"repair-dates",
 		"repair-identity",
+		"repair-labels",
+		"repair-list-ids",
+		"repair-senders",
 		"repack-attachments",
 		"remove-account",
 		"repair-derived",
@@ -1579,6 +1703,7 @@ func cliRunCommandAllowed(args []string) bool {
 		"sync-circleback",
 		"sync-discord",
 		"sync-granola",
+		"sync-notion-meetings",
 		"sync-slack",
 		"sync-synctech-sms",
 		"sync-teams":
@@ -1586,6 +1711,117 @@ func cliRunCommandAllowed(args []string) bool {
 	default:
 		return false
 	}
+}
+
+func cliRunPersonProviderArgsAllowed(operation string, args []string) bool {
+	boolFlags := map[string]bool{}
+	valueFlags := map[string]bool{}
+	maxPositionals := 0
+	switch operation {
+	case "list":
+		boolFlags["json"] = true
+	case "status":
+		maxPositionals = 1
+		for _, name := range []string{"all", "json", "semantic-embeddings"} {
+			boolFlags[name] = true
+		}
+	case "consent":
+		maxPositionals = 1
+		for _, name := range []string{"yes", "json", "semantic-embeddings"} {
+			boolFlags[name] = true
+		}
+	case "revoke":
+		maxPositionals = 1
+		for _, name := range []string{"all", "json", "semantic-embeddings"} {
+			boolFlags[name] = true
+		}
+		valueFlags["if-fingerprint"] = true
+		valueFlags["fingerprint"] = true
+	case "history":
+		maxPositionals = 1
+		boolFlags["json"] = true
+		valueFlags["limit"] = true
+		valueFlags["person"] = true
+	case "check":
+		maxPositionals = 1
+		boolFlags["json"] = true
+		valueFlags["if-fingerprint"] = true
+	case "reverify":
+		maxPositionals = 1
+		boolFlags["yes"] = true
+		boolFlags["json"] = true
+	default:
+		return false
+	}
+
+	positionals := 0
+	guardedRevoke := false
+	pendingValueFlag := ""
+	consumeValue := func(name, value string) bool {
+		if value == "" || strings.HasPrefix(value, "-") {
+			return false
+		}
+		if name == "if-fingerprint" && !validPersonProviderFingerprint(value) {
+			return false
+		}
+		guardedRevoke = guardedRevoke || name == "if-fingerprint"
+		return true
+	}
+	for _, argument := range args {
+		if pendingValueFlag != "" {
+			if !consumeValue(pendingValueFlag, argument) {
+				return false
+			}
+			pendingValueFlag = ""
+			continue
+		}
+		if !strings.HasPrefix(argument, "--") {
+			positionals++
+			if positionals > maxPositionals || peoplesweep.ValidateProviderProfileName(argument) != nil {
+				return false
+			}
+			continue
+		}
+		nameValue := strings.TrimPrefix(argument, "--")
+		name, value, hasValue := strings.Cut(nameValue, "=")
+		if boolFlags[name] {
+			if hasValue {
+				if _, err := strconv.ParseBool(value); err != nil {
+					return false
+				}
+			}
+			continue
+		}
+		if !valueFlags[name] {
+			return false
+		}
+		if !hasValue {
+			pendingValueFlag = name
+			continue
+		}
+		if !consumeValue(name, value) {
+			return false
+		}
+	}
+	if pendingValueFlag != "" {
+		return false
+	}
+	if guardedRevoke && positionals != 1 {
+		return false
+	}
+	return true
+}
+
+func validPersonProviderFingerprint(fingerprint string) bool {
+	if len(fingerprint) != 64 {
+		return false
+	}
+	for _, value := range fingerprint {
+		if !strings.ContainsRune("0123456789abcdef", value) {
+			return false
+		}
+	}
+	return true
 }
 
 func cliRunPersonEnrichmentAllowed(args []string) bool {
@@ -1731,9 +1967,9 @@ func newCLINDJSONEventWriter[T any](w http.ResponseWriter) func(T) error {
 	}
 }
 
-// cliRunEnvAllowed permits the static forwarding allowlist plus config-named
-// provider API key variables, which the frontend CLI forwards so a key
-// exported in the caller's shell reaches the daemon subprocess.
+// cliRunEnvAllowed permits the static forwarding allowlist plus configured
+// provider variables used by non-check commands. Provider checks use the
+// separate fingerprint-bound policy in cliRunSavedProviderCheckEnvAllowed.
 func (s *Server) cliRunEnvAllowed(name string) bool {
 	if clirun.EnvAllowed(name) {
 		return true
@@ -1760,11 +1996,33 @@ func (s *Server) cliRunEnvAllowed(name string) bool {
 }
 
 func (s *Server) configuredPeopleProviderKeyEnv() string {
-	if s.cfg == nil ||
-		s.cfg.People.Sweep.Provider.Kind != peoplesweep.ProviderOpenAICompatible {
+	sweep, ok := s.currentPeopleSweepConfig()
+	if !ok {
 		return ""
 	}
-	return s.cfg.People.Sweep.Provider.APIKeyEnv
+	_, provider, err := sweep.ActiveProviderConfig()
+	if err != nil || provider.Credential != peoplesweep.CredentialEnv {
+		return ""
+	}
+	return provider.CredentialEnv
+}
+
+func (s *Server) currentPeopleSweepConfig() (peoplesweep.Config, bool) {
+	if s.cfg == nil {
+		return peoplesweep.Config{}, false
+	}
+	snapshot, err := config.ReadConfigFile(s.cfg.ConfigFilePath())
+	if err != nil {
+		return peoplesweep.Config{}, false
+	}
+	if !snapshot.Exists {
+		return s.cfg.People.Sweep, true
+	}
+	loaded, err := config.LoadConfigFile(snapshot, s.cfg.HomeDir)
+	if err != nil {
+		return peoplesweep.Config{}, false
+	}
+	return loaded.People.Sweep, true
 }
 
 func (s *Server) cliDedupDeleteStore() (CLIDedupDeleteStore, *apiHTTPError) {
@@ -3057,6 +3315,7 @@ func cliMessageResponseFromQuery(msg *query.MessageDetail) cliMessageResponse {
 	return cliMessageResponse{
 		ID:                   msg.ID,
 		SourceMessageID:      msg.SourceMessageID,
+		RFC822MessageID:      msg.RFC822MessageID,
 		ConversationID:       msg.ConversationID,
 		SourceConversationID: msg.SourceConversationID,
 		Subject:              msg.Subject,
@@ -3113,7 +3372,7 @@ func cliCollectionResponseFromStore(
 		Name:               coll.Name,
 		Description:        coll.Description,
 		CreatedAt:          coll.CreatedAt,
-		SourceIDs:          append([]int64(nil), coll.SourceIDs...),
+		SourceIDs:          append([]int64{}, coll.SourceIDs...),
 		MessageCount:       coll.MessageCount,
 		SourceDeletedCount: coll.SourceDeletedCount,
 		Sources:            make([]cliCollectionSourceResponse, 0, len(coll.SourceIDs)),

@@ -100,22 +100,21 @@ func TestEmailModeScopesMessageQueries(t *testing.T) {
 	})
 
 	t.Run("deep search", func(t *testing.T) {
-		assert := assert.New(t)
-		require := require.New(t)
-		var captured *search.Query
+		var captured query.MessageFilter
 		engine := newMockEngine(MockConfig{})
-		engine.SearchFunc = func(_ context.Context, q *search.Query, _, _ int) ([]query.MessageSummary, error) {
-			captured = q
+		engine.SearchDeepFunc = func(
+			_ context.Context, _ *search.Query, filter query.MessageFilter, _, _ int,
+		) ([]query.MessageSummary, error) {
+			captured = filter
 			return nil, nil
 		}
 		model := New(engine, Options{DataDir: t.TempDir(), Version: "test"})
 		model.searchMode = searchModeDeep
 
 		msg, ok := model.loadSearch("shared term")().(searchResultsMsg)
-		require.True(ok)
-		require.NoError(msg.err)
-		require.NotNil(captured)
-		assert.Equal([]string{emailMessageType}, captured.MessageTypes)
+		require.True(t, ok)
+		require.NoError(t, msg.err)
+		assert.Equal(t, emailMessageType, captured.MessageType)
 	})
 
 	t.Run("thread", func(t *testing.T) {
@@ -132,4 +131,24 @@ func TestEmailModeScopesMessageQueries(t *testing.T) {
 		require.NoError(t, msg.err)
 		assert.Equal(t, emailMessageType, captured.MessageType)
 	})
+}
+
+func TestConversationOnlyDrillScopesMessageReload(t *testing.T) {
+	require := require.New(t)
+	var captured query.MessageFilter
+	engine := newMockEngine(MockConfig{})
+	engine.ListMessagesFunc = func(_ context.Context, filter query.MessageFilter) ([]query.MessageSummary, error) {
+		captured = filter
+		return nil, nil
+	}
+	conversationID := int64(42)
+	model := New(engine, Options{DataDir: t.TempDir(), Version: "test"})
+	model.allMessages = true
+	model.drillFilter = query.MessageFilter{ConversationID: &conversationID}
+
+	msg, ok := model.loadMessages()().(messagesLoadedMsg)
+	require.True(ok)
+	require.NoError(msg.err)
+	require.NotNil(captured.ConversationID)
+	assert.Equal(t, conversationID, *captured.ConversationID)
 }

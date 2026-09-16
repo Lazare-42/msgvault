@@ -52,8 +52,8 @@ func (s *Store) ListWhatsAppConversationsForSource(sourceID int64) ([]WhatsAppMe
 // archive for the purpose of replaying it into a target archive. Only the
 // fields the merge engine needs to reconstruct an equivalent Message are
 // included; message_bodies and message_raw are fetched separately by PK
-// lookup (see GetMessageBodyText / Store.GetMessageRaw) to keep this bulk
-// list query off those tables per the project's SQL guidelines.
+// lookup (see GetMessageBodyTextAndHTML / Store.GetMessageRaw) to keep this
+// bulk list query off those tables per the project's SQL guidelines.
 type WhatsAppMergeMessage struct {
 	ID               int64
 	SourceMessageID  string
@@ -99,10 +99,10 @@ func (s *Store) ListWhatsAppMessagesForConversation(conversationID int64) ([]Wha
 	return out, rows.Err()
 }
 
-// GetMessageBodyText fetches body_text/body_html for messageID by primary
-// key. found is false when the message has no message_bodies row (e.g. a
-// media-only message with no caption).
-func (s *Store) GetMessageBodyText(messageID int64) (bodyText, bodyHTML sql.NullString, found bool, err error) {
+// GetMessageBodyTextAndHTML fetches body_text/body_html for messageID by
+// primary key. found is false when the message has no message_bodies row
+// (e.g. a media-only message with no caption).
+func (s *Store) GetMessageBodyTextAndHTML(messageID int64) (bodyText, bodyHTML sql.NullString, found bool, err error) {
 	err = s.db.QueryRow(`
 		SELECT body_text, body_html FROM message_bodies WHERE message_id = ?
 	`, messageID).Scan(&bodyText, &bodyHTML)

@@ -1,17 +1,22 @@
 package tui
 
 import (
+	"errors"
+	"fmt"
 	"time"
 
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
 	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/search"
 )
 
 // Key names matched against tea.KeyPressMsg.String() in the key-handling switches.
 const (
 	keyNameEnter     = "enter"
 	keyNameEsc       = "esc"
+	keyNameCtrlC     = "ctrl+c"
+	keyNameUp        = "up"
 	keyNameDown      = "down"
 	keyNameCtrlN     = "ctrl+n"
 	keyNameCtrlP     = "ctrl+p"
@@ -19,6 +24,7 @@ const (
 	keyNameBackspace = "backspace"
 	keyNameCtrlU     = "ctrl+u"
 	keyNameCtrlD     = "ctrl+d"
+	keyNameRight     = "right"
 	keyNamePageUp    = "pgup"
 	keyNamePageDown  = "pgdown"
 	keyNameHome      = "home"
@@ -30,6 +36,7 @@ const (
 	helpLabelBack      = "Esc back"
 	helpLabelEsc       = "Esc"
 	helpLabelEnter     = "Enter"
+	helpLabelMode      = "m mode"
 	sourceTypeWhatsApp = "whatsapp"
 )
 
@@ -42,9 +49,15 @@ func (m Model) handleInlineSearchKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 	case keyNameEsc:
 		return m.cancelInlineSearch()
 
-	case "ctrl+c":
+	case keyNameCtrlC:
 		m.quitting = true
 		return m, tea.Quit
+
+	case keyNameUp:
+		return m.navigateInlineSearchHistory(-1)
+
+	case keyNameDown:
+		return m.navigateInlineSearchHistory(1)
 
 	case keyNameTab:
 		// Toggle search mode — only meaningful at message list level
@@ -58,10 +71,17 @@ func (m Model) handleInlineSearchKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 		m.searchInput.Placeholder = m.searchPlaceholder()
 		m.inlineSearchDebounce++
 		if query := m.searchInput.Value(); query != "" {
+			if err := m.searchInputValidationError(query); err != nil {
+				m.invalidateInlineSearchRequests()
+				m.inlineSearchLoading = false
+				m.inlineSearchError = err.Error()
+				return m, nil
+			}
+			m.inlineSearchError = ""
 			m.searchQuery = query
 			m.inlineSearchLoading = true
 			spinCmd := m.startSpinner()
-			m.searchRequestID++
+			m.invalidateInlineSearchRequests()
 			m.prepareSearchReplacement()
 			return m, tea.Batch(spinCmd, m.loadSearch(query))
 		}
@@ -69,39 +89,85 @@ func (m Model) handleInlineSearchKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 
 	default:
 		// Pass key to text input
+		previousQuery := m.searchInput.Value()
 		var cmd tea.Cmd
 		m.searchInput, cmd = m.searchInput.Update(msg)
-
-		// Trigger debounced search (Fast: 100ms, Deep: 500ms)
-		query := m.searchInput.Value()
-		m.inlineSearchDebounce++
-		debounceID := m.inlineSearchDebounce
-
-		delay := inlineSearchDebounceDelay
-		if m.searchMode != searchModeFast {
-			delay = deepSearchDebounceDelay
+		if m.searchHistoryIndex >= 0 && m.searchInput.Value() != previousQuery {
+			m.resetInlineSearchHistoryNavigation()
 		}
-
-		// Show loading spinner immediately while waiting for debounce
-		var spinCmd tea.Cmd
-		if query != "" {
-			m.inlineSearchLoading = true
-			spinCmd = m.startSpinner()
-		} else {
-			m.inlineSearchLoading = false
-		}
-
-		debounceCmd := tea.Tick(delay, func(t time.Time) tea.Msg {
-			return searchDebounceMsg{query: query, debounceID: debounceID}
-		})
-
-		return m, tea.Batch(cmd, spinCmd, debounceCmd)
+		return m.scheduleInlineSearch(cmd)
 	}
+}
+
+func (m Model) navigateInlineSearchHistory(direction int) (tea.Model, tea.Cmd) {
+	if len(m.searchHistory) == 0 {
+		return m, nil
+	}
+
+	if m.searchHistoryIndex < 0 {
+		if direction > 0 {
+			return m, nil
+		}
+		m.searchHistoryDraft = m.searchInput.Value()
+		m.searchHistoryIndex = len(m.searchHistory)
+	}
+
+	if direction < 0 && m.searchHistoryIndex > 0 {
+		m.searchHistoryIndex--
+		m.searchInput.SetValue(m.searchHistory[m.searchHistoryIndex])
+	} else if direction > 0 {
+		if m.searchHistoryIndex < len(m.searchHistory)-1 {
+			m.searchHistoryIndex++
+			m.searchInput.SetValue(m.searchHistory[m.searchHistoryIndex])
+		} else {
+			m.searchInput.SetValue(m.searchHistoryDraft)
+			m.resetInlineSearchHistoryNavigation()
+		}
+	}
+
+	return m.scheduleInlineSearch(nil)
+}
+
+func (m Model) scheduleInlineSearch(inputCmd tea.Cmd) (tea.Model, tea.Cmd) {
+	query := m.searchInput.Value()
+	if query != m.searchQuery {
+		m.invalidateInlineSearchRequests()
+	}
+	m.inlineSearchError = ""
+	m.inlineSearchDebounce++
+	debounceID := m.inlineSearchDebounce
+
+	delay := inlineSearchDebounceDelay
+	if m.searchMode != searchModeFast {
+		delay = deepSearchDebounceDelay
+	}
+
+	var spinCmd tea.Cmd
+	if query != "" {
+		m.inlineSearchLoading = true
+		spinCmd = m.startSpinner()
+	} else {
+		m.inlineSearchLoading = false
+	}
+
+	debounceCmd := tea.Tick(delay, func(time.Time) tea.Msg {
+		return searchDebounceMsg{query: query, debounceID: debounceID}
+	})
+	return m, tea.Batch(inputCmd, spinCmd, debounceCmd)
+}
+
+func (m *Model) invalidateInlineSearchRequests() {
+	if m.level == levelMessageList {
+		m.searchRequestID++
+		m.loadRequestID++
+		return
+	}
+	m.aggregateRequestID++
 }
 
 func (m Model) currentSearchFilter() query.MessageFilter {
 	filter := m.drillFilter
-	filter.SourceID = m.accountFilter
+	m.sourceScope.apply(&filter)
 	filter.WithAttachmentsOnly = m.filters.attachmentsOnly
 	filter.HideDeletedFromSource = m.filters.hideDeletedFromSource
 	return filter
@@ -112,9 +178,15 @@ func (m Model) semanticSearchAvailable() bool {
 		query.SemanticMessageSearchSupportsFilter(m.currentSearchFilter())
 }
 
+func (m Model) deepSearchAvailable() bool {
+	filter := m.currentSearchFilter()
+	return filter.SourceIDs == nil || len(filter.SourceIDs) == 1
+}
+
 func (m *Model) syncSearchScope() {
 	m.searchFilter = m.currentSearchFilter()
-	if m.searchMode == searchModeSemantic && !m.semanticSearchAvailable() {
+	if (m.searchMode == searchModeDeep && !m.deepSearchAvailable()) ||
+		(m.searchMode == searchModeSemantic && !m.semanticSearchAvailable()) {
 		m.searchMode = searchModeFast
 	}
 }
@@ -122,6 +194,9 @@ func (m *Model) syncSearchScope() {
 func (m Model) nextSearchMode() searchModeKind {
 	switch m.searchMode {
 	case searchModeFast:
+		if !m.deepSearchAvailable() {
+			return searchModeFast
+		}
 		return searchModeDeep
 	case searchModeDeep:
 		if m.semanticSearchAvailable() {
@@ -154,7 +229,7 @@ func (m Model) handleGlobalKeys(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 	case "q":
 		m.modal = modalQuitConfirm
 		return m, nil, true
-	case "ctrl+c":
+	case keyNameCtrlC:
 		m.quitting = true
 		return m, tea.Quit, true
 	case "?":
@@ -178,22 +253,7 @@ func (m Model) handleGlobalKeys(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		m.searchLoadingMore = false
 		switch m.mode {
 		case modeTexts:
-			m.textState.filter.SourceID = m.accountFilter
-			var loadCmd tea.Cmd
-			if m.textState.level == textLevelDetail {
-				if m.messageDetail == nil && m.textState.selectedMessageID > 0 {
-					loadCmd = m.loadTextMessage(m.textState.selectedMessageID)
-				}
-			} else if m.textState.level != textLevelTimeline || !m.textState.globalSearchTimeline {
-				loadCmd = m.loadTextData()
-			}
-			if loadCmd == nil {
-				m.loading = false
-				return m, nil, true
-			}
-			m.loading = true
-			spinCmd := m.startSpinner()
-			return m, tea.Batch(spinCmd, loadCmd), true
+			return m, m.activateTextPresentation(), true
 		case modeMeetings:
 			m.meetingState.listLoading = false
 			m.meetingState.searchLoading = false
@@ -286,11 +346,22 @@ func (m Model) handleGlobalKeys(msg tea.KeyPressMsg) (Model, tea.Cmd, bool) {
 		default:
 			m.loading = true
 			m.aggregateRequestID++
+			statsCmd := m.refreshStats()
 			spinCmd := m.startSpinner()
-			return m, tea.Batch(spinCmd, m.loadData(), m.loadStats()), true
+			return m, tea.Batch(spinCmd, m.loadData(), statsCmd), true
 		}
 	}
 	return m, nil, false
+}
+
+func (m *Model) activateTextPresentation() tea.Cmd {
+	loadCmd := m.textPresentationLoadCmd()
+	if loadCmd == nil {
+		m.loading = false
+		return nil
+	}
+	m.loading = true
+	return tea.Batch(m.startSpinner(), loadCmd)
 }
 
 // handleAggregateKeys handles keys in the aggregate and sub-aggregate views.
@@ -384,12 +455,26 @@ func (m Model) handleAggregateKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.loadRequestID++
 		return m, m.loadMessages()
 
-	case "d", "D": // Stage for deletion (selection or current row)
+	case "d": // Stage selected aggregates, or the current row.
 		if !m.hasSelection() && len(m.rows) > 0 && m.cursor < len(m.rows) {
 			// No selection - select current row first
 			m.selection.aggregateKeys[m.rows[m.cursor].Key] = true
 		}
 		return m.stageForDeletion()
+
+	case "D": // Stage every message in the current aggregate row.
+		if m.loading || m.inlineSearchLoading {
+			return m, nil
+		}
+		if len(m.rows) == 0 || m.cursor >= len(m.rows) {
+			return m, nil
+		}
+		dctx := m.deletionContext(true)
+		dctx.AggregateViewType = m.viewType
+		key := m.rows[m.cursor].Key
+		dctx.AggregateMatchKey = &key
+		dctx.MatchFilter = m.actions.buildFilterForAggregate(key, dctx)
+		return m.stageAllMatchesForDeletionContext(dctx)
 
 	// Drill down - go to message list for selected aggregate
 	case keyNameEnter:
@@ -416,6 +501,18 @@ func (m Model) handleAggregateKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			skipView = m.drillViewType
 		}
 		m.cycleViewType(false, skipView)
+		m.resetViewState()
+		m.loading = true
+		m.aggregateRequestID++
+		return m, m.loadData()
+
+	// Lists view: jump directly to List ID aggregates.
+	case "l":
+		if isSub && m.drillViewType == query.ViewLists {
+			// Can't sub-aggregate by the same list dimension we drilled from.
+			return m, nil
+		}
+		m.viewType = query.ViewLists
 		m.resetViewState()
 		m.loading = true
 		m.aggregateRequestID++
@@ -474,6 +571,8 @@ func (m Model) nextSubGroupView(current query.ViewType) query.ViewType {
 	case query.ViewDomains:
 		return query.ViewLabels
 	case query.ViewLabels:
+		return query.ViewLists
+	case query.ViewLists:
 		return query.ViewTime
 	case query.ViewTime:
 		return query.ViewSenders
@@ -502,7 +601,8 @@ func (m Model) handleMessageListKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
 	if (key == keyNamePageDown || key == keyNameCtrlD) &&
 		m.searchQuery != "" && m.searchMode == searchModeDeep &&
-		m.searchTotalCount == -1 && !m.searchLoadingMore && !m.loading &&
+		(m.searchTotalCount < 0 || int64(len(m.messages)) < m.searchTotalCount) &&
+		!m.searchLoadingMore && !m.loading &&
 		m.cursor >= len(m.messages)-1 && len(m.messages) > 0 {
 		m.searchLoadingMore = true
 		m.searchRequestID++
@@ -557,12 +657,15 @@ func (m Model) handleMessageListKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	case "x": // Clear selection
 		m.clearAllSelections()
 
-	case "d", "D": // Stage for deletion (selection or current row)
+	case "d": // Stage selected messages, or the current row.
 		if !m.hasSelection() && len(m.messages) > 0 && m.cursor < len(m.messages) {
 			// No selection - select current row first
 			m.selection.messageIDs[m.messages[m.cursor].ID] = true
 		}
 		return m.stageForDeletion()
+
+	case "D": // Stage every message matching the current filter/search.
+		return m.stageAllMatchesForDeletion()
 
 	// Attachment filter
 	case "f":
@@ -618,6 +721,27 @@ func (m Model) handleMessageListKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.err = nil         // Clear any previous error
 			m.detailRequestID++ // Increment to invalidate stale responses
 			return m, m.loadMessageDetail(m.messages[m.cursor].ID)
+		}
+
+	// Lists sub-grouping: jump directly to sub-aggregate List IDs.
+	case "l":
+		if m.hasActiveSemanticSearch() {
+			return m, nil
+		}
+		if m.hasDrillFilter() && m.drillViewType != query.ViewLists {
+			m.transitionBuffer = m.renderView()
+			m.pushBreadcrumb()
+			m.level = levelDrillDown
+			m.viewType = query.ViewLists
+			m.cursor = 0
+			m.scrollOffset = 0
+			m.rows = nil
+			m.loading = true
+			m.err = nil
+			m.selection.aggregateKeys = make(map[string]bool)
+			m.selection.aggregateViewType = m.viewType
+			m.aggregateRequestID++
+			return m, m.loadData()
 		}
 
 	// Time sub-grouping: jump directly to sub-aggregate Time view
@@ -908,7 +1032,7 @@ func (m Model) handleMessageDetailKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd)
 		return m.navigateDetailPrev()
 
 	// Navigate to next message in list (right = towards last)
-	case "right", "l":
+	case keyNameRight, "l":
 		return m.navigateDetailNext()
 
 	// Scroll content
@@ -971,6 +1095,17 @@ func (m Model) handleMessageDetailKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd)
 			m.loadRequestID++
 			return m, m.loadThreadMessages(m.messageDetail.ConversationID)
 		}
+
+	// Save the current email to the TUI process's working directory.
+	case "s":
+		if m.loading || m.savingMessage {
+			return m, nil
+		}
+		if m.messageDetail == nil {
+			return m.showFlash("No message to save")
+		}
+		m.savingMessage = true
+		return m, m.actions.SaveMessage(m.messageDetail)
 
 	// Export attachments
 	case "e":
@@ -1122,8 +1257,8 @@ func (m Model) handleQuitConfirmKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleAccountSelectorKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	accounts := m.selectableAccounts()
-	maxIdx := len(accounts) // 0 = All Accounts/Sources, then selectable sources
+	options := m.selectorOptions()
+	maxIdx := len(options) - 1
 	switch msg.String() {
 	case "up", "k", keyNameCtrlP:
 		if m.modalCursor > 0 {
@@ -1135,15 +1270,30 @@ func (m Model) handleAccountSelectorKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cm
 		}
 	case keyNameEnter:
 		// Apply selection with bounds check
-		var selectedID *int64
-		if m.modalCursor > 0 && m.modalCursor <= len(accounts) {
-			accID := accounts[m.modalCursor-1].ID
-			selectedID = &accID
+		if m.modalCursor < 0 || m.modalCursor > maxIdx {
+			m.modalCursor = 0
 		}
-		if m.mode == modeMeetings {
-			m.meetingState.sourceID = selectedID
-		} else {
-			m.accountFilter = selectedID
+		selected := options[m.modalCursor]
+		switch m.mode {
+		case modeMeetings:
+			m.meetingState.sourceID = selected.accountID
+		case modeTexts:
+			m.textState.sourceID = selected.accountID
+			m.nextTextRequestID()
+		case modeEmail:
+			previous := m.sourceScope
+			switch selected.kind {
+			case scopeOptionAll:
+				m.sourceScope = allSourceScope()
+			case scopeOptionAccount:
+				m.sourceScope = accountSourceScope(selected.accountID)
+			case scopeOptionCollection:
+				m.sourceScope = collectionSourceScope(selected.collection)
+			}
+			if !previous.matches(selected) {
+				m.invalidateSourceScope()
+			}
+		case modePeople, modeCount:
 		}
 		m.modal = modalNone
 		m.loading = true
@@ -1176,12 +1326,11 @@ func (m Model) handleAccountSelectorKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cm
 			return m, m.loadMeetingMessages()
 		}
 		if m.mode == modeTexts {
-			m.textState.filter.SourceID = m.accountFilter
-			cmd := m.loadTextData()
-			return m, cmd
+			return m, m.activateTextPresentation()
 		}
 		m.aggregateRequestID++
-		return m, tea.Batch(m.loadData(), m.loadStats())
+		statsCmd := m.refreshStats()
+		return m, tea.Batch(m.loadData(), statsCmd)
 	case keyNameEsc:
 		m.modal = modalNone
 	}
@@ -1232,13 +1381,16 @@ func (m Model) handleFilterToggleKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) 
 				m.loadRequestID++ // Invalidate normal list loads before replacing ranked results.
 				m.searchRequestID++
 				m.prepareSearchReplacement()
-				return m, tea.Batch(m.loadSearch(m.searchQuery), m.loadStats())
+				statsCmd := m.refreshStats()
+				return m, tea.Batch(m.loadSearch(m.searchQuery), statsCmd)
 			}
 			m.loadRequestID++
-			return m, tea.Batch(m.loadMessages(), m.loadStats())
+			statsCmd := m.refreshStats()
+			return m, tea.Batch(m.loadMessages(), statsCmd)
 		}
 		m.aggregateRequestID++
-		return m, tea.Batch(m.loadData(), m.loadStats())
+		statsCmd := m.refreshStats()
+		return m, tea.Batch(m.loadData(), statsCmd)
 	}
 	return m, nil
 }
@@ -1402,6 +1554,8 @@ func (m *Model) setDrillFilterForView(key string) {
 		if key == "" {
 			m.drillFilter.SetEmptyTarget(query.ViewLabels)
 		}
+	case query.ViewLists:
+		m.drillFilter.ListID = key
 	case query.ViewTime:
 		m.drillFilter.TimeRange.Period = key
 		m.drillFilter.TimeRange.Granularity = m.timeGranularity
@@ -1428,11 +1582,11 @@ func (m Model) enterDrillDown(row query.AggregateRow) (tea.Model, tea.Cmd) {
 		// Top-level: create fresh drill filter
 		m.drillViewType = m.viewType
 		m.drillFilter = query.MessageFilter{
-			SourceID:              m.accountFilter,
 			WithAttachmentsOnly:   m.filters.attachmentsOnly,
 			HideDeletedFromSource: m.filters.hideDeletedFromSource,
 			TimeRange:             query.TimeRange{Granularity: m.timeGranularity},
 		}
+		m.sourceScope.apply(&m.drillFilter)
 	}
 
 	// Set filter field on drillFilter (accumulates for sub-agg)
@@ -1475,23 +1629,66 @@ func (m Model) enterDrillDown(row query.AggregateRow) (tea.Model, tea.Cmd) {
 func (m *Model) openAccountSelector() {
 	m.modal = modalAccountSelector
 	m.modalCursor = 0 // Default to "All Accounts" / "All Sources"
-	selectedID := m.accountFilter
-	if m.mode == modeMeetings {
-		selectedID = m.meetingState.sourceID
-	}
-	accounts := m.selectableAccounts()
-	if selectedID != nil {
-		for i, acc := range accounts {
-			if acc.ID == *selectedID {
-				m.modalCursor = i + 1 // +1 because 0 is "All Accounts"
+	options := m.selectorOptions()
+	for i, option := range options {
+		if m.mode == modeEmail {
+			if m.sourceScope.matches(option) {
+				m.modalCursor = i
+				break
+			}
+		} else if option.kind == scopeOptionAll && m.mode == modeMeetings && m.meetingState.sourceID == nil {
+			m.modalCursor = i
+		} else if option.kind == scopeOptionAll && m.mode == modeTexts && m.textState.sourceID == nil {
+			m.modalCursor = i
+		} else if option.accountID != nil {
+			selectedID := m.textState.sourceID
+			if m.mode == modeMeetings {
+				selectedID = m.meetingState.sourceID
+			}
+			if selectedID != nil && *selectedID == *option.accountID {
+				m.modalCursor = i
 				break
 			}
 		}
 	}
 	// Clamp to valid range in case accounts list changed
-	if m.modalCursor > len(accounts) {
+	if m.modalCursor >= len(options) {
 		m.modalCursor = 0
 	}
+}
+
+func (m *Model) invalidateSourceScope() {
+	m.deletionRequestID++
+	m.finishDeletionResolution()
+	m.aggregateRequestID++
+	m.statsRequestID++
+	m.loadRequestID++
+	m.detailRequestID++
+	m.searchRequestID++
+	m.presentationGeneration++
+	m.invalidatePreSearchSnapshot()
+	m.resetEmailNavigation()
+}
+
+// resetEmailNavigation returns Email to its root while retaining display preferences.
+func (m *Model) resetEmailNavigation() {
+	m.viewState = viewState{
+		viewType:         m.viewType,
+		timeGranularity:  m.timeGranularity,
+		sortField:        m.sortField,
+		sortDirection:    m.sortDirection,
+		msgSortField:     m.msgSortField,
+		msgSortDirection: m.msgSortDirection,
+	}
+	m.breadcrumbs = nil
+	m.selection = selectionState{
+		aggregateKeys:     make(map[string]bool),
+		aggregateViewType: m.viewType,
+		messageIDs:        make(map[int64]bool),
+	}
+	m.stats = nil
+	m.parkedMessageReaders[modeEmail] = messageReaderState{}
+	m.restorePosition = false
 }
 
 func (m *Model) openFilterModal() {
@@ -1503,6 +1700,23 @@ func (m *Model) openFilterModal() {
 func (m *Model) exitInlineSearchMode() {
 	m.inlineSearchActive = false
 	m.inlineSearchLoading = false
+	m.inlineSearchError = ""
+	m.resetInlineSearchHistoryNavigation()
+}
+
+func (m *Model) resetInlineSearchHistoryNavigation() {
+	m.searchHistoryIndex = -1
+	m.searchHistoryDraft = ""
+}
+
+func (m *Model) recordInlineSearch(queryStr string) {
+	if queryStr == "" || len(m.searchHistory) > 0 && m.searchHistory[len(m.searchHistory)-1] == queryStr {
+		return
+	}
+	m.searchHistory = append(m.searchHistory, queryStr)
+	if len(m.searchHistory) > inlineSearchHistoryLimit {
+		m.searchHistory = append([]string(nil), m.searchHistory[len(m.searchHistory)-inlineSearchHistoryLimit:]...)
+	}
 }
 
 // clearSearchState clears search query and invalidates pending requests.
@@ -1536,8 +1750,16 @@ func (m Model) reloadCurrentView() (tea.Model, tea.Cmd) {
 
 // commitInlineSearch finalizes the search and exits inline mode.
 func (m Model) commitInlineSearch() (tea.Model, tea.Cmd) {
-	m.exitInlineSearchMode()
 	queryStr := m.searchInput.Value()
+	if err := m.searchInputValidationError(queryStr); err != nil {
+		m.inlineSearchLoading = false
+		m.inlineSearchError = err.Error()
+		return m, nil
+	}
+	aggregateReloadNeeded := (m.level == levelAggregates || m.level == levelDrillDown) &&
+		(queryStr != m.searchQuery || m.inlineSearchLoading)
+	m.recordInlineSearch(queryStr)
+	m.exitInlineSearchMode()
 
 	if queryStr == "" {
 		// Empty search clears filter - restore from snapshot if available
@@ -1560,8 +1782,31 @@ func (m Model) commitInlineSearch() (tea.Model, tea.Cmd) {
 		m.prepareSearchReplacement()
 		return m, tea.Batch(spinCmd, m.loadSearch(queryStr))
 	}
-	// In aggregate views, results already showing from debounced search
+	if aggregateReloadNeeded {
+		m.aggregateRequestID++
+		m.inlineSearchLoading = true
+		spinCmd := m.startSpinner()
+		return m, tea.Batch(spinCmd, m.loadData())
+	}
+	// Aggregate rows already match the committed debounced search.
 	return m, nil
+}
+
+func (m Model) searchInputValidationError(queryStr string) error {
+	if queryStr == "" {
+		return nil
+	}
+	parsed := search.Parse(queryStr)
+	if m.searchMode == searchModeSemantic {
+		if parsed.Err() == nil && len(parsed.TextTerms) == 0 {
+			return errors.New("semantic search requires free text")
+		}
+		return nil
+	}
+	if err := parsed.Err(); err != nil {
+		return fmt.Errorf("invalid search query: %w", err)
+	}
+	return nil
 }
 
 // cancelInlineSearch cancels the search and restores previous state.
@@ -1649,6 +1894,7 @@ func (m *Model) activateInlineSearch(placeholder string) tea.Cmd {
 		m.searchInput.Placeholder = placeholder
 	}
 	m.searchInput.SetValue("") // Clear previous search
+	m.resetInlineSearchHistoryNavigation()
 	m.searchInput.Focus()
 	return textinput.Blink
 }

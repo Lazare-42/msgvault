@@ -15,19 +15,20 @@ func TestFormatRoundTripsRepresentableQueryFields(t *testing.T) {
 	larger := int64(1024)
 	smaller := int64(4096)
 	want := Query{
-		TextTerms:     []string{"plain", "meeting notes", `quoted "phrase"`, `path\segment`, "subject:not-an-operator"},
-		FromAddrs:     []string{"alice@example.com", "sender name"},
-		ToAddrs:       []string{"bob@example.com"},
-		CcAddrs:       []string{"carol@example.com"},
-		BccAddrs:      []string{"archive@example.com"},
-		SubjectTerms:  []string{"project update"},
-		Labels:        []string{`Important "Review"`},
-		HasAttachment: &hasAttachment,
-		BeforeDate:    &before,
-		AfterDate:     &after,
-		LargerThan:    &larger,
-		SmallerThan:   &smaller,
-		MessageTypes:  []string{"meeting_transcript", "sms"},
+		TextTerms:       []string{"plain", "meeting notes", `quoted "phrase"`, `path\segment`, "subject:not-an-operator"},
+		FromAddrs:       []string{"alice@example.com", "sender name"},
+		ToAddrs:         []string{"bob@example.com"},
+		CcAddrs:         []string{"carol@example.com"},
+		BccAddrs:        []string{"archive@example.com"},
+		SubjectTerms:    []string{"project update"},
+		Labels:          []string{`Important "Review"`},
+		HasAttachment:   &hasAttachment,
+		BeforeDate:      &before,
+		AfterDate:       &after,
+		LargerThan:      &larger,
+		SmallerThan:     &smaller,
+		MessageTypes:    []string{"meeting_transcript", "sms"},
+		ConversationIDs: []int64{42, 84},
 	}
 
 	formatted := Format(&want)
@@ -39,6 +40,47 @@ func TestFormatRoundTripsRepresentableQueryFields(t *testing.T) {
 
 func TestFormatNilQuery(t *testing.T) {
 	assert.Empty(t, Format(nil))
+}
+
+func TestFormatRoundTripsExplicitEmptyConversationScope(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	want := &Query{
+		TextTerms:       []string{"needle"},
+		ConversationIDs: []int64{},
+	}
+
+	formatted := Format(want)
+	got := Parse(formatted)
+
+	require.NoError(got.Err())
+	assert.NotNil(got.ConversationIDs)
+	assert.Empty(got.ConversationIDs)
+	assert.False(got.IsEmpty())
+}
+
+// TestFormatCanonicalizesListIDAliases catches a formatter that drops List-Id
+// restrictions while rebuilding a canonical query for an adapter boundary.
+func TestFormatCanonicalizesListIDAliases(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	parsed := Parse(`list:"alerts example.test" list-id:updates.example.test list:third.example.test`)
+	require.NoError(parsed.Err(), "initial query parses")
+
+	formatted := Format(parsed)
+	assert.Equal(
+		`list:"alerts example.test" list:updates.example.test list:third.example.test`,
+		formatted,
+		"Format uses the canonical list: alias in ListIDs order",
+	)
+
+	roundTripped := Parse(formatted)
+	require.NoError(roundTripped.Err(), "formatted query parses")
+	assert.Equal(
+		[]string{"alerts example.test", "updates.example.test", "third.example.test"},
+		roundTripped.ListIDs,
+		"ListIDs survive Format/Parse",
+	)
 }
 
 func TestFormatRoundTripsExactDateTimes(t *testing.T) {

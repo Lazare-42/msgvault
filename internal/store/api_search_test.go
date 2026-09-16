@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
 
@@ -184,4 +185,141 @@ func TestSearchMessagesQuery_MessageTypeFilter(t *testing.T) {
 	require.Len(msgs, 1, "messages")
 	assert.Equal("sms", msgs[0].MessageType, "MessageType")
 	assert.Equal(smsMsg, msgs[0].ID, "ID")
+}
+
+// TestSearchMessagesQuery_MessageTypeEmailIncludesLegacyBlankRows pins the
+// blank-type half of the email filter: Gmail messages imported before
+// message_type existed carry an empty value and must still answer
+// message_type:email, or narrowing a deletion search by type silently drops
+// exactly the oldest mail.
+func TestSearchMessagesQuery_MessageTypeEmailIncludesLegacyBlankRows(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := storetest.New(t)
+
+	typed := f.NewMessage().
+		WithSourceMessageID("typed-email").
+		WithSubject("receipt for lunch").
+		WithSnippet("typed").
+		Create(t, f.Store)
+	legacyBlank := f.NewMessage().
+		WithSourceMessageID("legacy-blank-email").
+		WithSubject("receipt for lunch").
+		WithSnippet("legacy blank").
+		Create(t, f.Store)
+	sms := f.NewMessage().
+		WithSourceMessageID("typed-sms").
+		WithSubject("receipt for lunch").
+		WithSnippet("text message").
+		Create(t, f.Store)
+
+	for id, value := range map[int64]string{legacyBlank: "", sms: "sms"} {
+		_, err := f.Store.DB().Exec(
+			f.Store.Rebind(`UPDATE messages SET message_type = ? WHERE id = ?`), value, id)
+		require.NoError(err, "set message_type for %d", id)
+	}
+	_, err := f.Store.BackfillFTS(nil)
+	require.NoError(err, "BackfillFTS")
+
+	msgs, total, err := f.Store.SearchMessagesQuery(search.Parse("message_type:email receipt"), 0, 50)
+	require.NoError(err, "SearchMessagesQuery")
+	got := make([]int64, 0, len(msgs))
+	for _, msg := range msgs {
+		got = append(got, msg.ID)
+	}
+	assert.ElementsMatch([]int64{typed, legacyBlank}, got, "legacy blank-typed rows match message_type:email")
+	assert.Equal(int64(2), total, "total")
+	assert.NotContains(got, sms, "typed non-email rows stay excluded")
+}
+
+// TestSearchMessagesQuery_MessageTypeEmailIncludesLegacyNullRows pins the
+// NULL half of the same legacy contract: archives written before the NOT
+// NULL constraint carry NULL message_type, and message_type:email must match
+// them exactly as the repair and analytical paths already do.
+func TestSearchMessagesQuery_MessageTypeEmailIncludesLegacyNullRows(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st, sourceID, conversationID := newLegacyNullableMessageTypeStore(t)
+
+	typed, err := st.UpsertMessage(&store.Message{
+		SourceID: sourceID, ConversationID: conversationID,
+		SourceMessageID: "typed-email-null-fixture",
+		Subject:         sql.NullString{String: "receipt for lunch", Valid: true},
+		Snippet:         sql.NullString{String: "typed", Valid: true}, MessageType: store.MessageTypeEmail,
+	})
+	require.NoError(err, "create typed email")
+	legacyNull, err := st.UpsertMessage(&store.Message{
+		SourceID: sourceID, ConversationID: conversationID,
+		SourceMessageID: "legacy-null-email",
+		Subject:         sql.NullString{String: "receipt for lunch", Valid: true},
+		Snippet:         sql.NullString{String: "legacy null", Valid: true}, MessageType: store.MessageTypeEmail,
+	})
+	require.NoError(err, "create legacy email")
+	_, err = st.DB().Exec(st.Rebind(
+		`UPDATE messages SET message_type = NULL WHERE id = ?`), legacyNull)
+	require.NoError(err, "clear legacy message type")
+	_, err = st.BackfillFTS(nil)
+	require.NoError(err, "BackfillFTS")
+
+	msgs, total, err := st.SearchMessagesQuery(search.Parse("message_type:email receipt"), 0, 50)
+	require.NoError(err, "SearchMessagesQuery")
+	got := make([]int64, 0, len(msgs))
+	for _, msg := range msgs {
+		got = append(got, msg.ID)
+	}
+	assert.ElementsMatch([]int64{typed, legacyNull}, got,
+		"legacy NULL-typed rows match message_type:email")
+	assert.Equal(int64(2), total, "total")
+}
+
+// TestSearchMessagesQuery_ListIDFilters catches Store searches that treat
+// List-Id substrings as wildcard patterns, skip case folding, or OR repeated
+// filters instead of requiring every requested literal substring.
+func TestSearchMessagesQuery_ListIDFilters(t *testing.T) {
+	f := storetest.New(t)
+
+	create := func(sourceMessageID, listID string) int64 {
+		message := f.NewMessage().WithSourceMessageID(sourceMessageID).Build()
+		if listID != "" {
+			message.ListID = sql.NullString{String: listID, Valid: true}
+		}
+		id, err := f.Store.UpsertMessage(message)
+		require.NoError(t, err, "insert %s", sourceMessageID)
+		return id
+	}
+
+	alerts := create("list-alerts", "<Alerts.EXAMPLE.test>")
+	unicode := create("list-unicode", "<ÉCOLE.example.test>")
+	literal := create("list-literal", `<token%_\literal.example.test>`)
+	_ = create("list-percent-decoy", `<tokenAA_\literal.example.test>`)
+	_ = create("list-underscore-decoy", `<token%AA\literal.example.test>`)
+	_ = create("list-escape-decoy", "<token%_AAliteral.example.test>")
+	_ = create("list-and-decoy", "<alerts.invalid.test>")
+	_ = create("list-null", "")
+
+	cases := []struct {
+		name  string
+		query string
+		want  []int64
+	}{
+		{name: "case insensitive substring", query: "list:alerts.example", want: []int64{alerts}},
+		{name: "Unicode case insensitive substring", query: "list:école", want: []int64{unicode}},
+		{name: "literal wildcards and escape character", query: `list:%_\literal`, want: []int64{literal}},
+		{name: "repeated aliases are ANDed", query: "list:alerts list-id:example.test", want: []int64{alerts}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			msgs, total, err := f.Store.SearchMessagesQuery(search.Parse(tc.query), 0, 50)
+			require.NoError(err, "SearchMessagesQuery")
+			require.Equal(int64(len(tc.want)), total, "total")
+			require.Len(msgs, len(tc.want), "messages")
+			got := make([]int64, len(msgs))
+			for i, msg := range msgs {
+				got[i] = msg.ID
+			}
+			assert.ElementsMatch(t, tc.want, got, "matching message IDs")
+		})
+	}
 }

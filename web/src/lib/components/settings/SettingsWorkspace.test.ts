@@ -1,17 +1,44 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import SettingsWorkspace from './SettingsWorkspace.svelte';
 import { createAPIClient } from '../../api/client';
 import { chooseSelectOption } from '../../../test/kit-ui';
 
 const initialSettings = {
+  groups: [
+    { id: 'browser', label: 'Appearance', description: 'How the web app looks.' },
+    {
+      id: 'server', label: 'Daemon', description: 'How the daemon runs.',
+      sections: [{ id: 'listener', label: 'Listener and access' }]
+    },
+    {
+      id: 'search', label: 'Search', description: 'Semantic search and the embedding provider.',
+      sections: [{ id: 'provider', label: 'Text embedding provider', description: 'Save endpoint changes before storing a credential.' }]
+    },
+    { id: 'integrations', label: 'Integrations', description: 'Outside services.' }
+  ],
   settings: [
-    setting('web.theme', 'system', { options: ['system', 'light', 'dark'] }),
-    setting('server.api_key', undefined, { kind: 'secret', secret: { configured: true } }),
-    setting('vector.embeddings.endpoint', 'http://127.0.0.1:11434', { testable: true }),
-    setting('vector.embeddings.api_key_env', 'MSGVAULT_EMBED_API_KEY', { read_only: true }),
+    setting('web.theme', 'system', {
+      group: 'browser', label: 'Theme', options: ['system', 'light', 'dark'], restart_required: false
+    }),
+    setting('server.api_key', undefined, {
+      group: 'server',
+      section: 'listener',
+      label: 'API key',
+      kind: 'secret',
+      read_only: true,
+      secret: { configured: true, source: 'environment', hint: 'tes…key' }
+    }),
+    setting('vector.embeddings.endpoint', 'http://127.0.0.1:11434', {
+      group: 'search', section: 'provider', label: 'Text embedding endpoint'
+    }),
+    setting('vector.embeddings.api_key_env', 'MSGVAULT_EMBED_API_KEY', {
+      group: 'search', section: 'provider', label: 'Text embedding key variable', read_only: true
+    }),
     setting('integrations.tasks.api_key', undefined, {
+      group: 'integrations',
+      label: 'Task integration API key',
       kind: 'secret',
       secret: { configured: false }
     })
@@ -19,18 +46,55 @@ const initialSettings = {
   pending_restart: false
 };
 
+afterEach(() => vi.useRealTimers());
+
 describe('SettingsWorkspace', () => {
+  it.each([
+    [{ authority: 'document_index', categoryID: 'archive', settingKey: 'analytics.auto_build_cache' }, 'Archive'],
+    [{ authority: 'document_vector', categoryID: 'search', settingKey: 'vector.enabled' }, 'Search'],
+    [{ authority: 'visual_attachments', categoryID: 'search', settingKey: 'vector.multimodal.enabled' }, 'Search']
+  ] as const)('opens and focuses the requested $0.authority setting authority', async (navigationTarget, categoryLabel) => {
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json({
+      groups: [
+        { id: 'archive', label: 'Archive', description: 'Cache and history.' },
+        { id: 'search', label: 'Search', description: 'Semantic search.' }
+      ],
+      settings: [
+        setting('analytics.auto_build_cache', false, { group: 'archive', kind: 'boolean' }),
+        setting('vector.enabled', true, { group: 'search', kind: 'boolean' }),
+        setting('vector.multimodal.enabled', false, { group: 'search', kind: 'boolean' })
+      ],
+      pending_restart: false
+    }));
+    render(SettingsWorkspace, {
+      client: createAPIClient(fetchFn),
+      navigationTarget
+    });
+
+    const category = await screen.findByRole('button', { name: new RegExp(`^${categoryLabel}`) });
+    await waitFor(() => expect(category.getAttribute('aria-current') ?? category.getAttribute('aria-pressed')).toBeTruthy());
+    await waitFor(() => expect((document.activeElement as HTMLElement | null)?.dataset.settingKey).toBe(navigationTarget.settingKey));
+  });
+
   it('groups fields, redacts secrets, labels restart posture and warns on plain HTTP', async () => {
     render(SettingsWorkspace, {
       client: createAPIClient(vi.fn<typeof fetch>(async () => settingsResponse(initialSettings, '"etag-a"'))),
       plainHTTPWarning: true
     });
 
-    expect(await screen.findByRole('heading', { name: 'Browser experience' })).toBeDefined();
+    expect(await screen.findByRole('heading', { name: 'Appearance' })).toBeDefined();
     expect(screen.getByRole('main', { name: 'Settings' })).toBeDefined();
-    expect(screen.getByText('Set')).toBeDefined();
-    expect(screen.getByText('Not set')).toBeDefined();
-    expect(screen.getAllByText('Restart required').length).toBeGreaterThan(0);
+    expect(screen.getByText('Changes apply right away.')).toBeDefined();
+    expect(screen.queryByText(/Restart required/)).toBeNull();
+    await openSettingsCategory('Daemon');
+    expect(screen.getByRole('heading', { name: 'Listener and access' })).toBeDefined();
+    expect(screen.getByText('tes…key')).toBeDefined();
+    expect(screen.getByText('Host-managed')).toBeDefined();
+    expect(screen.getByText('Set in config.toml on the daemon host.')).toBeDefined();
+    await openSettingsCategory('Integrations');
+    expect(screen.getByText('None')).toBeDefined();
+    expect(screen.queryByRole('button', { name: 'Clear task integration API key' })).toBeNull();
+    expect(screen.getByText('Changes take effect after the daemon restarts.')).toBeDefined();
     expect(screen.getByRole('alert').textContent).toContain('plain HTTP');
   });
 
@@ -60,10 +124,10 @@ describe('SettingsWorkspace', () => {
     expect(request.method).toBe('PATCH');
     expect(request.headers.get('If-Match')).toBe('"etag-a"');
     await expect(request.clone().json()).resolves.toEqual({
-      updates: [{ key: 'web.theme', value: { string: 'dark' } }],
-      confirm_api_key_restart: false
+      updates: [{ key: 'web.theme', value: { string: 'dark' } }]
     });
-    expect(await screen.findByText('Changes are pending restart.')).toBeDefined();
+    expect((await screen.findByText('Restart the daemon to apply these changes.', { exact: false })).textContent).toContain('Saved.');
+    expect(screen.getByText('No unsaved changes')).toBeDefined();
   });
 
   it('reloads the latest ETag after a conflict while retaining the local draft', async () => {
@@ -89,34 +153,16 @@ describe('SettingsWorkspace', () => {
     expect(screen.getByRole('combobox', { name: 'Theme: Dark' })).toBeDefined();
   });
 
-  it('requires explicit API-key restart confirmation before sending the secret', async () => {
-    const fetchFn = vi
-      .fn<typeof fetch>()
-      .mockResolvedValueOnce(settingsResponse(initialSettings, '"etag-a"'))
-      .mockResolvedValueOnce(settingsResponse({ ...initialSettings, pending_restart: true }, '"etag-b"'));
+  it('keeps daemon authentication host-managed and never publishes an API-key input', async () => {
+    const fetchFn = vi.fn<typeof fetch>(async () => settingsResponse(initialSettings, '"etag-a"'));
     render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
 
-    await openSettingsCategory('Server access');
-    await fireEvent.input(await screen.findByLabelText('New daemon API key'), {
-      target: { value: 'replacement-key' }
-    });
-    await fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+    await openSettingsCategory('Daemon');
+    expect(await screen.findByText('tes…key')).toBeDefined();
+    expect(screen.getByText('Host-managed values are set in config.toml on the daemon host.')).toBeDefined();
+    expect(screen.queryByLabelText('New API key')).toBeNull();
+    expect((screen.getByRole('button', { name: 'Save settings' }) as HTMLButtonElement).disabled).toBe(true);
     expect(fetchFn).toHaveBeenCalledTimes(1);
-    expect(screen.getByRole('alert').textContent).toContain('confirm');
-
-    await fireEvent.click(screen.getByLabelText('I understand the API key changes after restart'));
-    await fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
-    await waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(2));
-    const request = fetchFn.mock.calls[1]?.[0] as Request;
-    await expect(request.clone().json()).resolves.toEqual({
-      updates: [
-        {
-          key: 'server.api_key',
-          secret: { action: 'set', value: 'replacement-key' }
-        }
-      ],
-      confirm_api_key_restart: true
-    });
   });
 
   it('renders read-only settings without an input and excludes them from saves', async () => {
@@ -126,20 +172,54 @@ describe('SettingsWorkspace', () => {
       .mockResolvedValueOnce(settingsResponse({ ...initialSettings, pending_restart: true }, '"etag-b"'));
     render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
 
-    await openSettingsCategory('Search and vectors');
+    await openSettingsCategory('Search');
     expect(await screen.findByText('MSGVAULT_EMBED_API_KEY')).toBeDefined();
-    expect(screen.getByText('Set via config.toml on the daemon host.')).toBeDefined();
-    expect(screen.queryByLabelText('Embedding key environment variable')).toBeNull();
+    expect(screen.getByText(
+      'Save endpoint changes before storing a credential. Host-managed values are set in config.toml on the daemon host.'
+    )).toBeDefined();
+    expect(screen.queryByLabelText('Text embedding key variable')).toBeNull();
 
-    await openSettingsCategory('Browser experience');
+    await openSettingsCategory('Appearance');
     await chooseSelectOption(screen.getByLabelText('Theme'), 'Dark');
     await fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
     await waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(2));
     const request = fetchFn.mock.calls[1]?.[0] as Request;
     await expect(request.clone().json()).resolves.toEqual({
-      updates: [{ key: 'web.theme', value: { string: 'dark' } }],
-      confirm_api_key_restart: false
+      updates: [{ key: 'web.theme', value: { string: 'dark' } }]
     });
+  });
+
+  it('treats a value restored to its saved state as no change', async () => {
+    const fetchFn = vi.fn<typeof fetch>(async () => settingsResponse(initialSettings, '"etag-a"'));
+    render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
+
+    await screen.findByRole('heading', { name: 'Appearance' });
+    await chooseSelectOption(screen.getByLabelText('Theme'), 'Dark');
+    expect(screen.getByText('1 unsaved change')).toBeDefined();
+    await chooseSelectOption(screen.getByLabelText('Theme'), 'System');
+    expect(screen.getByText('No unsaved changes')).toBeDefined();
+    expect((screen.getByRole('button', { name: 'Save settings' }) as HTMLButtonElement).disabled).toBe(true);
+
+    await openSettingsCategory('Search');
+    const endpoint = (await screen.findByLabelText('Text embedding endpoint')) as HTMLInputElement;
+    await fireEvent.input(endpoint, { target: { value: 'http://127.0.0.1:11435' } });
+    expect(screen.getByText('1 unsaved change')).toBeDefined();
+    await fireEvent.input(endpoint, { target: { value: 'http://127.0.0.1:11434' } });
+    expect(screen.getByText('No unsaved changes')).toBeDefined();
+
+    await openSettingsCategory('Integrations');
+    await fireEvent.click(await screen.findByRole('button', { name: 'Add task integration API key' }));
+    await fireEvent.input(screen.getByLabelText('New task integration API key'), {
+      target: { value: 'typed-then-removed' }
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Save task integration API key' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.getByText('1 unsaved change')).toBeDefined();
+    expect(screen.getByText('typ…ved')).toBeDefined();
+    await fireEvent.click(screen.getByRole('button', { name: 'Clear task integration API key' }));
+    expect(screen.getByText('No unsaved changes')).toBeDefined();
+    expect(screen.getByText('None')).toBeDefined();
+    expect(fetchFn).toHaveBeenCalledTimes(1);
   });
 
   it('hides the Test connection button when no handler is provided', async () => {
@@ -147,28 +227,35 @@ describe('SettingsWorkspace', () => {
       client: createAPIClient(vi.fn<typeof fetch>(async () => settingsResponse(initialSettings, '"etag-a"')))
     });
 
-    await screen.findByRole('heading', { name: 'Browser experience' });
+    await screen.findByRole('heading', { name: 'Appearance' });
     expect(screen.queryByRole('button', { name: 'Test embedding endpoint connection' })).toBeNull();
   });
 
-  it('offers secret clearing and test-connection hooks without exposing values', async () => {
-    const onTestConnection = vi.fn(async () => undefined);
+  it('offers generic secret clearing without publishing fake connection actions', async () => {
+    const configured = {
+      ...initialSettings,
+      settings: initialSettings.settings.map((item) =>
+        item.key === 'integrations.tasks.api_key' ? { ...item, secret: { configured: true } } : item
+      )
+    };
     const fetchFn = vi
       .fn<typeof fetch>()
-      .mockResolvedValueOnce(settingsResponse(initialSettings, '"etag-a"'))
-      .mockResolvedValueOnce(settingsResponse({ ...initialSettings, pending_restart: true }, '"etag-b"'));
-    render(SettingsWorkspace, { client: createAPIClient(fetchFn), onTestConnection });
+      .mockResolvedValueOnce(settingsResponse(configured, '"etag-a"'))
+      .mockResolvedValueOnce(settingsResponse({ ...configured, pending_restart: true }, '"etag-b"'));
+    render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
 
-    await openSettingsCategory('Optional integrations');
+    await openSettingsCategory('Integrations');
+    expect(screen.getByText('••••••••')).toBeDefined();
     await fireEvent.click(await screen.findByRole('button', { name: 'Clear task integration API key' }));
-    await openSettingsCategory('Search and vectors');
-    await fireEvent.click(screen.getByRole('button', { name: 'Test embedding endpoint connection' }));
-    expect(onTestConnection).toHaveBeenCalledWith('vector.embeddings.endpoint');
+    expect(screen.getByText('1 unsaved change')).toBeDefined();
+    expect(screen.getByText('None')).toBeDefined();
+    expect(screen.queryByRole('button', { name: 'Clear task integration API key' })).toBeNull();
+    await openSettingsCategory('Search');
+    expect(screen.queryByRole('button', { name: /Test .* connection/i })).toBeNull();
     await fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
     const request = fetchFn.mock.calls[1]?.[0] as Request;
     await expect(request.clone().json()).resolves.toEqual({
-      updates: [{ key: 'integrations.tasks.api_key', secret: { action: 'clear' } }],
-      confirm_api_key_restart: false
+      updates: [{ key: 'integrations.tasks.api_key', secret: { action: 'clear' } }]
     });
   });
 
@@ -186,12 +273,401 @@ describe('SettingsWorkspace', () => {
     expect((screen.getByRole('button', { name: 'Save settings' }) as HTMLButtonElement).disabled).toBe(false);
   });
 
-  it('tests CardDAV credentials through the dedicated account endpoint', async () => {
+  it('uses daemon metadata and writes provider credentials with the independent credential ETag', async () => {
+    const document = approvedSettingsDocument();
+    const requests: Request[] = [];
     const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      requests.push(request);
+      const path = new URL(request.url).pathname;
+      if (request.method === 'GET' && path === '/api/v1/settings') {
+        return settingsResponse(document, '"config-a"', '"credential-a"');
+      }
+      if (request.method === 'PUT' && path === '/api/v1/settings/provider-credentials/vector.embeddings') {
+        return Response.json({
+          credential_id: 'vector.embeddings',
+          state: { configured: true, source: 'stored', hint: 'one…ret' },
+          pending_restart: true
+        }, { headers: { ETag: '"credential-b"' } });
+      }
+      throw new Error(`Unexpected ${request.method} ${path}`);
+    });
+    render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
+
+    expect(await screen.findByRole('heading', { name: 'Appearance' })).toBeDefined();
+    await openSettingsCategory('Search');
+    expect(screen.getByText('Semantic search')).toBeDefined();
+    expect(screen.getByText('From an environment variable on the daemon host.')).toBeDefined();
+    expect(screen.queryByRole('button', { name: /Test .* connection/i })).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Replace text embedding API key' }));
+    expect(screen.getByRole('dialog').textContent).toContain('Saved right away. The daemon uses it after a restart.');
+    await fireEvent.input(screen.getByLabelText('New text embedding API key'), {
+      target: { value: 'one-use-browser-secret' }
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Save text embedding API key' }));
+
+    await waitFor(() => expect(requests).toHaveLength(2));
+    const write = requests[1] as Request;
+    expect(write.method).toBe('PUT');
+    expect(write.headers.get('If-Match')).toBe('"credential-a"');
+    await expect(write.clone().json()).resolves.toEqual({ value: 'one-use-browser-secret' });
+    expect(await screen.findByText('one…ret')).toBeDefined();
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.queryByText('From an environment variable on the daemon host.')).toBeNull();
+    expect(JSON.stringify(requests.map((request) => request.url))).not.toContain('one-use-browser-secret');
+    expect(requests.some((request) => request.method === 'PATCH')).toBe(false);
+  });
+
+  it('requires endpoint settings to be saved before binding a provider credential', async () => {
+    const requests: Request[] = [];
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      requests.push(request);
+      return settingsResponse(approvedSettingsDocument(), '"config-a"', '"credential-a"');
+    });
+    render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
+
+    await openSettingsCategory('Search');
+    await fireEvent.input(await screen.findByLabelText('Text embedding endpoint'), {
+      target: { value: 'https://new-embedding.example.test/v1' }
+    });
+
+    const replace = screen.getByRole('button', { name: /^(Replace|Add) text embedding API key$/ }) as HTMLButtonElement;
+    expect(replace.disabled).toBe(true);
+    expect(screen.getByText('Save endpoint settings first before changing this credential.')).toBeDefined();
+    await fireEvent.click(replace);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(requests).toHaveLength(1);
+  });
+
+  it('renders attachment validation and future-download semantics from the daemon', async () => {
+    render(SettingsWorkspace, {
+      client: createAPIClient(vi.fn<typeof fetch>(async () =>
+        settingsResponse(approvedSettingsDocument(), '"config-a"', '"credential-a"')))
+    });
+
+    await openSettingsCategory('Attachments');
+    expect(await screen.findByText('Controls future downloads only; existing files are unchanged.')).toBeDefined();
+    expect(screen.getByRole('heading', { name: 'Discord' })).toBeDefined();
+    expect(screen.getByText('Discord default of 50 MiB')).toBeDefined();
+    expect((screen.getByRole('switch', { name: 'Set Discord maximum attachment size' }) as HTMLInputElement).checked).toBe(false);
+    expect(screen.queryByLabelText('Discord maximum attachment size')).toBeNull();
+    expect(screen.queryByText(/0 uses/)).toBeNull();
+    const participants = screen.getByLabelText('Discord participant limit') as HTMLInputElement;
+    expect(participants.min).toBe('1');
+    expect(participants.value).toBe('20');
+    expect((screen.getByRole('switch', { name: 'Set Discord participant limit' }) as HTMLInputElement).checked).toBe(true);
+    expect(screen.getByRole('combobox', { name: 'Discord attachment scope: All' })).toBeDefined();
+  });
+
+  it('switches an off value on from its suggestion and back to the daemon off value', async () => {
+    const requests: Request[] = [];
+    const fetchFn = vi.fn<typeof fetch>(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      requests.push(request);
+      if (request.method === 'PATCH') {
+        const body = await request.clone().json();
+        const document = approvedSettingsDocument();
+        for (const update of body.updates as Array<{ key: string; value: { integer: number } }>) {
+          const target = document.settings.find((item) => item.key === update.key);
+          if (target) target.value = update.value;
+        }
+        return settingsResponse(document, '"config-b"', '"credential-a"');
+      }
+      return settingsResponse(approvedSettingsDocument(), '"config-a"', '"credential-a"');
+    });
+    render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
+
+    await openSettingsCategory('Attachments');
+    await screen.findByText('Discord default of 50 MiB');
+    await fireEvent.click(screen.getByRole('switch', { name: 'Set Discord maximum attachment size' }));
+    const maximum = screen.getByLabelText('Discord maximum attachment size') as HTMLInputElement;
+    expect(maximum.value).toBe('50');
+    expect(maximum.min).toBe('1');
+    await fireEvent.input(maximum, { target: { value: '75' } });
+    await fireEvent.click(screen.getByRole('switch', { name: 'Set Discord participant limit' }));
+    expect(screen.getByText('No limit')).toBeDefined();
+    expect(screen.queryByLabelText('Discord participant limit')).toBeNull();
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+    await waitFor(() => expect(requests.filter((request) => request.method === 'PATCH')).toHaveLength(1));
+    const patch = await requests.find((request) => request.method === 'PATCH')!.clone().json();
+    expect(patch.updates).toEqual([
+      { key: 'discord.max_media_mb', value: { integer: 75 } },
+      { key: 'discord.media_max_participants', value: { integer: 0 } },
+    ]);
+  });
+
+  it('keeps a switch round trip and an emptied number from counting as changes', async () => {
+    const fetchFn = vi.fn<typeof fetch>(async () =>
+      settingsResponse(approvedSettingsDocument(), '"config-a"', '"credential-a"'));
+    render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
+
+    await openSettingsCategory('Attachments');
+    const sizeSwitch = () => screen.getByRole('switch', { name: 'Set Discord maximum attachment size' });
+    await screen.findByText('Discord default of 50 MiB');
+    await fireEvent.click(sizeSwitch());
+    expect(screen.getByText('1 unsaved change')).toBeDefined();
+    await fireEvent.click(sizeSwitch());
+    expect(screen.getByText('No unsaved changes')).toBeDefined();
+    expect((screen.getByRole('button', { name: 'Save settings' }) as HTMLButtonElement).disabled).toBe(true);
+
+    const participants = screen.getByLabelText('Discord participant limit') as HTMLInputElement;
+    await fireEvent.input(participants, { target: { value: '' } });
+    expect(screen.getByLabelText('Discord participant limit')).toBeDefined();
+    expect(participants.getAttribute('aria-invalid')).toBe('true');
+    expect((screen.getByRole('switch', { name: 'Set Discord participant limit' }) as HTMLInputElement).checked).toBe(true);
+    expect(screen.getByText('1 unsaved change. Enter a number to save.')).toBeDefined();
+    expect((screen.getByRole('button', { name: 'Save settings' }) as HTMLButtonElement).disabled).toBe(true);
+    await fireEvent.input(participants, { target: { value: '20' } });
+    expect(screen.getByText('No unsaved changes')).toBeDefined();
+  });
+
+  it('never treats an emptied number as the stored zero', async () => {
+    const fetchFn = vi.fn<typeof fetch>(async () =>
+      settingsResponse(approvedSettingsDocument(), '"config-a"', '"credential-a"'));
+    render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
+
+    await openSettingsCategory('Attachments');
+    await screen.findByText('Discord default of 50 MiB');
+    await fireEvent.click(screen.getByRole('switch', { name: 'Set Discord maximum attachment size' }));
+    const size = screen.getByLabelText('Discord maximum attachment size') as HTMLInputElement;
+    expect(size.value).toBe('50');
+    await fireEvent.input(size, { target: { value: '' } });
+
+    // The stored value is 0. An empty input must stay an unfinished draft
+    // rather than collapse back to the stored zero and the off state.
+    expect(screen.getByLabelText('Discord maximum attachment size')).toBe(size);
+    expect(size.getAttribute('aria-invalid')).toBe('true');
+    expect(screen.queryByText('Discord default of 50 MiB')).toBeNull();
+    expect(screen.getByText('1 unsaved change. Enter a number to save.')).toBeDefined();
+    expect((screen.getByRole('button', { name: 'Save settings' }) as HTMLButtonElement).disabled).toBe(true);
+    await fireEvent.input(size, { target: { value: '0' } });
+    expect(screen.getByText('No unsaved changes')).toBeDefined();
+    expect(screen.getByText('Discord default of 50 MiB')).toBeDefined();
+  });
+
+  it('drops drafts the daemon already holds after a conflict reload', async () => {
+    const latest = {
+      ...initialSettings,
+      settings: initialSettings.settings.map((item) =>
+        item.key === 'web.theme' ? { ...item, value: { string: 'dark' } } : item
+      )
+    };
+    const fetchFn = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(settingsResponse(initialSettings, '"etag-a"'))
+      .mockResolvedValueOnce(Response.json({ error: 'settings_conflict' }, { status: 412 }))
+      .mockResolvedValueOnce(settingsResponse(latest, '"etag-latest"'));
+    render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
+
+    await chooseSelectOption(await screen.findByLabelText('Theme'), 'Dark');
+    await openSettingsCategory('Integrations');
+    await fireEvent.click(await screen.findByRole('button', { name: 'Add task integration API key' }));
+    await fireEvent.input(screen.getByLabelText('New task integration API key'), {
+      target: { value: 'typed-then-removed' }
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Save task integration API key' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Clear task integration API key' }));
+    await openSettingsCategory('Appearance');
+    await fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+
+    expect((await screen.findByRole('alert')).textContent).toContain('changed on disk');
+    expect(screen.getByText('No unsaved changes')).toBeDefined();
+    expect((screen.getByRole('button', { name: 'Save settings' }) as HTMLButtonElement).disabled).toBe(true);
+    expect(fetchFn).toHaveBeenCalledTimes(3);
+  });
+
+  it('edits cron schedules with the cron field and its presets', async () => {
+    const requests: Request[] = [];
+    const fetchFn = vi.fn<typeof fetch>(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      requests.push(request);
+      if (request.method === 'PATCH') {
+        return settingsResponse(approvedSettingsDocument(), '"config-b"', '"credential-a"');
+      }
+      return settingsResponse(approvedSettingsDocument(), '"config-a"', '"credential-a"');
+    });
+    render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
+
+    await openSettingsCategory('Search');
+    const presets = (name: string) => screen.getByRole('combobox', { name: `Presets: ${name}` });
+    expect(await screen.findByRole('combobox', { name: 'Presets: Every day at 03:00' })).toBeDefined();
+    expect(screen.queryByLabelText('Embedding schedule')).toBeNull();
+    expect(screen.queryByText(/Five-field cron/)).toBeNull();
+
+    await chooseSelectOption(presets('Every day at 03:00'), 'Every 15 minutes');
+    expect(presets('Every 15 minutes')).toBeDefined();
+    await chooseSelectOption(presets('Every 15 minutes'), 'Custom');
+    const schedule = screen.getByLabelText('Embedding schedule') as HTMLInputElement;
+    expect(schedule.value).toBe('*/15 * * * *');
+    const status = () => document.getElementById(schedule.getAttribute('aria-describedby') ?? '')?.textContent?.trim();
+    expect(status()).toBe('Every 15 minutes');
+    await fireEvent.input(schedule, { target: { value: '0 3 * * 9' } });
+    expect(status()).toBe('Weekday: 9 is above the maximum of 6.');
+    await fireEvent.input(schedule, { target: { value: '0 2 * * 0' } });
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
+    await waitFor(() => expect(requests.filter((request) => request.method === 'PATCH')).toHaveLength(1));
+    const patch = await requests.find((request) => request.method === 'PATCH')!.clone().json();
+    expect(patch.updates).toEqual([{ key: 'vector.embed.schedule.cron', value: { string: '0 2 * * 0' } }]);
+  });
+
+  it('updates one stable-name enrichment provider without rewriting same-kind siblings', async () => {
+    const initial = approvedSettingsDocument();
+    const requests: Request[] = [];
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      requests.push(request);
+      const path = new URL(request.url).pathname;
+      if (request.method === 'GET' && path === '/api/v1/settings') {
+        return settingsResponse(initial, '"config-a"', '"credential-a"');
+      }
+      if (request.method === 'PUT' && path === '/api/v1/settings/person-enrichment/providers/exa-primary') {
+        const body = await request.clone().json();
+        const providers = initial.person_enrichment_providers.map((provider) =>
+          provider.name === 'exa-primary' ? { ...provider, enabled: body.enabled } : provider
+        );
+        return settingsResponse({ ...initial, person_enrichment_providers: providers }, '"config-b"', '"credential-a"');
+      }
+      throw new Error(`Unexpected ${request.method} ${path}`);
+    });
+    render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
+
+    await openSettingsCategory('Person enrichment');
+    expect(await screen.findByRole('heading', { name: 'exa-primary' })).toBeDefined();
+    expect(screen.getByRole('heading', { name: 'exa-secondary' })).toBeDefined();
+    await fireEvent.click(screen.getByLabelText('Enable exa-primary'));
+    await fireEvent.click(screen.getByRole('button', { name: 'Save exa-primary provider' }));
+
+    await waitFor(() => expect(requests).toHaveLength(2));
+    const write = requests[1] as Request;
+    expect(write.headers.get('If-Match')).toBe('"config-a"');
+    const body = await write.clone().json();
+    expect(body.kind).toBe('exa');
+    expect(body.enabled).toBe(true);
+    expect(body).not.toHaveProperty('name');
+    expect(body).not.toHaveProperty('api_key_env');
+    expect(body).not.toHaveProperty('max_cost_usd_micros_per_day');
+    expect(requests.some((request) => request.method === 'PATCH')).toBe(false);
+    expect(screen.getByLabelText('Enable exa-secondary')).toBeDefined();
+  });
+
+  it('requires a named provider endpoint draft to be saved before its credential', async () => {
+    const requests: Request[] = [];
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      requests.push(request);
+      return settingsResponse(approvedSettingsDocument(), '"config-a"', '"credential-a"');
+    });
+    render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
+
+    await openSettingsCategory('Person enrichment');
+    await fireEvent.input(await screen.findByLabelText('exa-primary endpoint'), {
+      target: { value: 'https://new-exa.example.test/search' }
+    });
+
+    const replace = screen.getByRole('button', { name: /^(Replace|Add) exa API key for exa-primary$/ }) as HTMLButtonElement;
+    expect(replace.disabled).toBe(true);
+    expect(screen.getByText('Save provider settings first before changing this credential.')).toBeDefined();
+    expect(requests).toHaveLength(1);
+  });
+
+  it('creates an absent Exa provider by stable name with safe disabled defaults', async () => {
+    const initial = { ...approvedSettingsDocument(), person_enrichment_providers: [] };
+    const requests: Request[] = [];
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      requests.push(request);
+      const path = new URL(request.url).pathname;
+      if (request.method === 'GET') return settingsResponse(initial, '"config-a"', '"credential-a"');
+      if (request.method === 'PUT' && path === '/api/v1/settings/person-enrichment/providers/exa-primary') {
+        const body = await request.clone().json();
+        return settingsResponse({
+          ...initial,
+          person_enrichment_providers: [{
+            name: 'exa-primary',
+            ...body,
+            credential: { configured: false, source: 'none' },
+            credential_id: 'people.enrichment/exa-primary'
+          }]
+        }, '"config-b"', '"credential-a"');
+      }
+      throw new Error(`Unexpected ${request.method} ${path}`);
+    });
+    render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
+
+    await openSettingsCategory('Person enrichment');
+    await fireEvent.click(await screen.findByRole('button', { name: 'Add Exa provider' }));
+    await fireEvent.input(screen.getByLabelText('Exa stable provider name'), {
+      target: { value: 'exa-primary' }
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Create Exa provider' }));
+
+    await waitFor(() => expect(requests).toHaveLength(2));
+    const write = requests[1] as Request;
+    expect(write.headers.get('If-Match')).toBe('"config-a"');
+    const body = await write.clone().json();
+    expect(body).toMatchObject({
+      kind: 'exa',
+      enabled: false,
+      endpoint: 'https://api.exa.ai/search',
+      mode: 'people',
+      num_results: 1,
+      allowed_identifiers: ['public_profile_url'],
+      target_keys: ['attribute:location'],
+      allow_sensitive_targets: false,
+      retention_posture: '',
+      training_posture: '',
+      refresh_interval: '720h',
+      request_timeout: '1m',
+      max_retries: 5,
+      max_requests_per_run: 10,
+      max_requests_per_day: 100
+    });
+    expect(body).not.toHaveProperty('api_key_env');
+    expect(body).not.toHaveProperty('max_cost_usd_micros_per_day');
+    expect(await screen.findByRole('heading', { name: 'exa-primary' })).toBeDefined();
+    expect(screen.getByRole('button', { name: 'Add Exa provider' })).toBeDefined();
+    expect(screen.getByRole('button', { name: 'Add SixtyFour provider' })).toBeDefined();
+  });
+
+  it('rejects invalid or duplicate stable provider names before any write', async () => {
+    const initial = approvedSettingsDocument();
+    const requests: Request[] = [];
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      requests.push(request);
+      return settingsResponse(initial, '"config-a"', '"credential-a"');
+    });
+    render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
+
+    await openSettingsCategory('Person enrichment');
+    await fireEvent.click(await screen.findByRole('button', { name: 'Add SixtyFour provider' }));
+    const name = screen.getByLabelText('SixtyFour stable provider name');
+    await fireEvent.input(name, { target: { value: 'invalid/name' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Create SixtyFour provider' }));
+    expect(screen.getByRole('alert').textContent).toContain("letters, digits, '.', '_', ':', or '-'");
+
+    await fireEvent.input(name, { target: { value: 'exa-primary' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Create SixtyFour provider' }));
+    expect(screen.getByRole('alert').textContent).toContain('already exists');
+    expect(requests).toHaveLength(1);
+  });
+
+  it('tests CardDAV credentials through the dedicated account endpoint', async () => {
+    const credentialFacts: Array<{ method: string; path: string; passwordMatched: boolean }> = [];
+    const fetchFn: typeof fetch = async (input) => {
       const request = input instanceof Request ? input : new Request(input);
       const path = new URL(request.url).pathname;
       if (path === '/api/v1/settings') return settingsResponse(cardDAVSettings(), '"etag-a"');
       if (path === '/api/v1/carddav/account/test') {
+        const body = await request.clone().json();
+        expect(body).toEqual({
+          base_url: 'https://dav.example.test/', username: 'alice', password: 'changed-password',
+          enabled: true, schedule: '0 3 * * *'
+        });
+        credentialFacts.push({ method: request.method, path, passwordMatched: body.password === 'changed-password' });
         return Response.json({
           base_url: 'https://dav.example.test/',
           username: 'alice',
@@ -200,8 +676,10 @@ describe('SettingsWorkspace', () => {
           books: 2
         });
       }
+      const readResponse = cardDAVOperationsResponse(request);
+      if (readResponse) return readResponse;
       throw new Error(`Unexpected request: ${request.method} ${path}`);
-    });
+    };
     render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
 
     await openSettingsCategory('CardDAV account');
@@ -210,6 +688,7 @@ describe('SettingsWorkspace', () => {
     expect(screen.getByLabelText('Username')).toBeDefined();
     expect(screen.getByLabelText('Password')).toBeDefined();
     expect(screen.getByLabelText('Enabled')).toBeDefined();
+    expect(screen.getByRole('combobox', { name: 'Presets: Custom' })).toBeDefined();
     expect(screen.getByLabelText('Schedule')).toBeDefined();
     expect(screen.queryByText('CardDAV server')).toBeNull();
 
@@ -221,26 +700,26 @@ describe('SettingsWorkspace', () => {
     await fireEvent.input(screen.getByLabelText('Schedule'), { target: { value: '0 3 * * *' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Test CardDAV connection' }));
 
-    await waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(2));
-    const request = fetchFn.mock.calls[1]?.[0] as Request;
-    expect(request.method).toBe('POST');
-    expect(new URL(request.url).pathname).toBe('/api/v1/carddav/account/test');
-    await expect(request.clone().json()).resolves.toEqual({
-      base_url: 'https://dav.example.test/',
-      username: 'alice',
-      password: 'changed-password',
-      enabled: true,
-      schedule: '0 3 * * *'
-    });
+    await waitFor(() => expect(credentialFacts).toEqual([
+      { method: 'POST', path: '/api/v1/carddav/account/test', passwordMatched: true }
+    ]));
+    expect(JSON.stringify(credentialFacts)).not.toContain('changed-password');
     expect((await screen.findByRole('status')).textContent).toContain('Found 2 address books');
   });
 
   it('saves CardDAV credentials through PUT without a generic settings PATCH', async () => {
-    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+    const credentialFacts: Array<{ method: string; path: string; passwordPresent: boolean }> = [];
+    let genericPatches = 0;
+    const fetchFn: typeof fetch = async (input) => {
       const request = input instanceof Request ? input : new Request(input);
       const path = new URL(request.url).pathname;
       if (path === '/api/v1/settings') return settingsResponse(cardDAVSettings(), '"etag-a"');
       if (path === '/api/v1/carddav/account') {
+        const body = await request.clone().json();
+        expect(body).toEqual({
+          base_url: 'https://old.example.test/', username: 'alice', enabled: false, schedule: '0 2 * * *'
+        });
+        credentialFacts.push({ method: request.method, path, passwordPresent: Object.hasOwn(body, 'password') });
         return Response.json({
           base_url: 'https://dav.example.test/',
           username: 'alice',
@@ -249,8 +728,11 @@ describe('SettingsWorkspace', () => {
           books: 1
         });
       }
+      if (request.method === 'PATCH') genericPatches += 1;
+      const readResponse = cardDAVOperationsResponse(request);
+      if (readResponse) return readResponse;
       throw new Error(`Unexpected request: ${request.method} ${path}`);
-    });
+    };
     render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
 
     await openSettingsCategory('CardDAV account');
@@ -258,29 +740,24 @@ describe('SettingsWorkspace', () => {
     expect((screen.getByLabelText('Password') as HTMLInputElement).required).toBe(false);
     await fireEvent.click(screen.getByRole('button', { name: 'Save CardDAV account' }));
 
-    await waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(2));
-    const request = fetchFn.mock.calls[1]?.[0] as Request;
-    expect(request.method).toBe('PUT');
-    expect(new URL(request.url).pathname).toBe('/api/v1/carddav/account');
-    await expect(request.clone().json()).resolves.toEqual({
-      base_url: 'https://old.example.test/',
-      username: 'alice',
-      enabled: false,
-      schedule: '0 2 * * *'
-    });
-    expect(
-      fetchFn.mock.calls.some(([candidate]) => candidate instanceof Request && candidate.method === 'PATCH')
-    ).toBe(false);
+    await waitFor(() => expect(credentialFacts).toEqual([
+      { method: 'PUT', path: '/api/v1/carddav/account', passwordPresent: false }
+    ]));
+    expect(genericPatches).toBe(0);
     expect((await screen.findByRole('status')).textContent).toContain('CardDAV account saved');
   });
 
   it('requires a password before testing an unconfigured CardDAV account', async () => {
-    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+    let credentialRequests = 0;
+    const fetchFn: typeof fetch = async (input) => {
       const request = input instanceof Request ? input : new Request(input);
       const path = new URL(request.url).pathname;
       if (path === '/api/v1/settings') return settingsResponse(initialSettings, '"etag-a"');
+      if (path === '/api/v1/carddav/account/test') credentialRequests += 1;
+      const readResponse = cardDAVOperationsResponse(request);
+      if (readResponse) return readResponse;
       throw new Error(`Unexpected request: ${request.method} ${path}`);
-    });
+    };
     render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
 
     await openSettingsCategory('CardDAV account');
@@ -292,17 +769,49 @@ describe('SettingsWorkspace', () => {
     expect(password.required).toBe(true);
     await fireEvent.click(screen.getByRole('button', { name: 'Test CardDAV connection' }));
 
-    expect(fetchFn).toHaveBeenCalledOnce();
+    expect(credentialRequests).toBe(0);
     expect(screen.getByRole('alert').textContent).toContain('Password is required');
   });
 
-  it('requires a password when a configured CardDAV identity changes', async () => {
+  it('renders unconfigured CardDAV conflict review as optional setup without retry or detail requests', async () => {
+    const requests: Array<{ method: string; path: string }> = [];
     const fetchFn = vi.fn<typeof fetch>(async (input) => {
       const request = input instanceof Request ? input : new Request(input);
       const path = new URL(request.url).pathname;
-      if (path === '/api/v1/settings') return settingsResponse(cardDAVSettings(), '"etag-a"');
-      throw new Error(`Unexpected request: ${request.method} ${path}`);
+      requests.push({ method: request.method, path });
+      if (path === '/api/v1/settings') return settingsResponse(initialSettings, '"etag-a"');
+      if (path === '/api/v1/carddav/status') return Response.json({
+        configured: false, available: false, credential_configured: false,
+        enabled: false, scheduled: false, schedule: ''
+      });
+      if (path === '/api/v1/carddav/books') return Response.json({ books: [] });
+      if (path === '/api/v1/carddav/runs') return Response.json({ runs: [] });
+      if (path === '/api/v1/carddav/conflicts') {
+        return Response.json({ error: 'carddav_unavailable', message: 'synthetic setup detail' }, { status: 503 });
+      }
+      throw new Error(`Unexpected ${request.method} ${path}`);
     });
+    render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
+
+    await openSettingsCategory('CardDAV account');
+    expect(await screen.findByText('CardDAV conflict review is unavailable.')).toBeDefined();
+    expect(screen.queryByRole('button', { name: 'Retry CardDAV conflicts' })).toBeNull();
+    expect(screen.queryByText('Unable to load CardDAV conflicts.')).toBeNull();
+    expect(document.body.textContent).not.toContain('synthetic setup detail');
+    expect(requests.some(({ method, path }) => method !== 'GET' || /^\/api\/v1\/carddav\/conflicts\//.test(path))).toBe(false);
+  });
+
+  it('requires a password when a configured CardDAV identity changes', async () => {
+    let credentialRequests = 0;
+    const fetchFn: typeof fetch = async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      const path = new URL(request.url).pathname;
+      if (path === '/api/v1/settings') return settingsResponse(cardDAVSettings(), '"etag-a"');
+      if (path === '/api/v1/carddav/account/test') credentialRequests += 1;
+      const readResponse = cardDAVOperationsResponse(request);
+      if (readResponse) return readResponse;
+      throw new Error(`Unexpected request: ${request.method} ${path}`);
+    };
     render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
 
     await openSettingsCategory('CardDAV account');
@@ -314,19 +823,102 @@ describe('SettingsWorkspace', () => {
     expect(password.required).toBe(true);
     await fireEvent.click(screen.getByRole('button', { name: 'Test CardDAV connection' }));
 
-    expect(fetchFn).toHaveBeenCalledOnce();
+    expect(credentialRequests).toBe(0);
     expect(screen.getByRole('alert').textContent).toContain('Password is required');
   });
 
-  it('reuses the persisted CardDAV password after the first successful save', async () => {
-    const requests: Request[] = [];
-    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+  it('refreshes the saved account snapshot while retaining unrelated drafts across category navigation', async () => {
+    const credentialFacts: Array<{ method: string; path: string; passwordMatched: boolean }> = [];
+    let settingsReads = 0;
+    let operationsReads = 0;
+    let saved = false;
+    const fetchFn: typeof fetch = async (input) => {
       const request = input instanceof Request ? input : new Request(input);
       const path = new URL(request.url).pathname;
-      if (path === '/api/v1/settings') return settingsResponse(initialSettings, '"etag-a"');
+      if (path === '/api/v1/settings') {
+        settingsReads += 1;
+        return settingsResponse(saved
+          ? cardDAVSettings({ baseURL: 'https://saved.example.test/', username: 'saved-user', schedule: '0 6 * * *' })
+          : cardDAVSettings(), '"etag-a"');
+      }
       if (path === '/api/v1/carddav/account') {
-        requests.push(request);
-        const body = (await request.clone().json()) as Record<string, unknown>;
+        const body = await request.clone().json();
+        expect(body).toEqual({
+          base_url: 'https://saved.example.test/', username: 'saved-user', password: 'one-use-password',
+          enabled: false, schedule: '0 6 * * *'
+        });
+        credentialFacts.push({ method: request.method, path, passwordMatched: body.password === 'one-use-password' });
+        saved = true;
+        return Response.json({
+          base_url: body.base_url, username: body.username, enabled: body.enabled,
+          schedule: body.schedule, books: 1
+        });
+      }
+      const readResponse = cardDAVOperationsResponse(request);
+      if (readResponse) {
+        operationsReads += 1;
+        return readResponse;
+      }
+      throw new Error(`Unexpected request: ${request.method} ${path}`);
+    };
+    render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
+
+    await chooseSelectOption(await screen.findByLabelText('Theme'), 'Dark');
+    await openSettingsCategory('CardDAV account');
+    await fireEvent.input(await screen.findByLabelText('Base URL'), { target: { value: 'https://saved.example.test/' } });
+    await fireEvent.input(screen.getByLabelText('Username'), { target: { value: 'saved-user' } });
+    await fireEvent.input(screen.getByLabelText('Password'), { target: { value: 'one-use-password' } });
+    await fireEvent.input(screen.getByLabelText('Schedule'), { target: { value: '0 6 * * *' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Save CardDAV account' }));
+
+    await waitFor(() => expect(credentialFacts).toEqual([
+      { method: 'PUT', path: '/api/v1/carddav/account', passwordMatched: true }
+    ]));
+    expect(JSON.stringify(credentialFacts)).not.toContain('one-use-password');
+    await waitFor(() => expect(settingsReads).toBe(2));
+    await waitFor(() => expect(operationsReads).toBe(8));
+
+    await openSettingsCategory('Appearance');
+    expect(screen.getByRole('combobox', { name: 'Theme: Dark' })).toBeDefined();
+    await openSettingsCategory('CardDAV account');
+    expect((await screen.findByLabelText('Base URL') as HTMLInputElement).value).toBe('https://saved.example.test/');
+    expect((screen.getByLabelText('Username') as HTMLInputElement).value).toBe('saved-user');
+    expect((screen.getByLabelText('Schedule') as HTMLInputElement).value).toBe('0 6 * * *');
+    expect((screen.getByLabelText('Password') as HTMLInputElement).required).toBe(false);
+  });
+
+  it('reuses the persisted CardDAV password after the first successful save', async () => {
+    const credentialFacts: Array<{ passwordMatched: boolean; passwordPresent: boolean; schedule: string }> = [];
+    let saved = false;
+    let savedSchedule = '0 2 * * *';
+    const fetchFn: typeof fetch = async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      const path = new URL(request.url).pathname;
+      if (path === '/api/v1/settings') {
+        return settingsResponse(saved
+          ? cardDAVSettings({ baseURL: 'https://dav.example.test/', username: 'alice', schedule: savedSchedule })
+          : initialSettings, '"etag-a"');
+      }
+      if (path === '/api/v1/carddav/account') {
+        const body = await request.clone().json();
+        const first = credentialFacts.length === 0;
+        if (first) {
+          expect(body).toEqual({
+            base_url: 'https://dav.example.test/', username: 'alice', password: 'first-password',
+            enabled: false, schedule: '0 2 * * *'
+          });
+        } else {
+          expect(body).toEqual({
+            base_url: 'https://dav.example.test/', username: 'alice', enabled: false, schedule: '0 4 * * *'
+          });
+        }
+        credentialFacts.push({
+          passwordMatched: body.password === 'first-password',
+          passwordPresent: Object.hasOwn(body, 'password'),
+          schedule: String(body.schedule)
+        });
+        saved = true;
+        savedSchedule = String(body.schedule);
         return Response.json({
           base_url: body.base_url,
           username: body.username,
@@ -335,8 +927,10 @@ describe('SettingsWorkspace', () => {
           books: 1
         });
       }
+      const readResponse = cardDAVOperationsResponse(request);
+      if (readResponse) return readResponse;
       throw new Error(`Unexpected request: ${request.method} ${path}`);
-    });
+    };
     render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
 
     await openSettingsCategory('CardDAV account');
@@ -345,24 +939,133 @@ describe('SettingsWorkspace', () => {
     });
     await fireEvent.input(screen.getByLabelText('Username'), { target: { value: 'alice' } });
     await fireEvent.input(screen.getByLabelText('Password'), { target: { value: 'first-password' } });
+    await chooseSelectOption(screen.getByRole('combobox', { name: 'Presets: Off' }), 'Custom');
+    await fireEvent.input(screen.getByLabelText('Schedule'), { target: { value: '0 2 * * *' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Save CardDAV account' }));
-    await waitFor(() => expect(requests).toHaveLength(1));
-    await screen.findByRole('status');
-
-    const password = screen.getByLabelText('Password') as HTMLInputElement;
-    expect(password.value).toBe('');
+    await waitFor(() => expect(credentialFacts).toHaveLength(1));
+    const password = await screen.findByLabelText('Password') as HTMLInputElement;
+    await waitFor(() => expect(password.value).toBe(''));
     expect(password.required).toBe(false);
     await fireEvent.input(screen.getByLabelText('Schedule'), { target: { value: '0 4 * * *' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Save CardDAV account' }));
-    await waitFor(() => expect(requests).toHaveLength(2));
+    await waitFor(() => expect(credentialFacts).toHaveLength(2));
+    expect(credentialFacts).toEqual([
+      { passwordMatched: true, passwordPresent: true, schedule: '0 2 * * *' },
+      { passwordMatched: false, passwordPresent: false, schedule: '0 4 * * *' }
+    ]);
+    expect(JSON.stringify(credentialFacts)).not.toContain('first-password');
+  });
 
-    await expect(requests[0].clone().json()).resolves.toMatchObject({ password: 'first-password' });
-    await expect(requests[1].clone().json()).resolves.toEqual({
-      base_url: 'https://dav.example.test/',
-      username: 'alice',
-      enabled: false,
-      schedule: '0 4 * * *'
+  it('destroys CardDAV on category exit, clears its password, aborts polling, and remounts fresh reads', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let statusReads = 0;
+    let booksReads = 0;
+    let runsReads = 0;
+    let pollSignal: AbortSignal | undefined;
+    const fetchFn = vi.fn<typeof fetch>((input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      const path = new URL(request.url).pathname;
+      if (path === '/api/v1/settings') return Promise.resolve(settingsResponse(cardDAVSettings(), '"etag-a"'));
+      if (path === '/api/v1/carddav/books') {
+        booksReads += 1;
+        return Promise.resolve(Response.json({ books: [] }));
+      }
+      if (path === '/api/v1/carddav/runs') {
+        runsReads += 1;
+        return Promise.resolve(Response.json({ runs: [] }));
+      }
+      if (path === '/api/v1/carddav/status') {
+        statusReads += 1;
+        if (statusReads === 1) return Promise.resolve(Response.json({
+          configured: true, available: true, credential_configured: true, enabled: true,
+          scheduled: true, schedule: '0 2 * * *', active: {
+            id: 9, trigger: 'manual', full: false, state: 'running', started_at: '2026-08-28T10:00:00Z',
+            books: 1, created: 0, updated: 1, removed: 0
+          }
+        }));
+        if (statusReads === 2) {
+          pollSignal = request.signal;
+          return new Promise<Response>(() => undefined);
+        }
+        return Promise.resolve(Response.json({
+          configured: true, available: true, credential_configured: true, enabled: true,
+          scheduled: true, schedule: '0 2 * * *'
+        }));
+      }
+      throw new Error(`Unexpected request: ${request.method} ${path}`);
     });
+    const rendered = render(SettingsWorkspace, { client: createAPIClient(fetchFn) });
+
+    await openSettingsCategory('CardDAV account');
+    await screen.findByLabelText('Password');
+    await waitFor(() => expect([statusReads, booksReads, runsReads]).toEqual([1, 1, 1]));
+    await fireEvent.input(screen.getByLabelText('Password'), { target: { value: 'synthetic-password' } });
+    expect(rendered.container.querySelector('.kit-settings__footer')).toBeNull();
+    await vi.advanceTimersByTimeAsync(500);
+    await waitFor(() => expect(pollSignal).toBeDefined());
+
+    await openSettingsCategory('Appearance');
+    expect(pollSignal?.aborted).toBe(true);
+    expect(screen.queryByLabelText('Password')).toBeNull();
+
+    await openSettingsCategory('CardDAV account');
+    await waitFor(() => expect([statusReads, booksReads, runsReads]).toEqual([3, 2, 2]));
+    expect((screen.getByLabelText('Password') as HTMLInputElement).value).toBe('');
+    rendered.unmount();
+  });
+
+  it('consumes keyed CardDAV conflict handoffs once and focuses the exact non-dialog detail surface', async () => {
+    const detailRequests: number[] = [];
+    const onCardDAVRequestConsumed = vi.fn();
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      const path = new URL(request.url).pathname;
+      if (path === '/api/v1/settings') return settingsResponse(cardDAVSettings(), '"etag-a"');
+      if (path === '/api/v1/carddav/conflicts/41') {
+        detailRequests.push(41);
+        return Response.json({
+          id: 41,
+          address_book: { id: 5, name: 'Synthetic contacts' },
+          status: 'unresolved',
+          base: { state: 'present', display_name: 'Base person', emails: [], phones: [] },
+          local: { state: 'present', display_name: 'Local person', emails: [], phones: [] },
+          remote: { state: 'deleted', emails: [], phones: [] },
+          allowed_resolutions: ['keep_local', 'keep_remote'],
+          created_at: '2026-08-28T10:00:00Z',
+          updated_at: '2026-08-28T11:00:00Z'
+        });
+      }
+      const operations = cardDAVOperationsResponse(request);
+      if (operations) return operations;
+      throw new Error(`Unexpected ${request.method} ${path}`);
+    });
+    const rendered = render(SettingsWorkspace, {
+      client: createAPIClient(fetchFn),
+      cardDAVRequest: { conflictID: 41, key: 1 },
+      onCardDAVRequestConsumed
+    });
+
+    const heading = await screen.findByRole('heading', { name: 'Conflict comparison' });
+    await waitFor(() => expect(document.activeElement).toBe(heading));
+    expect(detailRequests).toEqual([41]);
+    expect(onCardDAVRequestConsumed.mock.calls).toEqual([[1]]);
+    expect(screen.queryByRole('dialog')).toBeNull();
+
+    await rendered.rerender({
+      client: createAPIClient(fetchFn),
+      cardDAVRequest: { conflictID: 41, key: 1 },
+      onCardDAVRequestConsumed
+    });
+    await Promise.resolve();
+    expect(detailRequests).toEqual([41]);
+    await rendered.rerender({
+      client: createAPIClient(fetchFn),
+      cardDAVRequest: { conflictID: 41, key: 2 },
+      onCardDAVRequestConsumed
+    });
+    await waitFor(() => expect(detailRequests).toEqual([41, 41]));
+    await waitFor(() => expect(onCardDAVRequestConsumed.mock.calls).toEqual([[1], [2]]));
+    rendered.unmount();
   });
 });
 
@@ -370,15 +1073,20 @@ async function openSettingsCategory(label: string): Promise<void> {
   await fireEvent.click(await screen.findByRole('button', { name: new RegExp(`^${label}`) }));
 }
 
-function cardDAVSettings(): object {
+function cardDAVSettings({
+  baseURL = 'https://old.example.test/',
+  username = 'alice',
+  schedule = '0 2 * * *'
+}: { baseURL?: string; username?: string; schedule?: string } = {}): object {
   return {
+    groups: initialSettings.groups,
     settings: [
       ...initialSettings.settings,
-      setting('carddav.base_url', 'https://old.example.test/'),
-      setting('carddav.username', 'alice'),
+      setting('carddav.base_url', baseURL),
+      setting('carddav.username', username),
       setting('carddav.password', undefined, { kind: 'secret', secret: { configured: true } }),
       setting('carddav.enabled', false, { kind: 'boolean' }),
-      setting('carddav.schedule', '0 2 * * *')
+      setting('carddav.schedule', schedule)
     ],
     pending_restart: false
   };
@@ -406,6 +1114,111 @@ function typedValue(value: unknown): Record<string, unknown> {
   return { string: value };
 }
 
-function settingsResponse(body: object, etag: string): Response {
-  return Response.json(body, { headers: { ETag: etag } });
+function settingsResponse(body: object, etag: string, credentialETag?: string): Response {
+  return Response.json(body, { headers: {
+    ETag: etag,
+    ...(credentialETag ? { 'Credential-ETag': credentialETag } : {})
+  } });
+}
+
+function approvedSettingsDocument() {
+  const provider = (name: string) => ({
+    name,
+    kind: 'exa',
+    enabled: false,
+    endpoint: 'https://api.exa.ai/search',
+    mode: 'people',
+    num_results: 1,
+    allowed_identifiers: ['email'],
+    target_keys: ['job_title'],
+    allow_sensitive_targets: false,
+    retention_posture: 'zero_retention',
+    training_posture: 'no_training',
+    refresh_interval: '720h',
+    request_timeout: '1m',
+    poll_interval: '30s',
+    max_job_age: '15m',
+    max_retries: 5,
+    max_requests_per_run: 10,
+    max_requests_per_day: 100,
+    credential: { configured: false, source: 'none' },
+    credential_id: `people.enrichment/${name}`
+  });
+  return {
+    groups: [
+      { id: 'browser', label: 'Appearance', description: 'How the web app looks.' },
+      { id: 'search', label: 'Search', description: 'Semantic search and providers.' },
+      {
+        id: 'attachments', label: 'Attachments',
+        description: 'Controls future downloads only; existing files are unchanged.',
+        sections: [{ id: 'discord', label: 'Discord' }]
+      },
+      { id: 'enrichment', label: 'Person enrichment', description: 'Named provider policies.' }
+    ],
+    settings: [
+      daemonSetting('web.theme', 'browser', 'Theme', 'Browser color theme.', 'string', 'system', {
+        options: ['system', 'light', 'dark'], restart_required: false
+      }),
+      daemonSetting('vector.enabled', 'search', 'Semantic search', 'Index message text with an embedding provider.', 'boolean', false),
+      daemonSetting('vector.embeddings.endpoint', 'search', 'Text embedding endpoint', 'Provider API root.', 'string', 'https://old-embedding.example.test/v1'),
+      daemonSetting('vector.embeddings.api_key', 'search', 'Text embedding API key', 'Write-only provider credential.', 'secret', undefined, {
+        secret: { configured: true, source: 'environment' }, credential_id: 'vector.embeddings'
+      }),
+      daemonSetting('vector.multimodal.enabled', 'search', 'Visual Voyage embeddings', 'Additional visual lane gate.', 'boolean', false),
+      daemonSetting('vector.embed.schedule.cron', 'search', 'Embedding schedule', 'When the daemon embeds new messages.', 'string', '0 3 * * *', {
+        validation: { format: 'cron' }
+      }),
+      daemonSetting('vector.multimodal.api_key', 'search', 'Voyage API key', 'Write-only provider credential.', 'secret', undefined, {
+        secret: { configured: false, source: 'none' }, credential_id: 'vector.multimodal'
+      }),
+      daemonSetting('discord.media', 'attachments', 'Download Discord attachments', 'Future downloads only.', 'boolean', true, { section: 'discord' }),
+      daemonSetting('discord.media_scope', 'attachments', 'Discord attachment scope', 'Conversation scope.', 'string', 'all', {
+        section: 'discord', options: ['all', 'direct', 'none']
+      }),
+      daemonSetting('discord.media_max_participants', 'attachments', 'Discord participant limit', 'Skip conversations over this size.', 'integer', 20, {
+        section: 'discord', validation: { minimum: 0, off: { value: '0', label: 'No limit', suggest: '20', on_minimum: 1 } }
+      }),
+      daemonSetting('discord.max_media_mb', 'attachments', 'Discord maximum attachment size', 'Maximum future file size.', 'integer', 0, {
+        section: 'discord', validation: { minimum: 0, off: { value: '0', label: 'Discord default of 50 MiB', suggest: '50', on_minimum: 1 } }
+      }),
+      daemonSetting('people.enrichment.enabled', 'enrichment', 'Enable person enrichment', 'Global enrichment gate.', 'boolean', false)
+    ],
+    person_enrichment_providers: [provider('exa-primary'), provider('exa-secondary')],
+    credential_etag: '"credential-a"',
+    pending_restart: false
+  };
+}
+
+function daemonSetting(
+  key: string,
+  group: string,
+  label: string,
+  description: string,
+  kind: string,
+  value: unknown,
+  overrides: Record<string, unknown> = {}
+) {
+  return {
+    key, group, label, description, kind,
+    value: value === undefined ? undefined : typedValue(value),
+    restart_required: true,
+    ...overrides
+  };
+}
+
+function cardDAVOperationsResponse(request: Request): Response | undefined {
+  if (request.method !== 'GET') return undefined;
+  const path = new URL(request.url).pathname;
+  if (path === '/api/v1/carddav/status') return Response.json({
+    configured: true,
+    available: true,
+    credential_configured: true,
+    enabled: false,
+    scheduled: false,
+    schedule: ''
+  });
+  if (path === '/api/v1/carddav/books') return Response.json({ books: [] });
+  if (path === '/api/v1/carddav/runs') return Response.json({ runs: [] });
+  if (path === '/api/v1/carddav/conflicts') return Response.json({ conflicts: [] });
+  return undefined;
 }

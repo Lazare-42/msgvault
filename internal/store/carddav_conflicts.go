@@ -34,32 +34,72 @@ var (
 )
 
 type CardDAVConflict struct {
-	ID                      int64
-	AddressBookID           int64
-	Href                    string
-	BaseLocalHash           string
-	LocalHash               string
-	BaseRemoteHash          string
-	BaseRemoteETag          string
-	RemoteETag              string
-	MappingRevision         int64
-	LocalBody               []byte
-	RemoteBody              []byte
-	LocalTombstone          bool
-	RemoteTombstone         bool
-	PendingOperation        CardDAVMutationOperation
-	ConnectionGeneration    int64
-	BookSyncRevision        int64
-	PreviousMappingRevision int64
-	PendingStartedAt        *time.Time
-	Status                  CardDAVConflictStatus
-	Resolution              CardDAVConflictResolution
-	ResolvedAt              *time.Time
-	CreatedAt               time.Time
-	UpdatedAt               time.Time
+	ReviewRevision                 int64
+	LocalInferenceRevision         *int64
+	ApprovedLocalBodySHA256        *string
+	ApprovedLocalInferenceRevision *int64
+	ApprovedConflictRevision       *int64
+	LocalEnvelopeMetadata          []byte
+	LocalMutationIntent            []byte
+	ID                             int64
+	AddressBookID                  int64
+	Href                           string
+	BaseLocalHash                  string
+	LocalHash                      string
+	BaseRemoteHash                 string
+	BaseRemoteETag                 string
+	RemoteETag                     string
+	MappingRevision                int64
+	LocalBody                      []byte
+	RemoteBody                     []byte
+	LocalTombstone                 bool
+	RemoteTombstone                bool
+	PendingOperation               CardDAVMutationOperation
+	ConnectionGeneration           int64
+	BookSyncRevision               int64
+	PreviousMappingRevision        int64
+	PendingStartedAt               *time.Time
+	Status                         CardDAVConflictStatus
+	Resolution                     CardDAVConflictResolution
+	ResolvedAt                     *time.Time
+	CreatedAt                      time.Time
+	UpdatedAt                      time.Time
+}
+
+// CardDAVConflictHeader is the compact, body-free read model used by public
+// conflict lists. Sensitive mutation evidence deliberately remains absent.
+type CardDAVConflictHeader struct {
+	ID              int64
+	AddressBookID   int64
+	AddressBookName string
+	Status          CardDAVConflictStatus
+	LocalTombstone  bool
+	RemoteTombstone bool
+	UpdatedAt       time.Time
+}
+
+// CardDAVConflictDetailSource contains the internal evidence needed to build
+// one bounded public projection. It must not cross the CardDAV service boundary.
+type CardDAVConflictDetailSource struct {
+	ID              int64
+	AddressBookID   int64
+	AddressBookName string
+	MappingRevision int64
+	LocalBody       []byte
+	RemoteBody      []byte
+	BaseBody        []byte
+	LocalTombstone  bool
+	RemoteTombstone bool
+	BaseAvailable   bool
+	Status          CardDAVConflictStatus
+	Resolution      CardDAVConflictResolution
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+	ResolvedAt      *time.Time
 }
 
 type CardDAVConflictCapture struct {
+	ExpectedPersonID        int64
 	AddressBookID           int64
 	Href                    string
 	ExpectedMappingRevision int64
@@ -75,6 +115,7 @@ type CardDAVConflictCapture struct {
 }
 
 type CardDAVConflictRemoteResolution struct {
+	ExpectedPersonID        int64
 	ConflictID              int64
 	ExpectedMappingRevision int64
 	Remote                  CardDAVRemoteResource
@@ -82,6 +123,7 @@ type CardDAVConflictRemoteResolution struct {
 }
 
 type CardDAVConflictLocalPlan struct {
+	ExpectedPersonID        int64
 	ConflictID              int64
 	ExpectedMappingRevision int64
 	RemoteETag              string
@@ -161,33 +203,26 @@ func (s *Store) PrepareCardDAVConflictLocalContext(
 	}
 	var prepared *CardDAVPublication
 	err := s.withTxContext(ctx, func(tx *loggedTx) error {
-		conflict, err := getCardDAVConflictFrom(ctx, tx, plan.ConflictID, s.dialect.SelectForUpdate())
+		source, err := s.lockCardDAVConflictReviewTx(ctx, tx, plan.ConflictID)
 		if err != nil {
 			return err
 		}
-		if conflict.Status != CardDAVConflictUnresolved || conflict.MappingRevision != plan.ExpectedMappingRevision ||
-			conflict.LocalTombstone || len(conflict.LocalBody) == 0 {
-			return ErrCardDAVConflictStale
+		if plan.ExpectedPersonID != 0 && plan.ExpectedPersonID != source.Person.ID {
+			return ErrCardDAVReviewStale
 		}
-		mapping, err := s.findCardDAVResourceTx(ctx, tx, conflict.AddressBookID, conflict.Href)
-		if err != nil || mapping.PersonID == nil {
-			return ErrCardDAVConflictStale
-		}
-		snapshot, err := s.loadPersonVCardSnapshotTx(ctx, tx, *mapping.PersonID)
-		if err != nil {
+		conflict, mapping, snapshot, book, generation := source.Conflict, source.Resource, source.Snapshot, source.Book, source.ConnectionGeneration
+		if len(conflict.LocalMutationIntent) > 0 {
+			prepared, err = conflict.LocalMutationPublication()
+			if err == nil {
+				if prepared.PersonID != source.Person.ID {
+					return ErrCardDAVReviewStale
+				}
+				prepared.RecoveryOnly = true
+			}
 			return err
 		}
-		if snapshot.Fingerprint != conflict.LocalHash {
+		if conflict.MappingRevision != plan.ExpectedMappingRevision || conflict.LocalTombstone || len(conflict.LocalBody) == 0 {
 			return ErrCardDAVConflictStale
-		}
-		var generation int64
-		if err := tx.QueryRowContext(ctx, `SELECT connection_generation FROM carddav_accounts
-			WHERE id = 1`+s.dialect.SelectForUpdate()).Scan(&generation); err != nil {
-			return err
-		}
-		book, err := s.lockCardDAVConflictResolutionBookTx(ctx, tx, conflict.AddressBookID)
-		if err != nil {
-			return err
 		}
 		operation := CardDAVMutationUpdate
 		remoteETag := plan.RemoteETag
@@ -214,8 +249,21 @@ func (s *Store) PrepareCardDAVConflictLocalContext(
 			prepared = publication
 			return nil
 		}
+		if source.Inference.InferenceRevision > 0 && !conflict.HasExactLocalApproval(source.Inference, generation, book.SyncRevision) {
+			return ErrCardDAVInferenceReviewRequired
+		}
+		if snapshot.Fingerprint != conflict.LocalHash {
+			return ErrCardDAVConflictStale
+		}
+		if conflict.ApprovedConflictRevision != nil && (conflict.RemoteTombstone != plan.RemoteTombstone || conflict.RemoteETag != plan.RemoteETag) {
+			return ErrCardDAVReviewStale
+		}
 		if mapping.MappingRevision != plan.ExpectedMappingRevision {
 			return ErrCardDAVConflictStale
+		}
+		if !book.IsWriteTarget || publication == nil || !publication.Desired || publication.AddressBookID != conflict.AddressBookID || publication.Href != conflict.Href {
+			prepared, err = s.prepareCardDAVConflictIntentTx(ctx, tx, source, operation, remoteETag, plan.OutgoingSemanticHash)
+			return err
 		}
 		nextMappingRevision := mapping.MappingRevision + 1
 		result, err := tx.ExecContext(ctx, `UPDATE carddav_resources SET
@@ -242,6 +290,8 @@ func (s *Store) PrepareCardDAVConflictLocalContext(
 		ON CONFLICT(person_id) DO UPDATE SET
 			desired = TRUE, address_book_id = excluded.address_book_id, href = excluded.href,
 			pending_operation = excluded.pending_operation, outgoing_body = excluded.outgoing_body,
+			approved_body_sha256 = NULL, approved_inference_revision = NULL,
+			approved_mutation_revision = NULL, outgoing_envelope_metadata = NULL,
 			outgoing_semantic_hash = excluded.outgoing_semantic_hash,
 			local_hash = excluded.local_hash, remote_etag = excluded.remote_etag,
 			connection_generation = excluded.connection_generation,
@@ -256,6 +306,14 @@ func (s *Store) PrepareCardDAVConflictLocalContext(
 			mutationRevision, timeValue(&now))
 		if err != nil {
 			return fmt.Errorf("prepare keep-local CardDAV conflict mutation: %w", err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE carddav_publications SET approved_body_sha256=?, approved_inference_revision=?, approved_mutation_revision=mutation_revision, outgoing_envelope_metadata=? WHERE person_id=?`, CardDAVBodySHA256(conflict.LocalBody), source.Inference.InferenceRevision, nullableCardDAVMetadata(conflict.LocalEnvelopeMetadata), source.Person.ID); err != nil {
+			return err
+		}
+		if conflict.HasExactLocalApproval(source.Inference, generation, book.SyncRevision) {
+			if err := s.approveCardDAVInferenceTx(ctx, tx, source.Inference, generation, book.ID); err != nil {
+				return err
+			}
 		}
 		prepared, err = getCardDAVPublicationFrom(ctx, tx, *mapping.PersonID, "")
 		if err == nil {
@@ -350,6 +408,8 @@ func (s *Store) PrepareCardDAVConflictLocalTombstoneContext(
 		}
 		now := time.Now().UTC()
 		row := tx.QueryRowContext(ctx, `UPDATE carddav_conflicts SET
+			review_revision = review_revision + 1, approved_local_body_sha256 = NULL,
+			approved_local_inference_revision = NULL, approved_conflict_revision = NULL, local_envelope_metadata = NULL,
 			remote_etag = ?, remote_body = ?, remote_tombstone = FALSE,
 			mapping_revision = ?, pending_operation = ?, connection_generation = ?,
 			book_sync_revision = ?, previous_mapping_revision = ?, pending_started_at = ?,
@@ -398,6 +458,8 @@ func (s *Store) RefreshCardDAVConflictMutationFenceContext(
 			return err
 		}
 		row := tx.QueryRowContext(ctx, `UPDATE carddav_conflicts SET
+			review_revision = review_revision + 1, approved_local_body_sha256 = NULL,
+			approved_local_inference_revision = NULL, approved_conflict_revision = NULL, local_envelope_metadata = NULL,
 			book_sync_revision = ?, mapping_revision = ?, updated_at = `+s.dialect.Now()+`
 			WHERE id = ? AND status = 'unresolved' AND pending_operation = ?
 			RETURNING `+cardDAVConflictColumns,
@@ -498,6 +560,8 @@ func (s *Store) ResetCardDAVConflictLocalTombstoneContext(
 			return ErrCardDAVConflictStale
 		}
 		row := tx.QueryRowContext(ctx, `UPDATE carddav_conflicts SET
+			review_revision = review_revision + 1, approved_local_body_sha256 = NULL,
+			approved_local_inference_revision = NULL, approved_conflict_revision = NULL, local_envelope_metadata = NULL,
 			remote_etag = ?, remote_body = ?, remote_tombstone = FALSE,
 			mapping_revision = previous_mapping_revision, pending_operation = NULL,
 			connection_generation = NULL, book_sync_revision = NULL,
@@ -546,6 +610,8 @@ func (s *Store) RollbackCardDAVConflictMutationContext(
 			return ErrCardDAVConflictStale
 		}
 		result, err = tx.ExecContext(ctx, `UPDATE carddav_conflicts SET
+			review_revision = review_revision + 1, approved_local_body_sha256 = NULL,
+			approved_local_inference_revision = NULL, approved_conflict_revision = NULL, local_envelope_metadata = NULL,
 			mapping_revision = previous_mapping_revision, pending_operation = NULL,
 			connection_generation = NULL, book_sync_revision = NULL,
 			previous_mapping_revision = NULL, pending_started_at = NULL,
@@ -619,6 +685,9 @@ func (s *Store) completeCardDAVConflictLocalTombstoneTx(
 		return nil, ErrCardDAVConflictStale
 	}
 	if retainPerson {
+		if err := s.clearPersonCardDAVInferenceApprovalTx(ctx, tx, *mapping.PersonID); err != nil {
+			return nil, err
+		}
 		result, err := tx.ExecContext(ctx, `DELETE FROM carddav_publications
 			WHERE person_id = ? AND desired = FALSE AND address_book_id = ? AND href = ?`,
 			*mapping.PersonID, conflict.AddressBookID, conflict.Href)
@@ -726,6 +795,8 @@ func (s *Store) recordCardDAVPublicationConflictContext(
 		}
 		result, err := tx.ExecContext(ctx, `UPDATE carddav_publications SET
 			pending_operation = NULL, outgoing_body = NULL,
+			approved_body_sha256 = NULL, approved_inference_revision = NULL,
+			approved_mutation_revision = NULL, outgoing_envelope_metadata = NULL,
 			outgoing_semantic_hash = NULL, local_hash = NULL, remote_etag = NULL,
 			connection_generation = NULL, book_sync_revision = NULL,
 			mapping_revision = NULL, previous_mapping_revision = NULL,
@@ -826,6 +897,8 @@ func (s *Store) rollbackOversizedCardDAVPublicationConflictContext(
 		} else {
 			result, err = tx.ExecContext(ctx, `UPDATE carddav_publications SET
 				pending_operation = NULL, outgoing_body = NULL,
+				approved_body_sha256 = NULL, approved_inference_revision = NULL,
+				approved_mutation_revision = NULL, outgoing_envelope_metadata = NULL,
 				outgoing_semantic_hash = NULL, local_hash = NULL, remote_etag = NULL,
 				connection_generation = NULL, book_sync_revision = NULL,
 				mapping_revision = NULL, previous_mapping_revision = NULL,
@@ -907,6 +980,18 @@ func (s *Store) recordCardDAVConflictTx(
 		}
 		return nil, fmt.Errorf("lock CardDAV conflict mapping: %w", err)
 	}
+	if capture.ExpectedPersonID != 0 && (!personID.Valid || personID.Int64 != capture.ExpectedPersonID) {
+		return nil, ErrCardDAVReviewStale
+	}
+	existing, existingErr := scanCardDAVConflict(tx.QueryRowContext(ctx, `SELECT `+cardDAVConflictColumns+` FROM carddav_conflicts WHERE address_book_id=? AND href=? AND status='unresolved'`, capture.AddressBookID, capture.Href))
+	if existingErr == nil && len(existing.LocalMutationIntent) > 0 {
+		// Keep the sync token unchanged until recovery settles this operation;
+		// accepting the plan here would discard its new remote snapshot.
+		return nil, ErrCardDAVPublicationPending
+	}
+	if existingErr != nil && !errors.Is(existingErr, sql.ErrNoRows) {
+		return nil, existingErr
+	}
 	if revision != capture.ExpectedMappingRevision || baseLocalHash != capture.BaseLocalHash ||
 		baseRemoteHash != capture.BaseRemoteHash || baseRemoteETag != capture.BaseRemoteETag ||
 		mappingStatus != CardDAVMappingMapped {
@@ -939,6 +1024,24 @@ func (s *Store) recordCardDAVConflictTx(
 		currentLocalHash != capture.LocalHash {
 		return nil, ErrCardDAVConflictStale
 	}
+	var localInferenceRevision *int64
+	if personID.Valid {
+		state, err := s.getCardDAVInferenceExportStateTx(ctx, tx, personID.Int64)
+		if err != nil {
+			return nil, err
+		}
+		localInferenceRevision = &state.InferenceRevision
+	}
+	if existingErr == nil && (!options.supersedePendingIntent || existing.PendingOperation == "") &&
+		existing.MappingRevision == revision && existing.BaseLocalHash == capture.BaseLocalHash &&
+		existing.LocalHash == capture.LocalHash && existing.BaseRemoteHash == capture.BaseRemoteHash &&
+		existing.BaseRemoteETag == capture.BaseRemoteETag && existing.RemoteETag == capture.RemoteETag &&
+		existing.LocalTombstone == capture.LocalTombstone && existing.RemoteTombstone == capture.RemoteTombstone &&
+		sameOptionalInt64(existing.LocalInferenceRevision, localInferenceRevision) &&
+		(capture.LocalTombstone || bytes.Equal(existing.LocalBody, capture.LocalBody)) &&
+		(capture.RemoteTombstone || bytes.Equal(existing.RemoteBody, capture.RemoteBody)) {
+		return existing, nil
+	}
 	nextRevision := revision + 1
 	result, err := tx.ExecContext(ctx, `UPDATE carddav_resources SET
 		mapping_revision = ?, updated_at = `+s.dialect.Now()+`
@@ -952,11 +1055,13 @@ func (s *Store) recordCardDAVConflictTx(
 	row := tx.QueryRowContext(ctx, `INSERT INTO carddav_conflicts (
 		address_book_id, href, base_local_hash, local_hash, base_remote_hash,
 		base_remote_etag, remote_etag, mapping_revision, local_body,
-		remote_body, local_tombstone, remote_tombstone
-	) VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?)
+		remote_body, local_tombstone, remote_tombstone, local_inference_revision
+	) VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(address_book_id, href) WHERE status = 'unresolved' DO UPDATE SET
+			review_revision = carddav_conflicts.review_revision + 1, approved_local_body_sha256 = NULL,
+			approved_local_inference_revision = NULL, approved_conflict_revision = NULL, local_envelope_metadata = NULL,
 		base_local_hash = excluded.base_local_hash,
-		local_hash = excluded.local_hash,
+		local_hash = excluded.local_hash, local_inference_revision = excluded.local_inference_revision,
 		base_remote_hash = excluded.base_remote_hash,
 		base_remote_etag = excluded.base_remote_etag,
 		remote_etag = excluded.remote_etag,
@@ -971,13 +1076,15 @@ func (s *Store) recordCardDAVConflictTx(
 		capture.BaseRemoteHash, capture.BaseRemoteETag, capture.RemoteETag,
 		nextRevision, nullableConflictBody(capture.LocalBody, capture.LocalTombstone),
 		nullableConflictBody(capture.RemoteBody, capture.RemoteTombstone),
-		capture.LocalTombstone, capture.RemoteTombstone)
+		capture.LocalTombstone, capture.RemoteTombstone, localInferenceRevision)
 	conflict, err := scanCardDAVConflict(row)
 	if err != nil {
 		return nil, fmt.Errorf("record CardDAV conflict: %w", err)
 	}
 	if options.supersedePendingIntent && conflict.PendingOperation != "" {
 		conflict, err = scanCardDAVConflict(tx.QueryRowContext(ctx, `UPDATE carddav_conflicts SET
+			review_revision = review_revision + 1, approved_local_body_sha256 = NULL,
+			approved_local_inference_revision = NULL, approved_conflict_revision = NULL, local_envelope_metadata = NULL,
 			pending_operation = NULL, connection_generation = NULL, book_sync_revision = NULL,
 			previous_mapping_revision = NULL, pending_started_at = NULL,
 			updated_at = `+s.dialect.Now()+` WHERE id = ? AND status = 'unresolved'
@@ -1051,6 +1158,72 @@ func (s *Store) ListCardDAVConflictsContext(
 	return conflicts, rows.Err()
 }
 
+func (s *Store) ListCardDAVConflictHeadersContext(ctx context.Context) ([]CardDAVConflictHeader, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT c.id, c.address_book_id, b.display_name,
+		c.status, c.local_tombstone, c.remote_tombstone, c.updated_at
+		FROM carddav_conflicts c
+		JOIN carddav_address_books b ON b.id = c.address_book_id
+		WHERE c.status = 'unresolved'
+		ORDER BY c.updated_at DESC, c.id`)
+	if err != nil {
+		return nil, fmt.Errorf("list CardDAV conflict headers: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	result := []CardDAVConflictHeader{}
+	for rows.Next() {
+		var header CardDAVConflictHeader
+		if err := rows.Scan(&header.ID, &header.AddressBookID, &header.AddressBookName,
+			&header.Status, &header.LocalTombstone, &header.RemoteTombstone, &header.UpdatedAt); err != nil {
+			return nil, fmt.Errorf("scan CardDAV conflict header: %w", err)
+		}
+		result = append(result, header)
+	}
+	return result, rows.Err()
+}
+
+func (s *Store) GetCardDAVConflictDetailSourceContext(
+	ctx context.Context, id int64,
+) (*CardDAVConflictDetailSource, error) {
+	var source CardDAVConflictDetailSource
+	var resolution sql.NullString
+	var resolvedAt sql.NullTime
+	var baseBody []byte
+	err := s.db.QueryRowContext(ctx, `SELECT c.id, c.address_book_id, b.display_name,
+		c.mapping_revision, c.local_body, c.remote_body,
+		c.local_tombstone, c.remote_tombstone, c.status, c.resolution,
+		c.created_at, c.updated_at, c.resolved_at, r.remote_body
+		FROM carddav_conflicts c
+		JOIN carddav_address_books b ON b.id = c.address_book_id
+		LEFT JOIN carddav_resources r ON r.address_book_id = c.address_book_id
+			AND r.href = c.href
+			AND r.mapping_revision = c.mapping_revision
+			AND r.remote_semantic_hash = c.base_remote_hash
+			AND r.remote_etag = c.base_remote_etag
+		WHERE c.id = ?`, id).Scan(
+		&source.ID, &source.AddressBookID, &source.AddressBookName,
+		&source.MappingRevision, &source.LocalBody, &source.RemoteBody,
+		&source.LocalTombstone, &source.RemoteTombstone, &source.Status, &resolution,
+		&source.CreatedAt, &source.UpdatedAt, &resolvedAt, &baseBody)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrCardDAVConflictNotFound
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get CardDAV conflict detail source: %w", err)
+	}
+	source.Resolution = CardDAVConflictResolution(resolution.String)
+	if resolvedAt.Valid {
+		value := resolvedAt.Time.UTC()
+		source.ResolvedAt = &value
+	}
+	if baseBody != nil {
+		source.BaseAvailable = true
+		source.BaseBody = append([]byte(nil), baseBody...)
+	}
+	source.LocalBody = append([]byte(nil), source.LocalBody...)
+	source.RemoteBody = append([]byte(nil), source.RemoteBody...)
+	return &source, nil
+}
+
 func (s *Store) ResolveCardDAVConflictRemoteContext(
 	ctx context.Context, input CardDAVConflictRemoteResolution,
 ) (*CardDAVConflict, error) {
@@ -1077,6 +1250,9 @@ func (s *Store) ResolveCardDAVConflictRemoteContext(
 		if err != nil || mapping.MappingRevision != input.ExpectedMappingRevision {
 			return ErrCardDAVConflictStale
 		}
+		if input.ExpectedPersonID != 0 && (mapping.PersonID == nil || *mapping.PersonID != input.ExpectedPersonID) {
+			return ErrCardDAVReviewStale
+		}
 		conflict, err := getCardDAVConflictFrom(ctx, tx, input.ConflictID, s.dialect.SelectForUpdate())
 		if err != nil {
 			if errors.Is(err, ErrCardDAVConflictNotFound) {
@@ -1089,6 +1265,9 @@ func (s *Store) ResolveCardDAVConflictRemoteContext(
 			conflict.MappingRevision != input.ExpectedMappingRevision ||
 			mapping.AddressBookID != conflict.AddressBookID || mapping.Href != conflict.Href {
 			return ErrCardDAVConflictStale
+		}
+		if len(conflict.LocalMutationIntent) > 0 {
+			return ErrCardDAVPublicationPending
 		}
 		publicationPersonID := mapping.PersonID
 		if input.RemoteTombstone != conflict.RemoteTombstone {
@@ -1103,8 +1282,8 @@ func (s *Store) ResolveCardDAVConflictRemoteContext(
 				return ErrCardDAVConflictStale
 			}
 			if publicationPersonID != nil {
-				if _, err := tx.ExecContext(ctx, `DELETE FROM carddav_publications WHERE person_id = ?`,
-					*publicationPersonID); err != nil {
+				if _, err := tx.ExecContext(ctx, `DELETE FROM carddav_publications WHERE person_id = ? AND address_book_id=? AND href=?`,
+					*publicationPersonID, conflict.AddressBookID, conflict.Href); err != nil {
 					return fmt.Errorf("cancel retained CardDAV remote tombstone publication: %w", err)
 				}
 			}
@@ -1139,12 +1318,14 @@ func (s *Store) ResolveCardDAVConflictRemoteContext(
 			if publicationPersonID != nil {
 				if _, err := tx.ExecContext(ctx, `UPDATE carddav_publications SET
 					desired = TRUE, pending_operation = NULL, outgoing_body = NULL,
+					approved_body_sha256 = NULL, approved_inference_revision = NULL,
+					approved_mutation_revision = NULL, outgoing_envelope_metadata = NULL,
 					outgoing_semantic_hash = NULL, local_hash = NULL, remote_etag = NULL,
 					connection_generation = NULL, book_sync_revision = NULL,
 					mapping_revision = NULL, previous_mapping_revision = NULL,
 					create_recovery_used = FALSE, pending_started_at = NULL,
-					updated_at = `+s.dialect.Now()+` WHERE person_id = ?`,
-					*publicationPersonID); err != nil {
+					updated_at = `+s.dialect.Now()+` WHERE person_id = ? AND address_book_id=? AND href=?`,
+					*publicationPersonID, conflict.AddressBookID, conflict.Href); err != nil {
 					return fmt.Errorf("retain CardDAV remote publication choice: %w", err)
 				}
 			}
@@ -1208,6 +1389,8 @@ func resolveCardDAVConflictAuditTx(
 		return nil, ErrCardDAVConflictResolution
 	}
 	conflict, err := scanCardDAVConflict(tx.QueryRowContext(ctx, `UPDATE carddav_conflicts SET
+			review_revision = review_revision + 1, approved_local_body_sha256 = NULL,
+			approved_local_inference_revision = NULL, approved_conflict_revision = NULL, local_envelope_metadata = NULL,
 		status = 'resolved', resolution = ?, resolved_at = `+dialect.Now()+`,
 		pending_operation = NULL, connection_generation = NULL, book_sync_revision = NULL,
 		previous_mapping_revision = NULL, pending_started_at = NULL,
@@ -1264,7 +1447,7 @@ const cardDAVConflictColumns = `id, address_book_id, href, base_local_hash, loca
 	base_remote_hash, base_remote_etag, remote_etag, mapping_revision,
 	local_body, remote_body, local_tombstone, remote_tombstone, pending_operation,
 	connection_generation, book_sync_revision, previous_mapping_revision, pending_started_at, status,
-	resolution, resolved_at, created_at, updated_at`
+	resolution, resolved_at, created_at, updated_at, review_revision, local_inference_revision, approved_local_body_sha256, approved_local_inference_revision, approved_conflict_revision, local_envelope_metadata, local_mutation_intent`
 
 func scanCardDAVConflict(row scanner) (*CardDAVConflict, error) {
 	var conflict CardDAVConflict
@@ -1272,6 +1455,8 @@ func scanCardDAVConflict(row scanner) (*CardDAVConflict, error) {
 	var pendingOperation sql.NullString
 	var connectionGeneration, bookSyncRevision, previousMappingRevision sql.NullInt64
 	var localBody, remoteBody []byte
+	var localInference, approvedInference, approvedRevision sql.NullInt64
+	var approvedBody sql.NullString
 	var pendingStartedAt, resolvedAt sql.NullTime
 	if err := row.Scan(&conflict.ID, &conflict.AddressBookID, &conflict.Href,
 		&conflict.BaseLocalHash, &conflict.LocalHash, &conflict.BaseRemoteHash, &conflict.BaseRemoteETag,
@@ -1279,8 +1464,14 @@ func scanCardDAVConflict(row scanner) (*CardDAVConflict, error) {
 		&conflict.LocalTombstone, &conflict.RemoteTombstone, &pendingOperation,
 		&connectionGeneration, &bookSyncRevision, &previousMappingRevision, &pendingStartedAt,
 		&conflict.Status,
-		&resolution, &resolvedAt, &conflict.CreatedAt, &conflict.UpdatedAt); err != nil {
+		&resolution, &resolvedAt, &conflict.CreatedAt, &conflict.UpdatedAt, &conflict.ReviewRevision, &localInference, &approvedBody, &approvedInference, &approvedRevision, &conflict.LocalEnvelopeMetadata, &conflict.LocalMutationIntent); err != nil {
 		return nil, err
+	}
+	conflict.LocalInferenceRevision = cardDAVInferenceNullInt64Ptr(localInference)
+	conflict.ApprovedLocalInferenceRevision = cardDAVInferenceNullInt64Ptr(approvedInference)
+	conflict.ApprovedConflictRevision = cardDAVInferenceNullInt64Ptr(approvedRevision)
+	if approvedBody.Valid {
+		conflict.ApprovedLocalBodySHA256 = &approvedBody.String
 	}
 	conflict.RemoteETag = remoteETag.String
 	conflict.PendingOperation = CardDAVMutationOperation(pendingOperation.String)

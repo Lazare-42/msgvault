@@ -37,20 +37,21 @@ const (
 )
 
 type ExploreFilter struct {
-	Dimension string   `json:"dimension" enum:"source,participant,domain,message_type,after,before,deletion,identity"`
+	Dimension string   `json:"dimension" enum:"source,participant,domain,message_type,mailing_list,after,before,deletion,identity"`
 	Values    []string `json:"values" minItems:"1"`
 }
 
 // Explore filter dimension names, matching ExploreFilter.Dimension's enum tag.
 const (
-	exploreFilterSource      = "source"
-	exploreFilterParticipant = "participant"
-	exploreFilterDomain      = "domain"
-	exploreFilterMessageType = "message_type"
-	exploreFilterAfter       = "after"
-	exploreFilterBefore      = "before"
-	exploreFilterDeletion    = "deletion"
-	exploreFilterIdentity    = "identity"
+	exploreFilterSource      = explorecatalog.FilterSource
+	exploreFilterParticipant = explorecatalog.FilterParticipant
+	exploreFilterDomain      = explorecatalog.FilterDomain
+	exploreFilterMessageType = explorecatalog.FilterMessageType
+	exploreFilterMailingList = explorecatalog.FilterMailingList
+	exploreFilterAfter       = explorecatalog.FilterAfter
+	exploreFilterBefore      = explorecatalog.FilterBefore
+	exploreFilterDeletion    = explorecatalog.FilterDeletion
+	exploreFilterIdentity    = explorecatalog.FilterIdentity
 )
 
 var (
@@ -76,6 +77,7 @@ const (
 	ExploreGroupParticipant ExploreGroupDimension = explorecatalog.GroupParticipant
 	ExploreGroupDomain      ExploreGroupDimension = explorecatalog.GroupDomain
 	ExploreGroupMessageType ExploreGroupDimension = explorecatalog.GroupMessageType
+	ExploreGroupMailingList ExploreGroupDimension = explorecatalog.GroupMailingList
 	ExploreGroupKind        ExploreGroupDimension = explorecatalog.GroupKind
 	ExploreGroupYear        ExploreGroupDimension = explorecatalog.GroupYear
 	ExploreGroupMonth       ExploreGroupDimension = explorecatalog.GroupMonth
@@ -173,6 +175,7 @@ type ExploreActionTarget struct {
 }
 
 type ExplorePreflightResponse struct {
+	DeletableCount      int64                      `json:"deletable_count"`
 	Count               int64                      `json:"count"`
 	EstimatedBytes      int64                      `json:"estimated_bytes"`
 	CacheRevision       string                     `json:"cache_revision"`
@@ -590,7 +593,9 @@ func (s *Server) handleExplorePreflight(w http.ResponseWriter, r *http.Request) 
 	token := state.issueOperation(selectionHash, stats.Count, stats.CacheRevision)
 	unavailableActions := make([]ExploreUnavailableAction, 0, 4)
 	actionTargets := make([]ExploreActionTarget, 0, 1)
-	if stats.DeletableCount != stats.Count {
+	// Staging takes the deletable subset of a mixed selection, so only a
+	// selection with nothing deletable makes the action unavailable.
+	if stats.DeletableCount == 0 {
 		unavailableActions = append(unavailableActions, ExploreUnavailableAction{
 			Action: "stage_deletion", Reason: "selection_contains_items_that_cannot_be_deleted_from_source",
 		})
@@ -630,7 +635,8 @@ func (s *Server) handleExplorePreflight(w http.ResponseWriter, r *http.Request) 
 		Action: "open_in_source", Reason: "trusted_source_link_unavailable",
 	})
 	writeJSON(w, http.StatusOK, ExplorePreflightResponse{
-		Count: stats.Count, EstimatedBytes: stats.EstimatedBytes, CacheRevision: stats.CacheRevision,
+		DeletableCount: stats.DeletableCount,
+		Count:          stats.Count, EstimatedBytes: stats.EstimatedBytes, CacheRevision: stats.CacheRevision,
 		SearchProvenance: stats.SearchProvenance, UnavailableActions: unavailableActions,
 		ActionTargets:  actionTargets,
 		OperationToken: token, ExpiresAt: state.now().Add(exploreOperationTokenTTL),
@@ -833,9 +839,9 @@ func (s *Server) resolveExploreIdentityContext(
 	// An email-shaped identity carries its stored address into the predicate
 	// for envelope-first matching, and stays matchable even with zero
 	// resolved participants: the address may survive only in
-	// message_recipients.email_address snapshots after a participant merge.
-	// Identifier types without an envelope surface keep the match-none
-	// short-circuit when no participant carries them.
+	// message_recipients.envelope_address, the raw header snapshot, after a
+	// participant merge. Identifier types without an envelope surface keep
+	// the match-none short-circuit when no participant carries them.
 	emailIdentifier := ""
 	if resolved.IdentifierIsEmail {
 		emailIdentifier = resolved.Identifier
@@ -979,7 +985,8 @@ func exploreContext(filters []ExploreFilter) (query.Context, error) {
 	}
 	seen := map[string]struct{}{}
 	for _, filter := range filters {
-		conjunctive := filter.Dimension == exploreFilterParticipant || filter.Dimension == exploreFilterDomain
+		conjunctive := filter.Dimension == exploreFilterParticipant || filter.Dimension == exploreFilterDomain ||
+			filter.Dimension == exploreFilterMailingList
 		if !conjunctive {
 			if _, ok := seen[filter.Dimension]; ok {
 				return result, fmt.Errorf("filter dimension %q may appear only once", filter.Dimension)
@@ -1023,6 +1030,13 @@ func exploreContext(filters []ExploreFilter) (query.Context, error) {
 			}
 		case exploreFilterMessageType:
 			result.MessageTypes = append([]string(nil), filter.Values...)
+		case exploreFilterMailingList:
+			values := append([]string(nil), filter.Values...)
+			if len(result.MailingLists) == 0 {
+				result.MailingLists = values
+			} else {
+				result.AdditionalMailingListGroups = append(result.AdditionalMailingListGroups, values)
+			}
 		case exploreFilterAfter, exploreFilterBefore:
 			if len(filter.Values) != 1 {
 				return result, fmt.Errorf("filter dimension %q requires exactly one timestamp", filter.Dimension)
@@ -1110,6 +1124,48 @@ func parseExploreIdentityFilter(filters []ExploreFilter) (exploreIdentityFilter,
 		identifier: identityValues[1],
 		direction:  direction,
 	}, nil
+}
+
+// exploreSearchDefinitionError is a search rule violation that depends only
+// on the request, so it carries the error code the Explore endpoints report.
+type exploreSearchDefinitionError struct {
+	code    string
+	message string
+}
+
+func (e *exploreSearchDefinitionError) Error() string { return e.message }
+
+// validateExploreSearchDefinition applies the search rules that depend only on
+// the request and not on the daemon's environment: query syntax, and for the
+// semantic and hybrid modes an active-only deletion scope and free text to
+// embed. The resolvers call it at run time; Saved View writes call it at save
+// time so a definition that can never search is refused before it is stored.
+// Index readiness and vector configuration stay with the resolvers.
+func validateExploreSearchDefinition(
+	request ExploreHTTPRequest, context query.Context,
+) (*search.Query, *exploreSearchDefinitionError) {
+	if request.SearchMode == "" {
+		return nil, nil
+	}
+	parsed := search.Parse(request.Query)
+	if err := parsed.Err(); err != nil {
+		return nil, &exploreSearchDefinitionError{code: "invalid_query", message: err.Error()}
+	}
+	if request.SearchMode == exploreSearchModeFullText {
+		return parsed, nil
+	}
+	if context.Deletion == query.DeletionDeleted {
+		return nil, &exploreSearchDefinitionError{
+			code:    "semantic_deletion_unsupported",
+			message: "Semantic and hybrid search cover active messages only; remove the deletion:deleted filter to search",
+		}
+	}
+	if strings.Join(parsed.TextTerms, " ") == "" {
+		return nil, &exploreSearchDefinitionError{
+			code: "missing_free_text", message: "Semantic and hybrid exploration require free text",
+		}
+	}
+	return parsed, nil
 }
 
 func validateExploreSearchPair(queryText, mode string) error {
@@ -1279,14 +1335,14 @@ func (s *Server) resolveExploreSearch(ctx context.Context, w http.ResponseWriter
 		writeError(w, http.StatusServiceUnavailable, "lexical_index_unavailable", "The full-text index is unavailable")
 		return query.SearchSpec{}, "", false
 	}
-	parsed := search.Parse(request.Query)
-	if err := parsed.Err(); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
-		return query.SearchSpec{}, "", false
-	}
 	filters, err := exploreContext(request.Filters)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_filter", err.Error())
+		return query.SearchSpec{}, "", false
+	}
+	parsed, failure := validateExploreSearchDefinition(request, filters)
+	if failure != nil {
+		writeError(w, http.StatusBadRequest, failure.code, failure.message)
 		return query.SearchSpec{}, "", false
 	}
 	// Candidate resolution must cover the same population the analytical
@@ -1356,7 +1412,8 @@ func (s *Server) resolveExploreSearch(ctx context.Context, w http.ResponseWriter
 
 // applyLexicalFilterPushdown narrows the parsed search query with the
 // request filters the candidate resolvers evaluate natively — source,
-// message_type, after, and before — so the bounded candidate cap applies
+// message_type, mailing_list, after, and before — so the bounded candidate
+// cap applies
 // to the filtered population instead of truncating it before the filters
 // run. Both resolvers share it: the lexical resolver pushes the narrowed
 // query into SQLite FTS5, and the vector resolver builds its backend
@@ -1368,8 +1425,8 @@ func (s *Server) resolveExploreSearch(ctx context.Context, w http.ResponseWriter
 // never widens results).
 //
 // Pushed dimensions intersect with any equivalent operator already present
-// in the query text (in:, message_type:, after:, before:) so the candidate
-// set never grows beyond what the parsed query alone would match. The
+// in the query text (in:, message_type:, list:, after:, before:). The candidate
+// set therefore never grows beyond what the parsed query alone would match. The
 // returned bool is false when such an intersection is empty, meaning the
 // combined predicate can match no messages and the resolver should skip
 // the index entirely.
@@ -1402,6 +1459,15 @@ func applyLexicalFilterPushdown(parsed *search.Query, filters query.Context) boo
 			}
 		}
 		parsed.MessageTypes = types
+	}
+	appendListGroup := func(values []string) {
+		if len(values) > 0 {
+			parsed.ListIDExactGroups = append(parsed.ListIDExactGroups, slices.Clone(values))
+		}
+	}
+	appendListGroup(filters.MailingLists)
+	for _, group := range filters.AdditionalMailingListGroups {
+		appendListGroup(group)
 	}
 	if filters.After != nil && (parsed.AfterDate == nil || filters.After.After(*parsed.AfterDate)) {
 		bound := *filters.After
@@ -1486,14 +1552,14 @@ func (s *Server) resolveExploreVectorSearch(ctx context.Context, w http.Response
 		writeError(w, http.StatusServiceUnavailable, "vector_not_enabled", "Vector search is not configured")
 		return query.SearchSpec{}, "", false
 	}
-	parsed := search.Parse(request.Query)
-	if err := parsed.Err(); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
-		return query.SearchSpec{}, "", false
-	}
 	exploreCtx, err := exploreContext(request.Filters)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_filter", err.Error())
+		return query.SearchSpec{}, "", false
+	}
+	parsed, failure := validateExploreSearchDefinition(request, exploreCtx)
+	if failure != nil {
+		writeError(w, http.StatusBadRequest, failure.code, failure.message)
 		return query.SearchSpec{}, "", false
 	}
 	// Participant and domain filters are absent from the vector filter
@@ -1506,10 +1572,6 @@ func (s *Server) resolveExploreVectorSearch(ctx context.Context, w http.Response
 	// endpoints apply their participant/domain scope over semantic
 	// candidates the same way (see applyIdentityScope in
 	// handleExploreWithScope).
-	if exploreCtx.Deletion == query.DeletionDeleted {
-		writeError(w, http.StatusBadRequest, "semantic_deletion_unsupported", "Semantic and hybrid search cover active messages only; remove the deletion:deleted filter to search")
-		return query.SearchSpec{}, "", false
-	}
 	var lexicalSpec query.SearchSpec
 	if request.SearchMode == exploreSearchModeHybrid {
 		var ok bool
@@ -1530,10 +1592,6 @@ func (s *Server) resolveExploreVectorSearch(ctx context.Context, w http.Response
 		}
 	}
 	freeText := strings.Join(parsed.TextTerms, " ")
-	if freeText == "" {
-		writeError(w, http.StatusBadRequest, "missing_free_text", "Semantic and hybrid exploration require free text")
-		return query.SearchSpec{}, "", false
-	}
 	// Mirror the lexical resolver's pushdown semantics: request source and
 	// message-type filters intersect with equivalent query operators, and
 	// date bounds only tighten. Because the vector backends OR the values
@@ -1741,6 +1799,11 @@ func canonicalParsedExploreQuery(parsed *search.Query) string {
 	canonical.BccAddrs = canonicalStrings(parsed.BccAddrs)
 	canonical.SubjectTerms = canonicalStrings(parsed.SubjectTerms)
 	canonical.Labels = canonicalStrings(parsed.Labels)
+	canonical.ListIDExactGroups = make([][]string, len(parsed.ListIDExactGroups))
+	for i, group := range parsed.ListIDExactGroups {
+		canonical.ListIDExactGroups[i] = canonicalStrings(group)
+	}
+	slices.SortFunc(canonical.ListIDExactGroups, slices.Compare)
 	canonical.MessageTypes = canonicalStrings(parsed.MessageTypes)
 	canonical.AccountIDs = slices.Clone(parsed.AccountIDs)
 	slices.Sort(canonical.AccountIDs)

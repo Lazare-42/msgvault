@@ -1,5 +1,5 @@
 ---
-last_edited: 2026-08-27
+last_edited: 2026-08-30
 ---
 
 # Accounts, Identities, Collections, and Deduplication — Specification
@@ -313,9 +313,9 @@ preference runs in this order:
 
 1. Source preference (when `--prefer` is configured, or the default
    order: `gmail,imap,mbox,emlx,hey`).
-2. Complete original payload — has raw MIME, then, when normalized
-   raw MIME matches, more attachments, an attachment-presence signal,
-   and a larger original payload.
+2. Complete original payload — has raw MIME, then, only when every
+   eligible copy has the same normalized raw MIME hash, more attachments,
+   an attachment-presence signal, and a larger original payload.
 3. Source metadata quality — provider IDs, threading info, presence
    of Message-ID.
 4. Richer label or folder metadata.
@@ -324,9 +324,9 @@ preference runs in this order:
 
 Earlier rules win outright. Later rules apply only when all earlier
 ones tie. Attachment and payload-size metadata are authoritative only
-when both rows have raw MIME and their normalized MIME hashes match;
-a shared Message-ID alone is insufficient. The exact policy is visible
-in dry-run output.
+when every eligible copy has raw MIME and all normalized MIME hashes
+match; a shared Message-ID alone is insufficient. The exact policy is
+visible in dry-run output.
 
 The public [Deduplication](../../usage/deduplication.md) guide carries
 the rendered survivor-selection diagram.
@@ -490,12 +490,15 @@ decisions remain source-specific.
   the default, never inferred from dedup, and never applied in batch
   without the user acknowledging the source and scope at the moment
   of the action.
-- **Release guardrail.** The destructive `delete-staged` execute
-  path is gated behind the environment variable
-  `MSGVAULT_ENABLE_REMOTE_DELETE=1` for the v1 release. Read-only
-  modes (`--list`, `--dry-run`, `list-deletions`, `show-deletion`)
-  are always permitted. The gate is independent of `--permanent`.
-  Removal of the guardrail is a future release decision.
+- **Permanent guardrail.** Starting in v0.20.0, remote deletion remains
+  permanently opt-in. The invoking CLI may enable it durably with
+  `[deletion] remote_enabled = true` or for one command with
+  `MSGVAULT_ENABLE_REMOTE_DELETE=1`. Both mechanisms are permanent;
+  there is no planned automatic removal of the guardrail. A remote
+  daemon's own `[deletion]` section is not server policy for a command
+  invoked elsewhere. Read-only modes (`--list`, `--dry-run`,
+  `list-deletions`, `show-deletion`) and staging are always permitted.
+  The gate is independent of `--permanent`.
 
 ### Manifest format
 
@@ -642,13 +645,19 @@ predicate combines them.
 ```sql
 CREATE TABLE IF NOT EXISTS applied_migrations (
     name       TEXT PRIMARY KEY,
+    version    INTEGER NOT NULL DEFAULT 1,
     applied_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 ```
 
 DDL changes use `IF NOT EXISTS`. This table records *data*
-migrations that must run exactly once (e.g.
-`legacy_identity_to_per_account`).
+migrations by name and the highest successfully applied implementation
+version (e.g. `legacy_identity_to_per_account`). Existing rows upgraded
+from the legacy schema receive version 1. Name-only methods request
+version 1; context-aware methods take an explicit positive version. A
+migration runs when the recorded version is below the requested minimum,
+and successful runs advance the recorded version monotonically. A failed
+or cancelled run leaves the previous version unchanged.
 
 ## CLI surface
 
@@ -669,7 +678,7 @@ Find duplicate messages and (with `--undo`) reverse a previous run.
 | `--undo <batch-id>` (repeatable)    | string... | (none)                        | Reverse one or more named batches.                                 |
 | `--account <name>`                  | string    | (none)                        | Per-source scope.                                                  |
 | `--collection <name>`               | string    | (none)                        | Cross-source scope inside one collection.                          |
-| `--delete-dups-from-source-server`  | bool      | `false`                       | DESTRUCTIVE: stage pruned duplicates for remote deletion. Execution still requires `MSGVAULT_ENABLE_REMOTE_DELETE=1`. |
+| `--delete-dups-from-source-server`  | bool      | `false`                       | DESTRUCTIVE: stage pruned duplicates for remote deletion. Execution requires durable invoking-CLI `[deletion] remote_enabled = true` consent or `MSGVAULT_ENABLE_REMOTE_DELETE=1` for one command. |
 | `--yes` / `-y`                      | bool      | `false`                       | Skip the confirmation prompt.                                      |
 
 Mutually exclusive flag pairs (enforced at the cobra layer):
@@ -722,10 +731,10 @@ the command errors with `must specify --batch or --all-hidden`.
 
 | Command                              | Notes                                                                                            |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------ |
-| `list-deletions`                     | List pending and recent deletion batches. Always permitted regardless of the env-var guardrail.  |
+| `list-deletions`                     | List pending and recent deletion batches. Always permitted regardless of the execution guardrail. |
 | `show-deletion <batch-id>`           | Show one batch's manifest. Read-only; permitted regardless of the guardrail.                     |
 | `cancel-deletion [batch-id] [--all]` | Cancel pending or in-progress batches. `--all` cancels every pending or in-progress batch.       |
-| `delete-staged [batch-id]`           | Execute pending remote deletions. Gated behind `MSGVAULT_ENABLE_REMOTE_DELETE=1`.                |
+| `delete-staged [batch-id]`           | Execute pending remote deletions. Requires durable invoking-CLI `[deletion] remote_enabled = true` consent or `MSGVAULT_ENABLE_REMOTE_DELETE=1` for one command. |
 
 `delete-staged` flags:
 
@@ -839,7 +848,7 @@ can recognize them.
 
 | Condition                                                          | Message                                                                                                       |
 | ------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
-| `delete-staged` invoked without `MSGVAULT_ENABLE_REMOTE_DELETE=1`  | (release-guardrail message naming the env var; refused before any API call)                                   |
+| `delete-staged` invoked without durable config or one-command environment consent | (guardrail message naming `[deletion] remote_enabled = true` first and `MSGVAULT_ENABLE_REMOTE_DELETE=1` as the one-command alternative; refused before any API call) |
 | `delete-staged` finds no account in manifest, `--account` not set  | `no account in deletion manifest - use --account flag`                                                        |
 | `delete-staged` finds multiple accounts pending, `--account` not set | `multiple accounts in pending batches (<list>) - use --account flag to specify which account`              |
 | Permanent confirmation prompt receives anything other than `delete` | `Cancelled. Drop --permanent to use trash deletion without elevated permissions.`                            |
@@ -864,16 +873,18 @@ runs the one-time data migration `legacy_identity_to_per_account`:
      identifiers, insert a confirmed identity record with
      `source_signal = manual` if the address is not already
      confirmed.
-2. Insert a row into `applied_migrations` with
-   `name = 'legacy_identity_to_per_account'`.
+2. Insert or advance the `applied_migrations` row with
+   `name = 'legacy_identity_to_per_account'` and `version = 1`.
 3. Log a warning naming the migration and the number of records
    inserted.
 4. Print a one-time CLI notice asking the user to review per-account
    identities via `msgvault identity list`.
 
-After migration, the `[identity]` block is no longer read. The
-migration runs exactly once: subsequent startups see the
-`applied_migrations` row and skip.
+After migration, the `[identity]` block is no longer read. Once the
+version-1 run succeeds, subsequent startups see the
+`applied_migrations` row and skip it. A future reshaped implementation
+can request a higher minimum version and rerun the migration; the ledger
+retains the highest successful version.
 
 If startup happens before any source exists, the migration defers
 until the first source is created, then runs against that source
@@ -931,8 +942,10 @@ Every question should answer cleanly without qualifications.
 - Does remote deletion stay same-source-only, default to moving to
   source trash, and require explicit confirmation for permanent
   removal?
-- Is the v1 release guardrail (`MSGVAULT_ENABLE_REMOTE_DELETE=1`)
-  still enforced for the destructive `delete-staged` execute path?
+- Is the permanent guardrail (`[deletion] remote_enabled = true` in the
+  invoking CLI config or `MSGVAULT_ENABLE_REMOTE_DELETE=1` for one command)
+  still enforced for the destructive `delete-staged` execute path, without
+  treating remote daemon config as invoking-client policy?
 - Does undo avoid promising exact rollback, both in code and in
   user-facing text?
 - Do error messages match the verbatim strings in the

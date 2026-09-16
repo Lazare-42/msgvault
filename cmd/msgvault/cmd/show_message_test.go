@@ -165,6 +165,7 @@ func messageHTTPDaemon(t *testing.T) (*httptest.Server, *atomic.Int32) {
 		_, _ = w.Write([]byte(`{
 			"id": 42,
 			"source_message_id": "remote-42",
+			"rfc822_message_id": "Case-ID@example.test",
 			"conversation_id": 7,
 			"subject": "Test Subject",
 			"snippet": "short",
@@ -232,4 +233,68 @@ func TestResolveMessageIDArg(t *testing.T) {
 			assert.Equal(tt.want, got, "resolveMessageIDArg(%q)", tt.in)
 		})
 	}
+}
+
+func TestOutputMessageLabelsSanitizedOnlyForText(t *testing.T) {
+	assert, require := assert.New(t), require.New(t)
+	label := "Résolu\x1b[2J\x1b]52;c;eA==\x07\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\"
+	msg := &query.MessageDetail{Labels: []string{label, "ordinary"}}
+	done := captureStdout(t)
+	err := outputMessageText(msg)
+	out := done()
+	require.NoError(err)
+	assert.Contains(out, "Labels:  Résolulink, ordinary\n")
+	assert.NotContains(out, "\x1b")
+
+	done = captureStdout(t)
+	err = outputMessageJSON(msg)
+	out = done()
+	require.NoError(err)
+	var got struct {
+		Labels []string `json:"labels"`
+	}
+	require.NoError(json.Unmarshal([]byte(out), &got))
+	assert.Equal([]string{label, "ordinary"}, got.Labels)
+}
+
+func TestShowMessageJSONPreservesRFCMessageIDFromDaemon(t *testing.T) {
+	assert, require := assert.New(t), require.New(t)
+	dataDir := t.TempDir()
+	server, _ := messageHTTPDaemon(t)
+	writeStatsHTTPDaemonRuntime(t, dataDir, server)
+	oldCfg, oldLocal, oldJSON := cfg, useLocal, showMessageJSON
+	t.Cleanup(func() { cfg, useLocal, showMessageJSON = oldCfg, oldLocal, oldJSON })
+	cfg = &config.Config{HomeDir: dataDir, Data: config.DataConfig{DataDir: dataDir}}
+	useLocal, showMessageJSON = true, true
+	done := captureStdout(t)
+	cmd := &cobra.Command{Use: "show-message", RunE: showMessageCmd.RunE, Args: showMessageCmd.Args}
+	cmd.SetArgs([]string{"remote-42"})
+	err := cmd.Execute()
+	output := done()
+	require.NoError(err)
+	var decoded map[string]any
+	require.NoError(json.Unmarshal([]byte(output), &decoded))
+	assert.Equal("Case-ID@example.test", decoded["rfc822_message_id"])
+}
+
+func TestOutputMessageJSONIncludesAbsentRFCMessageID(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	done := captureStdout(t)
+	err := outputMessageJSON(&query.MessageDetail{})
+	output := done()
+	requirements.NoError(err)
+	var decoded map[string]any
+	requirements.NoError(json.Unmarshal([]byte(output), &decoded))
+	value, ok := decoded["rfc822_message_id"].(string)
+	requirements.True(ok, "RFC Message-ID must be present as a string")
+	assertions.Empty(value)
+}
+
+func TestOutputMessageJSONIncludesBrowserURL(t *testing.T) {
+	done := captureStdout(t)
+	require.NoError(t, outputMessageJSON(&query.MessageDetail{ID: 42, WebURL: "https://archive.example/messages/42"}))
+	var result map[string]any
+	require.NoError(t, json.Unmarshal([]byte(done()), &result))
+	assert.Equal(t, "https://archive.example/messages/42", result["web_url"])
 }

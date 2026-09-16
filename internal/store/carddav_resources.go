@@ -354,6 +354,13 @@ func (s *Store) moveCardDAVResourceHrefTx(
 	if err != nil || resource.RemoteUID != input.RemoteUID {
 		return hashes, ErrCardDAVStalePlan
 	}
+	var pendingConflict bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM carddav_conflicts WHERE address_book_id=? AND href=? AND status='unresolved' AND local_mutation_intent IS NOT NULL)`, bookID, input.PreviousHref).Scan(&pendingConflict); err != nil {
+		return hashes, err
+	}
+	if pendingConflict {
+		return hashes, ErrCardDAVPublicationPending
+	}
 	if _, err := s.findCardDAVResourceTx(ctx, tx, bookID, input.Href); err == nil {
 		return hashes, ErrCardDAVStalePlan
 	} else if !errors.Is(err, ErrCardDAVResourceNotFound) {
@@ -410,7 +417,7 @@ func (s *Store) moveCardDAVResourceHrefTx(
 		input.Href, bookID, input.PreviousHref); err != nil {
 		return hashes, fmt.Errorf("move CardDAV publication href: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE carddav_conflicts SET href = ?, updated_at = `+
+	if _, err := tx.ExecContext(ctx, `UPDATE carddav_conflicts SET review_revision = review_revision + 1, approved_local_body_sha256 = NULL, approved_local_inference_revision = NULL, approved_conflict_revision = NULL, local_envelope_metadata = NULL, href = ?, updated_at = `+
 		s.dialect.Now()+` WHERE address_book_id = ? AND href = ?`,
 		input.Href, bookID, input.PreviousHref); err != nil {
 		return hashes, fmt.Errorf("move CardDAV conflict href: %w", err)
@@ -851,6 +858,11 @@ func (s *Store) createCardDAVImportedPersonTx(
 		VALUES (?, NULLIF(?, '')) RETURNING id`, uid, input.DisplayName).Scan(&personID); err != nil {
 		return nil, nil, fmt.Errorf("create CardDAV imported person: %w", err)
 	}
+	if strings.TrimSpace(input.DisplayName) != "" {
+		if err := s.bumpPersonDisplayNameRevisionContext(ctx, tx); err != nil {
+			return nil, nil, err
+		}
+	}
 	if err := s.addCardDAVImportedProjectionTx(ctx, tx, bookID, personID, input); err != nil {
 		return nil, nil, err
 	}
@@ -952,6 +964,11 @@ func (s *Store) rebaseCardDAVImportedProjectionTx(
 			return false, fmt.Errorf("count rebased CardDAV display label: %w", err)
 		}
 		displayChanged = affected > 0
+		if displayChanged {
+			if err := s.bumpPersonDisplayNameRevisionContext(ctx, tx); err != nil {
+				return false, err
+			}
+		}
 	}
 	if err := s.bumpPersonRevisionsTx(ctx, tx, personID); err != nil {
 		return false, err
@@ -1000,9 +1017,19 @@ func (s *Store) retireCardDAVImportedProjectionTx(
 		}
 	}
 	if remoteOwnsDisplay {
-		if _, err := tx.ExecContext(ctx, `UPDATE persons SET display_name = NULL
-			WHERE id = ? AND display_name = ?`, personID, importedDisplay.String); err != nil {
+		result, err := tx.ExecContext(ctx, `UPDATE persons SET display_name = NULL
+			WHERE id = ? AND display_name = ?`, personID, importedDisplay.String)
+		if err != nil {
 			return fmt.Errorf("clear retired CardDAV display label: %w", err)
+		}
+		affected, err := result.RowsAffected()
+		if err != nil {
+			return fmt.Errorf("count cleared CardDAV display label: %w", err)
+		}
+		if affected > 0 {
+			if err := s.bumpPersonDisplayNameRevisionContext(ctx, tx); err != nil {
+				return err
+			}
 		}
 	}
 	if err := s.bumpPersonRevisionsTx(ctx, tx, personID); err != nil {
@@ -1074,11 +1101,32 @@ func (s *Store) putCardDAVEnvelopeTx(
 		return err
 	}
 	envelope.CanonicalPersonUID = canonicalUID
+	current, loadErr := s.findVCardResourceEnvelopeTx(ctx, tx, envelope.SourceRef, input.Href)
+	if loadErr != nil && !errors.Is(loadErr, ErrVCardResourceNotFound) {
+		return loadErr
+	}
+	if current != nil && len(current.NativeMappings) > 0 {
+		envelope, err = vcard.RebindResourceOwnership(current.ResourceEnvelope, envelope, false)
+		if err != nil {
+			return err
+		}
+	}
+	return s.putCardDAVPreparedEnvelopeTx(ctx, tx, bookID, personID, input.Href, envelope)
+}
+
+func (s *Store) putCardDAVPreparedEnvelopeTx(ctx context.Context, tx *loggedTx, bookID, personID int64, href string, envelope vcard.ResourceEnvelope) error {
+	canonicalUID, err := vcardCanonicalUIDTx(ctx, tx, personID)
+	if err != nil {
+		return err
+	}
+	if envelope.SourceRef != fmt.Sprintf("carddav:%d", bookID) || envelope.SourceResourceUID != href || envelope.CanonicalPersonUID != canonicalUID {
+		return ErrCardDAVPublicationMismatch
+	}
 	prepared, err := prepareVCardEnvelope(envelope)
 	if err != nil {
 		return err
 	}
-	current, err := s.findVCardResourceEnvelopeTx(ctx, tx, envelope.SourceRef, input.Href)
+	current, err := s.findVCardResourceEnvelopeTx(ctx, tx, envelope.SourceRef, href)
 	if errors.Is(err, ErrVCardResourceNotFound) {
 		_, err = s.insertVCardResourceEnvelopeTx(ctx, tx,
 			VCardResourceEnvelopeInput{PersonID: personID}, prepared)

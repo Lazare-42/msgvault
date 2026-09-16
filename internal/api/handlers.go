@@ -226,16 +226,20 @@ type StatusMessageResponse struct {
 }
 
 type FilteredMessagesResponse struct {
-	Count    int              `json:"count"`
-	HasMore  bool             `json:"has_more"`
-	Offset   int              `json:"offset"`
-	Limit    int              `json:"limit"`
-	Messages []MessageSummary `json:"messages"`
+	Count            int              `json:"count"`
+	HasMore          bool             `json:"has_more"`
+	Offset           int              `json:"offset"`
+	Limit            int              `json:"limit"`
+	Messages         []MessageSummary `json:"messages"`
+	AppliedSourceIDs []int64          `json:"applied_source_ids,omitempty"`
 }
 
 type GmailIDsResponse struct {
-	GmailIDs []string               `json:"gmail_ids"`
-	Targets  []query.DeletionTarget `json:"targets,omitempty"`
+	GmailIDs         []string               `json:"gmail_ids"`
+	Targets          []query.DeletionTarget `json:"targets,omitempty"`
+	SearchQuery      string                 `json:"search_query,omitempty"`
+	SearchMode       string                 `json:"search_mode,omitempty"`
+	AppliedSourceIDs []int64                `json:"applied_source_ids,omitempty"`
 }
 
 type DeepSearchResponse struct {
@@ -244,6 +248,8 @@ type DeepSearchResponse struct {
 	Messages     []MessageSummary    `json:"messages"`
 	BodyContexts []BodySearchContext `json:"body_contexts,omitempty"`
 	Count        int                 `json:"count"`
+	TotalCount   int64               `json:"total_count"`
+	Stats        *TotalStatsResponse `json:"stats,omitempty"`
 	HasMore      bool                `json:"has_more"`
 	Offset       int                 `json:"offset"`
 	Limit        int                 `json:"limit"`
@@ -399,7 +405,7 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 	// Headers already sent; if Encode fails mid-stream (broken pipe,
 	// non-serializable value) there's no meaningful recovery beyond
 	// truncating the response body.
-	_ = json.NewEncoder(w).Encode(data) //nolint:errchkjson // any is the public API; mid-response error is unrecoverable
+	_ = marshalAPIJSON(w, data)
 }
 
 // writeError writes an error response.
@@ -677,7 +683,9 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, "not_found", "Message not found")
 			return
 		case err == nil:
-			writeJSON(w, http.StatusOK, messageDetailFromQuery(qMsg))
+			detail := messageDetailFromQuery(qMsg)
+			detail.BodyHTML = s.archivedRemoteImageHTML(id, detail.BodyHTML)
+			writeJSON(w, http.StatusOK, detail)
 			return
 		}
 		// err is unsupported sentinel — fall through to store path so
@@ -716,6 +724,7 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 		attachments = append(attachments, attachmentInfoFromStore(att))
 	}
 	detail.Attachments = attachments
+	detail.BodyHTML = s.archivedRemoteImageHTML(id, detail.BodyHTML)
 
 	writeJSON(w, http.StatusOK, detail)
 }
@@ -727,8 +736,8 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	query := r.URL.Query().Get("q")
-	if query == "" {
+	searchText := r.URL.Query().Get("q")
+	if searchText == "" {
 		writeError(w, http.StatusBadRequest, "missing_query", "Query parameter 'q' is required")
 		return
 	}
@@ -747,7 +756,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	parsedQuery := parseSearchQueryRequest(r, query)
+	parsedQuery := parseSearchQueryRequest(r, searchText)
 	if err := parsedQuery.Err(); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
 		return
@@ -832,7 +841,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		s.handleHybridSearch(
-			w, r, query, parsedQuery, structuredFilter,
+			w, r, searchText, parsedQuery, structuredFilter,
 			mode, explain, offset, pageSize, includeMatches, minScore, scope,
 		)
 		return
@@ -842,6 +851,14 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_mode",
 			fmt.Sprintf("mode must be one of fts|vector|hybrid, got %q", mode))
 		return
+	}
+	if conversationID, ok, err := queryInt64(r, "conversation_id"); err != nil {
+		s.rejectBadParam(w, err)
+		return
+	} else if ok {
+		parsedQuery = query.MergeFilterIntoQuery(parsedQuery, query.MessageFilter{
+			ConversationID: &conversationID,
+		})
 	}
 	if param, ok := firstPresentQueryParam(r, semanticSearchStructuredFilterParamNames); ok {
 		writeError(w, http.StatusBadRequest, "unsupported_filter_mode",
@@ -879,18 +896,18 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		if useQuery {
 			messages, total, err = searcher.SearchMessagesQueryContext(r.Context(), parsedQuery, offset, pageSize)
 		} else {
-			messages, total, err = searcher.SearchMessagesContext(r.Context(), query, offset, pageSize)
+			messages, total, err = searcher.SearchMessagesContext(r.Context(), searchText, offset, pageSize)
 		}
 	} else if useQuery {
 		messages, total, err = s.store.SearchMessagesQuery(parsedQuery, offset, pageSize)
 	} else {
-		messages, total, err = s.store.SearchMessages(query, offset, pageSize)
+		messages, total, err = s.store.SearchMessages(searchText, offset, pageSize)
 	}
 	if err != nil {
 		if s.writeIfContextError(w, err) {
 			return
 		}
-		s.logger.Error("search failed", "query", query, "error", err)
+		s.logger.Error("search failed", "query", searchText, "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Search failed")
 		return
 	}
@@ -901,7 +918,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, SearchResult{
-		Query:    query,
+		Query:    searchText,
 		Total:    total,
 		Page:     page,
 		PageSize: pageSize,
@@ -927,6 +944,7 @@ var semanticSearchStructuredFilterParamNames = []string{
 	recipientParam,
 	"domain",
 	"label",
+	"list_id",
 	"time_period",
 	"time_granularity",
 	"source_id",
@@ -1990,8 +2008,9 @@ func (s *Server) writeIfAnalyticsInitializing(ctx context.Context, w http.Respon
 
 // AggregateResponse represents aggregate query results.
 type AggregateResponse struct {
-	ViewType string             `json:"view_type"`
-	Rows     []AggregateRowJSON `json:"rows"`
+	ViewType         string             `json:"view_type"`
+	Rows             []AggregateRowJSON `json:"rows"`
+	AppliedSourceIDs []int64            `json:"applied_source_ids,omitempty"`
 }
 
 // AggregateRowJSON represents a single aggregate row in JSON format.
@@ -2062,20 +2081,28 @@ type TextMessagesResponse struct {
 }
 
 type TextSearchResponse struct {
-	Count    int                    `json:"count"`
-	HasMore  bool                   `json:"has_more"`
-	Offset   int                    `json:"offset"`
-	Limit    int                    `json:"limit"`
-	Messages []query.MessageSummary `json:"messages"`
+	AppliedSourceID *int64                 `json:"applied_source_id,omitempty"`
+	Count           int                    `json:"count"`
+	HasMore         bool                   `json:"has_more"`
+	Offset          int                    `json:"offset"`
+	Limit           int                    `json:"limit"`
+	Messages        []query.MessageSummary `json:"messages"`
 }
 
 // aggregateViewTypes are the accepted view_type values, surfaced in 400 messages.
 var aggregateViewTypes = []string{
 	"senders", "sender_names", "recipients", "recipient_names",
-	"domains", aggregateViewLabels, "time",
+	"domains", aggregateViewLabels, aggregateViewLists, "time",
 }
 
-const aggregateViewLabels = "labels"
+func invalidAggregateViewTypeMessage() string {
+	return "Invalid view_type. Must be one of: " + strings.Join(aggregateViewTypes, ", ")
+}
+
+const (
+	aggregateViewLabels = "labels"
+	aggregateViewLists  = "lists"
+)
 
 // parseViewType parses a view type string into query.ViewType.
 func parseViewType(s string) (query.ViewType, bool) {
@@ -2092,6 +2119,8 @@ func parseViewType(s string) (query.ViewType, bool) {
 		return query.ViewDomains, true
 	case aggregateViewLabels:
 		return query.ViewLabels, true
+	case aggregateViewLists:
+		return query.ViewLists, true
 	case "time":
 		return query.ViewTime, true
 	default:
@@ -2114,6 +2143,8 @@ func viewTypeString(v query.ViewType) string {
 		return "domains"
 	case query.ViewLabels:
 		return aggregateViewLabels
+	case query.ViewLists:
+		return aggregateViewLists
 	case query.ViewTime:
 		return "time"
 	default:
@@ -2262,6 +2293,11 @@ func parseAggregateOptions(r *http.Request) (query.AggregateOptions, error) {
 	} else if ok {
 		opts.SourceID = &sourceID
 	}
+	if sourceIDs, ok, err := queryInt64s(r, "source_ids"); err != nil {
+		return opts, err
+	} else if ok {
+		opts.SourceIDs = normalizeSourceIDs(sourceIDs)
+	}
 	if r.URL.Query().Get("attachments_only") == "true" {
 		opts.WithAttachmentsOnly = true
 	}
@@ -2314,6 +2350,7 @@ func parseMessageFilter(r *http.Request) (query.MessageFilter, error) {
 	filter.RecipientName = r.URL.Query().Get("recipient_name")
 	filter.Domain = r.URL.Query().Get("domain")
 	filter.Label = r.URL.Query().Get("label")
+	filter.ListID = r.URL.Query().Get("list_id")
 	filter.MessageType = r.URL.Query().Get("message_type")
 
 	if v := r.URL.Query().Get("time_period"); v != "" {
@@ -2339,6 +2376,11 @@ func parseMessageFilter(r *http.Request) (query.MessageFilter, error) {
 		return filter, err
 	} else if ok {
 		filter.SourceID = &id
+	}
+	if ids, ok, err := queryInt64s(r, "source_ids"); err != nil {
+		return filter, err
+	} else if ok {
+		filter.SourceIDs = normalizeSourceIDs(ids)
 	}
 	if r.URL.Query().Get("attachments_only") == "true" {
 		filter.WithAttachmentsOnly = true
@@ -2703,7 +2745,7 @@ func (s *Server) handleAggregates(w http.ResponseWriter, r *http.Request) {
 	viewType, ok := parseViewType(viewTypeStr)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "invalid_view_type",
-			"Invalid view_type. Must be one of: senders, sender_names, recipients, recipient_names, domains, labels, time")
+			invalidAggregateViewTypeMessage())
 		return
 	}
 
@@ -2729,8 +2771,9 @@ func (s *Server) handleAggregates(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, AggregateResponse{
-		ViewType: viewTypeString(viewType),
-		Rows:     jsonRows,
+		ViewType:         viewTypeString(viewType),
+		Rows:             jsonRows,
+		AppliedSourceIDs: append([]int64(nil), opts.SourceIDs...),
 	})
 }
 
@@ -2754,7 +2797,7 @@ func (s *Server) handleSubAggregates(w http.ResponseWriter, r *http.Request) {
 	viewType, ok := parseViewType(viewTypeStr)
 	if !ok {
 		writeError(w, http.StatusBadRequest, "invalid_view_type",
-			"Invalid view_type. Must be one of: senders, sender_names, recipients, recipient_names, domains, labels, time")
+			invalidAggregateViewTypeMessage())
 		return
 	}
 
@@ -2791,8 +2834,9 @@ func (s *Server) handleSubAggregates(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, AggregateResponse{
-		ViewType: viewTypeString(viewType),
-		Rows:     jsonRows,
+		ViewType:         viewTypeString(viewType),
+		Rows:             jsonRows,
+		AppliedSourceIDs: append([]int64(nil), filter.SourceIDs...),
 	})
 }
 
@@ -2845,11 +2889,12 @@ func (s *Server) handleFilteredMessages(w http.ResponseWriter, r *http.Request) 
 	}
 
 	writeJSON(w, http.StatusOK, FilteredMessagesResponse{
-		Count:    len(summaries),
-		HasMore:  hasMore,
-		Offset:   filter.Pagination.Offset,
-		Limit:    requestLimit,
-		Messages: summaries,
+		Count:            len(summaries),
+		HasMore:          hasMore,
+		Offset:           filter.Pagination.Offset,
+		Limit:            requestLimit,
+		Messages:         summaries,
+		AppliedSourceIDs: append([]int64(nil), filter.SourceIDs...),
 	})
 }
 
@@ -2879,6 +2924,7 @@ type ChangedMessageJSON struct {
 	SourceMessageID     string  `json:"source_message_id,omitempty"`
 	ConversationID      int64   `json:"conversation_id"`
 	MessageType         string  `json:"message_type,omitempty"`
+	ListID              *string `json:"list_id,omitempty"`
 	Subject             string  `json:"subject,omitempty"`
 	Snippet             string  `json:"snippet,omitempty"`
 	SentAt              *string `json:"sent_at,omitempty" format:"date-time"`
@@ -2897,15 +2943,15 @@ type ChangedMessageJSON struct {
 // caught-up consumer can poll forever without replaying the archive — the
 // exception being a cursor above the database clock (see handleMessageChanges).
 // It is never empty, so it needs no `omitempty` to satisfy the generated
-// client's validator; Messages is `nullable:"false"` because the handler always
-// allocates the slice. CompleteThrough is a bound, never a cursor: while
+// client's validator. JSON v2 always encodes Messages as an array, including
+// when the handler leaves the slice nil. CompleteThrough is a bound, never a cursor: while
 // HasMore is true it stands above rows this page did not carry, so a consumer
 // that resumes from it instead of NextCursor skips them.
 //
 // CompleteThrough is nullable because "no commit bound has been established"
 // is a state, not a timestamp.
 type ChangesResponse struct {
-	Messages        []ChangedMessageJSON `json:"messages" nullable:"false"`
+	Messages        []ChangedMessageJSON `json:"messages"`
 	Count           int                  `json:"count"`
 	HasMore         bool                 `json:"has_more"`
 	NextCursor      string               `json:"next_cursor" doc:"Opaque cursor for the next request. Always present and never empty. Store it and send it back as the cursor parameter; do not parse, construct, compare, or order it — its contents may change without notice"`
@@ -3105,6 +3151,7 @@ func toChangedMessageJSON(m store.ChangedMessage) ChangedMessageJSON {
 		SourceMessageID:     m.SourceMessageID,
 		ConversationID:      m.ConversationID,
 		MessageType:         m.MessageType,
+		ListID:              m.ListID,
 		Subject:             m.Subject,
 		Snippet:             m.Snippet,
 		SentAt:              changesTimePtr(m.SentAt),
@@ -3140,8 +3187,58 @@ func (s *Server) handleGmailIDsByFilter(w http.ResponseWriter, r *http.Request) 
 		s.rejectBadParam(w, err)
 		return
 	}
-	targets, err := engine.GetDeletionTargetsByFilter(r.Context(), filter)
+	searchQuery := strings.TrimSpace(r.URL.Query().Get("q"))
+	searchMode := strings.TrimSpace(r.URL.Query().Get("search_mode"))
+	var targets []query.DeletionTarget
+	if searchQuery == "" {
+		if searchMode != "" {
+			writeError(w, http.StatusBadRequest, "invalid_search", "search_mode requires q")
+			return
+		}
+		targets, err = engine.GetDeletionTargetsByFilter(r.Context(), filter)
+	} else {
+		parsed := search.Parse(searchQuery)
+		if parseErr := parsed.Err(); parseErr != nil {
+			writeError(w, http.StatusBadRequest, "invalid_search", parseErr.Error())
+			return
+		}
+		switch searchMode {
+		case string(query.DeletionSearchFast), string(query.DeletionSearchDeep):
+			resolver, ok := engine.(query.DeletionTargetSearchResolver)
+			if !ok {
+				writeError(w, http.StatusServiceUnavailable, "search_unavailable", "Search-aware deletion resolution is not available")
+				return
+			}
+			targets, err = resolver.GetDeletionTargetsBySearch(
+				r.Context(), parsed, filter, query.DeletionSearchMode(searchMode),
+			)
+		case string(query.DeletionSearchAggregate):
+			viewType, ok := parseViewType(r.URL.Query().Get("view_type"))
+			if !ok {
+				writeError(w, http.StatusBadRequest, "invalid_view_type", "aggregate search requires a valid view_type")
+				return
+			}
+			if !r.URL.Query().Has("aggregate_key") {
+				writeError(w, http.StatusBadRequest, "missing_aggregate_key", "aggregate search requires aggregate_key")
+				return
+			}
+			resolver, ok := engine.(query.DeletionTargetAggregateSearchResolver)
+			if !ok {
+				writeError(w, http.StatusServiceUnavailable, "search_unavailable", "Aggregate search deletion resolution is not available")
+				return
+			}
+			targets, err = resolver.GetDeletionTargetsByAggregateSearch(
+				r.Context(), searchQuery, filter, viewType, r.URL.Query().Get("aggregate_key"),
+			)
+		default:
+			writeError(w, http.StatusBadRequest, "invalid_search_mode", "search_mode must be fast, deep, or aggregate")
+			return
+		}
+	}
 	if err != nil {
+		if errors.Is(err, context.Canceled) {
+			return
+		}
 		s.logger.Error("gmail id filter query failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Gmail ID query failed")
 		return
@@ -3150,7 +3247,11 @@ func (s *Server) handleGmailIDsByFilter(w http.ResponseWriter, r *http.Request) 
 		targets = []query.DeletionTarget{}
 	}
 	writeJSON(w, http.StatusOK, GmailIDsResponse{
-		GmailIDs: deletion.SourceMessageIDs(targets), Targets: targets,
+		GmailIDs:         deletion.SourceMessageIDs(targets),
+		Targets:          targets,
+		SearchQuery:      searchQuery,
+		SearchMode:       searchMode,
+		AppliedSourceIDs: append([]int64(nil), filter.SourceIDs...),
 	})
 }
 
@@ -3449,7 +3550,21 @@ func (s *Server) handleTotalStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	filter, err := parseMessageFilter(r)
+	if err != nil {
+		s.rejectBadParam(w, err)
+		return
+	}
 	var opts query.StatsOptions
+	for _, name := range []string{
+		"sender", "sender_name", recipientParam, "recipient_name", "domain", "label", "list_id",
+		"message_type", "time_period", "time_granularity", "conversation_id", "after", "before", "empty_targets",
+	} {
+		if _, present := r.URL.Query()[name]; present {
+			opts.Filter = &filter
+			break
+		}
+	}
 
 	if id, ok, err := queryInt64(r, "source_id"); err != nil {
 		s.rejectBadParam(w, err)
@@ -3549,30 +3664,9 @@ func (s *Server) handleFastSearch(w http.ResponseWriter, r *http.Request) {
 		s.rejectBadParam(w, err)
 		return
 	}
-	if ids, ok, err := queryInt64s(r, "source_ids"); err != nil {
-		s.rejectBadParam(w, err)
-		return
-	} else if ok {
-		filter.SourceIDs = normalizeSourceIDs(ids)
-	}
 	q := search.Parse(queryStr)
 	if err := q.Err(); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_query", err.Error())
-		return
-	}
-
-	// Reject filter fields that the search engines cannot honor.
-	// SenderName/RecipientName use display names that aren't indexed
-	// for search, ConversationID scoping isn't implemented, and
-	// EmptyValueTargets is an aggregate-only concept. The parsed
-	// message_type: operator is honored by the query engine; the
-	// filter parameter form is still list-search-only.
-	if filter.SenderName != "" || filter.RecipientName != "" ||
-		filter.ConversationID != nil || filter.HasEmptyTargets() ||
-		filter.MessageType != "" {
-		writeError(w, http.StatusBadRequest, "unsupported_filter",
-			"Fast search does not support sender_name, recipient_name, "+
-				"conversation_id, empty_targets, or message_type filters")
 		return
 	}
 
@@ -3583,7 +3677,7 @@ func (s *Server) handleFastSearch(w http.ResponseWriter, r *http.Request) {
 		statsGroupBy, ok = parseViewType(v)
 		if !ok {
 			writeError(w, http.StatusBadRequest, "invalid_view_type",
-				"Invalid view_type. Must be one of: senders, sender_names, recipients, recipient_names, domains, labels, time")
+				invalidAggregateViewTypeMessage())
 			return
 		}
 	}
@@ -3657,18 +3751,24 @@ func (s *Server) handleDeepSearch(w http.ResponseWriter, r *http.Request) {
 			"Body-scoped search requires at least one free-text term")
 		return
 	}
-
-	// Reject filter fields that this deep-search engine path cannot
-	// honor. Without this check the parameters parse
-	// successfully but silently do nothing, letting deep search
-	// escape the current drill-down scope.
-	if filter.SenderName != "" || filter.RecipientName != "" ||
-		filter.TimeRange.Period != "" || filter.ConversationID != nil ||
-		filter.HasEmptyTargets() || filter.MessageType != "" {
+	if filter.SourceIDs != nil {
 		writeError(w, http.StatusBadRequest, "unsupported_filter",
-			"Deep search does not support sender_name, recipient_name, "+
-				"time_period, conversation_id, empty_targets, or "+
-				"message_type filters")
+			"Deep search does not support source_ids filters")
+		return
+	}
+
+	// Exact body-only search rejects view filters whose exact MessageFilter
+	// semantics cannot be preserved through search.Query. Generic Deep search
+	// below keeps the complete filter independent from user-entered operators.
+	if scope == "body" && (filter.Sender != "" || filter.SenderName != "" ||
+		filter.Recipient != "" || filter.RecipientName != "" ||
+		filter.Domain != "" || filter.Label != "" ||
+		filter.TimeRange.Period != "" || filter.HasEmptyTargets() ||
+		filter.MessageType != "" || filter.ListID != "") {
+		writeError(w, http.StatusBadRequest, "unsupported_filter",
+			"Body search does not support sender, sender_name, recipient, "+
+				"recipient_name, domain, label, time_period, empty_targets, "+
+				"message_type, or list_id filters")
 		return
 	}
 
@@ -3683,18 +3783,19 @@ func (s *Server) handleDeepSearch(w http.ResponseWriter, r *http.Request) {
 		limit = 100
 	}
 
-	merged := query.MergeFilterIntoQuery(q, filter)
-	if filter.HideDeletedFromSource {
-		merged.DeletionScope = search.DeletionScopeActive
-	} else {
-		// Preserve the pre-2.12 deep-search contract: omitted or false
-		// hide_deleted includes retained source-deleted messages.
-		merged.DeletionScope = search.DeletionScopeAny
-	}
-
 	// Fetch one extra row to determine has_more accurately.
 	var messages []query.MessageSummary
+	var totalCount int64
+	var stats *query.TotalStats
 	if scope == "body" {
+		merged := query.MergeFilterIntoQuery(q, filter)
+		if filter.HideDeletedFromSource {
+			merged.DeletionScope = search.DeletionScopeActive
+		} else {
+			// Preserve the pre-2.12 deep-search contract: omitted or false
+			// hide_deleted includes retained source-deleted messages.
+			merged.DeletionScope = search.DeletionScopeAny
+		}
 		bodySearcher, ok := engine.(query.MessageBodySearcher)
 		if !ok {
 			writeError(w, http.StatusNotImplemented, "body_search_unavailable",
@@ -3703,7 +3804,21 @@ func (s *Server) handleDeepSearch(w http.ResponseWriter, r *http.Request) {
 		}
 		messages, err = bodySearcher.SearchMessageBodies(r.Context(), merged, limit+1, offset)
 	} else {
-		messages, err = engine.Search(r.Context(), merged, limit+1, offset)
+		searchScope := *q
+		if filter.HideDeletedFromSource {
+			searchScope.DeletionScope = search.DeletionScopeActive
+		} else {
+			// Preserve the pre-2.12 deep-search contract: omitted or false
+			// hide_deleted includes retained source-deleted messages.
+			searchScope.DeletionScope = search.DeletionScopeAny
+		}
+		var result *query.SearchFastResult
+		result, err = engine.SearchDeepWithStats(r.Context(), &searchScope, filter, limit+1, offset)
+		if err == nil {
+			messages = result.Messages
+			totalCount = result.TotalCount
+			stats = result.Stats
+		}
 	}
 	if err != nil {
 		if s.writeIfContextError(w, err) {
@@ -3727,6 +3842,15 @@ func (s *Server) handleDeepSearch(w http.ResponseWriter, r *http.Request) {
 	if hasMore {
 		messages = messages[:limit]
 	}
+	if scope == "body" {
+		if hasMore || (offset > 0 && len(messages) == 0) {
+			totalCount = -1
+		} else {
+			totalCount = int64(offset + len(messages))
+		}
+	} else if totalCount >= 0 {
+		hasMore = totalCount > int64(offset+len(messages))
+	}
 
 	summaries := make([]MessageSummary, len(messages))
 	for i, m := range messages {
@@ -3746,6 +3870,8 @@ func (s *Server) handleDeepSearch(w http.ResponseWriter, r *http.Request) {
 		Messages:     summaries,
 		BodyContexts: bodyContexts,
 		Count:        len(summaries),
+		TotalCount:   totalCount,
+		Stats:        toTotalStatsResponse(stats),
 		HasMore:      hasMore,
 		Offset:       offset,
 		Limit:        limit,
@@ -3945,7 +4071,15 @@ func (s *Server) handleTextSearch(w http.ResponseWriter, r *http.Request) {
 		limit = maxPageSize
 	}
 
-	messages, err := textEngine.TextSearch(r.Context(), queryStr, limit+1, offset)
+	var sourceID *int64
+	if id, present, err := queryInt64(r, "source_id"); err != nil {
+		s.rejectBadParam(w, err)
+		return
+	} else if present {
+		sourceID = &id
+	}
+
+	messages, err := textEngine.TextSearch(r.Context(), queryStr, sourceID, limit+1, offset)
 	if err != nil {
 		if s.writeIfContextError(w, err) {
 			return
@@ -3964,11 +4098,12 @@ func (s *Server) handleTextSearch(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, TextSearchResponse{
-		Count:    len(messages),
-		HasMore:  hasMore,
-		Offset:   offset,
-		Limit:    limit,
-		Messages: messages,
+		AppliedSourceID: sourceID,
+		Count:           len(messages),
+		HasMore:         hasMore,
+		Offset:          offset,
+		Limit:           limit,
+		Messages:        messages,
 	})
 }
 
@@ -4019,10 +4154,6 @@ type archivedMessageRawReader interface {
 // without ambiguity in the routing layer.
 func (s *Server) handleMessageInline(w http.ResponseWriter, r *http.Request) {
 	engine := s.queryEngineForContext(r.Context())
-	if engine == nil {
-		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
-		return
-	}
 
 	idStr := r.PathValue("id")
 	id, err := strconv.ParseInt(idStr, 10, 64)
@@ -4034,6 +4165,14 @@ func (s *Server) handleMessageInline(w http.ResponseWriter, r *http.Request) {
 	cidParam := r.URL.Query().Get("cid")
 	if cidParam == "" {
 		writeError(w, http.StatusBadRequest, "missing_cid", "Missing 'cid' query parameter")
+		return
+	}
+	if strings.HasPrefix(cidParam, "remote-image:") {
+		s.serveArchivedRemoteImage(w, r, id, cidParam)
+		return
+	}
+	if engine == nil {
+		writeError(w, http.StatusServiceUnavailable, "engine_unavailable", "Query engine not available")
 		return
 	}
 

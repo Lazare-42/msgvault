@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"go.kenn.io/msgvault/internal/api"
 	"go.kenn.io/msgvault/internal/daemonclient"
 )
 
@@ -79,7 +80,11 @@ func runDaemonCLICommandHTTPWithEnv(
 	if err != nil {
 		return err
 	}
+	if api.IsCLIRunDraftReply(args) {
+		cwd = ""
+	}
 
+	draftFailureReported := false
 	runErr := st.RunCLICommand(cmd.Context(), daemonclient.CLIRunRequest{
 		Args: args, Env: env, Cwd: cwd, GrantDecided: grantDecided,
 	}, func(stream, data string) error {
@@ -92,9 +97,14 @@ func runDaemonCLICommandHTTPWithEnv(
 			if _, err := fmt.Fprint(cmd.ErrOrStderr(), data); err != nil {
 				return fmt.Errorf("write CLI stderr: %w", err)
 			}
+			draftFailureReported = api.IsCLIRunDraftReply(args) && data != ""
 		}
 		return nil
 	})
+	if runErr != nil && draftFailureReported {
+		// Draft stderr already contains the failure result or fixed code.
+		cmd.SilenceErrors = true
+	}
 	if runErr != nil && strings.Contains(runErr.Error(), cliSubprocessExitSentinel) {
 		// The daemon subprocess already streamed its real error to our
 		// stderr and exited non-zero. Propagate a non-zero exit without
@@ -113,7 +123,7 @@ var errCLISubprocessProxied = errors.New("cli subprocess failed")
 func daemonCLIRunCwd(info HTTPStoreInfo, requiresLocalFiles bool) (string, error) {
 	if info.Kind != HTTPStoreLocalDaemon {
 		if requiresLocalFiles {
-			return "", errors.New("this command uses a local capability manifest and cannot run through a configured remote daemon; run it on the daemon host with --local")
+			return "", errors.New("this command uses local files and cannot run through a configured remote daemon; run it on the daemon host with --local")
 		}
 		return "", nil
 	}

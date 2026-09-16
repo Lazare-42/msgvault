@@ -57,10 +57,21 @@ func prepareStorageDir(attachmentsDir string) (string, error) {
 // content-addressed storage (hash[:2]/hash). It validates existing files when
 // de-duping. If attachmentsDir is a symlink, it is resolved before writing.
 //
-// Returns the storage path relative to attachmentsDir (e.g. "ab/<hash>"), or
-// empty string if nothing was stored.
+// Empty content is skipped. Returns the storage path relative to attachmentsDir
+// (e.g. "ab/<hash>"), or empty string if nothing was stored.
 func StoreAttachmentFile(attachmentsDir string, att *mime.Attachment) (string, error) {
-	if attachmentsDir == "" || len(att.Content) == 0 {
+	return storeAttachmentFile(attachmentsDir, att, false)
+}
+
+// StoreAttachmentFileIncludingEmpty stores loaded attachment content even
+// when it is a present zero-length slice. A nil Content slice still means the
+// bytes were not loaded and is skipped.
+func StoreAttachmentFileIncludingEmpty(attachmentsDir string, att *mime.Attachment) (string, error) {
+	return storeAttachmentFile(attachmentsDir, att, true)
+}
+
+func storeAttachmentFile(attachmentsDir string, att *mime.Attachment, includeEmpty bool) (string, error) {
+	if attachmentsDir == "" || att.Content == nil || (!includeEmpty && len(att.Content) == 0) {
 		return "", nil
 	}
 
@@ -131,33 +142,43 @@ func attachmentLooseStore(baseDir string, staging packstore.StagingMode) (*packs
 	return store, nil
 }
 
+// DurableAttachmentReceipt identifies one durable loose publication. Created
+// distinguishes a blob introduced by this call from a verified deduplication.
+type DurableAttachmentReceipt struct {
+	StoragePath string
+	ContentHash string
+	Created     bool
+}
+
 // StoreAttachmentFileDurable stores attachment content, including an empty
 // blob, through the content-addressed atomic write path. Unlike ordinary
 // ingest, this entry point is reserved for maintenance that will discard an
-// existing authoritative copy after the loose file is durable.
-func StoreAttachmentFileDurable(attachmentsDir string, att *mime.Attachment) (string, error) {
+// existing authoritative copy after the loose file is durable. Its receipt is
+// populated even when publication succeeded but a later durability step
+// failed, so callers can roll back a newly created blob.
+func StoreAttachmentFileDurable(attachmentsDir string, att *mime.Attachment) (DurableAttachmentReceipt, error) {
 	if attachmentsDir == "" {
-		return "", nil
+		return DurableAttachmentReceipt{}, nil
 	}
 	var expectedHash packstore.Hash
 	var err error
 	if att.ContentHash != "" {
 		normalized := strings.ToLower(att.ContentHash)
 		if err := ValidateContentHash(normalized); err != nil {
-			return "", fmt.Errorf("invalid attachment content hash %q: %w", normalized, err)
+			return DurableAttachmentReceipt{}, fmt.Errorf("invalid attachment content hash %q: %w", normalized, err)
 		}
 		expectedHash, err = packstore.ParseHash(normalized)
 		if err != nil {
-			return "", fmt.Errorf("parse attachment content hash: %w", err)
+			return DurableAttachmentReceipt{}, fmt.Errorf("parse attachment content hash: %w", err)
 		}
 	}
 	baseDir, err := prepareStorageDir(attachmentsDir)
 	if err != nil {
-		return "", err
+		return DurableAttachmentReceipt{}, err
 	}
 	loose, err := attachmentLooseStore(baseDir, packstore.StagingSameDirectory)
 	if err != nil {
-		return "", err
+		return DurableAttachmentReceipt{}, err
 	}
 	result, writeErr := loose.WriteBytes(context.Background(), att.Content, packstore.WriteOptions{
 		Durability:   packstore.DurablePublication,
@@ -169,11 +190,50 @@ func StoreAttachmentFileDurable(attachmentsDir string, att *mime.Attachment) (st
 	if result.Hash != "" && (expectedHash == "" || result.Hash == expectedHash) {
 		att.ContentHash = result.Hash.String()
 	}
-	if writeErr != nil {
-		return "", fmt.Errorf("store durable loose attachment: %w", writeErr)
+	receipt := DurableAttachmentReceipt{Created: result.Created}
+	if result.Hash != "" {
+		receipt.ContentHash = result.Hash.String()
+		receipt.StoragePath = path.Join(receipt.ContentHash[:2], receipt.ContentHash)
 	}
-	contentHash := result.Hash.String()
-	return path.Join(contentHash[:2], contentHash), nil
+	if writeErr != nil {
+		return receipt, fmt.Errorf("store durable loose attachment: %w", writeErr)
+	}
+	return receipt, nil
+}
+
+// RemoveAttachmentFileDurable removes a blob only when receipt proves the
+// corresponding publication created it. Callers remain responsible for
+// checking that no committed attachment row references StoragePath.
+func RemoveAttachmentFileDurable(attachmentsDir string, receipt DurableAttachmentReceipt) error {
+	if !receipt.Created {
+		return nil
+	}
+	if attachmentsDir == "" {
+		return errors.New("attachments directory is required")
+	}
+	if err := ValidateContentHash(receipt.ContentHash); err != nil {
+		return fmt.Errorf("invalid attachment content hash %q: %w", receipt.ContentHash, err)
+	}
+	expectedPath := path.Join(receipt.ContentHash[:2], receipt.ContentHash)
+	if receipt.StoragePath != expectedPath {
+		return fmt.Errorf("attachment storage path %q does not match content hash", receipt.StoragePath)
+	}
+	hash, err := packstore.ParseHash(receipt.ContentHash)
+	if err != nil {
+		return fmt.Errorf("parse attachment content hash: %w", err)
+	}
+	baseDir, err := prepareStorageDir(attachmentsDir)
+	if err != nil {
+		return err
+	}
+	loose, err := attachmentLooseStore(baseDir, packstore.StagingSameDirectory)
+	if err != nil {
+		return err
+	}
+	if err := loose.Remove(hash, packstore.DurableRemoval); err != nil {
+		return fmt.Errorf("remove durable loose attachment: %w", err)
+	}
+	return nil
 }
 
 // hashSourceFile hashes f without staging any bytes, enforcing maxSize on
