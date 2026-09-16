@@ -792,6 +792,76 @@ func agentReadToolPermission(name string) (agentgrant.Permission, bool) {
 	return "", false
 }
 
+// Shared search_metadata schema text. The parser implements a subset of Gmail
+// syntax — not full Gmail compatibility. Keep this in sync with
+// internal/search/parser.go and the SearchFast path in handlers.go.
+func withLimit(defaultDesc string) mcp.ToolOption {
+	return mcp.WithNumber("limit",
+		mcp.Description("Maximum results to return (default "+defaultDesc+")"),
+	)
+}
+
+func withAccount() mcp.ToolOption {
+	return mcp.WithString("account",
+		mcp.Description("Filter by account email address (use get_stats to list available accounts)"),
+	)
+}
+
+// withNewAttachments declares the "new_attachments" draft parameter shared by
+// create_draft and update_draft: file content that has never been archived
+// (e.g. a document just written or scanned), supplied inline as base64 rather
+// than looked up by ID. Combine with attachment_ids to attach both archived
+// and brand-new files on the same draft.
+func withNewAttachments() mcp.ToolOption {
+	return mcp.WithArray("new_attachments",
+		mcp.Description("New file attachments to upload and attach, not yet in the archive (use attachment_ids instead for files already seen in a previous email). Each item is {filename, mime_type, content_base64}: filename and content_base64 (standard base64, no data: URI prefix) are required; mime_type is optional and defaults to application/octet-stream. Subject to the same per-file and combined draft size limits as attachment_ids."),
+		mcp.Items(map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"filename": map[string]any{
+					"type":        "string",
+					"description": "File name shown to the recipient, e.g. \"passport-scan.pdf\"",
+				},
+				"mime_type": map[string]any{
+					"type":        "string",
+					"description": "MIME type, e.g. \"application/pdf\" or \"image/png\". Defaults to application/octet-stream when omitted.",
+				},
+				"content_base64": map[string]any{
+					"type":        "string",
+					"description": "Base64-encoded raw file bytes",
+				},
+			},
+			"required": []string{"filename", "content_base64"},
+		}),
+	)
+}
+
+func searchAttachmentTextTool() mcp.Tool {
+	return mcp.NewTool(ToolSearchAttachmentText,
+		mcp.WithDescription("Search cached text extracted asynchronously from PDF and image attachments. Results include attachment, page, confidence, parent message, and conversation."),
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithString("query", mcp.Required(), mcp.Description("Text to search for")), withLimit("20"))
+}
+
+func getOCRStatusTool() mcp.Tool {
+	return mcp.NewTool(ToolGetOCRStatus,
+		mcp.WithDescription("Get asynchronous attachment extraction queue and availability status."),
+		mcp.WithReadOnlyHintAnnotation(true))
+}
+
+func getAttachmentTextTool() mcp.Tool {
+	return mcp.NewTool(ToolGetAttachmentText,
+		mcp.WithDescription("Get cached page-level text and extraction provenance for an attachment content hash. Never runs OCR inline."),
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithString("content_hash", mcp.Required(), mcp.Description("Attachment SHA-256 content hash")))
+}
+
+func requestAttachmentTextTool() mcp.Tool {
+	return mcp.NewTool(ToolRequestAttachmentText,
+		mcp.WithDescription("Raise an attachment OCR job to interactive priority and return its state immediately. Never waits for extraction."),
+		mcp.WithString("content_hash", mcp.Required(), mcp.Description("Attachment SHA-256 content hash")))
+}
+
 func listDraftsTool() mcp.Tool {
 	return mcp.NewTool(ToolListDrafts,
 		mcp.WithDescription("List email drafts from Gmail. Returns draft ID, subject, recipients, and body preview for each draft."),
@@ -852,6 +922,7 @@ func createDraftTool() mcp.Tool {
 		mcp.WithString("attachment_ids",
 			mcp.Description("Attachment IDs to attach, comma-separated (from get_message). Attaches the archived file directly — no need to export first."),
 		),
+		withNewAttachments(),
 	)
 }
 
@@ -895,6 +966,7 @@ func updateDraftTool() mcp.Tool {
 		mcp.WithString("attachment_ids",
 			mcp.Description("Attachment IDs to attach, comma-separated (from get_message). Replaces any existing attachments."),
 		),
+		withNewAttachments(),
 	)
 }
 
