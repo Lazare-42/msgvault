@@ -176,17 +176,18 @@ type searchMessageRow struct {
 }
 
 type getMessageResp struct {
-	ID             int64           `json:"id"`
-	Subject        string          `json:"subject"`
-	From           []query.Address `json:"from"`
-	BodyText       string          `json:"body_text"`
-	BodyHTML       string          `json:"body_html"`
-	BodyFormat     string          `json:"body_format"`
-	BodyLength     int             `json:"body_length"`
-	BodyReturned   int             `json:"body_returned"`
-	Offset         int             `json:"offset"`
-	HasMore        bool            `json:"has_more"`
-	ConversationID int64           `json:"conversation_id"`
+	ID              int64           `json:"id"`
+	RFC822MessageID string          `json:"rfc822_message_id"`
+	Subject         string          `json:"subject"`
+	From            []query.Address `json:"from"`
+	BodyText        string          `json:"body_text"`
+	BodyHTML        string          `json:"body_html"`
+	BodyFormat      string          `json:"body_format"`
+	BodyLength      int             `json:"body_length"`
+	BodyReturned    int             `json:"body_returned"`
+	Offset          int             `json:"offset"`
+	HasMore         bool            `json:"has_more"`
+	ConversationID  int64           `json:"conversation_id"`
 }
 
 type paginatedInMessageMatches struct {
@@ -2627,6 +2628,46 @@ func TestGetMessage(t *testing.T) {
 		realHandlers := newTestHandlers(query.NewEngine(f.Store.DB(), f.Store.IsPostgreSQL()))
 		msg := runTool[getMessageResp](t, "get_message", realHandlers.getMessage, map[string]any{"id": float64(messageID)})
 		assert.Equal(t, []query.Address{{Email: "sender@example.com", Name: "Test Sender"}}, msg.From)
+	})
+
+	// TestGetMessage/exposes_rfc822_message_id_for_reply_threading locks in
+	// the fix for a real threading bug: create_draft's in_reply_to parameter
+	// needs the RFC 5322 Message-ID of the message being replied to, and its
+	// own tool description says to get that from get_message — but the field
+	// was fetched by the query engine and then silently dropped before the
+	// MCP response was built, so no caller could ever construct a correct
+	// in_reply_to, and replies threaded only on thread_id, which the
+	// codebase's own gmail.DraftCompose.InReplyTo doc comment already says
+	// "does not guarantee" correct threading. Uses the real query engine, not
+	// a mock, so this proves the whole path: sql.NullString column ->
+	// query.MessageSummary -> getMessageResponse -> JSON.
+	t.Run("exposes rfc822_message_id for reply threading", func(t *testing.T) {
+		f := storetest.New(t)
+		const wantMessageID = "<original-msg-abc123@mail.gmail.com>"
+		messageID := f.NewMessage().
+			WithSourceMessageID("thread-original").
+			WithSubject("Original message").
+			Create(t, f.Store)
+		_, err := f.Store.DB().Exec(f.Store.Rebind(
+			`UPDATE messages SET rfc822_message_id = ? WHERE id = ?`,
+		), wantMessageID, messageID)
+		require.NoError(t, err, "set rfc822_message_id")
+
+		realHandlers := newTestHandlers(query.NewEngine(f.Store.DB(), f.Store.IsPostgreSQL()))
+		msg := runTool[getMessageResp](t, "get_message", realHandlers.getMessage, map[string]any{"id": float64(messageID)})
+		assert.Equal(t, wantMessageID, msg.RFC822MessageID, "rfc822_message_id, angle brackets included, ready for in_reply_to")
+	})
+
+	t.Run("rfc822_message_id omitted when the source never carried one", func(t *testing.T) {
+		f := storetest.New(t)
+		messageID := f.NewMessage().
+			WithSourceMessageID("no-message-id-header").
+			WithSubject("Message without a Message-ID header").
+			Create(t, f.Store)
+
+		realHandlers := newTestHandlers(query.NewEngine(f.Store.DB(), f.Store.IsPostgreSQL()))
+		msg := runTool[getMessageResp](t, "get_message", realHandlers.getMessage, map[string]any{"id": float64(messageID)})
+		assert.Empty(t, msg.RFC822MessageID)
 	})
 
 	t.Run("html-only body returns html slice", func(t *testing.T) {
