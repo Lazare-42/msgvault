@@ -4208,7 +4208,7 @@ func runScheduledSync(ctx context.Context, identifier string, s *store.Store, ge
 		case sourceTypeGmail:
 			summary, err = runScheduledGmailSync(ctx, identifier, src, s, getOAuthMgr, state)
 		case sourceTypeIMAP:
-			summary, err = runScheduledIMAPSync(ctx, src, s, state)
+			summary, err = runScheduledIMAPSync(ctx, src, s, state, identifier)
 		case sourceTypeTeams:
 			err = runScheduledTeamsSync(ctx, src, s, state)
 		case sourceTypeMSMail:
@@ -4515,7 +4515,7 @@ func scheduledGmailAccountIdentifier(selector string, src *store.Source) string 
 // and relying on the store to dedupe by message-id. NoResume is forced
 // on because IMAP page tokens are numeric offsets that don't survive
 // across processes (see syncfull.go).
-func runScheduledIMAPSync(ctx context.Context, src *store.Source, s *store.Store, state *invocation) (*gmail.SyncSummary, error) {
+func runScheduledIMAPSync(ctx context.Context, src *store.Source, s *store.Store, state *invocation, scheduleIdentifier string) (*gmail.SyncSummary, error) {
 	if state == nil {
 		state = invocationFromContext(ctx)
 	}
@@ -4525,6 +4525,9 @@ func runScheduledIMAPSync(ctx context.Context, src *store.Source, s *store.Store
 	cfg := state.cfg
 	logger := state.logger
 	imapOpts := imapFolderStateOptions(s, src, false, cfg, logger)
+	if account := cfg.GetAccountSchedule(scheduleIdentifier); account != nil && len(account.SkipFolders) > 0 {
+		imapOpts = append(imapOpts, imaplib.WithFolderFilter(nil, account.SkipFolders))
+	}
 	apiClient, err := buildAPIClient(ctx, src, nil, nil, imapOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("build IMAP client: %w", err)

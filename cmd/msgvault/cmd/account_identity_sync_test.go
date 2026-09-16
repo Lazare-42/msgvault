@@ -221,7 +221,7 @@ func TestAddIMAPDefaultIdentityScheduledSync(t *testing.T) {
 			require.NoError(err)
 			require.EqualValues(1, removed)
 		}
-		summary, err := runScheduledIMAPSync(ctx, src, st, invocationFromContext(ctx))
+		summary, err := runScheduledIMAPSync(ctx, src, st, invocationFromContext(ctx), src.Identifier)
 		require.NoError(err)
 		assert.Zero(summary.Errors)
 		ids, err := st.ListAccountIdentities(src.ID)
