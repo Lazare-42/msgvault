@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -16,6 +17,7 @@ import (
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/gmail"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/query/querytest"
 	"go.kenn.io/msgvault/internal/search"
@@ -941,4 +943,56 @@ func TestOfficialSDKInMemoryRoundTrip(t *testing.T) {
 	var fallback map[string]any
 	must.NoError(json.Unmarshal([]byte(textContent.Text), &fallback))
 	checks.Equal(structured, fallback)
+}
+
+// TestCreateDraftAndUpdateDraftSchemasIncludeNewAttachments proves the
+// "new_attachments" parameter actually reaches an MCP client's tools/list
+// response with the right shape, not just that createDraftTool()/
+// updateDraftTool() build without panicking. legacyDefinition round-trips
+// mcp-go's schema through encoding/json into a jsonschema.Schema, so this
+// also guards against that conversion silently dropping the nested array-of-
+// objects "items" schema (there was no existing array-of-objects parameter
+// in this codebase to prove that conversion works before this feature).
+func TestCreateDraftAndUpdateDraftSchemasIncludeNewAttachments(t *testing.T) {
+	require := require.New(t)
+	opts := ServeOptions{
+		Engine: &querytest.MockEngine{},
+		GmailFactory: func(context.Context, string) (gmail.API, error) {
+			return nil, errors.New("not used in this schema-only test")
+		},
+	}
+	byName := toolsByName(t, rawListTools(t, opts, true))
+
+	for _, name := range []string{ToolCreateDraft, ToolUpdateDraft} {
+		tool, ok := byName[name]
+		require.True(ok, "%s tool registered", name)
+		schema, ok := tool["inputSchema"].(map[string]any)
+		require.True(ok, "%s inputSchema: %#v", name, tool["inputSchema"])
+		properties, ok := schema["properties"].(map[string]any)
+		require.True(ok, "%s properties: %#v", name, schema)
+
+		require.Contains(properties, "attachment_ids", "%s keeps attachment_ids for archived files", name)
+
+		newAttachments, ok := properties["new_attachments"].(map[string]any)
+		require.True(ok, "%s new_attachments property: %#v", name, properties)
+		require.Equal("array", newAttachments["type"])
+
+		items, ok := newAttachments["items"].(map[string]any)
+		require.True(ok, "%s new_attachments.items: %#v", name, newAttachments)
+		require.Equal("object", items["type"])
+
+		itemProperties, ok := items["properties"].(map[string]any)
+		require.True(ok, "%s new_attachments.items.properties: %#v", name, items)
+		require.Contains(itemProperties, "filename")
+		require.Contains(itemProperties, "mime_type")
+		require.Contains(itemProperties, "content_base64")
+
+		rawRequired, ok := items["required"].([]any)
+		require.True(ok, "%s new_attachments.items.required: %#v", name, items)
+		required := make([]string, len(rawRequired))
+		for i, r := range rawRequired {
+			required[i], _ = r.(string)
+		}
+		assert.ElementsMatch(t, []string{"filename", "content_base64"}, required)
+	}
 }

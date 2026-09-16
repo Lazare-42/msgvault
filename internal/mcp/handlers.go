@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	stdmime "mime"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -744,20 +745,86 @@ type searchMessageItem struct {
 }
 
 // maxDraftAttachmentsSize caps the combined raw size of attachments on a single
-// draft. Gmail rejects messages over ~25MB; base64 inflates content by ~33%, so
-// the raw total must stay below that ceiling.
+// draft, applied uniformly whether the bytes come from an already-archived
+// attachment (attachment_ids) or a freshly uploaded one (new_attachments).
+// Gmail's API caps the fully MIME-encoded message at 35MB
+// (https://developers.google.com/workspace/gmail/api/guides/uploads); base64
+// inflates raw content by ~33%, so the raw total must stay below that ceiling.
 const maxDraftAttachmentsSize = 18 * 1024 * 1024
 
-// resolveDraftAttachments loads the attachments named by the comma-separated
-// "attachment_ids" argument from the archive into draft attachments. Returns
-// (nil, nil) when no attachment_ids are provided.
+// newDraftAttachmentInput is one validated element of the "new_attachments"
+// tool argument, prior to base64 decoding. Decoding happens in
+// resolveDraftAttachments so every attachment — archived or new — is checked
+// against the same running maxDraftAttachmentsSize total in one place.
+type newDraftAttachmentInput struct {
+	filename      string
+	mimeType      string
+	contentBase64 string
+}
+
+// parseNewAttachmentArgs validates the shape of the "new_attachments" array
+// argument (create_draft/update_draft): each element must be an object with
+// a non-empty filename and content_base64, and an optional, well-formed
+// mime_type. Returns (nil, nil) when the argument is absent.
+func parseNewAttachmentArgs(args map[string]any) ([]newDraftAttachmentInput, error) {
+	raw, found := args["new_attachments"]
+	if !found {
+		return nil, nil
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		return nil, errors.New("new_attachments must be an array of {filename, mime_type, content_base64} objects")
+	}
+	inputs := make([]newDraftAttachmentInput, 0, len(items))
+	for i, item := range items {
+		obj, ok := item.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("new_attachments[%d]: must be an object with filename and content_base64", i)
+		}
+		filename := strings.TrimSpace(stringField(obj, "filename"))
+		if filename == "" {
+			return nil, fmt.Errorf("new_attachments[%d]: filename is required", i)
+		}
+		contentBase64 := stringField(obj, "content_base64")
+		if strings.TrimSpace(contentBase64) == "" {
+			return nil, fmt.Errorf("new_attachments[%d]: content_base64 is required", i)
+		}
+		mimeType := strings.TrimSpace(stringField(obj, "mime_type"))
+		if mimeType != "" {
+			if _, _, err := stdmime.ParseMediaType(mimeType); err != nil {
+				return nil, fmt.Errorf("new_attachments[%d]: invalid mime_type %q: %v", i, mimeType, err)
+			}
+		}
+		inputs = append(inputs, newDraftAttachmentInput{filename: filename, mimeType: mimeType, contentBase64: contentBase64})
+	}
+	return inputs, nil
+}
+
+func stringField(obj map[string]any, key string) string {
+	v, _ := obj[key].(string)
+	return v
+}
+
+// resolveDraftAttachments builds the combined attachment list for a draft
+// from two independent sources: "attachment_ids", a comma-separated list of
+// IDs of attachments already in the archive (from a previously-received or
+// previously-sent message, looked up via get_message), and
+// "new_attachments", an array of files that have never been archived,
+// supplied inline as base64. A draft may use either, both, or neither.
+// Returns (nil, nil) when neither argument is provided.
 func (h *handlers) resolveDraftAttachments(ctx context.Context, args map[string]any) ([]gmail.DraftAttachment, error) {
 	raw, _ := args["attachment_ids"].(string)
 	ids := splitCSV(raw)
-	if len(ids) == 0 {
+
+	newAttachments, err := parseNewAttachmentArgs(args)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(ids) == 0 && len(newAttachments) == 0 {
 		return nil, nil
 	}
-	if h.attachmentsDir == "" && h.attachmentReader == nil {
+	if len(ids) > 0 && h.attachmentsDir == "" && h.attachmentReader == nil {
 		return nil, fmt.Errorf("attachments directory not configured")
 	}
 
@@ -789,6 +856,26 @@ func (h *handlers) resolveDraftAttachments(ctx context.Context, args map[string]
 			Content:     data,
 		})
 	}
+
+	for i, na := range newAttachments {
+		content, err := base64.StdEncoding.DecodeString(na.contentBase64)
+		if err != nil {
+			return nil, fmt.Errorf("new_attachments[%d]: content_base64 is invalid: %v", i, err)
+		}
+		if int64(len(content)) > maxAttachmentSize {
+			return nil, fmt.Errorf("new_attachments[%d]: attachment too large: %d bytes (max %d)", i, len(content), maxAttachmentSize)
+		}
+		total += int64(len(content))
+		if total > maxDraftAttachmentsSize {
+			return nil, fmt.Errorf("total attachment size exceeds %d bytes", maxDraftAttachmentsSize)
+		}
+		atts = append(atts, gmail.DraftAttachment{
+			Filename:    na.filename,
+			ContentType: na.mimeType,
+			Content:     content,
+		})
+	}
+
 	return atts, nil
 }
 
