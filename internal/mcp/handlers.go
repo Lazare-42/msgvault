@@ -1916,6 +1916,7 @@ type getMessageResponse struct {
 	HasMore              bool                   `json:"has_more"`
 	Labels               []string               `json:"labels"`
 	Attachments          []query.AttachmentInfo `json:"attachments"`
+	RFC822MessageID string `json:"rfc822_message_id,omitempty"`
 }
 
 func (h *handlers) getMessage(ctx context.Context, req toolRequest) (*toolResult, error) {
@@ -1990,6 +1991,7 @@ func (h *handlers) getMessage(ctx context.Context, req toolRequest) (*toolResult
 		SourceMessageID:      msg.SourceMessageID,
 		ConversationID:       msg.ConversationID,
 		SourceConversationID: msg.SourceConversationID,
+		RFC822MessageID:      msg.RFC822MessageID,
 		Subject:              msg.Subject,
 		MessageType:          msg.MessageType,
 		RelatedMessageID:     msg.RelatedMessageID,
