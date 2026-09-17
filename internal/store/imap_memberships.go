@@ -313,6 +313,323 @@ func (s *Store) applyIMAPMailboxDeltas(
 	})
 }
 
+// ApplyIMAPMailboxDeltasScoped commits verified membership and cursor state
+// for an explicitly bounded set of mailboxes, leaving every other mailbox's
+// folder state, memberships, and labels untouched. Unlike
+// ApplyIMAPMailboxDeltas it never retires a mailbox absent from deltas (that
+// mailbox may simply be excluded, failed, or unscanned this run rather than
+// gone from the account) and it never tombstones a message: partial coverage
+// can prove a message left one scanned mailbox, but never proves it left the
+// account. A message that loses every label observed within this scope is
+// left label-less rather than deleted, for a later run — scoped or
+// whole-account — to reconcile once its true location is known again.
+func (s *Store) ApplyIMAPMailboxDeltasScoped(sourceID int64, deltas []IMAPMailboxDelta) error {
+	return s.applyIMAPMailboxDeltasScoped(context.Background(), sourceID, 0, deltas)
+}
+
+// ApplyIMAPMailboxDeltasScopedForSyncContext applies a scoped topology only
+// if syncRunID is still the latest completed generation for sourceID. Like
+// ApplyIMAPMailboxDeltasForSyncContext, the generation check and the write
+// share one transaction and source lock.
+func (s *Store) ApplyIMAPMailboxDeltasScopedForSyncContext(
+	ctx context.Context,
+	sourceID int64,
+	syncRunID int64,
+	deltas []IMAPMailboxDelta,
+) error {
+	if syncRunID <= 0 {
+		return fmt.Errorf("apply scoped IMAP mailbox deltas: invalid sync generation %d", syncRunID)
+	}
+	return s.applyIMAPMailboxDeltasScoped(ctx, sourceID, syncRunID, deltas)
+}
+
+func (s *Store) applyIMAPMailboxDeltasScoped(
+	ctx context.Context,
+	sourceID int64,
+	syncRunID int64,
+	deltas []IMAPMailboxDelta,
+) error {
+	if len(deltas) == 0 {
+		// Nothing was individually verified this run. Every mailbox's state
+		// stays exactly as the last successful run (scoped or whole-account)
+		// left it, ready to be retried in full next time.
+		return nil
+	}
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
+		if syncRunID > 0 {
+			if err := validateCurrentSyncGeneration(
+				ctx, tx, sourceID, syncRunID, SyncStatusCompleted,
+			); err != nil {
+				return err
+			}
+		}
+		normalizedDeltas, err := normalizeIMAPMailboxDeltas(deltas)
+		if err != nil {
+			return err
+		}
+		resolver := imapMembershipResolver{tx: tx, sourceID: sourceID}
+		if err := resolver.primeRawIdentities(normalizedDeltas); err != nil {
+			return err
+		}
+
+		affected := make(map[int64]struct{})
+
+		// Look up (never retire) each scoped mailbox's label, and — for a
+		// mailbox this run fully re-enumerated — capture messages that
+		// already carry that label from before membership tracking existed
+		// (or from an earlier scoped run of a different mailbox subset).
+		// This is the scoped equivalent of the whole-account bootstrap in
+		// captureUntrackedIMAPMessageIDs, restricted to mailboxes actually in
+		// scope so an excluded or unscanned mailbox's legacy labels are never
+		// touched.
+		scopedMailboxLabelID := make(map[string]int64, len(normalizedDeltas))
+		for _, normalized := range normalizedDeltas {
+			labelID, ok, err := findIMAPMailboxLabel(tx, sourceID, normalized.mailbox)
+			if err != nil {
+				return fmt.Errorf("find label for IMAP mailbox %q: %w", normalized.mailbox, err)
+			}
+			if !ok {
+				continue
+			}
+			scopedMailboxLabelID[normalized.mailbox] = labelID
+			if normalized.delta.Reset {
+				if err := captureIMAPMembershipMessageIDs(
+					tx, affected,
+					`SELECT message_id FROM message_labels WHERE label_id = ?`,
+					labelID,
+				); err != nil {
+					return fmt.Errorf("capture legacy label rows for mailbox %q: %w", normalized.mailbox, err)
+				}
+			}
+		}
+
+		for _, normalized := range normalizedDeltas {
+			delta := normalized.delta
+			if delta.Reset {
+				if err := captureIMAPMembershipMessageIDs(
+					tx, affected,
+					`SELECT message_id FROM imap_message_memberships WHERE source_id = ? AND mailbox = ?`,
+					sourceID, normalized.mailbox,
+				); err != nil {
+					return fmt.Errorf("capture reset memberships for mailbox %q: %w", normalized.mailbox, err)
+				}
+				if _, err := tx.Exec(`
+					DELETE FROM imap_message_memberships
+					WHERE source_id = ? AND mailbox = ?
+				`, sourceID, normalized.mailbox); err != nil {
+					return fmt.Errorf("reset IMAP memberships for mailbox %q: %w", normalized.mailbox, err)
+				}
+			}
+
+			for _, uid := range delta.VanishedUIDs {
+				if err := captureIMAPMembershipMessageIDs(
+					tx, affected,
+					`SELECT message_id FROM imap_message_memberships
+					 WHERE source_id = ? AND mailbox = ? AND uidvalidity = ? AND uid = ?`,
+					sourceID, normalized.mailbox, normalized.uidValidity, uid,
+				); err != nil {
+					return fmt.Errorf("capture vanished UID %d in mailbox %q: %w", uid, normalized.mailbox, err)
+				}
+				if _, err := tx.Exec(`
+					DELETE FROM imap_message_memberships
+					WHERE source_id = ? AND mailbox = ? AND uidvalidity = ? AND uid = ?
+				`, sourceID, normalized.mailbox, normalized.uidValidity, uid); err != nil {
+					return fmt.Errorf("remove vanished UID %d in mailbox %q: %w", uid, normalized.mailbox, err)
+				}
+			}
+
+			for _, observation := range delta.Memberships {
+				observation.Mailbox = normalized.mailbox
+				observation.UIDValidity = normalized.uidValidity
+				messageID, err := resolver.resolve(observation)
+				if err != nil {
+					return err
+				}
+				if observation.SourceMessageID != "" {
+					if err := captureIMAPMembershipMessageIDs(
+						tx, affected,
+						`SELECT id FROM messages WHERE source_id = ? AND source_message_id = ?`,
+						sourceID, observation.SourceMessageID,
+					); err != nil {
+						return fmt.Errorf("capture observed IMAP message: %w", err)
+					}
+				}
+				affected[messageID] = struct{}{}
+				if err := captureIMAPMembershipMessageIDs(
+					tx, affected,
+					`SELECT message_id FROM imap_message_memberships
+					 WHERE source_id = ? AND mailbox = ? AND uidvalidity = ? AND uid = ?`,
+					sourceID, observation.Mailbox, observation.UIDValidity, observation.UID,
+				); err != nil {
+					return fmt.Errorf("capture replaced IMAP membership: %w", err)
+				}
+
+				flags := observation.Flags
+				if flags == nil {
+					flags = []string{}
+				}
+				flagsJSON, err := json.Marshal(flags)
+				if err != nil {
+					return fmt.Errorf("marshal IMAP flags: %w", err)
+				}
+				if _, err := tx.Exec(fmt.Sprintf(`
+					INSERT INTO imap_message_memberships
+						(source_id, mailbox, uidvalidity, uid, message_id, flags, updated_at)
+					VALUES (?, ?, ?, ?, ?, %s, %s)
+					ON CONFLICT(source_id, mailbox, uidvalidity, uid) DO UPDATE SET
+						message_id = excluded.message_id,
+						flags = excluded.flags,
+						updated_at = %s
+				`, s.dialect.JSONBindExpr(), s.dialect.Now(), s.dialect.Now()),
+					sourceID, observation.Mailbox, observation.UIDValidity,
+					observation.UID, messageID, string(flagsJSON),
+				); err != nil {
+					return fmt.Errorf("upsert IMAP membership for mailbox %q UID %d: %w",
+						observation.Mailbox, observation.UID, err)
+				}
+			}
+		}
+
+		for _, messageID := range sortedIMAPMessageIDs(affected) {
+			if err := s.reconcileScopedIMAPLabelsTx(
+				tx, sourceID, messageID, normalizedDeltas, scopedMailboxLabelID,
+			); err != nil {
+				return err
+			}
+		}
+		// Deliberately no tombstone/untombstone pass here: scoped
+		// reconciliation only ever proves where a message currently is
+		// within the mailboxes it scanned, never that it is gone from every
+		// mailbox in the account.
+
+		for _, normalized := range normalizedDeltas {
+			delta := normalized.delta
+			if _, err := tx.Exec(fmt.Sprintf(`
+				INSERT INTO imap_folder_state
+					(source_id, mailbox, uidvalidity, uidnext, highest_modseq, updated_at)
+				VALUES (?, ?, ?, ?, ?, %s)
+				ON CONFLICT(source_id, mailbox) DO UPDATE SET
+					uidvalidity = excluded.uidvalidity,
+					uidnext = excluded.uidnext,
+					highest_modseq = excluded.highest_modseq,
+					updated_at = %s
+			`, s.dialect.Now(), s.dialect.Now()),
+				sourceID, normalized.mailbox, normalized.uidValidity, delta.State.UIDNext,
+				strconv.FormatUint(delta.State.HighestModSeq, 10),
+			); err != nil {
+				return fmt.Errorf("upsert IMAP folder state for %q: %w", normalized.mailbox, err)
+			}
+		}
+		return nil
+	})
+}
+
+// reconcileScopedIMAPLabelsTx adds or removes only the labels for mailboxes
+// within scope, leaving every other label already on the message — from a
+// mailbox outside scope, or a legacy label with no membership backing at
+// all — untouched. It never tombstones: a message left with no labels at
+// all may simply live in a mailbox this run never looked at.
+func (s *Store) reconcileScopedIMAPLabelsTx(
+	tx *loggedTx,
+	sourceID, messageID int64,
+	normalizedDeltas []normalizedIMAPMailboxDelta,
+	scopedMailboxLabelID map[string]int64,
+) error {
+	memberMailboxes, err := imapMembershipMailboxes(tx, sourceID, messageID)
+	if err != nil {
+		return err
+	}
+	memberSet := make(map[string]struct{}, len(memberMailboxes))
+	for _, mailbox := range memberMailboxes {
+		memberSet[mailbox] = struct{}{}
+	}
+
+	existingLabelIDs, err := messageLabelIDsTx(tx, messageID)
+	if err != nil {
+		return err
+	}
+	existingSet := make(map[int64]struct{}, len(existingLabelIDs))
+	for _, id := range existingLabelIDs {
+		existingSet[id] = struct{}{}
+	}
+
+	var toAdd, toRemove []int64
+	for _, normalized := range normalizedDeltas {
+		mailbox := normalized.mailbox
+		_, isMember := memberSet[mailbox]
+		labelID, hasLabelRow := scopedMailboxLabelID[mailbox]
+		if isMember {
+			if !hasLabelRow {
+				labelID, err = ensureIMAPMailboxLabel(tx, sourceID, mailbox)
+				if err != nil {
+					return err
+				}
+				scopedMailboxLabelID[mailbox] = labelID
+			}
+			if _, linked := existingSet[labelID]; !linked {
+				toAdd = append(toAdd, labelID)
+			}
+			continue
+		}
+		if hasLabelRow {
+			if _, linked := existingSet[labelID]; linked {
+				toRemove = append(toRemove, labelID)
+			}
+		}
+	}
+
+	if len(toAdd) > 0 {
+		if err := s.addMessageLabelsTx(tx, messageID, toAdd); err != nil {
+			return fmt.Errorf("add scoped IMAP labels for message %d: %w", messageID, err)
+		}
+	}
+	if len(toRemove) > 0 {
+		if err := execInChunks(tx, toRemove, []any{messageID},
+			`DELETE FROM message_labels WHERE message_id = ? AND label_id IN (%s)`,
+		); err != nil {
+			return fmt.Errorf("remove scoped IMAP labels for message %d: %w", messageID, err)
+		}
+	}
+	return nil
+}
+
+// findIMAPMailboxLabel looks up (without creating) the label for an IMAP
+// mailbox.
+func findIMAPMailboxLabel(tx *loggedTx, sourceID int64, mailbox string) (int64, bool, error) {
+	var labelID int64
+	err := tx.QueryRow(`
+		SELECT id FROM labels WHERE source_id = ? AND source_label_id = ?
+	`, sourceID, mailbox).Scan(&labelID)
+	if err == nil {
+		return labelID, true, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	return 0, false, fmt.Errorf("find label for IMAP mailbox %q: %w", mailbox, err)
+}
+
+// messageLabelIDsTx returns the label IDs currently linked to a message.
+func messageLabelIDsTx(tx *loggedTx, messageID int64) ([]int64, error) {
+	rows, err := tx.Query(`SELECT label_id FROM message_labels WHERE message_id = ?`, messageID)
+	if err != nil {
+		return nil, fmt.Errorf("query labels for message %d: %w", messageID, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan label for message %d: %w", messageID, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate labels for message %d: %w", messageID, err)
+	}
+	return ids, nil
+}
+
 func captureUntrackedIMAPMessageIDs(
 	tx *loggedTx, sourceID int64, affected map[int64]struct{},
 ) error {

@@ -395,17 +395,31 @@ func imapFolderStateOptions(
 	if forceRescan {
 		opts = append(opts, imaplib.WithForceFullEnumeration())
 	}
+	// Activate per-mailbox completion tracking: the client only reports a
+	// mailbox via ObservedFolderStates once every message it listed there
+	// has been acknowledged (added, updated, skipped, or confirmed gone) by
+	// the syncer. Without this option that tracking never starts, and
+	// saveIMAPFolderStates cannot tell a mailbox with a stuck fetch failure
+	// apart from one that finished cleanly. The callback itself is only for
+	// operator visibility; the durable commit happens once, after the run,
+	// from ObservedFolderStates/ObservedMailboxDeltas.
+	opts = append(opts, imaplib.WithFolderStateSave(func(mailbox string, state imaplib.FolderState) {
+		logger.Debug("IMAP mailbox fully acknowledged this run",
+			"source", src.Identifier, "mailbox", mailbox, "known_uids", len(state.KnownUIDs))
+	}))
 	return opts
 }
 
-func applyIMAPMailboxDeltas(
-	ctx context.Context,
-	s *store.Store,
-	src *store.Source,
-	syncRunID int64,
+// buildStoreIMAPMailboxDeltas converts the client's per-session deltas and
+// membership observations into the store's delta shape, folding duplicate
+// observations for the same mailbox|UIDVALIDITY|UID together and grouping
+// memberships under their mailbox's delta. It is shared by the whole-account
+// and scoped apply paths; the two differ only in which store method they
+// hand the result to.
+func buildStoreIMAPMailboxDeltas(
 	deltas []imaplib.MailboxDelta,
 	observations []imaplib.MembershipObservation,
-) error {
+) ([]store.IMAPMailboxDelta, error) {
 	type membershipKey struct {
 		mailbox     string
 		uidValidity uint32
@@ -455,7 +469,7 @@ func applyIMAPMailboxDeltas(
 	seenMailboxes := make(map[string]struct{}, len(deltas))
 	for _, delta := range deltas {
 		if _, exists := seenMailboxes[delta.Mailbox]; exists {
-			return fmt.Errorf("duplicate IMAP mailbox delta for %q", delta.Mailbox)
+			return nil, fmt.Errorf("duplicate IMAP mailbox delta for %q", delta.Mailbox)
 		}
 		seenMailboxes[delta.Mailbox] = struct{}{}
 		vanished := make([]uint32, len(delta.VanishedUIDs))
@@ -477,11 +491,96 @@ func applyIMAPMailboxDeltas(
 		delete(byMailbox, delta.Mailbox)
 	}
 	for mailbox := range byMailbox {
-		return fmt.Errorf("IMAP membership observation for mailbox %q has no mailbox delta", mailbox)
+		return nil, fmt.Errorf("IMAP membership observation for mailbox %q has no mailbox delta", mailbox)
+	}
+	return storeDeltas, nil
+}
+
+// applyIMAPMailboxDeltas commits the whole-account authoritative topology:
+// every current mailbox must be represented in deltas, and the store retires
+// (and may tombstone messages from) any saved mailbox that is not. Only call
+// this when the session covered every mailbox in the account this run — see
+// imapSyncCanCommit and Client.LabelsSnapshotComplete.
+func applyIMAPMailboxDeltas(
+	ctx context.Context,
+	s *store.Store,
+	src *store.Source,
+	syncRunID int64,
+	deltas []imaplib.MailboxDelta,
+	observations []imaplib.MembershipObservation,
+) error {
+	storeDeltas, err := buildStoreIMAPMailboxDeltas(deltas, observations)
+	if err != nil {
+		return err
 	}
 	return s.ApplyIMAPMailboxDeltasForSyncContext(ctx, src.ID, syncRunID, storeDeltas)
 }
 
+// applyIMAPMailboxDeltasScoped commits only the mailboxes present in deltas.
+// It never retires a mailbox absent from deltas and never tombstones a
+// message on their account — see Store.ApplyIMAPMailboxDeltasScoped. Callers
+// must already have restricted deltas and observations to mailboxes that
+// were individually verified this run (see scopeIMAPMailboxDeltas).
+func applyIMAPMailboxDeltasScoped(
+	ctx context.Context,
+	s *store.Store,
+	src *store.Source,
+	syncRunID int64,
+	deltas []imaplib.MailboxDelta,
+	observations []imaplib.MembershipObservation,
+) error {
+	storeDeltas, err := buildStoreIMAPMailboxDeltas(deltas, observations)
+	if err != nil {
+		return err
+	}
+	return s.ApplyIMAPMailboxDeltasScopedForSyncContext(ctx, src.ID, syncRunID, storeDeltas)
+}
+
+// scopeIMAPMailboxDeltas restricts deltas to the mailboxes present in
+// verified, preserving order. A mailbox excluded from this run, whose
+// enumeration or STATUS failed, or whose listed messages were not all
+// acknowledged by the syncer is absent from verified and is silently
+// dropped here — it is left for a future run to retry in full, rather than
+// committed on partial information.
+func scopeIMAPMailboxDeltas(
+	deltas []imaplib.MailboxDelta, verified map[string]imaplib.FolderState,
+) []imaplib.MailboxDelta {
+	if len(deltas) == 0 || len(verified) == 0 {
+		return nil
+	}
+	scoped := make([]imaplib.MailboxDelta, 0, len(deltas))
+	for _, delta := range deltas {
+		if _, ok := verified[delta.Mailbox]; ok {
+			scoped = append(scoped, delta)
+		}
+	}
+	return scoped
+}
+
+// scopeIMAPMembershipObservations restricts observations to verified
+// mailboxes, mirroring scopeIMAPMailboxDeltas. Every membership observation
+// must have a corresponding mailbox delta (buildStoreIMAPMailboxDeltas
+// enforces this), so a scoped delta set requires scoped observations too.
+func scopeIMAPMembershipObservations(
+	observations []imaplib.MembershipObservation, verified map[string]imaplib.FolderState,
+) []imaplib.MembershipObservation {
+	if len(observations) == 0 || len(verified) == 0 {
+		return nil
+	}
+	scoped := make([]imaplib.MembershipObservation, 0, len(observations))
+	for _, observation := range observations {
+		if _, ok := verified[observation.Mailbox]; ok {
+			scoped = append(scoped, observation)
+		}
+	}
+	return scoped
+}
+
+// imapSyncCanCommit reports whether the run is eligible for the whole-account
+// authoritative commit (applyIMAPMailboxDeltas): clean, unlimited, and not a
+// resumed run. It does not by itself mean anything should be committed —
+// saveIMAPFolderStates still requires the client's snapshot to be complete
+// and unfiltered too.
 func imapSyncCanCommit(ctx context.Context, summary *gmail.SyncSummary, limit int) bool {
 	return summary != nil &&
 		ctx.Err() == nil &&
@@ -490,8 +589,20 @@ func imapSyncCanCommit(ctx context.Context, summary *gmail.SyncSummary, limit in
 		limit == 0
 }
 
-// saveIMAPFolderStates atomically persists mailbox membership and cursor
-// observations only after a clean, unlimited, unfiltered sync.
+// saveIMAPFolderStates persists mailbox membership and cursor state after a
+// full sync. A completely clean, unlimited, unfiltered run — one where every
+// mailbox in the account was enumerated and every listed message safely
+// persisted — commits the whole-account authoritative topology, which may
+// retire mailboxes genuinely gone from the account and tombstone messages
+// with no remaining membership.
+//
+// A run with excluded folders or a mailbox-level enumeration/fetch failure
+// still commits the mailboxes individually verified this session through
+// the scoped, non-destructive path, leaving every other mailbox's state,
+// memberships, and labels untouched for a later run to reconcile once it
+// can see them. A resumed, --limit-truncated, date-filtered, or cancelled
+// run commits nothing at all: its client session cannot vouch for even the
+// mailboxes it happened to observe.
 func saveIMAPFolderStates(
 	ctx context.Context,
 	s *store.Store,
@@ -501,20 +612,52 @@ func saveIMAPFolderStates(
 	limit int,
 ) error {
 	imapClient, ok := apiClient.(*imaplib.Client)
-	if !ok || !imapSyncCanCommit(ctx, summary, limit) {
+	if !ok || summary == nil || summary.SyncRunID <= 0 {
+		// No valid sync generation to fence a commit against — both apply
+		// paths require one to protect against an overlapping newer run.
 		return nil
 	}
-	if imapClient.LabelsSnapshotFiltered() || !imapClient.LabelsSnapshotComplete() {
+	if summary.WasResumed || limit != 0 || ctx.Err() != nil {
+		// These make the whole session's observations untrustworthy for any
+		// durable commit, not just the whole-account authoritative one: a
+		// resumed run's client session may not reflect a fresh listing, a
+		// deliberately bounded --limit run is exploratory rather than
+		// durable, and a cancelled run's snapshot was taken mid-cancellation.
 		return nil
 	}
-	deltas := imapClient.ObservedMailboxDeltas()
-	if deltas == nil {
+
+	if imapSyncCanCommit(ctx, summary, limit) &&
+		!imapClient.LabelsSnapshotFiltered() && imapClient.LabelsSnapshotComplete() {
+		deltas := imapClient.ObservedMailboxDeltas()
+		if deltas == nil {
+			return nil
+		}
+		if err := applyIMAPMailboxDeltas(
+			ctx, s, src, summary.SyncRunID, deltas, imapClient.ObservedMemberships(),
+		); err != nil {
+			return fmt.Errorf("apply IMAP mailbox deltas: %w", err)
+		}
 		return nil
 	}
-	if err := applyIMAPMailboxDeltas(
-		ctx, s, src, summary.SyncRunID, deltas, imapClient.ObservedMemberships(),
+
+	// Whole-account authoritative commit is not eligible — some mailbox was
+	// excluded, its enumeration or label map failed, or an individual
+	// message error occurred somewhere in the run. Commit only the
+	// mailboxes individually verified this session instead of discarding
+	// all of them.
+	verified := imapClient.ObservedFolderStates()
+	if len(verified) == 0 {
+		return nil
+	}
+	deltas := scopeIMAPMailboxDeltas(imapClient.ObservedMailboxDeltas(), verified)
+	if len(deltas) == 0 {
+		return nil
+	}
+	observations := scopeIMAPMembershipObservations(imapClient.ObservedMemberships(), verified)
+	if err := applyIMAPMailboxDeltasScoped(
+		ctx, s, src, summary.SyncRunID, deltas, observations,
 	); err != nil {
-		return fmt.Errorf("apply IMAP mailbox deltas: %w", err)
+		return fmt.Errorf("apply scoped IMAP mailbox deltas: %w", err)
 	}
 	return nil
 }
