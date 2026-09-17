@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -68,6 +69,36 @@ func acknowledgeMailboxObservations(t *testing.T, client *imaplib.Client, mailbo
 		}
 	}
 	client.AcknowledgeMessages(context.Background(), ids)
+	return ids
+}
+
+// syncMailboxMessages drives client through the two production steps a real
+// sync performs for a mailbox's listed messages: a raw FETCH (which is what
+// actually records membership — see buildMessageListCache's
+// fullScanWithoutAll — any folder-filtered session, or one against a server
+// with no \All mailbox once more than one mailbox is in play, never builds a
+// label map during listing, so ObservedMemberships stays empty until the
+// real per-message fetch that follows) and AcknowledgeMessages. Returns the
+// composite source message IDs fetched.
+func syncMailboxMessages(t *testing.T, client *imaplib.Client, mailbox string) []string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	resp, err := client.ListMessages(ctx, "", "")
+	require.NoError(t, err)
+	var ids []string
+	for _, m := range resp.Messages {
+		mb, _, parseErr := imaplib.SourceMailboxFromMessageID(m.ID)
+		require.NoError(t, parseErr)
+		if mb == mailbox {
+			ids = append(ids, m.ID)
+		}
+	}
+	if len(ids) > 0 {
+		_, err = client.GetMessagesRawBatchWithErrors(ctx, ids)
+		require.NoError(t, err)
+	}
+	client.AcknowledgeMessages(ctx, ids)
 	return ids
 }
 
@@ -511,6 +542,7 @@ func TestSaveIMAPFolderStates_ExcludedFolderRetainsStateAndLabels(t *testing.T) 
 	require.NoError(err)
 
 	// A prior run reconciled "Personal" before this run starts excluding it.
+	seedIMAPMessage(t, st, src, "Personal|1", "")
 	require.NoError(st.ApplyIMAPMailboxDeltas(src.ID, []store.IMAPMailboxDelta{{
 		Mailbox: "Personal",
 		State:   store.IMAPFolderState{Mailbox: "Personal", UIDValidity: 99, UIDNext: 2, HighestModSeq: 900},
@@ -521,8 +553,9 @@ func TestSaveIMAPFolderStates_ExcludedFolderRetainsStateAndLabels(t *testing.T) 
 	require.Contains(queryScriptedRFC7162LabelsBySourceMessageID(t, st, src.ID), "Personal|1|Personal")
 
 	client := listedIMAPClient(t, addr, imaplib.WithFolderFilter(nil, []string{"Personal"}))
+	inboxIDs := syncMailboxMessages(t, client, "INBOX")
+	require.Len(inboxIDs, 1)
 	seedObservedIMAPMessages(t, st, src, client)
-	acknowledgeMailboxObservations(t, client, "INBOX")
 	require.NoError(saveIMAPFolderStates(
 		context.Background(), st, src, client, completedIMAPSyncSummary(t, st, src), 0))
 
@@ -537,16 +570,8 @@ func TestSaveIMAPFolderStates_ExcludedFolderRetainsStateAndLabels(t *testing.T) 
 	}, loaded, "the excluded mailbox's saved cursor must be untouched")
 	assert.Contains(queryScriptedRFC7162LabelsBySourceMessageID(t, st, src.ID), "Personal|1|Personal",
 		"the excluded mailbox's message must keep its label")
-
-	var inboxSourceMessageID string
-	for _, observation := range client.ObservedMemberships() {
-		if observation.Mailbox == "INBOX" {
-			inboxSourceMessageID = observation.SourceMessageID
-		}
-	}
-	require.NotEmpty(inboxSourceMessageID)
 	assert.Contains(queryScriptedRFC7162LabelsBySourceMessageID(t, st, src.ID),
-		inboxSourceMessageID+"|INBOX", "the scanned mailbox must still reconcile normally")
+		inboxIDs[0]+"|INBOX", "the scanned mailbox must still reconcile normally")
 }
 
 // TestSaveIMAPFolderStates_MovedMessageAcrossTwoScopedSyncsWithExclusion
@@ -570,6 +595,7 @@ func TestSaveIMAPFolderStates_MovedMessageAcrossTwoScopedSyncsWithExclusion(t *t
 
 	// Personal was reconciled by a run from before this test's exclusion
 	// window; nothing here should ever touch it again.
+	seedIMAPMessage(t, st, src, "Personal|1", "")
 	require.NoError(st.ApplyIMAPMailboxDeltas(src.ID, []store.IMAPMailboxDelta{{
 		Mailbox: "Personal",
 		State:   store.IMAPFolderState{Mailbox: "Personal", UIDValidity: 99, UIDNext: 2, HighestModSeq: 900},
@@ -580,19 +606,18 @@ func TestSaveIMAPFolderStates_MovedMessageAcrossTwoScopedSyncsWithExclusion(t *t
 
 	// First sync: the message lives in INBOX; Personal is excluded.
 	first := listedIMAPClient(t, addr, excludePersonal)
+	inboxIDs := syncMailboxMessages(t, first, "INBOX")
+	require.Len(inboxIDs, 1)
+	syncMailboxMessages(t, first, "Archive")
 	seedObservedIMAPMessages(t, st, src, first)
-	acknowledgeMailboxObservations(t, first, "INBOX")
-	acknowledgeMailboxObservations(t, first, "Archive")
 	require.NoError(saveIMAPFolderStates(
 		context.Background(), st, src, first, completedIMAPSyncSummary(t, st, src), 0))
 
-	var movedUID imapapi.UID
-	for _, observation := range first.ObservedMemberships() {
-		if observation.Mailbox == "INBOX" {
-			movedUID = imapapi.UID(observation.UID)
-		}
-	}
-	require.NotZero(movedUID)
+	inboxParts := strings.SplitN(inboxIDs[0], "|", 2)
+	require.Len(inboxParts, 2)
+	movedUIDNum, err := strconv.ParseUint(inboxParts[1], 10, 32)
+	require.NoError(err)
+	movedUID := imapapi.UID(movedUIDNum)
 	require.NoError(first.Close())
 	require.Contains(queryScriptedRFC7162LabelsBySourceMessageID(t, st, src.ID), "INBOX|1|INBOX")
 
@@ -604,8 +629,9 @@ func TestSaveIMAPFolderStates_MovedMessageAcrossTwoScopedSyncsWithExclusion(t *t
 	// (imapFolderStateOptions), and keep Personal excluded throughout.
 	opts := append(imapFolderStateOptions(st, src, false), excludePersonal)
 	second := listedIMAPClient(t, addr, opts...)
-	acknowledgeMailboxObservations(t, second, "INBOX")
-	acknowledgeMailboxObservations(t, second, "Archive")
+	syncMailboxMessages(t, second, "INBOX")
+	syncMailboxMessages(t, second, "Archive")
+	seedObservedIMAPMessages(t, st, src, second)
 	require.NoError(saveIMAPFolderStates(
 		context.Background(), st, src, second, completedIMAPSyncSummary(t, st, src), 0))
 
@@ -658,8 +684,9 @@ func TestSaveIMAPFolderStates_BootstrapWithEmptyMembershipTables(t *testing.T) {
 		"reproduces production: labels exist but imap_message_memberships is empty")
 
 	client := listedIMAPClient(t, addr, imaplib.WithFolderFilter(nil, []string{"Other"}))
-	acknowledgeMailboxObservations(t, client, "INBOX")
-	acknowledgeMailboxObservations(t, client, "Archive")
+	syncMailboxMessages(t, client, "INBOX")
+	archiveIDs := syncMailboxMessages(t, client, "Archive")
+	require.Len(archiveIDs, 1)
 	require.NoError(saveIMAPFolderStates(
 		context.Background(), st, src, client, completedIMAPSyncSummary(t, st, src), 0))
 
