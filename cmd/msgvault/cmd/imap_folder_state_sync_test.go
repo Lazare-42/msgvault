@@ -626,12 +626,17 @@ func TestSaveIMAPFolderStates_MovedMessageAcrossTwoScopedSyncsWithExclusion(t *t
 	testutil.ExpungeIMAPMessage(t, addr, "INBOX", movedUID)
 
 	// Second sync: reload saved identity state exactly as production does
-	// (imapFolderStateOptions), and keep Personal excluded throughout.
+	// (imapFolderStateOptions), and keep Personal excluded throughout. The
+	// moved message already exists in the store from the first sync and
+	// resolves via its RFC822 Message-ID (see applyIMAPMailboxDeltasScoped's
+	// resolver) -- no seeding needed, and re-seeding it here under its new
+	// "Archive|1" source ID would just create ambiguity for UpsertMessage's
+	// own identity matching, unrelated to the scoped-apply path this test
+	// means to exercise.
 	opts := append(imapFolderStateOptions(st, src, false), excludePersonal)
 	second := listedIMAPClient(t, addr, opts...)
 	syncMailboxMessages(t, second, "INBOX")
 	syncMailboxMessages(t, second, "Archive")
-	seedObservedIMAPMessages(t, st, src, second)
 	require.NoError(saveIMAPFolderStates(
 		context.Background(), st, src, second, completedIMAPSyncSummary(t, st, src), 0))
 
@@ -660,7 +665,7 @@ func TestSaveIMAPFolderStates_BootstrapWithEmptyMembershipTables(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	addr, user := testutil.StartIMAPMemServer(
-		t, map[string]int{"INBOX": 0, "Archive": 1, "Other": 0})
+		t, map[string]int{"INBOX": 0, "Archive": 0, "Other": 0})
 	const rfc822ID = "legacy-bootstrap@example.com"
 	testutil.AppendIMAPMessageWithMessageID(t, user, "Archive", rfc822ID)
 	st := testutil.NewTestStore(t)
