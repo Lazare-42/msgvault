@@ -936,10 +936,29 @@ func TestGmailAllMailStatusFailureSuppressesIncrementalPublication(t *testing.T)
 	client := newTestClient(t, addr)
 
 	require.Equal([]string{"[Gmail]/All Mail|1"}, listAllMessages(t, client))
-	assert.False(client.LabelsSnapshotComplete())
-	assert.Nil(client.ObservedFolderStates())
-	assert.Nil(client.ObservedMailboxDeltas(),
-		"a missing STATUS must not expose a zero-valued mailbox cursor")
+	assert.False(client.LabelsSnapshotComplete(),
+		"a missing STATUS anywhere in the account forfeits the whole-account authoritative designation")
+	// INBOX's own observedFolderStates entry, and every non-\All mailbox's
+	// synthetic delta, are only ever built by the same rebuild step that
+	// requires a complete STATUS pass (see buildMessageListCache's
+	// allMailFolder rebuild block) — so a STATUS failure here still leaves
+	// ObservedFolderStates with no eligible mailbox to scope a commit
+	// around, even though it is no longer forced to nil.
+	assert.Empty(client.ObservedFolderStates())
+	// [Gmail]/All Mail's own STATUS and enumeration succeeded independently
+	// of INBOX's failure, so its delta survives for a caller doing scoped,
+	// per-mailbox reconciliation — it is simply never authoritative for the
+	// whole account (LabelsSnapshotComplete is false), and with
+	// ObservedFolderStates empty above, nothing here is actually eligible to
+	// commit through the scoped path either.
+	deltas := client.ObservedMailboxDeltas()
+	require.Len(deltas, 1)
+	assert.Equal("[Gmail]/All Mail", deltas[0].Mailbox)
+	assert.True(deltas[0].Reset)
+	assert.Equal([]imapv2.UID{1}, deltas[0].ChangedUIDs)
+	assert.Equal(uint32(2), deltas[0].State.UIDValidity)
+	assert.Equal(uint32(2), deltas[0].State.UIDNext)
+	assert.Equal([]uint32{1}, deltas[0].State.KnownUIDs)
 }
 
 func TestClientRebuildsCompleteSnapshotWithoutAllMailboxOrModSeq(t *testing.T) {

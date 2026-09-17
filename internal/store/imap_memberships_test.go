@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"sort"
@@ -805,4 +806,271 @@ func TestApplyIMAPMailboxDeltas_ConflictingDeltaIdentityRollsBackEverything(t *t
 			assert.False(messageTombstoned(t, f.store, messageID))
 		})
 	}
+}
+
+// legacyLabelOnlyMessage attaches an IMAP-mailbox label to a message with no
+// backing imap_message_memberships row, reproducing state from before
+// membership tracking existed (or a mailbox a scoped run has never covered).
+func legacyLabelOnlyMessage(
+	t *testing.T, st *store.Store, sourceID, messageID int64, mailbox string,
+) {
+	t.Helper()
+	_, err := st.DB().Exec(st.Rebind(`
+		INSERT INTO labels (source_id, source_label_id, name, label_type)
+		VALUES (?, ?, ?, 'user')
+	`), sourceID, mailbox, mailbox)
+	require.NoError(t, err)
+	var labelID int64
+	require.NoError(t, st.DB().QueryRow(st.Rebind(`
+		SELECT id FROM labels WHERE source_id = ? AND source_label_id = ?
+	`), sourceID, mailbox).Scan(&labelID))
+	_, err = st.DB().Exec(st.Rebind(`
+		INSERT INTO message_labels (message_id, label_id) VALUES (?, ?)
+	`), messageID, labelID)
+	require.NoError(t, err)
+}
+
+func TestApplyIMAPMailboxDeltasScoped_PersistsOnlyScopedMailboxAndPreservesTheRest(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newIMAPMembershipFixture(t)
+	archivedID := f.createMessage(t, "Archive|1", "<untouched@example.com>")
+	require.NoError(f.store.ApplyIMAPMailboxDeltas(f.source.ID, []store.IMAPMailboxDelta{{
+		Mailbox: "Archive",
+		State:   store.IMAPFolderState{Mailbox: "Archive", UIDValidity: 2, UIDNext: 2, HighestModSeq: 20},
+		Memberships: []store.IMAPMembershipObservation{{
+			Mailbox: "Archive", UIDValidity: 2, UID: 1, SourceMessageID: "Archive|1",
+		}},
+	}}))
+
+	inboxID := f.createMessage(t, "INBOX|1", "<scoped@example.com>")
+	require.NoError(f.store.ApplyIMAPMailboxDeltasScoped(f.source.ID, []store.IMAPMailboxDelta{{
+		Mailbox: "INBOX",
+		State:   store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 1, UIDNext: 2, HighestModSeq: 10},
+		Memberships: []store.IMAPMembershipObservation{{
+			Mailbox: "INBOX", UIDValidity: 1, UID: 1, SourceMessageID: "INBOX|1",
+		}},
+	}}))
+
+	assert.Equal([]string{"INBOX"}, messageLabels(t, f.store, inboxID))
+	assert.False(messageTombstoned(t, f.store, inboxID))
+	assert.Equal([]string{"Archive"}, messageLabels(t, f.store, archivedID),
+		"a mailbox absent from the scoped delta must keep its labels exactly as the earlier run left them")
+	assert.False(messageTombstoned(t, f.store, archivedID))
+	states, err := f.store.GetIMAPFolderStates(f.source.ID)
+	require.NoError(err)
+	sort.Slice(states, func(i, j int) bool { return states[i].Mailbox < states[j].Mailbox })
+	assert.Equal([]store.IMAPFolderState{
+		{Mailbox: "Archive", UIDValidity: 2, UIDNext: 2, HighestModSeq: 20},
+		{Mailbox: "INBOX", UIDValidity: 1, UIDNext: 2, HighestModSeq: 10},
+	}, states)
+}
+
+func TestApplyIMAPMailboxDeltasScoped_NeverRetiresMailboxAbsentFromScope(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newIMAPMembershipFixture(t)
+	require.NoError(f.store.ApplyIMAPMailboxDeltas(f.source.ID, []store.IMAPMailboxDelta{{
+		Mailbox: "Personal",
+		State:   store.IMAPFolderState{Mailbox: "Personal", UIDValidity: 9, UIDNext: 5, HighestModSeq: 90},
+	}}))
+
+	require.NoError(f.store.ApplyIMAPMailboxDeltasScoped(f.source.ID, []store.IMAPMailboxDelta{{
+		Mailbox: "INBOX",
+		State:   store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 1, UIDNext: 1, HighestModSeq: 10},
+	}}))
+
+	states, err := f.store.GetIMAPFolderStates(f.source.ID)
+	require.NoError(err)
+	sort.Slice(states, func(i, j int) bool { return states[i].Mailbox < states[j].Mailbox })
+	assert.Equal([]store.IMAPFolderState{
+		{Mailbox: "INBOX", UIDValidity: 1, UIDNext: 1, HighestModSeq: 10},
+		{Mailbox: "Personal", UIDValidity: 9, UIDNext: 5, HighestModSeq: 90},
+	}, states, "a mailbox excluded from this run's scope must never be retired")
+}
+
+func TestApplyIMAPMailboxDeltasScoped_NeverTombstonesOnZeroScopedMembership(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newIMAPMembershipFixture(t)
+	messageID := f.createMessage(t, "INBOX|1", "<vanished@example.com>")
+	require.NoError(f.store.ApplyIMAPMailboxDeltasScoped(f.source.ID, []store.IMAPMailboxDelta{{
+		Mailbox: "INBOX",
+		State:   store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 1, UIDNext: 2, HighestModSeq: 10},
+		Memberships: []store.IMAPMembershipObservation{{
+			Mailbox: "INBOX", UIDValidity: 1, UID: 1, SourceMessageID: "INBOX|1",
+		}},
+	}}))
+	require.Equal([]string{"INBOX"}, messageLabels(t, f.store, messageID))
+
+	require.NoError(f.store.ApplyIMAPMailboxDeltasScoped(f.source.ID, []store.IMAPMailboxDelta{{
+		Mailbox:      "INBOX",
+		State:        store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 1, UIDNext: 2, HighestModSeq: 11},
+		VanishedUIDs: []uint32{1},
+	}}))
+
+	assert.Empty(messageLabels(t, f.store, messageID),
+		"a message that left the only mailbox this run scanned loses that mailbox's label")
+	assert.False(messageTombstoned(t, f.store, messageID),
+		"partial coverage must never justify tombstoning: the message may simply live in a mailbox this run never looked at")
+}
+
+func TestApplyIMAPMailboxDeltasScoped_PreservesLegacyLabelOutsideScope(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newIMAPMembershipFixture(t)
+	messageID := f.createMessage(t, "INBOX|1", "<dual-homed@example.com>")
+	legacyLabelOnlyMessage(t, f.store, f.source.ID, messageID, "Personal")
+	require.NoError(f.store.ApplyIMAPMailboxDeltasScoped(f.source.ID, []store.IMAPMailboxDelta{{
+		Mailbox: "INBOX",
+		State:   store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 1, UIDNext: 2, HighestModSeq: 10},
+		Memberships: []store.IMAPMembershipObservation{{
+			Mailbox: "INBOX", UIDValidity: 1, UID: 1, SourceMessageID: "INBOX|1",
+		}},
+	}}))
+	require.ElementsMatch([]string{"INBOX", "Personal"}, messageLabels(t, f.store, messageID))
+
+	require.NoError(f.store.ApplyIMAPMailboxDeltasScoped(f.source.ID, []store.IMAPMailboxDelta{{
+		Mailbox:      "INBOX",
+		State:        store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 1, UIDNext: 2, HighestModSeq: 11},
+		VanishedUIDs: []uint32{1},
+	}}))
+
+	assert.Equal([]string{"Personal"}, messageLabels(t, f.store, messageID),
+		"a legacy label from a mailbox outside this run's scope must survive untouched")
+	assert.False(messageTombstoned(t, f.store, messageID))
+}
+
+func TestApplyIMAPMailboxDeltasScoped_BootstrapReconcilesLegacyLabelForResetMailbox(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newIMAPMembershipFixture(t)
+	staleID := f.createMessage(t, "stale-legacy", "<stale-legacy@example.com>")
+	legacyLabelOnlyMessage(t, f.store, f.source.ID, staleID, "INBOX")
+	require.Zero(membershipCount(t, f.store, f.source.ID),
+		"reproduces production: labels exist but imap_message_memberships is empty")
+
+	// A full re-enumeration of INBOX (Reset) that no longer lists this
+	// message reconciles the stale legacy label even though no membership
+	// row ever existed for it — the scoped equivalent of the whole-account
+	// bootstrap, restricted to the one mailbox actually scanned.
+	require.NoError(f.store.ApplyIMAPMailboxDeltasScoped(f.source.ID, []store.IMAPMailboxDelta{{
+		Mailbox: "INBOX",
+		State:   store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 1, UIDNext: 1, HighestModSeq: 10},
+		Reset:   true,
+	}}))
+
+	assert.Empty(messageLabels(t, f.store, staleID))
+	assert.False(messageTombstoned(t, f.store, staleID),
+		"bootstrap reconciliation must not tombstone — the message may live in a mailbox never scanned")
+}
+
+func TestApplyIMAPMailboxDeltasScoped_UIDValidityChangeResetsOnlyThatMailbox(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newIMAPMembershipFixture(t)
+	otherID := f.createMessage(t, "Archive|1", "<other-mailbox@example.com>")
+	require.NoError(f.store.ApplyIMAPMailboxDeltas(f.source.ID, []store.IMAPMailboxDelta{{
+		Mailbox: "Archive",
+		State:   store.IMAPFolderState{Mailbox: "Archive", UIDValidity: 2, UIDNext: 2, HighestModSeq: 20},
+		Memberships: []store.IMAPMembershipObservation{{
+			Mailbox: "Archive", UIDValidity: 2, UID: 1, SourceMessageID: "Archive|1",
+		}},
+	}}))
+	removedID := f.createMessage(t, "old-epoch-only", "<old-epoch@example.com>")
+	survivingID := f.createMessage(t, "old-and-new-epoch", "<old-and-new-epoch@example.com>")
+	require.NoError(f.store.ApplyIMAPMailboxDeltasScoped(f.source.ID, []store.IMAPMailboxDelta{{
+		Mailbox: "INBOX",
+		State:   store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 10, UIDNext: 3, HighestModSeq: 100},
+		Memberships: []store.IMAPMembershipObservation{
+			{Mailbox: "INBOX", UIDValidity: 10, UID: 1, SourceMessageID: "old-epoch-only"},
+			{Mailbox: "INBOX", UIDValidity: 10, UID: 2, SourceMessageID: "old-and-new-epoch"},
+		},
+	}}))
+
+	require.NoError(f.store.ApplyIMAPMailboxDeltasScoped(f.source.ID, []store.IMAPMailboxDelta{{
+		Mailbox: "INBOX",
+		State:   store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 20, UIDNext: 10, HighestModSeq: 200},
+		Reset:   true,
+		Memberships: []store.IMAPMembershipObservation{{
+			Mailbox: "INBOX", UIDValidity: 20, UID: 9, SourceMessageID: "old-and-new-epoch",
+		}},
+	}}))
+
+	known, err := f.store.GetIMAPKnownUIDs(f.source.ID)
+	require.NoError(err)
+	assert.Equal(map[string][]uint32{"Archive": {1}, "INBOX": {9}}, known)
+	assert.Empty(messageLabels(t, f.store, removedID))
+	assert.False(messageTombstoned(t, f.store, removedID))
+	assert.Equal([]string{"INBOX"}, messageLabels(t, f.store, survivingID))
+	assert.Equal([]string{"Archive"}, messageLabels(t, f.store, otherID),
+		"an unrelated mailbox's UIDVALIDITY epoch must be unaffected by another mailbox's reset")
+	assert.False(messageTombstoned(t, f.store, otherID))
+}
+
+func TestApplyIMAPMailboxDeltasScoped_EmptyOrNilDeltasIsANoOp(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newIMAPMembershipFixture(t)
+	messageID := f.createMessage(t, "INBOX|1", "<preserved@example.com>")
+	require.NoError(f.store.ApplyIMAPMailboxDeltasScoped(f.source.ID, []store.IMAPMailboxDelta{{
+		Mailbox: "INBOX",
+		State:   store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 1, UIDNext: 2, HighestModSeq: 10},
+		Memberships: []store.IMAPMembershipObservation{{
+			Mailbox: "INBOX", UIDValidity: 1, UID: 1, SourceMessageID: "INBOX|1",
+		}},
+	}}))
+
+	// Unlike ApplyIMAPMailboxDeltas — where nil is rejected and an empty
+	// slice retires every saved mailbox — a scoped apply treats "nothing
+	// verified this run" as a plain no-op: there is no whole-account claim
+	// being made that an empty or nil delta set could contradict.
+	require.NoError(f.store.ApplyIMAPMailboxDeltasScoped(f.source.ID, nil))
+	require.NoError(f.store.ApplyIMAPMailboxDeltasScoped(f.source.ID, []store.IMAPMailboxDelta{}))
+
+	assert.Equal([]string{"INBOX"}, messageLabels(t, f.store, messageID))
+	assert.False(messageTombstoned(t, f.store, messageID))
+	states, err := f.store.GetIMAPFolderStates(f.source.ID)
+	require.NoError(err)
+	assert.Equal([]store.IMAPFolderState{
+		{Mailbox: "INBOX", UIDValidity: 1, UIDNext: 2, HighestModSeq: 10},
+	}, states)
+}
+
+func TestApplyIMAPMailboxDeltasScoped_SupersededGenerationRejectedWithoutChangingSavedState(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newIMAPMembershipFixture(t)
+	require.NoError(f.store.ApplyIMAPMailboxDeltas(f.source.ID, []store.IMAPMailboxDelta{{
+		Mailbox: "INBOX",
+		State:   store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 1, UIDNext: 1, HighestModSeq: 5},
+	}}))
+	oldRunID, err := f.store.StartSync(f.source.ID, "full")
+	require.NoError(err)
+	require.NoError(f.store.CompleteSync(oldRunID, "0"))
+	newRunID, err := f.store.StartSync(f.source.ID, "full")
+	require.NoError(err)
+
+	err = f.store.ApplyIMAPMailboxDeltasScopedForSyncContext(
+		context.Background(), f.source.ID, oldRunID, []store.IMAPMailboxDelta{{
+			Mailbox: "INBOX",
+			State:   store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 1, UIDNext: 9, HighestModSeq: 90},
+		}})
+	require.ErrorIs(err, store.ErrSyncRunSuperseded)
+
+	states, statesErr := f.store.GetIMAPFolderStates(f.source.ID)
+	require.NoError(statesErr)
+	assert.Equal([]store.IMAPFolderState{
+		{Mailbox: "INBOX", UIDValidity: 1, UIDNext: 1, HighestModSeq: 5},
+	}, states)
+	active, activeErr := f.store.GetActiveSync(f.source.ID)
+	require.NoError(activeErr)
+	assert.Equal(newRunID, active.ID)
+
+	err = f.store.ApplyIMAPMailboxDeltasScopedForSyncContext(
+		context.Background(), f.source.ID, 0, []store.IMAPMailboxDelta{{
+			Mailbox: "INBOX",
+			State:   store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 1, UIDNext: 1, HighestModSeq: 5},
+		}})
+	require.ErrorContains(err, "invalid sync generation")
 }

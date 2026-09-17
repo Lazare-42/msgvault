@@ -1471,7 +1471,7 @@ func TestIMAPQresyncEndToEndGmailAllStatusFailureSuppressesPublication(t *testin
 	assertions.Empty(server.commandsFor(3), "an ineligible QRESYNC baseline issues no command, so nothing needs discarding")
 }
 
-func TestIMAPQresyncEndToEndNoAllEmptyStatusFailureSuppressesPublication(t *testing.T) {
+func TestIMAPQresyncEndToEndNoAllStatusFailureScopesToHealthyMailbox(t *testing.T) {
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	baseline := scriptedRFC7162Snapshot{
@@ -1499,13 +1499,22 @@ func TestIMAPQresyncEndToEndNoAllEmptyStatusFailureSuppressesPublication(t *test
 	second, _ := requireScriptedRFC7162Sync(t, st, identifier, addr)
 	requirements.NoError(second.Close())
 
+	// A failed STATUS on Archive forfeits the whole-account authoritative
+	// commit (no CHANGEDSINCE / QRESYNC republish), but INBOX's own STATUS
+	// and enumeration succeeded independently, so it still reconciles
+	// through the scoped path instead of being discarded along with
+	// Archive.
 	states, err := st.GetIMAPFolderStates(source.ID)
 	requirements.NoError(err)
 	requirements.Len(states, 2)
+	byMailbox := make(map[string]store.IMAPFolderState, len(states))
 	for _, state := range states {
-		assertions.Equal(uint64(1), state.HighestModSeq,
-			"one failed STATUS must suppress the entire authoritative snapshot")
+		byMailbox[state.Mailbox] = state
 	}
+	assertions.Equal(uint64(2), byMailbox["INBOX"].HighestModSeq,
+		"the healthy mailbox must still reconcile despite Archive's STATUS failure")
+	assertions.Equal(uint64(1), byMailbox["Archive"].HighestModSeq,
+		"the mailbox whose STATUS failed must not advance")
 	assertions.NotContains(server.commandsFor(2), "CHANGEDSINCE")
 	assertions.Contains(server.commandsFor(2), `SELECT "ARCHIVE"`)
 	assertions.Empty(server.commandsFor(3), "an ineligible QRESYNC baseline issues no command, so nothing needs discarding")

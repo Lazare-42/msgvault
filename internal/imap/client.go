@@ -167,6 +167,16 @@ func NewClient(cfg *Config, password string, opts ...Option) *Client {
 // memberships are published intact, and the post-sync mailbox-delta transaction
 // is what reconciles labels. Syncer guarantees the pairing by forcing full
 // enumeration on any client that reconciles labels immediately instead.
+//
+// False does not mean nothing is safe to persist: ObservedFolderStates and
+// ObservedMailboxDeltas still carry an entry for every individual mailbox
+// whose own enumeration, STATUS, and message acknowledgement succeeded this
+// session, even when other mailboxes were excluded, failed, or left
+// unacknowledged work behind. Only a whole-account authoritative apply
+// (retiring mailboxes absent from the topology, tombstoning messages with no
+// remaining membership) requires this to be true; a caller can still commit
+// those individually-verified mailboxes through a scoped, non-destructive
+// reconciliation.
 func (c *Client) LabelsSnapshotComplete() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1189,10 +1199,19 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 	statusesComplete := folderStatusesCoverMailboxes(allMailboxes, folderStatuses)
 	authoritativeSnapshot := trackFolders && !c.labelsSnapshotFilteredLocked()
 	if authoritativeSnapshot && (!statusesComplete || !labelMapComplete || !enumerationComplete) {
+		// A STATUS, label-map, or enumeration failure anywhere in the account
+		// means this run cannot claim whole-account authoritative coverage, so
+		// it must not drive the destructive whole-topology apply (which
+		// retires every mailbox absent from the delta set and can tombstone
+		// messages). It does NOT mean every mailbox this loop observed
+		// cleanly is untrustworthy: each mailbox's own entry in
+		// observedFolderStates/observedMailboxDeltas was populated only when
+		// that mailbox's own STATUS and enumeration succeeded, independent of
+		// any other mailbox's failure. Only revoke the "authoritative"
+		// designation here; leave the per-mailbox data intact so the caller
+		// can reconcile the mailboxes that did succeed through the scoped,
+		// non-destructive path instead of discarding all of them.
 		labelMapComplete = false
-		c.observedFolderStates = nil
-		c.observedMailboxDeltas = nil
-		c.clearFolderAcknowledgements()
 	} else if authoritativeSnapshot && c.allMailFolder != "" {
 		if labelMapComplete && enumerationComplete {
 			deltaByMailbox := make(map[string]int, len(c.observedMailboxDeltas))
@@ -1225,15 +1244,15 @@ func (c *Client) buildMessageListCache(ctx context.Context) error {
 	}
 	if authoritativeSnapshot && c.observedMailboxDeltas != nil &&
 		!deltasCoverMailboxes(allMailboxes, c.observedMailboxDeltas) {
-		// Publishing a partial topology is destructive, not merely incomplete:
-		// the store retires every mailbox missing from the delta set, deleting
-		// its memberships and tombstoning the messages that lived only there.
-		c.logger.Warn("incomplete mailbox delta set, suppressing authoritative snapshot",
+		// Publishing this as a whole-account authoritative topology would be
+		// destructive: the full-replace apply retires every mailbox missing
+		// from the delta set, deleting its memberships and tombstoning the
+		// messages that lived only there. Revoke only the authoritative
+		// designation — the mailboxes that did get a delta stay available for
+		// scoped, per-mailbox reconciliation.
+		c.logger.Warn("incomplete mailbox delta set, whole-account topology not authoritative this run",
 			"mailboxes", len(allMailboxes), "deltas", len(c.observedMailboxDeltas))
 		labelMapComplete = false
-		c.observedFolderStates = nil
-		c.observedMailboxDeltas = nil
-		c.clearFolderAcknowledgements()
 	}
 	if unchangedFolders > 0 {
 		c.logger.Info("skipped unchanged mailboxes",
