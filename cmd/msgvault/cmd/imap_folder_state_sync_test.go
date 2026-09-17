@@ -88,7 +88,7 @@ func syncMailboxMessages(t *testing.T, client *imaplib.Client, mailbox string) [
 	require.NoError(t, err)
 	var ids []string
 	for _, m := range resp.Messages {
-		mb, _, parseErr := imaplib.SourceMailboxFromMessageID(m.ID)
+		mb, parseErr := imaplib.SourceMailboxFromMessageID(m.ID)
 		require.NoError(t, parseErr)
 		if mb == mailbox {
 			ids = append(ids, m.ID)
