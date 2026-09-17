@@ -650,8 +650,8 @@ func TestSaveIMAPFolderStates_MovedMessageAcrossTwoScopedSyncsWithExclusion(t *t
 
 	loaded, err := loadIMAPFolderStates(st, src.ID)
 	require.NoError(err)
-	assert.Equal(t, []uint32{}, loaded["INBOX"].KnownUIDs)
-	assert.Equal(t, []uint32{1}, loaded["Archive"].KnownUIDs)
+	assert.Equal([]uint32{}, loaded["INBOX"].KnownUIDs)
+	assert.Equal([]uint32{1}, loaded["Archive"].KnownUIDs)
 }
 
 // TestSaveIMAPFolderStates_BootstrapWithEmptyMembershipTables covers
@@ -700,7 +700,7 @@ func TestSaveIMAPFolderStates_BootstrapWithEmptyMembershipTables(t *testing.T) {
 		"a full re-enumeration of INBOX must clear the stale legacy label even with no prior membership row")
 	assert.Contains(afterLabels, "legacy-inbox-1|Archive",
 		"the message resolves via RFC822 Message-ID to its current mailbox")
-	assert.Zero(t, imapTombstonedMessageCount(t, st, src.ID),
+	assert.Zero(imapTombstonedMessageCount(t, st, src.ID),
 		"bootstrap reconciliation must not tombstone")
 }
 
