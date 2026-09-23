@@ -513,6 +513,31 @@ func (t *WhatsmeowTransport) SendReaction(ctx context.Context, req TransportSend
 	}, nil
 }
 
+// CreateGroup creates a WhatsApp group with the given name and participants.
+// WhatsApp implicitly adds the linked account itself — req.Participants
+// should list only the other members. There is no idempotency at this layer
+// (whatsmeow's CreateKey only dedupes the JOIN notification, not the create
+// call itself): calling this twice creates two groups, so callers that need
+// "create once, reuse after" must persist the returned JID themselves.
+func (t *WhatsmeowTransport) CreateGroup(ctx context.Context, req TransportCreateGroupRequest) (TransportCreateGroupResult, error) {
+	participants := make([]types.JID, 0, len(req.Participants))
+	for _, p := range req.Participants {
+		jid, err := ParseChatJID(p)
+		if err != nil {
+			return TransportCreateGroupResult{}, fmt.Errorf("participant %q: %w", p, err)
+		}
+		participants = append(participants, jid)
+	}
+	info, err := t.client.CreateGroup(ctx, whatsmeow.ReqCreateGroup{
+		Name:         req.Name,
+		Participants: participants,
+	})
+	if err != nil {
+		return TransportCreateGroupResult{}, err
+	}
+	return TransportCreateGroupResult{JID: info.JID.String(), Name: info.Name}, nil
+}
+
 // RequestHistorySync asks WhatsApp's own on-demand history-sync mechanism
 // (whatsmeow's Client.BuildHistorySyncRequest) for more messages older than
 // req.AnchorMessageID in one chat. The built protocol message is sent via

@@ -2958,6 +2958,44 @@ func (h *handlers) sendWhatsAppMessage(ctx context.Context, req toolRequest) (*t
 	return jsonResult(result)
 }
 
+func (h *handlers) createWhatsAppGroup(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+	client, account, err := h.getWhatsAppClient(ctx, args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	name, _ := args["name"].(string)
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return toolErrorResult("name parameter is required"), nil
+	}
+	rawParticipants, _ := args["participants"].([]any)
+	var participants []string
+	for _, p := range rawParticipants {
+		if s, ok := p.(string); ok {
+			if s = strings.TrimSpace(s); s != "" {
+				participants = append(participants, s)
+			}
+		}
+	}
+	if len(participants) == 0 {
+		return toolErrorResult("participants parameter is required"), nil
+	}
+	if err := requireWhatsAppReady(ctx, client); err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+
+	result, err := client.CreateGroup(ctx, whatsapplive.CreateGroupRequest{
+		Account:      account,
+		Name:         name,
+		Participants: participants,
+	})
+	if err != nil {
+		return toolErrorResult(fmt.Sprintf("create whatsapp group: %v", err)), nil
+	}
+	return jsonResult(result)
+}
+
 func (h *handlers) sendWhatsAppReaction(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 	client, account, err := h.getWhatsAppClient(ctx, args)
