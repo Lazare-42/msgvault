@@ -22,6 +22,7 @@ type mockTransport struct {
 	pairingState       QRPairingState
 	sendMessage        func(context.Context, TransportSendMessageRequest) (TransportSendResult, error)
 	sendReaction       func(context.Context, TransportSendReactionRequest) (TransportSendResult, error)
+	createGroup        func(context.Context, TransportCreateGroupRequest) (TransportCreateGroupResult, error)
 	requestHistorySync func(context.Context, TransportRequestHistorySyncRequest) error
 }
 
@@ -53,6 +54,12 @@ func (m *mockTransport) SendMessage(ctx context.Context, req TransportSendMessag
 }
 func (m *mockTransport) SendReaction(ctx context.Context, req TransportSendReactionRequest) (TransportSendResult, error) {
 	return m.sendReaction(ctx, req)
+}
+func (m *mockTransport) CreateGroup(ctx context.Context, req TransportCreateGroupRequest) (TransportCreateGroupResult, error) {
+	if m.createGroup != nil {
+		return m.createGroup(ctx, req)
+	}
+	return TransportCreateGroupResult{}, nil
 }
 
 // RequestHistorySync makes mockTransport satisfy the optional
@@ -86,6 +93,9 @@ func (m *minimalTransport) SendMessage(context.Context, TransportSendMessageRequ
 }
 func (m *minimalTransport) SendReaction(context.Context, TransportSendReactionRequest) (TransportSendResult, error) {
 	return TransportSendResult{}, nil
+}
+func (m *minimalTransport) CreateGroup(context.Context, TransportCreateGroupRequest) (TransportCreateGroupResult, error) {
+	return TransportCreateGroupResult{}, nil
 }
 
 func TestServiceSendMessageArchivesAndOutbox(t *testing.T) {

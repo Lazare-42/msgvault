@@ -137,6 +137,7 @@ const (
 	ToolWhatsAppLogout             = "whatsapp_logout"
 	ToolSendWhatsAppMessage        = "send_whatsapp_message"
 	ToolSendWhatsAppReaction       = "send_whatsapp_reaction"
+	ToolCreateWhatsAppGroup = "create_whatsapp_group"
 	ToolListGoogleDocs             = "list_google_docs"
 	ToolSearchGoogleDocs           = "search_google_docs"
 	ToolGetGoogleDoc               = "get_google_doc"
@@ -544,6 +545,7 @@ func WhatsAppToolNames() []string {
 		ToolWhatsAppLogout,
 		ToolSendWhatsAppMessage,
 		ToolSendWhatsAppReaction,
+		ToolCreateWhatsAppGroup,
 		ToolWhatsAppRequestHistorySync,
 		ToolListWhatsAppChats,
 		ToolListWhatsAppMessages,
@@ -1096,6 +1098,24 @@ func sendWhatsAppMessageTool() mcp.Tool {
 		),
 		mcp.WithString("local_request_id",
 			mcp.Description("Optional caller-provided idempotency/audit key"),
+		),
+	)
+}
+
+func createWhatsAppGroupTool() mcp.Tool {
+	return mcp.NewTool(ToolCreateWhatsAppGroup,
+		mcp.WithDescription("Create a new WhatsApp group through the linked live account and return its JID. Requires whatsapp_status ready=true. The linked account is added implicitly — list only the other members in participants. No dedup: calling this twice with the same participants creates two separate groups, so callers that need one group per recipient must remember the returned jid themselves."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithIdempotentHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(true),
+		withAccount(),
+		mcp.WithString("name",
+			mcp.Required(),
+			mcp.Description("Group name, max 25 characters (WhatsApp hard limit — longer names are rejected)."),
+		),
+		mcp.WithArray("participants",
+			mcp.Required(),
+			mcp.Description("Other group members: international phone numbers or full JID strings."),
+			mcp.Items(map[string]any{"type": "string"}),
 		),
 	)
 }

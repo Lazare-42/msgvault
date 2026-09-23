@@ -13,6 +13,7 @@ type Client interface {
 	SendMessage(ctx context.Context, req SendMessageRequest) (SendResult, error)
 	SendReaction(ctx context.Context, req SendReactionRequest) (SendResult, error)
 	RequestHistorySync(ctx context.Context, req RequestHistorySyncRequest) (RequestHistorySyncResult, error)
+	CreateGroup(ctx context.Context, req CreateGroupRequest) (CreateGroupResult, error)
 }
 
 // DefaultHistorySyncRequestCount is WhatsApp's own documented recommendation
@@ -72,6 +73,23 @@ type SendMessageRequest struct {
 type LogoutRequest struct {
 	Account    string
 	ForceLocal bool
+}
+
+// CreateGroupRequest creates a new WhatsApp group. WhatsApp implicitly adds
+// the linked account itself as a participant/owner — callers only list the
+// other members.
+type CreateGroupRequest struct {
+	Account string
+	// Name is limited to 25 characters by WhatsApp (longer names 406).
+	Name string
+	// Participants are phone numbers or full JID strings, same format as
+	// SendMessageRequest.ChatID.
+	Participants []string
+}
+
+type CreateGroupResult struct {
+	JID  string `json:"jid"`
+	Name string `json:"name"`
 }
 
 type LogoutResult struct {
@@ -179,6 +197,7 @@ type Transport interface {
 	Logout(ctx context.Context, req TransportLogoutRequest) (TransportLogoutResult, error)
 	SendMessage(ctx context.Context, req TransportSendMessageRequest) (TransportSendResult, error)
 	SendReaction(ctx context.Context, req TransportSendReactionRequest) (TransportSendResult, error)
+	CreateGroup(ctx context.Context, req TransportCreateGroupRequest) (TransportCreateGroupResult, error)
 }
 
 type TransportLogoutRequest struct {
@@ -210,6 +229,17 @@ type TransportSendResult struct {
 	RemoteMessageID string
 	ChatJID         string
 	Timestamp       time.Time
+}
+
+type TransportCreateGroupRequest struct {
+	Account      string
+	Name         string
+	Participants []string
+}
+
+type TransportCreateGroupResult struct {
+	JID  string
+	Name string
 }
 
 // TransportRequestHistorySyncRequest carries an already-resolved anchor

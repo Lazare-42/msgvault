@@ -374,6 +374,37 @@ func (s *Service) existingSendResult(
 	return result, nil
 }
 
+func (s *Service) CreateGroup(ctx context.Context, req CreateGroupRequest) (CreateGroupResult, error) {
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" {
+		return CreateGroupResult{}, errors.New("name is required")
+	}
+	if utf8.RuneCountInString(req.Name) > 25 {
+		return CreateGroupResult{}, fmt.Errorf("name %q exceeds WhatsApp's 25-character group name limit", req.Name)
+	}
+	if len(req.Participants) == 0 {
+		return CreateGroupResult{}, errors.New("participants is required")
+	}
+	if _, err := s.requireReady(ctx); err != nil {
+		return CreateGroupResult{}, err
+	}
+
+	source, err := s.sourceForAccount(ctx, req.Account)
+	if err != nil {
+		return CreateGroupResult{}, err
+	}
+
+	remote, err := s.transport.CreateGroup(ctx, TransportCreateGroupRequest{
+		Account:      source.Identifier,
+		Name:         req.Name,
+		Participants: req.Participants,
+	})
+	if err != nil {
+		return CreateGroupResult{}, err
+	}
+	return CreateGroupResult{JID: remote.JID, Name: remote.Name}, nil
+}
+
 func (s *Service) SendReaction(ctx context.Context, req SendReactionRequest) (SendResult, error) {
 	if req.MessageID == 0 {
 		return SendResult{}, errors.New("message_id is required")

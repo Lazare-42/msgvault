@@ -78,6 +78,7 @@ type mockWhatsAppClient struct {
 	logout             func(context.Context, whatsapplive.LogoutRequest) (whatsapplive.LogoutResult, error)
 	sendMessage        func(context.Context, whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error)
 	sendReaction       func(context.Context, whatsapplive.SendReactionRequest) (whatsapplive.SendResult, error)
+	createGroup        func(context.Context, whatsapplive.CreateGroupRequest) (whatsapplive.CreateGroupResult, error)
 	requestHistorySync func(context.Context, whatsapplive.RequestHistorySyncRequest) (whatsapplive.RequestHistorySyncResult, error)
 }
 
@@ -109,6 +110,12 @@ func (m *mockWhatsAppClient) SendReaction(ctx context.Context, req whatsapplive.
 }
 func (m *mockWhatsAppClient) RequestHistorySync(ctx context.Context, req whatsapplive.RequestHistorySyncRequest) (whatsapplive.RequestHistorySyncResult, error) {
 	return m.requestHistorySync(ctx, req)
+}
+func (m *mockWhatsAppClient) CreateGroup(ctx context.Context, req whatsapplive.CreateGroupRequest) (whatsapplive.CreateGroupResult, error) {
+	if m.createGroup != nil {
+		return m.createGroup(ctx, req)
+	}
+	return whatsapplive.CreateGroupResult{}, nil
 }
 
 type mockGoogleDocsClient struct {
