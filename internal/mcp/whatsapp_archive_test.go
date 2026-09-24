@@ -47,7 +47,7 @@ func TestToolAllowlistServesOnlyWhatsAppTools(t *testing.T) {
 	sort.Strings(want)
 	assert.Equal(want, listedToolNames(t, rawListTools(t, opts, true)))
 	assert.Equal(
-		[]string{ToolListWhatsAppChats, ToolListWhatsAppMessages, ToolWhatsAppLoginStatus, ToolWhatsAppStatus},
+		[]string{ToolGetWhatsAppGroupInfo, ToolListWhatsAppChats, ToolListWhatsAppMessages, ToolWhatsAppLoginStatus, ToolWhatsAppStatus},
 		listedToolNames(t, rawListTools(t, opts, false)),
 		"write tools stay gated by allowWrites inside the allowlist")
 
