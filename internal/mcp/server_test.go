@@ -71,14 +71,16 @@ func (f similarSearcherFunc) FindSimilar(ctx context.Context, req SimilarSearchR
 type toolHandler func(context.Context, toolRequest) (*toolResult, error)
 
 type mockWhatsAppClient struct {
-	status             whatsapplive.Status
-	loginState         whatsapplive.LoginState
-	startLogin         func(context.Context) (whatsapplive.LoginState, error)
-	logout             func(context.Context, whatsapplive.LogoutRequest) (whatsapplive.LogoutResult, error)
-	sendMessage        func(context.Context, whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error)
-	sendReaction       func(context.Context, whatsapplive.SendReactionRequest) (whatsapplive.SendResult, error)
-	createGroup        func(context.Context, whatsapplive.CreateGroupRequest) (whatsapplive.CreateGroupResult, error)
-	requestHistorySync func(context.Context, whatsapplive.RequestHistorySyncRequest) (whatsapplive.RequestHistorySyncResult, error)
+	status                  whatsapplive.Status
+	loginState              whatsapplive.LoginState
+	startLogin              func(context.Context) (whatsapplive.LoginState, error)
+	logout                  func(context.Context, whatsapplive.LogoutRequest) (whatsapplive.LogoutResult, error)
+	sendMessage             func(context.Context, whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error)
+	sendReaction            func(context.Context, whatsapplive.SendReactionRequest) (whatsapplive.SendResult, error)
+	createGroup             func(context.Context, whatsapplive.CreateGroupRequest) (whatsapplive.CreateGroupResult, error)
+	getGroupInfo            func(context.Context, whatsapplive.GetGroupInfoRequest) (whatsapplive.GroupInfoResult, error)
+	updateGroupParticipants func(context.Context, whatsapplive.UpdateGroupParticipantsRequest) (whatsapplive.GroupParticipantsResult, error)
+	requestHistorySync      func(context.Context, whatsapplive.RequestHistorySyncRequest) (whatsapplive.RequestHistorySyncResult, error)
 }
 
 func (m *mockWhatsAppClient) Status(context.Context) (whatsapplive.Status, error) {
@@ -115,6 +117,18 @@ func (m *mockWhatsAppClient) CreateGroup(ctx context.Context, req whatsapplive.C
 		return m.createGroup(ctx, req)
 	}
 	return whatsapplive.CreateGroupResult{}, nil
+}
+func (m *mockWhatsAppClient) GetGroupInfo(ctx context.Context, req whatsapplive.GetGroupInfoRequest) (whatsapplive.GroupInfoResult, error) {
+	if m.getGroupInfo != nil {
+		return m.getGroupInfo(ctx, req)
+	}
+	return whatsapplive.GroupInfoResult{}, nil
+}
+func (m *mockWhatsAppClient) UpdateGroupParticipants(ctx context.Context, req whatsapplive.UpdateGroupParticipantsRequest) (whatsapplive.GroupParticipantsResult, error) {
+	if m.updateGroupParticipants != nil {
+		return m.updateGroupParticipants(ctx, req)
+	}
+	return whatsapplive.GroupParticipantsResult{}, nil
 }
 
 type mockGoogleDocsClient struct {

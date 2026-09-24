@@ -51,57 +51,59 @@ type GoogleDocsClientFactory func(ctx context.Context) (googledocs.Client, error
 
 // Tool name constants.
 const (
-	ToolSearchMessages             = "search_messages"
-	ToolSearchMetadata             = "search_metadata"
-	ToolSearchMessageBodies        = "search_message_bodies"
-	ToolSemanticSearchMessages     = "semantic_search_messages"
-	ToolGetMessage                 = "get_message"
-	ToolGetAttachment              = "get_attachment"
-	ToolExportAttachment           = "export_attachment"
-	ToolListMessages               = "list_messages"
-	ToolGetStats                   = "get_stats"
-	ToolAggregate                  = "aggregate"
-	ToolStageDeletion              = "stage_deletion"
-	ToolSearchByDomains            = "search_by_domains"
-	ToolFindSimilarMessages        = "find_similar_messages"
-	ToolSearchInMessage            = "search_in_message"
-	ToolListDrafts                 = "list_drafts"
-	ToolGetDraft                   = "get_draft"
-	ToolCreateDraft                = "create_draft"
-	ToolUpdateDraft                = "update_draft"
-	ToolDeleteDraft                = "delete_draft"
-	ToolSendDraft                  = "send_draft"
-	ToolModifyLabels               = "modify_labels"
-	ToolCreateLabel                = "create_label"
-	ToolDeleteLabel                = "delete_label"
-	ToolListGmailLabels            = "list_gmail_labels"
-	ToolWhatsAppStatus             = "whatsapp_status"
-	ToolWhatsAppStartLogin         = "whatsapp_start_login"
-	ToolWhatsAppLoginStatus        = "whatsapp_login_status"
-	ToolWhatsAppLogout             = "whatsapp_logout"
-	ToolSendWhatsAppMessage        = "send_whatsapp_message"
-	ToolSendWhatsAppReaction       = "send_whatsapp_reaction"
-	ToolCreateWhatsAppGroup        = "create_whatsapp_group"
-	ToolWhatsAppRequestHistorySync = "whatsapp_request_history_sync"
-	ToolListWhatsAppChats          = "list_whatsapp_chats"
-	ToolListWhatsAppMessages       = "list_whatsapp_messages"
-	ToolListGoogleDocs             = "list_google_docs"
-	ToolSearchGoogleDocs           = "search_google_docs"
-	ToolGetGoogleDoc               = "get_google_doc"
-	ToolAppendGoogleDocText        = "append_google_doc_text"
-	ToolReplaceGoogleDocText       = "replace_google_doc_text"
-	ToolSearchAttachmentText       = "search_attachment_text"
-	ToolGetAttachmentText          = "get_attachment_text"
-	ToolRequestAttachmentText      = "request_attachment_text"
-	ToolGetOCRStatus               = "get_ocr_status"
-	ToolSearchVisualAttachments    = "search_visual_attachments"
-	ToolSearchDocuments            = "search_document_attachments"
-	ToolSearchPersonFiles          = "search_person_files"
-	ToolSearchPeople               = "search_people"
-	ToolGetPersonNotes             = "get_person_notes"
-	ToolGetPersonRelationship      = "get_person_relationship"
-	ToolPromotePerson              = "promote_person"
-	ToolUpdatePersonNotes          = "update_person_notes"
+	ToolSearchMessages                  = "search_messages"
+	ToolSearchMetadata                  = "search_metadata"
+	ToolSearchMessageBodies             = "search_message_bodies"
+	ToolSemanticSearchMessages          = "semantic_search_messages"
+	ToolGetMessage                      = "get_message"
+	ToolGetAttachment                   = "get_attachment"
+	ToolExportAttachment                = "export_attachment"
+	ToolListMessages                    = "list_messages"
+	ToolGetStats                        = "get_stats"
+	ToolAggregate                       = "aggregate"
+	ToolStageDeletion                   = "stage_deletion"
+	ToolSearchByDomains                 = "search_by_domains"
+	ToolFindSimilarMessages             = "find_similar_messages"
+	ToolSearchInMessage                 = "search_in_message"
+	ToolListDrafts                      = "list_drafts"
+	ToolGetDraft                        = "get_draft"
+	ToolCreateDraft                     = "create_draft"
+	ToolUpdateDraft                     = "update_draft"
+	ToolDeleteDraft                     = "delete_draft"
+	ToolSendDraft                       = "send_draft"
+	ToolModifyLabels                    = "modify_labels"
+	ToolCreateLabel                     = "create_label"
+	ToolDeleteLabel                     = "delete_label"
+	ToolListGmailLabels                 = "list_gmail_labels"
+	ToolWhatsAppStatus                  = "whatsapp_status"
+	ToolWhatsAppStartLogin              = "whatsapp_start_login"
+	ToolWhatsAppLoginStatus             = "whatsapp_login_status"
+	ToolWhatsAppLogout                  = "whatsapp_logout"
+	ToolSendWhatsAppMessage             = "send_whatsapp_message"
+	ToolSendWhatsAppReaction            = "send_whatsapp_reaction"
+	ToolCreateWhatsAppGroup             = "create_whatsapp_group"
+	ToolGetWhatsAppGroupInfo            = "get_whatsapp_group_info"
+	ToolUpdateWhatsAppGroupParticipants = "update_whatsapp_group_participants"
+	ToolWhatsAppRequestHistorySync      = "whatsapp_request_history_sync"
+	ToolListWhatsAppChats               = "list_whatsapp_chats"
+	ToolListWhatsAppMessages            = "list_whatsapp_messages"
+	ToolListGoogleDocs                  = "list_google_docs"
+	ToolSearchGoogleDocs                = "search_google_docs"
+	ToolGetGoogleDoc                    = "get_google_doc"
+	ToolAppendGoogleDocText             = "append_google_doc_text"
+	ToolReplaceGoogleDocText            = "replace_google_doc_text"
+	ToolSearchAttachmentText            = "search_attachment_text"
+	ToolGetAttachmentText               = "get_attachment_text"
+	ToolRequestAttachmentText           = "request_attachment_text"
+	ToolGetOCRStatus                    = "get_ocr_status"
+	ToolSearchVisualAttachments         = "search_visual_attachments"
+	ToolSearchDocuments                 = "search_document_attachments"
+	ToolSearchPersonFiles               = "search_person_files"
+	ToolSearchPeople                    = "search_people"
+	ToolGetPersonNotes                  = "get_person_notes"
+	ToolGetPersonRelationship           = "get_person_relationship"
+	ToolPromotePerson                   = "promote_person"
+	ToolUpdatePersonNotes               = "update_person_notes"
 )
 
 // search_message_bodies/search_in_message mode values (wire format).
@@ -321,6 +323,8 @@ func WhatsAppToolNames() []string {
 		ToolSendWhatsAppMessage,
 		ToolSendWhatsAppReaction,
 		ToolCreateWhatsAppGroup,
+		ToolGetWhatsAppGroupInfo,
+		ToolUpdateWhatsAppGroupParticipants,
 		ToolWhatsAppRequestHistorySync,
 		ToolListWhatsAppChats,
 		ToolListWhatsAppMessages,
@@ -841,6 +845,41 @@ func createWhatsAppGroupTool() mcp.Tool {
 		mcp.WithArray("participants",
 			mcp.Required(),
 			mcp.Description("Other group members: international phone numbers or full JID strings."),
+			mcp.Items(map[string]any{"type": "string"}),
+		),
+	)
+}
+
+func getWhatsAppGroupInfoTool() mcp.Tool {
+	return mcp.NewTool(ToolGetWhatsAppGroupInfo,
+		mcp.WithDescription("Fetch a WhatsApp group's current member list from WhatsApp's servers. Requires whatsapp_status ready=true. Use this to check who is ACTUALLY in a group right now — create_whatsapp_group's own response only reflects add outcomes at creation time, and a participant with a nonzero error code there is not actually a member."),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(true), mcp.WithOpenWorldHintAnnotation(true),
+		withAccount(),
+		mcp.WithString("jid",
+			mcp.Required(),
+			mcp.Description("Group JID, e.g. \"120363428130382724@g.us\"."),
+		),
+	)
+}
+
+func updateWhatsAppGroupParticipantsTool() mcp.Tool {
+	return mcp.NewTool(ToolUpdateWhatsAppGroupParticipants,
+		mcp.WithDescription("Add, remove, promote, or demote members of an existing WhatsApp group. Requires whatsapp_status ready=true. Per-participant failures (e.g. their privacy settings blocked a direct add) show up as a nonzero error on that participant in the response, not as a tool-call error — check every participant's error field, don't just trust a successful call."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithIdempotentHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(true),
+		withAccount(),
+		mcp.WithString("jid",
+			mcp.Required(),
+			mcp.Description("Group JID, e.g. \"120363428130382724@g.us\"."),
+		),
+		mcp.WithString("action",
+			mcp.Required(),
+			mcp.Description("One of: add, remove, promote, demote."),
+		),
+		mcp.WithArray("participants",
+			mcp.Required(),
+			mcp.Description("Phone numbers or full JID strings to act on."),
 			mcp.Items(map[string]any{"type": "string"}),
 		),
 	)

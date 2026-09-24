@@ -14,6 +14,8 @@ type Client interface {
 	SendReaction(ctx context.Context, req SendReactionRequest) (SendResult, error)
 	RequestHistorySync(ctx context.Context, req RequestHistorySyncRequest) (RequestHistorySyncResult, error)
 	CreateGroup(ctx context.Context, req CreateGroupRequest) (CreateGroupResult, error)
+	GetGroupInfo(ctx context.Context, req GetGroupInfoRequest) (GroupInfoResult, error)
+	UpdateGroupParticipants(ctx context.Context, req UpdateGroupParticipantsRequest) (GroupParticipantsResult, error)
 }
 
 // DefaultHistorySyncRequestCount is WhatsApp's own documented recommendation
@@ -87,9 +89,48 @@ type CreateGroupRequest struct {
 	Participants []string
 }
 
+// GroupParticipantInfo reports one participant's state as returned by
+// WhatsApp. Error is nonzero when WhatsApp rejected adding this participant
+// (most commonly because their privacy settings only allow being added to
+// groups by existing contacts/conversations) — a nonzero Error means the
+// participant is NOT actually in the group despite the overall call
+// succeeding, so callers must check this per participant rather than
+// trusting a nil error from CreateGroup/UpdateGroupParticipants.
+type GroupParticipantInfo struct {
+	JID     string `json:"jid"`
+	IsAdmin bool   `json:"is_admin,omitempty"`
+	Error   int    `json:"error,omitempty"`
+}
+
 type CreateGroupResult struct {
 	JID  string `json:"jid"`
 	Name string `json:"name"`
+	// Participants reports the add outcome for every requested participant
+	// (see GroupParticipantInfo — check Error, not just this call's own err).
+	Participants []GroupParticipantInfo `json:"participants"`
+}
+
+type GetGroupInfoRequest struct {
+	Account string
+	JID     string
+}
+
+type GroupInfoResult struct {
+	JID          string                 `json:"jid"`
+	Name         string                 `json:"name"`
+	Participants []GroupParticipantInfo `json:"participants"`
+}
+
+type UpdateGroupParticipantsRequest struct {
+	Account      string
+	JID          string
+	Participants []string
+	// Action: "add", "remove", "promote", or "demote".
+	Action string
+}
+
+type GroupParticipantsResult struct {
+	Participants []GroupParticipantInfo `json:"participants"`
 }
 
 type LogoutResult struct {
@@ -198,6 +239,8 @@ type Transport interface {
 	SendMessage(ctx context.Context, req TransportSendMessageRequest) (TransportSendResult, error)
 	SendReaction(ctx context.Context, req TransportSendReactionRequest) (TransportSendResult, error)
 	CreateGroup(ctx context.Context, req TransportCreateGroupRequest) (TransportCreateGroupResult, error)
+	GetGroupInfo(ctx context.Context, req TransportGetGroupInfoRequest) (TransportGroupInfoResult, error)
+	UpdateGroupParticipants(ctx context.Context, req TransportUpdateGroupParticipantsRequest) (TransportGroupParticipantsResult, error)
 }
 
 type TransportLogoutRequest struct {
@@ -238,8 +281,31 @@ type TransportCreateGroupRequest struct {
 }
 
 type TransportCreateGroupResult struct {
-	JID  string
-	Name string
+	JID          string
+	Name         string
+	Participants []GroupParticipantInfo
+}
+
+type TransportGetGroupInfoRequest struct {
+	Account string
+	JID     string
+}
+
+type TransportGroupInfoResult struct {
+	JID          string
+	Name         string
+	Participants []GroupParticipantInfo
+}
+
+type TransportUpdateGroupParticipantsRequest struct {
+	Account      string
+	JID          string
+	Participants []string
+	Action       string
+}
+
+type TransportGroupParticipantsResult struct {
+	Participants []GroupParticipantInfo
 }
 
 // TransportRequestHistorySyncRequest carries an already-resolved anchor
