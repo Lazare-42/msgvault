@@ -402,7 +402,62 @@ func (s *Service) CreateGroup(ctx context.Context, req CreateGroupRequest) (Crea
 	if err != nil {
 		return CreateGroupResult{}, err
 	}
-	return CreateGroupResult{JID: remote.JID, Name: remote.Name}, nil
+	return CreateGroupResult{JID: remote.JID, Name: remote.Name, Participants: remote.Participants}, nil
+}
+
+func (s *Service) GetGroupInfo(ctx context.Context, req GetGroupInfoRequest) (GroupInfoResult, error) {
+	req.JID = strings.TrimSpace(req.JID)
+	if req.JID == "" {
+		return GroupInfoResult{}, errors.New("jid is required")
+	}
+	if _, err := s.requireReady(ctx); err != nil {
+		return GroupInfoResult{}, err
+	}
+	source, err := s.sourceForAccount(ctx, req.Account)
+	if err != nil {
+		return GroupInfoResult{}, err
+	}
+	remote, err := s.transport.GetGroupInfo(ctx, TransportGetGroupInfoRequest{
+		Account: source.Identifier,
+		JID:     req.JID,
+	})
+	if err != nil {
+		return GroupInfoResult{}, err
+	}
+	return GroupInfoResult{JID: remote.JID, Name: remote.Name, Participants: remote.Participants}, nil
+}
+
+func (s *Service) UpdateGroupParticipants(ctx context.Context, req UpdateGroupParticipantsRequest) (GroupParticipantsResult, error) {
+	req.JID = strings.TrimSpace(req.JID)
+	req.Action = strings.TrimSpace(req.Action)
+	if req.JID == "" {
+		return GroupParticipantsResult{}, errors.New("jid is required")
+	}
+	if len(req.Participants) == 0 {
+		return GroupParticipantsResult{}, errors.New("participants is required")
+	}
+	switch req.Action {
+	case "add", "remove", "promote", "demote":
+	default:
+		return GroupParticipantsResult{}, fmt.Errorf("action must be one of add/remove/promote/demote, got %q", req.Action)
+	}
+	if _, err := s.requireReady(ctx); err != nil {
+		return GroupParticipantsResult{}, err
+	}
+	source, err := s.sourceForAccount(ctx, req.Account)
+	if err != nil {
+		return GroupParticipantsResult{}, err
+	}
+	remote, err := s.transport.UpdateGroupParticipants(ctx, TransportUpdateGroupParticipantsRequest{
+		Account:      source.Identifier,
+		JID:          req.JID,
+		Participants: req.Participants,
+		Action:       req.Action,
+	})
+	if err != nil {
+		return GroupParticipantsResult{}, err
+	}
+	return GroupParticipantsResult{Participants: remote.Participants}, nil
 }
 
 func (s *Service) SendReaction(ctx context.Context, req SendReactionRequest) (SendResult, error) {
