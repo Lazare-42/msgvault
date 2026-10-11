@@ -173,6 +173,14 @@ func generatedDetailToAPIMessage(m *generated.MessageDetail) *store.APIMessage {
 		BodyHTML:        stringValue(m.BodyHTML),
 		Attachments:     apiAttachmentsFromGenerated(m.Attachments),
 	}
+	// The daemon sends body = text, falling back to HTML when there is no
+	// text part, plus body_html. Rebuild both so callers can tell them apart.
+	if m.BodyHTML != nil {
+		msg.BodyHTML = *m.BodyHTML
+	}
+	if m.Body != msg.BodyHTML {
+		msg.BodyText = m.Body
+	}
 	return msg
 }
 
