@@ -325,6 +325,19 @@ func WhatsAppToolNames() []string {
 	}
 }
 
+// ExternalWhatsAppToolNames returns the WhatsApp tools safe for a delegated
+// remote user. Session administration and history backfill remain available
+// only on the private bridge endpoint.
+func ExternalWhatsAppToolNames() []string {
+	return []string{
+		ToolWhatsAppStatus,
+		ToolSendWhatsAppMessage,
+		ToolSendWhatsAppReaction,
+		ToolListWhatsAppChats,
+		ToolListWhatsAppMessages,
+	}
+}
+
 // toolAllowlistSet returns nil for an empty allowlist, meaning every tool the
 // options enable is registered.
 func toolAllowlistSet(names []string) map[string]bool {
