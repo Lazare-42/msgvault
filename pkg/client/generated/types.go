@@ -7754,13 +7754,16 @@ type MessageDetail struct {
 	Labels            []string `json:"labels" validate:"required"`
 	MessageType       *string  `json:"message_type,omitzero"`
 	RelatedMessageID  *int64   `json:"related_message_id,omitempty"`
-	SentAt            string   `json:"sent_at" validate:"required"`
-	SizeBytes         int64    `json:"size_bytes"`
-	Snippet           string   `json:"snippet" validate:"required"`
-	SourceID          *int64   `json:"source_id,omitempty"`
-	SourceMessageID   *string  `json:"source_message_id,omitzero"`
-	Subject           string   `json:"subject" validate:"required"`
-	To                []string `json:"to" validate:"required"`
+
+	// Rfc822MessageID Original Message-ID header for In-Reply-To and References when composing a reply.
+	Rfc822MessageID *string  `json:"rfc822_message_id,omitzero"`
+	SentAt          string   `json:"sent_at" validate:"required"`
+	SizeBytes       int64    `json:"size_bytes"`
+	Snippet         string   `json:"snippet" validate:"required"`
+	SourceID        *int64   `json:"source_id,omitempty"`
+	SourceMessageID *string  `json:"source_message_id,omitzero"`
+	Subject         string   `json:"subject" validate:"required"`
+	To              []string `json:"to" validate:"required"`
 }
 
 func (m MessageDetail) Validate() error {

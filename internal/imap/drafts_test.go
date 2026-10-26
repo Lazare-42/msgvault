@@ -37,6 +37,7 @@ func TestClientCreateDraftAppendsToDrafts(t *testing.T) {
 		Subject:   "Synthetic IMAP draft",
 		Body:      "hello from draft",
 		InReplyTo: "<orig@example.com>",
+		ThreadID:  "INBOX|1",
 	}
 
 	draft, err := client.CreateDraft(context.Background(), compose)
@@ -59,6 +60,8 @@ func TestClientCreateDraftAppendsToDrafts(t *testing.T) {
 	assert.Contains(msg.Header.Get("To"), "alice@example.com")
 	assert.Contains(msg.Header.Get("Cc"), "bob@example.com")
 	assert.Equal("Synthetic IMAP draft", msg.Header.Get("Subject"))
+	assert.NotEmpty(msg.Header.Get("Message-ID"))
+	assert.NotEqual("<orig@example.com>", msg.Header.Get("Message-ID"))
 	assert.Equal("<orig@example.com>", msg.Header.Get("In-Reply-To"))
 	assert.Equal("<orig@example.com>", msg.Header.Get("References"))
 	assert.Contains(string(raw.Raw), "Content-Transfer-Encoding: base64")
@@ -355,4 +358,15 @@ func fetchMessageFlags(t *testing.T, client *Client, mailbox string, uid goimap.
 	})
 	require.NoError(t, err)
 	return flags
+}
+
+func TestClientCreateDraftRejectsThreadWithoutReplyHeader(t *testing.T) {
+	for _, header := range []string{"", " \t"} {
+		t.Run(fmt.Sprintf("header_%q", header), func(t *testing.T) {
+			client := &Client{}
+			draft, err := client.CreateDraft(t.Context(), &gmailapi.DraftCompose{ThreadID: "INBOX|1", InReplyTo: header})
+			require.ErrorContains(t, err, "IMAP replies require in_reply_to")
+			assert.Nil(t, draft)
+		})
+	}
 }

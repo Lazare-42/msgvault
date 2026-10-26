@@ -3614,6 +3614,12 @@ Find and merge duplicate messages within an account or collection.
 msgvault deduplicate [flags]
 ```
 
+The scan also plans recovery of missing RFC822 Message-IDs from stored MIME.
+Use `--dry-run --account <email>` to review the proposed work. Applying the
+confirmed plan fills recoverable IDs and merges any reported duplicates; it is
+not a backfill-only command. MIME without a Message-ID cannot supply one for an
+old message. This recovery does not rewrite mail on the source server.
+
 By default, each source is deduplicated independently. `--collection` is the explicit opt-in for cross-source deduplication.
 
 | Flag | Description |

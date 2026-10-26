@@ -53,6 +53,7 @@ type APIMessage struct {
 	ID                   int64
 	SourceID             int64
 	SourceMessageID      string
+	RFC822MessageID      string
 	ConversationID       int64
 	SourceConversationID string
 	Subject              string
@@ -223,6 +224,7 @@ func (s *Store) GetMessageContext(ctx context.Context, id int64) (*APIMessage, e
 			m.id,
 			m.source_id,
 			COALESCE(m.source_message_id, '') as source_message_id,
+			COALESCE(m.rfc822_message_id, '') as rfc822_message_id,
 			COALESCE(m.conversation_id, 0) as conversation_id,
 			COALESCE(c.source_conversation_id, '') as source_conversation_id,
 			COALESCE(c.title, ''),
@@ -259,6 +261,7 @@ func (s *Store) GetMessageContext(ctx context.Context, id int64) (*APIMessage, e
 		&m.ID,
 		&m.SourceID,
 		&m.SourceMessageID,
+		&m.RFC822MessageID,
 		&m.ConversationID,
 		&m.SourceConversationID,
 		&m.ConversationTitle,

@@ -327,6 +327,7 @@ type MessageSummary struct {
 
 // MessageDetail represents a full message response.
 type MessageDetail struct {
+	RFC822MessageID string `json:"rfc822_message_id,omitempty" doc:"Original Message-ID header for In-Reply-To and References when composing a reply."`
 	MessageSummary
 
 	RelatedMessageID  *int64 `json:"related_message_id,omitempty"`
@@ -560,6 +561,7 @@ func messageDetailFromQuery(qMsg *query.MessageDetail) MessageDetail {
 	}
 
 	return MessageDetail{
+		RFC822MessageID:   qMsg.RFC822MessageID,
 		RelatedMessageID:  qMsg.RelatedMessageID,
 		ConversationTitle: qMsg.ConversationTitle,
 
@@ -799,6 +801,7 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	detail := MessageDetail{
+		RFC822MessageID:   msg.RFC822MessageID,
 		RelatedMessageID:  msg.RelatedMessageID,
 		MessageSummary:    toMessageSummary(*msg),
 		ConversationTitle: msg.ConversationTitle,

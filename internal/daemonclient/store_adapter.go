@@ -152,6 +152,7 @@ func generatedDetailToAPIMessage(m *generated.MessageDetail) *store.APIMessage {
 		ID:              m.ID,
 		SourceID:        int64Value(m.SourceID),
 		SourceMessageID: stringValue(m.SourceMessageID),
+		RFC822MessageID: stringValue(m.Rfc822MessageID),
 		ConversationID:  int64Value(m.ConversationID),
 		Subject:         m.Subject,
 		MessageType:     stringValue(m.MessageType),
@@ -169,6 +170,7 @@ func generatedDetailToAPIMessage(m *generated.MessageDetail) *store.APIMessage {
 		HasAttachments:  m.HasAttachments,
 		SizeEstimate:    m.SizeBytes,
 		Body:            m.Body,
+		BodyHTML:        stringValue(m.BodyHTML),
 		Attachments:     apiAttachmentsFromGenerated(m.Attachments),
 	}
 	return msg
