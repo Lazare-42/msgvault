@@ -122,11 +122,13 @@ func TestHydrateAssetsForceFetchesRemoteAssetBranches(t *testing.T) {
 	scriptPath := installScript(t, localRepo, filepath.Join("docs", "assets", "hydrate-assets.sh"))
 	cmd := exec.Command("bash", scriptPath)
 	cmd.Dir = localRepo
+	cmd.Env = append(os.Environ(), "MSGVAULT_DOCS_ASSETS_REMOTE="+remoteRepo)
 	output, err := cmd.CombinedOutput()
 	require.NoError(err, string(output))
 
-	assert.Equal(newStaticCommit, gitOutput(t, localRepo, "rev-parse", "refs/remotes/origin/docs-assets"))
-	assert.Equal(generatedCommit, gitOutput(t, localRepo, "rev-parse", "refs/remotes/origin/docs-generated-assets"))
+	assert.Equal(oldStaticCommit, gitOutput(t, localRepo, "rev-parse", "refs/remotes/origin/docs-assets"))
+	assert.Equal(newStaticCommit, gitOutput(t, localRepo, "rev-parse", "refs/msgvault-docs-assets/docs-assets"))
+	assert.Equal(generatedCommit, gitOutput(t, localRepo, "rev-parse", "refs/msgvault-docs-assets/docs-generated-assets"))
 	assertRecursiveFileList(t, filepath.Join(docsAssetsDir, "static"), msgvaultStaticAssets)
 	assertRecursiveFileList(t, filepath.Join(docsAssetsDir, "generated"), msgvaultGeneratedAssets)
 	assertAssetFilesHaveContent(t, filepath.Join(docsAssetsDir, "static"), msgvaultStaticAssets, "new static")
