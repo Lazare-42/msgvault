@@ -2,7 +2,7 @@ module go.kenn.io/msgvault
 
 go 1.27.3
 
-replace github.com/emersion/go-imap/v2 => github.com/rodboev/go-imap/v2 v2.0.0-beta.8.0.20261004224420-eafa576a8efe
+replace github.com/emersion/go-imap/v2 => github.com/Lazare-42/go-imap/v2 v2.0.0-beta.8.0.20261026154532-2e64455e2e27
 
 require (
 	charm.land/bubbles/v2 v2.2.1
@@ -23,6 +23,7 @@ require (
 	github.com/emersion/go-message v0.18.2
 	github.com/emersion/go-sasl v0.0.0-20241020182733-b788ff22d5a6
 	github.com/emersion/go-smtp v0.24.0
+	github.com/go-playground/validator/v10 v10.30.5
 	github.com/gofrs/flock v0.13.1
 	github.com/gogs/chardet v0.0.0-20211120154057-b7413eaefb8f
 	github.com/google/go-cmp v0.7.0
@@ -117,7 +118,6 @@ require (
 	github.com/go-pdf/fpdf v0.9.0 // indirect
 	github.com/go-playground/locales v0.14.1 // indirect
 	github.com/go-playground/universal-translator v0.18.1 // indirect
-	github.com/go-playground/validator/v10 v10.30.5 // indirect
 	github.com/go-viper/mapstructure/v2 v2.5.0 // indirect
 	github.com/goccy/go-json v0.10.6 // indirect
 	github.com/godzie44/go-uring v0.0.0-20220926161041-69611e8b13d5 // indirect

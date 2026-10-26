@@ -533,15 +533,22 @@ Gmail and Google Calendar need a Google Cloud OAuth credential:
 	return hint
 }
 
+// errOAuthNotConfiguredSentinel identifies the "OAuth client secrets not
+// configured" failure so callers can distinguish it from other causes of a
+// token-source resolution failure (e.g. with errors.Is), without relying on
+// matching its user-facing text. Every error returned by
+// errOAuthNotConfigured wraps this sentinel.
+var errOAuthNotConfiguredSentinel = errors.New("OAuth client secrets not configured")
+
 // errOAuthNotConfigured returns a helpful error when OAuth client secrets are missing.
 // It also searches for client_secret*.json files in common locations.
 func errOAuthNotConfigured(cfg *config.Config) error {
 	// Check common locations for client_secret*.json
 	hint := tryFindClientSecrets(cfg)
 	if hint != "" {
-		return fmt.Errorf("OAuth client secrets not configured.%s", hint)
+		return fmt.Errorf("%w.%s", errOAuthNotConfiguredSentinel, hint)
 	}
-	return fmt.Errorf("OAuth client secrets not configured.%s", oauthSetupHint(cfg))
+	return fmt.Errorf("%w.%s", errOAuthNotConfiguredSentinel, oauthSetupHint(cfg))
 }
 
 // tryFindClientSecrets looks for client_secret*.json in common locations

@@ -4188,6 +4188,13 @@ func runScheduledSync(ctx context.Context, identifier string, s *store.Store, ge
 				"messages_added", summary.MessagesAdded,
 				"duration", time.Since(startTime),
 			)
+		} else if errors.Is(syncErr, errOAuthNotConfiguredSentinel) {
+			// No sources row AND no usable Gmail OAuth config: this identifier
+			// was never registered at all (most likely a failed add-o365-app /
+			// add-imap / add-account), not a case of a real Gmail-token-first
+			// account missing its client secrets. Say so, since the message
+			// above otherwise sends people looking for a missing secret.
+			syncErr = fmt.Errorf("%w (no source is registered for %s either — run add-o365-app, add-imap, or add-account first)", syncErr, identifier)
 		}
 		return errors.Join(syncErr, rebuildCacheAfterScheduledSourceRun(context.WithoutCancel(ctx), identifier))
 	}

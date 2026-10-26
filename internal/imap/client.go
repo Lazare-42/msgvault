@@ -638,10 +638,12 @@ func (c *Client) listMailboxesLocked() ([]string, error) {
 		return c.mailboxCache, nil
 	}
 
-	items, err := c.conn.List("", "*", c.listOptionsLocked()).Collect()
+	listCmd := c.conn.List("", "*", c.listOptionsLocked())
+	items, err := listCmd.Collect()
 	if err != nil {
 		return nil, fmt.Errorf("LIST: %w", err)
 	}
+	logSkippedMailboxNames(c.logger, listCmd.SkippedNames())
 
 	var names []string
 	for _, item := range items {
@@ -1820,11 +1822,13 @@ type MailboxInfo struct {
 
 // listMailboxesLockedFromConn returns all selectable mailbox names
 // for an already-connected IMAP client. It skips NoSelect mailboxes.
-func listMailboxesLockedFromConn(conn *imapclient.Client) ([]string, error) {
-	items, err := conn.List("", "*", nil).Collect()
+func listMailboxesLockedFromConn(logger *slog.Logger, conn *imapclient.Client) ([]string, error) {
+	listCmd := conn.List("", "*", nil)
+	items, err := listCmd.Collect()
 	if err != nil {
 		return nil, fmt.Errorf("LIST: %w", err)
 	}
+	logSkippedMailboxNames(logger, listCmd.SkippedNames())
 	var names []string
 	for _, item := range items {
 		if hasAttr(item.Attrs, imap.MailboxAttrNoSelect) {
@@ -1833,6 +1837,18 @@ func listMailboxesLockedFromConn(conn *imapclient.Client) ([]string, error) {
 		names = append(names, item.Mailbox)
 	}
 	return names, nil
+}
+
+// logSkippedMailboxNames warns about mailbox names a server reported that
+// could not be decoded as modified UTF-7 (e.g. a name containing literal
+// control characters) and were therefore skipped rather than failing the
+// whole LIST. The names are diagnostic only: %q escapes control characters,
+// and these folders must never be opened under the raw name shown here.
+func logSkippedMailboxNames(logger *slog.Logger, names []string) {
+	for _, name := range names {
+		logger.Warn("skipping mailbox with a name that is not valid modified UTF-7",
+			"raw_name", fmt.Sprintf("%q", name))
+	}
 }
 
 // compositeID builds a message identifier as "mailbox|uid".
@@ -1891,10 +1907,12 @@ func (c *Client) GetProfile(ctx context.Context) (*gmailapi.Profile, error) {
 func (c *Client) ListLabels(ctx context.Context) ([]*gmailapi.Label, error) {
 	var labels []*gmailapi.Label
 	err := c.withConn(ctx, func(conn *imapclient.Client) error {
-		items, err := conn.List("", "*", c.listOptionsLocked()).Collect()
+		listCmd := conn.List("", "*", c.listOptionsLocked())
+		items, err := listCmd.Collect()
 		if err != nil {
 			return fmt.Errorf("LIST: %w", err)
 		}
+		logSkippedMailboxNames(c.logger, listCmd.SkippedNames())
 		for _, item := range items {
 			labelType := classifyLabelType(item.Mailbox, item.Attrs)
 			labels = append(labels, &gmailapi.Label{
@@ -1918,7 +1936,7 @@ func (c *Client) ListLabels(ctx context.Context) ([]*gmailapi.Label, error) {
 func (c *Client) ListMailboxes(ctx context.Context) ([]MailboxInfo, error) {
 	var info []MailboxInfo
 	err := c.withConn(ctx, func(conn *imapclient.Client) error {
-		names, err := listMailboxesLockedFromConn(conn)
+		names, err := listMailboxesLockedFromConn(c.logger, conn)
 		if err != nil {
 			return err
 		}
@@ -2719,7 +2737,7 @@ func uidExists(conn *imapclient.Client, uid imap.UID) (bool, error) {
 // the mailbox; quota, ACL, and other CREATE failures remain errors.
 // Caller must hold c.mu.
 func (c *Client) ensureMailboxLocked(conn *imapclient.Client, name string) (string, error) {
-	mailboxes, err := listMailboxesLockedFromConn(conn)
+	mailboxes, err := listMailboxesLockedFromConn(c.logger, conn)
 	if err != nil {
 		return "", fmt.Errorf("check mailbox %q before CREATE: %w", name, err)
 	}
@@ -2732,7 +2750,7 @@ func (c *Client) ensureMailboxLocked(conn *imapclient.Client, name string) (stri
 		if !isMailboxAlreadyExistsError(err) {
 			return "", fmt.Errorf("CREATE mailbox %q: %w", name, err)
 		}
-		mailboxes, listErr := listMailboxesLockedFromConn(conn)
+		mailboxes, listErr := listMailboxesLockedFromConn(c.logger, conn)
 		if listErr != nil {
 			return "", fmt.Errorf("CREATE mailbox %q: %w (verify with LIST: %w)", name, err, listErr)
 		}
