@@ -3068,7 +3068,7 @@ func TestHandleCLIAccountsExposesIMAPSyncConfigOnly(t *testing.T) {
 	for _, a := range resp.Accounts {
 		byEmail[a.Email] = a.SyncConfig
 	}
-	assert.Equal(imapConfig, byEmail["shared@example.com"], "IMAP sync_config exposed")
+	assert.JSONEq(imapConfig, byEmail["shared@example.com"], "IMAP sync_config exposed")
 	assert.Empty(byEmail["alice@example.com"], "non-IMAP sync_config stays private")
 }
 
