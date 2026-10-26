@@ -70,7 +70,7 @@ Example Claude Desktop config (with port-forward):
 		if err != nil {
 			return err
 		}
-		opts.GmailFactory = buildGmailFactory(ctx, st)
+		opts.GmailFactory = buildMailFactory(ctx, st)
 		opts.GoogleDocsFactory = buildGoogleDocsFactory()
 
 		// Graceful shutdown on SIGINT/SIGTERM

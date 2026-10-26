@@ -14,6 +14,7 @@ import (
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/gmail"
 	"go.kenn.io/msgvault/internal/googledocs"
+	"go.kenn.io/msgvault/internal/mailclient"
 	mcpserver "go.kenn.io/msgvault/internal/mcp"
 	"go.kenn.io/msgvault/internal/oauth"
 	"go.kenn.io/msgvault/internal/vector/visual"
@@ -74,7 +75,7 @@ Add to Claude Desktop config:
 		// Set up the live mail client factory for draft/label operations.
 		// If neither Gmail OAuth nor an IMAP account is available, the
 		// write tools are simply not exposed.
-		opts.GmailFactory = buildGmailFactory(ctx, st)
+		opts.GmailFactory = buildMailFactory(ctx, st)
 		opts.GoogleDocsFactory = buildGoogleDocsFactory()
 		opts.AllowProfileWrites = mcpAllowProfileWrites
 
@@ -272,7 +273,7 @@ func (s daemonMCPSimilarSearcher) FindSimilar(
 	}, nil
 }
 
-// buildGmailFactory returns a GmailClientFactory that creates authenticated
+// buildMailFactory returns a MailClientFactory that creates authenticated
 // live mail clients for the MCP draft/label write tools. Gmail accounts use
 // Google OAuth tokens; IMAP accounts (including Microsoft 365 delegated and
 // app-only sources) build an IMAP/SMTP client from the source's sync_config.
@@ -284,7 +285,7 @@ func (s daemonMCPSimilarSearcher) FindSimilar(
 // are resolved through the daemon's CLI accounts API. Credentials themselves
 // (OAuth tokens, IMAP passwords, Microsoft refresh tokens or certificates)
 // live locally (cfg.TokensDir() or configured paths) and are read directly.
-func buildGmailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.GmailClientFactory {
+func buildMailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.MailClientFactory {
 	secretsPath, secretsErr := cfg.OAuth.ClientSecretsFor("")
 	oauthConfigured := secretsErr == nil
 
@@ -306,7 +307,17 @@ func buildGmailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.G
 		return nil
 	}
 
-	return func(ctx context.Context, email string) (gmail.API, error) {
+	return func(ctx context.Context, email string) (client gmail.API, err error) {
+		defer func() {
+			if err != nil || client == nil {
+				return
+			}
+			backend := client
+			client, err = mailclient.New(backend, email, cfg.Mail.Accounts[email].AllowedFrom)
+			if err != nil {
+				_ = backend.Close()
+			}
+		}()
 		// Look up the account's source type and OAuth app binding via the daemon.
 		accounts, err := st.GetCLIAccounts(ctx)
 		if err != nil {
@@ -352,7 +363,7 @@ func buildGmailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.G
 			}
 
 			rateLimiter := gmail.NewRateLimiter(float64(cfg.Sync.RateLimitQPS))
-			client := gmail.NewClient(tokenSource,
+			client = gmail.NewClient(tokenSource,
 				gmail.WithLogger(logger),
 				gmail.WithRateLimiter(rateLimiter),
 			)

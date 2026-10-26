@@ -2206,3 +2206,14 @@ capabilities_file = "manifests/voyage.json"
 	assert.Equal(filepath.Join(tmpDir, "manifests/voyage.json"),
 		cfg.Vector.Multimodal.CapabilitiesFile)
 }
+
+func TestMailAccountSenderPolicyLoads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(t, os.WriteFile(path, []byte(`[mail.accounts."owner@example.com"]
+allowed_from = ["reports@example.com"]
+`), 0600))
+	cfg, err := Load(path, "")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"reports@example.com"}, cfg.Mail.Accounts["owner@example.com"].AllowedFrom)
+	assert.Empty(t, cfg.Mail.Accounts["other@example.com"].AllowedFrom)
+}
