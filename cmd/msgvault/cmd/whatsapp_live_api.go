@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -227,5 +228,7 @@ func (h *whatsappLiveAPIHandler) sendMessage(w http.ResponseWriter, r *http.Requ
 
 func writeAPIJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
+	if err := json.NewEncoder(w).Encode(v); err != nil {
+		slog.Warn("encode whatsapp API response", "err", err)
+	}
 }

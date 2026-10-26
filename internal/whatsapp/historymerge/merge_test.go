@@ -5,13 +5,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/msgvault/internal/export"
 	"go.kenn.io/msgvault/internal/mime"
@@ -124,7 +123,7 @@ func buildFixture(t *testing.T) *fixture {
 	// instead of source_message_id.
 	decoyConvID, err := intoSt.EnsureConversationWithType(intoSource.ID, "15550000000@s.whatsapp.net", "direct_chat", "")
 	require.NoError(t, err)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		seedWhatsAppMessage(t, intoSt, intoSource.ID, decoyConvID, "15550000000@s.whatsapp.net",
 			fmt.Sprintf("decoy-%d", i), "15550000000@s.whatsapp.net", "", "decoy", false,
 			time.Unix(1600000000+int64(i), 0).UTC())
@@ -237,20 +236,22 @@ func messageCount(t *testing.T, st *store.Store, sourceID int64) int {
 }
 
 func TestMergeSource(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
 	f := buildFixture(t)
 	defer func() { _ = f.intoStore.Close() }()
 
 	baselineIntoCount := messageCount(t, f.intoStore, f.intoSourceID)
-	require.Equal(t, 6, baselineIntoCount, "fixture sanity: 5 decoys + 1 pre-synced shared message")
+	requirements.Equal(6, baselineIntoCount, "fixture sanity: 5 decoys + 1 pre-synced shared message")
 
 	// --- Phase 1: dry run. --into is opened read-only, matching exactly
 	// what the CLI does when --apply is not passed — any accidental write
 	// attempt would surface as a real SQLite readonly-database error,
 	// recorded in report.Errors, not a silent no-op.
 	intoRO, err := store.OpenReadOnly(f.intoDBPath)
-	require.NoError(t, err)
+	requirements.NoError(err)
 	fromRO, err := store.OpenReadOnly(f.fromDBPath)
-	require.NoError(t, err)
+	requirements.NoError(err)
 
 	dryOpts := historymerge.Options{
 		From: fromRO, Into: intoRO,
@@ -258,28 +259,25 @@ func TestMergeSource(t *testing.T) {
 		Apply: false,
 	}
 	dryReport, err := historymerge.MergeSource(context.Background(), dryOpts, f.fromSourceID, f.intoSourceID)
-	require.NoError(t, err)
-	require.Empty(t, dryReport.Errors)
-
-	assert.Equal(t, 4, dryReport.MessagesScanned, "wa-hello, wa-reply, wa-shared, wa-group — wa-deleted must be excluded")
-	assert.Equal(t, 1, dryReport.MessagesAlreadyInTarget, "wa-shared already exists in into")
-	assert.Equal(t, 3, dryReport.MessagesCopied, "wa-hello, wa-reply, wa-group would be copied")
-	assert.Equal(t, 0, dryReport.MessagesFailed)
-	assert.Equal(t, 1, dryReport.AttachmentsWithContent, "only wa-hello has real attachment content")
-	assert.Equal(t, 1, dryReport.AttachmentsAlreadyStored, "same bytes already stored in into by hash")
-	assert.Equal(t, 0, dryReport.AttachmentsWouldCopy, "already-stored blob does not need copying")
-	assert.Equal(t, 1, dryReport.AttachmentMarkers, "wa-group's failed-download marker")
-	assert.Equal(t, 1, dryReport.ReactionsWouldCopy, "only the active reaction, not the retracted one")
-
-	require.NoError(t, intoRO.Close())
-	require.NoError(t, fromRO.Close())
-
-	// into must be completely unchanged after a dry run.
-	assert.Equal(t, baselineIntoCount, messageCount(t, f.intoStore, f.intoSourceID))
+	requirements.NoError(err)
+	requirements.Empty(dryReport.Errors)
+	assertions.Equal(4, dryReport.MessagesScanned, "wa-hello, wa-reply, wa-shared, wa-group — wa-deleted must be excluded")
+	assertions.Equal(1, dryReport.MessagesAlreadyInTarget, "wa-shared already exists in into")
+	assertions.Equal(3, dryReport.MessagesCopied, "wa-hello, wa-reply, wa-group would be copied")
+	assertions.Equal(0, dryReport.MessagesFailed)
+	assertions.Equal(1, dryReport.AttachmentsWithContent, "only wa-hello has real attachment content")
+	assertions.Equal(1, dryReport.AttachmentsAlreadyStored, "same bytes already stored in into by hash")
+	assertions.Equal(0, dryReport.AttachmentsWouldCopy, "already-stored blob does not need copying")
+	assertions.Equal(1, dryReport.AttachmentMarkers, "wa-group's failed-download marker")
+	assertions.Equal(1, dryReport.ReactionsWouldCopy, "only the active reaction, not the retracted one")
+	requirements.NoError(intoRO.Close())
+	requirements.NoError(fromRO.Close())
+	assertions. // into must be completely unchanged after a dry run.
+			Equal(baselineIntoCount, messageCount(t, f.intoStore, f.intoSourceID))
 
 	// --- Phase 2: apply.
 	fromRO2, err := store.OpenReadOnly(f.fromDBPath)
-	require.NoError(t, err)
+	requirements.NoError(err)
 	defer func() { _ = fromRO2.Close() }()
 
 	applyOpts := historymerge.Options{
@@ -288,18 +286,16 @@ func TestMergeSource(t *testing.T) {
 		Apply: true,
 	}
 	applyReport, err := historymerge.MergeSource(context.Background(), applyOpts, f.fromSourceID, f.intoSourceID)
-	require.NoError(t, err)
-	require.Empty(t, applyReport.Errors)
-
-	assert.Equal(t, 4, applyReport.MessagesScanned)
-	assert.Equal(t, 1, applyReport.MessagesAlreadyInTarget)
-	assert.Equal(t, 3, applyReport.MessagesCopied)
-	assert.Equal(t, 1, applyReport.AttachmentsAlreadyStored)
-	assert.Equal(t, 0, applyReport.AttachmentsCopied, "the only real attachment blob was already present by hash")
-	assert.Equal(t, 1, applyReport.AttachmentMarkers)
-	assert.Equal(t, 1, applyReport.ReactionsCopied)
-
-	assert.Equal(t, baselineIntoCount+3, messageCount(t, f.intoStore, f.intoSourceID))
+	requirements.NoError(err)
+	requirements.Empty(applyReport.Errors)
+	assertions.Equal(4, applyReport.MessagesScanned)
+	assertions.Equal(1, applyReport.MessagesAlreadyInTarget)
+	assertions.Equal(3, applyReport.MessagesCopied)
+	assertions.Equal(1, applyReport.AttachmentsAlreadyStored)
+	assertions.Equal(0, applyReport.AttachmentsCopied, "the only real attachment blob was already present by hash")
+	assertions.Equal(1, applyReport.AttachmentMarkers)
+	assertions.Equal(1, applyReport.ReactionsCopied)
+	assertions.Equal(baselineIntoCount+3, messageCount(t, f.intoStore, f.intoSourceID))
 
 	// Table of per-message expectations, verified against the target
 	// archive's own row shape — not the report counters above.
@@ -334,73 +330,75 @@ func TestMergeSource(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			assertions := assert.New(t)
+			requirements := require.New(t)
 			msgID, err := f.intoStore.GetWhatsAppMessageIDBySource(context.Background(), f.intoSourceID, tc.sourceMessageID)
-			require.NoError(t, err)
-			require.NotZero(t, msgID, "message must exist in target")
+			requirements.NoError(err)
+			requirements.NotZero(msgID, "message must exist in target")
 
 			var convID int64
-			require.NoError(t, f.intoStore.DB().QueryRow(
+			requirements.NoError(f.intoStore.DB().QueryRow(
 				f.intoStore.Rebind(`SELECT conversation_id FROM messages WHERE id = ?`), msgID,
 			).Scan(&convID))
 
 			var gotConvJID, gotConvType string
-			require.NoError(t, f.intoStore.DB().QueryRow(
+			requirements.NoError(f.intoStore.DB().QueryRow(
 				f.intoStore.Rebind(`SELECT source_conversation_id, conversation_type FROM conversations WHERE id = ? AND source_id = ?`),
 				convID, f.intoSourceID,
 			).Scan(&gotConvJID, &gotConvType), "conversation_id must point at a real conversation row in the target")
-			assert.Equal(t, tc.wantConvJID, gotConvJID)
-			assert.Equal(t, tc.wantConvType, gotConvType)
+			assertions.Equal(tc.wantConvJID, gotConvJID)
+			assertions.Equal(tc.wantConvType, gotConvType)
 
-			bodyText, _, found, err := f.intoStore.GetMessageBodyText(msgID)
-			require.NoError(t, err)
-			require.True(t, found)
-			assert.Equal(t, tc.wantBody, bodyText.String)
+			bodyText, _, found, err := f.intoStore.GetMessageBodiesForMerge(msgID)
+			requirements.NoError(err)
+			requirements.True(found)
+			assertions.Equal(tc.wantBody, bodyText.String)
 
 			refs, err := f.intoStore.MessageWhatsAppAttachments(msgID)
-			require.NoError(t, err)
+			requirements.NoError(err)
 			switch {
 			case tc.wantAttachHash != "":
-				require.Len(t, refs, 1)
+				requirements.Len(refs, 1)
 				for _, ref := range refs {
-					assert.Equal(t, tc.wantAttachHash, ref.ContentHash)
+					assertions.Equal(tc.wantAttachHash, ref.ContentHash)
 					// Attachment content must actually be reachable at the
 					// canonical content-addressed path under into's
 					// attachments dir — not just referenced in the DB.
 					data, err := os.ReadFile(filepath.Join(f.intoAttDir, ref.StoragePath))
-					require.NoError(t, err, "attachment blob must be reachable on disk")
-					assert.Equal(t, f.imageBytes, data)
+					requirements.NoError(err, "attachment blob must be reachable on disk")
+					assertions.Equal(f.imageBytes, data)
 				}
 			case tc.wantAttachMarker:
-				require.Len(t, refs, 1)
+				requirements.Len(refs, 1)
 				for _, ref := range refs {
-					assert.Empty(t, ref.ContentHash)
-					assert.Contains(t, ref.StoragePath, "pending")
+					assertions.Empty(ref.ContentHash)
+					assertions.Contains(ref.StoragePath, "pending")
 				}
 			default:
-				assert.Empty(t, refs)
+				assertions.Empty(refs)
 			}
 
 			reactions, err := f.intoStore.ListActiveWhatsAppReactions(msgID)
-			require.NoError(t, err)
-			assert.Len(t, reactions, tc.wantReactions)
+			requirements.NoError(err)
+			assertions.Len(reactions, tc.wantReactions)
 		})
 	}
 
 	// wa-shared must still resolve to the ORIGINAL into-side row — the
 	// merge must not have created a second copy under a new id.
 	sharedID, err := f.intoStore.GetWhatsAppMessageIDBySource(context.Background(), f.intoSourceID, store.WhatsAppSourceMessageID(contactJID, waMsgShared))
-	require.NoError(t, err)
-	require.NotZero(t, sharedID)
+	requirements.NoError(err)
+	requirements.NotZero(sharedID)
 
 	// wa-deleted must never have been created in the target.
 	deletedTargetID, err := f.intoStore.GetWhatsAppMessageIDBySource(context.Background(), f.intoSourceID, store.WhatsAppSourceMessageID(contactJID, waMsgDeleted))
-	require.NoError(t, err)
-	assert.Zero(t, deletedTargetID, "soft-deleted source message must not be copied")
+	requirements.NoError(err)
+	assertions.Zero(deletedTargetID, "soft-deleted source message must not be copied")
 
 	// --- Phase 3: idempotency. Running --apply again must not duplicate
 	// anything, and must report everything as already present.
 	fromRO3, err := store.OpenReadOnly(f.fromDBPath)
-	require.NoError(t, err)
+	requirements.NoError(err)
 	defer func() { _ = fromRO3.Close() }()
 
 	rerunOpts := historymerge.Options{
@@ -409,13 +407,12 @@ func TestMergeSource(t *testing.T) {
 		Apply: true,
 	}
 	rerunReport, err := historymerge.MergeSource(context.Background(), rerunOpts, f.fromSourceID, f.intoSourceID)
-	require.NoError(t, err)
-	require.Empty(t, rerunReport.Errors)
-
-	assert.Equal(t, 4, rerunReport.MessagesScanned)
-	assert.Equal(t, 4, rerunReport.MessagesAlreadyInTarget, "all four now already exist in target")
-	assert.Equal(t, 0, rerunReport.MessagesCopied)
-	assert.Equal(t, baselineIntoCount+3, messageCount(t, f.intoStore, f.intoSourceID), "re-running must not duplicate any message")
+	requirements.NoError(err)
+	requirements.Empty(rerunReport.Errors)
+	assertions.Equal(4, rerunReport.MessagesScanned)
+	assertions.Equal(4, rerunReport.MessagesAlreadyInTarget, "all four now already exist in target")
+	assertions.Equal(0, rerunReport.MessagesCopied)
+	assertions.Equal(baselineIntoCount+3, messageCount(t, f.intoStore, f.intoSourceID), "re-running must not duplicate any message")
 }
 
 func TestResolveSourcePairsRequiresExistingTargetSource(t *testing.T) {
@@ -435,6 +432,8 @@ func TestResolveSourcePairsRequiresExistingTargetSource(t *testing.T) {
 }
 
 func TestResolveSourcePairsMatchesByIdentifier(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
 	base := t.TempDir()
 	fromSt, _ := newFileStore(t, filepath.Join(base, "from"))
 	defer func() { _ = fromSt.Close() }()
@@ -442,13 +441,13 @@ func TestResolveSourcePairsMatchesByIdentifier(t *testing.T) {
 	defer func() { _ = intoSt.Close() }()
 
 	fromSource, err := fromSt.GetOrCreateSource(store.WhatsAppSourceType, fromJID)
-	require.NoError(t, err)
+	requirements.NoError(err)
 	intoSource, err := intoSt.GetOrCreateSource(store.WhatsAppSourceType, fromJID)
-	require.NoError(t, err)
+	requirements.NoError(err)
 
 	pairs, err := historymerge.ResolveSourcePairs(fromSt, intoSt, "")
-	require.NoError(t, err)
-	require.Len(t, pairs, 1)
-	assert.Equal(t, fromSource.ID, pairs[0].From.ID)
-	assert.Equal(t, intoSource.ID, pairs[0].Into.ID)
+	requirements.NoError(err)
+	requirements.Len(pairs, 1)
+	assertions.Equal(fromSource.ID, pairs[0].From.ID)
+	assertions.Equal(intoSource.ID, pairs[0].Into.ID)
 }

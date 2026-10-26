@@ -141,6 +141,7 @@ import type {
   GetAggregatesParams,
   GetAttachmentContentPathParameters,
   GetAttachmentPathParameters,
+  GetAttachmentTextPathParameters,
   GetAttributeDefinitionPathParameters,
   GetCLIAttachmentParams,
   GetCLICollectionParams,
@@ -293,6 +294,10 @@ import type {
   MessageTagResult,
   MuesliRemoteRequest,
   MuesliRemoteResult,
+  OCRResult,
+  OCRRuntimeStatus,
+  OcrSearchRequest,
+  OcrSearchResponse,
   OperationRunDetail,
   OperationRunsResponse,
   OperationStatusResponse,
@@ -396,6 +401,7 @@ import type {
   RelationshipType,
   RelationshipTypesResponse,
   RemoteImageRequest,
+  RequestAttachmentTextPathParameters,
   ResolveCardDAVConflictPathParameters,
   ReviewAcceptIdentityMatchCandidatePathParameters,
   ReviewRejectIdentityMatchCandidatePathParameters,
@@ -597,6 +603,36 @@ export const getAttachmentContent = (
       url: `/api/v1/attachments/${encodeURIComponent(String(hash))}/content`,
       method: "GET",
       responseType: "blob",
+    },
+    options,
+  );
+};
+/**
+ * @summary Get cached attachment text
+ */
+export const getAttachmentText = (
+  { hash }: GetAttachmentTextPathParameters,
+  options?: SecondParameter<typeof orvalFetch<OCRResult>>,
+) => {
+  return orvalFetch<OCRResult>(
+    {
+      url: `/api/v1/attachments/${encodeURIComponent(String(hash))}/text`,
+      method: "GET",
+    },
+    options,
+  );
+};
+/**
+ * @summary Queue attachment text extraction
+ */
+export const requestAttachmentText = (
+  { hash }: RequestAttachmentTextPathParameters,
+  options?: SecondParameter<typeof orvalFetch<OCRResult>>,
+) => {
+  return orvalFetch<OCRResult>(
+    {
+      url: `/api/v1/attachments/${encodeURIComponent(String(hash))}/text/request`,
+      method: "POST",
     },
     options,
   );
@@ -1749,6 +1785,23 @@ export const setPrimaryEmployment = (
   );
 };
 /**
+ * @summary Search cached attachment text
+ */
+export const searchAttachmentText = (
+  ocrSearchRequest: OcrSearchRequest,
+  options?: SecondParameter<typeof orvalFetch<OcrSearchResponse>>,
+) => {
+  return orvalFetch<OcrSearchResponse>(
+    {
+      url: `/api/v1/files/text-search`,
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      data: ocrSearchRequest,
+    },
+    options,
+  );
+};
+/**
  * @summary Get authoritative file metadata
  */
 export const getFile = (
@@ -2472,6 +2525,17 @@ export const getVisualAttachmentStatus = (
 ) => {
   return orvalFetch<Status>(
     { url: `/api/v1/multimodal/status`, method: "GET" },
+    options,
+  );
+};
+/**
+ * @summary Get attachment text extraction status
+ */
+export const getOCRStatus = (
+  options?: SecondParameter<typeof orvalFetch<OCRRuntimeStatus>>,
+) => {
+  return orvalFetch<OCRRuntimeStatus>(
+    { url: `/api/v1/ocr/status`, method: "GET" },
     options,
   );
 };

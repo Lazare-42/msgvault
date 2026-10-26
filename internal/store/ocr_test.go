@@ -45,7 +45,7 @@ func TestOCRLifecycleDeduplicatesLeasesAndSearchesPages(t *testing.T) {
 	requirements.NoError(err)
 	assertions.Equal(store.OCRReady, result.Status)
 	assertions.Equal("mixed", result.Method)
-	assertions.Equal(94.0, result.AverageConfidence)
+	assertions.InDelta(94.0, result.AverageConfidence, 0.001)
 	assertions.Equal(pages, result.Pages)
 
 	hits, err := f.Store.SearchOCR(t.Context(), "ORCHID", 20)

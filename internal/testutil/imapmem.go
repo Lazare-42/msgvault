@@ -2,9 +2,8 @@ package testutil
 
 import (
 	"bytes"
-"errors"
-"sync/atomic"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net"
 	"sort"
@@ -603,6 +602,7 @@ func serveIMAPMemServerWithCaps(
 	appendLimit *uint32,
 	statusAppendLimit *uint32,
 	statusAppendMailbox string,
+	wrappers ...func(imapserver.Session) imapserver.Session,
 ) *imapmemserver.User {
 	t.Helper()
 	user := imapmemserver.NewUser(IMAPTestUsername, IMAPTestPassword)
@@ -654,6 +654,9 @@ func serveIMAPMemServerWithCaps(
 			}
 			if appendLimit != nil {
 				session = &appendLimitSession{Session: session, limit: *appendLimit}
+			}
+			for _, wrap := range wrappers {
+				session = wrap(session)
 			}
 			return session, nil, nil
 		},
@@ -787,7 +790,7 @@ func StartIMAPMemServerWithCreateError(
 	createErrorMailbox string,
 ) (string, *imapmemserver.User) {
 	t.Helper()
-	return startIMAPMemServer(t, messagesPerMailbox, nil, "", 0, &createErrorConfig{
+	return startIMAPMemServerWithFaults(t, messagesPerMailbox, &createErrorConfig{
 		mailbox: createErrorMailbox,
 		err: &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -805,7 +808,7 @@ func StartIMAPMemServerWithCreateFailure(
 	createErrorMailbox string,
 ) (string, *imapmemserver.User) {
 	t.Helper()
-	return startIMAPMemServer(t, messagesPerMailbox, nil, "", 0, &createErrorConfig{
+	return startIMAPMemServerWithFaults(t, messagesPerMailbox, &createErrorConfig{
 		mailbox: createErrorMailbox,
 		err: &imap.Error{
 			Type: imap.StatusResponseTypeNo,
@@ -821,5 +824,33 @@ func StartIMAPMemServerWithPhantomUID(
 	phantomUID imap.UID,
 ) (string, *imapmemserver.User) {
 	t.Helper()
-	return startIMAPMemServer(t, messagesPerMailbox, nil, "", 0, nil, phantomUID)
+	return startIMAPMemServerWithFaults(t, messagesPerMailbox, nil, phantomUID)
+}
+
+type createErrorConfig struct {
+	mailbox string
+	err     error
+}
+
+func startIMAPMemServerWithFaults(t *testing.T, messages map[string]int, createError *createErrorConfig, phantom imap.UID) (string, *imapmemserver.User) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	var listed, claimed atomic.Bool
+	var names []string
+	for name := range messages {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	wrap := func(s imapserver.Session) imapserver.Session {
+		if createError != nil {
+			s = &createErrorSession{Session: s, mailboxes: names, mailbox: createError.mailbox, createErr: createError.err, listed: &listed}
+		}
+		if phantom != 0 {
+			s = &phantomUIDSession{Session: s, uid: phantom, claimed: &claimed}
+		}
+		return s
+	}
+	user := serveIMAPMemServerWithCaps(t, ln, messages, nil, "", 0, "", nil, nil, nil, false, nil, nil, "", wrap)
+	return ln.Addr().String(), user
 }

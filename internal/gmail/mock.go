@@ -279,22 +279,22 @@ func (m *MockAPI) Close() error {
 	return nil
 }
 
-// Draft stubs — MockAPI is primarily for sync testing; draft tests use real Client.
+// ComposedDraft stubs — MockAPI is primarily for sync testing; draft tests use real Client.
 
-func (m *MockAPI) ListDrafts(ctx context.Context, query string, maxResults int) ([]*Draft, error) {
+func (m *MockAPI) ListDrafts(ctx context.Context, query string, maxResults int) ([]*ComposedDraft, error) {
 	return nil, nil
 }
 
-func (m *MockAPI) GetDraft(ctx context.Context, draftID string) (*Draft, error) {
+func (m *MockAPI) GetDraft(ctx context.Context, draftID string) (*ComposedDraft, error) {
 	return nil, &NotFoundError{Path: "/drafts/" + draftID}
 }
 
-func (m *MockAPI) CreateDraft(ctx context.Context, draft *DraftCompose) (*Draft, error) {
-	return &Draft{ID: "mock_draft_1"}, nil
+func (m *MockAPI) CreateDraft(ctx context.Context, draft *DraftCompose) (*ComposedDraft, error) {
+	return &ComposedDraft{ID: "mock_draft_1"}, nil
 }
 
-func (m *MockAPI) UpdateDraft(ctx context.Context, draftID string, draft *DraftCompose) (*Draft, error) {
-	return &Draft{ID: draftID}, nil
+func (m *MockAPI) UpdateDraft(ctx context.Context, draftID string, draft *DraftCompose) (*ComposedDraft, error) {
+	return &ComposedDraft{ID: draftID}, nil
 }
 
 func (m *MockAPI) DeleteDraft(ctx context.Context, draftID string) error {

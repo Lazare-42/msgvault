@@ -1,11 +1,20 @@
 {
   lib,
   buildGoModule,
+  fetchurl,
+  bun2nix,
   gitignoreSource,
+  nodejs,
+  runCommand,
   sqlite,
 }:
 let
-  version = "0.18.0";
+  version = "0.22.0";
+  kitUIURL = "https://github.com/kenn-io/kit-ui/archive/1bd3bb05ac0fbb0dba8b6372ba53106380e64632.tar.gz";
+  kitUI = fetchurl {
+    url = kitUIURL;
+    hash = "sha512-N2c0xfkx6uZTSfdslAZqdpk0/AUQ7eadMxoBzW8SKT6WI4PXXyOmA1Vdd6iJx9x9LSXkxHQwMISvCQLFxoZhgg==";
+  };
 in
 buildGoModule {
   pname = "msgvault";
@@ -13,8 +22,66 @@ buildGoModule {
 
   src = gitignoreSource ../.;
 
-	vendorHash = "sha256-9OF7kmPW3LTAC/ExDzTYrY4ki/aAEhP8KGnwci3Smbg=";
+  vendorHash = "sha256-hyHxGKQdt3+kpj8ybbgtjbU1FMjCkXGPMTCQTlSD9Po=";
   proxyVendor = true;
+
+  # Bun's copyfile backend can install incomplete packages when fetchBunDeps'
+  # cache entries are backed by symlinks. Materialize the cache as regular
+  # files before the sandboxed install consumes it.
+  bunDeps =
+    let
+      base = bun2nix.fetchBunDeps { bunNix = ../web/bun.nix; };
+    in
+    runCommand "msgvault-bun-deps" { } ''
+      mkdir -p "$out/share/bun-cache"
+      cp -RL ${base}/share/bun-cache/. "$out/share/bun-cache/"
+      chmod -R u+w "$out/share/bun-cache"
+    '';
+  bunRoot = "web";
+  # Bun 1.4 re-fetches URL tarballs despite a populated bun2nix cache.
+  # Use the exact lockfile-verified tarball as a local dependency in the sandbox.
+  preBunNodeModulesInstallPhase = ''
+    substituteInPlace package.json --replace-fail "${kitUIURL}" "file:${kitUI}"
+    substituteInPlace bun.lock --replace-fail "${kitUIURL}" "${kitUI}"
+  '';
+  bunInstallFlags = [
+    "--linker=hoisted"
+    "--backend=copyfile"
+  ];
+  # The frontend dependencies do not need install scripts. A second Linux Bun
+  # install can remove package binaries created by the offline install.
+  dontRunLifecycleScripts = true;
+  dontUseBunBuild = true;
+  dontUseBunCheck = true;
+  dontUseBunInstall = true;
+
+  nativeBuildInputs = [
+    bun2nix.hook
+    nodejs
+  ];
+  overrideModAttrs = _: previous: {
+    nativeBuildInputs = builtins.filter (
+      input: (input.name or "") != "bun2nix-hook"
+    ) previous.nativeBuildInputs;
+    preBuild = "";
+  };
+
+  preBuild = ''
+    go mod download go.mau.fi/whatsmeow
+    gomodcache="$(go env GOMODCACHE)"
+    whatsmeow_mod="$gomodcache/go.mau.fi/whatsmeow@v0.0.0-20261017175727-b2b1e71d45e2"
+    chmod -R u+w "$whatsmeow_mod"
+    patch -d "$whatsmeow_mod" -p1 < nix/patches/whatsmeow-clean-failed-pairing-state.patch
+
+    pushd web
+    bun run generate
+    bun node_modules/vite/bin/vite.js build
+    popd
+    mkdir -p internal/web/dist
+    find internal/web/dist -mindepth 1 -maxdepth 1 ! -name stub.html -exec rm -rf {} +
+    cp -R web/dist/. internal/web/dist/
+    bun scripts/check-web-assets.mjs
+  '';
 
   subPackages = [ "cmd/msgvault" ];
 
@@ -31,14 +98,6 @@ buildGoModule {
     "fts5"
     "sqlite_vec"
   ];
-
-  preBuild = ''
-    go mod download go.mau.fi/whatsmeow
-    gomodcache="$(go env GOMODCACHE)"
-    whatsmeow_mod="$gomodcache/go.mau.fi/whatsmeow@v0.0.0-20260630180629-b572e5bcb92b"
-    chmod -R u+w "$whatsmeow_mod"
-    patch -d "$whatsmeow_mod" -p1 < nix/patches/whatsmeow-clean-failed-pairing-state.patch
-  '';
 
   ldflags = [
     "-s"

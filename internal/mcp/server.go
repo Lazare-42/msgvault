@@ -18,12 +18,11 @@ import (
 	"go.kenn.io/msgvault/internal/agentgrant"
 	"go.kenn.io/msgvault/internal/mcpdiscovery"
 
-	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
-	"go.kenn.io/msgvault/internal/peoplebrowser"
 	"github.com/mark3labs/mcp-go/mcp"
-	"github.com/mark3labs/mcp-go/server"
+	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.kenn.io/msgvault/internal/gmail"
 	"go.kenn.io/msgvault/internal/googledocs"
+	"go.kenn.io/msgvault/internal/peoplebrowser"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/savedview"
 	"go.kenn.io/msgvault/internal/store"
@@ -34,12 +33,12 @@ import (
 )
 
 // GmailClientFactory creates authenticated mail API clients for a given
-// account email. The returned client is a gmail.API implementation — the
+// account email. The returned client is a gmail.LiveAPI implementation — the
 // Gmail OAuth client for Gmail accounts, or the IMAP client (which also
-// satisfies gmail.API, including drafts and label/folder operations) for
+// satisfies gmail.LiveAPI, including drafts and label/folder operations) for
 // IMAP-backed accounts such as Microsoft 365. The caller is responsible
 // for closing the client.
-type GmailClientFactory func(ctx context.Context, email string) (gmail.API, error)
+type GmailClientFactory func(ctx context.Context, email string) (gmail.LiveAPI, error)
 
 // WhatsAppClientFactory creates a live WhatsApp client for an archive account.
 type WhatsAppClientFactory func(ctx context.Context, account string) (whatsapplive.Client, error)
@@ -57,92 +56,92 @@ type GoogleDocsClientFactory func(ctx context.Context) (googledocs.Client, error
 
 // Tool name constants.
 const (
-	ToolDraftReply                = "draft_reply"
-	ToolDraftCompose              = "draft_compose"
-	ToolDraftForward              = "draft_forward"
-	ToolDraftGet                  = "draft_get"
-	ToolDraftEdit                 = "draft_edit"
-	ToolDraftDelete               = "draft_delete"
-	ToolDraftRecover              = "draft_recover"
-	ToolDraftSendAs               = "draft_send_as"
-	ToolSearchMessages            = "search_messages"
-	ToolQuerySQL                  = "query_sql"
-	ToolSearchMetadata            = "search_metadata"
-	ToolSearchMessageBodies       = "search_message_bodies"
-	ToolSemanticSearchMessages    = "semantic_search_messages"
-	ToolGetMessage                = "get_message"
-	ToolGetAttachment             = "get_attachment"
-	ToolExportAttachment          = "export_attachment"
-	ToolExportEML                 = "export_eml"
-	ToolListThread                = "list_thread"
-	ToolListMessages              = "list_messages"
-	ToolGetStats                  = "get_stats"
-	ToolAggregate                 = "aggregate"
-	ToolStageDeletion             = "stage_deletion"
-	ToolSearchByDomains           = "search_by_domains"
-	ToolFindSimilarMessages       = "find_similar_messages"
-	ToolSearchVisualAttachments   = "search_visual_attachments"
-	ToolSearchInMessage           = "search_in_message"
-	ToolSearchDocuments           = "search_document_attachments"
-	ToolSearchPersonFiles         = "search_person_files"
-	ToolSearchPeople              = "search_people"
-	ToolListDirectoryPeople       = "list_directory_people"
-	ToolFindChat                  = "find_chat"
-	ToolGetPersonNotes            = "get_person_notes"
-	ToolGetPersonProfile          = "get_person_profile"
-	ToolGetPersonRelationship     = "get_person_relationship"
-	ToolGetPersonAgenda           = "get_person_agenda"
-	ToolFindContactCandidates     = "find_contact_candidates"
-	ToolGetPersonMessagingRoutes  = "get_person_messaging_routes"
-	ToolPromotePerson             = "promote_person"
-	ToolUpdatePersonNotes         = "update_person_notes"
-	ToolListSavedViews            = "list_saved_views"
-	ToolGetSavedView              = "get_saved_view"
-	ToolRunSavedView              = "run_saved_view"
-	ToolCreateSavedView           = "create_saved_view"
-	ToolUpdateSavedView           = "update_saved_view"
-	ToolDeleteSavedView           = "delete_saved_view"
-	ToolGetMeetingContext         = "get_meeting_context"
-	ToolListMeetingActionItems    = "list_meeting_action_items"
-	ToolGetMeetingMetrics         = "get_meeting_metrics"
-	ToolListIdentityMatches       = "list_identity_matches"
-	ToolGetIdentityMatch          = "get_identity_match"
-	ToolAcceptIdentityMatch       = "accept_identity_match"
-	ToolRejectIdentityMatch       = "reject_identity_match"
-	ToolGetPersonMergeContext     = "get_person_merge_context"
-	ToolMergePerson               = "merge_person"
-	ToolGetCardDAVPublication     = "get_carddav_publication"
-	ToolPreviewCardDAVPublication = "preview_carddav_publication"
-	ToolApproveCardDAVPublication = "approve_carddav_publication"
-	ToolSyncCardDAV               = "sync_carddav"
-	ToolGetCardDAVSyncStatus      = "get_carddav_sync_status"
-	ToolGetIdentityScoringStatus  = "get_identity_scoring_status"
-	ToolScoreIdentityMatches      = "score_identity_matches"
-	ToolListIdentityJudgments     = "list_identity_judgments"
-	ToolListDrafts             = "list_drafts"
-	ToolGetDraft               = "get_draft"
-	ToolCreateDraft            = "create_draft"
-	ToolUpdateDraft            = "update_draft"
-	ToolDeleteDraft            = "delete_draft"
-	ToolSendDraft              = "send_draft"
-	ToolModifyLabels           = "modify_labels"
-	ToolCreateLabel            = "create_label"
-	ToolDeleteLabel            = "delete_label"
-	ToolListGmailLabels        = "list_gmail_labels"
-	ToolWhatsAppStatus         = "whatsapp_status"
-	ToolWhatsAppStartLogin     = "whatsapp_start_login"
-	ToolWhatsAppLoginStatus    = "whatsapp_login_status"
-	ToolWhatsAppLogout         = "whatsapp_logout"
-	ToolSendWhatsAppMessage    = "send_whatsapp_message"
-	ToolSendWhatsAppReaction   = "send_whatsapp_reaction"
-	ToolListGoogleDocs         = "list_google_docs"
-	ToolSearchGoogleDocs       = "search_google_docs"
-	ToolGetGoogleDoc           = "get_google_doc"
-	ToolAppendGoogleDocText    = "append_google_doc_text"
-	ToolReplaceGoogleDocText   = "replace_google_doc_text"
+	ToolDraftReply                 = "draft_reply"
+	ToolDraftCompose               = "draft_compose"
+	ToolDraftForward               = "draft_forward"
+	ToolDraftGet                   = "draft_get"
+	ToolDraftEdit                  = "draft_edit"
+	ToolDraftDelete                = "draft_delete"
+	ToolDraftRecover               = "draft_recover"
+	ToolDraftSendAs                = "draft_send_as"
+	ToolSearchMessages             = "search_messages"
+	ToolQuerySQL                   = "query_sql"
+	ToolSearchMetadata             = "search_metadata"
+	ToolSearchMessageBodies        = "search_message_bodies"
+	ToolSemanticSearchMessages     = "semantic_search_messages"
+	ToolGetMessage                 = "get_message"
+	ToolGetAttachment              = "get_attachment"
+	ToolExportAttachment           = "export_attachment"
+	ToolExportEML                  = "export_eml"
+	ToolListThread                 = "list_thread"
+	ToolListMessages               = "list_messages"
+	ToolGetStats                   = "get_stats"
+	ToolAggregate                  = "aggregate"
+	ToolStageDeletion              = "stage_deletion"
+	ToolSearchByDomains            = "search_by_domains"
+	ToolFindSimilarMessages        = "find_similar_messages"
+	ToolSearchVisualAttachments    = "search_visual_attachments"
+	ToolSearchInMessage            = "search_in_message"
+	ToolSearchDocuments            = "search_document_attachments"
+	ToolSearchPersonFiles          = "search_person_files"
+	ToolSearchPeople               = "search_people"
+	ToolListDirectoryPeople        = "list_directory_people"
+	ToolFindChat                   = "find_chat"
+	ToolGetPersonNotes             = "get_person_notes"
+	ToolGetPersonProfile           = "get_person_profile"
+	ToolGetPersonRelationship      = "get_person_relationship"
+	ToolGetPersonAgenda            = "get_person_agenda"
+	ToolFindContactCandidates      = "find_contact_candidates"
+	ToolGetPersonMessagingRoutes   = "get_person_messaging_routes"
+	ToolPromotePerson              = "promote_person"
+	ToolUpdatePersonNotes          = "update_person_notes"
+	ToolListSavedViews             = "list_saved_views"
+	ToolGetSavedView               = "get_saved_view"
+	ToolRunSavedView               = "run_saved_view"
+	ToolCreateSavedView            = "create_saved_view"
+	ToolUpdateSavedView            = "update_saved_view"
+	ToolDeleteSavedView            = "delete_saved_view"
+	ToolGetMeetingContext          = "get_meeting_context"
+	ToolListMeetingActionItems     = "list_meeting_action_items"
+	ToolGetMeetingMetrics          = "get_meeting_metrics"
+	ToolListIdentityMatches        = "list_identity_matches"
+	ToolGetIdentityMatch           = "get_identity_match"
+	ToolAcceptIdentityMatch        = "accept_identity_match"
+	ToolRejectIdentityMatch        = "reject_identity_match"
+	ToolGetPersonMergeContext      = "get_person_merge_context"
+	ToolMergePerson                = "merge_person"
+	ToolGetCardDAVPublication      = "get_carddav_publication"
+	ToolPreviewCardDAVPublication  = "preview_carddav_publication"
+	ToolApproveCardDAVPublication  = "approve_carddav_publication"
+	ToolSyncCardDAV                = "sync_carddav"
+	ToolGetCardDAVSyncStatus       = "get_carddav_sync_status"
+	ToolGetIdentityScoringStatus   = "get_identity_scoring_status"
+	ToolScoreIdentityMatches       = "score_identity_matches"
+	ToolListIdentityJudgments      = "list_identity_judgments"
+	ToolListDrafts                 = "list_drafts"
+	ToolGetDraft                   = "get_draft"
+	ToolCreateDraft                = "create_draft"
+	ToolUpdateDraft                = "update_draft"
+	ToolDeleteDraft                = "delete_draft"
+	ToolSendDraft                  = "send_draft"
+	ToolModifyLabels               = "modify_labels"
+	ToolCreateLabel                = "create_label"
+	ToolDeleteLabel                = "delete_label"
+	ToolListGmailLabels            = "list_gmail_labels"
+	ToolWhatsAppStatus             = "whatsapp_status"
+	ToolWhatsAppStartLogin         = "whatsapp_start_login"
+	ToolWhatsAppLoginStatus        = "whatsapp_login_status"
+	ToolWhatsAppLogout             = "whatsapp_logout"
+	ToolSendWhatsAppMessage        = "send_whatsapp_message"
+	ToolSendWhatsAppReaction       = "send_whatsapp_reaction"
+	ToolListGoogleDocs             = "list_google_docs"
+	ToolSearchGoogleDocs           = "search_google_docs"
+	ToolGetGoogleDoc               = "get_google_doc"
+	ToolAppendGoogleDocText        = "append_google_doc_text"
+	ToolReplaceGoogleDocText       = "replace_google_doc_text"
 	ToolWhatsAppRequestHistorySync = "whatsapp_request_history_sync"
-	ToolListWhatsAppChats = "list_whatsapp_chats"
-	ToolListWhatsAppMessages = "list_whatsapp_messages"
+	ToolListWhatsAppChats          = "list_whatsapp_chats"
+	ToolListWhatsAppMessages       = "list_whatsapp_messages"
 	ToolSearchAttachmentText       = "search_attachment_text"
 	ToolGetAttachmentText          = "get_attachment_text"
 	ToolRequestAttachmentText      = "request_attachment_text"
@@ -210,7 +209,7 @@ type ServeOptions struct {
 	// AllowKataWrites exposes Kata issue creation and evidence linking when
 	// the transport's general write policy also permits writes.
 	AllowKataWrites bool
-	OCR OCRClient
+	OCR             OCRClient
 
 	// HybridEngine is optional. When nil, semantic_search_messages rejects
 	// vector/hybrid searches with a vector_not_enabled error.
@@ -252,7 +251,7 @@ type ServeOptions struct {
 	// Drafts runs managed draft commands with the caller's credential.
 	Drafts        DraftRunner
 	DraftCommands []string
-	GmailFactory GmailClientFactory
+	GmailFactory  GmailClientFactory
 	// WhatsAppFactory is optional. When non-nil, live WhatsApp tools are exposed.
 	WhatsAppFactory WhatsAppClientFactory
 	// WhatsAppLoginURL is an optional browser URL for QR login/resync.
@@ -471,12 +470,12 @@ func newMCPServerWithPolicy(
 		drafts:               opts.Drafts,
 		contactRoutesBackend: opts.ContactRoutesBackend,
 		chatDiscoveryBackend: opts.ChatDiscoveryBackend,
-	gmailFactory: opts.GmailFactory,
-	whatsAppFactory: opts.WhatsAppFactory,
-	googleDocsFactory: opts.GoogleDocsFactory,
-	whatsAppLoginURL: strings.TrimSpace(opts.WhatsAppLoginURL),
-	whatsAppArchive: opts.WhatsAppArchive,
-	ocr: opts.OCR,
+		gmailFactory:         opts.GmailFactory,
+		whatsAppFactory:      opts.WhatsAppFactory,
+		googleDocsFactory:    opts.GoogleDocsFactory,
+		whatsAppLoginURL:     strings.TrimSpace(opts.WhatsAppLoginURL),
+		whatsAppArchive:      opts.WhatsAppArchive,
+		ocr:                  opts.OCR,
 	}
 
 	allowed := toolAllowlistSet(opts.ToolAllowlist)
@@ -517,43 +516,15 @@ func newMCPServerWithPolicy(
 		}
 		sdkmcp.AddTool[map[string]any, any](s, definition.tool(), officialToolHandler(definition.bind(h), confirmation))
 	}
-	if !opts.DelegatedOnly {
+	if !opts.DelegatedOnly && allowed == nil {
 		registerAttachmentResources(s, h)
 	}
 
 	for _, definition := range operationalCatalog(opts, allowWrites) {
+		if allowed != nil && !allowed[definition.definition.name] {
+			continue
+		}
 		sdkmcp.AddTool[map[string]any, any](s, definition.definition.tool(), officialToolHandler(definition.bind(opts.Operations), confirmation))
-	}
-
-	if opts.GmailFactory != nil {
-		s.AddTool(listDraftsTool(), h.listDrafts)
-		s.AddTool(getDraftTool(), h.getDraft)
-		s.AddTool(createDraftTool(), h.createDraft)
-		s.AddTool(updateDraftTool(), h.updateDraft)
-		s.AddTool(deleteDraftTool(), h.deleteDraft)
-		s.AddTool(sendDraftTool(), h.sendDraft)
-		s.AddTool(modifyLabelsTool(), h.modifyLabels)
-		s.AddTool(createLabelTool(), h.createLabel)
-		s.AddTool(deleteLabelTool(), h.deleteLabel)
-		s.AddTool(listGmailLabelsTool(), h.listGmailLabels)
-	}
-
-	if opts.WhatsAppFactory != nil {
-		s.AddTool(whatsAppStatusTool(), h.whatsAppStatus)
-		s.AddTool(whatsAppStartLoginTool(), h.whatsAppStartLogin)
-		s.AddTool(whatsAppLoginStatusTool(), h.whatsAppLoginStatus)
-		s.AddTool(whatsAppLogoutTool(), h.whatsAppLogout)
-		s.AddTool(sendWhatsAppMessageTool(), h.sendWhatsAppMessage)
-		s.AddTool(sendWhatsAppReactionTool(), h.sendWhatsAppReaction)
-		s.AddTool(whatsAppRequestHistorySyncTool(), h.whatsAppRequestHistorySync)
-	}
-
-	if opts.GoogleDocsFactory != nil {
-		s.AddTool(listGoogleDocsTool(), h.listGoogleDocs)
-		s.AddTool(searchGoogleDocsTool(), h.searchGoogleDocs)
-		s.AddTool(getGoogleDocTool(), h.getGoogleDoc)
-		s.AddTool(appendGoogleDocTextTool(), h.appendGoogleDocText)
-		s.AddTool(replaceGoogleDocTextTool(), h.replaceGoogleDocText)
 	}
 
 	return s
@@ -597,12 +568,11 @@ func toolAllowlistSet(names []string) map[string]bool {
 // fields empty; callers that want vector/hybrid search should use
 // ServeWithOptions directly.
 // Serve creates an MCP server with archive tools and serves over stdio.
-func Serve(ctx context.Context, engine query.Engine, attachmentsDir, dataDir string, gmailFactory ...GmailClientFactory) error {
+func Serve(ctx context.Context, engine query.Engine, attachmentsDir, dataDir string) error {
 	return ServeWithOptions(ctx, ServeOptions{
 		Engine:         engine,
 		AttachmentsDir: attachmentsDir,
 		DataDir:        dataDir,
-		GmailFactory:   gmailFactory,
 	})
 }
 
@@ -1256,4 +1226,10 @@ func replaceGoogleDocTextTool() mcp.Tool {
 			mcp.Description("Whether the search should be case sensitive (default false)"),
 		),
 	)
+}
+
+// NewHTTPServer builds a server for embedding the MCP handler alongside fork
+// endpoints. Call Shutdown when the embedding listener stops to release sessions.
+func NewHTTPServer(opts ServeOptions, httpOpts HTTPOptions) *http.Server {
+	return newMCPHTTPServer(opts, httpOpts)
 }

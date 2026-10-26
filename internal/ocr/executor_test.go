@@ -24,7 +24,7 @@ func TestParseTSVPreservesLinesAndConfidence(t *testing.T) {
 		"5\t1\t1\t1\t2\t1\t0\t0\t1\t1\t70\ttotal\n")
 	text, confidence := parseTSV(tsv)
 	assert.Equal(t, "Synthetic invoice\ntotal", text)
-	assert.Equal(t, 80.0, confidence)
+	assert.InDelta(t, 80.0, confidence, 0.001)
 }
 
 func TestExtractImageWithRealTesseract(t *testing.T) {

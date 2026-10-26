@@ -310,7 +310,7 @@ func (s *Store) ListWhatsAppChats(ctx context.Context, filter WhatsAppChatFilter
 // with id > AfterID, in ascending archive ID order.
 func (s *Store) ListWhatsAppMessagesAfter(ctx context.Context, filter WhatsAppMessageFilter) ([]WhatsAppMessageRecord, error) {
 	if filter.ChatJID == "" {
-		return nil, fmt.Errorf("chat_jid is required")
+		return nil, errors.New("chat_jid is required")
 	}
 	limit := filter.Limit
 	if limit <= 0 || limit > MaxWhatsAppMessagePage {

@@ -6,6 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"go.kenn.io/kit/atomicfile"
 )
 
 type syncState struct {
@@ -78,7 +80,7 @@ func saveState(path string, st *syncState) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp state file: %w", err)
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := atomicfile.Replace(tmpName, path); err != nil {
 		return fmt.Errorf("replace state file: %w", err)
 	}
 	return nil

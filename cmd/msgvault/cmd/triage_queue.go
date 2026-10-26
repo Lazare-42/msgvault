@@ -132,7 +132,7 @@ func runTriageQueue(cmd *cobra.Command, _ []string) error {
 	defer func() { _ = st.Close() }()
 	engine := daemonclient.NewEngineAdapter(st)
 
-	accounts, err := st.GetCLIAccounts(ctx)
+	accounts, _, err := st.GetCLIAccounts(ctx)
 	if err != nil {
 		return fmt.Errorf("list accounts: %w", err)
 	}
@@ -144,9 +144,9 @@ func runTriageQueue(cmd *cobra.Command, _ []string) error {
 	// Resolve the live mail client before the (potentially long) scan so
 	// configuration problems surface immediately. Dry runs never touch
 	// the mail server and skip this entirely.
-	var apiClient gmail.API
+	var apiClient gmail.LiveAPI
 	if !triageDryRun {
-		src, err := lookupAccountWriteSource(account)
+		src, err := lookupAccountWriteSource(cmd.Context(), account)
 		if err != nil {
 			return err
 		}
@@ -156,7 +156,7 @@ func runTriageQueue(cmd *cobra.Command, _ []string) error {
 					"and support only IMAP-backed sources (use --dry-run to classify without moving)",
 				account.Email, src.SourceType)
 		}
-		apiClient, err = buildAPIClient(ctx, src, oauthManagerCache(), nil)
+		apiClient, err = buildIMAPAPIClient(ctx, src.Identifier, src.SyncConfig.String)
 		if err != nil {
 			return err
 		}
@@ -272,7 +272,7 @@ func triageCutoff(cmd *cobra.Command) (time.Time, error) {
 // set of archive message IDs. Empty segments are ignored.
 func parseTriageSkipIDs(raw string) (map[int64]bool, error) {
 	ids := map[int64]bool{}
-	for _, part := range strings.Split(raw, ",") {
+	for part := range strings.SplitSeq(raw, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue

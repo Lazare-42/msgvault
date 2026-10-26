@@ -128,7 +128,7 @@ func TestIMAPRelocationAdoptsEditedSentSnapshot(t *testing.T) {
 	assert.Contains(message.BodyHTML, "htmlfinal")
 	assert.Empty(message.Snippet)
 	assert.Equal(int64(len(sentRaw)), message.SizeEstimate)
-	assert.ElementsMatch([]string{"Envoyes"}, message.Labels)
+	assert.ElementsMatch([]string{"Envoyes", "UNREAD"}, message.Labels)
 	raw, err := env.Store.GetMessageRaw(initialID)
 	require.NoError(err)
 	assert.Equal(sentRaw, raw)
@@ -215,7 +215,7 @@ func TestIMAPPartialRelocationMergesLabelsAndRefreshesContent(t *testing.T) {
 	assert.Equal("Envoyes|1", message.SourceMessageID)
 	assert.Equal("Partial final", message.Subject)
 	assert.Contains(message.BodyText, "finalword")
-	assert.ElementsMatch([]string{"Archive", "Brouillons", "Envoyes"}, message.Labels)
+	assert.ElementsMatch([]string{"Archive", "Brouillons", "Envoyes", "UNREAD"}, message.Labels)
 	require.NoError(partialClient.Close())
 }
 
@@ -261,7 +261,7 @@ func TestIMAPDeferredRelocationPreservesLabelsUntilFinalization(t *testing.T) {
 	require.NoError(err)
 	assert.Equal("Envoyes|1", message.SourceMessageID)
 	assert.Contains(message.BodyText, "finalword")
-	assert.ElementsMatch([]string{"Brouillons"}, message.Labels,
+	assert.ElementsMatch([]string{"Brouillons", "UNREAD"}, message.Labels,
 		"Syncer leaves labels untouched until the command-layer mailbox delta transaction")
 	require.NoError(secondClient.Close())
 }
@@ -332,7 +332,7 @@ func TestIMAPPreferredAllMailAdoptionPreservesSnapshot(t *testing.T) {
 	raw, err := env.Store.GetMessageRaw(internalID)
 	require.NoError(err)
 	assert.Equal(draftRaw, raw)
-	assert.ElementsMatch([]string{"All Mail", "INBOX"}, message.Labels)
+	assert.ElementsMatch([]string{"All Mail", "INBOX", "UNREAD"}, message.Labels)
 	require.Len(message.Attachments, 2)
 	filenames := []string{message.Attachments[0].Filename, message.Attachments[1].Filename}
 	assert.ElementsMatch([]string{"old.bin", "provider.bin"}, filenames)
@@ -823,7 +823,7 @@ func TestIMAPPreferredAdoptionKeepsOldKeyOnLabelFailure(t *testing.T) {
 	require.NoError(err)
 	assert.Equal("INBOX|1", message.SourceMessageID,
 		"a failed preferred adoption must not consume the old composite key")
-	assert.Equal([]string{"INBOX"}, message.Labels,
+	assert.ElementsMatch([]string{"INBOX", "UNREAD"}, message.Labels,
 		"a failed preferred adoption must not mutate labels")
 	assert.Contains(message.BodyText, "atomicword")
 
@@ -838,5 +838,5 @@ func TestIMAPPreferredAdoptionKeepsOldKeyOnLabelFailure(t *testing.T) {
 	message, err = env.Store.GetMessage(internalID)
 	require.NoError(err)
 	assert.Equal("All Mail|1", message.SourceMessageID)
-	assert.ElementsMatch([]string{"All Mail", "INBOX"}, message.Labels)
+	assert.ElementsMatch([]string{"All Mail", "INBOX", "UNREAD"}, message.Labels)
 }

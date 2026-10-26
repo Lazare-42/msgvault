@@ -1030,7 +1030,7 @@ type listDraftsResponse struct {
 }
 
 // parseDraft converts a Gmail API draft response to our domain type.
-func parseDraft(d gmailDraft) *Draft {
+func parseDraft(d gmailDraft) *ComposedDraft {
 	msg := d.Message
 	dm := DraftMessage{
 		ID:       msg.ID,
@@ -1062,7 +1062,7 @@ func parseDraft(d gmailDraft) *Draft {
 		dm.Body = extractBody(msg.Payload)
 	}
 
-	return &Draft{ID: d.ID, Message: dm}
+	return &ComposedDraft{ID: d.ID, Message: dm}
 }
 
 // splitAddresses splits a comma-separated list of email addresses.
@@ -1140,7 +1140,7 @@ func extractBody(p *gmailPayload) string {
 }
 
 // ListDrafts returns drafts matching the optional query.
-func (c *Client) ListDrafts(ctx context.Context, query string, maxResults int) ([]*Draft, error) {
+func (c *LiveClient) ListDrafts(ctx context.Context, query string, maxResults int) ([]*ComposedDraft, error) {
 	params := url.Values{}
 	if maxResults > 0 {
 		params.Set("maxResults", strconv.Itoa(maxResults))
@@ -1165,13 +1165,12 @@ func (c *Client) ListDrafts(ctx context.Context, query string, maxResults int) (
 	}
 
 	// The list endpoint returns minimal data. Fetch each draft for full content.
-	drafts := make([]*Draft, 0, len(resp.Drafts))
+	drafts := make([]*ComposedDraft, 0, len(resp.Drafts))
 	for _, d := range resp.Drafts {
 		full, err := c.GetDraft(ctx, d.ID)
 		if err != nil {
 			// Skip drafts that fail to fetch (may have been deleted)
-			var nfe *NotFoundError
-			if errors.As(err, &nfe) {
+			if _, ok := errors.AsType[*NotFoundError](err); ok {
 				continue
 			}
 			return nil, fmt.Errorf("get draft %s: %w", d.ID, err)
@@ -1183,7 +1182,7 @@ func (c *Client) ListDrafts(ctx context.Context, query string, maxResults int) (
 }
 
 // GetDraft returns a single draft by ID with full message content.
-func (c *Client) GetDraft(ctx context.Context, draftID string) (*Draft, error) {
+func (c *LiveClient) GetDraft(ctx context.Context, draftID string) (*ComposedDraft, error) {
 	params := url.Values{}
 	params.Set("format", "full")
 
@@ -1202,7 +1201,7 @@ func (c *Client) GetDraft(ctx context.Context, draftID string) (*Draft, error) {
 }
 
 // CreateDraft creates a new draft.
-func (c *Client) CreateDraft(ctx context.Context, compose *DraftCompose) (*Draft, error) {
+func (c *LiveClient) CreateDraft(ctx context.Context, compose *DraftCompose) (*ComposedDraft, error) {
 	raw, err := BuildDraftMIME(compose)
 	if err != nil {
 		return nil, fmt.Errorf("build draft MIME: %w", err)
@@ -1240,7 +1239,7 @@ func (c *Client) CreateDraft(ctx context.Context, compose *DraftCompose) (*Draft
 }
 
 // UpdateDraft replaces the content of an existing draft.
-func (c *Client) UpdateDraft(ctx context.Context, draftID string, compose *DraftCompose) (*Draft, error) {
+func (c *LiveClient) UpdateDraft(ctx context.Context, draftID string, compose *DraftCompose) (*ComposedDraft, error) {
 	raw, err := BuildDraftMIME(compose)
 	if err != nil {
 		return nil, fmt.Errorf("build draft MIME: %w", err)
@@ -1278,14 +1277,14 @@ func (c *Client) UpdateDraft(ctx context.Context, draftID string, compose *Draft
 }
 
 // DeleteDraft permanently deletes a draft.
-func (c *Client) DeleteDraft(ctx context.Context, draftID string) error {
+func (c *LiveClient) DeleteDraft(ctx context.Context, draftID string) error {
 	path := fmt.Sprintf("/users/%s/drafts/%s", c.userID, draftID)
 	_, err := c.request(ctx, OpDraftsDelete, "DELETE", path, nil)
 	return err
 }
 
 // SendDraft sends a draft. The draft is removed from drafts afterward.
-func (c *Client) SendDraft(ctx context.Context, draftID string) (*SentMessage, error) {
+func (c *LiveClient) SendDraft(ctx context.Context, draftID string) (*SentMessage, error) {
 	body := struct {
 		ID string `json:"id"`
 	}{ID: draftID}

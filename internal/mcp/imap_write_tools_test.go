@@ -57,7 +57,9 @@ func startIMAPTestServer(t *testing.T) int {
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(func() { _ = server.Close() })
 
-	return listener.Addr().(*net.TCPAddr).Port
+	addr, ok := listener.Addr().(*net.TCPAddr)
+	require.True(t, ok)
+	return addr.Port
 }
 
 // imapFactory returns a GmailClientFactory that builds a fresh IMAP client
@@ -65,7 +67,7 @@ func startIMAPTestServer(t *testing.T) int {
 // new authenticated client that it closes when done.
 func imapFactory(t *testing.T, port int) GmailClientFactory {
 	t.Helper()
-	return func(_ context.Context, email string) (gmail.API, error) {
+	return func(_ context.Context, email string) (gmail.LiveAPI, error) {
 		assert.Equal(t, testIMAPAccount, email, "factory should receive the resolved account email")
 		return imaplib.NewClient(&imaplib.Config{
 			Host:     "127.0.0.1",
@@ -77,7 +79,7 @@ func imapFactory(t *testing.T, port int) GmailClientFactory {
 
 // TestDraftAndLabelToolsOverIMAP drives the MCP draft/label write handlers
 // through a GmailClientFactory that returns a real IMAP client (the same
-// gmail.API implementation used for IMAP and Microsoft 365 sources),
+// gmail.LiveAPI implementation used for IMAP and Microsoft 365 sources),
 // proving the write toolset works for non-Gmail accounts end to end.
 func TestDraftAndLabelToolsOverIMAP(t *testing.T) {
 	require := require.New(t)
@@ -209,6 +211,7 @@ func TestDraftToolsWithoutFactoryReportError(t *testing.T) {
 // a file that was never part of any archived email (e.g. a document just
 // scanned to local disk) to an outgoing draft.
 func TestCreateDraftWithNewAttachmentOverIMAP(t *testing.T) {
+	assert := assert.New(t)
 	require := require.New(t)
 	port := startIMAPTestServer(t)
 	h := &handlers{gmailFactory: imapFactory(t, port)}
@@ -232,7 +235,7 @@ func TestCreateDraftWithNewAttachmentOverIMAP(t *testing.T) {
 		},
 	})
 	require.NotEmpty(created.DraftID, "create_draft should return a draft ID")
-	assert.Equal(t, 1, created.Attachments)
+	assert.Equal(1, created.Attachments)
 
 	// Fetch the draft's raw MIME back over IMAP with a fresh client, the same
 	// way the production sync path would, and parse it with the production
@@ -248,9 +251,9 @@ func TestCreateDraftWithNewAttachmentOverIMAP(t *testing.T) {
 	parsed, err := msgmime.Parse(raw.Raw)
 	require.NoError(err)
 	require.Len(parsed.Attachments, 1)
-	assert.Equal(t, "policy-scan.pdf", parsed.Attachments[0].Filename)
-	assert.Equal(t, "application/pdf", parsed.Attachments[0].ContentType)
-	assert.Equal(t, content, parsed.Attachments[0].Content)
+	assert.Equal("policy-scan.pdf", parsed.Attachments[0].Filename)
+	assert.Equal("application/pdf", parsed.Attachments[0].ContentType)
+	assert.Equal(content, parsed.Attachments[0].Content)
 }
 
 // TestCreateDraftWithArchivedAndNewAttachmentOverIMAP proves a single
@@ -259,6 +262,7 @@ func TestCreateDraftWithNewAttachmentOverIMAP(t *testing.T) {
 // attachment reader) with a brand-new upload (new_attachments) and have both
 // land correctly in the same outgoing draft.
 func TestCreateDraftWithArchivedAndNewAttachmentOverIMAP(t *testing.T) {
+	assert := assert.New(t)
 	require := require.New(t)
 	port := startIMAPTestServer(t)
 
@@ -297,7 +301,7 @@ func TestCreateDraftWithArchivedAndNewAttachmentOverIMAP(t *testing.T) {
 		},
 	})
 	require.NotEmpty(created.DraftID)
-	assert.Equal(t, 2, created.Attachments)
+	assert.Equal(2, created.Attachments)
 
 	client, err := imapFactory(t, port)(context.Background(), testIMAPAccount)
 	require.NoError(err)
@@ -317,11 +321,25 @@ func TestCreateDraftWithArchivedAndNewAttachmentOverIMAP(t *testing.T) {
 
 	archived, ok := byFilename["id-card.jpg"]
 	require.True(ok, "archived attachment present")
-	assert.Equal(t, "image/jpeg", archived.ContentType)
-	assert.Equal(t, archivedContent, archived.Content)
+	assert.Equal("image/jpeg", archived.ContentType)
+	assert.Equal(archivedContent, archived.Content)
 
 	fresh, ok := byFilename["insurance-form.pdf"]
 	require.True(ok, "new attachment present")
-	assert.Equal(t, "application/pdf", fresh.ContentType)
-	assert.Equal(t, newContent, fresh.Content)
+	assert.Equal("application/pdf", fresh.ContentType)
+	assert.Equal(newContent, fresh.Content)
+}
+
+func TestIMAPLabelListOverHTTPHasStructuredObject(t *testing.T) {
+	require := require.New(t)
+	port := startIMAPTestServer(t)
+	response := rawModernCall(t, ServeOptions{GmailFactory: imapFactory(t, port)}, HTTPOptions{}, "tools/call", map[string]any{
+		"name":      ToolListGmailLabels,
+		"arguments": map[string]any{"account": testIMAPAccount},
+	})
+	require.Empty(response.Error)
+	require.NotEqual(true, response.Result["isError"])
+	structured, ok := response.Result["structuredContent"].(map[string]any)
+	require.True(ok)
+	assert.NotEmpty(t, structured["labels"])
 }

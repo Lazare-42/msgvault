@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
-	"path/filepath"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -24,7 +24,6 @@ import (
 	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/vector/visual"
 	"go.kenn.io/msgvault/pkg/client/generated"
-	"go.kenn.io/msgvault/internal/oauth"
 	"google.golang.org/api/docs/v1"
 	"google.golang.org/api/drive/v3"
 	"google.golang.org/api/option"
@@ -131,8 +130,10 @@ Add to Claude Desktop config:
 		// Set up the live mail client factory for draft/label operations.
 		// If neither Gmail OAuth nor an IMAP account is available, the
 		// write tools are simply not exposed.
-		opts.GmailFactory = buildGmailFactory(ctx, st)
-		opts.GoogleDocsFactory = buildGoogleDocsFactory()
+		if !isAgentMode(state) {
+			opts.GmailFactory = buildGmailFactory(ctx, st)
+			opts.GoogleDocsFactory = buildGoogleDocsFactory(ctx)
+		}
 
 		if httpAddr != "" {
 			return serveMCPHTTPWithOptions(ctx, opts, mcpserver.HTTPOptions{
@@ -547,11 +548,15 @@ func (s daemonMCPSimilarSearcher) FindSimilar(
 // (OAuth tokens, IMAP passwords, Microsoft refresh tokens or certificates)
 // live locally (cfg.TokensDir() or configured paths) and are read directly.
 func buildGmailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.GmailClientFactory {
-	secretsPath, secretsErr := cfg.OAuth.ClientSecretsFor("")
-	oauthConfigured := secretsErr == nil
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil {
+		return nil
+	}
+	cfg, logger := state.cfg, state.logger
+	oauthConfigured := cfg.OAuth.HasAnyConfig()
 
 	hasIMAP := false
-	if accounts, err := st.GetCLIAccounts(ctx); err == nil {
+	if accounts, _, err := st.GetCLIAccounts(ctx); err == nil {
 		for _, a := range accounts {
 			if a.Type == sourceTypeIMAP {
 				hasIMAP = true
@@ -568,9 +573,10 @@ func buildGmailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.G
 		return nil
 	}
 
-	return func(ctx context.Context, email string) (gmail.API, error) {
+	return func(ctx context.Context, email string) (gmail.LiveAPI, error) {
+		ctx = withInvocation(ctx, state)
 		// Look up the account's source type and OAuth app binding via the daemon.
-		accounts, err := st.GetCLIAccounts(ctx)
+		accounts, _, err := st.GetCLIAccounts(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("lookup account %s: %w", email, err)
 		}
@@ -590,20 +596,7 @@ func buildGmailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.G
 			return buildIMAPAPIClient(ctx, account.Email, account.SyncConfig)
 
 		case sourceTypeGmail, "":
-			if !oauthConfigured {
-				return nil, fmt.Errorf("Gmail OAuth not configured for %s: %v", email, secretsErr)
-			}
-
-			// Resolve the correct OAuth app for this account
-			appSecrets := secretsPath
-			if account.OAuthApp != "" {
-				appSecrets, err = cfg.OAuth.ClientSecretsFor(account.OAuthApp)
-				if err != nil {
-					return nil, fmt.Errorf("OAuth app %q: %w", account.OAuthApp, err)
-				}
-			}
-
-			oauthMgr, err := oauth.NewManager(appSecrets, cfg.TokensDir(), logger)
+			oauthMgr, err := loadOAuthManager(ctx, state, account.OAuthApp)
 			if err != nil {
 				return nil, fmt.Errorf("create OAuth manager: %w", err)
 			}
@@ -619,7 +612,7 @@ func buildGmailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.G
 				gmail.WithRateLimiter(rateLimiter),
 			)
 
-			return client, nil
+			return gmail.NewLiveClient(client), nil
 
 		default:
 			return nil, fmt.Errorf("account %s has source type %q, which does not support draft/label operations", email, account.Type)
@@ -629,27 +622,33 @@ func buildGmailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.G
 
 // buildGoogleDocsFactory returns a GoogleDocsClientFactory for configured
 // Drive folder sources. It returns nil when no Google Docs sources are enabled.
-func buildGoogleDocsFactory() mcpserver.GoogleDocsClientFactory {
+func buildGoogleDocsFactory(ctx context.Context) mcpserver.GoogleDocsClientFactory {
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil {
+		return nil
+	}
+	cfg := state.cfg
 	sources := cfg.EnabledGoogleDocsSources()
 	if len(sources) == 0 {
 		return nil
 	}
 
 	return func(ctx context.Context) (googledocs.Client, error) {
+		ctx = withInvocation(ctx, state)
 		services := make([]googledocs.SourceServices, 0, len(sources))
 		for _, src := range sources {
 			if err := googledocs.ValidateSource(src); err != nil {
 				return nil, err
 			}
-			clientSecrets, err := cfg.OAuth.ClientSecretsFor(src.OAuthApp)
+			clientSecrets, err := cfg.OAuth.CredentialsFor(src.OAuthApp)
 			if err != nil {
 				return nil, fmt.Errorf("OAuth for google-docs source %q: %w", src.Name, err)
 			}
-			mgr, err := newGoogleDocsDriveOAuthManager(clientSecrets)
+			mgr, err := newGoogleDocsDriveOAuthManager(ctx, clientSecrets)
 			if err != nil {
 				return nil, fmt.Errorf("create OAuth manager for google-docs source %q: %w", src.Name, err)
 			}
-			if !googleDocsDriveTokenReady(mgr, src.GoogleAccount) {
+			if !googleDocsDriveTokenReady(ctx, mgr, src.GoogleAccount) {
 				return nil, fmt.Errorf("no Google Docs OAuth token with Drive/Docs scopes for %s; run 'msgvault add-google-docs-drive %s --folder-id %s --google-account %s' on a machine with browser auth first",
 					src.GoogleAccount, src.Name, src.FolderID, src.GoogleAccount)
 			}

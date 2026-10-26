@@ -27,6 +27,7 @@ import (
 	"go.kenn.io/msgvault/internal/fileutil"
 	"go.kenn.io/msgvault/internal/identityops"
 	"go.kenn.io/msgvault/internal/netguard"
+	"go.kenn.io/msgvault/internal/ocr"
 	"go.kenn.io/msgvault/internal/omi"
 	"go.kenn.io/msgvault/internal/peoplesweep"
 	"go.kenn.io/msgvault/internal/personenrichment"
@@ -34,7 +35,6 @@ import (
 	"go.kenn.io/msgvault/internal/recordingref"
 	"go.kenn.io/msgvault/internal/sqliteutil"
 	"go.kenn.io/msgvault/internal/store"
-	"go.kenn.io/msgvault/internal/ocr"
 	"go.kenn.io/msgvault/internal/taskclient"
 	"go.kenn.io/msgvault/internal/twenty"
 	"go.kenn.io/msgvault/internal/vector"
@@ -614,8 +614,8 @@ type Config struct {
 	IMAP               IMAPConfig                      `toml:"imap"`
 	Gmail              GmailConfig                     `toml:"gmail"`
 	Telemetry          TelemetryConfig                 `toml:"telemetry"`
-	GoogleDocs GoogleDocsConfig `toml:"google_docs"`
-	OCR OCRConfig `toml:"ocr"`
+	GoogleDocs         GoogleDocsConfig                `toml:"google_docs"`
+	OCR                OCRConfig                       `toml:"ocr"`
 
 	// Computed paths (not from config file)
 	HomeDir            string `toml:"-"`
@@ -802,7 +802,7 @@ func (o *OCRConfig) ApplyDefaults(homeDir string) {
 	}
 }
 
-func (o OCRConfig) Validate() error {
+func (o *OCRConfig) Validate() error {
 	if o.Enabled && !filepath.IsAbs(o.Socket) {
 		return fmt.Errorf("invalid [ocr] socket %q: must be an absolute path", o.Socket)
 	}
@@ -1013,11 +1013,11 @@ func NewDefaultConfig() *Config {
 		SynctechSMS: SynctechSMSConfig{Sources: []SynctechSMSSource{}},
 		GCal:        []GCalSource{},
 		// Group-room media is capped by default; see DefaultMediaMaxParticipants.
-		Beeper:  BeeperConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
-		Slack:   SlackConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
-		Discord: DiscordConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
-		Teams:   TeamsConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
-		GoogleDocs:  GoogleDocsConfig{Sources: []GoogleDocsSource{}},
+		Beeper:     BeeperConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
+		Slack:      SlackConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
+		Discord:    DiscordConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
+		Teams:      TeamsConfig{MediaMaxParticipants: DefaultMediaMaxParticipants},
+		GoogleDocs: GoogleDocsConfig{Sources: []GoogleDocsSource{}},
 	}
 	cfg.Attachments.Documents = documentindex.DefaultDocumentsConfig()
 	cfg.Vector.ApplyDefaults()

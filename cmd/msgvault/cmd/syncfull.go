@@ -365,7 +365,12 @@ func configuredTrustedSentMailboxes(identifier string, cfg *config.Config) []str
 // daemon rather than a local *store.Source. Handles both auth models:
 // XOAUTH2 (Microsoft 365 delegated or app-only certificate flow) and
 // password (stored credentials in the tokens dir).
-func buildIMAPAPIClient(ctx context.Context, identifier, syncConfigJSON string, imapOpts ...imaplib.Option) (gmail.API, error) {
+func buildIMAPAPIClient(ctx context.Context, identifier, syncConfigJSON string, imapOpts ...imaplib.Option) (gmail.LiveAPI, error) {
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil {
+		return nil, errors.New("configuration is unavailable")
+	}
+	cfg, logger := state.cfg, state.logger
 	if syncConfigJSON == "" {
 		return nil, fmt.Errorf("IMAP source %s has no config (run 'add-imap' first)", identifier)
 	}

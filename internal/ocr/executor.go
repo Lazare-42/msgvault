@@ -9,8 +9,8 @@ import (
 	"fmt"
 	"image"
 	"image/color"
-	_ "image/gif"
-	_ "image/jpeg"
+	_ "image/gif"  // Register GIF decoding for OCR input.
+	_ "image/jpeg" // Register JPEG decoding for OCR input.
 	"image/png"
 	"io"
 	"net"
@@ -116,7 +116,7 @@ func ServeExecutor(ctx context.Context, cfg ExecutorConfig) error {
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()
-		shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdown, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdown)
 	}()
@@ -137,7 +137,7 @@ func extractRequest(r *http.Request, cfg ExecutorConfig) Response {
 	if err != nil {
 		return failure("temporary_storage", err.Error(), false)
 	}
-	defer os.RemoveAll(dir)
+	defer func() { _ = os.RemoveAll(dir) }()
 	input := filepath.Join(dir, "input")
 	f, err := os.OpenFile(input, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
@@ -342,6 +342,7 @@ func upscaleImage(ctx context.Context, input string, scale int) (string, image.C
 			return "", image.Config{}, false, err
 		}
 		for sourceX := range bounds.Dx() {
+			//nolint:forcetypeassert // The standard NRGBA color model always returns color.NRGBA.
 			pixel := color.NRGBAModel.Convert(source.At(bounds.Min.X+sourceX, bounds.Min.Y+sourceY)).(color.NRGBA)
 			for dy := range scale {
 				row := (sourceY*scale+dy)*target.Stride + sourceX*scale*4
@@ -403,7 +404,7 @@ func tesseractPage(ctx context.Context, cfg ExecutorConfig, imagePath string, pa
 }
 
 func parsePDFPages(info string) int {
-	for _, line := range strings.Split(info, "\n") {
+	for line := range strings.SplitSeq(info, "\n") {
 		key, value, ok := strings.Cut(line, ":")
 		if ok && strings.EqualFold(strings.TrimSpace(key), "Pages") {
 			n, _ := strconv.Atoi(strings.TrimSpace(value))
@@ -426,7 +427,7 @@ func splitPDFText(text []byte, pages int) []string {
 
 func estimatedPDFPixels(info string, page, dpi int) int64 {
 	var fallback int64
-	for _, line := range strings.Split(info, "\n") {
+	for line := range strings.SplitSeq(info, "\n") {
 		key, value, ok := strings.Cut(line, ":")
 		if !ok {
 			continue
@@ -507,6 +508,7 @@ func parseTSV(data []byte) (string, float64) {
 
 type cappedBuffer struct {
 	bytes.Buffer
+
 	max int64
 }
 
@@ -514,14 +516,19 @@ func (b *cappedBuffer) Write(p []byte) (int, error) {
 	if int64(b.Len()+len(p)) > b.max {
 		return 0, errors.New("command output exceeds limit")
 	}
-	return b.Buffer.Write(p)
+	n, err := b.Buffer.Write(p)
+	if err != nil {
+		return n, fmt.Errorf("capture command output: %w", err)
+	}
+	return n, nil
 }
 
-func runBounded(ctx context.Context, max int64, name string, args ...string) ([]byte, error) {
+func runBounded(ctx context.Context, outputLimit int64, name string, args ...string) ([]byte, error) {
 	var stdout cappedBuffer
-	stdout.max = max
+	stdout.max = outputLimit
 	var stderr cappedBuffer
 	stderr.max = 256 << 10
+	//nolint:gosec // Only configured OCR executables are invoked, with arguments passed without a shell.
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	if err := cmd.Run(); err != nil {

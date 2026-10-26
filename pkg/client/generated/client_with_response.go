@@ -921,11 +921,12 @@ func (c *Client) GetAttachmentContentWithResponse(ctx context.Context, options *
 }
 
 // GetAttachmentText Get cached attachment text
-func (c *Client) GetAttachmentTextWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetAttachmentTextResp, error) {
+func (c *Client) GetAttachmentTextWithResponse(ctx context.Context, options *GetAttachmentTextRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetAttachmentTextResp, error) {
 	var err error
 	reqParams := runtime.RequestOptionsParameters{
 		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/attachments/{hash}/text",
 		Method:     "GET",
+		Options:    options,
 	}
 
 	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
@@ -961,19 +962,32 @@ func (c *Client) GetAttachmentTextWithResponse(ctx context.Context, reqEditors .
 			}
 		}
 		return out, nil
-	case 500:
-		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
 	default:
-		return out, runtime.NewClientAPIError(fmt.Errorf("unexpected status code: %d", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+		out.JSONDefault = new(GetAttachmentTextErrorResponse)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSONDefault); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "GetAttachmentTextErrorResponse",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
 	}
 }
 
 // RequestAttachmentText Queue attachment text extraction
-func (c *Client) RequestAttachmentTextWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*RequestAttachmentTextResp, error) {
+func (c *Client) RequestAttachmentTextWithResponse(ctx context.Context, options *RequestAttachmentTextRequestOptions, reqEditors ...runtime.RequestEditorFn) (*RequestAttachmentTextResp, error) {
 	var err error
 	reqParams := runtime.RequestOptionsParameters{
 		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/attachments/{hash}/text/request",
 		Method:     "POST",
+		Options:    options,
 	}
 
 	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
@@ -993,11 +1007,11 @@ func (c *Client) RequestAttachmentTextWithResponse(ctx context.Context, reqEdito
 	}
 
 	switch resp.StatusCode {
-	case 200:
-		out.JSON200 = new(RequestAttachmentTextResponse)
+	case 202:
+		out.JSON202 = new(RequestAttachmentTextResponse)
 		bodyBytes := resp.Content
 		if len(bodyBytes) > 0 {
-			if err := json.Unmarshal(bodyBytes, out.JSON200); err != nil {
+			if err := json.Unmarshal(bodyBytes, out.JSON202); err != nil {
 				return out, &runtime.ResponseDecodeError{
 					StatusCode:    resp.StatusCode,
 					ContentType:   resp.Headers.Get("Content-Type"),
@@ -1009,10 +1023,22 @@ func (c *Client) RequestAttachmentTextWithResponse(ctx context.Context, reqEdito
 			}
 		}
 		return out, nil
-	case 500:
-		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
 	default:
-		return out, runtime.NewClientAPIError(fmt.Errorf("unexpected status code: %d", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+		out.JSONDefault = new(RequestAttachmentTextErrorResponse)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSONDefault); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "RequestAttachmentTextErrorResponse",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
 	}
 }
 
@@ -11967,11 +11993,13 @@ func (c *Client) SuggestFilesWithResponse(ctx context.Context, options *SuggestF
 }
 
 // SearchAttachmentText Search cached attachment text
-func (c *Client) SearchAttachmentTextWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*SearchAttachmentTextResp, error) {
+func (c *Client) SearchAttachmentTextWithResponse(ctx context.Context, options *SearchAttachmentTextRequestOptions, reqEditors ...runtime.RequestEditorFn) (*SearchAttachmentTextResp, error) {
 	var err error
 	reqParams := runtime.RequestOptionsParameters{
-		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/files/text-search",
-		Method:     "POST",
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/v1/files/text-search",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
 	}
 
 	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
@@ -12007,10 +12035,22 @@ func (c *Client) SearchAttachmentTextWithResponse(ctx context.Context, reqEditor
 			}
 		}
 		return out, nil
-	case 500:
-		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
 	default:
-		return out, runtime.NewClientAPIError(fmt.Errorf("unexpected status code: %d", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+		out.JSONDefault = new(SearchAttachmentTextErrorResponse)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSONDefault); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "SearchAttachmentTextErrorResponse",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
 	}
 }
 
@@ -17421,6 +17461,66 @@ func (c *Client) GetVisualAttachmentStatusWithResponse(ctx context.Context, reqE
 					ContentType:   resp.Headers.Get("Content-Type"),
 					ContentLength: len(bodyBytes),
 					TargetType:    "GetVisualAttachmentStatusErrorResponse",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	}
+}
+
+// GetOCRStatus Get attachment text extraction status
+func (c *Client) GetOCRStatusWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetOCRStatusResp, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/ocr/status",
+		Method:     "GET",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/ocr/status")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+
+	out := &GetOCRStatusResp{
+		HTTPResponse: resp.Raw,
+		Body:         resp.Content,
+		StatusCode:   resp.StatusCode,
+	}
+
+	switch resp.StatusCode {
+	case 200:
+		out.JSON200 = new(GetOCRStatusResponse)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON200); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "GetOCRStatusResponse",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, nil
+	default:
+		out.JSONDefault = new(GetOCRStatusErrorResponse)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSONDefault); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "GetOCRStatusErrorResponse",
 					Body:          bodyBytes,
 					Err:           err,
 				}

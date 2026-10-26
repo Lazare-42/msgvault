@@ -17,6 +17,7 @@ export interface CliAccountResponse {
   oauth_app?: string;
   reanchor_required: boolean;
   source_deleted_count: number;
+  sync_config?: string;
   type: string;
   virtual_accounts?: VirtualAccount[];
   [key: string]: unknown;

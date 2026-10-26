@@ -671,6 +671,8 @@ func TestStore_MessageLabels(t *testing.T) {
 }
 
 func TestStore_RemoveStaleFlagLabels(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	f := storetest.New(t)
 
 	msgID := f.CreateMessage("msg-1")
@@ -695,7 +697,7 @@ func TestStore_RemoveStaleFlagLabels(t *testing.T) {
 		userLabels["Archive"],
 		keywordLabels["Traite"],
 	})
-	require.NoError(t, err, "ReplaceMessageLabels()")
+	require.NoError(err, "ReplaceMessageLabels()")
 
 	// The message was read and its category removed; the star remains.
 	keep := []int64{
@@ -704,8 +706,8 @@ func TestStore_RemoveStaleFlagLabels(t *testing.T) {
 		systemLabels["STARRED"],
 	}
 	changed, err := f.Store.RemoveStaleFlagLabels(msgID, f.Source.ID, keep)
-	require.NoError(t, err, "RemoveStaleFlagLabels()")
-	assert.True(t, changed, "stale UNREAD and Traite should be removed")
+	require.NoError(err, "RemoveStaleFlagLabels()")
+	assert.True(changed, "stale UNREAD and Traite should be removed")
 
 	f.AssertLabelCount(msgID, 3)
 	f.AssertMessageHasLabel(msgID, systemLabels["INBOX"])
@@ -714,14 +716,14 @@ func TestStore_RemoveStaleFlagLabels(t *testing.T) {
 
 	// Idempotent: nothing left to remove.
 	changed, err = f.Store.RemoveStaleFlagLabels(msgID, f.Source.ID, keep)
-	require.NoError(t, err, "RemoveStaleFlagLabels() second call")
-	assert.False(t, changed, "no stale flag labels remain")
+	require.NoError(err, "RemoveStaleFlagLabels() second call")
+	assert.False(changed, "no stale flag labels remain")
 
 	// An empty keep set clears all flag-derived labels but preserves
 	// mailbox and user labels.
 	changed, err = f.Store.RemoveStaleFlagLabels(msgID, f.Source.ID, nil)
-	require.NoError(t, err, "RemoveStaleFlagLabels() empty keep")
-	assert.True(t, changed, "STARRED should be removed")
+	require.NoError(err, "RemoveStaleFlagLabels() empty keep")
+	assert.True(changed, "STARRED should be removed")
 	f.AssertLabelCount(msgID, 2)
 	f.AssertMessageHasLabel(msgID, systemLabels["INBOX"])
 	f.AssertMessageHasLabel(msgID, userLabels["Archive"])

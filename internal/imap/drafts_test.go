@@ -27,6 +27,8 @@ const (
 )
 
 func TestClientCreateDraftAppendsToDrafts(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	client := newDraftTestClient(t)
 
 	compose := &gmailapi.DraftCompose{
@@ -38,34 +40,36 @@ func TestClientCreateDraftAppendsToDrafts(t *testing.T) {
 	}
 
 	draft, err := client.CreateDraft(context.Background(), compose)
-	require.NoError(t, err)
-	require.NotNil(t, draft)
-	assert.Equal(t, "Synthetic IMAP draft", draft.Message.Subject)
-	assert.Equal(t, []string{"alice@example.com"}, draft.Message.To)
+	require.NoError(err)
+	require.NotNil(draft)
+	assert.Equal("Synthetic IMAP draft", draft.Message.Subject)
+	assert.Equal([]string{"alice@example.com"}, draft.Message.To)
 
 	mailbox, uid, err := parseCompositeID(draft.ID)
-	require.NoError(t, err)
-	assert.Equal(t, "Drafts", mailbox)
-	assert.NotZero(t, uid)
+	require.NoError(err)
+	assert.Equal("Drafts", mailbox)
+	assert.NotZero(uid)
 
 	raw, err := client.GetMessageRaw(context.Background(), draft.ID)
-	require.NoError(t, err)
-	require.NotNil(t, raw)
+	require.NoError(err)
+	require.NotNil(raw)
 
 	msg, err := mail.ReadMessage(bytes.NewReader(raw.Raw))
-	require.NoError(t, err)
-	assert.Contains(t, msg.Header.Get("To"), "alice@example.com")
-	assert.Contains(t, msg.Header.Get("Cc"), "bob@example.com")
-	assert.Equal(t, "Synthetic IMAP draft", msg.Header.Get("Subject"))
-	assert.Equal(t, "<orig@example.com>", msg.Header.Get("In-Reply-To"))
-	assert.Equal(t, "<orig@example.com>", msg.Header.Get("References"))
-	assert.Contains(t, string(raw.Raw), "Content-Transfer-Encoding: base64")
+	require.NoError(err)
+	assert.Contains(msg.Header.Get("To"), "alice@example.com")
+	assert.Contains(msg.Header.Get("Cc"), "bob@example.com")
+	assert.Equal("Synthetic IMAP draft", msg.Header.Get("Subject"))
+	assert.Equal("<orig@example.com>", msg.Header.Get("In-Reply-To"))
+	assert.Equal("<orig@example.com>", msg.Header.Get("References"))
+	assert.Contains(string(raw.Raw), "Content-Transfer-Encoding: base64")
 
 	flags := fetchMessageFlags(t, client, mailbox, uid)
-	assert.Contains(t, flags, goimap.FlagDraft)
+	assert.Contains(flags, goimap.FlagDraft)
 }
 
 func TestClientDraftCRUD(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	client := newDraftTestClient(t)
 
 	first, err := client.CreateDraft(context.Background(), &gmailapi.DraftCompose{
@@ -73,42 +77,43 @@ func TestClientDraftCRUD(t *testing.T) {
 		Subject: "first draft",
 		Body:    "first body",
 	})
-	require.NoError(t, err)
+	require.NoError(err)
 
 	got, err := client.GetDraft(context.Background(), first.ID)
-	require.NoError(t, err)
-	assert.Equal(t, "first draft", got.Message.Subject)
-	assert.Equal(t, "first body", strings.TrimSpace(got.Message.Body))
+	require.NoError(err)
+	assert.Equal("first draft", got.Message.Subject)
+	assert.Equal("first body", strings.TrimSpace(got.Message.Body))
 
 	listed, err := client.ListDrafts(context.Background(), "first", 10)
-	require.NoError(t, err)
-	require.Len(t, listed, 1)
-	assert.Equal(t, first.ID, listed[0].ID)
+	require.NoError(err)
+	require.Len(listed, 1)
+	assert.Equal(first.ID, listed[0].ID)
 
 	updated, err := client.UpdateDraft(context.Background(), first.ID, &gmailapi.DraftCompose{
 		To:      []string{"bob@example.com"},
 		Subject: "updated draft",
 		Body:    "updated body",
 	})
-	require.NoError(t, err)
-	assert.NotEqual(t, first.ID, updated.ID)
-	assert.Equal(t, "updated draft", updated.Message.Subject)
+	require.NoError(err)
+	assert.NotEqual(first.ID, updated.ID)
+	assert.Equal("updated draft", updated.Message.Subject)
 
 	_, err = client.GetDraft(context.Background(), first.ID)
-	assert.Error(t, err)
+	require.Error(err)
 
 	listed, err = client.ListDrafts(context.Background(), "", 10)
-	require.NoError(t, err)
-	require.Len(t, listed, 1)
-	assert.Equal(t, updated.ID, listed[0].ID)
-
-	require.NoError(t, client.DeleteDraft(context.Background(), updated.ID))
+	require.NoError(err)
+	require.Len(listed, 1)
+	assert.Equal(updated.ID, listed[0].ID)
+	require.NoError(client.DeleteDraft(context.Background(), updated.ID))
 	listed, err = client.ListDrafts(context.Background(), "", 10)
-	require.NoError(t, err)
-	assert.Empty(t, listed)
+	require.NoError(err)
+	assert.Empty(listed)
 }
 
 func TestClientSendDraftSendsAppendsSentAndDeletesDraft(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	client := newDraftTestClient(t)
 
 	var sentFrom string
@@ -128,72 +133,72 @@ func TestClientSendDraftSendsAppendsSentAndDeletesDraft(t *testing.T) {
 		Subject: "send me",
 		Body:    "send body",
 	})
-	require.NoError(t, err)
+	require.NoError(err)
 
 	sent, err := client.SendDraft(context.Background(), draft.ID)
-	require.NoError(t, err)
-	require.NotNil(t, sent)
-
-	assert.Equal(t, testIMAPUsername, sentFrom)
-	assert.ElementsMatch(t, []string{"alice@example.com", "bob@example.com", "carol@example.com"}, sentTo)
-	assert.Contains(t, string(sentRaw), "Subject: send me")
-	assert.Equal(t, []string{"Sent Items"}, sent.LabelIDs)
+	require.NoError(err)
+	require.NotNil(sent)
+	assert.Equal(testIMAPUsername, sentFrom)
+	assert.ElementsMatch([]string{"alice@example.com", "bob@example.com", "carol@example.com"}, sentTo)
+	assert.Contains(string(sentRaw), "Subject: send me")
+	assert.Equal([]string{"Sent Items"}, sent.LabelIDs)
 
 	_, err = client.GetDraft(context.Background(), draft.ID)
-	assert.Error(t, err)
+	require.Error(err)
 
 	raw, err := client.GetMessageRaw(context.Background(), sent.ID)
-	require.NoError(t, err)
-	require.NotNil(t, raw)
+	require.NoError(err)
+	require.NotNil(raw)
 	msg, err := mail.ReadMessage(bytes.NewReader(raw.Raw))
-	require.NoError(t, err)
-	assert.Equal(t, "send me", msg.Header.Get("Subject"))
+	require.NoError(err)
+	assert.Equal("send me", msg.Header.Get("Subject"))
 
 	drafts, err := client.ListDrafts(context.Background(), "", 10)
-	require.NoError(t, err)
-	assert.Empty(t, drafts)
+	require.NoError(err)
+	assert.Empty(drafts)
 }
 
 func TestClientModifyMessageLabelsFlagSubset(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	client := newDraftTestClient(t)
 	id := appendTestMessage(t, client, "INBOX", &gmailapi.DraftCompose{
 		To:      []string{"alice@example.com"},
 		Subject: "label flags",
 		Body:    "body",
-	}, nil)
+	})
 	_, uid, err := parseCompositeID(id)
-	require.NoError(t, err)
-
-	require.NoError(t, client.ModifyMessageLabels(
+	require.NoError(err)
+	require.NoError(client.ModifyMessageLabels(
 		context.Background(),
 		id,
 		[]string{"STARRED"},
 		[]string{"UNREAD"},
 	))
 	flags := fetchMessageFlags(t, client, "INBOX", uid)
-	assert.Contains(t, flags, goimap.FlagFlagged)
-	assert.Contains(t, flags, goimap.FlagSeen)
-
-	require.NoError(t, client.ModifyMessageLabels(
+	assert.Contains(flags, goimap.FlagFlagged)
+	assert.Contains(flags, goimap.FlagSeen)
+	require.NoError(client.ModifyMessageLabels(
 		context.Background(),
 		id,
 		[]string{"UNREAD"},
 		[]string{"STARRED"},
 	))
 	flags = fetchMessageFlags(t, client, "INBOX", uid)
-	assert.NotContains(t, flags, goimap.FlagFlagged)
-	assert.NotContains(t, flags, goimap.FlagSeen)
+	assert.NotContains(flags, goimap.FlagFlagged)
+	assert.NotContains(flags, goimap.FlagSeen)
 }
 
 func TestClientModifyMessageLabelsArchive(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	client := newDraftTestClient(t)
 	id := appendTestMessage(t, client, "INBOX", &gmailapi.DraftCompose{
 		To:      []string{"alice@example.com"},
 		Subject: "archive me",
 		Body:    "body",
-	}, nil)
-
-	require.NoError(t, client.ModifyMessageLabels(
+	})
+	require.NoError(client.ModifyMessageLabels(
 		context.Background(),
 		id,
 		nil,
@@ -201,13 +206,13 @@ func TestClientModifyMessageLabelsArchive(t *testing.T) {
 	))
 
 	_, err := client.GetMessageRaw(context.Background(), id)
-	assert.Error(t, err)
+	require.Error(err)
 
 	archiveIDs := listMailboxMessageIDs(t, client, "Archive")
-	require.Len(t, archiveIDs, 1)
+	require.Len(archiveIDs, 1)
 	raw, err := client.GetMessageRaw(context.Background(), archiveIDs[0])
-	require.NoError(t, err)
-	assert.Contains(t, string(raw.Raw), "Subject: archive me")
+	require.NoError(err)
+	assert.Contains(string(raw.Raw), "Subject: archive me")
 }
 
 func TestClientModifyMessageLabelsRejectsArbitraryLabels(t *testing.T) {
@@ -216,7 +221,7 @@ func TestClientModifyMessageLabelsRejectsArbitraryLabels(t *testing.T) {
 		To:      []string{"alice@example.com"},
 		Subject: "label reject",
 		Body:    "body",
-	}, nil)
+	})
 
 	err := client.ModifyMessageLabels(context.Background(), id, []string{"Projects"}, nil)
 	require.Error(t, err)
@@ -255,7 +260,9 @@ func newDraftTestClient(t *testing.T) *Client {
 		errCh <- server.Serve(listener)
 	}()
 
-	port := listener.Addr().(*net.TCPAddr).Port
+	addr, ok := listener.Addr().(*net.TCPAddr)
+	require.True(t, ok)
+	port := addr.Port
 	client := NewClient(&Config{
 		Host:     "127.0.0.1",
 		Port:     port,
@@ -281,7 +288,6 @@ func appendTestMessage(
 	client *Client,
 	mailbox string,
 	compose *gmailapi.DraftCompose,
-	flags []goimap.Flag,
 ) string {
 	t.Helper()
 
@@ -291,7 +297,7 @@ func appendTestMessage(
 	var id string
 	err = client.withConn(context.Background(), func(conn *imapclient.Client) error {
 		var err error
-		id, err = client.appendMessageLocked(conn, mailbox, raw, flags)
+		id, err = client.appendMessageLocked(conn, mailbox, raw, nil)
 		return err
 	})
 	require.NoError(t, err)
@@ -308,7 +314,7 @@ func listMailboxMessageIDs(t *testing.T, client *Client, mailbox string) []strin
 		}
 		searchData, err := conn.UIDSearch(&goimap.SearchCriteria{}, nil).Wait()
 		if err != nil {
-			return err
+			return fmt.Errorf("read test mailbox: %w", err)
 		}
 		uidSet, ok := searchData.All.(goimap.UIDSet)
 		if !ok {
@@ -339,7 +345,7 @@ func fetchMessageFlags(t *testing.T, client *Client, mailbox string, uid goimap.
 			Flags: true,
 		}).Collect()
 		if err != nil {
-			return err
+			return fmt.Errorf("read test mailbox: %w", err)
 		}
 		if len(msgs) != 1 {
 			return fmt.Errorf("expected 1 fetched draft, got %d", len(msgs))

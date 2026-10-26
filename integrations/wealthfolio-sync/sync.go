@@ -16,6 +16,8 @@ import (
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/store"
+
+	"go.kenn.io/kit/atomicfile"
 )
 
 type syncRunner struct {
@@ -269,7 +271,7 @@ func (r *syncRunner) runRsync(ctx context.Context) error {
 	}
 	args = append(args, r.cfg.OutputDirAbs+string(os.PathSeparator), r.cfg.Delivery.RsyncTarget)
 
-	cmd := exec.CommandContext(ctx, "rsync", args...)
+	cmd := exec.CommandContext(ctx, "rsync", args...) //nolint:gosec // Operator-configured arguments, without a shell.
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
@@ -399,7 +401,7 @@ func copyFileAtomic(srcPath, dstPath string) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp output: %w", err)
 	}
-	if err := os.Rename(tmpName, dstPath); err != nil {
+	if err := atomicfile.Replace(tmpName, dstPath); err != nil {
 		return fmt.Errorf("move attachment into outbox: %w", err)
 	}
 	return nil
@@ -426,5 +428,5 @@ func writeJSONAtomic(path string, value any) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpName, path)
+	return atomicfile.Replace(tmpName, path)
 }

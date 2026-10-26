@@ -36,7 +36,7 @@ type Status struct {
 	SessionPath string `json:"session_path,omitempty"`
 }
 
-func (s Status) IsReady() bool {
+func (s *Status) IsReady() bool {
 	return s.Paired && s.Connected && s.LoggedIn
 }
 
@@ -49,7 +49,7 @@ type QRPairingState struct {
 	Code      string    `json:"code,omitempty"`
 	Event     string    `json:"event,omitempty"`
 	Error     string    `json:"error,omitempty"`
-	ExpiresAt time.Time `json:"expires_at,omitempty"`
+	ExpiresAt time.Time `json:"expires_at,omitzero"`
 	Paired    bool      `json:"paired"`
 }
 
@@ -128,24 +128,24 @@ type RequestHistorySyncResult struct {
 }
 
 type InboundMessage struct {
-	Account   string
-	ChatJID   string
-	ChatTitle string
-	SenderJID string
-	MessageID string
-	PushName  string
-	Text      string
-	Timestamp time.Time
-	IsFromMe  bool
-	IsGroup   bool
-	RawJSON   []byte
-	Reaction  *InboundReaction
+	Account   string           `json:"Account"`
+	ChatJID   string           `json:"ChatJID"`
+	ChatTitle string           `json:"ChatTitle"`
+	SenderJID string           `json:"SenderJID"`
+	MessageID string           `json:"MessageID"`
+	PushName  string           `json:"PushName"`
+	Text      string           `json:"Text"`
+	Timestamp time.Time        `json:"Timestamp"`
+	IsFromMe  bool             `json:"IsFromMe"`
+	IsGroup   bool             `json:"IsGroup"`
+	RawJSON   []byte           `json:"RawJSON"`
+	Reaction  *InboundReaction `json:"Reaction"`
 	// Attachment is non-nil when the message carries a downloadable media
 	// payload (image/video/document/audio/sticker), even if the caption is
 	// empty. A non-nil Attachment with empty Data means the media reference
 	// existed but the bytes could not be downloaded (see DownloadError); the
 	// message is archived regardless so it is never silently dropped.
-	Attachment *InboundAttachment
+	Attachment *InboundAttachment `json:"Attachment"`
 }
 
 // InboundAttachment captures a WhatsApp media payload discovered on an
@@ -154,22 +154,22 @@ type InboundMessage struct {
 // must happen where the *events.Message is first observed (registerEventHandler
 // / archiveHistorySync), not later from stored metadata alone.
 type InboundAttachment struct {
-	Filename  string
-	MimeType  string
-	MediaType string // image, video, document, audio, voice_note, sticker
-	Size      int64
-	Data      []byte
+	Filename  string `json:"Filename"`
+	MimeType  string `json:"MimeType"`
+	MediaType string `json:"MediaType"` // image, video, document, audio, voice_note, sticker
+	Size      int64  `json:"Size"`
+	Data      []byte `json:"Data"`
 	// DownloadError explains why Data is empty (e.g. expired media key,
 	// network failure). Empty when Data was downloaded successfully.
-	DownloadError string
+	DownloadError string `json:"DownloadError"`
 }
 
 type InboundReaction struct {
-	TargetChatJID   string
-	TargetMessageID string
-	TargetSenderJID string
-	Emoji           string
-	TargetFromMe    bool
+	TargetChatJID   string `json:"TargetChatJID"`
+	TargetMessageID string `json:"TargetMessageID"`
+	TargetSenderJID string `json:"TargetSenderJID"`
+	Emoji           string `json:"Emoji"`
+	TargetFromMe    bool   `json:"TargetFromMe"`
 }
 
 type Transport interface {

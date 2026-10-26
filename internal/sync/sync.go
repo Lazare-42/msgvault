@@ -1619,7 +1619,7 @@ type messageData struct {
 	gmailLabelIDs     []string
 	attachments       []mime.Attachment
 	participantMap    map[string]int64
-	flagLabels []string
+	flagLabels        []string
 }
 
 // resolvePreparedMessage performs the store-mutating resolution needed by
@@ -1815,7 +1815,7 @@ func (s *Syncer) prepareMessage(
 		bcc:               parsed.Bcc,
 		gmailLabelIDs:     raw.LabelIDs,
 		attachments:       parsed.Attachments,
-	flagLabels: raw.FlagLabels,
+		flagLabels:        raw.FlagLabels,
 	}, nil
 }
 

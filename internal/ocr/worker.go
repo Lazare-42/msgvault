@@ -13,18 +13,18 @@ import (
 )
 
 type WorkStore interface {
-	EnqueueOCRBacklog(context.Context, string, int) (int64, error)
-	ClaimOCRJob(context.Context, string, time.Duration) (*store.OCRJob, error)
-	CompleteOCR(context.Context, string, string, int, string, []store.OCRPage) error
-	FailOCR(context.Context, string, string, int, string, string, string, time.Duration) error
+	EnqueueOCRBacklog(ctx context.Context, fingerprint string, limit int) (int64, error)
+	ClaimOCRJob(ctx context.Context, fingerprint string, lease time.Duration) (*store.OCRJob, error)
+	CompleteOCR(ctx context.Context, hash string, fingerprint string, attempts int, method string, pages []store.OCRPage) error
+	FailOCR(ctx context.Context, hash string, fingerprint string, attempts int, status string, code string, detail string, retry time.Duration) error
 }
 
 type BlobStore interface {
-	OpenStream(context.Context, string) (io.ReadCloser, int64, error)
+	OpenStream(ctx context.Context, hash string) (io.ReadCloser, int64, error)
 }
 
 type Extractor interface {
-	Extract(context.Context, string, string, int64, io.Reader) (Response, error)
+	Extract(ctx context.Context, hash string, mimeType string, size int64, reader io.Reader) (Response, error)
 }
 
 type WorkerConfig struct {
@@ -151,5 +151,5 @@ func errorsJoin(a, b error) error {
 	if b == nil {
 		return a
 	}
-	return fmt.Errorf("%v; %w", a, b)
+	return fmt.Errorf("%w; %w", a, b)
 }

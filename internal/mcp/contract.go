@@ -75,6 +75,20 @@ func jsonResult(v any) (*toolResult, error) {
 	}, nil
 }
 
+// jsonArrayResult keeps the text array while returning the object-shaped
+// structured content required by MCP.
+func jsonArrayResult(field string, v any) (*toolResult, error) {
+	text, err := json.Marshal(v, json.Deterministic(true))
+	if err != nil {
+		return nil, newInternalError("marshal tool result", err)
+	}
+	structured, err := json.Marshal(map[string]any{field: v}, json.Deterministic(true))
+	if err != nil {
+		return nil, newInternalError("marshal structured tool result", err)
+	}
+	return &toolResult{text: string(text), structuredContent: structured}, nil
+}
+
 func toolErrorResult(text string) *toolResult {
 	return &toolResult{
 		text:    text,

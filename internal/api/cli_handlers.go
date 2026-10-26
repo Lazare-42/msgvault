@@ -2810,14 +2810,22 @@ func (s *Server) handleCLIAccounts(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	owner := s.requestAuthentication(r).Grant == nil
+	accountResponse := func(src *store.Source, count, deleted int64) cliAccountResponse {
+		account := newCLIAccountResponse(src, count, deleted)
+		if owner && src.SourceType == "imap" && src.SyncConfig.Valid {
+			account.SyncConfig = src.SyncConfig.String
+		}
+		return account
+	}
 	accounts := make([]cliAccountResponse, 0, len(sources))
 	for _, src := range sources {
 		if response.CountsPending {
-			accounts = append(accounts, newCLIAccountResponse(src, 0, 0))
+			accounts = append(accounts, accountResponse(src, 0, 0))
 			continue
 		}
 		if grouped != nil {
-			accounts = append(accounts, newCLIAccountResponse(src, grouped[src.ID].Live, grouped[src.ID].SourceDeleted))
+			accounts = append(accounts, accountResponse(src, grouped[src.ID].Live, grouped[src.ID].SourceDeleted))
 			continue
 		}
 		count, err := cliStore.CountMessagesForSource(src.ID)
@@ -2838,9 +2846,7 @@ func (s *Server) handleCLIAccounts(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to list accounts")
 			return
 		}
-		account := newCLIAccountResponse(src, count, sourceDeleted)
-		if src.SourceType == "imap" && src.SyncConfig.Valid { account.SyncConfig = src.SyncConfig.String }
-		accounts = append(accounts, account)
+		accounts = append(accounts, accountResponse(src, count, sourceDeleted))
 	}
 
 	if lister, ok := s.store.(virtualAccountLister); ok {

@@ -1,13 +1,12 @@
 package cmd
 
 import (
-	"testing"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
+	"testing"
 )
 
 // TestLookupAccountWriteSourceInResolvesIMAPByDisplayName guards the
@@ -16,11 +15,13 @@ import (
 // display_name, so a lookup keyed on the email must match display_name
 // too or every IMAP write fails with "no local imap source found".
 func TestLookupAccountWriteSourceInResolvesIMAPByDisplayName(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	s := testutil.NewTestStore(t)
 
 	src, err := s.GetOrCreateSource(sourceTypeIMAP, "imaps://alice@example.com@mail.example.com:993")
-	require.NoError(t, err)
-	require.NoError(t, s.UpdateSourceDisplayName(src.ID, "alice@example.com"))
+	require.NoError(err)
+	require.NoError(s.UpdateSourceDisplayName(src.ID, "alice@example.com"))
 
 	account := daemonclient.CLIAccount{
 		ID:    src.ID,
@@ -29,10 +30,10 @@ func TestLookupAccountWriteSourceInResolvesIMAPByDisplayName(t *testing.T) {
 	}
 
 	got, err := lookupAccountWriteSourceIn(s, account)
-	require.NoError(t, err)
-	assert.Equal(t, src.ID, got.ID)
-	assert.Equal(t, "imaps://alice@example.com@mail.example.com:993", got.Identifier)
-	assert.Equal(t, sourceTypeIMAP, got.SourceType)
+	require.NoError(err)
+	assert.Equal(src.ID, got.ID)
+	assert.Equal("imaps://alice@example.com@mail.example.com:993", got.Identifier)
+	assert.Equal(sourceTypeIMAP, got.SourceType)
 }
 
 func TestPickAccountWriteSource(t *testing.T) {
@@ -70,14 +71,16 @@ func TestPickAccountWriteSource(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
 			got, err := pickAccountWriteSource(tt.sources, account)
 			if tt.wantErr != "" {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tt.wantErr)
+				require.Error(err)
+				assert.Contains(err.Error(), tt.wantErr)
 				return
 			}
-			require.NoError(t, err)
-			assert.Equal(t, tt.want, got)
+			require.NoError(err)
+			assert.Equal(tt.want, got)
 		})
 	}
 }
@@ -146,14 +149,16 @@ func TestResolveSyncableAccount(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
 			got, err := resolveSyncableAccount(tt.accounts, tt.input)
 			if tt.wantErr != "" {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tt.wantErr)
+				require.Error(err)
+				assert.Contains(err.Error(), tt.wantErr)
 				return
 			}
-			require.NoError(t, err)
-			assert.Equal(t, tt.want, got)
+			require.NoError(err)
+			assert.Equal(tt.want, got)
 		})
 	}
 }

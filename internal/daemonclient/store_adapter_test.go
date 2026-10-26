@@ -1372,7 +1372,7 @@ func TestGetCLIAccounts_Success(t *testing.T) {
 	assert.Empty(accounts[0].SyncConfig, "gmail SyncConfig empty")
 
 	assert.Equal("imap", accounts[1].Type, "imap Type")
-	assert.Equal(`{"host":"imap.example.com","port":993}`, accounts[1].SyncConfig, "imap SyncConfig")
+	assert.JSONEq(`{"host":"imap.example.com","port":993}`, accounts[1].SyncConfig, "imap SyncConfig")
 }
 
 func TestCLICollectionMutations(t *testing.T) {

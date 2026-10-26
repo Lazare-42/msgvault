@@ -28,6 +28,17 @@ const (
 )
 
 var topLevelCommandGroups = map[string]string{
+	"add-google-docs-drive":  helpGroupSources,
+	"add-o365-app":           helpGroupSources,
+	"mcp-http":               helpGroupOperations,
+	"merge-whatsapp-history": helpGroupImport,
+	"modify-labels":          helpGroupWrite,
+	"ocr-executor":           helpGroupIndex,
+	"triage-queue":           helpGroupWrite,
+	"whatsapp-link":          helpGroupSources,
+	"whatsapp-status":        helpGroupSources,
+	"whatsapp-live-mcp":      helpGroupOperations,
+
 	"activity":               helpGroupIndex,
 	"add-account":            helpGroupSources,
 	"add-beeper":             helpGroupSources,

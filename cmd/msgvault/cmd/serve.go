@@ -40,6 +40,7 @@ import (
 	"go.kenn.io/msgvault/internal/muesli"
 	"go.kenn.io/msgvault/internal/notionmeetings"
 	"go.kenn.io/msgvault/internal/oauth"
+	"go.kenn.io/msgvault/internal/ocr"
 	"go.kenn.io/msgvault/internal/operations"
 	"go.kenn.io/msgvault/internal/peoplesweep"
 	"go.kenn.io/msgvault/internal/personagenda"
@@ -48,7 +49,6 @@ import (
 	"go.kenn.io/msgvault/internal/personmatch"
 	"go.kenn.io/msgvault/internal/plaud"
 	"go.kenn.io/msgvault/internal/provideridentity"
-	"go.kenn.io/msgvault/internal/ocr"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/search"
@@ -568,7 +568,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 			Provider:    personEnrichmentProviderCredentialLookup(cfg),
 		}); err != nil {
 		return fmt.Errorf("schedule person enrichment: %w", err)
-}
+	}
 
 	if cfg.OCR.Enabled {
 		ocrClient := ocr.NewClient(cfg.OCR.Socket, cfg.OCR.RequestTimeout)
@@ -950,7 +950,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 		TelemetryCapture:              telemetry.CaptureHandler(telemetryReporter, cfg.Data.DataDir),
 		MessageRecordings:             messageRecordings,
 		DocbankAttachments:            docbankAttachments,
- OCRStore: s,
+		OCRStore:                      s,
 	}
 	apiOpts.GmailProfileAddress = func(ctx context.Context, source *store.Source) (string, error) {
 		client, serviceAccount, err := newDaemonGmailClient(

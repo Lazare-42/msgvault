@@ -26,8 +26,8 @@ import (
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/export"
-	"go.kenn.io/msgvault/internal/personscope"
 	"go.kenn.io/msgvault/internal/googledocs"
+	"go.kenn.io/msgvault/internal/personscope"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/query/querytest"
 	"go.kenn.io/msgvault/internal/search"
@@ -37,8 +37,8 @@ import (
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/hybrid"
 	"go.kenn.io/msgvault/internal/vector/visual"
-	"go.kenn.io/msgvault/pkg/client/generated"
 	whatsapplive "go.kenn.io/msgvault/internal/whatsapp/live"
+	"go.kenn.io/msgvault/pkg/client/generated"
 )
 
 // stubEmbedder is an EmbeddingClient placeholder for tests where the
@@ -207,28 +207,6 @@ type paginatedListMessages struct {
 	HasMore  bool                   `json:"has_more"`
 }
 
-type compactMessageSummary struct {
-	ID                   int64  `json:"id"`
-	SourceMessageID      string `json:"source_message_id"`
-	ConversationID       int64  `json:"conversation_id"`
-	SourceConversationID string `json:"source_conversation_id"`
-	Subject              string `json:"subject"`
-	FromEmail            string `json:"from_email"`
-	FromName             string `json:"from_name"`
-	SentAt               string `json:"sent_at"`
-	HasAttachments       bool   `json:"has_attachments"`
-}
-
-// paginatedCompactMessages is the default (compact) search/list response:
-// a paginated envelope whose Data is the compact summary projection.
-type paginatedCompactMessages struct {
-	Data     []compactMessageSummary `json:"data"`
-	Total    int64                   `json:"total"`
-	Returned int                     `json:"returned"`
-	Offset   int                     `json:"offset"`
-	HasMore  bool                    `json:"has_more"`
-}
-
 // newTestHandlers creates a handlers instance with the given mock engine.
 func newTestHandlers(eng query.Engine) *handlers {
 	return &handlers{engine: eng, downloads: &downloadCache{}}
@@ -337,6 +315,7 @@ func TestErrorIsolationMiddlewarePreservesWrappedJSONRPCErrors(t *testing.T) {
 }
 
 func TestWhatsAppStatusUsesWhatsAppAccountScope(t *testing.T) {
+	assert := assert.New(t)
 	eng := &querytest.MockEngine{
 		Accounts: []query.AccountInfo{
 			{ID: 1, SourceType: "gmail", Identifier: "lazare@example.com"},
@@ -362,13 +341,14 @@ func TestWhatsAppStatusUsesWhatsAppAccountScope(t *testing.T) {
 	}
 
 	status := runTool[whatsapplive.Status](t, ToolWhatsAppStatus, h.whatsAppStatus, map[string]any{})
-	assert.Equal(t, "15551234567@s.whatsapp.net", factoryAccount)
-	assert.True(t, status.Paired)
-	assert.True(t, status.Ready)
-	assert.Equal(t, "15551234567@s.whatsapp.net", status.AccountJID)
+	assert.Equal("15551234567@s.whatsapp.net", factoryAccount)
+	assert.True(status.Paired)
+	assert.True(status.Ready)
+	assert.Equal("15551234567@s.whatsapp.net", status.AccountJID)
 }
 
 func TestWhatsAppStartLoginReturnsQRPayload(t *testing.T) {
+	assert := assert.New(t)
 	eng := &querytest.MockEngine{}
 	client := &mockWhatsAppClient{
 		loginState: whatsapplive.LoginState{
@@ -384,7 +364,7 @@ func TestWhatsAppStartLoginReturnsQRPayload(t *testing.T) {
 		engine:           eng,
 		whatsAppLoginURL: "https://whats.lazare.ai/work/qr",
 		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
-			assert.Empty(t, account)
+			assert.Empty(account)
 			return client, nil
 		},
 	}
@@ -393,10 +373,10 @@ func TestWhatsAppStartLoginReturnsQRPayload(t *testing.T) {
 		"include_qr_png": false,
 		"wait_ms":        float64(0),
 	})
-	assert.True(t, result.NeedsPairing)
-	assert.Equal(t, "test-qr-code", result.QRCode)
-	assert.Empty(t, result.QRPNGBase64)
-	assert.Equal(t, "https://whats.lazare.ai/work/qr", result.QRPageURL)
+	assert.True(result.NeedsPairing)
+	assert.Equal("test-qr-code", result.QRCode)
+	assert.Empty(result.QRPNGBase64)
+	assert.Equal("https://whats.lazare.ai/work/qr", result.QRPageURL)
 }
 
 func TestWhatsAppLoginStatusCanIncludeQRPNG(t *testing.T) {
@@ -425,6 +405,7 @@ func TestWhatsAppLoginStatusCanIncludeQRPNG(t *testing.T) {
 }
 
 func TestWhatsAppLoginStatusReportsPairedButNotReady(t *testing.T) {
+	assert := assert.New(t)
 	eng := &querytest.MockEngine{}
 	client := &mockWhatsAppClient{
 		loginState: whatsapplive.LoginState{
@@ -443,19 +424,19 @@ func TestWhatsAppLoginStatusReportsPairedButNotReady(t *testing.T) {
 	h := &handlers{
 		engine: eng,
 		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
-			assert.Empty(t, account)
+			assert.Empty(account)
 			return client, nil
 		},
 	}
 
 	result := runTool[whatsAppLoginResponse](t, ToolWhatsAppLoginStatus, h.whatsAppLoginStatus, map[string]any{})
-	assert.True(t, result.AlreadyPaired)
-	assert.False(t, result.NeedsPairing)
-	assert.False(t, result.Ready)
-	assert.False(t, result.Status.Ready)
-	assert.True(t, result.NeedsReconnect)
-	assert.True(t, result.NeedsAuth)
-	assert.Equal(t, 5, result.PollAfterSecs)
+	assert.True(result.AlreadyPaired)
+	assert.False(result.NeedsPairing)
+	assert.False(result.Ready)
+	assert.False(result.Status.Ready)
+	assert.True(result.NeedsReconnect)
+	assert.True(result.NeedsAuth)
+	assert.Equal(5, result.PollAfterSecs)
 }
 
 func TestWhatsAppLogoutRequiresConfirm(t *testing.T) {
@@ -481,6 +462,7 @@ func TestWhatsAppLogoutRequiresConfirm(t *testing.T) {
 }
 
 func TestWhatsAppLogoutForwardsForceLocal(t *testing.T) {
+	assert := assert.New(t)
 	eng := &querytest.MockEngine{
 		Accounts: []query.AccountInfo{
 			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
@@ -505,7 +487,7 @@ func TestWhatsAppLogoutForwardsForceLocal(t *testing.T) {
 	h := &handlers{
 		engine: eng,
 		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
-			assert.Equal(t, "15551234567@s.whatsapp.net", account)
+			assert.Equal("15551234567@s.whatsapp.net", account)
 			return client, nil
 		},
 	}
@@ -514,13 +496,14 @@ func TestWhatsAppLogoutForwardsForceLocal(t *testing.T) {
 		"confirm":     true,
 		"force_local": false,
 	})
-	assert.Equal(t, "15551234567@s.whatsapp.net", gotReq.Account)
-	assert.False(t, gotReq.ForceLocal)
-	assert.True(t, result.RemoteLogout)
-	assert.True(t, result.LocalSessionCleared)
+	assert.Equal("15551234567@s.whatsapp.net", gotReq.Account)
+	assert.False(gotReq.ForceLocal)
+	assert.True(result.RemoteLogout)
+	assert.True(result.LocalSessionCleared)
 }
 
 func TestSendWhatsAppMessage(t *testing.T) {
+	assert := assert.New(t)
 	eng := &querytest.MockEngine{
 		Accounts: []query.AccountInfo{
 			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
@@ -548,7 +531,7 @@ func TestSendWhatsAppMessage(t *testing.T) {
 	h := &handlers{
 		engine: eng,
 		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
-			assert.Equal(t, "15551234567@s.whatsapp.net", account)
+			assert.Equal("15551234567@s.whatsapp.net", account)
 			return client, nil
 		},
 	}
@@ -558,11 +541,11 @@ func TestSendWhatsAppMessage(t *testing.T) {
 		"body":             "hello",
 		"local_request_id": "req-1",
 	})
-	assert.Equal(t, "15557654321@s.whatsapp.net", gotReq.ChatID)
-	assert.Equal(t, "hello", gotReq.Body)
-	assert.Equal(t, "req-1", gotReq.LocalRequestID)
-	assert.Equal(t, int64(8), result.MessageID)
-	assert.Equal(t, "remote-1", result.RemoteMessageID)
+	assert.Equal("15557654321@s.whatsapp.net", gotReq.ChatID)
+	assert.Equal("hello", gotReq.Body)
+	assert.Equal("req-1", gotReq.LocalRequestID)
+	assert.Equal(int64(8), result.MessageID)
+	assert.Equal("remote-1", result.RemoteMessageID)
 }
 
 func TestSendWhatsAppMessageRejectsNotReady(t *testing.T) {
@@ -601,6 +584,7 @@ func TestSendWhatsAppMessageRejectsNotReady(t *testing.T) {
 }
 
 func TestWhatsAppRequestHistorySync(t *testing.T) {
+	assert := assert.New(t)
 	eng := &querytest.MockEngine{
 		Accounts: []query.AccountInfo{
 			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
@@ -628,23 +612,24 @@ func TestWhatsAppRequestHistorySync(t *testing.T) {
 	h := &handlers{
 		engine: eng,
 		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
-			assert.Equal(t, "15551234567@s.whatsapp.net", account)
+			assert.Equal("15551234567@s.whatsapp.net", account)
 			return client, nil
 		},
 	}
 
 	result := runTool[struct {
 		whatsapplive.RequestHistorySyncResult
+
 		Message string `json:"message"`
 	}](t, ToolWhatsAppRequestHistorySync, h.whatsAppRequestHistorySync, map[string]any{
 		"chat_id": "15557654321@s.whatsapp.net",
 		"count":   float64(30),
 	})
-	assert.Equal(t, "15557654321@s.whatsapp.net", gotReq.ChatID)
-	assert.Equal(t, 30, gotReq.Count)
-	assert.Equal(t, "anchor-msg", result.AnchorMessageID)
-	assert.Equal(t, 30, result.RequestedCount)
-	assert.NotEmpty(t, result.Message)
+	assert.Equal("15557654321@s.whatsapp.net", gotReq.ChatID)
+	assert.Equal(30, gotReq.Count)
+	assert.Equal("anchor-msg", result.AnchorMessageID)
+	assert.Equal(30, result.RequestedCount)
+	assert.NotEmpty(result.Message)
 }
 
 func TestWhatsAppRequestHistorySyncDefaultsCount(t *testing.T) {
@@ -670,6 +655,7 @@ func TestWhatsAppRequestHistorySyncDefaultsCount(t *testing.T) {
 
 	runTool[struct {
 		whatsapplive.RequestHistorySyncResult
+
 		Message string `json:"message"`
 	}](t, ToolWhatsAppRequestHistorySync, h.whatsAppRequestHistorySync, map[string]any{
 		"chat_id": "15557654321@s.whatsapp.net",
@@ -726,6 +712,7 @@ func TestWhatsAppRequestHistorySyncRequiresChatID(t *testing.T) {
 }
 
 func TestSendWhatsAppReactionAllowsEmptyEmojiToClear(t *testing.T) {
+	assert := assert.New(t)
 	eng := &querytest.MockEngine{
 		Accounts: []query.AccountInfo{
 			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
@@ -750,7 +737,7 @@ func TestSendWhatsAppReactionAllowsEmptyEmojiToClear(t *testing.T) {
 	h := &handlers{
 		engine: eng,
 		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
-			assert.Equal(t, "15551234567@s.whatsapp.net", account)
+			assert.Equal("15551234567@s.whatsapp.net", account)
 			return client, nil
 		},
 	}
@@ -760,10 +747,10 @@ func TestSendWhatsAppReactionAllowsEmptyEmojiToClear(t *testing.T) {
 		"emoji":            "",
 		"local_request_id": "react-1",
 	})
-	assert.Equal(t, int64(42), gotReq.MessageID)
-	assert.Equal(t, "", gotReq.Emoji)
-	assert.Equal(t, "react-1", gotReq.LocalRequestID)
-	assert.Equal(t, int64(42), result.MessageID)
+	assert.Equal(int64(42), gotReq.MessageID)
+	assert.Empty(gotReq.Emoji)
+	assert.Equal("react-1", gotReq.LocalRequestID)
+	assert.Equal(int64(42), result.MessageID)
 }
 
 func TestGoogleDocsHandlers(t *testing.T) {
@@ -805,7 +792,7 @@ func TestGoogleDocsHandlers(t *testing.T) {
 				assert.Equal("doc-1", documentID, "documentID")
 				assert.Equal(50, maxChars, "maxChars")
 				return &googledocs.Document{
-					File:       googledocs.File{Source: "work", DocumentID: "doc-1", Name: "Notes"},
+					Source: "work", DocumentID: "doc-1", Name: "Notes",
 					Text:       "body",
 					TextLength: 4,
 				}, nil
@@ -840,7 +827,7 @@ func TestGoogleDocsHandlers(t *testing.T) {
 				assert.Equal(t, "doc-1", documentID, "documentID")
 				assert.Equal(t, maxGoogleDocsMaxChars, maxChars, "maxChars")
 				return &googledocs.Document{
-					File:       googledocs.File{Source: "work", DocumentID: "doc-1", Name: "Strategy"},
+					Source: "work", DocumentID: "doc-1", Name: "Strategy",
 					Text:       "intro alpha beta target phrase gamma delta conclusion",
 					TextLength: 53,
 				}, nil
@@ -898,7 +885,7 @@ func TestGoogleDocsHandlers(t *testing.T) {
 				assert.Equal("work", sourceName, "sourceName")
 				assert.Equal("doc-1", documentID, "documentID")
 				assert.Equal("remove me", find, "find")
-				assert.Equal("", replacement, "replacement")
+				assert.Empty(replacement, "replacement")
 				assert.True(matchCase, "matchCase")
 				return &googledocs.ReplaceResult{
 					Source:             sourceName,
@@ -5314,6 +5301,7 @@ func TestResolveDraftAttachments_NewAttachmentSizeLimits(t *testing.T) {
 // upload (new_attachments) in the same call, each resolved through its own
 // path but landing in one combined attachment list.
 func TestResolveDraftAttachments_ArchivedAndNewCombined(t *testing.T) {
+	assert := assert.New(t)
 	require := require.New(t)
 	hash := "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
 	archivedContent := []byte("previously archived attachment bytes")
@@ -5344,11 +5332,11 @@ func TestResolveDraftAttachments_ArchivedAndNewCombined(t *testing.T) {
 	})
 	require.NoError(err)
 	require.Len(atts, 2)
-	assert.Equal(t, hash, gotHash)
-	assert.Equal(t, "id-card.jpg", atts[0].Filename)
-	assert.Equal(t, "image/jpeg", atts[0].ContentType)
-	assert.Equal(t, archivedContent, atts[0].Content)
-	assert.Equal(t, "insurance-form.pdf", atts[1].Filename)
-	assert.Equal(t, "application/pdf", atts[1].ContentType)
-	assert.Equal(t, newContent, atts[1].Content)
+	assert.Equal(hash, gotHash)
+	assert.Equal("id-card.jpg", atts[0].Filename)
+	assert.Equal("image/jpeg", atts[0].ContentType)
+	assert.Equal(archivedContent, atts[0].Content)
+	assert.Equal("insurance-form.pdf", atts[1].Filename)
+	assert.Equal("application/pdf", atts[1].ContentType)
+	assert.Equal(newContent, atts[1].Content)
 }

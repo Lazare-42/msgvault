@@ -2,11 +2,13 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
+	"go.kenn.io/msgvault/internal/daemonclient"
 	"io"
 	"log"
-	"log/slog"
 	"net"
-	"os"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	goimap "github.com/emersion/go-imap/v2"
@@ -45,7 +47,9 @@ func startMemIMAPServer(t *testing.T, username, password string) int {
 	go func() { _ = server.Serve(listener) }()
 	t.Cleanup(func() { _ = server.Close() })
 
-	return listener.Addr().(*net.TCPAddr).Port
+	addr, ok := listener.Addr().(*net.TCPAddr)
+	require.True(t, ok)
+	return addr.Port
 }
 
 // TestBuildIMAPAPIClient exercises the shared IMAP client constructor used by
@@ -59,17 +63,11 @@ func TestBuildIMAPAPIClient(t *testing.T) {
 	)
 
 	tmpDir := t.TempDir()
-	savedCfg := cfg
-	savedLogger := logger
-	defer func() {
-		cfg = savedCfg
-		logger = savedLogger
-	}()
-	cfg = &config.Config{
+	cfg := &config.Config{
 		HomeDir: tmpDir,
 		Data:    config.DataConfig{DataDir: tmpDir},
 	}
-	logger = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	ctx := withStoreResolverConfig(t, cfg)
 
 	port := startMemIMAPServer(t, identifier, password)
 	require.NoError(t, imaplib.SaveCredentials(cfg.TokensDir(), identifier, password))
@@ -79,7 +77,7 @@ func TestBuildIMAPAPIClient(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Run("password auth connects and lists labels", func(t *testing.T) {
-		client, err := buildIMAPAPIClient(context.Background(), identifier, syncConfig)
+		client, err := buildIMAPAPIClient(ctx, identifier, syncConfig)
 		require.NoError(t, err)
 		defer func() { assert.NoError(t, client.Close()) }()
 
@@ -93,13 +91,13 @@ func TestBuildIMAPAPIClient(t *testing.T) {
 	})
 
 	t.Run("empty sync config errors", func(t *testing.T) {
-		_, err := buildIMAPAPIClient(context.Background(), identifier, "")
+		_, err := buildIMAPAPIClient(ctx, identifier, "")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "has no config")
 	})
 
 	t.Run("malformed sync config errors", func(t *testing.T) {
-		_, err := buildIMAPAPIClient(context.Background(), identifier, "{not json")
+		_, err := buildIMAPAPIClient(ctx, identifier, "{not json")
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "parse IMAP config")
 	})
@@ -108,7 +106,7 @@ func TestBuildIMAPAPIClient(t *testing.T) {
 		otherCfg := &imaplib.Config{Host: "127.0.0.1", Port: port, Username: "nobody@example.com"}
 		otherJSON, err := otherCfg.ToJSON()
 		require.NoError(t, err)
-		_, err = buildIMAPAPIClient(context.Background(), "nobody@example.com", otherJSON)
+		_, err = buildIMAPAPIClient(ctx, "nobody@example.com", otherJSON)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "load IMAP credentials")
 	})
@@ -129,8 +127,42 @@ func TestBuildIMAPAPIClient(t *testing.T) {
 		// The certificate file does not exist, so the app-only token
 		// source constructor must fail — proving the XOAUTH2/app-only
 		// branch is reached without any Google OAuth configuration.
-		_, err = buildIMAPAPIClient(context.Background(), identifier, appOnlyJSON)
+		_, err = buildIMAPAPIClient(ctx, identifier, appOnlyJSON)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "app-only token source")
 	})
+}
+
+func TestLiveMailFactoryRetainsInvocationForHTTPRequest(t *testing.T) {
+	require := require.New(t)
+	const email, password = "user@example.com", "test-password"
+	cfg := config.NewDefaultConfig()
+	cfg.HomeDir = t.TempDir()
+	cfg.Data.DataDir = cfg.HomeDir
+	ctx := withStoreResolverConfig(t, cfg)
+	port := startMemIMAPServer(t, email, password)
+	require.NoError(imaplib.SaveCredentials(cfg.TokensDir(), email, password))
+	imapCfg := &imaplib.Config{Host: "127.0.0.1", Port: port, Username: email}
+	syncConfig, err := imapCfg.ToJSON()
+	require.NoError(err)
+	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/cli/accounts", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"accounts": []map[string]any{{
+			"email": email, "type": "imap", "sync_config": syncConfig,
+		}}}))
+	}))
+	defer daemon.Close()
+	st, err := daemonclient.New(daemonclient.Config{URL: daemon.URL, AllowInsecure: true})
+	require.NoError(err)
+	defer func() { assert.NoError(t, st.Close()) }()
+	factory := buildGmailFactory(ctx, st)
+	require.NotNil(factory)
+	// HTTP request contexts do not carry the CLI invocation.
+	client, err := factory(t.Context(), email)
+	require.NoError(err)
+	defer func() { assert.NoError(t, client.Close()) }()
+	labels, err := client.ListLabels(t.Context())
+	require.NoError(err)
+	require.NotEmpty(labels)
 }

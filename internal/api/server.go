@@ -254,10 +254,10 @@ type analyticsEngineState struct {
 type analyticsEngineContextKey struct{}
 
 type OCRStore interface {
-	OCRSummary(context.Context) (store.OCRSummary, error)
-	RequestOCR(context.Context, string, string) (*store.OCRResult, error)
-	GetOCRResult(context.Context, string, bool) (*store.OCRResult, error)
-	SearchOCR(context.Context, string, int) ([]store.OCRSearchHit, error)
+	OCRSummary(ctx context.Context) (store.OCRSummary, error)
+	RequestOCR(ctx context.Context, hash string, fingerprint string) (*store.OCRResult, error)
+	GetOCRResult(ctx context.Context, hash string, includePages bool) (*store.OCRResult, error)
+	SearchOCR(ctx context.Context, query string, limit int) ([]store.OCRSearchHit, error)
 }
 
 // Server represents the HTTP API server.
@@ -440,7 +440,7 @@ type Server struct {
 	// an empty list.
 	messageRecordings  *MessageRecordingReader
 	docbankAttachments *DocbankAttachmentReader
-	ocrStore  OCRStore
+	ocrStore           OCRStore
 	// remoteImages is the SSRF-hardened fetcher behind
 	// POST /api/v1/content/remote-image. Tests replace it to inject a fake
 	// resolver and dialer.

@@ -1,10 +1,9 @@
 package cmd
 
 import (
-	"testing"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"testing"
 )
 
 func TestParseArchiveIDList(t *testing.T) {
@@ -31,14 +30,16 @@ func TestParseArchiveIDList(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
 			got, err := parseArchiveIDList(tt.raw)
 			if tt.wantErr != "" {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tt.wantErr)
+				require.Error(err)
+				assert.Contains(err.Error(), tt.wantErr)
 				return
 			}
-			require.NoError(t, err)
-			assert.Equal(t, tt.want, got)
+			require.NoError(err)
+			assert.Equal(tt.want, got)
 		})
 	}
 }
@@ -119,14 +120,16 @@ func TestParseModifyLabelsRequest(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
 			got, err := parseModifyLabelsRequest(tt.ids, tt.sourceIDs, tt.add, tt.remove)
 			if tt.wantErr != "" {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tt.wantErr)
+				require.Error(err)
+				assert.Contains(err.Error(), tt.wantErr)
 				return
 			}
-			require.NoError(t, err)
-			assert.Equal(t, tt.want, got)
+			require.NoError(err)
+			assert.Equal(tt.want, got)
 		})
 	}
 }

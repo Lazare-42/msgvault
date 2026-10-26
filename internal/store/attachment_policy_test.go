@@ -28,6 +28,8 @@ func TestInitSchemaAddsAttachmentOutcomeColumns(t *testing.T) {
 			id INTEGER PRIMARY KEY,
 			message_id INTEGER NOT NULL,
 			content_hash TEXT,
+			filename TEXT,
+			mime_type TEXT,
 			storage_path TEXT NOT NULL,
 			thumbnail_hash TEXT,
 			thumbnail_path TEXT

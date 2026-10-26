@@ -10,6 +10,7 @@ import (
 	"sync"
 
 	"github.com/google/jsonschema-go/jsonschema"
+	legacymcp "github.com/mark3labs/mcp-go/mcp"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/query"
@@ -174,18 +175,6 @@ func (c *operationCatalogCache) get(capabilities catalogCapabilities) []toolDefi
 	if cached, ok := actual.([]toolDefinition); ok {
 		return cached
 	}
-	if opts.WhatsAppFactory != nil {
-		definitions = append(definitions, whatsAppOperationDefinitions...)
-	}
-	if opts.WhatsAppArchive != nil {
-		definitions = append(definitions, whatsAppArchiveOperationDefinitions...)
-	}
-	if opts.GoogleDocsFactory != nil {
-		definitions = append(definitions, googleDocsOperationDefinitions...)
-	}
-	sort.Slice(definitions, func(i, j int) bool {
-		return definitions[i].name < definitions[j].name
-	})
 	return definitions
 }
 
@@ -202,6 +191,23 @@ func operationCatalog(opts ServeOptions, _ *handlers) []toolDefinition {
 			if permission, ok := agentReadToolPermission(definition.name); ok && slices.Contains(opts.GrantPermissions, string(permission)) {
 				definitions = append(definitions, definition)
 			}
+		}
+	}
+	if !opts.DelegatedOnly {
+		if opts.OCR != nil {
+			definitions = append(definitions, ocrOperationDefinitions...)
+		}
+		if opts.GmailFactory != nil {
+			definitions = append(definitions, gmailOperationDefinitions...)
+		}
+		if opts.WhatsAppFactory != nil {
+			definitions = append(definitions, whatsAppOperationDefinitions...)
+		}
+		if opts.WhatsAppArchive != nil {
+			definitions = append(definitions, whatsAppArchiveOperationDefinitions...)
+		}
+		if opts.GoogleDocsFactory != nil {
+			definitions = append(definitions, googleDocsOperationDefinitions...)
 		}
 	}
 	if opts.Calendar != nil {
@@ -1032,4 +1038,65 @@ type stageDeletionResponse struct {
 	MessageCount int    `json:"message_count"`
 	Status       string `json:"status"`
 	NextStep     string `json:"next_step"`
+}
+
+var (
+	ocrOperationDefinitions = []toolDefinition{
+		legacyDefinition(getOCRStatusTool(), toolSecurityRead, (*handlers).getOCRStatus),
+		legacyDefinition(searchAttachmentTextTool(), toolSecurityRead, (*handlers).searchAttachmentText),
+		legacyDefinition(getAttachmentTextTool(), toolSecurityRead, (*handlers).getAttachmentText),
+		legacyDefinition(requestAttachmentTextTool(), toolSecurityWrite, (*handlers).requestAttachmentText),
+	}
+	gmailOperationDefinitions = []toolDefinition{
+		legacyDefinition(listDraftsTool(), toolSecurityRead, (*handlers).listDrafts),
+		legacyDefinition(getDraftTool(), toolSecurityRead, (*handlers).getDraft),
+		legacyDefinition(createDraftTool(), toolSecurityWrite, (*handlers).createDraft),
+		legacyDefinition(updateDraftTool(), toolSecurityWrite, (*handlers).updateDraft),
+		legacyDefinition(deleteDraftTool(), toolSecurityWrite, (*handlers).deleteDraft),
+		legacyDefinition(sendDraftTool(), toolSecurityWrite, (*handlers).sendDraft),
+		legacyDefinition(modifyLabelsTool(), toolSecurityWrite, (*handlers).modifyLabels),
+		legacyDefinition(createLabelTool(), toolSecurityWrite, (*handlers).createLabel),
+		legacyDefinition(deleteLabelTool(), toolSecurityWrite, (*handlers).deleteLabel),
+		legacyDefinition(listGmailLabelsTool(), toolSecurityRead, (*handlers).listGmailLabels),
+	}
+	whatsAppOperationDefinitions = []toolDefinition{
+		legacyDefinition(whatsAppStatusTool(), toolSecurityRead, (*handlers).whatsAppStatus),
+		legacyDefinition(whatsAppStartLoginTool(), toolSecurityWrite, (*handlers).whatsAppStartLogin),
+		legacyDefinition(whatsAppLoginStatusTool(), toolSecurityRead, (*handlers).whatsAppLoginStatus),
+		legacyDefinition(whatsAppLogoutTool(), toolSecurityWrite, (*handlers).whatsAppLogout),
+		legacyDefinition(sendWhatsAppMessageTool(), toolSecurityWrite, (*handlers).sendWhatsAppMessage),
+		legacyDefinition(sendWhatsAppReactionTool(), toolSecurityWrite, (*handlers).sendWhatsAppReaction),
+		legacyDefinition(whatsAppRequestHistorySyncTool(), toolSecurityWrite, (*handlers).whatsAppRequestHistorySync),
+	}
+	whatsAppArchiveOperationDefinitions = []toolDefinition{
+		listWhatsAppChatsDefinition(),
+		listWhatsAppMessagesDefinition(),
+	}
+	googleDocsOperationDefinitions = []toolDefinition{
+		legacyDefinition(listGoogleDocsTool(), toolSecurityRead, (*handlers).listGoogleDocs),
+		legacyDefinition(searchGoogleDocsTool(), toolSecurityRead, (*handlers).searchGoogleDocs),
+		legacyDefinition(getGoogleDocTool(), toolSecurityRead, (*handlers).getGoogleDoc),
+		legacyDefinition(appendGoogleDocTextTool(), toolSecurityWrite, (*handlers).appendGoogleDocText),
+		legacyDefinition(replaceGoogleDocTextTool(), toolSecurityWrite, (*handlers).replaceGoogleDocText),
+	}
+)
+
+func legacyDefinition(tool legacymcp.Tool, security toolSecurityClass, handler catalogToolHandler) toolDefinition {
+	encoded, err := json.Marshal(tool.InputSchema)
+	if err != nil {
+		panic(err)
+	}
+	input := &jsonschema.Schema{}
+	if err := json.Unmarshal(encoded, input); err != nil {
+		panic(err)
+	}
+	input.Schema = schema202012
+	return toolDefinition{
+		name: tool.Name, description: tool.Description,
+		annotations:  toolAnnotations(security == toolSecurityRead),
+		availability: alwaysAvailable, security: security,
+		inputSchema:  input,
+		outputSchema: &jsonschema.Schema{Schema: schema202012, Type: "object"},
+		handler:      handler,
+	}
 }

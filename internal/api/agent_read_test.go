@@ -643,7 +643,7 @@ func TestAgentReadScopeCounts(t *testing.T) {
 	requirements := require.New(t)
 
 	st := testutil.NewTestStore(t)
-	src, err := st.GetOrCreateSource("test", "reader@example.test")
+	src, err := st.GetOrCreateSource("imap", "reader@example.test")
 	requirements.NoError(err)
 	other, err := st.GetOrCreateSource("test", "stats@example.test")
 	requirements.NoError(err)
@@ -654,6 +654,7 @@ func TestAgentReadScopeCounts(t *testing.T) {
 	_, err = st.UpsertMessage(&store.Message{SourceID: src.ID, ConversationID: conv, SourceMessageID: "deleted-email", MessageType: "email"})
 	requirements.NoError(err)
 	requirements.NoError(st.MarkMessageDeleted(src.ID, "deleted-email"))
+	requirements.NoError(st.UpdateSourceSyncConfig(src.ID, `{"host":"mail.example.test","ms_cert_path":"/private/client.pem"}`))
 	requirements.NoError(st.UpdateSourceDisplayName(src.ID, "Reader archive"))
 	srv := NewServerWithOptions(ServerOptions{Config: &config.Config{Server: config.ServerConfig{APIKey: "owner", AgentAccess: true}}, Store: st, Engine: newExploreDuckDBFixture(t), Logger: testLogger()})
 	defer srv.agentGrants.Close()
@@ -680,6 +681,7 @@ func TestAgentReadScopeCounts(t *testing.T) {
 	var accounts cliAccountsResponse
 	requirements.NoError(json.Unmarshal(w.Body.Bytes(), &accounts))
 	requirements.Len(accounts.Accounts, 1)
+	assertions.Empty(accounts.Accounts[0].SyncConfig, "delegated readers must not receive provider connection configuration")
 	assertions.Equal(src.ID, accounts.Accounts[0].ID)
 	assertions.Equal(int64(1), accounts.Accounts[0].MessageCount)
 	assertions.Equal(int64(1), accounts.Accounts[0].SourceDeletedCount)

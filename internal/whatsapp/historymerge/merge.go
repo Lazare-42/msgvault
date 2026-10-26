@@ -331,7 +331,7 @@ func mergeMessage(
 		intoMessageID = id
 	}
 
-	bodyText, bodyHTML, hasBody, err := opts.From.GetMessageBodyText(m.ID)
+	bodyText, bodyHTML, hasBody, err := opts.From.GetMessageBodiesForMerge(m.ID)
 	if err != nil {
 		return fmt.Errorf("read message body: %w", err)
 	}
@@ -401,7 +401,7 @@ func mergeAttachments(
 		ref.ContentHash = hash
 		report.AttachmentsWithContent++
 
-		loc, locErr := opts.Into.ResolveAttachmentBlob(hash)
+		loc, locErr := opts.Into.ResolveAttachmentBlobContext(ctx, hash)
 		if locErr == nil && loc.Referenced {
 			// Content-addressed: an existing reference to this hash in the
 			// target archive means the blob is already stored there

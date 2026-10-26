@@ -37,7 +37,7 @@ func (s *apiOCRStore) RequestOCR(_ context.Context, hash, fingerprint string) (*
 }
 
 func (*apiOCRStore) GetOCRResult(context.Context, string, bool) (*store.OCRResult, error) {
-	return nil, nil
+	return nil, nil //nolint:nilnil // A missing OCR result is represented by nil without an error.
 }
 
 func (s *apiOCRStore) SearchOCR(context.Context, string, int) ([]store.OCRSearchHit, error) {

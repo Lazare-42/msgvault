@@ -76,15 +76,6 @@ func rawBatchFetchOptions() *imap.FetchOptions {
 	}
 }
 
-// labelRescanFetchOptions extends the Message-ID-only fetch with FLAGS so
-// labels-only rescans of known messages can refresh flag-derived labels
-// (read state, star, keywords) without downloading bodies.
-func labelRescanFetchOptions() *imap.FetchOptions {
-	opts := messageIDHeaderFetchOptions()
-	opts.Flags = true
-	return opts
-}
-
 func rawMIMEMessageID(rawMIME []byte) string {
 	entity, _ := gomessage.Read(bytes.NewReader(rawMIME))
 	if entity == nil {
@@ -843,7 +834,6 @@ func (c *Client) GetMessageLabelsBatch(ctx context.Context, messageIDs []string)
 		return nil, err
 	}
 
-	fetchOpts := labelRescanFetchOptions()
 	for _, mailbox := range batchMailboxOrder(byMailbox, c.allMailFolder) {
 		if ctx.Err() != nil {
 			return results, ctx.Err()

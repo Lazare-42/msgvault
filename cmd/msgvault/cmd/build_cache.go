@@ -2344,9 +2344,9 @@ func rebuildCacheForHome(dbPath, analyticsDir string) error {
 	switch {
 	case result.Skipped:
 	case result.IdentityOnly:
-		logger.Info("identity datasets refreshed", "data_dir", analyticsDir)
+		slog.Info("identity datasets refreshed", "data_dir", analyticsDir)
 	default:
-		logger.Info("cache rebuilt", "data_dir", analyticsDir, "exported", result.ExportedCount)
+		slog.Info("cache rebuilt", "data_dir", analyticsDir, "exported", result.ExportedCount)
 	}
 	return nil
 }

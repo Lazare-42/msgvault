@@ -64,12 +64,14 @@ Add and sync sources:
   add-chatwoot           Register Chatwoot inboxes
   add-circleback         Authorize a Circleback account (browser OAuth)
   add-discord            Register Discord guilds for bot-based archival
+  add-google-docs-drive  Configure a Google Drive folder of Google Docs for MCP query and update
   add-granola            Register a Granola account and validate its API key
   add-imap               Add an IMAP account
   add-matrix             Add a read-only Matrix account as an archive source
   add-muesli             Register a local Muesli meeting database
   add-notion-meetings    Register and validate a Notion AI Meeting Notes source
   add-o365               Add a Microsoft 365 account via OAuth
+  add-o365-app           Add a Microsoft 365 shared mailbox via certificate app-only auth
   add-omi                Register an Omi account and validate its API key
   add-plaud              Authorize and register a Plaud cloud account
   add-slack              Add a Slack workspace as an archive source
@@ -107,20 +109,23 @@ Add and sync sources:
   sync-twilio            Sync Twilio calls and recordings
   update-account         Update account settings
   verify                 Verify archive integrity against Gmail
+  whatsapp-link          Link a WhatsApp account for live MCP sending
+  whatsapp-status        Show live WhatsApp pairing status
 
 Import local exports:
-  import-eml          Import a tree of RFC 5322 .eml files
-  import-emlx         Import Apple Mail .emlx files into msgvault
-  import-gvoice       Import Google Voice history from Takeout export
-  import-imazing-csv  Import Messages CSV exports created by iMazing
-  import-imessage     Import iMessages from local database
-  import-maildir      Import a Maildir or Maildir++ archive
-  import-mbox         Import an MBOX export into msgvault
-  import-messenger    Import Facebook Messenger from a Meta data export
-  import-pst          Import a PST (Outlook) archive into msgvault
-  import-slackdump    Import a Slackdump export
-  import-synctech-sms Import SMS Backup & Restore exports
-  import-whatsapp     Import WhatsApp messages from an Android or Apple database
+  import-eml             Import a tree of RFC 5322 .eml files
+  import-emlx            Import Apple Mail .emlx files into msgvault
+  import-gvoice          Import Google Voice history from Takeout export
+  import-imazing-csv     Import Messages CSV exports created by iMazing
+  import-imessage        Import iMessages from local database
+  import-maildir         Import a Maildir or Maildir++ archive
+  import-mbox            Import an MBOX export into msgvault
+  import-messenger       Import Facebook Messenger from a Meta data export
+  import-pst             Import a PST (Outlook) archive into msgvault
+  import-slackdump       Import a Slackdump export
+  import-synctech-sms    Import SMS Backup & Restore exports
+  import-whatsapp        Import WhatsApp messages from an Android or Apple database
+  merge-whatsapp-history One-time backfill of WhatsApp history from another archive home
 
 Drafts, calendar, and Kata (write to providers):
   calendar      Control live calendar events and query availability
@@ -134,6 +139,8 @@ Drafts, calendar, and Kata (write to providers):
   draft-send-as List Gmail send-as identities
   kata          Create Kata issues that quote archived evidence
   message-tags  Read or update native email tags
+  modify-labels Add and/or remove labels on messages via the account's mail server
+  triage-queue  Move stale untreated messages from a label into a queue folder
 
 Review and delete:
   cancel-deletion Cancel pending or in-progress deletion batches
@@ -146,14 +153,15 @@ Review and delete:
   stage-delete    Stage messages matching a query or IDs for deletion
 
 Indexes, embeddings, and analytics cache:
-  activity    Build the derived activity spine
-  build-cache Build analytics cache for fast TUI queries
-  cache-stats Show statistics about the analytics cache
-  documents   Manage document attachment indexing
-  embeddings  Manage message vector embeddings
-  eval        Score search quality against relevance judgments (qrels)
-  multimodal  Manage and search visual attachment embeddings
-  rebuild-fts Rebuild the full-text search index from scratch
+  activity     Build the derived activity spine
+  build-cache  Build analytics cache for fast TUI queries
+  cache-stats  Show statistics about the analytics cache
+  documents    Manage document attachment indexing
+  embeddings   Manage message vector embeddings
+  eval         Score search quality against relevance judgments (qrels)
+  multimodal   Manage and search visual attachment embeddings
+  ocr-executor Run the stateless local attachment OCR executor
+  rebuild-fts  Rebuild the full-text search index from scratch
 
 Maintenance and repair:
   backup               Back up the archive to a snapshot repository
@@ -174,22 +182,24 @@ Maintenance and repair:
   unpack-attachments   Restore packed attachments to loose files
 
 Setup, daemon, and integrations:
-  agent-token  Manage restricted agent grant tokens
-  completion   Generate shell completion script
-  credentials  Manage provider credentials on the daemon host
-  daemon       Manage the background daemon
-  docbank      Manage the Docbank attachment mirror
-  export-token Export OAuth token to a remote msgvault instance
-  help         Help about any command
-  logs         View and tail msgvault's structured log files
-  mcp          Run MCP server for Claude Desktop integration
-  openapi      Print the msgvault OpenAPI schema
-  quickstart   Print a quickstart guide for AI agents
-  serve        Run msgvault as a daemon with scheduled sync
-  setup        Run first-time setup; 'setup status' shows enabled features
-  skills       Manage agent skills for coding assistants
-  update       Update msgvault to the latest version
-  version      Print version information
+  agent-token       Manage restricted agent grant tokens
+  completion        Generate shell completion script
+  credentials       Manage provider credentials on the daemon host
+  daemon            Manage the background daemon
+  docbank           Manage the Docbank attachment mirror
+  export-token      Export OAuth token to a remote msgvault instance
+  help              Help about any command
+  logs              View and tail msgvault's structured log files
+  mcp               Run MCP server for Claude Desktop integration
+  mcp-http          Run MCP server over HTTP for remote clients
+  openapi           Print the msgvault OpenAPI schema
+  quickstart        Print a quickstart guide for AI agents
+  serve             Run msgvault as a daemon with scheduled sync
+  setup             Run first-time setup; 'setup status' shows enabled features
+  skills            Manage agent skills for coding assistants
+  update            Update msgvault to the latest version
+  version           Print version information
+  whatsapp-live-mcp Run writable live WhatsApp MCP server
 
 Flags:
       --agent-allow-insecure      Allow plain HTTP for agent-delegated connections (trusted networks only)

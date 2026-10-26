@@ -15,16 +15,15 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"go.kenn.io/msgvault/internal/daemonclient"
-	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/skip2/go-qrcode"
+	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/export"
+	"go.kenn.io/msgvault/internal/gmail"
+	"go.kenn.io/msgvault/internal/googledocs"
 	"go.kenn.io/msgvault/internal/peoplebrowser"
 	"go.kenn.io/msgvault/internal/personscope"
 	personresolver "go.kenn.io/msgvault/internal/personscope/resolver"
-	"go.kenn.io/msgvault/internal/gmail"
-	"go.kenn.io/msgvault/internal/googledocs"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/savedview"
 	"go.kenn.io/msgvault/internal/search"
@@ -35,8 +34,8 @@ import (
 	"go.kenn.io/msgvault/internal/vector/embed"
 	"go.kenn.io/msgvault/internal/vector/hybrid"
 	"go.kenn.io/msgvault/internal/vector/visual"
-	"go.kenn.io/msgvault/pkg/client/generated"
 	whatsapplive "go.kenn.io/msgvault/internal/whatsapp/live"
+	"go.kenn.io/msgvault/pkg/client/generated"
 )
 
 const (
@@ -176,12 +175,12 @@ type handlers struct {
 	drafts               DraftRunner
 	contactRoutesBackend ContactRoutesBackend
 	chatDiscoveryBackend ChatDiscoveryBackend
-	gmailFactory GmailClientFactory
-	whatsAppFactory WhatsAppClientFactory
-	whatsAppLoginURL string
-	googleDocsFactory GoogleDocsClientFactory
-	ocr               OCRClient
-	whatsAppArchive WhatsAppArchiveReader
+	gmailFactory         GmailClientFactory
+	whatsAppFactory      WhatsAppClientFactory
+	whatsAppLoginURL     string
+	googleDocsFactory    GoogleDocsClientFactory
+	ocr                  OCRClient
+	whatsAppArchive      WhatsAppArchiveReader
 
 	// Optional vector-search wiring. When hybridEngine is nil, the
 	// search_message_bodies handler rejects mode=vector and mode=hybrid with
@@ -455,10 +454,10 @@ type AttachmentReader interface {
 }
 
 type OCRClient interface {
-	OCRStatus(context.Context) (*store.OCRRuntimeStatus, error)
-	SearchOCR(context.Context, string, int) ([]store.OCRSearchHit, error)
-	GetOCRResult(context.Context, string, bool) (*store.OCRResult, error)
-	RequestOCR(context.Context, string, string) (*store.OCRResult, error)
+	OCRStatus(ctx context.Context) (*store.OCRRuntimeStatus, error)
+	SearchOCR(ctx context.Context, query string, limit int) ([]store.OCRSearchHit, error)
+	GetOCRResult(ctx context.Context, hash string, includePages bool) (*store.OCRResult, error)
+	RequestOCR(ctx context.Context, hash string, fingerprint string) (*store.OCRResult, error)
 }
 
 // readAttachmentFile loads a content-addressed attachment for draft uploads.
@@ -470,7 +469,7 @@ type OCRClient interface {
 // attachment that has been packed, which export_attachment and get_attachment
 // (both already routed through attachmentService) do not.
 func (h *handlers) readAttachmentFile(ctx context.Context, contentHash string) ([]byte, error) {
-	data, err := h.attachmentService().read(ctx, contentHash)
+	data, err := h.attachmentService().read(ctx, contentHash, maxAttachmentSize)
 	if err != nil {
 		if unavailable, ok := errors.AsType[*attachmentUnavailableError](err); ok {
 			return nil, errors.New(unavailable.message)
@@ -483,46 +482,46 @@ func (h *handlers) readAttachmentFile(ctx context.Context, contentHash string) (
 func (h *handlers) getOCRStatus(ctx context.Context, _ toolRequest) (*toolResult, error) {
 	status, err := h.ocr.OCRStatus(ctx)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("get OCR status: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("get OCR status: %v", err)), nil
 	}
-	return structuredJSONResult(status)
+	return jsonResult(status)
 }
 
-func (h *handlers) searchAttachmentText(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) searchAttachmentText(ctx context.Context, request toolRequest) (*toolResult, error) {
 	args := request.GetArguments()
 	query, _ := args["query"].(string)
 	if strings.TrimSpace(query) == "" {
-		return mcp.NewToolResultError("query is required"), nil
+		return toolErrorResult("query is required"), nil
 	}
 	hits, err := h.ocr.SearchOCR(ctx, query, limitArg(args, "limit", 20))
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("search attachment text: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("search attachment text: %v", err)), nil
 	}
-	return structuredJSONResult(hits)
+	return jsonResult(hits)
 }
 
-func (h *handlers) getAttachmentText(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) getAttachmentText(ctx context.Context, request toolRequest) (*toolResult, error) {
 	hash, _ := request.GetArguments()["content_hash"].(string)
 	if strings.TrimSpace(hash) == "" {
-		return mcp.NewToolResultError("content_hash is required"), nil
+		return toolErrorResult("content_hash is required"), nil
 	}
 	result, err := h.ocr.GetOCRResult(ctx, hash, true)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("get attachment text: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("get attachment text: %v", err)), nil
 	}
-	return structuredJSONResult(result)
+	return jsonResult(result)
 }
 
-func (h *handlers) requestAttachmentText(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) requestAttachmentText(ctx context.Context, request toolRequest) (*toolResult, error) {
 	hash, _ := request.GetArguments()["content_hash"].(string)
 	if strings.TrimSpace(hash) == "" {
-		return mcp.NewToolResultError("content_hash is required"), nil
+		return toolErrorResult("content_hash is required"), nil
 	}
 	result, err := h.ocr.RequestOCR(ctx, hash, "")
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("request attachment text: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("request attachment text: %v", err)), nil
 	}
-	return structuredJSONResult(result)
+	return jsonResult(result)
 }
 
 // DeletionManifestSaver persists staged deletion manifests. It is optional:
@@ -741,36 +740,6 @@ func translateVectorErr(err error) *toolResult {
 	return nil
 }
 
-type messageSummaryCompact struct {
-	ID                   int64     `json:"id"`
-	SourceMessageID      string    `json:"source_message_id"`
-	ConversationID       int64     `json:"conversation_id"`
-	SourceConversationID string    `json:"source_conversation_id"`
-	Subject              string    `json:"subject"`
-	FromEmail            string    `json:"from_email"`
-	FromName             string    `json:"from_name"`
-	SentAt               time.Time `json:"sent_at"`
-	HasAttachments       bool      `json:"has_attachments"`
-}
-
-func compactMessageSummaries(results []query.MessageSummary) []messageSummaryCompact {
-	out := make([]messageSummaryCompact, len(results))
-	for i, msg := range results {
-		out[i] = messageSummaryCompact{
-			ID:                   msg.ID,
-			SourceMessageID:      msg.SourceMessageID,
-			ConversationID:       msg.ConversationID,
-			SourceConversationID: msg.SourceConversationID,
-			Subject:              msg.Subject,
-			FromEmail:            msg.FromEmail,
-			FromName:             msg.FromName,
-			SentAt:               msg.SentAt,
-			HasAttachments:       msg.HasAttachments,
-		}
-	}
-	return out
-}
-
 // getAccountID looks up a source ID by its identifier, preferring an exact
 // match and otherwise ignoring letter case, so "Me@gmail.com" names the same
 // source as "me@gmail.com"; failing that, by its display name, which for an
@@ -895,7 +864,7 @@ func parseNewAttachmentArgs(args map[string]any) ([]newDraftAttachmentInput, err
 		mimeType := strings.TrimSpace(stringField(obj, "mime_type"))
 		if mimeType != "" {
 			if _, _, err := stdmime.ParseMediaType(mimeType); err != nil {
-				return nil, fmt.Errorf("new_attachments[%d]: invalid mime_type %q: %v", i, mimeType, err)
+				return nil, fmt.Errorf("new_attachments[%d]: invalid mime_type %q: %w", i, mimeType, err)
 			}
 		}
 		inputs = append(inputs, newDraftAttachmentInput{filename: filename, mimeType: mimeType, contentBase64: contentBase64})
@@ -928,7 +897,7 @@ func (h *handlers) resolveDraftAttachments(ctx context.Context, args map[string]
 		return nil, nil
 	}
 	if len(ids) > 0 && h.attachmentsDir == "" && h.attachmentReader == nil {
-		return nil, fmt.Errorf("attachments directory not configured")
+		return nil, errors.New("attachments directory not configured")
 	}
 
 	var atts []gmail.DraftAttachment
@@ -940,14 +909,14 @@ func (h *handlers) resolveDraftAttachments(ctx context.Context, args map[string]
 		}
 		att, err := h.engine.GetAttachment(ctx, id)
 		if err != nil {
-			return nil, fmt.Errorf("get attachment %d: %v", id, err)
+			return nil, fmt.Errorf("get attachment %d: %w", id, err)
 		}
 		if att == nil {
 			return nil, fmt.Errorf("attachment %d not found", id)
 		}
 		data, err := h.readAttachmentFile(ctx, att.ContentHash)
 		if err != nil {
-			return nil, fmt.Errorf("attachment %d: %v", id, err)
+			return nil, fmt.Errorf("attachment %d: %w", id, err)
 		}
 		total += int64(len(data))
 		if total > maxDraftAttachmentsSize {
@@ -963,7 +932,7 @@ func (h *handlers) resolveDraftAttachments(ctx context.Context, args map[string]
 	for i, na := range newAttachments {
 		content, err := base64.StdEncoding.DecodeString(na.contentBase64)
 		if err != nil {
-			return nil, fmt.Errorf("new_attachments[%d]: content_base64 is invalid: %v", i, err)
+			return nil, fmt.Errorf("new_attachments[%d]: content_base64 is invalid: %w", i, err)
 		}
 		if int64(len(content)) > maxAttachmentSize {
 			return nil, fmt.Errorf("new_attachments[%d]: attachment too large: %d bytes (max %d)", i, len(content), maxAttachmentSize)
@@ -1916,7 +1885,7 @@ type getMessageResponse struct {
 	HasMore              bool                   `json:"has_more"`
 	Labels               []string               `json:"labels"`
 	Attachments          []query.AttachmentInfo `json:"attachments"`
-	RFC822MessageID string `json:"rfc822_message_id,omitempty"`
+	RFC822MessageID      string                 `json:"rfc822_message_id,omitempty"`
 }
 
 func (h *handlers) getMessage(ctx context.Context, req toolRequest) (*toolResult, error) {
@@ -2602,14 +2571,6 @@ func stringArrayArg(args map[string]any, key string) ([]string, error) {
 	return result, nil
 }
 
-func structuredJSONResult(v any) (*mcp.CallToolResult, error) {
-	data, err := json.Marshal(v)
-	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("marshal error: %v", err)), nil
-	}
-	return mcp.NewToolResultStructured(v, string(data)), nil
-}
-
 // maxStageDeletionResults limits how many messages can be staged in one call.
 const maxStageDeletionResults = 100000
 
@@ -2882,7 +2843,7 @@ func nonNilSlice[T any](values []T) []T {
 
 func (h *handlers) getWhatsAppClient(ctx context.Context, args map[string]any) (whatsapplive.Client, string, error) {
 	if h.whatsAppFactory == nil {
-		return nil, "", fmt.Errorf("WhatsApp live client not configured")
+		return nil, "", errors.New("WhatsApp live client not configured")
 	}
 
 	account, _ := args["account"].(string)
@@ -2907,7 +2868,7 @@ func (h *handlers) getWhatsAppClient(ctx context.Context, args map[string]any) (
 		case 1:
 			account = whatsAppAccounts[0].Identifier
 		default:
-			return nil, "", fmt.Errorf("multiple WhatsApp accounts configured, specify 'account' parameter")
+			return nil, "", errors.New("multiple WhatsApp accounts configured, specify 'account' parameter")
 		}
 	} else if len(whatsAppAccounts) > 0 {
 		found := false
@@ -2929,14 +2890,14 @@ func (h *handlers) getWhatsAppClient(ctx context.Context, args map[string]any) (
 	return client, account, nil
 }
 
-func (h *handlers) whatsAppStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) whatsAppStatus(ctx context.Context, req toolRequest) (*toolResult, error) {
 	client, _, err := h.getWhatsAppClient(ctx, req.GetArguments())
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	status, err := client.Status(ctx)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("whatsapp status: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("whatsapp status: %v", err)), nil
 	}
 	status.ApplyDerived()
 	return jsonResult(status)
@@ -2949,6 +2910,7 @@ type whatsappLoginClient interface {
 
 type whatsAppLoginResponse struct {
 	whatsapplive.LoginState
+
 	QRCode         string `json:"qr_code,omitempty"`
 	QRPNGBase64    string `json:"qr_png_base64,omitempty"`
 	QRPageURL      string `json:"qr_page_url,omitempty"`
@@ -2960,45 +2922,45 @@ type whatsAppLoginResponse struct {
 	NeedsAuth      bool   `json:"needs_authentication"`
 }
 
-func (h *handlers) whatsAppStartLogin(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) whatsAppStartLogin(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
-	loginClient, state, err := h.getWhatsAppLoginClient(ctx, args)
+	loginClient, err := h.getWhatsAppLoginClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
-	state, err = loginClient.StartLogin(ctx)
+	state, err := loginClient.StartLogin(ctx)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("start whatsapp login: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("start whatsapp login: %v", err)), nil
 	}
 
 	waitMS := boundedIntArg(args, "wait_ms", 3000, 15000)
 	if waitMS > 0 {
 		state, err = waitForWhatsAppLoginCode(ctx, loginClient, state, time.Duration(waitMS)*time.Millisecond)
 		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("wait for whatsapp login QR: %v", err)), nil
+			return toolErrorResult(fmt.Sprintf("wait for whatsapp login QR: %v", err)), nil
 		}
 	}
-	return structuredJSONResult(h.whatsAppLoginResponse(state, includeQRPNG(args)))
+	return jsonResult(h.whatsAppLoginResponse(state, includeQRPNG(args)))
 }
 
-func (h *handlers) whatsAppLoginStatus(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) whatsAppLoginStatus(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
-	loginClient, state, err := h.getWhatsAppLoginClient(ctx, args)
+	loginClient, err := h.getWhatsAppLoginClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
-	state, err = loginClient.LoginState(ctx)
+	state, err := loginClient.LoginState(ctx)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("whatsapp login status: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("whatsapp login status: %v", err)), nil
 	}
-	return structuredJSONResult(h.whatsAppLoginResponse(state, includeQRPNG(args)))
+	return jsonResult(h.whatsAppLoginResponse(state, includeQRPNG(args)))
 }
 
-func (h *handlers) whatsAppLogout(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) whatsAppLogout(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 	confirm, _ := args["confirm"].(bool)
 	if !confirm {
-		return mcp.NewToolResultError("confirm=true is required to log out WhatsApp and clear local pairing state"), nil
+		return toolErrorResult("confirm=true is required to log out WhatsApp and clear local pairing state"), nil
 	}
 	forceLocal := true
 	if v, ok := args["force_local"].(bool); ok {
@@ -3006,32 +2968,28 @@ func (h *handlers) whatsAppLogout(ctx context.Context, req mcp.CallToolRequest) 
 	}
 	client, account, err := h.getWhatsAppClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	result, err := client.Logout(ctx, whatsapplive.LogoutRequest{
 		Account:    account,
 		ForceLocal: forceLocal,
 	})
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("whatsapp logout: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("whatsapp logout: %v", err)), nil
 	}
-	return structuredJSONResult(result)
+	return jsonResult(result)
 }
 
-func (h *handlers) getWhatsAppLoginClient(ctx context.Context, args map[string]any) (whatsappLoginClient, whatsapplive.LoginState, error) {
+func (h *handlers) getWhatsAppLoginClient(ctx context.Context, args map[string]any) (whatsappLoginClient, error) {
 	client, _, err := h.getWhatsAppClient(ctx, args)
 	if err != nil {
-		return nil, whatsapplive.LoginState{}, err
+		return nil, err
 	}
 	loginClient, ok := client.(whatsappLoginClient)
 	if !ok {
-		return nil, whatsapplive.LoginState{}, fmt.Errorf("WhatsApp live client does not support MCP login")
+		return nil, errors.New("WhatsApp live client does not support MCP login")
 	}
-	state, err := loginClient.LoginState(ctx)
-	if err != nil {
-		return nil, whatsapplive.LoginState{}, err
-	}
-	return loginClient, state, nil
+	return loginClient, nil
 }
 
 func waitForWhatsAppLoginCode(ctx context.Context, client whatsappLoginClient, state whatsapplive.LoginState, wait time.Duration) (whatsapplive.LoginState, error) {
@@ -3111,21 +3069,21 @@ func requireWhatsAppReady(ctx context.Context, client whatsapplive.Client) error
 	return nil
 }
 
-func (h *handlers) sendWhatsAppMessage(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) sendWhatsAppMessage(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 	client, account, err := h.getWhatsAppClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	chatID, _ := args["chat_id"].(string)
 	chatID = strings.TrimSpace(chatID)
 	if chatID == "" {
-		return mcp.NewToolResultError("chat_id parameter is required"), nil
+		return toolErrorResult("chat_id parameter is required"), nil
 	}
 	body, _ := args["body"].(string)
 	body = strings.TrimSpace(body)
 	if body == "" {
-		return mcp.NewToolResultError("body parameter is required"), nil
+		return toolErrorResult("body parameter is required"), nil
 	}
 	localRequestID, _ := args["local_request_id"].(string)
 	var mentions []string
@@ -3139,7 +3097,7 @@ func (h *handlers) sendWhatsAppMessage(ctx context.Context, req mcp.CallToolRequ
 		}
 	}
 	if err := requireWhatsAppReady(ctx, client); err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 
 	result, err := client.SendMessage(ctx, whatsapplive.SendMessageRequest{
@@ -3150,32 +3108,32 @@ func (h *handlers) sendWhatsAppMessage(ctx context.Context, req mcp.CallToolRequ
 		Mentions:       mentions,
 	})
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("send whatsapp message: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("send whatsapp message: %v", err)), nil
 	}
 	return jsonResult(result)
 }
 
-func (h *handlers) sendWhatsAppReaction(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) sendWhatsAppReaction(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 	client, account, err := h.getWhatsAppClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	messageID, err := getIDArg(args, "message_id")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	emojiRaw, ok := args["emoji"]
 	if !ok {
-		return mcp.NewToolResultError("emoji parameter is required; use an empty string to clear"), nil
+		return toolErrorResult("emoji parameter is required; use an empty string to clear"), nil
 	}
 	emoji, ok := emojiRaw.(string)
 	if !ok {
-		return mcp.NewToolResultError("emoji must be a string"), nil
+		return toolErrorResult("emoji must be a string"), nil
 	}
 	localRequestID, _ := args["local_request_id"].(string)
 	if err := requireWhatsAppReady(ctx, client); err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 
 	result, err := client.SendReaction(ctx, whatsapplive.SendReactionRequest{
@@ -3185,25 +3143,25 @@ func (h *handlers) sendWhatsAppReaction(ctx context.Context, req mcp.CallToolReq
 		LocalRequestID: strings.TrimSpace(localRequestID),
 	})
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("send whatsapp reaction: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("send whatsapp reaction: %v", err)), nil
 	}
 	return jsonResult(result)
 }
 
-func (h *handlers) whatsAppRequestHistorySync(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) whatsAppRequestHistorySync(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 	client, account, err := h.getWhatsAppClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	chatID, _ := args["chat_id"].(string)
 	chatID = strings.TrimSpace(chatID)
 	if chatID == "" {
-		return mcp.NewToolResultError("chat_id parameter is required"), nil
+		return toolErrorResult("chat_id parameter is required"), nil
 	}
 	count := boundedIntArg(args, "count", whatsapplive.DefaultHistorySyncRequestCount, whatsapplive.MaxHistorySyncRequestCount)
 	if err := requireWhatsAppReady(ctx, client); err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 
 	result, err := client.RequestHistorySync(ctx, whatsapplive.RequestHistorySyncRequest{
@@ -3212,10 +3170,11 @@ func (h *handlers) whatsAppRequestHistorySync(ctx context.Context, req mcp.CallT
 		Count:   count,
 	})
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("request whatsapp history sync: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("request whatsapp history sync: %v", err)), nil
 	}
-	return structuredJSONResult(struct {
+	return jsonResult(struct {
 		whatsapplive.RequestHistorySyncResult
+
 		Message string `json:"message"`
 	}{
 		RequestHistorySyncResult: result,
@@ -3230,6 +3189,7 @@ func (h *handlers) whatsAppRequestHistorySync(ctx context.Context, req mcp.CallT
 
 type googleDocsSearchResult struct {
 	googledocs.File
+
 	Snippet       string `json:"snippet"`
 	TextLength    int    `json:"text_length"`
 	TextTruncated bool   `json:"text_truncated"`
@@ -3237,7 +3197,7 @@ type googleDocsSearchResult struct {
 
 func (h *handlers) getGoogleDocsClient(ctx context.Context) (googledocs.Client, error) {
 	if h.googleDocsFactory == nil {
-		return nil, fmt.Errorf("Google Docs API not configured")
+		return nil, errors.New("google docs API not configured")
 	}
 	client, err := h.googleDocsFactory(ctx)
 	if err != nil {
@@ -3246,11 +3206,11 @@ func (h *handlers) getGoogleDocsClient(ctx context.Context) (googledocs.Client, 
 	return client, nil
 }
 
-func (h *handlers) listGoogleDocs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) listGoogleDocs(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 	client, err := h.getGoogleDocsClient(ctx)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	files, err := client.ListDocs(
 		ctx,
@@ -3259,32 +3219,32 @@ func (h *handlers) listGoogleDocs(ctx context.Context, req mcp.CallToolRequest) 
 		boundedIntArg(args, "limit", defaultGoogleDocsListLimit, maxGoogleDocsListLimit),
 	)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("list Google Docs: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("list Google Docs: %v", err)), nil
 	}
-	return jsonResult(files)
+	return jsonArrayResult("files", files)
 }
 
-func (h *handlers) searchGoogleDocs(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) searchGoogleDocs(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 	query, err := requiredTrimmedStringArg(args, "query")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	client, err := h.getGoogleDocsClient(ctx)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	limit := boundedIntArg(args, "limit", defaultGoogleDocsSearchLimit, maxGoogleDocsSearchLimit)
 	snippetChars := boundedIntArg(args, "snippet_chars", defaultGoogleDocsSnippetChars, maxGoogleDocsSnippetChars)
 	files, err := client.ListDocs(ctx, optionalStringArg(args, "source"), query, limit)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("search Google Docs: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("search Google Docs: %v", err)), nil
 	}
 	results := make([]googleDocsSearchResult, 0, len(files))
 	for _, file := range files {
 		doc, err := client.GetDoc(ctx, file.Source, file.DocumentID, maxGoogleDocsMaxChars)
 		if err != nil {
-			return mcp.NewToolResultError(fmt.Sprintf("get Google Doc %s: %v", file.DocumentID, err)), nil
+			return toolErrorResult(fmt.Sprintf("get Google Doc %s: %v", file.DocumentID, err)), nil
 		}
 		results = append(results, googleDocsSearchResult{
 			File:          file,
@@ -3293,18 +3253,18 @@ func (h *handlers) searchGoogleDocs(ctx context.Context, req mcp.CallToolRequest
 			TextTruncated: doc.TextTruncated,
 		})
 	}
-	return jsonResult(results)
+	return jsonArrayResult("results", results)
 }
 
-func (h *handlers) getGoogleDoc(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) getGoogleDoc(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 	documentID, err := requiredTrimmedStringArg(args, "document_id")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	client, err := h.getGoogleDocsClient(ctx)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	doc, err := client.GetDoc(
 		ctx,
@@ -3313,54 +3273,54 @@ func (h *handlers) getGoogleDoc(ctx context.Context, req mcp.CallToolRequest) (*
 		boundedIntArg(args, "max_chars", defaultGoogleDocsMaxChars, maxGoogleDocsMaxChars),
 	)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("get Google Doc: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("get Google Doc: %v", err)), nil
 	}
 	return jsonResult(doc)
 }
 
-func (h *handlers) appendGoogleDocText(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) appendGoogleDocText(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 	documentID, err := requiredTrimmedStringArg(args, "document_id")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	text, err := requiredStringArg(args, "text")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	client, err := h.getGoogleDocsClient(ctx)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	result, err := client.AppendText(ctx, optionalStringArg(args, "source"), documentID, text)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("append Google Doc text: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("append Google Doc text: %v", err)), nil
 	}
 	return jsonResult(result)
 }
 
-func (h *handlers) replaceGoogleDocText(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) replaceGoogleDocText(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 	documentID, err := requiredTrimmedStringArg(args, "document_id")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	find, err := requiredStringArg(args, "find")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	replacement, err := requiredStringArgAllowEmpty(args, "replacement")
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	matchCase, _ := args["match_case"].(bool)
 	client, err := h.getGoogleDocsClient(ctx)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	result, err := client.ReplaceText(ctx, optionalStringArg(args, "source"), documentID, find, replacement, matchCase)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("replace Google Doc text: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("replace Google Doc text: %v", err)), nil
 	}
 	return jsonResult(result)
 }
@@ -3420,10 +3380,7 @@ func googleDocsSnippet(text, query string, maxChars int) string {
 	startRune := 0
 	if needle != "" {
 		if idx := strings.Index(strings.ToLower(text), needle); idx >= 0 {
-			startRune = utf8.RuneCountInString(text[:idx]) - maxChars/4
-			if startRune < 0 {
-				startRune = 0
-			}
+			startRune = max(utf8.RuneCountInString(text[:idx])-maxChars/4, 0)
 		}
 	}
 	endRune := min(len(runes), startRune+maxChars)
@@ -3442,9 +3399,9 @@ func googleDocsSnippet(text, query string, maxChars int) string {
 // getGmailClient resolves the account email and returns an authenticated mail
 // API client (Gmail OAuth or IMAP, depending on the account's source type).
 // The caller must close the returned client.
-func (h *handlers) getGmailClient(ctx context.Context, args map[string]any) (gmail.API, string, error) {
+func (h *handlers) getGmailClient(ctx context.Context, args map[string]any) (gmail.LiveAPI, error) {
 	if h.gmailFactory == nil {
-		return nil, "", fmt.Errorf("live mail API not configured (Gmail OAuth credentials or an IMAP account needed)")
+		return nil, errors.New("live mail API not configured (Gmail OAuth credentials or an IMAP account needed)")
 	}
 
 	account, _ := args["account"].(string)
@@ -3452,40 +3409,40 @@ func (h *handlers) getGmailClient(ctx context.Context, args map[string]any) (gma
 		// If no account specified, try to use the first/only account
 		accounts, err := h.engine.ListAccounts(ctx)
 		if err != nil {
-			return nil, "", fmt.Errorf("failed to list accounts: %w", err)
+			return nil, fmt.Errorf("failed to list accounts: %w", err)
 		}
 		if len(accounts) == 0 {
-			return nil, "", fmt.Errorf("no accounts configured")
+			return nil, errors.New("no accounts configured")
 		}
 		if len(accounts) > 1 {
-			return nil, "", fmt.Errorf("multiple accounts configured, specify 'account' parameter (use get_stats to list accounts)")
+			return nil, errors.New("multiple accounts configured, specify 'account' parameter (use get_stats to list accounts)")
 		}
 		account = accounts[0].Identifier
 	}
 
 	client, err := h.gmailFactory(ctx, account)
 	if err != nil {
-		return nil, "", fmt.Errorf("authenticate %s: %w", account, err)
+		return nil, fmt.Errorf("authenticate %s: %w", account, err)
 	}
 
-	return client, account, nil
+	return client, nil
 }
 
-func (h *handlers) listDrafts(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) listDrafts(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	client, _, err := h.getGmailClient(ctx, args)
+	client, err := h.getGmailClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	queryStr, _ := args["query"].(string)
 	limit := limitArg(args, "limit", 20)
 
 	drafts, err := client.ListDrafts(ctx, queryStr, limit)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("list drafts: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("list drafts: %v", err)), nil
 	}
 
 	// Return a compact summary
@@ -3508,43 +3465,43 @@ func (h *handlers) listDrafts(ctx context.Context, req mcp.CallToolRequest) (*mc
 		}
 	}
 
-	return jsonResult(summaries)
+	return jsonArrayResult("drafts", summaries)
 }
 
-func (h *handlers) getDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) getDraft(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	client, _, err := h.getGmailClient(ctx, args)
+	client, err := h.getGmailClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	draftID, _ := args["draft_id"].(string)
 	if draftID == "" {
-		return mcp.NewToolResultError("draft_id parameter is required"), nil
+		return toolErrorResult("draft_id parameter is required"), nil
 	}
 
 	draft, err := client.GetDraft(ctx, draftID)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("get draft: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("get draft: %v", err)), nil
 	}
 
 	return jsonResult(draft)
 }
 
-func (h *handlers) createDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) createDraft(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	client, _, err := h.getGmailClient(ctx, args)
+	client, err := h.getGmailClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	body, _ := args["body"].(string)
 	if body == "" {
-		return mcp.NewToolResultError("body parameter is required"), nil
+		return toolErrorResult("body parameter is required"), nil
 	}
 
 	compose := &gmail.DraftCompose{
@@ -3578,13 +3535,13 @@ func (h *handlers) createDraft(ctx context.Context, req mcp.CallToolRequest) (*m
 
 	atts, err := h.resolveDraftAttachments(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	compose.Attachments = atts
 
 	draft, err := client.CreateDraft(ctx, compose)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("create draft: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("create draft: %v", err)), nil
 	}
 
 	resp := struct {
@@ -3602,23 +3559,23 @@ func (h *handlers) createDraft(ctx context.Context, req mcp.CallToolRequest) (*m
 	return jsonResult(resp)
 }
 
-func (h *handlers) updateDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) updateDraft(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	client, _, err := h.getGmailClient(ctx, args)
+	client, err := h.getGmailClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	draftID, _ := args["draft_id"].(string)
 	if draftID == "" {
-		return mcp.NewToolResultError("draft_id parameter is required"), nil
+		return toolErrorResult("draft_id parameter is required"), nil
 	}
 
 	body, _ := args["body"].(string)
 	if body == "" {
-		return mcp.NewToolResultError("body parameter is required"), nil
+		return toolErrorResult("body parameter is required"), nil
 	}
 
 	compose := &gmail.DraftCompose{
@@ -3652,13 +3609,13 @@ func (h *handlers) updateDraft(ctx context.Context, req mcp.CallToolRequest) (*m
 
 	atts, err := h.resolveDraftAttachments(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
 	compose.Attachments = atts
 
 	draft, err := client.UpdateDraft(ctx, draftID, compose)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("update draft: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("update draft: %v", err)), nil
 	}
 
 	return jsonResult(struct {
@@ -3672,22 +3629,22 @@ func (h *handlers) updateDraft(ctx context.Context, req mcp.CallToolRequest) (*m
 	})
 }
 
-func (h *handlers) deleteDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) deleteDraft(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	client, _, err := h.getGmailClient(ctx, args)
+	client, err := h.getGmailClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	draftID, _ := args["draft_id"].(string)
 	if draftID == "" {
-		return mcp.NewToolResultError("draft_id parameter is required"), nil
+		return toolErrorResult("draft_id parameter is required"), nil
 	}
 
 	if err := client.DeleteDraft(ctx, draftID); err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("delete draft: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("delete draft: %v", err)), nil
 	}
 
 	return jsonResult(struct {
@@ -3699,23 +3656,23 @@ func (h *handlers) deleteDraft(ctx context.Context, req mcp.CallToolRequest) (*m
 	})
 }
 
-func (h *handlers) sendDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) sendDraft(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	client, _, err := h.getGmailClient(ctx, args)
+	client, err := h.getGmailClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	draftID, _ := args["draft_id"].(string)
 	if draftID == "" {
-		return mcp.NewToolResultError("draft_id parameter is required"), nil
+		return toolErrorResult("draft_id parameter is required"), nil
 	}
 
 	sent, err := client.SendDraft(ctx, draftID)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("send draft: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("send draft: %v", err)), nil
 	}
 
 	return jsonResult(struct {
@@ -3733,25 +3690,25 @@ func (h *handlers) sendDraft(ctx context.Context, req mcp.CallToolRequest) (*mcp
 
 // --- Label handlers ---
 
-func (h *handlers) modifyLabels(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) modifyLabels(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	client, _, err := h.getGmailClient(ctx, args)
+	client, err := h.getGmailClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	messageIDsStr, _ := args["message_ids"].(string)
 	if messageIDsStr == "" {
-		return mcp.NewToolResultError("message_ids parameter is required"), nil
+		return toolErrorResult("message_ids parameter is required"), nil
 	}
 
 	addLabelsStr, _ := args["add_labels"].(string)
 	removeLabelsStr, _ := args["remove_labels"].(string)
 
 	if addLabelsStr == "" && removeLabelsStr == "" {
-		return mcp.NewToolResultError("at least one of add_labels or remove_labels is required"), nil
+		return toolErrorResult("at least one of add_labels or remove_labels is required"), nil
 	}
 
 	messageIDs := splitCSV(messageIDsStr)
@@ -3764,7 +3721,7 @@ func (h *handlers) modifyLabels(ctx context.Context, req mcp.CallToolRequest) (*
 		err = client.ModifyMessageLabels(ctx, messageIDs[0], addLabelIDs, removeLabelIDs)
 	}
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("modify labels: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("modify labels: %v", err)), nil
 	}
 
 	return jsonResult(struct {
@@ -3780,44 +3737,44 @@ func (h *handlers) modifyLabels(ctx context.Context, req mcp.CallToolRequest) (*
 	})
 }
 
-func (h *handlers) createLabel(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) createLabel(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	client, _, err := h.getGmailClient(ctx, args)
+	client, err := h.getGmailClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	name, _ := args["name"].(string)
 	if name == "" {
-		return mcp.NewToolResultError("name parameter is required"), nil
+		return toolErrorResult("name parameter is required"), nil
 	}
 
 	label, err := client.CreateLabel(ctx, name)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("create label: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("create label: %v", err)), nil
 	}
 
 	return jsonResult(label)
 }
 
-func (h *handlers) deleteLabel(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) deleteLabel(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	client, _, err := h.getGmailClient(ctx, args)
+	client, err := h.getGmailClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	labelID, _ := args["label_id"].(string)
 	if labelID == "" {
-		return mcp.NewToolResultError("label_id parameter is required"), nil
+		return toolErrorResult("label_id parameter is required"), nil
 	}
 
 	if err := client.DeleteLabel(ctx, labelID); err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("delete label: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("delete label: %v", err)), nil
 	}
 
 	return jsonResult(struct {
@@ -3829,21 +3786,21 @@ func (h *handlers) deleteLabel(ctx context.Context, req mcp.CallToolRequest) (*m
 	})
 }
 
-func (h *handlers) listGmailLabels(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+func (h *handlers) listGmailLabels(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	client, _, err := h.getGmailClient(ctx, args)
+	client, err := h.getGmailClient(ctx, args)
 	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		return toolErrorResult(err.Error()), nil
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	labels, err := client.ListLabels(ctx)
 	if err != nil {
-		return mcp.NewToolResultError(fmt.Sprintf("list labels: %v", err)), nil
+		return toolErrorResult(fmt.Sprintf("list labels: %v", err)), nil
 	}
 
-	return jsonResult(labels)
+	return jsonArrayResult("labels", labels)
 }
 
 // splitCSV splits a comma-separated string into trimmed parts.

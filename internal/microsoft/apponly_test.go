@@ -12,6 +12,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -20,9 +22,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
 )
 
 // writeTestCertPEM generates a self-signed RSA cert + key and writes both to a
@@ -83,16 +82,17 @@ func TestAppOnlyConfigValidate(t *testing.T) {
 }
 
 func TestLoadAppOnlyCertBothKeyFormats(t *testing.T) {
+	assert := assert.New(t)
 	for _, pkcs8 := range []bool{false, true} {
 		path, key, certDER := writeTestCertPEM(t, pkcs8)
 		gotKey, x5t, err := loadAppOnlyCert(path)
 		require.NoError(t, err)
-		assert.Equal(t, key.N, gotKey.N, "loaded modulus should match")
+		assert.Equal(key.N, gotKey.N, "loaded modulus should match")
 
 		// x5t must be the base64url (unpadded) SHA-1 thumbprint of the cert DER.
 		want := base64.RawURLEncoding.EncodeToString(sha1Sum(certDER))
-		assert.Equal(t, want, x5t)
-		assert.NotContains(t, x5t, "=")
+		assert.Equal(want, x5t)
+		assert.NotContains(x5t, "=")
 	}
 }
 
@@ -110,59 +110,63 @@ func TestLoadAppOnlyCertErrors(t *testing.T) {
 }
 
 func TestClientAssertionIsVerifiableJWT(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	path, key, _ := writeTestCertPEM(t, false)
 	ts, err := NewAppOnlyTokenSource(testConfig(path), nil)
-	require.NoError(t, err)
+	require.NoError(err)
 
 	now := time.Unix(1_700_000_000, 0)
 	assertion, err := ts.clientAssertion(now)
-	require.NoError(t, err)
+	require.NoError(err)
 
 	parts := strings.Split(assertion, ".")
-	require.Len(t, parts, 3)
+	require.Len(parts, 3)
 
 	// header carries the x5t thumbprint and RS256 alg
 	hdrJSON, err := base64.RawURLEncoding.DecodeString(parts[0])
-	require.NoError(t, err)
+	require.NoError(err)
 	var hdr map[string]string
-	require.NoError(t, json.Unmarshal(hdrJSON, &hdr))
-	assert.Equal(t, "RS256", hdr["alg"])
-	assert.Equal(t, ts.x5t, hdr["x5t"])
+	require.NoError(json.Unmarshal(hdrJSON, &hdr))
+	assert.Equal("RS256", hdr["alg"])
+	assert.Equal(ts.x5t, hdr["x5t"])
 
 	// claims bind issuer/subject to the client id and target the token endpoint
 	clJSON, err := base64.RawURLEncoding.DecodeString(parts[1])
-	require.NoError(t, err)
+	require.NoError(err)
 	var cl map[string]any
-	require.NoError(t, json.Unmarshal(clJSON, &cl))
-	assert.Equal(t, ts.cfg.ClientID, cl["iss"])
-	assert.Equal(t, ts.cfg.ClientID, cl["sub"])
-	assert.Equal(t, ts.tokenEndpoint(), cl["aud"])
-	assert.EqualValues(t, now.Unix(), cl["iat"])
-	assert.EqualValues(t, now.Add(appOnlyAssertionLifetime).Unix(), cl["exp"])
+	require.NoError(json.Unmarshal(clJSON, &cl))
+	assert.Equal(ts.cfg.ClientID, cl["iss"])
+	assert.Equal(ts.cfg.ClientID, cl["sub"])
+	assert.Equal(ts.tokenEndpoint(), cl["aud"])
+	assert.EqualValues(now.Unix(), cl["iat"])
+	assert.EqualValues(now.Add(appOnlyAssertionLifetime).Unix(), cl["exp"])
 
 	// signature verifies against the cert's public key
 	signingInput := parts[0] + "." + parts[1]
 	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
-	require.NoError(t, err)
+	require.NoError(err)
 	digest := sha256.Sum256([]byte(signingInput))
-	require.NoError(t, rsa.VerifyPKCS1v15(&key.PublicKey, crypto.SHA256, digest[:], sig))
+	require.NoError(rsa.VerifyPKCS1v15(&key.PublicKey, crypto.SHA256, digest[:], sig))
 }
 
 func TestTokenFetchAndCache(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	path, _, _ := writeTestCertPEM(t, false)
 	ts, err := NewAppOnlyTokenSource(testConfig(path), nil)
-	require.NoError(t, err)
+	require.NoError(err)
 
 	var calls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
-		require.NoError(t, r.ParseForm())
-		assert.Equal(t, "client_credentials", r.Form.Get("grant_type"))
-		assert.Equal(t, appOnlyIMAPScope, r.Form.Get("scope"))
-		assert.Equal(t,
+		assert.NoError(r.ParseForm())
+		assert.Equal("client_credentials", r.Form.Get("grant_type"))
+		assert.Equal(appOnlyIMAPScope, r.Form.Get("scope"))
+		assert.Equal(
 			"urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
 			r.Form.Get("client_assertion_type"))
-		assert.NotEmpty(t, r.Form.Get("client_assertion"))
+		assert.NotEmpty(r.Form.Get("client_assertion"))
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"access_token":"tok-abc","expires_in":3600,"token_type":"Bearer"}`))
 	}))
@@ -174,27 +178,29 @@ func TestTokenFetchAndCache(t *testing.T) {
 	ts.now = func() time.Time { return base }
 
 	tok, err := ts.Token(context.Background())
-	require.NoError(t, err)
-	assert.Equal(t, "tok-abc", tok)
-	assert.Equal(t, 1, calls)
+	require.NoError(err)
+	assert.Equal("tok-abc", tok)
+	assert.Equal(1, calls)
 
 	// second call within lifetime is served from cache
 	tok2, err := ts.Token(context.Background())
-	require.NoError(t, err)
-	assert.Equal(t, "tok-abc", tok2)
-	assert.Equal(t, 1, calls, "cached token should not trigger a second fetch")
+	require.NoError(err)
+	assert.Equal("tok-abc", tok2)
+	assert.Equal(1, calls, "cached token should not trigger a second fetch")
 
 	// advance past expiry (minus skew) → refetch
 	ts.now = func() time.Time { return base.Add(59 * time.Minute) }
 	_, err = ts.Token(context.Background())
-	require.NoError(t, err)
-	assert.Equal(t, 2, calls)
+	require.NoError(err)
+	assert.Equal(2, calls)
 }
 
 func TestTokenFetchAADError(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	path, _, _ := writeTestCertPEM(t, false)
 	ts, err := NewAppOnlyTokenSource(testConfig(path), nil)
-	require.NoError(t, err)
+	require.NoError(err)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
@@ -204,8 +210,8 @@ func TestTokenFetchAADError(t *testing.T) {
 	ts.endpointOverride = srv.URL
 
 	_, err = ts.Token(context.Background())
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid_client")
-	assert.Contains(t, err.Error(), "AADSTS700027")
-	assert.NotContains(t, err.Error(), "Trace ID", "only the first line of the AAD description is kept")
+	require.Error(err)
+	assert.Contains(err.Error(), "invalid_client")
+	assert.Contains(err.Error(), "AADSTS700027")
+	assert.NotContains(err.Error(), "Trace ID", "only the first line of the AAD description is kept")
 }

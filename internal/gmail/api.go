@@ -114,20 +114,20 @@ type StatusError struct {
 
 func (e *StatusError) Error() string { return e.msg }
 
-// DraftManager provides CRUD operations for Gmail drafts.
+// DraftManager provides composed drafts and sending for live mail clients.
 type DraftManager interface {
 	// ListDrafts returns drafts matching the optional query.
-	ListDrafts(ctx context.Context, query string, maxResults int) ([]*Draft, error)
+	ListDrafts(ctx context.Context, query string, maxResults int) ([]*ComposedDraft, error)
 
 	// GetDraft returns a single draft by ID.
-	GetDraft(ctx context.Context, draftID string) (*Draft, error)
+	GetDraft(ctx context.Context, draftID string) (*ComposedDraft, error)
 
 	// CreateDraft creates a new draft. If threadID is non-empty, the draft
 	// is created as a reply within that thread.
-	CreateDraft(ctx context.Context, draft *DraftCompose) (*Draft, error)
+	CreateDraft(ctx context.Context, draft *DraftCompose) (*ComposedDraft, error)
 
 	// UpdateDraft replaces the content of an existing draft.
-	UpdateDraft(ctx context.Context, draftID string, draft *DraftCompose) (*Draft, error)
+	UpdateDraft(ctx context.Context, draftID string, draft *DraftCompose) (*ComposedDraft, error)
 
 	// DeleteDraft permanently deletes a draft.
 	DeleteDraft(ctx context.Context, draftID string) error
@@ -158,8 +158,6 @@ type API interface {
 	AccountReader
 	MessageReader
 	MessageDeleter
-	DraftManager
-	LabelManager
 
 	// Close releases any resources held by the client.
 	Close() error
@@ -273,8 +271,8 @@ type MessageRelocationTarget struct {
 	NewSourceMessageID string
 }
 
-// Draft represents a Gmail draft with its message content.
-type Draft struct {
+// ComposedDraft represents a Gmail draft with its message content.
+type ComposedDraft struct {
 	ID      string // Draft ID (used for update/send/delete)
 	Message DraftMessage
 }
@@ -330,4 +328,11 @@ type SentMessage struct {
 	ID       string
 	ThreadID string
 	LabelIDs []string
+}
+
+// LiveAPI adds the fork mail-writing surface to archive access.
+type LiveAPI interface {
+	API
+	DraftManager
+	LabelManager
 }

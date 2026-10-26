@@ -99,10 +99,10 @@ func (s *Store) ListWhatsAppMessagesForConversation(conversationID int64) ([]Wha
 	return out, rows.Err()
 }
 
-// GetMessageBodyText fetches body_text/body_html for messageID by primary
+// GetMessageBodiesForMerge fetches body_text/body_html for messageID by primary
 // key. found is false when the message has no message_bodies row (e.g. a
 // media-only message with no caption).
-func (s *Store) GetMessageBodyText(messageID int64) (bodyText, bodyHTML sql.NullString, found bool, err error) {
+func (s *Store) GetMessageBodiesForMerge(messageID int64) (bodyText, bodyHTML sql.NullString, found bool, err error) {
 	err = s.db.QueryRow(`
 		SELECT body_text, body_html FROM message_bodies WHERE message_id = ?
 	`, messageID).Scan(&bodyText, &bodyHTML)

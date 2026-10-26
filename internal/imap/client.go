@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"maps"
 	"net"
 	"slices"
 	"strconv"
@@ -153,11 +152,11 @@ type Client struct {
 	// actually touches. Nil when the caller keeps no durable state.
 	aliasLoader     func(mailbox string, uids []uint32) (map[string]string, error)
 	aliasLoadWarned bool // one failing load must not warn once per request
-	draftsMailbox string
-	archiveMailbox      string               // mailbox with \Archive attribute (empty if not detected)
-	sentMailbox         string               // mailbox with \Sent attribute (empty if not detected)
-	smtpAddr            string               // SMTP submission addr host:port, optional
-	smtpSend            smtpSendFunc         // test hook; nil uses real SMTP
+	draftsMailbox   string
+	archiveMailbox  string       // mailbox with \Archive attribute (empty if not detected)
+	sentMailbox     string       // mailbox with \Sent attribute (empty if not detected)
+	smtpAddr        string       // SMTP submission addr host:port, optional
+	smtpSend        smtpSendFunc // test hook; nil uses real SMTP
 
 	// folderFilter overrides which mailboxes are included in the sync.
 	// Zero-valued (empty include and exclude) means "all mailboxes".
@@ -756,7 +755,7 @@ func (c *Client) applyMailboxNameFallbacks(names []string) {
 
 	// Fallback: look for common drafts folder names
 	if c.draftsMailbox == "" {
-		for _, candidate := range []string{"Drafts", "Draft", "[Gmail]/Drafts"} {
+		for _, candidate := range []string{"Drafts", "ComposedDraft", "[Gmail]/Drafts"} {
 			for _, mb := range names {
 				if strings.EqualFold(mb, candidate) {
 					c.draftsMailbox = mb
@@ -2120,9 +2119,9 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// Draft operations.
+// ComposedDraft operations.
 
-func (c *Client) ListDrafts(ctx context.Context, query string, maxResults int) ([]*gmailapi.Draft, error) {
+func (c *Client) ListDrafts(ctx context.Context, query string, maxResults int) ([]*gmailapi.ComposedDraft, error) {
 	ids, err := c.listDraftIDs(ctx)
 	if err != nil {
 		return nil, err
@@ -2132,7 +2131,7 @@ func (c *Client) ListDrafts(ctx context.Context, query string, maxResults int) (
 		return nil, err
 	}
 
-	drafts := make([]*gmailapi.Draft, 0, len(raws))
+	drafts := make([]*gmailapi.ComposedDraft, 0, len(raws))
 	for _, raw := range raws {
 		if raw == nil || len(raw.Raw) == 0 {
 			continue
@@ -2181,7 +2180,7 @@ func (c *Client) listDraftIDs(ctx context.Context) ([]string, error) {
 	return ids, err
 }
 
-func (c *Client) GetDraft(ctx context.Context, draftID string) (*gmailapi.Draft, error) {
+func (c *Client) GetDraft(ctx context.Context, draftID string) (*gmailapi.ComposedDraft, error) {
 	raw, err := c.GetMessageRaw(ctx, draftID)
 	if err != nil {
 		return nil, err
@@ -2189,13 +2188,13 @@ func (c *Client) GetDraft(ctx context.Context, draftID string) (*gmailapi.Draft,
 	return draftFromRaw(raw)
 }
 
-func (c *Client) CreateDraft(ctx context.Context, compose *gmailapi.DraftCompose) (*gmailapi.Draft, error) {
+func (c *Client) CreateDraft(ctx context.Context, compose *gmailapi.DraftCompose) (*gmailapi.ComposedDraft, error) {
 	raw, err := gmailapi.BuildDraftMIME(compose)
 	if err != nil {
 		return nil, fmt.Errorf("build draft MIME: %w", err)
 	}
 
-	var draft *gmailapi.Draft
+	var draft *gmailapi.ComposedDraft
 	err = c.withConn(ctx, func(conn *imapclient.Client) error {
 		if !conn.Caps().Has(imap.CapUIDPlus) {
 			return errors.New("server does not support UIDPLUS; create draft requires APPENDUID")
@@ -2211,7 +2210,7 @@ func (c *Client) CreateDraft(ctx context.Context, compose *gmailapi.DraftCompose
 			return err
 		}
 
-		draft = &gmailapi.Draft{
+		draft = &gmailapi.ComposedDraft{
 			ID: id,
 			Message: gmailapi.DraftMessage{
 				ID:       id,
@@ -2276,7 +2275,7 @@ func (c *Client) appendMessageLocked(
 	return compositeID(mailbox, appendData.UID), nil
 }
 
-func (c *Client) UpdateDraft(ctx context.Context, draftID string, compose *gmailapi.DraftCompose) (*gmailapi.Draft, error) {
+func (c *Client) UpdateDraft(ctx context.Context, draftID string, compose *gmailapi.DraftCompose) (*gmailapi.ComposedDraft, error) {
 	draft, err := c.CreateDraft(ctx, compose)
 	if err != nil {
 		return nil, err
@@ -2369,7 +2368,7 @@ func (c *Client) SendDraft(ctx context.Context, draftID string) (*gmailapi.SentM
 	return sent, nil
 }
 
-func draftRecipients(draft *gmailapi.Draft) []string {
+func draftRecipients(draft *gmailapi.ComposedDraft) []string {
 	seen := make(map[string]bool)
 	var out []string
 	for _, addr := range append(append(slices.Clone(draft.Message.To), draft.Message.Cc...), draft.Message.Bcc...) {
@@ -2407,7 +2406,7 @@ func (c *Client) sendSMTP(ctx context.Context, from string, to []string, raw []b
 	if err != nil {
 		return fmt.Errorf("connect SMTP %s STARTTLS: %w", addr, err)
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	if !client.SupportsAuth("XOAUTH2") {
 		return errors.New("SMTP server does not advertise XOAUTH2")
@@ -2439,7 +2438,7 @@ func (c *Client) smtpSubmissionAddr() string {
 	return net.JoinHostPort("smtp."+host, "587")
 }
 
-func draftFromRaw(raw *gmailapi.RawMessage) (*gmailapi.Draft, error) {
+func draftFromRaw(raw *gmailapi.RawMessage) (*gmailapi.ComposedDraft, error) {
 	if raw == nil {
 		return nil, errors.New("draft raw message is nil")
 	}
@@ -2455,7 +2454,7 @@ func draftFromRaw(raw *gmailapi.RawMessage) (*gmailapi.Draft, error) {
 	if date == 0 && !parsed.Date.IsZero() {
 		date = parsed.Date.UnixMilli()
 	}
-	return &gmailapi.Draft{
+	return &gmailapi.ComposedDraft{
 		ID: raw.ID,
 		Message: gmailapi.DraftMessage{
 			ID:       raw.ID,
@@ -2503,7 +2502,7 @@ func snippet(body string) string {
 	return s
 }
 
-func draftMatchesQuery(draft *gmailapi.Draft, query string) bool {
+func draftMatchesQuery(draft *gmailapi.ComposedDraft, query string) bool {
 	query = strings.TrimSpace(strings.ToLower(query))
 	if query == "" {
 		return true

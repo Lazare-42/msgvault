@@ -85,7 +85,7 @@ func (s *Server) handleRequestOCR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.scheduler != nil && s.scheduler.IsJobScheduled("attachment-ocr") {
-		_ = s.scheduler.StartJob("attachment-ocr")
+		_, _ = s.scheduler.StartJob("attachment-ocr", false)
 	}
 	writeJSON(w, http.StatusAccepted, result)
 }

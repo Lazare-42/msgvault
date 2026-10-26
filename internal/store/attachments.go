@@ -509,7 +509,7 @@ func (s *Store) listPendingAttachmentMessages(sourceID int64, providerPrefix str
 // — it exists purely so the failure is visible/queryable instead of the
 // message looking attachment-free.
 func (s *Store) ReplaceMessageWhatsAppAttachments(messageID int64, refs []AttachmentRef) error {
-	return s.replaceMessageProviderAttachments(messageID, "whatsapp:", refs)
+	return s.replaceMessageProviderAttachmentsContext(context.Background(), messageID, "whatsapp:", refs)
 }
 
 // ReplaceMessageDiscordAttachments replaces Discord-managed attachment rows.

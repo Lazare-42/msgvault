@@ -1102,7 +1102,7 @@ func TestCreateDraftAndUpdateDraftSchemasIncludeNewAttachments(t *testing.T) {
 	require := require.New(t)
 	opts := ServeOptions{
 		Engine: &querytest.MockEngine{},
-		GmailFactory: func(context.Context, string) (gmail.API, error) {
+		GmailFactory: func(context.Context, string) (gmail.LiveAPI, error) {
 			return nil, errors.New("not used in this schema-only test")
 		},
 	}

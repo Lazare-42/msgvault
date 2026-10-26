@@ -22,6 +22,11 @@ func microsoftIMAPTokenSource(
 	ctx context.Context,
 	imapCfg *imapclient.Config,
 ) (func(context.Context) (string, error), error) {
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil {
+		return nil, errors.New("configuration is unavailable")
+	}
+	cfg, logger := state.cfg, state.logger
 	if imapCfg.MSAppOnly {
 		ts, err := microsoft.NewAppOnlyTokenSource(microsoft.AppOnlyConfig{
 			TenantID: imapCfg.MSTenantID,

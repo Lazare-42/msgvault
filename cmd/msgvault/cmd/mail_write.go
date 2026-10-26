@@ -82,8 +82,12 @@ func syncableAccountNames(accounts []daemonclient.CLIAccount) []string {
 // build a live mail client. The archive is opened read-only, so this is
 // safe alongside the running daemon; in remote daemon mode the local
 // archive does not exist and mail-server writes are unavailable.
-func lookupAccountWriteSource(account daemonclient.CLIAccount) (*store.Source, error) {
-	s, err := store.OpenReadOnly(cfg.DatabaseDSN())
+func lookupAccountWriteSource(ctx context.Context, account daemonclient.CLIAccount) (*store.Source, error) {
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil {
+		return nil, errors.New("configuration is unavailable")
+	}
+	s, err := store.OpenReadOnly(state.cfg.DatabaseDSN())
 	if err != nil {
 		return nil, fmt.Errorf(
 			"open local archive to load source credentials (mail-server writes require running where the account was added): %w", err)
@@ -141,7 +145,7 @@ func pickAccountWriteSource(sources []*store.Source, account daemonclient.CLIAcc
 // messages; progressVerb (e.g. "Moved") labels the stderr progress lines.
 func batchModifyLabelsChunked(
 	ctx context.Context,
-	client gmail.API,
+	client gmail.LabelManager,
 	sourceIDs, addLabels, removeLabels []string,
 	progressVerb string,
 ) (okIdx []int, errCount int) {

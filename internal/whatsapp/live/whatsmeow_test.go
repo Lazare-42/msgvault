@@ -4,14 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
-	stdmime "mime"
-	"path/filepath"
-	"strings"
-	"sync"
-	"testing"
-	"time"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.mau.fi/whatsmeow"
@@ -22,6 +14,13 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
+	"math"
+	stdmime "mime"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
 )
 
 // fakeMediaDownloader is a minimal mediaDownloader used to exercise
@@ -45,11 +44,9 @@ func (f *fakeMediaDownloader) Download(_ context.Context, msg whatsmeow.Download
 
 func testMessageInfo(id types.MessageID) types.MessageInfo {
 	return types.MessageInfo{
-		MessageSource: types.MessageSource{
-			Chat:    types.NewJID("120363", types.GroupServer),
-			Sender:  types.NewJID("15557654321", types.DefaultUserServer),
-			IsGroup: true,
-		},
+		Chat:      types.NewJID("120363", types.GroupServer),
+		Sender:    types.NewJID("15557654321", types.DefaultUserServer),
+		IsGroup:   true,
 		ID:        id,
 		Timestamp: time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC),
 	}
@@ -112,62 +109,65 @@ func TestExtractMediaMessage(t *testing.T) {
 	})
 
 	t.Run("no media", func(t *testing.T) {
-		_, _, ok := extractMediaMessage(&waE2E.Message{Conversation: proto.String("hello")})
+		_, _, ok := extractMediaMessage(&waE2E.Message{Conversation: new("hello")})
 		assert.False(t, ok)
 	})
 
 	t.Run("image", func(t *testing.T) {
+		assert := assert.New(t)
 		img := &waE2E.ImageMessage{
-			Mimetype:   proto.String("image/jpeg"),
+			Mimetype:   new("image/jpeg"),
 			FileLength: proto.Uint64(1024),
 			MediaKey:   []byte("mediakey"),
-			DirectPath: proto.String("/mms/image/abc"),
+			DirectPath: new("/mms/image/abc"),
 		}
 		downloadable, meta, ok := extractMediaMessage(&waE2E.Message{ImageMessage: img})
 		require.True(t, ok)
-		assert.Same(t, img, downloadable)
-		assert.Equal(t, "image/jpeg", meta.mimetype)
-		assert.Equal(t, "image", meta.mediaType)
-		assert.EqualValues(t, 1024, meta.size)
-		assert.True(t, strings.HasPrefix(meta.filename, "image"))
+		assert.Same(img, downloadable)
+		assert.Equal("image/jpeg", meta.mimetype)
+		assert.Equal("image", meta.mediaType)
+		assert.EqualValues(1024, meta.size)
+		assert.True(strings.HasPrefix(meta.filename, "image"))
 	})
 
 	t.Run("video", func(t *testing.T) {
+		assert := assert.New(t)
 		vid := &waE2E.VideoMessage{
-			Mimetype:   proto.String("video/mp4"),
+			Mimetype:   new("video/mp4"),
 			FileLength: proto.Uint64(2048),
 			MediaKey:   []byte("mediakey"),
-			DirectPath: proto.String("/mms/video/abc"),
+			DirectPath: new("/mms/video/abc"),
 		}
 		downloadable, meta, ok := extractMediaMessage(&waE2E.Message{VideoMessage: vid})
 		require.True(t, ok)
-		assert.Same(t, vid, downloadable)
-		assert.Equal(t, "video/mp4", meta.mimetype)
-		assert.Equal(t, "video", meta.mediaType)
-		assert.EqualValues(t, 2048, meta.size)
+		assert.Same(vid, downloadable)
+		assert.Equal("video/mp4", meta.mimetype)
+		assert.Equal("video", meta.mediaType)
+		assert.EqualValues(2048, meta.size)
 	})
 
 	t.Run("document with filename", func(t *testing.T) {
+		assert := assert.New(t)
 		doc := &waE2E.DocumentMessage{
-			FileName:   proto.String("RIB.pdf"),
-			Mimetype:   proto.String("application/pdf"),
+			FileName:   new("RIB.pdf"),
+			Mimetype:   new("application/pdf"),
 			FileLength: proto.Uint64(4096),
 			MediaKey:   []byte("mediakey"),
-			DirectPath: proto.String("/mms/document/abc"),
+			DirectPath: new("/mms/document/abc"),
 		}
 		downloadable, meta, ok := extractMediaMessage(&waE2E.Message{DocumentMessage: doc})
 		require.True(t, ok)
-		assert.Same(t, doc, downloadable)
-		assert.Equal(t, "RIB.pdf", meta.filename)
-		assert.Equal(t, "application/pdf", meta.mimetype)
-		assert.Equal(t, "document", meta.mediaType)
-		assert.EqualValues(t, 4096, meta.size)
+		assert.Same(doc, downloadable)
+		assert.Equal("RIB.pdf", meta.filename)
+		assert.Equal("application/pdf", meta.mimetype)
+		assert.Equal("document", meta.mediaType)
+		assert.EqualValues(4096, meta.size)
 	})
 
 	t.Run("document without filename falls back to title", func(t *testing.T) {
 		doc := &waE2E.DocumentMessage{
-			Title:      proto.String("Bank Details"),
-			Mimetype:   proto.String("application/pdf"),
+			Title:      new("Bank Details"),
+			Mimetype:   new("application/pdf"),
 			FileLength: proto.Uint64(4096),
 		}
 		_, meta, ok := extractMediaMessage(&waE2E.Message{DocumentMessage: doc})
@@ -177,9 +177,9 @@ func TestExtractMediaMessage(t *testing.T) {
 
 	t.Run("audio voice note", func(t *testing.T) {
 		aud := &waE2E.AudioMessage{
-			Mimetype:   proto.String("audio/ogg"),
+			Mimetype:   new("audio/ogg"),
 			FileLength: proto.Uint64(512),
-			PTT:        proto.Bool(true),
+			PTT:        new(true),
 		}
 		_, meta, ok := extractMediaMessage(&waE2E.Message{AudioMessage: aud})
 		require.True(t, ok)
@@ -188,7 +188,7 @@ func TestExtractMediaMessage(t *testing.T) {
 
 	t.Run("audio regular", func(t *testing.T) {
 		aud := &waE2E.AudioMessage{
-			Mimetype:   proto.String("audio/mpeg"),
+			Mimetype:   new("audio/mpeg"),
 			FileLength: proto.Uint64(512),
 		}
 		_, meta, ok := extractMediaMessage(&waE2E.Message{AudioMessage: aud})
@@ -198,7 +198,7 @@ func TestExtractMediaMessage(t *testing.T) {
 
 	t.Run("sticker", func(t *testing.T) {
 		sticker := &waE2E.StickerMessage{
-			Mimetype:   proto.String("image/webp"),
+			Mimetype:   new("image/webp"),
 			FileLength: proto.Uint64(128),
 		}
 		downloadable, meta, ok := extractMediaMessage(&waE2E.Message{StickerMessage: sticker})
@@ -209,109 +209,117 @@ func TestExtractMediaMessage(t *testing.T) {
 }
 
 func TestConvertMessageCaptionlessMediaIsArchived(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	dl := &fakeMediaDownloader{data: []byte("%PDF-1.4 synthetic bank details")}
 	transport := &WhatsmeowTransport{account: "15551234567@s.whatsapp.net", downloader: dl}
 	evt := &events.Message{
 		Info: testMessageInfo("msg-1"),
 		Message: &waE2E.Message{
 			DocumentMessage: &waE2E.DocumentMessage{
-				FileName:   proto.String("RIB.pdf"),
-				Mimetype:   proto.String("application/pdf"),
-				FileLength: proto.Uint64(uint64(len("%PDF-1.4 synthetic bank details"))),
+				FileName:   new("RIB.pdf"),
+				Mimetype:   new("application/pdf"),
+				FileLength: new(uint64(len("%PDF-1.4 synthetic bank details"))),
 				MediaKey:   []byte("mediakey"),
-				DirectPath: proto.String("/mms/document/abc"),
+				DirectPath: new("/mms/document/abc"),
 				// No Caption set: this is the captionless-attachment bug case.
 			},
 		},
 	}
 
 	inbound, ok := transport.convertMessage(context.Background(), evt)
-	require.True(t, ok, "a captionless media message must still be archived")
-	assert.Empty(t, inbound.Text)
-	require.NotNil(t, inbound.Attachment)
-	assert.Equal(t, "RIB.pdf", inbound.Attachment.Filename)
-	assert.Equal(t, "application/pdf", inbound.Attachment.MimeType)
-	assert.Equal(t, "document", inbound.Attachment.MediaType)
-	assert.Equal(t, []byte("%PDF-1.4 synthetic bank details"), inbound.Attachment.Data)
-	assert.Empty(t, inbound.Attachment.DownloadError)
-	assert.Equal(t, 1, dl.calls)
+	require.True(ok, "a captionless media message must still be archived")
+	assert.Empty(inbound.Text)
+	require.NotNil(inbound.Attachment)
+	assert.Equal("RIB.pdf", inbound.Attachment.Filename)
+	assert.Equal("application/pdf", inbound.Attachment.MimeType)
+	assert.Equal("document", inbound.Attachment.MediaType)
+	assert.Equal([]byte("%PDF-1.4 synthetic bank details"), inbound.Attachment.Data)
+	assert.Empty(inbound.Attachment.DownloadError)
+	assert.Equal(1, dl.calls)
 }
 
 func TestConvertMessageMediaWithCaptionKeepsBothTextAndAttachment(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	dl := &fakeMediaDownloader{data: []byte("image bytes")}
 	transport := &WhatsmeowTransport{account: "15551234567@s.whatsapp.net", downloader: dl}
 	evt := &events.Message{
 		Info: testMessageInfo("msg-2"),
 		Message: &waE2E.Message{
 			ImageMessage: &waE2E.ImageMessage{
-				Caption:    proto.String("check this out"),
-				Mimetype:   proto.String("image/jpeg"),
+				Caption:    new("check this out"),
+				Mimetype:   new("image/jpeg"),
 				FileLength: proto.Uint64(11),
 				MediaKey:   []byte("mediakey"),
-				DirectPath: proto.String("/mms/image/abc"),
+				DirectPath: new("/mms/image/abc"),
 			},
 		},
 	}
 
 	inbound, ok := transport.convertMessage(context.Background(), evt)
-	require.True(t, ok)
-	assert.Equal(t, "check this out", inbound.Text)
-	require.NotNil(t, inbound.Attachment)
-	assert.Equal(t, []byte("image bytes"), inbound.Attachment.Data)
+	require.True(ok)
+	assert.Equal("check this out", inbound.Text)
+	require.NotNil(inbound.Attachment)
+	assert.Equal([]byte("image bytes"), inbound.Attachment.Data)
 }
 
 func TestConvertMessageDownloadFailureStillArchivesMessage(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	dl := &fakeMediaDownloader{err: errors.New("media key expired")}
 	transport := &WhatsmeowTransport{account: "15551234567@s.whatsapp.net", downloader: dl}
 	evt := &events.Message{
 		Info: testMessageInfo("msg-3"),
 		Message: &waE2E.Message{
 			DocumentMessage: &waE2E.DocumentMessage{
-				FileName:   proto.String("RIB.pdf"),
-				Mimetype:   proto.String("application/pdf"),
+				FileName:   new("RIB.pdf"),
+				Mimetype:   new("application/pdf"),
 				FileLength: proto.Uint64(4096),
 				MediaKey:   []byte("mediakey"),
-				DirectPath: proto.String("/mms/document/abc"),
+				DirectPath: new("/mms/document/abc"),
 			},
 		},
 	}
 
 	inbound, ok := transport.convertMessage(context.Background(), evt)
-	require.True(t, ok, "a download failure must not drop the message")
-	require.NotNil(t, inbound.Attachment)
-	assert.Empty(t, inbound.Attachment.Data)
-	assert.Contains(t, inbound.Attachment.DownloadError, "media key expired")
-	// Metadata gathered ahead of the download attempt is preserved even
-	// though the bytes themselves could not be fetched.
-	assert.Equal(t, "RIB.pdf", inbound.Attachment.Filename)
-	assert.Equal(t, "application/pdf", inbound.Attachment.MimeType)
+	require.True(ok, "a download failure must not drop the message")
+	require.NotNil(inbound.Attachment)
+	assert.Empty(inbound.Attachment.Data)
+	assert.Contains(inbound.Attachment.DownloadError, "media key expired")
+	assert. // Metadata gathered ahead of the download attempt is preserved even
+		// though the bytes themselves could not be fetched.
+		Equal("RIB.pdf", inbound.Attachment.Filename)
+	assert.Equal("application/pdf", inbound.Attachment.MimeType)
 }
 
 func TestConvertMessageNoDownloaderRecordsErrorWithoutDroppingMessage(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	transport := &WhatsmeowTransport{account: "15551234567@s.whatsapp.net", downloader: nil}
 	evt := &events.Message{
 		Info: testMessageInfo("msg-4"),
 		Message: &waE2E.Message{
 			DocumentMessage: &waE2E.DocumentMessage{
-				FileName:   proto.String("RIB.pdf"),
-				Mimetype:   proto.String("application/pdf"),
+				FileName:   new("RIB.pdf"),
+				Mimetype:   new("application/pdf"),
 				FileLength: proto.Uint64(4096),
 			},
 		},
 	}
 
 	inbound, ok := transport.convertMessage(context.Background(), evt)
-	require.True(t, ok)
-	require.NotNil(t, inbound.Attachment)
-	assert.Empty(t, inbound.Attachment.Data)
-	assert.NotEmpty(t, inbound.Attachment.DownloadError)
+	require.True(ok)
+	require.NotNil(inbound.Attachment)
+	assert.Empty(inbound.Attachment.Data)
+	assert.NotEmpty(inbound.Attachment.DownloadError)
 }
 
 func TestConvertMessageTextOnlyMessageHasNoAttachment(t *testing.T) {
 	transport := &WhatsmeowTransport{account: "15551234567@s.whatsapp.net", downloader: &fakeMediaDownloader{}}
 	evt := &events.Message{
 		Info:    testMessageInfo("msg-5"),
-		Message: &waE2E.Message{Conversation: proto.String("hello there")},
+		Message: &waE2E.Message{Conversation: new("hello there")},
 	}
 
 	inbound, ok := transport.convertMessage(context.Background(), evt)
@@ -340,38 +348,38 @@ func TestMessageTextLocationFallsBackToCoordinates(t *testing.T) {
 		{
 			name: "location with name",
 			msg: &waE2E.Message{LocationMessage: &waE2E.LocationMessage{
-				DegreesLatitude: proto.Float64(48.8566), DegreesLongitude: proto.Float64(2.3522),
-				Name: proto.String("Eiffel Tower"),
+				DegreesLatitude: new(48.8566), DegreesLongitude: new(2.3522),
+				Name: new("Eiffel Tower"),
 			}},
 			want: "Eiffel Tower",
 		},
 		{
 			name: "location with address only",
 			msg: &waE2E.Message{LocationMessage: &waE2E.LocationMessage{
-				DegreesLatitude: proto.Float64(48.8566), DegreesLongitude: proto.Float64(2.3522),
-				Address: proto.String("Champ de Mars, Paris"),
+				DegreesLatitude: new(48.8566), DegreesLongitude: new(2.3522),
+				Address: new("Champ de Mars, Paris"),
 			}},
 			want: "Champ de Mars, Paris",
 		},
 		{
 			name: "bare location pin falls back to coordinates",
 			msg: &waE2E.Message{LocationMessage: &waE2E.LocationMessage{
-				DegreesLatitude: proto.Float64(48.8566), DegreesLongitude: proto.Float64(2.3522),
+				DegreesLatitude: new(48.8566), DegreesLongitude: new(2.3522),
 			}},
 			want: "📍 48.8566, 2.3522",
 		},
 		{
 			name: "live location with caption",
 			msg: &waE2E.Message{LiveLocationMessage: &waE2E.LiveLocationMessage{
-				DegreesLatitude: proto.Float64(40.7128), DegreesLongitude: proto.Float64(-74.0060),
-				Caption: proto.String("on my way"),
+				DegreesLatitude: new(40.7128), DegreesLongitude: new(-74.0060),
+				Caption: new("on my way"),
 			}},
 			want: "on my way",
 		},
 		{
 			name: "bare live location falls back to coordinates",
 			msg: &waE2E.Message{LiveLocationMessage: &waE2E.LiveLocationMessage{
-				DegreesLatitude: proto.Float64(40.7128), DegreesLongitude: proto.Float64(-74.0060),
+				DegreesLatitude: new(40.7128), DegreesLongitude: new(-74.0060),
 			}},
 			want: "📍 40.7128, -74.0060",
 		},
@@ -391,27 +399,28 @@ func TestConvertMessageBareLocationPinIsArchived(t *testing.T) {
 		{
 			name: "location",
 			msg: &waE2E.Message{LocationMessage: &waE2E.LocationMessage{
-				DegreesLatitude: proto.Float64(48.8566), DegreesLongitude: proto.Float64(2.3522),
+				DegreesLatitude: new(48.8566), DegreesLongitude: new(2.3522),
 			}},
 		},
 		{
 			name: "live location",
 			msg: &waE2E.Message{LiveLocationMessage: &waE2E.LiveLocationMessage{
-				DegreesLatitude: proto.Float64(48.8566), DegreesLongitude: proto.Float64(2.3522),
+				DegreesLatitude: new(48.8566), DegreesLongitude: new(2.3522),
 			}},
 		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
 			transport := &WhatsmeowTransport{account: "15551234567@s.whatsapp.net", downloader: &fakeMediaDownloader{}}
 			evt := &events.Message{Info: testMessageInfo("msg-loc"), Message: tt.msg}
 
 			inbound, ok := transport.convertMessage(context.Background(), evt)
 			require.True(t, ok, "a bare location pin must still be archived, not dropped")
-			assert.NotEmpty(t, inbound.Text)
-			assert.Contains(t, inbound.Text, "48.8566")
-			assert.Contains(t, inbound.Text, "2.3522")
-			assert.Nil(t, inbound.Attachment, "location messages are not downloadable media")
+			assert.NotEmpty(inbound.Text)
+			assert.Contains(inbound.Text, "48.8566")
+			assert.Contains(inbound.Text, "2.3522")
+			assert.Nil(inbound.Attachment, "location messages are not downloadable media")
 		})
 	}
 }
@@ -425,27 +434,28 @@ func TestConvertMessageBareLocationPinIsArchived(t *testing.T) {
 // fully local (sqlite session store + in-memory client construction), so no
 // live connection or pairing is needed.
 func TestNewWhatsmeowTransportAndResetClientKeepDownloaderInSync(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	dir := t.TempDir()
 	transport, err := NewWhatsmeowTransport(context.Background(), WhatsmeowOptions{
 		SessionPath: filepath.Join(dir, "session.db"),
 		Account:     "15551234567@s.whatsapp.net",
 	})
-	require.NoError(t, err)
+	require.NoError(err)
 	defer func() { _ = transport.Close() }()
-
-	require.NotNil(t, transport.downloader)
-	assert.Same(t, transport.client, transport.downloader.(*whatsmeow.Client))
-	require.NotNil(t, transport.peerSender)
-	assert.Same(t, transport.client, transport.peerSender.(*whatsmeow.Client))
+	require.NotNil(transport.downloader)
+	assert.Same(transport.client, transport.downloader)
+	require.NotNil(transport.peerSender)
+	assert.Same(transport.client, transport.peerSender)
 
 	oldClient := transport.client
-	require.NoError(t, transport.resetClient(context.Background()))
-	assert.NotSame(t, oldClient, transport.client, "resetClient must install a fresh client")
-	require.NotNil(t, transport.downloader)
-	assert.Same(t, transport.client, transport.downloader.(*whatsmeow.Client),
+	require.NoError(transport.resetClient(context.Background()))
+	assert.NotSame(oldClient, transport.client, "resetClient must install a fresh client")
+	require.NotNil(transport.downloader)
+	assert.Same(transport.client, transport.downloader,
 		"downloader must be resynced to the new client after resetClient")
-	require.NotNil(t, transport.peerSender)
-	assert.Same(t, transport.client, transport.peerSender.(*whatsmeow.Client),
+	require.NotNil(transport.peerSender)
+	assert.Same(transport.client, transport.peerSender,
 		"peerSender must be resynced to the new client after resetClient")
 }
 
@@ -485,6 +495,8 @@ func newRequestHistorySyncTestTransport(t *testing.T) (*WhatsmeowTransport, *fak
 }
 
 func TestRequestHistorySyncBuildsAndSendsOnDemandRequest(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	transport, sender := newRequestHistorySyncTestTransport(t)
 	anchorTime := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
 
@@ -495,20 +507,20 @@ func TestRequestHistorySyncBuildsAndSendsOnDemandRequest(t *testing.T) {
 		AnchorIsFromMe:  true,
 		Count:           25,
 	})
-	require.NoError(t, err)
-	require.NotNil(t, sender.sent)
+	require.NoError(err)
+	require.NotNil(sender.sent)
 
 	req := sender.sent.GetProtocolMessage().GetPeerDataOperationRequestMessage().GetHistorySyncOnDemandRequest()
-	require.NotNil(t, req)
-	assert.Equal(t, waE2E.PeerDataOperationRequestType_HISTORY_SYNC_ON_DEMAND,
+	require.NotNil(req)
+	assert.Equal(waE2E.PeerDataOperationRequestType_HISTORY_SYNC_ON_DEMAND,
 		sender.sent.GetProtocolMessage().GetPeerDataOperationRequestMessage().GetPeerDataOperationRequestType())
-	assert.Equal(t, "120363@g.us", req.GetChatJID())
-	assert.Equal(t, "ANCHOR123", req.GetOldestMsgID())
-	assert.True(t, req.GetOldestMsgFromMe())
-	assert.EqualValues(t, 25, req.GetOnDemandMsgCount())
-	// The field is named "...TimestampMS" but whatsmeow's own doc comment on
-	// BuildHistorySyncRequest notes it actually holds seconds.
-	assert.Equal(t, anchorTime.Unix(), req.GetOldestMsgTimestampMS())
+	assert.Equal("120363@g.us", req.GetChatJID())
+	assert.Equal("ANCHOR123", req.GetOldestMsgID())
+	assert.True(req.GetOldestMsgFromMe())
+	assert.EqualValues(25, req.GetOnDemandMsgCount())
+	assert. // The field is named "...TimestampMS" but whatsmeow's own doc comment on
+		// BuildHistorySyncRequest notes it actually holds seconds.
+		Equal(anchorTime.Unix(), req.GetOldestMsgTimestampMS())
 }
 
 func TestRequestHistorySyncDefaultsAndClampsCount(t *testing.T) {
@@ -614,8 +626,8 @@ func TestFileLengthInt64ClampsOverflow(t *testing.T) {
 
 func TestExtractMediaMessageAdversarialFileLengthDoesNotGoNegative(t *testing.T) {
 	doc := &waE2E.DocumentMessage{
-		FileName:   proto.String("bomb.bin"),
-		Mimetype:   proto.String("application/octet-stream"),
+		FileName:   new("bomb.bin"),
+		Mimetype:   new("application/octet-stream"),
 		FileLength: proto.Uint64(math.MaxUint64),
 	}
 	_, meta, ok := extractMediaMessage(&waE2E.Message{DocumentMessage: doc})
@@ -624,23 +636,24 @@ func TestExtractMediaMessageAdversarialFileLengthDoesNotGoNegative(t *testing.T)
 }
 
 func TestDownloadMediaAttachmentRejectsOversizedDeclaredSize(t *testing.T) {
+	assert := assert.New(t)
 	dl := &fakeMediaDownloader{data: []byte("should never be fetched")}
 	transport := &WhatsmeowTransport{account: "15551234567@s.whatsapp.net", downloader: dl, log: newWhatsmeowLogger("")}
 	msg := &waE2E.Message{
 		DocumentMessage: &waE2E.DocumentMessage{
-			FileName:   proto.String("huge.bin"),
-			Mimetype:   proto.String("application/octet-stream"),
-			FileLength: proto.Uint64(uint64(maxMediaDownloadBytes) + 1),
+			FileName:   new("huge.bin"),
+			Mimetype:   new("application/octet-stream"),
+			FileLength: new(uint64(maxMediaDownloadBytes) + 1),
 			MediaKey:   []byte("mediakey"),
-			DirectPath: proto.String("/mms/document/abc"),
+			DirectPath: new("/mms/document/abc"),
 		},
 	}
 
 	attachment := transport.downloadMediaAttachment(context.Background(), msg)
 	require.NotNil(t, attachment)
-	assert.Empty(t, attachment.Data)
-	assert.NotEmpty(t, attachment.DownloadError)
-	assert.Equal(t, 0, dl.calls, "an oversized declared size must be rejected before the network call")
+	assert.Empty(attachment.Data)
+	assert.NotEmpty(attachment.DownloadError)
+	assert.Equal(0, dl.calls, "an oversized declared size must be rejected before the network call")
 }
 
 // concurrencyTrackingDownloader is a mediaDownloader that records the
@@ -686,27 +699,27 @@ func (d *concurrencyTrackingDownloader) maxConcurrent() int {
 // purely local for a non-from-me message with a resolvable chat JID).
 func buildHistoryConversation(chatJID string, count int) *waHistorySync.Conversation {
 	messages := make([]*waHistorySync.HistorySyncMsg, count)
-	for i := 0; i < count; i++ {
+	for i := range count {
 		messages[i] = &waHistorySync.HistorySyncMsg{
 			Message: &waWeb.WebMessageInfo{
 				Key: &waCommon.MessageKey{
-					RemoteJID: proto.String(chatJID),
-					FromMe:    proto.Bool(false),
-					ID:        proto.String(fmt.Sprintf("hist-%s-%d", chatJID, i)),
+					RemoteJID: new(chatJID),
+					FromMe:    new(false),
+					ID:        new(fmt.Sprintf("hist-%s-%d", chatJID, i)),
 				},
-				MessageTimestamp: proto.Uint64(uint64(time.Now().Unix())),
+				MessageTimestamp: new(uint64(time.Now().Unix())),
 				Message: &waE2E.Message{
 					ImageMessage: &waE2E.ImageMessage{
-						Mimetype:   proto.String("image/jpeg"),
+						Mimetype:   new("image/jpeg"),
 						FileLength: proto.Uint64(11),
 						MediaKey:   []byte("mediakey"),
-						DirectPath: proto.String("/mms/image/abc"),
+						DirectPath: new("/mms/image/abc"),
 					},
 				},
 			},
 		}
 	}
-	return &waHistorySync.Conversation{ID: proto.String(chatJID), Messages: messages}
+	return &waHistorySync.Conversation{ID: new(chatJID), Messages: messages}
 }
 
 // TestArchiveHistorySyncPersistsPerConversationWithBoundedConcurrency covers
@@ -718,12 +731,14 @@ func buildHistoryConversation(chatJID string, count int) *waHistorySync.Conversa
 // because archiveHistorySync calls the concrete *whatsmeow.Client's
 // ParseWebMessage/Log, which a bare struct literal cannot supply.
 func TestArchiveHistorySyncPersistsPerConversationWithBoundedConcurrency(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	dir := t.TempDir()
 	transport, err := NewWhatsmeowTransport(context.Background(), WhatsmeowOptions{
 		SessionPath: filepath.Join(dir, "session.db"),
 		Account:     "15551234567@s.whatsapp.net",
 	})
-	require.NoError(t, err)
+	require.NoError(err)
 	defer func() { _ = transport.Close() }()
 
 	dl := &concurrencyTrackingDownloader{data: []byte("photo bytes"), delay: 25 * time.Millisecond}
@@ -751,10 +766,10 @@ func TestArchiveHistorySyncPersistsPerConversationWithBoundedConcurrency(t *test
 
 	mu.Lock()
 	defer mu.Unlock()
-	require.Len(t, batches, 2, "each conversation with messages must be persisted as its own batch, not accumulated into one")
+	require.Len(batches, 2, "each conversation with messages must be persisted as its own batch, not accumulated into one")
 	for _, batch := range batches {
-		assert.Len(t, batch, perConversation)
+		assert.Len(batch, perConversation)
 	}
-	assert.LessOrEqual(t, dl.maxConcurrent(), historySyncDownloadConcurrency, "must not exceed the configured worker pool bound")
-	assert.Greater(t, dl.maxConcurrent(), 1, "downloads within a conversation must run concurrently, not serially")
+	assert.LessOrEqual(dl.maxConcurrent(), historySyncDownloadConcurrency, "must not exceed the configured worker pool bound")
+	assert.Greater(dl.maxConcurrent(), 1, "downloads within a conversation must run concurrently, not serially")
 }

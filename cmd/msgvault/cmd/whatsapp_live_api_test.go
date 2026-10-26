@@ -3,14 +3,13 @@ package cmd
 import (
 	"context"
 	"errors"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	whatsapplive "go.kenn.io/msgvault/internal/whatsapp/live"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
-
-	assertpkg "github.com/stretchr/testify/assert"
-	requirepkg "github.com/stretchr/testify/require"
-	whatsapplive "go.kenn.io/msgvault/internal/whatsapp/live"
 )
 
 type stubWhatsAppSender struct {
@@ -22,6 +21,7 @@ func (s stubWhatsAppSender) SendMessage(ctx context.Context, req whatsapplive.Se
 }
 
 func TestWhatsAppLiveAPISendMessage(t *testing.T) {
+	assert := assert.New(t)
 	var got whatsapplive.SendMessageRequest
 	handler := &whatsappLiveAPIHandler{
 		token: "secret",
@@ -44,11 +44,11 @@ func TestWhatsAppLiveAPISendMessage(t *testing.T) {
 
 	handler.sendMessage(response, req)
 
-	requirepkg.Equal(t, http.StatusOK, response.Code)
-	assertpkg.Equal(t, "15551234567@s.whatsapp.net", got.ChatID)
-	assertpkg.Equal(t, "hello", got.Body)
-	assertpkg.Equal(t, "wa-desk:1", got.LocalRequestID)
-	assertpkg.Contains(t, response.Body.String(), `"remote_message_id":"remote-1"`)
+	require.Equal(t, http.StatusOK, response.Code)
+	assert.Equal("15551234567@s.whatsapp.net", got.ChatID)
+	assert.Equal("hello", got.Body)
+	assert.Equal("wa-desk:1", got.LocalRequestID)
+	assert.Contains(response.Body.String(), `"remote_message_id":"remote-1"`)
 }
 
 func TestWhatsAppLiveAPISendRequiresBearerToken(t *testing.T) {
@@ -58,7 +58,7 @@ func TestWhatsAppLiveAPISendRequiresBearerToken(t *testing.T) {
 
 	handler.sendMessage(response, req)
 
-	assertpkg.Equal(t, http.StatusUnauthorized, response.Code)
+	assert.Equal(t, http.StatusUnauthorized, response.Code)
 }
 
 func TestWhatsAppLiveAPISendReportsNotReady(t *testing.T) {
@@ -74,5 +74,5 @@ func TestWhatsAppLiveAPISendReportsNotReady(t *testing.T) {
 
 	handler.sendMessage(response, req)
 
-	assertpkg.Equal(t, http.StatusServiceUnavailable, response.Code)
+	assert.Equal(t, http.StatusServiceUnavailable, response.Code)
 }

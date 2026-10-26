@@ -2,41 +2,43 @@ package googledocs
 
 import (
 	"context"
-	"testing"
-
-	assertpkg "github.com/stretchr/testify/assert"
-	requirepkg "github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/config"
 	"google.golang.org/api/docs/v1"
 	"google.golang.org/api/drive/v3"
+	"testing"
 )
 
 func TestResolveSource(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	single, err := NewClient([]SourceServices{testSourceServices("work")})
-	requirepkg.NoError(t, err, "NewClient single")
+	require.NoError(err, "NewClient single")
 
 	src, err := single.resolveSource("")
-	requirepkg.NoError(t, err, "resolve single default source")
-	assertpkg.Equal(t, "work", src.source.Name, "source name")
+	require.NoError(err, "resolve single default source")
+	assert.Equal("work", src.source.Name, "source name")
 
 	multi, err := NewClient([]SourceServices{
 		testSourceServices("work"),
 		testSourceServices("personal"),
 	})
-	requirepkg.NoError(t, err, "NewClient multi")
+	require.NoError(err, "NewClient multi")
 
 	_, err = multi.resolveSource("")
-	requirepkg.Error(t, err, "resolveSource should require source for multiple configured sources")
-	assertpkg.Contains(t, err.Error(), "multiple Google Docs sources", "error")
+	require.Error(err, "resolveSource should require source for multiple configured sources")
+	assert.Contains(err.Error(), "multiple Google Docs sources", "error")
 
 	src, err = multi.resolveSource("personal")
-	requirepkg.NoError(t, err, "resolve explicit source")
-	assertpkg.Equal(t, "personal", src.source.Name, "source name")
+	require.NoError(err, "resolve explicit source")
+	assert.Equal("personal", src.source.Name, "source name")
 }
 
 func TestValidateSourceAndDocumentID(t *testing.T) {
+	require := require.New(t)
 	client, err := NewClient([]SourceServices{testSourceServices("work")})
-	requirepkg.NoError(t, err, "NewClient")
+	require.NoError(err, "NewClient")
 
 	_, err = NewClient([]SourceServices{{
 		Source: config.GoogleDocsSource{
@@ -48,11 +50,11 @@ func TestValidateSourceAndDocumentID(t *testing.T) {
 		Drive: &drive.Service{},
 		Docs:  &docs.Service{},
 	}})
-	requirepkg.Error(t, err, "invalid folder ID should fail")
+	require.Error(err, "invalid folder ID should fail")
 
 	_, err = client.GetDoc(context.Background(), "work", "bad document id", 100)
-	requirepkg.Error(t, err, "invalid document ID should fail before API call")
-	assertpkg.Contains(t, err.Error(), "document_id is invalid", "error")
+	require.Error(err, "invalid document ID should fail before API call")
+	assert.Contains(t, err.Error(), "document_id is invalid", "error")
 }
 
 func testSourceServices(name string) SourceServices {
