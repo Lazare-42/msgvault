@@ -60,6 +60,9 @@ accepted as a command-line flag. When the bot can access one guild, that guild
 is selected automatically; otherwise repeat --guild with the desired guild IDs.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if invocationFromContext(cmd.Context()) != nil && deps.bind != nil {
+				deps = deps.bind(cmd.Context())
+			}
 			return runAddDiscord(cmd, deps, opts)
 		},
 	}
@@ -154,7 +157,7 @@ func registerDiscordGuild(st *store.Store, guild discord.Guild, binding string) 
 	if err != nil {
 		return fmt.Errorf("register Discord guild %s: %w", guild.ID, err)
 	}
-	if err := st.UpdateSourceDisplayName(source.ID, guild.Name); err != nil {
+	if err := updateSourceDisplayNameForRegistration(st, source.ID, guild.Name, nil); err != nil {
 		return fmt.Errorf("set Discord guild name %s: %w", guild.ID, err)
 	}
 	if err := st.UpdateSourceOAuthApp(source.ID, nullableDiscordBinding(binding)); err != nil {

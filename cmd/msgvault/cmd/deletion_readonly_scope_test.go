@@ -1,11 +1,13 @@
 package cmd
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/oauth"
 	"go.kenn.io/msgvault/internal/store"
 	"google.golang.org/api/drive/v3"
@@ -72,12 +74,23 @@ func TestDeleteStagedScopeEscalationForSource_ReadonlyWorld(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, restore := seedTokenEnv(t, tt.tokenJSON)
+			tokenPath, restore := seedTokenEnv(t, tt.tokenJSON)
 			defer restore()
+			configHome := filepath.Dir(filepath.Dir(tokenPath))
+			cfg := config.NewDefaultConfig()
+			cfg.HomeDir = configHome
+			cfg.Data.DataDir = configHome
+			cfg.OAuth.ClientSecrets = filepath.Join(configHome, "client_secret.json")
+			testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
 
 			src := &store.Source{SourceType: sourceTypeGmail}
-			escalation, err := deleteStagedScopeEscalationForSource(
-				scopeEscalationAccount, src, tt.permanent, cfg.OAuth.ClientSecrets)
+			escalation, err := deleteStagedScopeEscalationForSource(t.Context(),
+				scopeEscalationAccount,
+				src,
+				tt.permanent,
+				config.OAuthApp{ClientSecrets: cfg.OAuth.ClientSecrets},
+				invocationFromContext(testCtx),
+			)
 
 			require.NoError(t, err)
 			assert.Equal(t, tt.wantPrompt, escalation.Needed, tt.description)

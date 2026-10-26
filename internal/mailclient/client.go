@@ -15,15 +15,15 @@ import (
 // The provider must also authorize alternate senders; this local allowlist does
 // not grant Exchange Send As or configure a Gmail send-as identity.
 type Client struct {
-	gmail.API
+	gmail.LiveAPI
 
 	account string
 	allowed map[string]bool
 }
 
 // New allows the account itself and explicitly configured additional senders.
-func New(backend gmail.API, account string, allowedFrom []string) (*Client, error) {
-	c := &Client{API: backend, account: account, allowed: make(map[string]bool)}
+func New(backend gmail.LiveAPI, account string, allowedFrom []string) (*Client, error) {
+	c := &Client{LiveAPI: backend, account: account, allowed: make(map[string]bool)}
 	for _, value := range append([]string{account}, allowedFrom...) {
 		address, err := gmail.ParseSender(value)
 		if err != nil {
@@ -59,17 +59,17 @@ func (c *Client) prepare(compose *gmail.DraftCompose) (*gmail.DraftCompose, erro
 	return &prepared, nil
 }
 
-func (c *Client) CreateDraft(ctx context.Context, compose *gmail.DraftCompose) (*gmail.Draft, error) {
+func (c *Client) CreateDraft(ctx context.Context, compose *gmail.DraftCompose) (*gmail.ComposedDraft, error) {
 	prepared, err := c.prepare(compose)
 	if err != nil {
 		return nil, err
 	}
-	return c.API.CreateDraft(ctx, prepared)
+	return c.LiveAPI.CreateDraft(ctx, prepared)
 }
 
 // UpdateDraft preserves routing fields omitted by a body/content replacement.
 // A non-nil empty ReplyTo slice explicitly removes the reply destination.
-func (c *Client) UpdateDraft(ctx context.Context, id string, compose *gmail.DraftCompose) (*gmail.Draft, error) {
+func (c *Client) UpdateDraft(ctx context.Context, id string, compose *gmail.DraftCompose) (*gmail.ComposedDraft, error) {
 	if compose == nil {
 		return nil, errors.New("draft compose is nil")
 	}
@@ -90,7 +90,7 @@ func (c *Client) UpdateDraft(ctx context.Context, id string, compose *gmail.Draf
 	if err != nil {
 		return nil, err
 	}
-	return c.API.UpdateDraft(ctx, id, replacement)
+	return c.LiveAPI.UpdateDraft(ctx, id, replacement)
 }
 
 // SendDraft checks the stored sender again: drafts can be edited outside msgvault.
@@ -106,5 +106,7 @@ func (c *Client) SendDraft(ctx context.Context, id string) (*gmail.SentMessage, 
 	if err := c.checkFrom(from); err != nil {
 		return nil, err
 	}
-	return c.API.SendDraft(ctx, id)
+	return c.LiveAPI.SendDraft(ctx, id)
 }
+
+var _ gmail.LiveAPI = (*Client)(nil)

@@ -147,7 +147,7 @@ func runModifyLabels(cmd *cobra.Command, _ []string) error {
 	defer func() { _ = st.Close() }()
 	engine := daemonclient.NewEngineAdapter(st)
 
-	accounts, err := st.GetCLIAccounts(ctx)
+	accounts, _, err := st.GetCLIAccounts(ctx)
 	if err != nil {
 		return fmt.Errorf("list accounts: %w", err)
 	}
@@ -159,9 +159,9 @@ func runModifyLabels(cmd *cobra.Command, _ []string) error {
 	// Resolve the live mail client before touching anything so
 	// configuration problems surface immediately. Dry runs never touch
 	// the mail server and skip this entirely.
-	var apiClient gmail.API
+	var apiClient gmail.LiveAPI
 	if !modifyLabelsDryRun {
-		src, err := lookupAccountWriteSource(account)
+		src, err := lookupAccountWriteSource(cmd.Context(), account)
 		if err != nil {
 			return err
 		}
@@ -171,7 +171,7 @@ func runModifyLabels(cmd *cobra.Command, _ []string) error {
 					"and support only IMAP-backed sources (use --dry-run to preview without modifying)",
 				account.Email, src.SourceType)
 		}
-		apiClient, err = buildAPIClient(ctx, src, oauthManagerCache(), nil)
+		apiClient, err = buildIMAPAPIClient(ctx, src.Identifier, src.SyncConfig.String)
 		if err != nil {
 			return err
 		}

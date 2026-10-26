@@ -3,9 +3,10 @@ package cmd
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"strconv"
 	"strings"
-	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -18,6 +19,8 @@ var (
 	searchLimit         int
 	searchOffset        int
 	searchJSON          bool
+	searchShowSnippet   bool
+	searchSort          string
 	searchAccount       string
 	searchCollection    string
 	searchMode          string
@@ -36,6 +39,20 @@ Uses the configured remote server when [remote].url is set; otherwise uses
 the local daemon for FTS search. Use --local to use the local daemon even
 when a remote is configured.
 
+Choose a search mode with --mode fts|vector|hybrid:
+  fts (default): exact words and phrases, without an embedding provider.
+  vector: search by meaning with a natural-language description.
+  hybrid: combine keyword and meaning search when wording is uncertain.
+Vector and hybrid require a usable embedding generation and free text.
+Combine intent queries with after:, newer_than:, from:, or filename: filters.
+Use --explain to see per-signal scores. --sort date orders the retrieved
+semantic page newest first; date filters restrict candidates before ranking.
+
+Add --snippet for bounded match context in tables. SQLite FTS uses index
+excerpts when available; other paths use stored previews. JSON includes the
+stored snippet, available match_snippet, and attachment names/counts.
+Use show-thread <message-id> to read a conversation chronologically.
+
 Supported operators:
   from:        Sender email address
   to:          Recipient email address
@@ -43,6 +60,8 @@ Supported operators:
   bcc:         BCC recipient
   subject:     Subject text search
   label:       Gmail label (or l: shorthand)
+  list:        List-Id literal substring (or list-id: alias)
+  filename:    Attachment filename literal substring
   has:         has:attachment - messages with attachments
   before:      Messages before date (YYYY-MM-DD)
   after:       Messages after date (YYYY-MM-DD)
@@ -51,14 +70,29 @@ Supported operators:
   larger:      Size filter (5M, 100K)
   smaller:     Size filter
   message_type: Message type filter (sms, mms, whatsapp, teams, email, meeting_transcript)
+  received:    Exact confirmed address that received the mail
+  account:     Exact confirmed address that received or sent the mail, or owns the calendar event
 
-Bare words and "quoted phrases" perform full-text search.
+Unlike --account, which selects a whole archive source, account: matches only
+messages attributed to that address.
+
+List-Id values are matched as case-insensitive literal substrings. Quote values
+that contain spaces. Repeating list: or list-id: requires every value to match.
+Bare words and "quoted phrases" perform full-text search in the default mode.
+Use | between alternatives, for example invoice from:alice | receipt from:bob.
+filename: values use case-insensitive literal substring matching, including
+%, _, and backslashes. Repeat filename: to require every value to match.
+The filename operator requires daemon API schema 3.14.0 or newer.
 
 Examples:
   msgvault search from:alice@example.com has:attachment
   msgvault search subject:meeting after:2024-01-01
+  msgvault search 'list:"<announce.example.org>"'
   msgvault search project report newer_than:30d
-  msgvault search '"exact phrase"' label:INBOX`,
+  msgvault search '"exact phrase"' label:INBOX
+  msgvault search 'planning the next release after:2026-01-01 from:sender@example.com' --mode hybrid --explain
+  msgvault search 'a discussion about release planning newer_than:30d' --mode vector --sort date --snippet
+  msgvault search 'filename:"project plan.pdf"' --json`,
 	Args: cobra.ArbitraryArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		// Join all args to form the query (allows unquoted multi-term searches)
@@ -68,9 +102,15 @@ Examples:
 			return usageErr(cmd, errors.New("provide a search query or --account/--collection flag"))
 		}
 
+		if searchSort != "" && searchSort != "date" {
+			return usageErr(cmd, fmt.Errorf("invalid --sort: %q (want date)", searchSort))
+		}
 		// Validate mode before any scope work so we fail fast on a typo.
 		if searchMode != "fts" && searchMode != "vector" && searchMode != "hybrid" {
 			return usageErr(cmd, fmt.Errorf("invalid --mode: %q (want fts|vector|hybrid)", searchMode))
+		}
+		if searchSort == "date" && searchMode == "fts" {
+			return usageErr(cmd, errors.New("--sort date requires --mode vector or hybrid"))
 		}
 		if searchDeletionScope != "active" && searchDeletionScope != "deleted" && searchDeletionScope != "any" {
 			return usageErr(cmd, fmt.Errorf(
@@ -106,17 +146,15 @@ Examples:
 		// rather than silently dropping the filter and running a wider query.
 		// Checked before the empty-query test so the user sees the offending
 		// value instead of a misleading "empty search query".
-		if err := search.Parse(queryStr).Err(); err != nil {
+		if err := search.ParseWithOR(queryStr, searchMode == "fts").Err(); err != nil {
 			return usageErr(cmd, err)
 		}
 		if searchMode == "fts" {
-			parsed := search.Parse(queryStr)
+			parsed := search.ParseOR(queryStr)
 			parsed.MessageTypes = append(parsed.MessageTypes, searchMessageTypes...)
 			if parsed.IsEmpty() && searchAccount == "" && searchCollection == "" {
 				return errors.New("empty search query")
 			}
-		}
-		if searchMode == "fts" {
 			return runHTTPSearch(cmd, queryStr)
 		}
 		if searchMode != "fts" && searchOffset > 0 {
@@ -140,15 +178,23 @@ Examples:
 	},
 }
 
-func runHTTPSearch(cmd *cobra.Command, queryStr string) error {
-	s, info, err := OpenHTTPStore(cmd.Context())
+func runHTTPSearch(cmd *cobra.Command, queryStr string) (result error) {
+	state := invocationFromCommand(cmd)
+	if state == nil || state.logger == nil {
+		return errors.New("invocation state is unavailable")
+	}
+	logger := state.logger
+	s, info, err := OpenHTTPStore(cmd.Context(), daemonclient.AgentReadMinAPISchemaVersion)
 	if err != nil {
 		return fmt.Errorf("open store: %w", err)
 	}
 	defer func() { _ = s.Close() }()
+	if searchOffset == 0 && strings.TrimSpace(queryStr) != "" {
+		defer reportSuccessfulCLIAction(cmd, s, "search_run", "search_type", "text", &result)
+	}
 
 	prefix := "Searching..."
-	if info.Kind == HTTPStoreConfiguredRemote {
+	if info.Kind == HTTPStoreConfiguredRemote || info.Kind == HTTPStoreAgentDelegated {
 		prefix = fmt.Sprintf("Searching %s...", info.URL)
 	}
 	stopStatus := startSearchStatus(cmd.Context(), prefix, info)
@@ -176,13 +222,14 @@ func runHTTPSearch(cmd *cobra.Command, queryStr string) error {
 		deletionScope = searchDeletionScope
 	}
 	resp, err := s.GetCLISearch(cmd.Context(), daemonclient.CLISearchRequest{
-		Query:         queryStr,
-		Account:       searchAccount,
-		Collection:    searchCollection,
-		MessageTypes:  searchMessageTypes,
-		DeletionScope: deletionScope,
-		Limit:         searchLimit,
-		Offset:        searchOffset,
+		Query:          queryStr,
+		IncludeSnippet: searchJSON || searchShowSnippet,
+		Account:        searchAccount,
+		Collection:     searchCollection,
+		MessageTypes:   searchMessageTypes,
+		DeletionScope:  deletionScope,
+		Limit:          searchLimit,
+		Offset:         searchOffset,
 	})
 	stopStatus()
 	if err != nil {
@@ -193,17 +240,30 @@ func runHTTPSearch(cmd *cobra.Command, queryStr string) error {
 		)
 		return query.HintRepairEncoding(fmt.Errorf("search: %w", err))
 	}
+	if searchOffset == 0 && strings.TrimSpace(queryStr) != "" && len(resp.Results) == 0 && resp.IndexState == "" {
+		defer reportSuccessfulCLIAction(cmd, s, "search_empty", "search_type", "text", &result)
+	}
+
 	if resp.IndexBuilt {
 		// Pre-0.18 daemons built the index synchronously inside the request.
 		fmt.Fprintf(os.Stderr, "Built search index (%d messages indexed).\n", resp.IndexedMessages)
 	}
 	switch resp.IndexState {
+	case "checking":
+		if isAgentMode(state) {
+			fmt.Fprintln(os.Stderr, "Note: the search index is being checked; results may be incomplete.")
+		}
+	case "unverified":
+		if isAgentMode(state) {
+			fmt.Fprintln(os.Stderr, "Note: the search index could not be verified for this request; results may be incomplete. Ask the archive owner to search once or run rebuild-fts.")
+		} else {
+			fmt.Fprintln(os.Stderr, "Note: the search index could not be verified for this request; results may be incomplete. Search again to retry the check, or run rebuild-fts.")
+		}
+	case "awaiting_owner":
+		fmt.Fprintln(os.Stderr, "Note: the search index is incomplete; run rebuild-fts with owner access. Results may be incomplete until it finishes.")
 	case "building":
 		fmt.Fprintln(os.Stderr,
-			"Note: the search index is being rebuilt in the background; results may be incomplete until it finishes.")
-	case "checking":
-		fmt.Fprintln(os.Stderr,
-			"Note: search index completeness is still being verified in the background; results may be incomplete until it finishes.")
+			"Note: the search index is rebuilding or awaiting a rebuild in the background; results may be incomplete until it finishes.")
 	}
 	if searchCollection != "" {
 		label := resp.ScopeLabel
@@ -227,6 +287,9 @@ func runHTTPSearch(cmd *cobra.Command, queryStr string) error {
 		"duration_ms", time.Since(started).Milliseconds(),
 	)
 
+	if len(resp.Results) == 0 && resp.HybridAvailable {
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "No full-text matches. Try --mode hybrid for an intent search with your active embeddings.")
+	}
 	// JSON mode must stay machine-parseable even with zero results:
 	// emit an empty array, never prose.
 	if searchJSON {
@@ -239,24 +302,59 @@ func runHTTPSearch(cmd *cobra.Command, queryStr string) error {
 	return outputSearchResultsTable(resp.Results)
 }
 
-// nil error return mirrors outputSearchResultsJSON so callers can return
-// either uniformly; tabwriter output never fails.
 func outputSearchResultsTable(results []query.MessageSummary) error {
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	_, _ = fmt.Fprintln(w, "ID\tDATE\tFROM\tSUBJECT\tSIZE")
-	_, _ = fmt.Fprintln(w, "──\t────\t────\t───────\t────")
+	return writeSearchResultsTable(os.Stdout, results)
+}
 
-	for _, msg := range results {
-		date := msg.SentAt.Format("2006-01-02")
-		from := truncate(summaryFromDisplay(msg), 30)
-		subject := truncate(msg.Subject, 50)
-		size := formatSize(msg.SizeEstimate)
-		_, _ = fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%s\n", msg.ID, date, from, subject, size)
+func writeSearchResultsTable(out io.Writer, results []query.MessageSummary) error {
+	return writeSearchResultsTableWidth(out, results, searchTableTerminalWidth(out))
+}
+
+func writeSearchResultsTableWidth(out io.Writer, results []query.MessageSummary, width int) error {
+	headers := []string{"ID", "DATE", "FROM", "SUBJECT", "SIZE"}
+	if searchShowSnippet {
+		headers = append(headers, "SNIPPET")
 	}
-
-	_ = w.Flush()
-	fmt.Printf("\n%s\n", formatShowingResults(len(results)))
+	rows := make([][]searchTableCell, 0, len(results))
+	for _, msg := range results {
+		row := []searchTableCell{
+			{text: strconv.FormatInt(msg.ID, 10)},
+			{text: msg.SentAt.Format("2006-01-02")},
+			{text: normalizeSearchTableText(summaryFromDisplay(msg))},
+			{text: summaryTableText(msg.Subject, msg.Snippet)},
+			{text: formatSummarySize(msg.SizeEstimate)},
+		}
+		if searchShowSnippet {
+			snippet := msg.MatchSnippet
+			if snippet == "" {
+				snippet = msg.Snippet
+			}
+			row = append(row, searchTableCell{text: searchSnippetText(snippet)})
+		}
+		rows = append(rows, row)
+	}
+	if err := writeSearchTable(out, headers, rows, width); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(out, "\n%s\n", formatShowingResults(len(results))); err != nil {
+		return fmt.Errorf("write search result count: %w", err)
+	}
 	return nil
+}
+
+func summaryTableText(subject, snippet string) string {
+	text := normalizeSearchTableText(subject)
+	if text == "" {
+		text = normalizeSearchTableText(snippet)
+	}
+	return text
+}
+
+func formatSummarySize(size int64) string {
+	if size <= 0 {
+		return "-"
+	}
+	return formatSize(size)
 }
 
 func summaryFromDisplay(msg query.MessageSummary) string {
@@ -286,6 +384,15 @@ func outputSearchResultsJSON(results []query.MessageSummary) error {
 			"attachment_count":       msg.AttachmentCount,
 			"labels":                 msg.Labels,
 		}
+		if msg.AttachmentNames != nil {
+			output[i]["attachment_names"] = msg.AttachmentNames
+		}
+		if msg.MatchSnippet != "" {
+			output[i]["match_snippet"] = msg.MatchSnippet
+		}
+		if msg.WebURL != "" {
+			output[i]["web_url"] = msg.WebURL
+		}
 		if msg.DeletedAt != nil {
 			output[i]["deleted_from_source_at"] = msg.DeletedAt.UTC().Format(time.RFC3339)
 		}
@@ -299,6 +406,8 @@ func init() {
 	searchCmd.Flags().IntVarP(&searchLimit, "limit", "n", 50, "Maximum number of results")
 	searchCmd.Flags().IntVar(&searchOffset, "offset", 0, "Skip first N results")
 	searchCmd.Flags().BoolVar(&searchJSON, flagJSON, false, "Output as JSON")
+	searchCmd.Flags().StringVar(&searchSort, "sort", "", "Sort the vector/hybrid result page by date (newest first); default keeps relevance")
+	searchCmd.Flags().BoolVar(&searchShowSnippet, "snippet", false, "Include bounded match context (stored previews for semantic search)")
 	searchCmd.Flags().StringVar(&searchAccount, "account", "", "Limit results to a specific account (email address)")
 	searchCmd.Flags().StringVar(&searchCollection, "collection", "",
 		"Limit results to all member accounts of one collection")

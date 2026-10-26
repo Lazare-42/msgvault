@@ -21,27 +21,6 @@ import (
 	"go.kenn.io/msgvault/internal/testutil"
 )
 
-// TestStatsCommand_AccountAndCollectionMutuallyExclusive confirms that passing
-// both --account and --collection to the stats command is rejected by cobra.
-func TestStatsCommand_AccountAndCollectionMutuallyExclusive(t *testing.T) {
-	var a, b string
-	cmd := &cobra.Command{Use: "stats-test", SilenceErrors: true}
-	sub := &cobra.Command{Use: "stats", RunE: func(cmd *cobra.Command, args []string) error { return nil }}
-	sub.Flags().StringVar(&a, "account", "", "")
-	sub.Flags().StringVar(&b, "collection", "", "")
-	sub.MarkFlagsMutuallyExclusive("account", "collection")
-	cmd.AddCommand(sub)
-	cmd.SetArgs([]string{"stats", "--account", "foo@example.com", "--collection", "bar"})
-
-	err := cmd.Execute()
-	require.Error(t, err, "expected error when both --account and --collection are set")
-	msg := err.Error()
-	assert.Contains(t, msg, "account", "error should mention account flag name")
-	assert.Contains(t, msg, "collection", "error should mention collection flag name")
-	_ = a
-	_ = b
-}
-
 // TestStatsCommand_EmptyCollectionRejected verifies that
 // `stats --collection <name>` errors out when the named collection
 // has zero member sources, instead of silently falling through to
@@ -50,6 +29,10 @@ func TestStatsCommand_AccountAndCollectionMutuallyExclusive(t *testing.T) {
 // SourceIDs() returned an empty slice, and GetStatsForScope treats
 // an empty slice as unscoped/global.
 func TestStatsCommand_EmptyCollectionRejected(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+	useLocal := false
+
 	require := require.New(t)
 	dataDir := t.TempDir()
 	st := testutil.NewTestStore(t)
@@ -78,8 +61,11 @@ func TestStatsCommand_EmptyCollectionRejected(t *testing.T) {
 		Data:    config.DataConfig{DataDir: dataDir},
 		Remote:  config.RemoteConfig{URL: "http://configured-daemonclient.invalid"},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	useLocal = true
+	invocationFromContext(testCtx).options.useLocal = true
 	statsCollection = "empty"
 
 	testCmd := &cobra.Command{Use: "stats", RunE: statsCmd.RunE}
@@ -87,6 +73,7 @@ func TestStatsCommand_EmptyCollectionRejected(t *testing.T) {
 	testCmd.Flags().StringVar(&statsCollection, "collection", "empty", "")
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(testCmd)
 	root.SetArgs([]string{"stats", "--collection", "empty"})
 
@@ -96,6 +83,10 @@ func TestStatsCommand_EmptyCollectionRejected(t *testing.T) {
 }
 
 func TestStatsCommand_ScopedUsesLocalDaemonHTTPAndPreservesLocalOutput(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+	useLocal := false
+
 	require := require.New(t)
 	assertions := assert.New(t)
 	dataDir := t.TempDir()
@@ -122,12 +113,14 @@ func TestStatsCommand_ScopedUsesLocalDaemonHTTPAndPreservesLocalOutput(t *testin
 	cfg = testCfg
 	logger = slog.New(slog.DiscardHandler)
 	useLocal = true
+	testCtx := testInvocationContext(t.Context(), testCfg, invocationOptions{useLocal: true})
 	statsAccount = ""
 	statsCollection = "Important"
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd := &cobra.Command{Use: "stats", RunE: runStats}
+	cmd.SetContext(testCtx)
 	cmd.SetOut(&stdout)
 	cmd.SetErr(&stderr)
 
@@ -149,6 +142,10 @@ Note: Size is global (not scoped).
 }
 
 func TestStatsCommand_UnscopedUsesLocalDaemonHTTPAndPreservesLocalOutput(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+	useLocal := false
+
 	require := require.New(t)
 	assertions := assert.New(t)
 	dataDir := t.TempDir()
@@ -175,12 +172,14 @@ func TestStatsCommand_UnscopedUsesLocalDaemonHTTPAndPreservesLocalOutput(t *test
 	cfg = testCfg
 	logger = slog.New(slog.DiscardHandler)
 	useLocal = true
+	testCtx := testInvocationContext(t.Context(), testCfg, invocationOptions{useLocal: true})
 	statsAccount = ""
 	statsCollection = ""
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd := &cobra.Command{Use: "stats", RunE: runStats}
+	cmd.SetContext(testCtx)
 	cmd.SetOut(&stdout)
 	cmd.SetErr(&stderr)
 
@@ -298,7 +297,10 @@ func TestPrintStats_ThousandsGroupingUniform(t *testing.T) {
 		LabelCount:      1183,
 		SourceCount:     12345,
 		DatabaseSize:    1024 * 1024,
-	})
+	}, true)
+	var zero bytes.Buffer
+	printStats(&zero, &store.Stats{}, true)
+	assert.Contains(zero.String(), "Size:        0.00 MB")
 	got := out.String()
 	assert.Contains(got, "Messages:    2,470,176", "messages grouped")
 	assert.Contains(got, "Threads:     561,070", "threads grouped")

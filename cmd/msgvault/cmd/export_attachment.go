@@ -2,7 +2,7 @@ package cmd
 
 import (
 	"encoding/base64"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 
 	"github.com/spf13/cobra"
+	"go.kenn.io/kit/atomicfile"
 	"go.kenn.io/msgvault/internal/export"
 )
 
@@ -27,16 +28,13 @@ var exportAttachmentCmd = &cobra.Command{
 Get the content hash from 'show-message --json':
   msgvault show-message 45 --json | jq '.attachments[0].content_hash'
 
-Examples:
-  msgvault export-attachment 61ccf192b5bd358738802dc2676d3ceab856f47d26dd29681ac3d335bfd5bbd0
-  msgvault export-attachment 61ccf192... --output invoice.pdf
-
 To export all attachments from a message with original filenames, use
 'msgvault export-attachments <message-id> -o <dir>', which sanitizes
 filenames. Attachment filenames are sender-controlled: do not pass the
 JSON 'filename' field to -o (a name like ../../evil escapes the output
-directory). Use content hashes or your own fixed paths instead.
-
+directory). Use content hashes or your own fixed paths instead.`,
+	Example: `  msgvault export-attachment 61ccf192b5bd358738802dc2676d3ceab856f47d26dd29681ac3d335bfd5bbd0
+  msgvault export-attachment 61ccf192... --output invoice.pdf
   msgvault export-attachment 61ccf192... -o -       # stdout (binary)
   msgvault export-attachment 61ccf192... --base64  # stdout (base64)
   msgvault export-attachment 61ccf192... --json    # JSON with base64 data`,
@@ -78,17 +76,12 @@ func runExportAttachmentHTTP(cmd *cobra.Command, contentHash string) error {
 	}
 	defer func() { _ = s.Close() }()
 
-	if exportAttachmentJSON {
-		data, err := s.GetCLIAttachment(cmd.Context(), contentHash)
-		if err != nil {
-			return err
-		}
-		return exportAttachmentDataAsJSON(data, contentHash)
-	}
-
 	body, err := s.OpenCLIAttachment(cmd.Context(), contentHash)
 	if err != nil {
 		return err
+	}
+	if exportAttachmentJSON {
+		return errors.Join(exportAttachmentStreamAsJSON(body, contentHash), body.Close())
 	}
 
 	if exportAttachmentBase64 {
@@ -97,15 +90,28 @@ func runExportAttachmentHTTP(cmd *cobra.Command, contentHash string) error {
 	return exportAttachmentBinaryDownload(body)
 }
 
-func exportAttachmentDataAsJSON(data []byte, contentHash string) error {
-	output := map[string]any{
-		"content_hash": contentHash,
-		"size":         len(data),
-		"data_base64":  base64.StdEncoding.EncodeToString(data),
+// exportAttachmentStreamAsJSON writes the same document as a deterministic
+// indented encoder, streaming the base64 data so size can come last.
+func exportAttachmentStreamAsJSON(r io.Reader, contentHash string) error {
+	hash, err := json.Marshal(contentHash)
+	if err != nil {
+		return err
 	}
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(output)
+	if _, err := fmt.Fprintf(os.Stdout, "{\n  \"content_hash\": %s,\n  \"data_base64\": \"", hash); err != nil {
+		return fmt.Errorf("write attachment JSON: %w", err)
+	}
+	encoder := base64.NewEncoder(base64.StdEncoding, os.Stdout)
+	size, err := io.Copy(encoder, r)
+	if err != nil {
+		return fmt.Errorf("encode attachment: %w", err)
+	}
+	if err := encoder.Close(); err != nil {
+		return fmt.Errorf("finalize base64: %w", err)
+	}
+	if _, err := fmt.Fprintf(os.Stdout, "\",\n  \"size\": %d\n}\n", size); err != nil {
+		return fmt.Errorf("write attachment JSON: %w", err)
+	}
+	return nil
 }
 
 func exportAttachmentStreamAsBase64(r io.Reader) error {
@@ -224,7 +230,7 @@ func replaceOutputFile(tmpPath, outputPath string) error {
 	info, err := os.Lstat(outputPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return os.Rename(tmpPath, outputPath)
+			return atomicfile.Replace(tmpPath, outputPath)
 		}
 		return err
 	}
@@ -246,11 +252,11 @@ func replaceOutputFile(tmpPath, outputPath string) error {
 		return fmt.Errorf("prepare output backup: %w", err)
 	}
 
-	if err := os.Rename(outputPath, backupPath); err != nil {
+	if err := atomicfile.Replace(outputPath, backupPath); err != nil {
 		return fmt.Errorf("backup existing output: %w", err)
 	}
-	if err := os.Rename(tmpPath, outputPath); err != nil {
-		if restoreErr := os.Rename(backupPath, outputPath); restoreErr != nil {
+	if err := atomicfile.Replace(tmpPath, outputPath); err != nil {
+		if restoreErr := atomicfile.Replace(backupPath, outputPath); restoreErr != nil {
 			return fmt.Errorf("%w; restore existing output: %w", err, restoreErr)
 		}
 		return err

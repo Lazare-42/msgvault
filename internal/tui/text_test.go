@@ -135,6 +135,24 @@ func TestTextTimelineSearchUsesConversationFullTextResults(t *testing.T) {
 	assert.Empty(model.textState.messages[0].BodyText)
 }
 
+func TestTextTimelineClearedSearchRejectsDelayedResponse(t *testing.T) {
+	model, _ := newTextTimelineDetailModel(t)
+	model.textEngine = timelineSearchTextEngine{}
+	var events []string
+	model.reportAction = func(_ context.Context, event, _, _ string) error { events = append(events, event); return nil }
+	original := model.textState.messages
+	model, _ = sendKey(t, model, key('/'))
+	model.searchInput.SetValue("hiddenneedle")
+	model, pending := sendKey(t, model, keyEnter())
+	model, _ = sendKey(t, model, keyEsc())
+	updated, report := model.Update(pending())
+	if report != nil {
+		_ = runBatchCommand(t, report)
+	}
+	assert.Empty(t, events)
+	assert.Equal(t, original, asModel(t, updated).textState.messages)
+}
+
 type globalSearchRefineTextEngine struct {
 	meetingModeTextEngine
 
@@ -143,7 +161,7 @@ type globalSearchRefineTextEngine struct {
 }
 
 func (e *globalSearchRefineTextEngine) TextSearch(
-	_ context.Context, searchQuery string, _, _ int,
+	_ context.Context, searchQuery string, _ *int64, _, _ int,
 ) ([]query.MessageSummary, error) {
 	e.searches = append(e.searches, searchQuery)
 	return []query.MessageSummary{{ID: 77, Subject: "Refined global result"}}, nil

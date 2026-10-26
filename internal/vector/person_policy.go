@@ -3,14 +3,16 @@ package vector
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"net/url"
 	"reflect"
-	"regexp"
 	"slices"
 	"strings"
+
+	"go.kenn.io/msgvault/internal/envutil"
 )
 
 const (
@@ -28,8 +30,6 @@ const (
 	// free text is sent to the provider for semantic person search.
 	SemanticPersonSearchQueryDisclosedFieldClass = "caller_supplied_free_text_query_for_semantic_person_search"
 )
-
-var semanticPersonEnvironmentNamePattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 var semanticPersonDisclosedFieldClasses = []string{
 	"active_relationship_counterpart_labels_and_display_names",
@@ -68,7 +68,7 @@ type SemanticPersonEmbeddingProfile struct {
 	RendererPolicy        string             `json:"renderer_policy"`
 	DisclosedFieldClasses []string           `json:"disclosed_field_classes"`
 	CorpusScope           string             `json:"corpus_scope"`
-	PolicyJSON            json.RawMessage    `json:"-"`
+	PolicyJSON            jsontext.Value     `json:"-"`
 }
 
 type semanticPersonEmbeddingPolicy struct {
@@ -178,7 +178,7 @@ func newSemanticPersonEmbeddingProfile(
 	if err := validateSemanticPersonEmbeddingPolicy(policy); err != nil {
 		return SemanticPersonEmbeddingProfile{}, err
 	}
-	policyJSON, err := json.Marshal(policy)
+	policyJSON, err := json.Marshal(policy, json.Deterministic(true))
 	if err != nil {
 		return SemanticPersonEmbeddingProfile{}, fmt.Errorf(
 			"encode semantic person embedding policy: %w", err,
@@ -227,7 +227,7 @@ func validateSemanticPersonEmbeddingPolicy(policy semanticPersonEmbeddingPolicy)
 	if policy.Model == "" {
 		return errors.New("vector.people: embedding model is required")
 	}
-	if policy.APIKeyEnv != "" && !semanticPersonEnvironmentNamePattern.MatchString(policy.APIKeyEnv) {
+	if policy.APIKeyEnv != "" && !envutil.ValidName(policy.APIKeyEnv) {
 		return fmt.Errorf("vector.people: embedding api_key_env %q is invalid", policy.APIKeyEnv)
 	}
 	if policy.RetentionPosture == "" || strings.EqualFold(policy.RetentionPosture, "unknown") {

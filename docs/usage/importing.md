@@ -1,11 +1,32 @@
 ---
+last_edited: "2026-10-08"
 title: Importing Local Email
-description: Import PST archives, MBOX archives, and Apple Mail exports into msgvault.
+description: Bring local email archives into msgvault, or backfill older Gmail and IMAP messages.
 ---
 
-msgvault can import email from local files, not just Gmail. This lets you archive Microsoft Outlook PST files, messages from any provider that supports MBOX export, or Apple Mail's on-disk storage. For live syncing from non-Gmail providers, see [IMAP account setup](/setup/#add-an-imap-account).
+Bring old mail into the same searchable archive as your live accounts. Local
+imports preserve message content and attachments; mailbox folders become
+labels where the format provides them.
 
-Imported messages are stored in the same database as Gmail messages. You can search, browse, export, and analyze them with all the same tools (Web UI, TUI, CLI, MCP server, and REST API). Labels, threading, attachments, and full-text search all work the same way.
+## Choose an import path
+
+| What you have | Command or guide |
+|---|---|
+| Outlook `.pst` archive | [`import-pst`](#import-pst) |
+| MBOX file or ZIP of MBOX files | [`import-mbox`](#import-mbox) |
+| Maildir or Maildir++ archive | [`import-maildir`](#import-maildir) |
+| MailMate-style tree of `.eml` files | [`import-eml`](#import-eml) |
+| Apple Mail directory or backup | [`import-emlx`](#import-emlx) |
+| Older messages still in Gmail or IMAP | [Historical import jobs](#historical-import-jobs) |
+| Chat database or export | [Text messages](/docs/usage/text-messages/) or [Slackdump](/docs/usage/slack/#import-a-slackdump-export) |
+
+Choose an identifier that names the owner of the export, usually an email
+address. Imports and live syncs remain separate sources even when they use the
+same address. Use [collections](/docs/usage/multi-account/#collections) to group
+them and [deduplication](/docs/usage/deduplication/) to review overlapping mail.
+
+For continuing sync from a non-Gmail provider, start with
+[IMAP setup](/docs/setup/#add-an-imap-account).
 
 ## import-pst
 
@@ -41,6 +62,24 @@ msgvault import-pst you@outlook.com backup.pst --no-resume
 | `--no-attachments` | `false` | Skip writing attachments to disk |
 
 PST imports are resumable. msgvault records a content-based archive fingerprint so an interrupted import resumes only when the file still matches the checkpointed archive.
+
+On `main`, the importer keeps existing transport threading headers and fills
+missing `Message-ID`, `In-Reply-To`, and `References` fields from the PST's
+stored email metadata (MAPI properties). It groups replies by archived email
+identifiers after importing all folders, so replies can precede their parents
+in the file. Messages with no usable threading identifiers keep the existing
+fallback grouping.
+
+To repair missing identifiers from an earlier import, rerun the same PST with
+the same identifier and `--no-resume`:
+
+```bash
+msgvault import-pst owner@example.com /path/to/archive.pst --no-resume
+```
+
+The rerun fills missing header metadata and reconciles conversations. It keeps
+existing raw messages, bodies, attachments, and conflicting stored identifiers.
+Existing messages count as skipped and receive their folder labels as usual.
 
 ## import-mbox
 
@@ -85,6 +124,23 @@ Most email providers offer an MBOX export option:
 - **Thunderbird**: Use the ImportExportTools NG add-on to export folders as MBOX
 - **Fastmail, ProtonMail, Yahoo**: Check your provider's export/download settings
 
+### Google Groups
+
+Export groups you own with [Google Takeout](https://support.google.com/groups/answer/9975859?hl=en), then import the downloaded ZIP or an extracted group MBOX:
+
+```bash
+msgvault import-mbox test-group@googlegroups.com takeout.zip --source-type google-groups
+msgvault import-mbox test-group@googlegroups.com topics.mbox --source-type google-groups
+```
+
+Select only Google Groups when creating the ZIP. A ZIP import reads every MBOX inside it, so a combined Gmail and Groups export would also import the Gmail files into this source. For a combined export, extract it first and import the individual group MBOX files. Localized MBOX filenames work too.
+
+Messages retain their senders, recipients, dates, bodies, raw MIME, and attachments. Groups headers supply group labels and topic-state labels, including localized labels. Exported thread IDs keep replies together even when reply headers are absent; different groups remain separate. Without an exported thread ID, normal email reply threading applies.
+
+The identifier names the group or archive. It is used as the group label when Groups headers are missing, and is not automatically added as your personal identity. For a ZIP containing several groups, use a stable archive name as the identifier; message headers provide each group label. Reuse the same identifier and source type when resuming or reimporting.
+
+Membership CSV files, group settings, favorites, and other non-message export data are skipped. Google only includes archived group messages when the exporting account has access to download them; an export containing only personal Groups activity is not a message archive.
+
 ### Supported formats
 
 The importer accepts:
@@ -93,6 +149,60 @@ The importer accepts:
 - `.zip` archives containing one or more `.mbox` or `.mbx` files
 
 ZIP archives are extracted to a cache directory and reused on subsequent runs, so re-importing the same zip does not re-extract.
+
+## import-maildir
+
+Import a stable snapshot of a Maildir or Maildir++ mailbox:
+
+```bash
+msgvault import-maildir ~/Maildir --identifier you@example.com
+```
+
+Each mailbox needs `cur`, `new`, and `tmp` directories. msgvault reads delivered
+messages from `cur` and `new`, skips `tmp` and symlinks, and leaves the source
+files unchanged. Nested folders and filename flags become archive labels.
+
+Rerun the same command to add messages and labels or resume an interrupted
+import. Filename changes do not create another copy. Reruns do not remove
+previously archived messages or labels, so this is an accumulating archive
+rather than a mirror of current mailbox state.
+
+See the [command reference](../cli-reference.md#import-maildir) for flags,
+label mappings, message size limits, and attachment failure behavior.
+
+## import-eml
+
+Import a MailMate-style mailbox tree containing standard `.eml` message files:
+
+```bash
+msgvault import-eml ~/MailExport --identifier you@example.com
+```
+
+The directory must contain `.mailbox` folders with `.eml` files directly inside
+them. You can also point at one `.mailbox` folder. For example:
+
+```text
+MailExport/
+├── Inbox.mailbox/
+│   └── message-1.eml
+└── Projects.mailbox/
+    └── Planning.mailbox/
+        └── message-2.eml
+```
+
+This creates the labels `Inbox` and `Projects/Planning`. The importer reads
+nested `.mailbox` folders, preserves raw MIME and attachments, and adds every
+mailbox label when the same raw message appears in several folders. A loose
+`.eml` file or a directory without `.mailbox` folders is not an accepted input.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--identifier` | required | Account identifier for the imported mail |
+| `--source-type` | `eml` | Source type recorded in the archive |
+| `--no-resume` | `false` | Start a new import instead of resuming a checkpoint |
+| `--checkpoint-interval` | `200` | Save progress every N messages |
+| `--no-attachments` | `false` | Skip writing attachment files |
+| `--no-default-identity` | `false` | Do not confirm the identifier as this source's “me” identity |
 
 ## import-emlx
 
@@ -137,10 +247,44 @@ msgvault import-emlx me@gmail.com ~/Mail/INBOX.mbox/
 | `--account` | — | Filter to specific account(s) during auto-discover (repeatable) |
 | `--accounts-db` | — | Custom path to macOS `Accounts4.sqlite` |
 | `--identifier` | — | Manual identifier when auto-discover is not suitable |
-| `--no-resume` | `false` | Start fresh instead of resuming an interrupted import |
+| `--no-resume` | `false` | Report totals for this run only; completed file receipts still apply |
+| `--full-reconcile` | `false` | Reconcile every file after invalidating the selected root's receipts |
+| `--max-message-bytes` | 128 MiB | Maximum EMLX file and merged MIME bytes, including encoding |
 | `--checkpoint-interval` | `200` | Save progress every N messages |
 | `--no-attachments` | `false` | Skip writing attachments to disk (messages still record attachment metadata) |
 | `--no-default-identity` | `false` | Do not auto-confirm the identifier as this source's "me" identity |
+
+If attachment restoration exceeds the message limit, previously archived
+attachments stay intact, the summary counts an error, and the file is retried on
+the next import. Choose a larger limit that fits your available memory, then
+rerun the same import. For example, this allows up to 256 MiB per message in
+automatic account mode:
+
+```bash
+msgvault import-emlx --max-message-bytes 268435456 ~/Library/Mail/
+```
+
+The flag also works with `--identifier` in manual mode. Omitting it uses the
+128 MiB default. See the [CLI reference](/docs/cli-reference/#import-emlx)
+for the accepted byte range. Changing the limit makes the next import read each
+file once more.
+
+### Message identifiers and replies
+
+The importer stores the email's `Message-ID` in `rfc822_message_id`, without surrounding angle brackets and with its original case preserved. `In-Reply-To` links to a message in the same source when exactly one visible parent matches. Missing or ambiguous parents remain unresolved; a later import can link a parent that arrives afterward.
+
+To fill missing identifiers in an archive created by an older msgvault, re-import the same directory and source identifier, then rebuild the analytics cache. On unreleased `main`, messages archived before file receipts existed are finished again automatically on the first import. Use `--full-reconcile` to redo every file, for example after editing archived messages directly:
+
+```bash
+msgvault import-emlx --full-reconcile me@gmail.com ~/Mail/INBOX.mbox/
+msgvault build-cache --full-rebuild
+msgvault show-message 123 --json
+msgvault query "SELECT id, rfc822_message_id FROM messages LIMIT 10"
+```
+
+`show-message --json` includes `rfc822_message_id` as a string, or an empty string when absent. Analytics queries preserve SQL `NULL` for absent identifiers. Re-importing fills missing identifiers while preserving existing message content and nonempty identifiers.
+
+For a Mail.app link, wrap the stored ID in angle brackets and URL-encode it. For example, `Case-ID@example.test` becomes `message://%3CCase-ID%40example.test%3E`.
 
 ### How Apple Mail organizes files
 
@@ -197,17 +341,36 @@ Both layouts are supported. The importer discovers all `.mbox` and `.imapmbox` d
 Apple Mail stores its data at `~/Library/Mail/` on macOS. The auto-discover mode reads `~/Library/Accounts/Accounts4.sqlite` (the macOS accounts database) to map V10 directory GUIDs to email addresses. You can also use a Time Machine backup or a copy of the Mail directory from another machine.
 
 !!! note
-    Apple Mail stores IMAP and Gmail messages whose attachments have not been downloaded as `.partial.emlx` files. The message body in these files is complete, so they are imported normally — only the uncached attachment parts are absent. When both `N.emlx` and `N.partial.emlx` exist for the same message, the fully-downloaded copy is used. The import summary reports how many partial files were imported.
+    Apple Mail stores IMAP and Gmail messages with larger attachments as `.partial.emlx` files: the message body is complete, and the attachments live in a sibling `Attachments/` directory. The importer restores cached top-level attachments; nested attachments are not restored. Re-import to add newly downloaded attachments to existing messages; messages that already hold every cached attachment are skipped, not rewritten. See [import-emlx](../cli-reference.md#import-emlx) for limits and warnings. When both `N.emlx` and `N.partial.emlx` exist for the same message, the fully-downloaded copy is used. The import summary reports how many partial files were read and how many attachments the run added to the archive.
 
 ## Deduplication
 
-MBOX and EMLX imports deduplicate messages by SHA-256 hash of the raw MIME content. Running the same import twice produces no duplicates. If the same message appears in multiple MBOX files or Apple Mail mailboxes, it is stored once and given labels from each location.
+MBOX, EML, and EMLX imports deduplicate messages by SHA-256 hash of the raw MIME content. Running the same import twice produces no duplicates. If the same message appears in multiple mailboxes within that source, it is stored once and given labels from each location.
 
 PST imports namespace source message IDs by a stable archive fingerprint, so importing multiple PST files into the same source does not collide on Outlook EntryIDs that are only unique inside one archive. Re-running the same PST import is idempotent and resumes from checkpoints by default.
 
+### Repeat Apple Mail imports (unreleased)
+
+A repeat Apple Mail import reads only new and changed `.emlx` files. It still
+walks every mailbox and checks each file's metadata, including the attachments
+Apple Mail cached for it, so a newly downloaded attachment or an old message
+added late is still imported. A file whose attachment or search-index work
+failed is retried before the import trusts its receipt. Files removed from
+Apple Mail's cache leave their archived messages and labels in place.
+
+Problems with individual files are counted as errors without failing the run;
+those files are retried on the next import. See
+[import-emlx](../cli-reference.md#import-emlx) for what counts as an error.
+
+Run with `--full-reconcile` and the same source identifier to redo every file
+under the selected directory, even ones whose content matches the archive. If
+that run is interrupted, the next ordinary import finishes the files it did not
+reach. `--no-resume` only resets the run's reported totals; unchanged files are
+still skipped.
+
 ## Resumable Imports
 
-Imports are resumable by default. If an import is interrupted (Ctrl+C, power loss, error), run the same command again and it picks up from the last checkpoint. Use `--no-resume` to discard progress and start fresh.
+Imports are resumable by default. If an import is interrupted (Ctrl+C, power loss, error), run the same command again and it picks up from the last checkpoint. Apple Mail (EMLX) imports always revisit every file and use file receipts, rather than a checkpoint position, to skip completed work. Use `--no-resume` to discard progress and start fresh.
 
 During import, a progress summary is printed on completion:
 
@@ -224,13 +387,17 @@ Import complete.
 
 ## Error Handling
 
-Individual messages that fail to parse are logged and skipped; the import continues. Raw MIME bytes are preserved even for messages that cannot be fully parsed, so no data is lost. Attachment storage errors are also non-fatal.
+Review the final error count as well as the number of messages added. The
+importers recover usable headers and content from malformed MIME where
+possible. File-read failures and incomplete attachment downloads can still
+leave gaps; keeping raw MIME for a stored message does not prove the whole
+export was imported. Correct the reported errors and rerun the import.
 
 ## After Importing
 
-Imported messages are immediately available for search, direct lookup, and
-MCP queries. To update the Parquet analytical cache used by the Web UI and TUI
-for fast aggregation, run:
+Import commands refresh the analytical cache after writing. Imported mail is
+then available through the Web UI, TUI, CLI, and MCP. If a cache refresh was
+interrupted or failed, rebuild it:
 
 ```bash
 msgvault build-cache
@@ -251,3 +418,53 @@ msgvault tui
 # View updated stats
 msgvault stats
 ```
+
+## Historical import jobs
+
+Backfill an older date range from an existing Gmail or IMAP account while the
+daemon works in the background. This reads the provider; it does not upload a
+local archive file.
+
+1. Use the account identifier or an unambiguous display name from
+   `msgvault list-accounts`.
+2. Start a bounded import through the API:
+
+   ```bash
+   curl http://localhost:8080/api/v1/imports \
+     -H "Authorization: Bearer $MSGVAULT_API_KEY" \
+     -H "Content-Type: application/json" \
+     --data '{"account":"you@example.com","after":"2020-01-01","before":"2021-01-01"}'
+   ```
+
+3. Save the returned `job_id` and poll its progress:
+
+   ```bash
+   curl -H "Authorization: Bearer $MSGVAULT_API_KEY" \
+     http://localhost:8080/api/v1/imports/JOB_ID
+   ```
+
+The start request returns `202 Accepted`. Status moves from `pending` to
+`running`, then `done` or `failed`. Closing the requesting client does not
+cancel the daemon's job. Progress includes processed, added, and skipped counts;
+a completed job also includes a summary with updates and errors. After a daemon
+restart, unfinished jobs are marked `failed`. Submit another job with the same
+account and bounds to continue from available import checkpoints.
+
+Jobs accept optional `limit` and `noresume` fields. Gmail jobs also accept a
+Gmail `query`; IMAP jobs reject that field. An account with an active sync
+rejects another import with `409 sync_already_active`. See the
+[API reference](/docs/api-server/#historical-import-jobs) for the request,
+response, and restart behavior.
+
+For a foreground CLI workflow, use `sync-full` with the same date bounds:
+
+```bash
+msgvault sync-full you@example.com --after 2020-01-01 --before 2021-01-01
+```
+
+## Images hosted outside the message
+
+Email imports store attachments embedded in the original message. Images
+loaded from a sender's website need a separate download and can trigger
+tracking. [Remote image archiving](/docs/usage/remote-images/) explains the
+explicit opt-in for new imports and the command for existing mail.

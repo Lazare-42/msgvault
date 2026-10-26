@@ -2,7 +2,8 @@ package api
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"net/http"
@@ -47,14 +48,15 @@ type StageDeletionFilter struct {
 	RecipientName string `json:"recipient_name,omitempty"`
 	Domain        string `json:"domain,omitempty"`
 	Label         string `json:"label,omitempty"`
-	SourceID      *int64 `json:"source_id,omitempty"`
+	ListID        string `json:"list_id,omitempty"`
+	SourceID      *int64 `json:"source_id,omitzero" nullable:"false"`
 	After         string `json:"after,omitempty"`
 	Before        string `json:"before,omitempty"`
 }
 
 func (f *StageDeletionFilter) isEmpty() bool {
 	return f == nil || (f.Sender == "" && f.SenderName == "" && f.Recipient == "" &&
-		f.RecipientName == "" && f.Domain == "" && f.Label == "" &&
+		f.RecipientName == "" && f.Domain == "" && f.Label == "" && f.ListID == "" &&
 		f.SourceID == nil && f.After == "" && f.Before == "")
 }
 
@@ -66,6 +68,7 @@ func (f *StageDeletionFilter) toMessageFilter() (query.MessageFilter, *apiHTTPEr
 	mf.RecipientName = f.RecipientName
 	mf.Domain = f.Domain
 	mf.Label = f.Label
+	mf.ListID = f.ListID
 	mf.SourceID = f.SourceID
 	if f.After != "" {
 		ts, err := parseAPITime(f.After)
@@ -88,23 +91,28 @@ func (f *StageDeletionFilter) toMessageFilter() (query.MessageFilter, *apiHTTPEr
 
 // StageDeletionRequest is the POST /api/v1/deletions body.
 type StageDeletionRequest struct {
-	Filter         *StageDeletionFilter `json:"filter,omitempty"`
+	Filter         *StageDeletionFilter `json:"filter,omitzero" nullable:"false"`
 	MessageIDs     []int64              `json:"message_ids,omitempty"`
-	Selection      *ExploreSelection    `json:"selection,omitempty"`
+	Selection      *ExploreSelection    `json:"selection,omitzero" nullable:"false"`
 	OperationToken string               `json:"operation_token,omitempty"`
 	Description    string               `json:"description,omitempty"`
-	DryRun         bool                 `json:"dry_run,omitempty"`
+	DryRun         bool                 `json:"dry_run,omitzero"`
 }
 
 // StageDeletionResponse covers both dry-run (200) and create (201).
+// MessageCount is the staged subset. MatchedCount and SkippedCount are
+// reported for reviewed selections, where the match set may contain items
+// no source supports deleting.
 type StageDeletionResponse struct {
 	DryRun         bool                      `json:"dry_run"`
 	MessageCount   int                       `json:"message_count"`
+	MatchedCount   int                       `json:"matched_count,omitzero"`
+	SkippedCount   int                       `json:"skipped_count,omitzero"`
 	Account        string                    `json:"account,omitempty"`
 	SampleGmailIDs []string                  `json:"sample_gmail_ids,omitempty"`
 	ID             string                    `json:"id,omitempty"`
 	Status         string                    `json:"status,omitempty"`
-	Source         *deletion.SourceReference `json:"source,omitempty"`
+	Source         *deletion.SourceReference `json:"source,omitzero" nullable:"false"`
 }
 
 // DeletionManifestSummary is one row of GET /api/v1/deletions.
@@ -130,9 +138,9 @@ type DeletionManifestDetail struct {
 	Description  string                    `json:"description"`
 	Account      string                    `json:"account,omitempty"`
 	MessageCount int                       `json:"message_count"`
-	Summary      *deletion.Summary         `json:"summary,omitempty"`
-	Execution    *deletion.Execution       `json:"execution,omitempty"`
-	Source       *deletion.SourceReference `json:"source,omitempty"`
+	Summary      *deletion.Summary         `json:"summary,omitzero" nullable:"false"`
+	Execution    *deletion.Execution       `json:"execution,omitzero" nullable:"false"`
+	Source       *deletion.SourceReference `json:"source,omitzero" nullable:"false"`
 }
 
 // CancelDeletionResponse is the DELETE /api/v1/deletions/{id} body.
@@ -155,10 +163,10 @@ func (s *Server) handleStageDeletion(w http.ResponseWriter, r *http.Request) {
 	// Reject unknown fields: a typo in a narrowing filter key would
 	// otherwise be silently dropped while a remaining broad criterion
 	// stages far more messages than intended.
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
+	dec := jsontext.NewDecoder(r.Body, json.RejectUnknownMembers(true))
+
 	var req StageDeletionRequest
-	if err := dec.Decode(&req); err != nil {
+	if err := json.UnmarshalDecode(dec, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request",
 			fmt.Sprintf("invalid JSON request body: %v", err))
 		return
@@ -185,9 +193,10 @@ func (s *Server) handleStageDeletion(w http.ResponseWriter, r *http.Request) {
 
 	var targets []query.DeletionTarget
 	var claim *deletionOperationClaim
+	var matched int
 	if req.Selection != nil {
 		var ok bool
-		targets, claim, ok = s.resolveAuthorizedDeletionSelection(w, r, *req.Selection, req.OperationToken)
+		targets, claim, matched, ok = s.resolveAuthorizedDeletionSelection(w, r, *req.Selection, req.OperationToken)
 		if !ok {
 			return
 		}
@@ -220,6 +229,8 @@ func (s *Server) handleStageDeletion(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, StageDeletionResponse{
 			DryRun:         true,
 			MessageCount:   len(gmailIDs),
+			MatchedCount:   matched,
+			SkippedCount:   max(matched-len(gmailIDs), 0),
 			Account:        account,
 			Source:         source,
 			SampleGmailIDs: sample,
@@ -239,7 +250,7 @@ func (s *Server) handleStageDeletion(w http.ResponseWriter, r *http.Request) {
 	// executed (or worse, could be forced onto the wrong account with
 	// --account).
 	manifest.Filters.Account = account
-	raw, err := json.Marshal(req)
+	raw, err := json.Marshal(req, json.Deterministic(true))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", "request is not serializable")
 		return
@@ -270,6 +281,8 @@ func (s *Server) handleStageDeletion(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusCreated, StageDeletionResponse{
 		MessageCount: len(gmailIDs),
+		MatchedCount: matched,
+		SkippedCount: max(matched-len(gmailIDs), 0),
 		Account:      account,
 		ID:           manifest.ID,
 		Status:       string(manifest.Status),
@@ -317,42 +330,44 @@ func (c *deletionOperationClaim) rollback() { c.state.rollbackOperation(c.token)
 // resolveAuthorizedDeletionSelection validates the reviewed selection
 // against the preflight grant without consuming it; the returned claim
 // lets the caller reserve/commit/rollback the token around manifest
-// persistence.
+// persistence. The returned targets are the deletable subset of the
+// reviewed match set, and the returned count is the full match set so the
+// caller can report what was left out.
 func (s *Server) resolveAuthorizedDeletionSelection(
 	w http.ResponseWriter,
 	r *http.Request,
 	selection ExploreSelection,
 	token string,
-) ([]query.DeletionTarget, *deletionOperationClaim, bool) {
+) ([]query.DeletionTarget, *deletionOperationClaim, int, bool) {
 	if token == "" {
 		writeError(w, http.StatusPreconditionRequired, "preflight_required",
 			"operation_token from deletion preflight is required")
-		return nil, nil, false
+		return nil, nil, 0, false
 	}
 	if selection.Mode != "explicit" && selection.Mode != "all_matching" {
 		writeError(w, http.StatusBadRequest, "invalid_selection", "selection mode must be explicit or all_matching")
-		return nil, nil, false
+		return nil, nil, 0, false
 	}
 	predicate, err := s.prepareResolvedExplorePredicate(r.Context(), selection.Predicate)
 	if err != nil {
 		s.writeExploreFilterError(w, err, "invalid_selection_predicate")
-		return nil, nil, false
+		return nil, nil, 0, false
 	}
 	if selection.CacheRevision == "" {
 		writeError(w, http.StatusBadRequest, "invalid_selection", "cache_revision is required")
-		return nil, nil, false
+		return nil, nil, 0, false
 	}
 	if predicate.request.SearchMode == exploreSearchModeSemantic || predicate.request.SearchMode == exploreSearchModeHybrid {
 		if selection.CandidateSnapshotID == "" {
 			writeError(w, http.StatusBadRequest, "candidate_snapshot_required",
 				"Semantic and hybrid deletion staging require the server-issued candidate snapshot")
-			return nil, nil, false
+			return nil, nil, 0, false
 		}
 		predicate.request.CandidateSnapshotID = selection.CandidateSnapshotID
 	}
 	searchSpec, _, resolved := s.resolveExploreSearch(r.Context(), w, predicate.request)
 	if !resolved || !requireCompleteCandidatePool(w, searchSpec) {
-		return nil, nil, false
+		return nil, nil, 0, false
 	}
 	predicate.query.Search = searchSpec
 	selectionRequest := query.ExploreSelectionRequest{
@@ -361,7 +376,7 @@ func (s *Server) resolveAuthorizedDeletionSelection(
 	if selection.Mode == "explicit" {
 		if selection.RowKeys == nil {
 			writeError(w, http.StatusBadRequest, "invalid_selection", "explicit selection requires row_keys")
-			return nil, nil, false
+			return nil, nil, 0, false
 		}
 		selectionRequest.IncludedKeys = selection.RowKeys
 	}
@@ -369,60 +384,62 @@ func (s *Server) resolveAuthorizedDeletionSelection(
 	analyzer, ok := engine.(query.Explorer)
 	if !ok {
 		s.writeExploreUnavailable(r.Context(), w, query.CacheAbsent)
-		return nil, nil, false
+		return nil, nil, 0, false
 	}
 	stats, err := analyzer.ExploreSelectionStats(r.Context(), selectionRequest)
 	if err != nil {
 		s.writeExploreError(r.Context(), w, err)
-		return nil, nil, false
+		return nil, nil, 0, false
 	}
 	if selection.CacheRevision != stats.CacheRevision {
 		writeError(w, http.StatusConflict, "archive_revision_changed", "The committed analytical cache changed; run preflight again")
-		return nil, nil, false
+		return nil, nil, 0, false
 	}
 	if searchSpec.Mode != query.SearchNone && !sameSearchProvenance(selection.SearchProvenance, stats.SearchProvenance) {
 		writeError(w, http.StatusConflict, "search_revision_changed", "The search index revision changed; run preflight again")
-		return nil, nil, false
+		return nil, nil, 0, false
 	}
 	selectionHash := hashCanonicalValue(&selection, false)
 	state := s.exploreState
 	if state == nil {
 		writeError(w, http.StatusConflict, "operation_token_invalid", "Deletion preflight expired; run preflight again")
-		return nil, nil, false
+		return nil, nil, 0, false
 	}
 	grant, authorized := state.operation(token, selectionHash)
 	if !authorized || grant.Revision != stats.CacheRevision || grant.Count != stats.Count {
 		writeError(w, http.StatusConflict, "operation_token_invalid", "Deletion preflight expired or no longer matches; run preflight again")
-		return nil, nil, false
+		return nil, nil, 0, false
 	}
 	if stats.Count == 0 {
 		writeError(w, http.StatusBadRequest, "no_messages_matched", "No messages matched the reviewed selection")
-		return nil, nil, false
+		return nil, nil, 0, false
 	}
-	if stats.DeletableCount != stats.Count {
+	// A mixed selection stages its deletable subset instead of failing as a
+	// whole. Only a selection with nothing deletable is a dead end.
+	if stats.DeletableCount == 0 {
 		writeError(w, http.StatusConflict, "selection_not_deletable",
-			"The reviewed selection contains items that cannot be deleted from their source")
-		return nil, nil, false
+			"No item in the reviewed selection can be deleted from its source")
+		return nil, nil, 0, false
 	}
 	resolver, ok := engine.(deletionMessageIDResolver)
 	if !ok {
 		writeError(w, http.StatusServiceUnavailable, "engine_unavailable",
 			"selection deletion staging is not supported by this query engine")
-		return nil, nil, false
+		return nil, nil, 0, false
 	}
 	targets, err := resolver.GetDeletionTargetsByMessageIDs(r.Context(), stats.DeletableMessageIDs)
 	if err != nil {
 		s.logger.Error("stage deletion selection resolution failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Gmail ID query failed")
-		return nil, nil, false
+		return nil, nil, 0, false
 	}
-	if int64(len(targets)) != stats.Count {
+	if int64(len(targets)) != stats.DeletableCount {
 		writeError(w, http.StatusConflict, "selection_changed",
 			"The reviewed selection changed before staging; run preflight again")
-		return nil, nil, false
+		return nil, nil, 0, false
 	}
 	claim := &deletionOperationClaim{state: state, token: token, selectionHash: selectionHash}
-	return targets, claim, true
+	return targets, claim, int(stats.Count), true
 }
 
 // resolveStageDeletionTargets unions filter-resolved and explicitly selected
@@ -588,6 +605,9 @@ func manifestFiltersFromRequest(f *StageDeletionFilter) deletion.Filters {
 	}
 	if f.Label != "" {
 		out.Labels = []string{f.Label}
+	}
+	if f.ListID != "" {
+		out.ListIDs = []string{f.ListID}
 	}
 	out.After = f.After
 	out.Before = f.Before

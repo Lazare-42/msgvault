@@ -11,9 +11,12 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/api"
+	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonclient"
+	"go.kenn.io/msgvault/internal/logging"
 	"go.kenn.io/msgvault/internal/peoplebrowser"
 	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/telemetry"
 	"go.kenn.io/msgvault/internal/tui"
 )
 
@@ -48,9 +51,10 @@ Navigation:
   Enter       Drill down / view message
   Esc         Go back
   m           Cycle Email / Texts / Meetings / People
+  ,           Open Settings
   g           Cycle aggregate view (Email and Texts)
   /           Search; Tab adds active-message-only Semantic mode when enabled
-  A           Filter by account, or meeting source in Meetings mode
+  A           Filter by account or named Email collection
   s           Cycle sort field
   r           Reverse sort direction
   t           Toggle time granularity (Time view only)
@@ -58,7 +62,8 @@ Navigation:
 Email selection:
   Space       Toggle selection
   x           Clear selection
-  d           Stage selected messages for deletion
+  d           Stage selected/current messages for deletion
+  D           Stage all current row/filter matches for deletion
 
 Meeting browsing is read-only; selection and deletion keys are disabled.
 Press '?' in any mode for its complete key reference, or 'q' to quit.
@@ -73,13 +78,23 @@ HTTP Mode:
   Otherwise it starts or reuses the local daemon. Use --local to force the local
   daemon when a remote is configured.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		backend, err := openTUIBackend(cmd.Context())
+		state := invocationFromCommand(cmd)
+		if state == nil || state.cfg == nil {
+			return errors.New("configuration is unavailable")
+		}
+		currentCfg := state.cfg
+		currentLogResult := state.logResult
+		local, err := cmd.Flags().GetBool(localValue)
+		if err != nil {
+			return fmt.Errorf("read --local flag: %w", err)
+		}
+		backend, err := openTUIBackendWithLocal(withInvocation(cmd.Context(), state), local)
 		if err != nil {
 			return err
 		}
 		defer backend.cleanup()
 		if backend.info.Kind == HTTPStoreConfiguredRemote {
-			fmt.Printf("Connected to remote: %s\n", cfg.Remote.URL)
+			fmt.Printf("Connected to remote: %s\n", currentCfg.Remote.URL)
 		}
 
 		// The shipped daemon engine provides Texts directly. People uses the
@@ -94,15 +109,22 @@ HTTP Mode:
 
 		// Create and run TUI
 		semanticSearch := tuiSemanticSearcher(cmd.Context(), backend.client, backend.engine)
+		collectionScopes := tuiCollectionScopes(cmd.Context(), backend.client, backend.engine)
+		gate := newTUITelemetryGate(currentCfg.Data.DataDir, backend.client.BaseURL())
 		model := tui.New(backend.engine, tui.Options{
-			DataDir:          cfg.Data.DataDir,
-			Version:          Version,
-			TextEngine:       textEngine,
-			PeopleBackend:    peopleBackend,
-			ManifestSaver:    backend.client,
-			AttachmentReader: tuiAttachmentOpener{client: backend.client},
-			SemanticSearch:   semanticSearch,
-			AnalyticsNotice:  notice,
+			DataDir:               currentCfg.Data.DataDir,
+			ExportDir:             currentCfg.ExportDir(),
+			Version:               Version,
+			TextEngine:            textEngine,
+			PeopleBackend:         peopleBackend,
+			ManifestSaver:         backend.client,
+			AttachmentReader:      tuiAttachmentOpener{client: backend.client},
+			SemanticSearch:        semanticSearch,
+			AnalyticsNotice:       notice,
+			SettingsBackend:       backend.settings,
+			CollectionScopeLister: collectionScopes,
+			ReportScreen:          tuiScreenReporter(gate, backend.client, currentCfg),
+			ReportAction:          tuiActionReporter(gate, backend.client, currentCfg),
 		})
 		p := tea.NewProgram(model)
 		noticeCtx, stopNoticeRefresh := context.WithCancel(cmd.Context())
@@ -122,18 +144,64 @@ HTTP Mode:
 		// the render. The daily log file still receives
 		// everything, so 'msgvault logs -f' in another pane
 		// continues to work for diagnostics.
-		prevLogger := slog.Default()
-		if logResult != nil {
-			slog.SetDefault(logResult.FileOnlyLogger())
-		}
-		defer slog.SetDefault(prevLogger)
-
-		if _, err := p.Run(); err != nil {
-			return fmt.Errorf("run tui: %w", err)
+		if err := withTUIFileLogger(currentLogResult, func() error {
+			started := time.Now()
+			_, err := p.Run()
+			if err == nil || errors.Is(err, tea.ErrInterrupted) {
+				reportTUISession(cmd.Context(), currentCfg, backend.info, time.Since(started), gate)
+			}
+			if err != nil {
+				return fmt.Errorf("run tui: %w", err)
+			}
+			return nil
+		}); err != nil {
+			return err
 		}
 
 		return nil
 	},
+}
+
+func reportTUISession(ctx context.Context, cfg *config.Config, info HTTPStoreInfo, duration time.Duration, gate *tuiTelemetryGate) {
+	if !clientTelemetryEnabled(cfg) {
+		return
+	}
+	inv := invocationFromContext(ctx)
+	if inv == nil {
+		return
+	}
+	clientConfig := daemonclient.Config{URL: info.URL, APIKey: httpStoreAPIKey(info, cfg), AllowInsecure: true}
+	if info.Kind == HTTPStoreConfiguredRemote {
+		clientConfig.AllowInsecure = cfg.Remote.AllowInsecure
+	}
+	inv.sends.Go(func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+		defer cancel()
+		client, err := newDaemonCLIClient(ctx, clientConfig)
+		if err != nil {
+			return
+		}
+		defer func() { _ = client.Close() }()
+		_ = gate.report(ctx, client, telemetry.EventSessionEnded, "duration_bucket", telemetry.DurationBucket(duration))
+	})
+}
+
+func tuiScreenReporter(gate *tuiTelemetryGate, client *daemonclient.Client, cfg *config.Config) func(context.Context, string) error {
+	return func(ctx context.Context, screen string) error {
+		if !clientTelemetryEnabled(cfg) {
+			return nil
+		}
+		return gate.report(ctx, client, telemetry.EventScreenViewed, "screen", screen)
+	}
+}
+
+func withTUIFileLogger(result *logging.Result, run func() error) error {
+	previous := slog.Default()
+	if result != nil {
+		slog.SetDefault(result.FileOnlyLogger())
+	}
+	defer slog.SetDefault(previous)
+	return run()
 }
 
 func tuiSemanticSearcher(
@@ -156,11 +224,16 @@ func tuiSemanticSearcher(
 	return searcher
 }
 
+// tuiPeopleBackend returns the People backend for the selected daemon, or nil
+// when the daemon is too old to serve People at all. The brief routes arrived
+// later than People itself, so a daemon between the two schema versions gets a
+// backend without the brief surfaces: the People browser then hides the brief
+// rather than reporting a failed read on every contact.
 func tuiPeopleBackend(
 	ctx context.Context,
 	client *daemonclient.Client,
 	engine *daemonclient.Engine,
-) *daemonclient.PeopleBrowser {
+) peoplebrowser.Backend {
 	if client == nil || engine == nil {
 		return nil
 	}
@@ -168,14 +241,38 @@ func tuiPeopleBackend(
 	if err != nil || !compatible {
 		return nil
 	}
-	return daemonclient.NewPeopleBrowser(engine)
+	browser := daemonclient.NewPeopleBrowser(engine)
+	briefs, err := client.SupportsAPISchemaVersion(ctx, briefMinAPISchemaVersion)
+	if err != nil || !briefs {
+		return daemonclient.NewPeopleBrowserWithoutBriefs(browser)
+	}
+	return browser
 }
 
 const (
-	semanticSearchMinAPISchemaVersion = "2.7.0"
-	peopleMinAPISchemaVersion         = "2.10.0"
-	tuiSemanticMessageType            = "email"
+	semanticSearchMinAPISchemaVersion   = "2.7.0"
+	peopleMinAPISchemaVersion           = "2.10.0"
+	directoryPeopleMinAPISchemaVersion  = "2.13.0"
+	collectionScopesMinAPISchemaVersion = "2.17.0"
+	briefMinAPISchemaVersion            = "2.20.0"
+	tuiSemanticMessageType              = "email"
 )
+
+func tuiCollectionScopes(
+	ctx context.Context,
+	client *daemonclient.Client,
+	engine query.Engine,
+) query.CollectionScopeLister {
+	if client == nil || engine == nil {
+		return nil
+	}
+	compatible, err := client.SupportsAPISchemaVersion(ctx, collectionScopesMinAPISchemaVersion)
+	if err != nil || !compatible {
+		return nil
+	}
+	lister, _ := engine.(query.CollectionScopeLister)
+	return lister
+}
 
 type tuiAttachmentOpener struct {
 	client *daemonclient.Client
@@ -186,10 +283,11 @@ func (o tuiAttachmentOpener) OpenAttachment(ctx context.Context, contentHash str
 }
 
 type tuiBackend struct {
-	engine  *daemonclient.Engine
-	client  *daemonclient.Client
-	info    HTTPStoreInfo
-	cleanup func()
+	engine   *daemonclient.Engine
+	client   *daemonclient.Client
+	settings tui.SettingsBackend
+	info     HTTPStoreInfo
+	cleanup  func()
 }
 
 const (
@@ -258,10 +356,22 @@ func refreshAnalyticsCacheNotice(
 }
 
 func openTUIBackend(ctx context.Context) (*tuiBackend, error) {
-	if forceLocalTUI {
-		previousUseLocal := useLocal
-		useLocal = true
-		defer func() { useLocal = previousUseLocal }()
+	state := invocationFromContext(ctx)
+	if state == nil {
+		return nil, errors.New("configuration is unavailable")
+	}
+	return openTUIBackendWithLocal(ctx, forceLocalTUI)
+}
+
+func openTUIBackendWithLocal(ctx context.Context, forceLocal bool) (*tuiBackend, error) {
+	if forceLocal {
+		inv := invocationFromContext(ctx)
+		if inv == nil {
+			return nil, errors.New("configuration is unavailable")
+		}
+		local := *inv
+		local.options.useLocal = true
+		ctx = withInvocation(ctx, &local)
 	}
 
 	st, info, err := OpenHTTPStore(ctx)
@@ -270,10 +380,11 @@ func openTUIBackend(ctx context.Context) (*tuiBackend, error) {
 	}
 	engine := daemonclient.NewEngineAdapter(st)
 	return &tuiBackend{
-		engine:  engine,
-		client:  st,
-		info:    info,
-		cleanup: func() { _ = engine.Close() },
+		engine:   engine,
+		client:   st,
+		settings: newTUISettingsBackend(st),
+		info:     info,
+		cleanup:  func() { _ = engine.Close() },
 	}, nil
 }
 
@@ -289,4 +400,13 @@ func init() {
 	_ = tuiCmd.Flags().MarkHidden("force-sql")
 	_ = tuiCmd.Flags().MarkHidden("no-cache-build")
 	_ = tuiCmd.Flags().MarkHidden("no-sqlite-scanner")
+}
+
+func tuiActionReporter(gate *tuiTelemetryGate, client *daemonclient.Client, cfg *config.Config) func(context.Context, string, string, string) error {
+	return func(ctx context.Context, event, property, value string) error {
+		if !clientTelemetryEnabled(cfg) {
+			return nil
+		}
+		return gate.report(ctx, client, event, property, value)
+	}
 }

@@ -208,7 +208,7 @@ func TestBuilderLockDoesNotBlockReaders(t *testing.T) {
 	analyticsDir := filepath.Join(t.TempDir(), "analytics")
 	requirements.NoError(os.MkdirAll(analyticsDir, 0o755))
 
-	builderLock, err := acquireCacheBuildLock(analyticsDir)
+	builderLock, err := acquireCacheBuildLock(context.Background(), analyticsDir)
 	requirements.NoError(err, "acquire builder lock")
 
 	readCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -220,7 +220,7 @@ func TestBuilderLockDoesNotBlockReaders(t *testing.T) {
 
 	unlockCache, err := lockCacheAndInvalidateSyncState(analyticsDir)
 	requirements.NoError(err, "destructive maintenance locks")
-	blockedCtx, cancelBlocked := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	blockedCtx, cancelBlocked := context.WithTimeout(context.Background(), 150*time.Millisecond) //nolint:kennlint // the deadline is the expected result; destructive maintenance holds the cache locks
 	defer cancelBlocked()
 	_, err = query.AcquireCacheReadLock(blockedCtx, analyticsDir)
 	requirements.Error(err, "readers must stay excluded during destructive maintenance")

@@ -5,10 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
+	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/jobctx"
 	"go.kenn.io/msgvault/internal/slack"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/textutil"
@@ -23,14 +27,16 @@ var (
 )
 
 func newSyncSlackCmd() *cobra.Command {
+	var syncPrivateChannels, syncDMs, syncGroupDMs bool
 	cmd := &cobra.Command{
 		Use:   "sync-slack [team-id]",
 		Short: "Sync Slack conversations (channels, group DMs, DMs)",
 		Long: `Sync Slack conversations for registered workspaces.
 
 The first run backfills each conversation's full history; later runs are
-incremental, fetching new messages and discovering late thread replies with
-search plus periodic canonical audits. Backfills and audits are resumable:
+incremental. Tokens with search:read use search plus periodic history audits
+to discover late thread replies. Without it, each sync revisits conversation
+history for replies on old threads. Backfills and audits are resumable:
 re-run after an interruption and the sync continues where it stopped.
 
 Requires a workspace added with 'add-slack'. Use --full to start a repair
@@ -45,6 +51,11 @@ Examples:
   msgvault sync-slack --full`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			state := invocationFromCommand(cmd)
+			if state == nil || state.cfg == nil {
+				return errors.New("configuration is unavailable")
+			}
+			cfg := state.cfg
 			if !isDaemonCLISubprocess() {
 				return runDaemonCLICommandHTTPFromCobra(cmd, args)
 			}
@@ -53,7 +64,7 @@ Examples:
 			if len(args) > 0 {
 				flagTeam = args[0]
 			}
-			s, cleanup, err := openWritableStoreAndInitForIngest()
+			s, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
 			if err != nil {
 				return err
 			}
@@ -82,7 +93,8 @@ Examples:
 					continue
 				}
 				imp := slack.NewImporter(s, slack.NewClient("", token), teamID)
-				opts := slackImportOptions(teamID, userID)
+				opts := slackImportOptions(teamID, userID, cfg)
+				applySlackConversationOverrides(cmd, &opts, syncPrivateChannels, syncDMs, syncGroupDMs)
 				opts.Limit = syncSlackLimit
 				opts.Full = syncSlackFull
 				opts.NoThreads = syncSlackNoThreads
@@ -104,7 +116,7 @@ Examples:
 
 			// Successful workspaces' messages must reach the analytics cache
 			// regardless of interruptions or per-workspace failures.
-			cacheErr := rebuildCacheAfterWrite(cfg.DatabaseDSN())
+			cacheErr := rebuildCacheAfterManualSync(cfg.DatabaseDSN(), state)
 			if ctx.Err() != nil {
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "\nInterrupted — re-run sync-slack to resume.")
 			} else if len(syncErrors) > 0 {
@@ -121,7 +133,22 @@ Examples:
 	cmd.Flags().BoolVar(&syncSlackNoThreads, "no-threads", false, "skip thread-reply fetching (backfill inline fetches and the reply sweep) for this run")
 	cmd.Flags().BoolVar(&syncSlackMaintenance, "maintenance", false, "run the maintenance rescan: repair edits and reaction changes on recent messages (archives ignore post-capture mutations by default)")
 	cmd.Flags().BoolVar(&syncSlackNoMedia, "no-media", false, "skip file downloads for this run (files are recorded as pending; backfill-slack-media fetches them later)")
+	cmd.Flags().BoolVar(&syncDMs, "dms", true, "include one-to-one DMs for this run, overriding config (true or false)")
+	cmd.Flags().BoolVar(&syncPrivateChannels, "private-channels", true, "include private channels for this run, overriding config (true or false)")
+	cmd.Flags().BoolVar(&syncGroupDMs, "group-dms", true, "include group DMs for this run, overriding config (true or false)")
 	return cmd
+}
+
+func applySlackConversationOverrides(cmd *cobra.Command, opts *slack.ImportOptions, privateChannels, dms, groupDMs bool) {
+	if cmd.Flags().Changed("private-channels") {
+		opts.ExcludePrivateChannels = !privateChannels
+	}
+	if cmd.Flags().Changed("dms") {
+		opts.ExcludeDMs = !dms
+	}
+	if cmd.Flags().Changed("group-dms") {
+		opts.ExcludeGroupDMs = !groupDMs
+	}
 }
 
 func writeSlackProgress(out io.Writer, line string) {
@@ -166,18 +193,26 @@ func resolveSlackSyncSources(s *store.Store, flagTeam string) ([]*store.Source, 
 		if len(sources) == 0 {
 			return nil, errors.New("no Slack workspaces registered (run 'add-slack' first)")
 		}
-		return sources, nil
+		active := activeSyncSources(sources)
+		if len(active) == 0 {
+			return nil, fmt.Errorf("no active Slack workspaces registered: %w", store.ErrSourceRetired)
+		}
+		return active, nil
 	}
-	var out []*store.Source
+	var matched []*store.Source
 	for _, src := range sources {
 		if teamID, _, ok := splitSlackIdentifier(src.Identifier); ok && teamID == flagTeam {
-			out = append(out, src)
+			matched = append(matched, src)
 		}
 	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("slack workspace %q is not registered (run 'add-slack' first)", flagTeam)
+	active := activeSyncSources(matched)
+	if len(active) > 0 {
+		return active, nil
 	}
-	return out, nil
+	if len(matched) > 0 {
+		return nil, fmt.Errorf("slack workspace %q is retired: %w", flagTeam, store.ErrSourceRetired)
+	}
+	return nil, fmt.Errorf("slack workspace %q is not registered (run 'add-slack' first)", flagTeam)
 }
 
 // slackSyncExit resolves sync-slack's exit error from the run's parts. An
@@ -199,16 +234,19 @@ func slackSyncExit(ctxErr error, syncErrors []string, cacheErr error) error {
 
 // slackImportOptions builds the config-derived import options shared by the
 // CLI and scheduler paths (flag overlays are applied by the CLI caller).
-func slackImportOptions(teamID, userID string) slack.ImportOptions {
+func slackImportOptions(teamID, userID string, cfg *config.Config) slack.ImportOptions {
 	policy := cfg.Slack.MediaPolicy(teamID)
 	return slack.ImportOptions{
-		TeamID:          teamID,
-		UserID:          userID,
-		AttachmentsDir:  cfg.AttachmentsDir(),
-		MaxMediaBytes:   policy.MaxBytes,
-		MediaPolicy:     policy,
-		IncludeChannels: cfg.Slack.Channels,
-		ExcludeChannels: cfg.Slack.ExcludeChannels,
+		TeamID:                 teamID,
+		UserID:                 userID,
+		AttachmentsDir:         cfg.AttachmentsDir(),
+		MaxMediaBytes:          policy.MaxBytes,
+		MediaPolicy:            policy,
+		IncludeChannels:        cfg.Slack.Channels,
+		ExcludeChannels:        cfg.Slack.ExcludeChannels,
+		ExcludePrivateChannels: !cfg.Slack.PrivateChannelsEnabled(),
+		ExcludeDMs:             !cfg.Slack.DMsEnabled(),
+		ExcludeGroupDMs:        !cfg.Slack.GroupDMsEnabled(),
 	}
 }
 
@@ -216,37 +254,104 @@ func slackImportOptions(teamID, userID string) slack.ImportOptions {
 // sync of every registered Slack workspace. Per-workspace failures are
 // collected so one broken workspace does not starve the others.
 func runConfiguredSlackSync(ctx context.Context, s *store.Store) error {
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
 	sources, err := resolveSlackSyncSources(s, "")
 	if err != nil {
 		return err
 	}
-	var errs []error
-	attempted := 0
-	for _, src := range sources {
-		if ctx.Err() != nil {
+	return runScheduledSlackAttempts(ctx, sources, scheduledSlackRotation,
+		func(src *store.Source) (bool, error) {
+			teamID, userID, ok := splitSlackIdentifier(src.Identifier)
+			if !ok {
+				return false, fmt.Errorf("slack %s: malformed identifier", src.Identifier)
+			}
+			token, terr := slack.LoadToken(cfg.TokensDir(), teamID, userID)
+			if terr != nil {
+				return false, fmt.Errorf("slack %s: %w", teamID, terr)
+			}
+			imp := slack.NewImporter(s, slack.NewClient("", token), teamID)
+			if _, serr := imp.Import(ctx, slackImportOptions(teamID, userID, cfg)); serr != nil {
+				return true, fmt.Errorf("slack %s: %w", teamID, serr)
+			}
+			return true, nil
+		}, func() error {
+			// Rebuild analytics after any import attempt: even a failed or
+			// canceled attempt may have committed messages from healthy channels.
+			return rebuildCacheAfterScheduledSync(context.WithoutCancel(ctx), "slack")
+		})
+}
+
+// scheduledSlackRotation remembers where a preempted scheduled sync stopped,
+// so one long-running workspace cannot starve workspaces later in store order.
+var scheduledSlackRotation = &slackWorkspaceRotation{}
+
+type slackWorkspaceRotation struct {
+	mu   sync.Mutex
+	next string
+}
+
+func (r *slackWorkspaceRotation) order(sources []*store.Source) []*store.Source {
+	r.mu.Lock()
+	next := r.next
+	r.mu.Unlock()
+	start := -1
+	for idx, src := range sources {
+		if src.Identifier == next {
+			start = idx
 			break
 		}
-		teamID, userID, ok := splitSlackIdentifier(src.Identifier)
-		if !ok {
-			errs = append(errs, fmt.Errorf("slack %s: malformed identifier", src.Identifier))
-			continue
+	}
+	if start <= 0 {
+		return slices.Clone(sources)
+	}
+	return append(slices.Clone(sources[start:]), sources[:start]...)
+}
+
+func (r *slackWorkspaceRotation) resumeAt(identifier string) {
+	r.mu.Lock()
+	r.next = identifier
+	r.mu.Unlock()
+}
+
+// runScheduledSlackAttempts isolates workspace failures, rebuilds analytics
+// after import attempts, and resumes after the workspace interrupted by a
+// scheduler yield. A cooperative preemption request also ends the current run
+// after the current workspace has had a chance to checkpoint.
+func runScheduledSlackAttempts(
+	ctx context.Context,
+	sources []*store.Source,
+	rotation *slackWorkspaceRotation,
+	attempt func(*store.Source) (bool, error),
+	rebuild func() error,
+) error {
+	var errs []error
+	attempted := false
+	resumeAt := ""
+	ordered := rotation.order(sources)
+	for idx, src := range ordered {
+		if ctx.Err() != nil || jobctx.PreemptionRequested(ctx) {
+			resumeAt = src.Identifier
+			break
 		}
-		token, terr := slack.LoadToken(cfg.TokensDir(), teamID, userID)
-		if terr != nil {
-			errs = append(errs, fmt.Errorf("slack %s: %w", teamID, terr))
-			continue
+		started, err := attempt(src)
+		_ = recordSyncAttempt(ctx, sourceTypeSlack, src.Identifier, err)
+		attempted = attempted || started
+		if err != nil {
+			errs = append(errs, err)
 		}
-		attempted++
-		imp := slack.NewImporter(s, slack.NewClient("", token), teamID)
-		if _, serr := imp.Import(ctx, slackImportOptions(teamID, userID)); serr != nil {
-			errs = append(errs, fmt.Errorf("slack %s: %w", teamID, serr))
+		if ctx.Err() != nil || jobctx.PreemptionRequested(ctx) {
+			resumeAt = ordered[(idx+1)%len(ordered)].Identifier
+			break
 		}
 	}
-	// Rebuild analytics after any attempt: even a failed or canceled attempt
-	// may have committed messages from healthy conversations.
-	if attempted > 0 {
-		if rerr := rebuildCacheAfterScheduledSync(context.WithoutCancel(ctx), "slack"); rerr != nil {
-			errs = append(errs, rerr)
+	rotation.resumeAt(resumeAt)
+	if attempted {
+		if err := rebuild(); err != nil {
+			errs = append(errs, err)
 		}
 	}
 	if ctx.Err() != nil {
@@ -256,5 +361,5 @@ func runConfiguredSlackSync(ctx context.Context, s *store.Store) error {
 }
 
 func init() {
-	rootCmd.AddCommand(newSyncSlackCmd())
+	rootCmd.AddCommand(addManualSyncCacheFlags(newSyncSlackCmd()))
 }

@@ -1,7 +1,8 @@
 package gcal
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"time"
 )
 
@@ -57,13 +58,15 @@ func (w *wirePerson) toPerson() Person {
 }
 
 type wireAttendee struct {
-	Email          string `json:"email"`
-	DisplayName    string `json:"displayName"`
-	ResponseStatus string `json:"responseStatus"`
-	Organizer      bool   `json:"organizer"`
-	Self           bool   `json:"self"`
-	Resource       bool   `json:"resource"`
-	Optional       bool   `json:"optional"`
+	Email            string `json:"email"`
+	DisplayName      string `json:"displayName"`
+	ResponseStatus   string `json:"responseStatus"`
+	Organizer        bool   `json:"organizer"`
+	Self             bool   `json:"self"`
+	Resource         bool   `json:"resource"`
+	Optional         bool   `json:"optional"`
+	AdditionalGuests int    `json:"additionalGuests"`
+	Comment          string `json:"comment"`
 }
 
 type wireEventDateTime struct {
@@ -86,6 +89,7 @@ func (w *wireEventDateTime) toEventDateTime() EventDateTime {
 }
 
 type wireEvent struct {
+	ETag              string             `json:"etag,omitempty"`
 	ID                string             `json:"id"`
 	Status            string             `json:"status"`
 	HTMLLink          string             `json:"htmlLink"`
@@ -108,6 +112,7 @@ type wireEvent struct {
 	Transparency      string             `json:"transparency"`
 	Visibility        string             `json:"visibility"`
 	EventType         string             `json:"eventType"`
+	Reminders         *Reminders         `json:"reminders"`
 }
 
 func parseRFC3339(s string) time.Time {
@@ -122,6 +127,7 @@ func parseRFC3339(s string) time.Time {
 
 func (w wireEvent) toEvent() Event {
 	ev := Event{
+		ETag:              w.ETag,
 		ID:                w.ID,
 		Status:            w.Status,
 		HTMLLink:          w.HTMLLink,
@@ -143,6 +149,7 @@ func (w wireEvent) toEvent() Event {
 		Transparency:      w.Transparency,
 		Visibility:        w.Visibility,
 		EventType:         w.EventType,
+		Reminders:         w.Reminders,
 	}
 	for _, a := range w.Attendees {
 		ev.Attendees = append(ev.Attendees, Attendee(a))
@@ -153,10 +160,10 @@ func (w wireEvent) toEvent() Event {
 type wireEvents struct {
 	// Items are kept as raw JSON so each event's original bytes can be
 	// preserved verbatim in Event.Raw for the archive.
-	Items         []json.RawMessage `json:"items"`
-	NextPageToken string            `json:"nextPageToken"`
-	NextSyncToken string            `json:"nextSyncToken"`
-	TimeZone      string            `json:"timeZone"`
+	Items         []jsontext.Value `json:"items"`
+	NextPageToken string           `json:"nextPageToken"`
+	NextSyncToken string           `json:"nextSyncToken"`
+	TimeZone      string           `json:"timeZone"`
 }
 
 // decodeEvent unmarshals one event's JSON into the domain Event, preserving the
@@ -167,6 +174,6 @@ func decodeEvent(raw []byte) (Event, error) {
 		return Event{}, err
 	}
 	ev := w.toEvent()
-	ev.Raw = append(json.RawMessage(nil), raw...)
+	ev.Raw = append(jsontext.Value(nil), raw...)
 	return ev, nil
 }

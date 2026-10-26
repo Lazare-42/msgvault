@@ -17,7 +17,9 @@ import (
 	"go.kenn.io/msgvault/internal/api"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonauth"
+	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/update"
+	apiclient "go.kenn.io/msgvault/pkg/client"
 	"golang.org/x/crypto/argon2"
 )
 
@@ -33,6 +35,7 @@ const (
 	runtimeCreateTime               = "create_time"
 	runtimeShutdownToken            = "shutdown_token"
 	runtimeStartupPhase             = "startup_phase"
+	minimumDaemonAPISchemaVersion   = "3.0.0"
 	runtimeStartupCacheBuildOutcome = "startup_cache_build_outcome"
 	daemonProbeTick                 = 250 * time.Millisecond
 )
@@ -148,10 +151,20 @@ func findCompatibleDaemonRuntimeContext(ctx context.Context, dataDir string) (*D
 // CLI upgrade or downgrade fails the compatibility check, yet it still holds
 // the database open.
 func findAnyDaemonRuntime(dataDir string) *DaemonRuntime {
+	return findAnyDaemonRuntimeContext(context.Background(), dataDir)
+}
+
+// findAnyDaemonRuntimeContext is the context-aware form of
+// findAnyDaemonRuntime. Guards that only need to know whether a live
+// process owns the archive (like the restore-into-home refusal) must use
+// this rather than findDaemonRuntime: a daemon left running across a CLI
+// upgrade or downgrade fails the compatibility check, yet it still holds
+// the database open.
+func findAnyDaemonRuntimeContext(ctx context.Context, dataDir string) *DaemonRuntime {
 	// findRespondingDaemonRuntime returns the accepted runtime's
 	// compatibility error alongside it; an incompatible daemon is exactly
 	// what this lookup must still surface, so only found matters here.
-	rt, found, _ := findRespondingDaemonRuntime(context.Background(), dataDir,
+	rt, found, _ := findRespondingDaemonRuntime(ctx, dataDir,
 		func(*DaemonRuntime, error) bool { return true })
 	if !found {
 		return nil
@@ -224,16 +237,14 @@ func findRespondingDaemonRuntime(
 	if err := ctx.Err(); err != nil {
 		return nil, false, err
 	}
-	records, err := listLiveDaemonRuntimeRecords(dataDir)
+	records, err := listLiveDaemonRuntimeRecordsContext(ctx, dataDir)
 	if err != nil {
 		return nil, false, err
 	}
 	for _, rec := range records {
 		switch runtimeRecordIdentity(rec) {
 		case createTimeMatch:
-		case createTimeMismatch:
-			continue
-		case createTimeSkew, createTimeUnknown:
+		case createTimeMismatch, createTimeSkew, createTimeUnknown:
 			proved, proofErr := proveDaemonRuntimeIdentity(ctx, rec)
 			if proofErr != nil {
 				if ctxErr := ctx.Err(); ctxErr != nil {
@@ -265,6 +276,16 @@ func findRespondingDaemonRuntime(
 }
 
 func listLiveDaemonRuntimeRecords(dataDir string) ([]daemon.RuntimeRecord, error) {
+	return listLiveDaemonRuntimeRecordsContext(context.Background(), dataDir)
+}
+
+func listLiveDaemonRuntimeRecordsContext(ctx context.Context, dataDir string) ([]daemon.RuntimeRecord, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	store := daemonRuntimeStore(dataDir)
 	_, _ = store.CleanupDead()
 	records, err := store.List()
@@ -280,12 +301,27 @@ func listLiveDaemonRuntimeRecords(dataDir string) ([]daemon.RuntimeRecord, error
 		if rec.Service != "" && rec.Service != daemonService {
 			continue
 		}
+		if daemon.RuntimeProcessScope(rec) != daemon.ProcessScopeLocal {
+			continue
+		}
 		if !daemon.ProcessAlive(rec.PID) {
 			continue
 		}
-		if runtimeRecordIdentityMismatched(rec) &&
-			(!ownershipHeld || rec.Metadata[runtimeStartupPhase] == "") {
-			continue
+		if runtimeRecordIdentityMismatched(rec) {
+			if ownershipHeld && rec.Metadata[runtimeStartupPhase] != "" {
+				alive = append(alive, rec)
+				continue
+			}
+			proved, proofErr := proveDaemonRuntimeIdentity(ctx, rec)
+			if proofErr != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return nil, ctxErr
+				}
+				continue
+			}
+			if !proved {
+				continue
+			}
 		}
 		alive = append(alive, rec)
 	}
@@ -360,6 +396,12 @@ func apiSchemaCompatibilityError(peerVersion string) error {
 			peerVersion, api.APISchemaVersion,
 		)
 	}
+	if !daemonclient.APISchemaVersionAtLeast(peerVersion, minimumDaemonAPISchemaVersion) {
+		return fmt.Errorf(
+			"daemon API schema version %q is incompatible: this CLI requires API schema %s or newer",
+			peerVersion, minimumDaemonAPISchemaVersion,
+		)
+	}
 	return nil
 }
 
@@ -422,16 +464,17 @@ func probeDaemonRuntimeIdentity(ctx context.Context, rec daemon.RuntimeRecord) (
 	}
 	proofCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
-	req, err := http.NewRequestWithContext(proofCtx, http.MethodGet, url+api.DaemonIdentityPath, nil)
+	client, err := localDaemonAPIClient(url, "")
 	if err != nil {
-		return daemonIdentityUnverified, fmt.Errorf("create daemon identity request: %w", err)
+		return daemonIdentityUnverified, fmt.Errorf("create daemon identity client: %w", err)
 	}
-	req.Header.Set(api.DaemonIdentityChallengeHeader, challenge)
-	resp, err := localDaemonHTTPClient.Do(req)
-	if err != nil {
+	resp, err := client.DaemonIdentityWithResponse(proofCtx, func(_ context.Context, req *http.Request) error {
+		req.Header.Set(api.DaemonIdentityChallengeHeader, challenge)
+		return nil
+	})
+	if resp == nil {
 		return daemonIdentityUnverified, fmt.Errorf("send daemon identity request: %w", err)
 	}
-	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusMethodNotAllowed {
 		return daemonIdentityUnsupported, nil
 	}
@@ -442,7 +485,7 @@ func probeDaemonRuntimeIdentity(ctx context.Context, rec daemon.RuntimeRecord) (
 		rec.Metadata[runtimeShutdownToken],
 		challenge,
 		rec.PID,
-		resp.Header.Get(api.DaemonIdentityProofHeader),
+		resp.HTTPResponse.Header.Get(api.DaemonIdentityProofHeader),
 	) {
 		return daemonIdentityUnverified, nil
 	}
@@ -462,7 +505,7 @@ func proveDaemonRuntimeIdentity(ctx context.Context, rec daemon.RuntimeRecord) (
 // (PID reuse). An indeterminate or tolerance-skewed comparison keeps the
 // record, but an affirmative mismatch is never overridden by the
 // unauthenticated HTTP ping at the recorded address. This function never
-// deletes the record file: genuinely dead PIDs are reaped by CleanupDead,
+// deletes the record file: processes proven gone are reaped by CleanupDead,
 // and anything else is left in place for inspection.
 func runtimeRecordIdentityMismatched(rec daemon.RuntimeRecord) bool {
 	return runtimeRecordIdentity(rec) == createTimeMismatch
@@ -602,4 +645,14 @@ func shouldUpgradeIncompatibleDaemonRuntimeWithPolicy(rt *DaemonRuntime, current
 		}
 	}
 	return rt.API <= daemonAPIVersion
+}
+
+func localDaemonAPIClient(baseURL, apiKey string) (*apiclient.Client, error) {
+	client, err := daemonclient.New(daemonclient.Config{
+		URL: baseURL, APIKey: apiKey, AllowInsecure: true, HTTPClient: localDaemonHTTPClient,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return client.GeneratedClient()
 }

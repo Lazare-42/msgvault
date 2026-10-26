@@ -56,10 +56,22 @@ func (m Model) meetingSourceLabel(sourceID int64) string {
 			continue
 		}
 		switch strings.ToLower(strings.TrimSpace(account.SourceType)) {
+		case meetingSourceOmi:
+			return "Omi"
 		case meetingSourceGranola:
 			return "Granola"
 		case meetingSourceCircleback:
 			return "Circleback"
+		case meetingSourcePlaud:
+			return "Plaud"
+		case meetingSourceNotion:
+			return "Notion"
+		case meetingSourceMuesli:
+			return "Muesli"
+		case meetingSourceTwilio:
+			return "Twilio"
+		case meetingSourceTwenty:
+			return "Twenty"
 		case meetingSourceImported:
 			if account.DisplayName != "" {
 				return textutil.SanitizeTerminal(account.DisplayName)
@@ -170,12 +182,12 @@ func (m Model) meetingListView() string {
 }
 
 func (m Model) meetingFooterView() string {
-	keys := []string{"↑/k", "↓/j", helpLabelEnter, "A source", "/ search", "m mode", helpLabelHelp}
+	keys := []string{"↑/k", "↓/j", helpLabelEnter, "A source", "/ search", helpLabelMode, helpLabelHelp}
 	if m.width < 60 {
 		keys = []string{helpLabelVertical, helpLabelEnter, "/", "m", "?"}
 	}
 	if m.meetingState.level == meetingLevelDetail {
-		keys = []string{"↑/k", "↓/j", "←/h prev", "→/l next", "/ find", helpLabelBack, "m mode", helpLabelHelp}
+		keys = []string{"↑/k", "↓/j", "←/h prev", "→/l next", "/ find", helpLabelBack, helpLabelMode, helpLabelHelp}
 		if m.width < 60 {
 			keys = []string{helpLabelVertical, "←/→", "/", helpLabelEsc, "?"}
 		}
@@ -204,6 +216,9 @@ func (m Model) meetingDetailLines() []string {
 	lines := []string{
 		"Title: " + textutil.SanitizeTerminal(detail.Subject),
 		"When: " + detail.SentAt.Format("Mon, 02 Jan 2006 15:04:05 MST"),
+	}
+	if detail.RelatedMessageID != nil {
+		lines = append(lines, fmt.Sprintf("Related message: %d", *detail.RelatedMessageID))
 	}
 	if len(detail.From) > 0 {
 		lines = append(lines, "Organizer: "+textutil.SanitizeTerminal(formatAddresses(detail.From)))

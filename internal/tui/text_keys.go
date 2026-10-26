@@ -96,8 +96,9 @@ func (m Model) handleTextListKeys(
 		return m, cmd
 
 	case "a":
-		// Reset to conversations view (clear filters)
+		// Reset navigation and drill filters within the selected account.
 		m.textState = textState{
+			sourceID: m.textState.sourceID,
 			viewType: query.TextViewConversations,
 		}
 		m.loading = true
@@ -199,7 +200,7 @@ func (m Model) handleTextDetailKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case keyNameEsc, keyNameBackspace:
 			return m.textGoBack()
-		case "left", "h", "right", "l", "T":
+		case "left", "h", keyNameRight, "l", "T":
 			return m, nil
 		}
 	}
@@ -218,6 +219,7 @@ func (m Model) handleTextInlineSearchKeys(
 		if queryStr == "" {
 			return m, nil
 		}
+		m.submittedQuery = queryStr
 		// Timeline search stays scoped to the selected conversation and runs
 		// through the full-text index. Other views use global FTS.
 		if m.textState.level == textLevelTimeline && !m.textState.globalSearchTimeline {
@@ -271,7 +273,7 @@ func (m Model) handleTextInlineSearchKeys(
 		m.searchInput.SetValue("")
 		return m, nil
 
-	case "ctrl+c":
+	case keyNameCtrlC:
 		m.quitting = true
 		return m, tea.Quit
 
@@ -553,6 +555,8 @@ func (m Model) textGoBack() (tea.Model, tea.Cmd) {
 	// them directly without reloading. This is instant and avoids
 	// re-querying the database.
 	if m.textState.unfilteredMessages != nil {
+		m.nextTextRequestID()
+		m.loading = false
 		m.textState.messages = m.textState.unfilteredMessages
 		m.textState.unfilteredMessages = nil
 		// Pop the search breadcrumb

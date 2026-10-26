@@ -3,7 +3,8 @@ package cmd
 import (
 	"bufio"
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -70,6 +71,11 @@ func runLogsCmd(cmd *cobra.Command, args []string) error {
 	if !isDaemonCLISubprocess() {
 		return runDaemonCLICommandHTTPFromCobra(cmd, args)
 	}
+	state := invocationFromCommand(cmd)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
 
 	dir := cfg.LogsDir()
 	serveLogPath := filepath.Join(cfg.Data.DataDir, "serve.log")

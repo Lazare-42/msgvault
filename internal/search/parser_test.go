@@ -9,6 +9,93 @@ import (
 	"go.kenn.io/msgvault/internal/testutil/ptr"
 )
 
+func TestQueryPipeORRecursiveCriteria(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	q := ParseOR("alpha | from:a@example.com")
+	q.DeletionScope = DeletionScopeDeleted
+	require.NoError(q.Err())
+	assert.False(q.IsEmpty())
+	assert.True(q.HasTextTerms())
+	q = &Query{Alternatives: []*Query{{}, {}}}
+	assert.True(q.IsEmpty())
+	assert.False(q.HasTextTerms())
+	q.Alternatives[1] = Parse("before:invalid")
+	require.Error(q.Err())
+}
+
+func TestParsePipeOR(t *testing.T) {
+	for _, tc := range []struct {
+		input       string
+		branches    int
+		terms       []string
+		plain       []string
+		branchTerms [][]string
+		labels      []string
+		subjects    []string
+		lists       []string
+		invalid     bool
+		branchError string
+	}{
+		{input: "alpha beta | gamma", branches: 2, plain: []string{"alpha", "beta", "|", "gamma"}, branchTerms: [][]string{{"alpha", "beta"}, {"gamma"}}},
+		{input: "foo\tbar", terms: []string{"foo\tbar"}, plain: []string{"foo\tbar"}},
+		{input: "foo\u00a0bar", terms: []string{"foo\u00a0bar"}, plain: []string{"foo\u00a0bar"}},
+		{input: "foo\t| bar", terms: []string{"foo\t|", "bar"}, plain: []string{"foo\t|", "bar"}},
+		{input: "foo |\u00a0bar", terms: []string{"foo", "|\u00a0bar"}, plain: []string{"foo", "|\u00a0bar"}},
+		{input: "alpha|beta", terms: []string{"alpha|beta"}},
+		{input: "a | b | c | d | e | f | g | h", branches: 8},
+		{input: "alpha\t|\nbeta", terms: []string{"alpha\t|\nbeta"}},
+		{input: "alpha\u2003|\u2003beta", terms: []string{"alpha\u2003|\u2003beta"}},
+		{input: "label:a|b", labels: []string{"a|b"}},
+		{input: "subject:foo|bar", subjects: []string{"foo|bar"}},
+		{input: "list:a|b", lists: []string{"a|b"}},
+		{input: "https://example.org/a|b", terms: []string{"https://example.org/a|b"}},
+		{input: "alpha| beta", terms: []string{"alpha|", "beta"}},
+		{input: "alpha |beta", terms: []string{"alpha", "|beta"}},
+		{input: `"alpha"|`, terms: []string{"alpha", "|"}},
+		{input: `|"alpha"`, terms: []string{"|", "alpha"}},
+		{input: `"a | b"`, terms: []string{"a | b"}},
+		{input: `'a | b'`, terms: []string{"a | b"}},
+		{input: `subject:"a|b"`, subjects: []string{"a|b"}},
+		{input: `'alpha beta'`, terms: []string{"alpha beta"}},
+		{input: `alpha"beta gamma"`, terms: []string{"alpha", "beta gamma"}},
+		{input: "a |", invalid: true},
+		{input: "| a", invalid: true},
+		{input: "a || b", terms: []string{"a", "||", "b"}},
+		{input: "a | | b", invalid: true},
+		{input: "a | b | c | d | e | f | g | h | i", invalid: true},
+		{input: "a | before:2025-13-45", invalid: true, branchError: "before:"},
+		{input: "x | account:me", invalid: true, branchError: "account:"},
+		{input: "a | label:", invalid: true},
+	} {
+		t.Run(tc.input, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			q := ParseWithOR(tc.input, true)
+			if tc.invalid {
+				require.Error(q.Err())
+				if tc.branchError != "" {
+					require.ErrorContains(q.Err(), tc.branchError)
+					assert.NotContains(q.Err().Error(), "every pipe")
+				}
+				return
+			}
+			require.NoError(q.Err())
+			require.Len(q.Alternatives, tc.branches)
+			for i, terms := range tc.branchTerms {
+				assert.Equal(terms, q.Alternatives[i].TextTerms)
+			}
+			if tc.plain != nil {
+				assert.Equal(tc.plain, ParseWithOR(tc.input, false).TextTerms)
+			}
+			assert.Equal(tc.terms, q.TextTerms)
+			assert.Equal(tc.labels, q.Labels)
+			assert.Equal(tc.subjects, q.SubjectTerms)
+			assert.Equal(tc.lists, q.ListIDs)
+		})
+	}
+}
+
 func TestParse(t *testing.T) {
 	type testCase struct {
 		name  string
@@ -25,6 +112,11 @@ func TestParse(t *testing.T) {
 		{
 			name: "BasicOperators",
 			tests: []testCase{
+				{
+					name:  "filename values",
+					query: `filename:"Budget Plan%.pdf" filename:界.csv`,
+					want:  Query{Filenames: []string{"Budget Plan%.pdf", "界.csv"}},
+				},
 				{
 					name:  "from operator",
 					query: "from:alice@example.com",
@@ -342,6 +434,40 @@ func TestParse(t *testing.T) {
 	}
 }
 
+// TestParseListIDOperators catches the List-Id aliases being treated as
+// Gmail-only text instead of ordered local structured filters.
+func TestParseListIDOperators(t *testing.T) {
+	cases := []struct {
+		name  string
+		query string
+		want  []string
+	}{
+		{name: "list alias", query: "list:alerts.example.test", want: []string{"alerts.example.test"}},
+		{name: "list id alias", query: "list-id:alerts.example.test", want: []string{"alerts.example.test"}},
+		{name: "quoted value", query: `list:"alerts.example.test"`, want: []string{"alerts.example.test"}},
+		{name: "repeated values retain order", query: "list:first list-id:second list:third", want: []string{"first", "second", "third"}},
+		{name: "empty value is ignored", query: `list: list-id:""`, want: nil},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			q := Parse(tc.query)
+			assert.Equal(tc.want, q.ListIDs, "ListIDs")
+			assert.Empty(q.UnsupportedOperators, "List-Id aliases must be locally supported")
+			assert.Empty(q.TextTerms, "List-Id aliases must not be retained as text")
+			assert.NoError(q.Err(), "List-Id aliases accept free-text values")
+		})
+	}
+}
+
+func TestParseListIDOperatorsRejectParenthesizedSyntax(t *testing.T) {
+	q := Parse("list:(alerts.example.test)")
+
+	require.ErrorContains(t, q.Err(), "parenthesized")
+	assert.Empty(t, q.ListIDs)
+}
+
 func TestParse_RelativeDates(t *testing.T) {
 	fixedNow := time.Date(2025, 6, 15, 0, 0, 0, 0, time.UTC)
 	p := &Parser{Now: func() time.Time { return fixedNow }}
@@ -399,6 +525,10 @@ func TestParse_InvalidOperatorValues(t *testing.T) {
 		{"smaller bad size", "smaller:abc", "abc", "smaller:"},
 		{"older_than bad age", "older_than:99q", "99q", "older_than:"},
 		{"newer_than bad age", "newer_than:7z", "7z", "newer_than:"},
+		{"empty from", "from:", "non-empty address", "from:"},
+		{"empty to with text", `receipt to:""`, "non-empty address", "to:"},
+		{"whitespace cc", `cc:"   "`, "non-empty address", "cc:"},
+		{"empty bcc", "bcc:", "non-empty address", "bcc:"},
 		{"has bad value", "has:banana", "banana", "has:"},
 	}
 	for _, tc := range cases {
@@ -426,7 +556,7 @@ func TestParse_ValidOperatorValues_NoError(t *testing.T) {
 		"subject:",  // empty value: intentional no-op, not an error
 		"label:",    // empty value: intentional no-op, not an error
 		"foo:bar",   // unknown operator: kept as text, not an error
-		"list:name", // recognized-but-unsupported operator: kept as text
+		"list:name", // supported List-Id filter
 	}
 	for _, q := range queries {
 		t.Run(q, func(t *testing.T) {
@@ -476,8 +606,10 @@ func TestQuery_IsEmpty(t *testing.T) {
 	}{
 		{"", true},
 		{"from:alice@example.com", false},
+		{"list:alerts.example.test", false},
 		{"hello", false},
 		{"has:attachment", false},
+		{`filename:"Budget Plan%.pdf" filename:界.csv`, false},
 	}
 
 	for _, tt := range tests {
@@ -493,4 +625,33 @@ func TestQuery_IsEmpty(t *testing.T) {
 		q.AccountIDs = []int64{id}
 		assert.False(t, q.IsEmpty(), "IsEmpty() = true for query with AccountIDs set")
 	})
+}
+
+func TestParseConversationID(t *testing.T) {
+	assert := assert.New(t)
+	q := Parse("conversation_id:42 conversation_id:84")
+
+	require.NoError(t, q.Err())
+	assert.Equal([]int64{42, 84}, q.ConversationIDs)
+	assert.False(q.IsEmpty())
+	assert.True(q.HasOperators())
+}
+
+func TestQueryHasOperatorsPreservesExplicitEmptyConversationScope(t *testing.T) {
+	q := &Query{ConversationIDs: []int64{}}
+
+	assert.True(t, q.HasOperators())
+	assert.False(t, q.IsEmpty())
+}
+
+func TestParseConversationIDRejectsNonPositiveAndInvalidValues(t *testing.T) {
+	for _, value := range []string{"0", "-1", "abc", ""} {
+		t.Run(value, func(t *testing.T) {
+			q := Parse("conversation_id:" + value)
+
+			require.Error(t, q.Err())
+			assert.Empty(t, q.ConversationIDs)
+			assert.Empty(t, q.TextTerms, "known invalid operator must not widen into text search")
+		})
+	}
 }

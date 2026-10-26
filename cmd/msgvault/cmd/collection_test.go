@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -17,10 +16,13 @@ import (
 	"go.kenn.io/kit/daemon"
 	"go.kenn.io/msgvault/internal/collectionops"
 	"go.kenn.io/msgvault/internal/config"
-	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
 func TestCollectionListUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	require := require.New(t)
 	assert := assert.New(t)
 	dataDir := t.TempDir()
@@ -39,11 +41,15 @@ func TestCollectionListUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
 		Data:    config.DataConfig{DataDir: dataDir},
 		Remote:  config.RemoteConfig{URL: "http://configured-daemonclient.invalid"},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	useLocal = true
+	invocationFromContext(testCtx).options.useLocal = true
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd := &cobra.Command{Use: "list", RunE: runCollectionList}
+	cmd.SetContext(testCtx)
 	cmd.SetOut(&stdout)
 	cmd.SetErr(&stderr)
 
@@ -59,6 +65,9 @@ func TestCollectionListUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
 }
 
 func TestCollectionShowUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	require := require.New(t)
 	assert := assert.New(t)
 	dataDir := t.TempDir()
@@ -77,7 +86,10 @@ func TestCollectionShowUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
 		Data:    config.DataConfig{DataDir: dataDir},
 		Remote:  config.RemoteConfig{URL: "http://configured-daemonclient.invalid"},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	useLocal = true
+	invocationFromContext(testCtx).options.useLocal = true
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -86,6 +98,7 @@ func TestCollectionShowUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
 		Args: collectionShowCmd.Args,
 		RunE: runCollectionShow,
 	}
+	cmd.SetContext(testCtx)
 	cmd.SetOut(&stdout)
 	cmd.SetErr(&stderr)
 	cmd.SetArgs([]string{"Team"})
@@ -105,6 +118,9 @@ func TestCollectionShowUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
 }
 
 func TestCollectionCreateUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	require := require.New(t)
 	assert := assert.New(t)
 	dataDir := t.TempDir()
@@ -125,7 +141,10 @@ func TestCollectionCreateUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
 		Data:    config.DataConfig{DataDir: dataDir},
 		Remote:  config.RemoteConfig{URL: "http://configured-daemonclient.invalid"},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	useLocal = true
+	invocationFromContext(testCtx).options.useLocal = true
 	collectionCreateAccounts = "alice@example.com,bob@example.com"
 
 	var stdout bytes.Buffer
@@ -135,6 +154,7 @@ func TestCollectionCreateUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
 		Args: collectionCreateCmd.Args,
 		RunE: runCollectionCreate,
 	}
+	cmd.SetContext(testCtx)
 	cmd.SetOut(&stdout)
 	cmd.SetErr(&stderr)
 	cmd.SetArgs([]string{"Team"})
@@ -148,6 +168,9 @@ func TestCollectionCreateUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
 }
 
 func TestCollectionAddUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	require := require.New(t)
 	assert := assert.New(t)
 	dataDir := t.TempDir()
@@ -168,7 +191,10 @@ func TestCollectionAddUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
 		Data:    config.DataConfig{DataDir: dataDir},
 		Remote:  config.RemoteConfig{URL: "http://configured-daemonclient.invalid"},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	useLocal = true
+	invocationFromContext(testCtx).options.useLocal = true
 	collectionAddAccounts = "alice@example.com,bob@example.com"
 
 	var stdout bytes.Buffer
@@ -178,6 +204,7 @@ func TestCollectionAddUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
 		Args: collectionAddCmd.Args,
 		RunE: runCollectionAdd,
 	}
+	cmd.SetContext(testCtx)
 	cmd.SetOut(&stdout)
 	cmd.SetErr(&stderr)
 	cmd.SetArgs([]string{"Team"})
@@ -191,6 +218,9 @@ func TestCollectionAddUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
 }
 
 func TestCollectionRemoveUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	require := require.New(t)
 	assert := assert.New(t)
 	dataDir := t.TempDir()
@@ -211,7 +241,10 @@ func TestCollectionRemoveUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
 		Data:    config.DataConfig{DataDir: dataDir},
 		Remote:  config.RemoteConfig{URL: "http://configured-daemonclient.invalid"},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	useLocal = true
+	invocationFromContext(testCtx).options.useLocal = true
 	collectionRemoveAccounts = "alice@example.com,bob@example.com"
 
 	var stdout bytes.Buffer
@@ -221,6 +254,7 @@ func TestCollectionRemoveUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
 		Args: collectionRemoveCmd.Args,
 		RunE: runCollectionRemove,
 	}
+	cmd.SetContext(testCtx)
 	cmd.SetOut(&stdout)
 	cmd.SetErr(&stderr)
 	cmd.SetArgs([]string{"Team"})
@@ -234,6 +268,9 @@ func TestCollectionRemoveUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
 }
 
 func TestCollectionDeleteUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	require := require.New(t)
 	assert := assert.New(t)
 	dataDir := t.TempDir()
@@ -252,7 +289,10 @@ func TestCollectionDeleteUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
 		Data:    config.DataConfig{DataDir: dataDir},
 		Remote:  config.RemoteConfig{URL: "http://configured-daemonclient.invalid"},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	useLocal = true
+	invocationFromContext(testCtx).options.useLocal = true
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -261,6 +301,7 @@ func TestCollectionDeleteUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
 		Args: collectionDeleteCmd.Args,
 		RunE: runCollectionDelete,
 	}
+	cmd.SetContext(testCtx)
 	cmd.SetOut(&stdout)
 	cmd.SetErr(&stderr)
 	cmd.SetArgs([]string{"Team"})
@@ -387,6 +428,9 @@ func collectionHTTPDaemon(t *testing.T) (*httptest.Server, *atomic.Int32) {
 }
 
 func TestCollectionShowPrintsReadableSourceNames(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	require := require.New(t)
 	assert := assert.New(t)
 	savedCfg := cfg
@@ -402,13 +446,13 @@ func TestCollectionShowPrintsReadableSourceNames(t *testing.T) {
 		Data:    config.DataConfig{DataDir: tmpDir},
 		Remote:  config.RemoteConfig{URL: "http://configured-daemonclient.invalid"},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	useLocal = true
+	invocationFromContext(testCtx).options.useLocal = true
 
 	dbPath := filepath.Join(tmpDir, "msgvault.db")
-	st, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	require.NoError(st.InitSchema(), "init schema")
-	t.Cleanup(func() { _ = st.Close() })
+	st := testutil.NewSQLiteTestStoreAt(t, dbPath)
 
 	alice, err := st.GetOrCreateSource("gmail", "alice@example.com")
 	require.NoError(err, "create alice source")
@@ -421,7 +465,8 @@ func TestCollectionShowPrintsReadableSourceNames(t *testing.T) {
 
 	done := captureStdout(t)
 	cmd := &cobra.Command{}
-	cmd.SetContext(context.Background())
+	cmd.SetContext(testCtx)
+	cmd.SetContext(testCtx)
 	require.NoError(runCollectionShow(cmd, []string{"team"}), "runCollectionShow")
 	out := done()
 
@@ -432,10 +477,7 @@ func TestCollectionShowPrintsReadableSourceNames(t *testing.T) {
 func TestResolveAccountListRejectsMissingNumericID(t *testing.T) {
 	require := require.New(t)
 	tmpDir := t.TempDir()
-	st, err := store.Open(filepath.Join(tmpDir, "msgvault.db"))
-	require.NoError(err, "open store")
-	defer func() { _ = st.Close() }()
-	require.NoError(st.InitSchema(), "init schema")
+	st := testutil.NewSQLiteTestStoreAt(t, filepath.Join(tmpDir, "msgvault.db"))
 
 	src, err := st.GetOrCreateSource("gmail", "alice@example.com")
 	require.NoError(err, "create source")
@@ -464,10 +506,7 @@ func TestResolveAccountListRejectsMissingNumericID(t *testing.T) {
 func TestResolveAccountListNumericFallthroughResolvesIdentifier(t *testing.T) {
 	require := require.New(t)
 	tmpDir := t.TempDir()
-	st, err := store.Open(filepath.Join(tmpDir, "msgvault.db"))
-	require.NoError(err, "open store")
-	defer func() { _ = st.Close() }()
-	require.NoError(st.InitSchema(), "init schema")
+	st := testutil.NewSQLiteTestStoreAt(t, filepath.Join(tmpDir, "msgvault.db"))
 
 	// Create a source with a numeric identifier that is unlikely to
 	// collide with the auto-assigned source ID. Use a 12-digit string

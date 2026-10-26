@@ -203,7 +203,7 @@ func TestAddMessageIDsFromHeaderFetchResultsParsesMessageIDHeaders(t *testing.T)
 		{
 			UID: imapapi.UID(11),
 			BodySection: []imapclient.FetchBodySectionBuffer{
-				{Bytes: []byte("Message-ID: not a message id\r\n\r\n")},
+				{Bytes: []byte("Message-ID: <broken@example.test\r\n\r\n")},
 			},
 		},
 		{
@@ -220,5 +220,6 @@ func TestAddMessageIDsFromHeaderFetchResultsParsesMessageIDHeaders(t *testing.T)
 	assert.Equal(t, map[string]bool{
 		"existing@example.com": true,
 		"one@example.com":      true,
+		"broken@example.test":  true,
 	}, got)
 }

@@ -25,7 +25,7 @@ import "strings"
 // TestMessagesActivityColumnsAreRealColumns keeps this list honest against the
 // live table.
 var MessagesActivityColumns = []string{
-	sourceIDColumnName,       // owner source; immutable in production, listed as read
+	sourceIDColumnName,       // owner source; changes during archive consolidation
 	"conversation_id",        // routing key; co-presence and conversation_type
 	"sender_id",              // direct-counterpart and direction derivation
 	"message_type",           // channel classification (email/chat/meeting)
@@ -36,6 +36,7 @@ var MessagesActivityColumns = []string{
 	"deleted_from_source_at", // retraction
 	"metadata",               // meeting all_day/status inputs
 	"source_is_from_me",      // source-native ownership
+	"is_sent",                // unsent messages retract activity
 }
 
 // activityTriggerColumnList renders MessagesActivityColumns for a

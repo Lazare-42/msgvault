@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/store"
 )
 
 var (
@@ -38,7 +39,7 @@ type Engine interface {
 	// Message queries
 	ListMessages(ctx context.Context, filter MessageFilter) ([]MessageSummary, error)
 	GetMessage(ctx context.Context, id int64) (*MessageDetail, error)
-	GetMessageBySourceID(ctx context.Context, sourceMessageID string) (*MessageDetail, error)
+	GetMessageBySourceID(ctx context.Context, sourceMessageID string, sourceIDs []int64) (*MessageDetail, error)
 	GetAttachment(ctx context.Context, id int64) (*AttachmentInfo, error)
 
 	// GetAttachmentsByHash returns every attachment matching the given content
@@ -62,6 +63,13 @@ type Engine interface {
 	// Search - full-text search using FTS5 (includes message body)
 	Search(ctx context.Context, query *search.Query, limit, offset int) ([]MessageSummary, error)
 
+	// SearchDeep runs body-aware search within a complete view filter.
+	SearchDeep(ctx context.Context, query *search.Query, filter MessageFilter, limit, offset int) ([]MessageSummary, error)
+
+	// SearchDeepWithStats returns deep-search messages, total count, and stats
+	// from the same complete view filter.
+	SearchDeepWithStats(ctx context.Context, query *search.Query, filter MessageFilter, limit, offset int) (*SearchFastResult, error)
+
 	// SearchFast searches message metadata only (no body text).
 	// This is much faster for large archives as it queries Parquet files directly.
 	// Free text searches subject, snippet, and sender/recipient metadata
@@ -81,6 +89,7 @@ type Engine interface {
 	//
 	// queryStr is the raw search string (needed for stats; search.Query doesn't store it).
 	// statsGroupBy controls which view's key columns are used for stats search filtering.
+	// ViewNoStats omits aggregates; limit=0 returns the count without a page.
 	SearchFastWithStats(ctx context.Context, query *search.Query, queryStr string,
 		filter MessageFilter, statsGroupBy ViewType, limit, offset int) (*SearchFastResult, error)
 
@@ -89,8 +98,9 @@ type Engine interface {
 	GetDeletionTargetsByFilter(ctx context.Context, filter MessageFilter) ([]DeletionTarget, error)
 
 	// SearchByDomains returns messages where any participant (from, to, cc, or bcc)
-	// belongs to one of the given domains.
-	SearchByDomains(ctx context.Context, domains []string, after, before *time.Time, limit, offset int) ([]MessageSummary, error)
+	// belongs to one of the given domains. Non-empty sourceIDs limit results to those accounts.
+	// HasMore reports whether another page follows the returned messages.
+	SearchByDomains(ctx context.Context, domains []string, after, before *time.Time, limit, offset int, sourceIDs []int64) (DomainSearchResult, error)
 
 	// Account queries
 	ListAccounts(ctx context.Context) ([]AccountInfo, error)
@@ -100,6 +110,47 @@ type Engine interface {
 
 	// Close releases any resources held by the engine.
 	Close() error
+}
+
+// VirtualAccountLister reads the virtual account catalog: per source, its
+// confirmed identities and its unattributed rows, with live counts.
+type VirtualAccountLister interface {
+	ListVirtualAccounts(ctx context.Context) (map[int64][]store.VirtualAccount, error)
+}
+
+// DeletionSearchMode selects the search predicate used while resolving an
+// exact, source-bound deletion target set.
+type DeletionSearchMode string
+
+const (
+	DeletionSearchFast      DeletionSearchMode = "fast"
+	DeletionSearchDeep      DeletionSearchMode = "deep"
+	DeletionSearchAggregate DeletionSearchMode = "aggregate"
+)
+
+// DeletionTargetSearchResolver resolves a filtered search and source deletion
+// eligibility in one backend query. Keeping this capability separate from
+// Engine lets callers fail closed when a backend cannot provide a stable
+// all-match snapshot.
+type DeletionTargetSearchResolver interface {
+	GetDeletionTargetsBySearch(
+		ctx context.Context,
+		searchQuery *search.Query,
+		filter MessageFilter,
+		mode DeletionSearchMode,
+	) ([]DeletionTarget, error)
+}
+
+// DeletionTargetAggregateSearchResolver resolves the exact message population
+// that contributed to one displayed aggregate row.
+type DeletionTargetAggregateSearchResolver interface {
+	GetDeletionTargetsByAggregateSearch(
+		ctx context.Context,
+		searchQuery string,
+		filter MessageFilter,
+		groupBy ViewType,
+		key string,
+	) ([]DeletionTarget, error)
 }
 
 // SemanticMessageSearcher is an optional engine capability for ranked
@@ -115,7 +166,7 @@ func SemanticMessageSearchSupportsFilter(filter MessageFilter) bool {
 	return filter.SourceIDs == nil &&
 		filter.SenderName == "" &&
 		filter.RecipientName == "" &&
-		filter.ConversationID == nil &&
+		filter.ListID == "" &&
 		!filter.HasEmptyTargets()
 }
 
@@ -182,13 +233,19 @@ type PeopleInboxAnalyzer interface {
 // message bodies. It is deliberately separate from Engine so generic Search
 // retains its composite subject/body/participant semantics.
 type MessageBodySearcher interface {
-	SearchMessageBodies(ctx context.Context, query *search.Query, limit, offset int) ([]MessageSummary, error)
+	SearchMessageBodies(ctx context.Context, query *search.Query, limit, offset int) (*SearchFastResult, error)
 }
 
-// SearchFastResult holds the combined results of a fast search:
-// paginated messages, total count, and aggregate stats — all from a single
-// materialized scan of the matching message IDs.
+// DomainSearchResult is one page of SearchByDomains matches. HasMore reports
+// whether a match remains beyond the page.
+type DomainSearchResult struct {
+	Messages []MessageSummary
+	HasMore  bool
+}
+
+// SearchFastResult carries messages and index status, with optional totals and aggregate stats.
 type SearchFastResult struct {
+	IndexState string
 	Messages   []MessageSummary
 	TotalCount int64
 	Stats      *TotalStats

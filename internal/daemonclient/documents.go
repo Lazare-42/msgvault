@@ -89,7 +89,7 @@ func documentSearchFromGenerated(response *generated.DocumentSearchResponse) sto
 			OtherLiveCopies: int(row.OtherLiveCopies), ChunkKey: row.ChunkKey,
 			ChunkOrdinal: int(row.ChunkOrdinal), HeadingPath: row.HeadingPath,
 			FirstUnitIndex: int(row.FirstUnitIndex), LastUnitIndex: int(row.LastUnitIndex),
-			Excerpt: row.Excerpt, HighlightStart: int(row.HighlightStart), HighlightEnd: int(row.HighlightEnd),
+			Excerpt: row.Excerpt, ExcerptStartRune: int(row.ExcerptStartRune), HighlightStart: int(row.HighlightStart), HighlightEnd: int(row.HighlightEnd),
 			ProfileID: row.ProfileID, ExtractionID: row.ExtractionID,
 			Provider: row.Provider, Model: row.Model, MatchedSignals: row.MatchedSignals,
 			Truncated: row.Truncated, Rank: int(row.Rank),
@@ -161,7 +161,19 @@ func documentIndexStatusFromGenerated(
 		RetryOwners: generatedStatus.RetryOwners, TerminalOwners: generatedStatus.TerminalOwners,
 		MissingOwners:         generatedStatus.MissingOwners,
 		StoredPlaintextChunks: generatedStatus.StoredPlaintextChunks,
+		FailuresExhausted:     generatedStatus.FailuresExhausted,
 	}}
+	result.Status.Failures = make([]store.DocumentFailureDiagnostic, 0, len(generatedStatus.Failures))
+	for _, failure := range generatedStatus.Failures {
+		detail := ""
+		if failure.Detail != nil {
+			detail = *failure.Detail
+		}
+		result.Status.Failures = append(result.Status.Failures, store.DocumentFailureDiagnostic{
+			CanonicalBlobHash: failure.CanonicalBlobHash, ReasonCode: failure.ReasonCode,
+			Detail: detail, State: failure.State,
+		})
+	}
 	if response.ActiveRebuild != nil {
 		result.ActiveRebuild = &store.DocumentIndexRebuildStatus{
 			SnapshotOwners:  response.ActiveRebuild.SnapshotOwners,

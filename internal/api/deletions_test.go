@@ -110,6 +110,7 @@ func postDeletions(t *testing.T, srv *Server, body string) *httptest.ResponseRec
 }
 
 func TestStageDeletionLegacyFilterIsDryRunOnly(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -151,7 +152,36 @@ func TestStageDeletionLegacyFilterIsDryRunOnly(t *testing.T) {
 	assert.Contains(mutation.Body.String(), "preflight_required")
 }
 
+func TestStageDeletionListIDFilterIsForwardedAndRecorded(t *testing.T) {
+	t.Parallel()
+	requirements := require.New(t)
+	assertions := assert.New(t)
+
+	st := &deletionMockStore{}
+	var gotFilter query.MessageFilter
+	engine := &querytest.MockEngine{
+		GetDeletionTargetsByFilterFunc: func(_ context.Context, f query.MessageFilter) ([]query.DeletionTarget, error) {
+			gotFilter = f
+			return []query.DeletionTarget{{
+				MessageID: 1, SourceID: 7, SourceType: "gmail",
+				SourceIdentifier: "user@example.com", SourceMessageID: "gm-1",
+			}}, nil
+		},
+	}
+	srv := newDeletionTestServer(t, st, engine)
+
+	w := postDeletions(t, srv, `{"filter":{"list_id":"announce.example.test"},"dry_run":true}`)
+
+	requirements.Equal(http.StatusOK, w.Code, w.Body.String())
+	assertions.Equal("announce.example.test", gotFilter.ListID)
+	assertions.Equal(
+		[]string{"announce.example.test"},
+		manifestFiltersFromRequest(&StageDeletionFilter{ListID: "announce.example.test"}).ListIDs,
+	)
+}
+
 func TestStageDeletionLegacyExplicitMessageIDsRemainCompatible(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -179,6 +209,7 @@ func TestStageDeletionLegacyExplicitMessageIDsRemainCompatible(t *testing.T) {
 }
 
 func TestStageDeletionLegacyFilterCannotPiggybackOnExplicitMessageIDs(t *testing.T) {
+	t.Parallel()
 	st := &deletionMockStore{}
 	srv := newDeletionTestServer(t, st, &querytest.MockEngine{})
 
@@ -190,6 +221,7 @@ func TestStageDeletionLegacyFilterCannotPiggybackOnExplicitMessageIDs(t *testing
 }
 
 func TestStageDeletionRejectsMultiAccountSelection(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 
 	st := &deletionMockStore{}
@@ -213,6 +245,7 @@ func TestStageDeletionRejectsMultiAccountSelection(t *testing.T) {
 }
 
 func TestStageDeletionDryRun(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -243,6 +276,7 @@ func TestStageDeletionDryRun(t *testing.T) {
 }
 
 func TestStageDeletionSelectionRequiresAndConsumesExactPreflightAuthority(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	engine := newExploreDuckDBFixture(t)
@@ -289,6 +323,7 @@ func TestStageDeletionSelectionRequiresAndConsumesExactPreflightAuthority(t *tes
 }
 
 func TestStageDeletionReplaysResolvedIdentityFilterOnceAfterPreflight(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	fixture := newExploreIdentityAPIFixture(t)
@@ -353,6 +388,7 @@ func preflightDeletionSelection(t *testing.T, srv *Server) (selection, token str
 }
 
 func TestStageDeletionPersistFailureLeavesTokenRetryable(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	engine := newExploreDuckDBFixture(t)
@@ -382,6 +418,7 @@ func TestStageDeletionPersistFailureLeavesTokenRetryable(t *testing.T) {
 }
 
 func TestStageDeletionConcurrentDoubleSubmitStagesExactlyOnce(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	engine := newExploreDuckDBFixture(t)
@@ -408,7 +445,138 @@ func TestStageDeletionConcurrentDoubleSubmitStagesExactlyOnce(t *testing.T) {
 	assertions.Equal([]string{"m2"}, st.saved[0].GmailIDs)
 }
 
+// mixedDeletabilityFixtureMessages puts a live Gmail email, a calendar event,
+// and a legacy blank-typed Gmail email in one source, so a selection over the
+// source matches three items of which two can be deleted.
+const mixedDeletabilityFixtureMessages = `(1::BIGINT, 1::BIGINT, 'm1', 101::BIGINT, 'Receipt', 'alpha', TIMESTAMP '2026-07-18 10:00:00', 100::BIGINT, true, 1::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', NULL::VARCHAR, false, 2026, 7),
+	(2::BIGINT, 1::BIGINT, 'm2', 102::BIGINT, 'Standup', 'beta', TIMESTAMP '2026-07-18 11:00:00', 200::BIGINT, true, 1::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'calendar_event', NULL::VARCHAR, false, 2026, 7),
+	(3::BIGINT, 1::BIGINT, 'm3', 103::BIGINT, 'Old receipt', 'gamma', TIMESTAMP '2026-07-18 09:00:00', 300::BIGINT, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, '', NULL::VARCHAR, false, 2026, 7)`
+
+// TestStageDeletionStagesDeletableSubsetOfMixedSelection is the issue #768
+// reproduction: a search that also matches items no source can delete used to
+// reject the whole selection, dry run included. It must stage the deletable
+// subset instead and report what it left out, with the legacy blank-typed
+// Gmail row counted as email.
+func TestStageDeletionStagesDeletableSubsetOfMixedSelection(t *testing.T) {
+	t.Parallel()
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	engine, _ := newExploreDuckDBFixtureWithMessages(t, mixedDeletabilityFixtureMessages, 3)
+	st := &deletionMockStore{}
+	srv := newDeletionTestServer(t, st, engine)
+
+	explore := postExploreJSON(t, srv, "/api/v1/explore", `{"filters":[{"dimension":"source","values":["1"]}]}`)
+	requirements.Equal(http.StatusOK, explore.Code, explore.Body.String())
+	var explored struct {
+		CacheRevision string `json:"cache_revision"`
+	}
+	requirements.NoError(json.Unmarshal(explore.Body.Bytes(), &explored))
+	selection := fmt.Sprintf(
+		`{"mode":"all_matching","predicate":{"filters":[{"dimension":"source","values":["1"]}]},"cache_revision":%q}`,
+		explored.CacheRevision)
+
+	preflight := postExploreJSON(t, srv, "/api/v1/explore/preflight", `{"selection":`+selection+`}`)
+	requirements.Equal(http.StatusOK, preflight.Code, preflight.Body.String())
+	var reviewed ExplorePreflightResponse
+	requirements.NoError(json.Unmarshal(preflight.Body.Bytes(), &reviewed))
+	assertions.Equal(int64(3), reviewed.Count, "all three items match")
+	assertions.Equal(int64(2), reviewed.DeletableCount, "preflight discloses the deletable subset")
+	assertions.NotContains(reviewed.UnavailableActions, ExploreUnavailableAction{
+		Action: "stage_deletion", Reason: "selection_contains_items_that_cannot_be_deleted_from_source",
+	}, "a partly deletable selection can still be staged")
+
+	dryRun := postDeletions(t, srv, fmt.Sprintf(
+		`{"selection":%s,"operation_token":%q,"dry_run":true}`, selection, reviewed.OperationToken))
+	requirements.Equal(http.StatusOK, dryRun.Code, dryRun.Body.String())
+	var preview StageDeletionResponse
+	requirements.NoError(json.Unmarshal(dryRun.Body.Bytes(), &preview))
+	assertions.True(preview.DryRun)
+	assertions.Equal(2, preview.MessageCount, "dry run previews the deletable subset")
+	assertions.Equal(3, preview.MatchedCount)
+	assertions.Equal(1, preview.SkippedCount)
+	assertions.ElementsMatch([]string{"m1", "m3"}, preview.SampleGmailIDs)
+	assertions.Empty(st.saved, "dry run persists nothing")
+
+	stage := postDeletions(t, srv, fmt.Sprintf(
+		`{"selection":%s,"operation_token":%q,"description":"mixed batch"}`, selection, reviewed.OperationToken))
+	requirements.Equal(http.StatusCreated, stage.Code, stage.Body.String())
+	var staged StageDeletionResponse
+	requirements.NoError(json.Unmarshal(stage.Body.Bytes(), &staged))
+	assertions.Equal(2, staged.MessageCount, "staging matches the dry run")
+	assertions.Equal(3, staged.MatchedCount)
+	assertions.Equal(1, staged.SkippedCount)
+	requirements.Len(st.saved, 1)
+	assertions.ElementsMatch([]string{"m1", "m3"}, st.saved[0].GmailIDs)
+}
+
+// TestStageDeletionRejectsSelectionWithNothingDeletable keeps the dead-end
+// case an error: partial staging only helps when something is stageable.
+func TestStageDeletionRejectsSelectionWithNothingDeletable(t *testing.T) {
+	t.Parallel()
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	engine := newExploreDuckDBFixture(t)
+	st := &deletionMockStore{}
+	srv := newDeletionTestServer(t, st, engine)
+
+	explore := postExploreJSON(t, srv, "/api/v1/explore", `{"filters":[{"dimension":"source","values":["2"]}]}`)
+	requirements.Equal(http.StatusOK, explore.Code, explore.Body.String())
+	var explored struct {
+		CacheRevision string `json:"cache_revision"`
+	}
+	requirements.NoError(json.Unmarshal(explore.Body.Bytes(), &explored))
+	selection := fmt.Sprintf(
+		`{"mode":"all_matching","predicate":{"filters":[{"dimension":"source","values":["2"]}]},"cache_revision":%q}`,
+		explored.CacheRevision)
+
+	preflight := postExploreJSON(t, srv, "/api/v1/explore/preflight", `{"selection":`+selection+`}`)
+	requirements.Equal(http.StatusOK, preflight.Code, preflight.Body.String())
+	var reviewed ExplorePreflightResponse
+	requirements.NoError(json.Unmarshal(preflight.Body.Bytes(), &reviewed))
+	assertions.Contains(reviewed.UnavailableActions, ExploreUnavailableAction{
+		Action: "stage_deletion", Reason: "selection_contains_items_that_cannot_be_deleted_from_source",
+	})
+
+	stage := postDeletions(t, srv, fmt.Sprintf(
+		`{"selection":%s,"operation_token":%q}`, selection, reviewed.OperationToken))
+	assertions.Equal(http.StatusConflict, stage.Code, stage.Body.String())
+	assertions.Contains(stage.Body.String(), "selection_not_deletable")
+	assertions.Empty(st.saved)
+}
+
+// TestDeletionSelectionRejectsEmptyAddressFilter covers the widening form of
+// a narrowing typo: from: with no value renders as LIKE '%%' and would stage
+// the whole archive.
+func TestDeletionSelectionRejectsEmptyAddressFilter(t *testing.T) {
+	t.Parallel()
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	engine := newExploreDuckDBFixture(t)
+	st := &deletionMockStore{}
+	srv := newDeletionTestServer(t, st, engine)
+
+	for _, queryText := range []string{"from:", `to:"   "`, `cc:""`, "bcc:"} {
+		selection := fmt.Sprintf(
+			`{"mode":"all_matching","predicate":{"query":%q,"search_mode":"full_text","filters":[{"dimension":"source","values":["1"]}]},"cache_revision":"cache-1"}`,
+			queryText)
+
+		explore := postExploreJSON(t, srv, "/api/v1/explore", fmt.Sprintf(`{"query":%q,"search_mode":"full_text"}`, queryText))
+		assertions.Equal(http.StatusBadRequest, explore.Code, explore.Body.String())
+		assertions.Contains(explore.Body.String(), "non-empty address filter")
+
+		preflight := postExploreJSON(t, srv, "/api/v1/explore/preflight", `{"selection":`+selection+`}`)
+		assertions.Equal(http.StatusBadRequest, preflight.Code, "query %q -> preflight status", queryText)
+		assertions.Contains(preflight.Body.String(), "invalid_query", "query %q -> preflight code", queryText)
+
+		stage := postDeletions(t, srv, `{"selection":`+selection+`,"operation_token":"token-1"}`)
+		assertions.Equal(http.StatusBadRequest, stage.Code, "query %q -> stage status", queryText)
+		assertions.Contains(stage.Body.String(), "invalid_query", "query %q -> stage code", queryText)
+	}
+	requirements.Empty(st.saved, "nothing staged from a wildcard address filter")
+}
+
 func TestStageDeletionRejectsEmptyFilter(t *testing.T) {
+	t.Parallel()
 	st := &deletionMockStore{}
 	srv := newDeletionTestServer(t, st, &querytest.MockEngine{})
 
@@ -421,6 +589,7 @@ func TestStageDeletionRejectsEmptyFilter(t *testing.T) {
 }
 
 func TestStageDeletionNoMatches(t *testing.T) {
+	t.Parallel()
 	st := &deletionMockStore{}
 	engine := &querytest.MockEngine{
 		GetDeletionTargetsByFilterFunc: func(_ context.Context, _ query.MessageFilter) ([]query.DeletionTarget, error) {
@@ -437,6 +606,7 @@ func TestStageDeletionNoMatches(t *testing.T) {
 }
 
 func TestStageDeletionInvalidDate(t *testing.T) {
+	t.Parallel()
 	srv := newDeletionTestServer(t, &deletionMockStore{}, &querytest.MockEngine{})
 	w := postDeletions(t, srv, `{"filter": {"after": "not-a-date"}, "dry_run": true}`)
 	assert.Equal(t, http.StatusBadRequest, w.Code)
@@ -444,6 +614,7 @@ func TestStageDeletionInvalidDate(t *testing.T) {
 }
 
 func TestStageDeletionRejectsUnknownFields(t *testing.T) {
+	t.Parallel()
 	st := &deletionMockStore{}
 	engine := &querytest.MockEngine{GmailIDs: []string{"gm-1"}}
 	srv := newDeletionTestServer(t, st, engine)
@@ -455,12 +626,13 @@ func TestStageDeletionRejectsUnknownFields(t *testing.T) {
 	} {
 		w := postDeletions(t, srv, body)
 		assert.Equal(t, http.StatusBadRequest, w.Code, "body %s -> status", body)
-		assert.Contains(t, w.Body.String(), "unknown field", "body %s -> error detail", body)
+		assert.Contains(t, w.Body.String(), "unknown object member name", "body %s -> error detail", body)
 	}
 	assert.Empty(t, st.saved, "nothing staged from rejected requests")
 }
 
 func TestStageDeletionEngineUnavailable(t *testing.T) {
+	t.Parallel()
 	srv := newDeletionTestServer(t, &deletionMockStore{}, nil)
 	w := postDeletions(t, srv, `{"filter": {"sender": "alice@example.com"}}`)
 	assert.Equal(t, http.StatusServiceUnavailable, w.Code)
@@ -468,6 +640,7 @@ func TestStageDeletionEngineUnavailable(t *testing.T) {
 }
 
 func TestListDeletions(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -511,6 +684,7 @@ func TestListDeletions(t *testing.T) {
 }
 
 func TestGetDeletionReturnsManifestLifecycleDetail(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	completedAt := time.Date(2026, 7, 1, 13, 0, 0, 0, time.UTC)
@@ -550,6 +724,7 @@ func deleteDeletion(srv *Server, id string) *httptest.ResponseRecorder {
 }
 
 func TestCancelDeletion(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -566,6 +741,7 @@ func TestCancelDeletion(t *testing.T) {
 }
 
 func TestCancelDeletionNotFound(t *testing.T) {
+	t.Parallel()
 	st := &deletionMockStore{getErr: fmt.Errorf("manifest batch-x: %w", deletion.ErrManifestNotFound)}
 	srv := newDeletionTestServer(t, st, &querytest.MockEngine{})
 
@@ -576,6 +752,7 @@ func TestCancelDeletionNotFound(t *testing.T) {
 }
 
 func TestCancelDeletionNotCancellable(t *testing.T) {
+	t.Parallel()
 	for _, status := range []deletion.Status{deletion.StatusCompleted, deletion.StatusFailed, deletion.StatusCancelled} {
 		st := &deletionMockStore{getStatus: status}
 		srv := newDeletionTestServer(t, st, &querytest.MockEngine{})
@@ -588,6 +765,7 @@ func TestCancelDeletionNotCancellable(t *testing.T) {
 }
 
 func TestCancelDeletionRejectsTraversalID(t *testing.T) {
+	t.Parallel()
 	st := &deletionMockStore{getStatus: deletion.StatusPending}
 	srv := newDeletionTestServer(t, st, &querytest.MockEngine{})
 

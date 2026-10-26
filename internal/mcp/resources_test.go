@@ -25,6 +25,7 @@ import (
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/query/querytest"
 	"go.kenn.io/msgvault/internal/vector"
+	"go.kenn.io/msgvault/internal/vector/visual"
 	"go.kenn.io/msgvault/pkg/client/generated"
 	"go.opentelemetry.io/otel"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -462,6 +463,23 @@ func (s task4DaemonSimilarErrorSearcher) FindSimilar(
 	return nil, err
 }
 
+type task4DaemonVisualErrorSearcher struct {
+	client *daemonclient.Client
+}
+
+func (s task4DaemonVisualErrorSearcher) SearchVisualAttachments(
+	ctx context.Context,
+	req VisualSearchRequest,
+) (*visual.SearchResponse, error) {
+	_, err := s.client.SearchVisualAttachmentsFiltered(ctx, daemonclient.VisualSearchOptions{
+		Text: req.Text, Image: req.Image, Limit: req.Limit, Cursor: req.Cursor,
+		SenderPersonID: req.SenderPersonID, PersonID: req.PersonID, ParticipantID: req.ParticipantID,
+		Directions: req.Directions, SourceID: req.SourceID, MessageID: req.MessageID,
+		Filename: req.Filename, MIMEPrefix: req.MIMEPrefix, After: req.After, Before: req.Before,
+	})
+	return nil, err
+}
+
 func task4DaemonErrorClient(t *testing.T, path, code, message string, status int) *daemonclient.Client {
 	t.Helper()
 	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -482,11 +500,12 @@ func task4DaemonErrorClient(t *testing.T, path, code, message string, status int
 
 func TestMCPInternalErrorIsolationMapsOnlyKnownDaemonVectorCodes(t *testing.T) {
 	vectorCodes := []struct {
-		code   string
-		status int
+		code           string
+		status         int
+		messageExposed bool
 	}{
 		{code: "vector_not_enabled", status: http.StatusServiceUnavailable},
-		{code: "index_stale", status: http.StatusServiceUnavailable},
+		{code: "index_stale", status: http.StatusServiceUnavailable, messageExposed: true},
 		{code: "index_building", status: http.StatusServiceUnavailable},
 		{code: "embedding_timeout", status: http.StatusServiceUnavailable},
 		{code: "index_scope_mismatch", status: http.StatusBadRequest},
@@ -542,7 +561,9 @@ func TestMCPInternalErrorIsolationMapsOnlyKnownDaemonVectorCodes(t *testing.T) {
 				must.Empty(response.Error, "response: %s", raw)
 				checks.Equal(true, response.Result["isError"])
 				checks.Contains(raw, vectorCode.code)
-				checks.NotContains(raw, privateMessage)
+				if !vectorCode.messageExposed {
+					checks.NotContains(raw, privateMessage)
+				}
 			})
 		}
 	}
@@ -607,9 +628,18 @@ func TestMCPDaemonRequestErrorsBecomeSafeToolResults(t *testing.T) {
 			name: "body search index unavailable", path: "/api/v1/search/deep",
 			code: "body_search_index_unavailable", status: http.StatusServiceUnavailable,
 			tool: ToolSearchMessageBodies, args: map[string]any{"query": "needle"},
-			want: "body_search_index_unavailable: message body search index is unavailable",
+			want: "body_search_index_unavailable: message body search index is unavailable; ask the archive owner to search or run rebuild-fts, then retry",
 			opts: func(client *daemonclient.Client) ServeOptions {
 				return ServeOptions{Engine: daemonclient.NewEngineAdapter(client)}
+			},
+		},
+		{
+			name: "hybrid account operator", path: "/api/v1/search", code: "unsupported_filter_mode",
+			status: http.StatusBadRequest, tool: ToolSemanticSearchMessages,
+			args: map[string]any{"query": "needle", "mode": searchModeHybrid},
+			want: "unsupported_filter_mode: a filter is not supported in this search mode",
+			opts: func(client *daemonclient.Client) ServeOptions {
+				return ServeOptions{Engine: &querytest.MockEngine{}, HybridSearcher: task4DaemonHybridErrorSearcher{client}}
 			},
 		},
 		{
@@ -617,6 +647,24 @@ func TestMCPDaemonRequestErrorsBecomeSafeToolResults(t *testing.T) {
 			status: http.StatusBadRequest, tool: ToolSemanticSearchMessages,
 			args: map[string]any{"query": "needle", "mode": searchModeHybrid},
 			want: "invalid_account: account filter is invalid",
+			opts: func(client *daemonclient.Client) ServeOptions {
+				return ServeOptions{Engine: &querytest.MockEngine{}, HybridSearcher: task4DaemonHybridErrorSearcher{client}}
+			},
+		},
+		{
+			name: "hybrid vector initializing", path: "/api/v1/search", code: "vector_initializing",
+			status: http.StatusServiceUnavailable, tool: ToolSemanticSearchMessages,
+			args: map[string]any{"query": "needle", "mode": searchModeHybrid},
+			want: "vector_initializing: vector search is still initializing",
+			opts: func(client *daemonclient.Client) ServeOptions {
+				return ServeOptions{Engine: &querytest.MockEngine{}, HybridSearcher: task4DaemonHybridErrorSearcher{client}}
+			},
+		},
+		{
+			name: "hybrid vector initialization failed", path: "/api/v1/search", code: "vector_init_failed",
+			status: http.StatusServiceUnavailable, tool: ToolSemanticSearchMessages,
+			args: map[string]any{"query": "needle", "mode": searchModeHybrid},
+			want: "vector_init_failed: vector search failed to initialize",
 			opts: func(client *daemonclient.Client) ServeOptions {
 				return ServeOptions{Engine: &querytest.MockEngine{}, HybridSearcher: task4DaemonHybridErrorSearcher{client}}
 			},
@@ -662,6 +710,15 @@ func TestMCPDaemonRequestErrorsBecomeSafeToolResults(t *testing.T) {
 			args: map[string]any{"message_id": 1}, want: "invalid_limit: result limit is invalid",
 			opts: func(client *daemonclient.Client) ServeOptions {
 				return ServeOptions{Engine: &querytest.MockEngine{}, SimilarSearcher: task4DaemonSimilarErrorSearcher{client}}
+			},
+		},
+		{
+			name: "visual search not ready", path: "/api/v1/search/attachments/visual", code: "visual_search_not_ready",
+			status: http.StatusServiceUnavailable, tool: ToolSearchVisualAttachments,
+			args: map[string]any{"text": "needle"},
+			want: "visual_search_not_ready: visual attachment search is unavailable",
+			opts: func(client *daemonclient.Client) ServeOptions {
+				return ServeOptions{Engine: &querytest.MockEngine{}, VisualSearcher: task4DaemonVisualErrorSearcher{client}}
 			},
 		},
 	}

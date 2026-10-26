@@ -162,23 +162,24 @@ type EmbedGenMetadataVersion struct {
 // contextual document revisions include those tokens. Without the restore,
 // the worker's own coverage bookkeeping changes the revision and an initial
 // reconciliation pays to publish the same document again. The ordinary
-// per-message stamp keeps its established row-watermark behavior.
+// per-message stamp keeps its established row-watermark behavior. covered
+// counts members that were not already stamped for target.
 func (s *Store) SetEmbedGenGroupIfUnchanged(
 	ctx context.Context,
 	versions []EmbedGenStamp,
 	metadataVersion EmbedGenMetadataVersion,
 	target int64,
-) (stamped bool, retErr error) {
+) (stamped bool, covered int, retErr error) {
 	if len(versions) == 0 {
-		return false, nil
+		return false, 0, nil
 	}
 	seen := make(map[int64]struct{}, len(versions))
 	for _, version := range versions {
 		if version.ID == 0 {
-			return false, nil
+			return false, 0, nil
 		}
 		if _, duplicate := seen[version.ID]; duplicate {
-			return false, nil
+			return false, 0, nil
 		}
 		seen[version.ID] = struct{}{}
 	}
@@ -189,11 +190,11 @@ func (s *Store) SetEmbedGenGroupIfUnchanged(
 
 	conn, err := s.db.Conn(ctx)
 	if err != nil {
-		return false, fmt.Errorf("acquire embed_gen group connection: %w", err)
+		return false, 0, fmt.Errorf("acquire embed_gen group connection: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
 	if _, err := conn.ExecContext(ctx, s.dialect.BeginWriteSQL()); err != nil {
-		return false, fmt.Errorf("begin embed_gen group transaction: %w", err)
+		return false, 0, fmt.Errorf("begin embed_gen group transaction: %w", err)
 	}
 	committed := false
 	defer func() {
@@ -210,7 +211,7 @@ func (s *Store) SetEmbedGenGroupIfUnchanged(
 	if s.IsPostgreSQL() {
 		if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_xact_lock(
 			hashtextextended('msgvault.embedding_change_clock', 0))`); err != nil {
-			return false, fmt.Errorf("lock embed_gen group journal boundary: %w", err)
+			return false, 0, fmt.Errorf("lock embed_gen group journal boundary: %w", err)
 		}
 	}
 
@@ -218,8 +219,9 @@ func (s *Store) SetEmbedGenGroupIfUnchanged(
 	if !s.IsPostgreSQL() {
 		lastModified = "CAST(last_modified AS TEXT)"
 	}
+	newlyCovered := 0
 	for _, version := range orderedVersions {
-		query := fmt.Sprintf(`SELECT id FROM messages
+		query := fmt.Sprintf(`SELECT id, embed_gen FROM messages
 			WHERE id = ? AND %s = ?
 			  AND deleted_at IS NULL AND deleted_from_source_at IS NULL`, lastModified)
 		args := []any{version.ID, version.LastModified}
@@ -229,22 +231,26 @@ func (s *Store) SetEmbedGenGroupIfUnchanged(
 		}
 		query += s.dialect.SelectForUpdate()
 		var id int64
-		err := conn.QueryRowContext(ctx, s.dialect.Rebind(query), args...).Scan(&id)
+		var previousGen sql.NullInt64
+		err := conn.QueryRowContext(ctx, s.dialect.Rebind(query), args...).Scan(&id, &previousGen)
 		if errors.Is(err, sql.ErrNoRows) {
-			return false, nil
+			return false, 0, nil
 		}
 		if err != nil {
-			return false, fmt.Errorf("lock embed_gen group member %d: %w", version.ID, err)
+			return false, 0, fmt.Errorf("lock embed_gen group member %d: %w", version.ID, err)
+		}
+		if !previousGen.Valid || previousGen.Int64 != target {
+			newlyCovered++
 		}
 	}
 
 	if metadataVersion.ConversationID != 0 {
 		digest, found, err := s.embedGenMetadataDigest(ctx, conn, metadataVersion.ConversationID)
 		if err != nil {
-			return false, err
+			return false, 0, err
 		}
 		if !found || digest != metadataVersion.Digest {
-			return false, nil
+			return false, 0, nil
 		}
 	}
 
@@ -253,34 +259,34 @@ func (s *Store) SetEmbedGenGroupIfUnchanged(
 			`UPDATE messages SET embed_gen = ? WHERE id = ? AND last_modified = ?`),
 			target, version.ID, version.LastModified)
 		if err != nil {
-			return false, fmt.Errorf("stamp embed_gen group member %d: %w", version.ID, err)
+			return false, 0, fmt.Errorf("stamp embed_gen group member %d: %w", version.ID, err)
 		}
 		matched, err := res.RowsAffected()
 		if err != nil {
-			return false, fmt.Errorf("rows affected for embed_gen group member %d: %w", version.ID, err)
+			return false, 0, fmt.Errorf("rows affected for embed_gen group member %d: %w", version.ID, err)
 		}
 		if matched != 1 {
-			return false, nil
+			return false, 0, nil
 		}
 		restored, err := conn.ExecContext(ctx, s.dialect.Rebind(
 			`UPDATE messages SET last_modified = ? WHERE id = ? AND embed_gen = ?`),
 			version.LastModified, version.ID, target)
 		if err != nil {
-			return false, fmt.Errorf("restore embed_gen group member %d revision token: %w", version.ID, err)
+			return false, 0, fmt.Errorf("restore embed_gen group member %d revision token: %w", version.ID, err)
 		}
 		restoredRows, err := restored.RowsAffected()
 		if err != nil {
-			return false, fmt.Errorf("rows affected restoring embed_gen group member %d revision token: %w", version.ID, err)
+			return false, 0, fmt.Errorf("rows affected restoring embed_gen group member %d revision token: %w", version.ID, err)
 		}
 		if restoredRows != 1 {
-			return false, nil
+			return false, 0, nil
 		}
 	}
 	if _, err := conn.ExecContext(ctx, "COMMIT"); err != nil {
-		return false, fmt.Errorf("commit embed_gen group transaction: %w", err)
+		return false, 0, fmt.Errorf("commit embed_gen group transaction: %w", err)
 	}
 	committed = true
-	return true, nil
+	return true, newlyCovered, nil
 }
 
 // ParticipantRevisionSQLite and ParticipantRevisionPostgres render
@@ -370,13 +376,14 @@ func (s *Store) embedGenMetadataDigest(
 // re-finds it on account of the bumped last_modified.
 //
 // Each row is a separate UPDATE because every message carries a distinct
-// last_modified token. Statements are not wrapped in one transaction: each is
-// independently correct, and the cross-DB worker contract already tolerates a
-// partial stamp (the next scan re-finds any unstamped row and re-runs an
-// idempotent batch). Used by the embed worker's content read→stamp path; the
-// backfill path keeps the plain SetEmbedGen (it has no read→stamp window).
+// last_modified token. The UPDATEs share one transaction, so a driver error
+// stamps nothing: the worker counts the whole batch as failed, and the next
+// scan re-finds every row and re-runs the idempotent batch. A partial stamp
+// would leave rows covered that the worker counted as failed. Used by the
+// embed worker's content read→stamp path; the backfill path keeps the plain
+// SetEmbedGen (it has no read→stamp window).
 //
-// Returns the ids whose per-row UPDATE matched 0 rows — the CAS MISSES. A miss
+// Returns newly covered rows and IDs whose content token no longer matches. A miss
 // means last_modified moved between the worker's content read and this stamp
 // (a concurrent repair/edit bumped it via the DB triggers), so the row was NOT
 // stamped and stays "needs embedding". The worker surfaces these (logs them and
@@ -398,22 +405,40 @@ func (s *Store) embedGenMetadataDigest(
 // update) bumps last_modified and clears embed_gen (repair) / re-finds it, and a
 // full rebuild or the auto-backstop re-embeds it regardless. See
 // docs/usage/vector-search.md ("CAS resolution").
-func (s *Store) SetEmbedGenIfUnchanged(ctx context.Context, items []EmbedGenStamp, target int64) (missed []int64, err error) {
-	for _, it := range items {
-		q := `UPDATE messages SET embed_gen = ? WHERE id = ? AND last_modified = ?`
-		res, err := s.db.ExecContext(ctx, q, target, it.ID, it.LastModified)
-		if err != nil {
-			return missed, fmt.Errorf("set embed_gen if unchanged (id=%d): %w", it.ID, err)
+func (s *Store) SetEmbedGenIfUnchanged(ctx context.Context, items []EmbedGenStamp, target int64) (missed []int64, covered int, err error) {
+	err = s.withTxContext(ctx, func(tx *loggedTx) error {
+		for _, it := range items {
+			res, err := tx.ExecContext(ctx,
+				`UPDATE messages SET embed_gen = ? WHERE id = ? AND last_modified = ? AND (embed_gen IS NULL OR embed_gen <> ?)`,
+				target, it.ID, it.LastModified, target)
+			if err != nil {
+				return fmt.Errorf("set embed_gen if unchanged (id=%d): %w", it.ID, err)
+			}
+			n, err := res.RowsAffected()
+			if err != nil {
+				return fmt.Errorf("rows affected (id=%d): %w", it.ID, err)
+			}
+			if n != 0 {
+				covered++
+				continue
+			}
+			var alreadyCovered bool
+			err = tx.QueryRowContext(ctx,
+				`SELECT EXISTS(SELECT 1 FROM messages WHERE id = ? AND last_modified = ? AND embed_gen = ?)`,
+				it.ID, it.LastModified, target).Scan(&alreadyCovered)
+			if err != nil {
+				return fmt.Errorf("read existing embed_gen (id=%d): %w", it.ID, err)
+			}
+			if !alreadyCovered {
+				missed = append(missed, it.ID)
+			}
 		}
-		n, err := res.RowsAffected()
-		if err != nil {
-			return missed, fmt.Errorf("rows affected (id=%d): %w", it.ID, err)
-		}
-		if n == 0 {
-			missed = append(missed, it.ID)
-		}
+		return nil
+	})
+	if err != nil {
+		return nil, 0, err
 	}
-	return missed, nil
+	return missed, covered, nil
 }
 
 // ResetEmbedGen clears embed_gen (sets it back to NULL) on the given
@@ -455,13 +480,13 @@ func (s *Store) ResetEmbedGen(ctx context.Context, ids []int64) error {
 //     messages with no extractable body that were stamped terminal but
 //     never produced a vector. It is therefore an UPPER bound on the true
 //     embedded count; the embedded/blank split is resolved at the display
-//     layer via the backend's EmbeddedMessageCount (the embeddings table
-//     lives in a separate DB on SQLite, so this single-DB query cannot do
-//     it). blank = stamped - embedded.
+//     layer with the vector backend (the embeddings table lives in a
+//     separate DB on SQLite, so this single-DB query cannot do it; see
+//     ScanEmbeddingCoverage). blank = stamped - embedded.
 //   - blank:    the 3rd return value is always 0 here — it cannot be
 //     computed without the embeddings table. The real blank count is
-//     derived by the caller as stamped - backend.EmbeddedMessageCount(gen)
-//     (see cmd/msgvault/cmd/embeddings_manage.go). Kept in the signature
+//     derived by the caller as stamped - embedded (see
+//     countEmbeddingCoverage in cmd/msgvault/cmd). Kept in the signature
 //     so callers that only need missing (the scheduler/CLI activation gate)
 //     do not have to change.
 //   - missing:  live messages still needing work for activeGen
@@ -475,25 +500,118 @@ func (s *Store) CoverageCounts(ctx context.Context, activeGen int64) (live, stam
 	return s.CoverageCountsScoped(ctx, activeGen, nil, nil)
 }
 
+// EmbeddingCoverageScan configures ScanEmbeddingCoverage. Empty MessageTypes
+// and SourceIDs mean the full live corpus.
+type EmbeddingCoverageScan struct {
+	MessageTypes []string
+	SourceIDs    []int64
+	// BatchSize caps how many IDs one VisitStamped call receives.
+	BatchSize int
+	// VisitStamped receives the stamped live message IDs in ascending order
+	// while the read snapshot is still open.
+	VisitStamped func(messageIDs []int64) error
+}
+
+// ScanEmbeddingCoverage counts live and stamped messages for activeGen from
+// one repeatable read snapshot and streams the stamped IDs to
+// scan.VisitStamped in batches. A caller that intersects each batch with
+// vectors in a separate database preserves the coverage partition even when
+// an embedding batch commits during the scan.
+func (s *Store) ScanEmbeddingCoverage(
+	ctx context.Context, activeGen int64, scan EmbeddingCoverageScan,
+) (live, stamped int64, err error) {
+	if scan.BatchSize < 1 {
+		return 0, 0, fmt.Errorf("embedding coverage batch size must be positive, got %d", scan.BatchSize)
+	}
+	err = s.withReadSnapshotContext(ctx, func(tx *loggedTx) error {
+		liveWhere, liveArgs := liveMessagesWhereScoped(scan.MessageTypes, scan.SourceIDs)
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM messages WHERE `+liveWhere,
+			liveArgs...).Scan(&live); err != nil {
+			return fmt.Errorf("count live messages: %w", err)
+		}
+		if activeGen == 0 {
+			return nil
+		}
+		stamped, err = visitStampedMessages(ctx, tx, activeGen, scan)
+		return err
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	return live, stamped, nil
+}
+
+func visitStampedMessages(
+	ctx context.Context, tx *loggedTx, activeGen int64, scan EmbeddingCoverageScan,
+) (int64, error) {
+	liveWhere, liveArgs := liveMessagesWhereScoped(scan.MessageTypes, scan.SourceIDs)
+	query := `SELECT id FROM messages WHERE embed_gen = ? AND ` + liveWhere + ` ORDER BY id`
+	rows, err := tx.QueryContext(ctx, query, append([]any{activeGen}, liveArgs...)...)
+	if err != nil {
+		return 0, fmt.Errorf("list stamped live messages: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var stamped int64
+	batch := make([]int64, 0, scan.BatchSize)
+	for rows.Next() {
+		var messageID int64
+		if err := rows.Scan(&messageID); err != nil {
+			return 0, fmt.Errorf("scan stamped live message: %w", err)
+		}
+		stamped++
+		batch = append(batch, messageID)
+		if len(batch) == scan.BatchSize {
+			if err := scan.VisitStamped(batch); err != nil {
+				return 0, err
+			}
+			batch = batch[:0]
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterate stamped live messages: %w", err)
+	}
+	if len(batch) > 0 {
+		if err := scan.VisitStamped(batch); err != nil {
+			return 0, err
+		}
+	}
+	return stamped, nil
+}
+
 // CoverageCountsScoped is CoverageCounts limited to the supplied message
 // types and source IDs. Empty messageTypes and sourceIDs slices mean the
 // full live corpus.
 func (s *Store) CoverageCountsScoped(ctx context.Context, activeGen int64, messageTypes []string, sourceIDs []int64) (live, stamped, blank, missing int64, err error) {
-	live, err = s.countLiveMessagesScoped(ctx, messageTypes, sourceIDs)
-	if err != nil {
-		return 0, 0, 0, 0, err
-	}
-	if activeGen != 0 {
-		liveWhere, liveArgs := liveMessagesWhereScoped(messageTypes, sourceIDs)
-		q := `SELECT COUNT(*) FROM messages
-		       WHERE embed_gen = ? AND ` + liveWhere
-		args := append([]any{activeGen}, liveArgs...)
-		if err := s.db.QueryRowContext(ctx, q, args...).Scan(&stamped); err != nil {
-			return 0, 0, 0, 0, fmt.Errorf("count stamped: %w", err)
-		}
+	q, args := coverageCountsScopedQuery(activeGen, messageTypes, sourceIDs)
+	if err := s.db.QueryRowContext(ctx, q, args...).Scan(&live, &stamped); err != nil {
+		return 0, 0, 0, 0, fmt.Errorf("count live embedding coverage: %w", err)
 	}
 	missing = max(live-stamped, 0)
 	return live, stamped, 0, missing, nil
+}
+
+// CoverageCountsScopedUnbounded counts like CoverageCountsScoped without
+// PostgreSQL's pool-wide statement timeout, so on a large archive the count is
+// bounded only by ctx. The timeout is lifted for this transaction alone.
+func (s *Store) CoverageCountsScopedUnbounded(ctx context.Context, activeGen int64, messageTypes []string, sourceIDs []int64) (live, stamped, blank, missing int64, err error) {
+	q, args := coverageCountsScopedQuery(activeGen, messageTypes, sourceIDs)
+	err = s.runMaintenance(ctx, func(ctx context.Context, tx *loggedTx) error {
+		return tx.QueryRowContext(ctx, q, args...).Scan(&live, &stamped)
+	})
+	if err != nil {
+		return 0, 0, 0, 0, fmt.Errorf("count live embedding coverage: %w", err)
+	}
+	missing = max(live-stamped, 0)
+	return live, stamped, 0, missing, nil
+}
+
+func coverageCountsScopedQuery(activeGen int64, messageTypes []string, sourceIDs []int64) (string, []any) {
+	liveWhere, liveArgs := liveMessagesWhereScoped(messageTypes, sourceIDs)
+	q := `SELECT COUNT(*),
+		COALESCE(SUM(CASE WHEN ? <> 0 AND embed_gen = ? THEN 1 ELSE 0 END), 0)
+		FROM messages WHERE ` + liveWhere
+	return q, append([]any{activeGen, activeGen}, liveArgs...)
 }
 
 // EmbeddingConvergenceCounts partitions message coverage for the contextual

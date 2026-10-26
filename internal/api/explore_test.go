@@ -15,13 +15,35 @@ import (
 )
 
 func TestExploreRejectsUnknownFilterDimension(t *testing.T) {
+	t.Parallel()
 	srv := newTestServerWithEngine(t, newExploreDuckDBFixture(t))
 	response := postExploreJSON(t, srv, "/api/v1/explore", `{"filters":[{"dimension":"sql","values":["select *"]}]}`)
 	assert.Equal(t, http.StatusBadRequest, response.Code)
 	assert.Contains(t, response.Body.String(), "unknown filter dimension")
 }
 
+func TestExploreMailingListFilterAcceptsValuesAndConjoinsRepeats(t *testing.T) {
+	t.Parallel()
+	context, err := exploreContext([]ExploreFilter{
+		{Dimension: "mailing_list", Values: []string{"<one@example.test>", "<two@example.test>"}},
+		{Dimension: "mailing_list", Values: []string{"<ONE@EXAMPLE.TEST>"}},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"<one@example.test>", "<two@example.test>"}, context.MailingLists)
+	assert.Equal(t, [][]string{{"<ONE@EXAMPLE.TEST>"}}, context.AdditionalMailingListGroups)
+}
+
+func TestParseMessageFilterPreservesExactListID(t *testing.T) {
+	t.Parallel()
+	request := httptest.NewRequest(http.MethodGet,
+		"/api/v1/messages/filter?list_id=%3CDev_1%40Example.Test%3E", nil)
+	filter, err := parseMessageFilter(request)
+	require.NoError(t, err)
+	assert.Equal(t, "<Dev_1@Example.Test>", filter.ListID)
+}
+
 func TestExploreCursorAcceptsCanonicalFilterValueOrdering(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	srv := newTestServerWithEngine(t, newExploreDuckDBFixture(t))
@@ -45,6 +67,7 @@ func TestExploreCursorAcceptsCanonicalFilterValueOrdering(t *testing.T) {
 }
 
 func TestExploreUnavailableReturnsNamedReadinessAndRecovery(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	srv, _ := newTestServerWithMockStore(t)
@@ -58,6 +81,7 @@ func TestExploreUnavailableReturnsNamedReadinessAndRecovery(t *testing.T) {
 }
 
 func TestExploreReportsTransientCacheInitialization(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	opts := testServerOptions(t, nil)
@@ -78,6 +102,7 @@ func TestExploreReportsTransientCacheInitialization(t *testing.T) {
 }
 
 func TestExploreReportsTransientCacheInitializationWithSQLFallback(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	opts := testServerOptions(t, nil)
@@ -94,6 +119,7 @@ func TestExploreReportsTransientCacheInitializationWithSQLFallback(t *testing.T)
 }
 
 func TestExploreUnavailableUsesRequestInitializationSnapshot(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	opts := testServerOptions(t, nil)
@@ -114,6 +140,7 @@ func TestExploreUnavailableUsesRequestInitializationSnapshot(t *testing.T) {
 }
 
 func TestExploreServerStateBoundsAndExpiresTransientCapabilities(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	state := newExploreServerState(func() time.Time { return now })

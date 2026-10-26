@@ -1,18 +1,17 @@
 package api
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"net"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -88,6 +87,7 @@ func meetingImportRequest(body string) *http.Request {
 }
 
 func TestMeetingImportRequiresAuthentication(t *testing.T) {
+	t.Parallel()
 	store := &fakeMeetingImportStore{
 		mockStore: &mockStore{stats: &StoreStats{}},
 		result:    meetingimport.Result{Status: meetingimport.StatusCreated},
@@ -110,6 +110,7 @@ func TestMeetingImportRequiresAuthentication(t *testing.T) {
 }
 
 func TestMeetingImportReturnsCreatedAndUpdated(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name       string
 		status     meetingimport.Status
@@ -154,6 +155,7 @@ func TestMeetingImportReturnsCreatedAndUpdated(t *testing.T) {
 }
 
 func TestMeetingImportRejectsInvalidRequests(t *testing.T) {
+	t.Parallel()
 	store := &fakeMeetingImportStore{mockStore: &mockStore{stats: &StoreStats{}}}
 	srv := newMeetingImportTestServer(t, store)
 
@@ -207,7 +209,31 @@ func TestMeetingImportRejectsInvalidRequests(t *testing.T) {
 	assert.Equal(t, 0, store.calls)
 }
 
+func TestMeetingImportValidationNamesFieldWithoutEchoingValue(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+	store := &fakeMeetingImportStore{mockStore: &mockStore{stats: &StoreStats{}}}
+	srv := newMeetingImportTestServer(t, store)
+	body := strings.Replace(validMeetingImportBody, `"email": "attendee@example.com"`,
+		`"phone": "(604) 555-0100"`, 1)
+	require.NotEqual(validMeetingImportBody, body, "fixture must contain the attendee email")
+
+	req := meetingImportRequest(body)
+	resp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(resp, req)
+
+	require.Equal(http.StatusUnprocessableEntity, resp.Code, "body: %s", resp.Body.String())
+	var decoded ErrorResponse
+	require.NoError(json.NewDecoder(resp.Body).Decode(&decoded))
+	assert.Equal("validation_failed", decoded.Error)
+	assert.Contains(decoded.Message, "meeting.attendees[0].phone")
+	assert.NotContains(decoded.Message, "555")
+	assert.Equal(0, store.calls)
+}
+
 func TestMeetingImportRejectsOversizedBody(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -226,6 +252,7 @@ func TestMeetingImportRejectsOversizedBody(t *testing.T) {
 }
 
 func TestMeetingImportReturnsUnavailableWithoutCapability(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -241,6 +268,7 @@ func TestMeetingImportReturnsUnavailableWithoutCapability(t *testing.T) {
 }
 
 func TestMeetingImportSanitizesInternalErrors(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -261,6 +289,7 @@ func TestMeetingImportSanitizesInternalErrors(t *testing.T) {
 }
 
 func TestMeetingImportOpenAPIDocument(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -306,6 +335,7 @@ func TestMeetingImportOpenAPIDocument(t *testing.T) {
 }
 
 func TestMeetingImportBodyLimitDoesNotReadPastBoundary(t *testing.T) {
+	t.Parallel()
 	store := &fakeMeetingImportStore{mockStore: &mockStore{stats: &StoreStats{}}}
 	srv := newMeetingImportTestServer(t, store)
 	body := bytes.NewReader(bytes.Repeat([]byte("x"), int(meetingimport.MaxRequestBytes)+1))
@@ -320,9 +350,13 @@ func TestMeetingImportBodyLimitDoesNotReadPastBoundary(t *testing.T) {
 }
 
 func TestMeetingImportReadsBodyBeforeWaitingOnOperationGate(t *testing.T) {
+	t.Parallel()
+	synctest.Test(t, testMeetingImportReadsBodyBeforeWaitingOnOperationGate)
+}
+
+func testMeetingImportReadsBodyBeforeWaitingOnOperationGate(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
-	const ordinaryReadTimeout = 100 * time.Millisecond
 
 	gate := NewSerialOperationGate()
 	releaseGate, ok := gate.BeginWork()
@@ -347,57 +381,40 @@ func TestMeetingImportReadsBodyBeforeWaitingOnOperationGate(t *testing.T) {
 		Logger:        testLogger(),
 		OperationGate: gate,
 	})
-	srv.readTimeout = ordinaryReadTimeout
+	defer func() { require.NoError(srv.Shutdown(context.Background())) }()
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(err, "listen")
-	serveErr := make(chan error, 1)
-	go func() {
-		serveErr <- srv.StartOnListener(listener)
-	}()
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		require.NoError(srv.Shutdown(ctx), "shutdown")
-		require.ErrorIs(<-serveErr, http.ErrServerClosed, "serve result")
-	})
+	reader, writer := io.Pipe()
+	defer func() { _ = reader.Close() }()
+	defer func() { _ = writer.Close() }()
+	body := io.MultiReader(strings.NewReader(validMeetingImportBody[:len(validMeetingImportBody)-1]), reader)
+	req := httptest.NewRequest(http.MethodPost, meetingImportEndpointPath, body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Api-Key", meetingImportTestAPIKey)
+	resp := &deadlineClearingRecorder{ResponseRecorder: httptest.NewRecorder()}
+	started := time.Now()
+	go srv.Router().ServeHTTP(resp, req)
 
-	conn, err := net.Dial("tcp", listener.Addr().String())
-	require.NoError(err, "dial server")
-	defer func() { _ = conn.Close() }()
-	require.NoError(conn.SetDeadline(time.Now().Add(5*time.Second)), "bound test connection")
+	synctest.Wait()
+	require.False(gate.HasRequestWaiters(), "partial upload must not hold or queue on the mutation gate")
+	require.Len(resp.readDeadlines, 1, "extend the read deadline before reading the upload")
+	assertDeadlineWithin(t, resp.readDeadlines[0], started, time.Now())
+	require.Len(resp.writeDeadlines, 1, "clear the write deadline before reading the upload")
+	assert.True(resp.writeDeadlines[0].IsZero())
+	assert.Zero(store.calls)
 
-	body := []byte(validMeetingImportBody)
-	_, err = fmt.Fprintf(conn,
-		"POST /api/v1/import/meeting HTTP/1.1\r\n"+
-			"Host: %s\r\n"+
-			"Content-Type: application/json\r\n"+
-			"X-Api-Key: %s\r\n"+
-			"Content-Length: %d\r\n\r\n"+
-			"%s",
-		listener.Addr().String(),
-		meetingImportTestAPIKey,
-		len(body),
-		body[:len(body)-1],
-	)
-	require.NoError(err, "write headers and partial body")
-
-	time.Sleep(2 * ordinaryReadTimeout)
-	assert.False(gate.HasRequestWaiters(), "partial upload must not hold or queue on the mutation gate")
-	_, err = conn.Write(body[len(body)-1:])
-	require.NoError(err, "finish body after ordinary server read timeout")
-	require.Eventually(gate.HasRequestWaiters, time.Second, time.Millisecond,
-		"validated meeting import waits on operation gate")
+	_, err := io.WriteString(writer, validMeetingImportBody[len(validMeetingImportBody)-1:])
+	require.NoError(err, "finish body")
+	require.NoError(writer.Close())
+	synctest.Wait()
+	require.True(gate.HasRequestWaiters(), "validated meeting import waits on operation gate")
+	assert.Zero(store.calls)
 	releaseGateOnce()
-
-	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodPost})
-	require.NoError(err, "read meeting import response")
-	defer func() { _ = resp.Body.Close() }()
-	assert.Equal(http.StatusCreated, resp.StatusCode)
+	synctest.Wait()
+	assert.Equal(http.StatusCreated, resp.Code)
 	assert.Equal(1, store.calls)
 }
 
-func TestMeetingImportValidatesBodyBeforeWaitingOnOperationGate(t *testing.T) {
+func TestMeetingImportValidatesBodyBeforeWaitingOnOperationGate(t *testing.T) { //nolint:paralleltest // swaps the package-level operationGateWaitLimit
 	require := require.New(t)
 
 	oldLimit := operationGateWaitLimit
@@ -425,7 +442,7 @@ func TestMeetingImportValidatesBodyBeforeWaitingOnOperationGate(t *testing.T) {
 	require.False(gate.HasRequestWaiters(), "invalid body must not queue on the mutation gate")
 }
 
-func TestMeetingImportReturnsBusyWithinBoundAfterValidation(t *testing.T) {
+func TestMeetingImportReturnsBusyWithinBoundAfterValidation(t *testing.T) { //nolint:paralleltest // swaps the package-level operationGateWaitLimit
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -459,7 +476,7 @@ func TestMeetingImportReturnsBusyWithinBoundAfterValidation(t *testing.T) {
 	assert.Equal(0, store.calls)
 }
 
-func TestMeetingImportUnavailableDoesNotWaitOnOperationGate(t *testing.T) {
+func TestMeetingImportUnavailableDoesNotWaitOnOperationGate(t *testing.T) { //nolint:paralleltest // swaps the package-level operationGateWaitLimit
 	require := require.New(t)
 
 	oldLimit := operationGateWaitLimit

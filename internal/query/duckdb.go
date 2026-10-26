@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"log"
@@ -126,12 +126,49 @@ type DuckDBOptions struct {
 	TempDirectory string
 	// OwnTempDirectory removes TempDirectory after DuckDB closes.
 	OwnTempDirectory bool
+	// MemoryLimit, Threads and MaxTempDirectorySize override the interactive
+	// DuckDB policy. Empty and zero values keep its defaults, which are sized
+	// for a laptop; a large archive must raise them or heavy queries fail with
+	// a DuckDB out-of-memory error once they spill past the cap.
+	MemoryLimit          string
+	Threads              int
+	MaxTempDirectorySize string
 	// DisableLegacyAnalyticalViews skips registration of the Parquet-backed
 	// SQL views. It is a test-only isolation option proving the unfiltered
 	// people/domain/relationship read paths need only the relationship
 	// rollup datasets; filtered predicates route through the explore
 	// logical-entry machinery and require the views.
 	DisableLegacyAnalyticalViews bool
+}
+
+// NewArchiveDuckDBEngine creates a separate SQL engine restricted to the
+// analytics directory. It never attaches SQLite or loads its scanner. Views,
+// resource limits, and publication locking work as on the owner query engine.
+func NewArchiveDuckDBEngine(ctx context.Context, analyticsDir string, opts ...DuckDBOptions) (*DuckDBEngine, error) {
+	if analyticsDir == "" {
+		return nil, errors.New("archive SQL requires an analytics directory")
+	}
+	analyticsDir, err := filepath.Abs(analyticsDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve analytics directory: %w", err)
+	}
+	engine, err := newDuckDBEngine(ctx, analyticsDir, "", nil, opts...)
+	if err != nil {
+		return nil, err
+	}
+	// The constructor registered trusted Parquet views. Lock this independent
+	// instance before any caller SQL runs; the owner engine stays unrestricted.
+	escapedDir := strings.ReplaceAll(filepath.ToSlash(analyticsDir), "'", "''")
+	_, err = engine.db.ExecContext(ctx, "SET allowed_directories = ['"+escapedDir+"']; "+
+		"SET autoinstall_known_extensions = false; "+
+		"SET autoload_known_extensions = false; "+
+		"SET allow_community_extensions = false; "+
+		"SET enable_external_access = false; "+
+		"SET lock_configuration = true")
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("restrict archive SQL access: %w", err), engine.Close())
+	}
+	return engine, nil
 }
 
 // NewDuckDBEngine creates a new DuckDB-backed query engine.
@@ -147,6 +184,10 @@ type DuckDBOptions struct {
 // If sqliteDB is nil, Search will fall back to LIKE queries and body extraction
 // from raw MIME may be slower.
 func NewDuckDBEngine(analyticsDir string, sqlitePath string, sqliteDB *sql.DB, opts ...DuckDBOptions) (*DuckDBEngine, error) {
+	return newDuckDBEngine(context.Background(), analyticsDir, sqlitePath, sqliteDB, opts...)
+}
+
+func newDuckDBEngine(ctx context.Context, analyticsDir string, sqlitePath string, sqliteDB *sql.DB, opts ...DuckDBOptions) (*DuckDBEngine, error) {
 	var opt DuckDBOptions
 	if len(opts) > 0 {
 		opt = opts[0]
@@ -162,7 +203,14 @@ func NewDuckDBEngine(analyticsDir string, sqlitePath string, sqliteDB *sql.DB, o
 		ownTempDirectory = true
 	}
 
-	db, err := duckdbutil.Open(context.Background(), duckdbutil.InteractivePolicy(tempDirectory))
+	db, err := duckdbutil.Open(ctx, duckdbutil.InteractivePolicyWithOverrides(
+		tempDirectory,
+		duckdbutil.InteractiveOverrides{
+			MemoryLimit:          opt.MemoryLimit,
+			Threads:              opt.Threads,
+			MaxTempDirectorySize: opt.MaxTempDirectorySize,
+		},
+	))
 	if err != nil {
 		if ownTempDirectory {
 			_ = os.RemoveAll(tempDirectory)
@@ -177,13 +225,13 @@ func NewDuckDBEngine(analyticsDir string, sqlitePath string, sqliteDB *sql.DB, o
 	// On other platforms, try to load but fall back gracefully (e.g. no internet).
 	var hasSQLiteScanner bool
 	if sqlitePath != "" && runtime.GOOS != "windows" && !opt.DisableSQLiteScanner {
-		if _, err := db.Exec("INSTALL sqlite; LOAD sqlite;"); err != nil {
+		if _, err := db.ExecContext(ctx, "INSTALL sqlite; LOAD sqlite;"); err != nil {
 			log.Printf("[warn] sqlite_scanner extension unavailable, falling back to direct SQLite: %v", err)
 		} else {
 			// Attach SQLite database as read-only
 			escapedPath := strings.ReplaceAll(sqlitePath, "'", "''")
 			attachSQL := fmt.Sprintf("ATTACH '%s' AS sqlite_db (TYPE sqlite, READ_ONLY)", escapedPath)
-			if _, err := db.Exec(attachSQL); err != nil {
+			if _, err := db.ExecContext(ctx, attachSQL); err != nil {
 				log.Printf("[warn] failed to attach SQLite via sqlite_scanner, falling back to direct SQLite: %v", err)
 			} else {
 				hasSQLiteScanner = true
@@ -212,7 +260,7 @@ func NewDuckDBEngine(analyticsDir string, sqlitePath string, sqliteDB *sql.DB, o
 	}
 	var releaseInitialCacheRead func()
 	if analyticsDir != "" {
-		releaseInitialCacheRead, err = AcquireCacheReadLock(context.Background(), analyticsDir)
+		releaseInitialCacheRead, err = AcquireCacheReadLock(ctx, analyticsDir)
 		if err != nil {
 			_ = engine.Close()
 			return nil, err
@@ -229,9 +277,12 @@ func NewDuckDBEngine(analyticsDir string, sqlitePath string, sqliteDB *sql.DB, o
 
 	// Probe Parquet schemas for optional columns added in PR #160 (WhatsApp import).
 	// Old cache files may lack these columns; we'll supply defaults in parquetCTEs().
-	engine.optionalCols, engine.cacheFP = stableOptionalColumns(engine.cacheFingerprint, func() map[string]map[string]bool {
-		return probeAllOptionalColumns(db, analyticsDir)
+	engine.optionalCols, engine.cacheFP, err = stableOptionalColumns(ctx, engine.cacheFingerprint, func() (map[string]map[string]bool, error) {
+		return probeAllOptionalColumns(ctx, db, analyticsDir)
 	})
+	if err != nil {
+		return nil, errors.Join(err, engine.Close())
+	}
 	var missing []string
 	for _, col := range []struct{ table, col string }{
 		{datasetParticipants, "phone_number"},
@@ -239,6 +290,9 @@ func NewDuckDBEngine(analyticsDir string, sqlitePath string, sqliteDB *sql.DB, o
 		{datasetMessages, "sender_id"},
 		{datasetMessages, "owner_participant_id"},
 		{datasetMessages, messageTypeDimension},
+		{datasetMessages, "list_id"},
+		{datasetMessages, "account_address"},
+		{datasetMessages, "account_path"},
 		{datasetConversations, "title"},
 		{datasetConversations, "conversation_type"},
 		{"sources", "source_type"},
@@ -253,10 +307,18 @@ func NewDuckDBEngine(analyticsDir string, sqlitePath string, sqliteDB *sql.DB, o
 	// Register SQL views over Parquet files for raw SQL access.
 	// Pass the already-probed optionalCols to avoid a redundant schema probe.
 	if !engine.disableLegacyAnalyticalViews {
-		if err := RegisterViewsWithColumns(db, analyticsDir, engine.optionalCols); err != nil {
+		if err := RegisterViewsWithColumns(ctx, db, analyticsDir, engine.optionalCols); err != nil {
+			if ctx.Err() != nil {
+				return nil, errors.Join(ctx.Err(), engine.Close())
+			}
 			log.Printf("[warn] failed to register SQL views: %v", err)
 			// Non-fatal: existing CTE-based queries still work.
 		}
+	} else if err := createRelationshipActivityView(ctx, db, analyticsDir); err != nil {
+		if ctx.Err() != nil {
+			return nil, errors.Join(ctx.Err(), engine.Close())
+		}
+		log.Printf("[warn] failed to register relationship activity view: %v", err)
 	}
 
 	return engine, nil
@@ -290,9 +352,20 @@ func (e *DuckDBEngine) QuerySQL(
 		return nil, err
 	}
 	defer release()
+	var cache *CacheFreshness
+	if e.analyticsDir != "" {
+		state, err := ReadCacheSyncState(e.analyticsDir)
+		if err != nil {
+			return nil, fmt.Errorf("read analytics publication for query: %w", err)
+		}
+		cache = &CacheFreshness{
+			Generation:  state.DatasetFingerprint,
+			PublishedAt: state.PublishedAt,
+		}
+	}
 
-	// codeql[go/sql-injection] -- QuerySQL is an explicit trusted-user SQL
-	// interface over the user's local archive, not an injection boundary.
+	// codeql[go/sql-injection] -- This is an explicit SQL interface. MCP uses
+	// NewArchiveDuckDBEngine's native access restrictions; owner SQL is privileged.
 	rows, err := e.db.QueryContext(ctx, sqlStr)
 	if err != nil {
 		return nil, fmt.Errorf("execute query: %w", err)
@@ -304,7 +377,7 @@ func (e *DuckDBEngine) QuerySQL(
 		return nil, fmt.Errorf("get columns: %w", err)
 	}
 
-	result := &QueryResult{Columns: cols}
+	result := &QueryResult{Columns: cols, Cache: cache}
 	for rows.Next() {
 		vals := make([]any, len(cols))
 		ptrs := make([]any, len(cols))
@@ -384,7 +457,10 @@ func (e *DuckDBEngine) acquireCacheRead(ctx context.Context) (func(), error) {
 		release()
 		return nil, err
 	}
-	e.ensureFreshOptionalCols(statSig)
+	if err := e.ensureFreshOptionalCols(ctx, statSig); err != nil {
+		release()
+		return nil, err
+	}
 	return release, nil
 }
 
@@ -462,6 +538,12 @@ func (e *DuckDBEngine) parquetPath(table string) string {
 	return filepath.Join(e.analyticsDir, table, "*.parquet")
 }
 
+// filenameCondition matches msg rows with an attachment name ILIKE the bound pattern.
+// It reads the cached Parquet because the daemon never attaches sqlite_db.
+func (e *DuckDBEngine) filenameCondition() string {
+	return fmt.Sprintf(`EXISTS (SELECT 1 FROM read_parquet('%s') fa WHERE CAST(fa.message_id AS BIGINT) = msg.id AND CAST(fa.filename AS VARCHAR) ILIKE ? ESCAPE '\')`, e.parquetPath("attachments"))
+}
+
 // hasCol returns true if the named column exists in the Parquet schema for the given table.
 func (e *DuckDBEngine) hasCol(table, col string) bool {
 	e.optColsMu.RLock()
@@ -515,15 +597,25 @@ func (e *DuckDBEngine) cacheFingerprintGlobs() []string {
 }
 
 func stableOptionalColumns(
+	ctx context.Context,
 	cacheFingerprint func() string,
-	probe func() map[string]map[string]bool,
-) (map[string]map[string]bool, string) {
+	probe func() (map[string]map[string]bool, error),
+) (map[string]map[string]bool, string, error) {
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, "", err
+		}
 		before := cacheFingerprint()
-		cols := probe()
+		cols, err := probe()
+		if err != nil {
+			return nil, "", err
+		}
 		after := cacheFingerprint()
+		if err := ctx.Err(); err != nil {
+			return nil, "", err
+		}
 		if before == after {
-			return cols, after
+			return cols, after, nil
 		}
 		log.Printf("[info] analytics cache changed during Parquet schema probe — retrying")
 	}
@@ -541,31 +633,46 @@ func stableOptionalColumns(
 //
 // Runs centrally from acquireCacheRead, so every query path — slot-gated and
 // detail lookups alike — refreshes before touching Parquet or the views.
-func (e *DuckDBEngine) ensureFreshOptionalCols(fp string) {
+func (e *DuckDBEngine) ensureFreshOptionalCols(ctx context.Context, fp string) error {
 	e.optColsMu.RLock()
 	unchanged := fp == e.cacheFP
 	e.optColsMu.RUnlock()
 	if unchanged {
-		return
+		return ctx.Err()
 	}
 
 	e.optColsMu.Lock()
 	defer e.optColsMu.Unlock()
 	if fp == e.cacheFP { // another goroutine refreshed while we waited
-		return
+		return ctx.Err()
 	}
 
-	newCols, fp := stableOptionalColumns(e.cacheFingerprint, func() map[string]map[string]bool {
-		return probeAllOptionalColumns(e.db, e.analyticsDir)
+	newCols, fp, err := stableOptionalColumns(ctx, e.cacheFingerprint, func() (map[string]map[string]bool, error) {
+		return probeAllOptionalColumns(ctx, e.db, e.analyticsDir)
 	})
-	e.optionalCols = newCols
-	e.cacheFP = fp
+	if err != nil {
+		return err
+	}
 	if !e.disableLegacyAnalyticalViews {
-		if err := RegisterViewsWithColumns(e.db, e.analyticsDir, newCols); err != nil {
+		if err := RegisterViewsWithColumns(ctx, e.db, e.analyticsDir, newCols); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			log.Printf("[warn] re-register views after analytics cache change: %v", err)
 		}
+	} else if err := createRelationshipActivityView(ctx, e.db, e.analyticsDir); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		log.Printf("[warn] re-register relationship activity view after analytics cache change: %v", err)
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	e.optionalCols = newCols
+	e.cacheFP = fp
 	log.Printf("[info] analytics cache changed — re-probed Parquet optional columns")
+	return nil
 }
 
 func (e *DuckDBEngine) currentCacheFingerprint() string {
@@ -583,7 +690,7 @@ func (e *DuckDBEngine) currentCacheFingerprint() string {
 // and COALESCE expressions.
 //
 // Optional columns (phone_number, attachment_count, sender_id,
-// owner_participant_id, message_type)
+// owner_participant_id, message_type, list_id)
 // are handled gracefully: if the Parquet file predates their addition, they
 // are synthesised with sensible defaults instead of causing a binder error.
 // Every caller holds the shared cache read lock (via acquireQuerySlot or
@@ -600,6 +707,7 @@ func (e *DuckDBEngine) parquetCTEs() string {
 		"CAST(snippet AS VARCHAR) AS snippet",
 		"CAST(size_estimate AS BIGINT) AS size_estimate",
 		"COALESCE(TRY_CAST(has_attachments AS BOOLEAN), false) AS has_attachments",
+		"CAST(archive_only AS BOOLEAN) AS archive_only",
 	}
 	var msgExtra []string
 	if e.hasCol(datasetMessages, "attachment_count") {
@@ -621,6 +729,18 @@ func (e *DuckDBEngine) parquetCTEs() string {
 		msgReplace = append(msgReplace, "COALESCE(CAST(message_type AS VARCHAR), '') AS message_type")
 	} else {
 		msgExtra = append(msgExtra, "'' AS message_type")
+	}
+	if e.hasCol(datasetMessages, "list_id") {
+		msgReplace = append(msgReplace, "CAST(list_id AS VARCHAR) AS list_id")
+	} else {
+		msgExtra = append(msgExtra, "NULL::VARCHAR AS list_id")
+	}
+	for _, col := range []string{"account_address", "account_path"} {
+		if e.hasCol(datasetMessages, col) {
+			msgReplace = append(msgReplace, "CAST("+col+" AS VARCHAR) AS "+col)
+		} else {
+			msgExtra = append(msgExtra, "NULL::VARCHAR AS "+col)
+		}
 	}
 	if e.hasCol(datasetMessages, "deleted_at") {
 		msgReplace = append(msgReplace, "TRY_CAST(deleted_at AS TIMESTAMP) AS deleted_at")
@@ -806,6 +926,20 @@ func escapeILIKE(s string) string {
 	return s
 }
 
+func aggregateTextSearchParts(termPattern string) ([]string, []any) {
+	return []string{
+		`msg.subject ILIKE ? ESCAPE '\'`,
+		`COALESCE(msg.snippet, '') ILIKE ? ESCAPE '\'`,
+		`EXISTS (
+			SELECT 1 FROM mr mr_search
+			JOIN p p_search ON p_search.id = mr_search.participant_id
+			WHERE mr_search.message_id = msg.id
+			  AND mr_search.recipient_type = 'from'
+			  AND (p_search.email_address ILIKE ? ESCAPE '\' OR COALESCE(p_search.display_name, '') ILIKE ? ESCAPE '\')
+		)`,
+	}, []any{termPattern, termPattern, termPattern, termPattern}
+}
+
 // buildWhereClause builds WHERE conditions for Parquet queries.
 // Column references use msg. prefix to be explicit since aggregate queries join multiple CTEs.
 // buildAggregateSearchConditions builds SQL conditions for a search query in aggregate views.
@@ -814,39 +948,31 @@ func escapeILIKE(s string) string {
 // keyColumns are SQL expressions for the grouping dimension that text terms
 // should filter on (e.g. "p.email_address", "p.display_name"). When nil,
 // text terms search subject + sender (the default for Senders/Time views).
-func (e *DuckDBEngine) buildAggregateSearchConditions(searchQuery string, keyColumns ...string) ([]string, []any) {
-	if searchQuery == "" {
+func (e *DuckDBEngine) buildAggregateSearchConditions(q *search.Query, keyColumns ...string) ([]string, []any) {
+	if q.HasOR() {
+		return store.CombineOR(q, func(branch *search.Query) ([]string, []any) {
+			return e.buildAggregateSearchConditions(branch, keyColumns...)
+		})
+	}
+	if q.IsEmpty() {
 		return nil, nil
 	}
 
 	var conditions []string
 	var args []any
 
-	q := search.Parse(searchQuery)
-
 	// Text terms: always search subject + sender, plus the view's grouping
 	// key columns when provided (e.g., label name in Labels view).
 	// Uses ILIKE for performance on Parquet scans.
 	for _, term := range q.TextTerms {
 		termPattern := "%" + escapeILIKE(term) + "%"
-		var parts []string
-		parts = append(parts, `msg.subject ILIKE ? ESCAPE '\'`)
-		args = append(args, termPattern)
-		parts = append(parts, `COALESCE(msg.snippet, '') ILIKE ? ESCAPE '\'`)
-		args = append(args, termPattern)
-		parts = append(parts, `EXISTS (
-			SELECT 1 FROM mr mr_search
-			JOIN p p_search ON p_search.id = mr_search.participant_id
-			WHERE mr_search.message_id = msg.id
-			  AND mr_search.recipient_type = 'from'
-			  AND (p_search.email_address ILIKE ? ESCAPE '\' OR COALESCE(p_search.display_name, '') ILIKE ? ESCAPE '\')
-		)`)
-		args = append(args, termPattern, termPattern)
+		parts, termArgs := aggregateTextSearchParts(termPattern)
 		for _, col := range keyColumns {
 			parts = append(parts, col+` ILIKE ? ESCAPE '\'`)
-			args = append(args, termPattern)
+			termArgs = append(termArgs, termPattern)
 		}
 		conditions = append(conditions, "("+strings.Join(parts, " OR ")+")")
+		args = append(args, termArgs...)
 	}
 
 	// Append non-text filters (from:, to:, subject:, label:, has:, dates, sizes).
@@ -858,7 +984,7 @@ func (e *DuckDBEngine) buildAggregateSearchConditions(searchQuery string, keyCol
 }
 
 // buildNonTextSearchConditions builds WHERE conditions for the non-text
-// portion of a parsed search query (from:, to:, subject:, label:, has:,
+// portion of a parsed search query (from:, to:, cc:, bcc:, subject:, label:, has:,
 // date/size filters). Extracted from buildAggregateSearchConditions so
 // callers that handle text terms themselves (e.g. buildStatsSearchConditions)
 // can append non-text filters without having to compute how many args
@@ -874,6 +1000,9 @@ func (e *DuckDBEngine) buildNonTextSearchConditions(q *search.Query, keyColumns 
 			args = append(args, conditionArgs...)
 		}
 	}
+	conditions, args = appendConversationFilter(
+		conditions, args, "msg.conversation_id", q.ConversationIDs,
+	)
 
 	// from: filter - match sender email
 	for _, from := range q.FromAddrs {
@@ -888,24 +1017,35 @@ func (e *DuckDBEngine) buildNonTextSearchConditions(q *search.Query, keyColumns 
 		args = append(args, fromPattern)
 	}
 
-	// to: filter - match recipient email (to or cc, consistent with SearchFast)
-	for _, to := range q.ToAddrs {
-		toPattern := "%" + escapeILIKE(to) + "%"
-		conditions = append(conditions, `EXISTS (
-			SELECT 1 FROM mr mr_to
-			JOIN p p_to ON p_to.id = mr_to.participant_id
-			WHERE mr_to.message_id = msg.id
-			  AND mr_to.recipient_type IN ('to', 'cc', 'bcc')
-			  AND p_to.email_address ILIKE ? ESCAPE '\'
-		)`)
-		args = append(args, toPattern)
-	}
+	conditions, args = appendDuckDBRecipientSearchCondition(conditions, args, q.ToAddrs, "to")
+	conditions, args = appendDuckDBRecipientSearchCondition(conditions, args, q.CcAddrs, "cc")
+	conditions, args = appendDuckDBRecipientSearchCondition(conditions, args, q.BccAddrs, "bcc")
 
 	// subject: filter
 	for _, subj := range q.SubjectTerms {
 		subjPattern := "%" + escapeILIKE(subj) + "%"
 		conditions = append(conditions, "msg.subject ILIKE ? ESCAPE '\\'")
 		args = append(args, subjPattern)
+	}
+
+	// List-Id filters use literal, case-insensitive substring matching.
+	// Keep one predicate per term so repeated list: operators are ANDed.
+	for _, listID := range q.ListIDs {
+		if strings.TrimSpace(listID) == "" {
+			continue
+		}
+		conditions = append(conditions, `msg.list_id ILIKE ? ESCAPE '\'`)
+		args = append(args, "%"+escapeILIKE(listID)+"%")
+	}
+	// account: and received: match the derived account projection.
+	if accountConditions, accountArgs := search.AccountConditions(q, "msg"); len(accountConditions) > 0 {
+		conditions = append(conditions, accountConditions...)
+		args = append(args, accountArgs...)
+	}
+	conditions, args = appendAccountScopeConditions(conditions, args, q.AccountScopes, "msg")
+	for _, filename := range q.Filenames {
+		conditions = append(conditions, e.filenameCondition())
+		args = append(args, "%"+escapeILIKE(filename)+"%")
 	}
 
 	// label: filter - case-insensitive substring match.
@@ -979,56 +1119,90 @@ func (e *DuckDBEngine) buildNonTextSearchConditions(q *search.Query, keyColumns 
 
 // buildWhereClause builds WHERE conditions for aggregate queries.
 // buildStatsSearchConditions builds search conditions for GetTotalStats.
-// For 1:N views (Recipients, RecipientNames, Labels), text terms filter via
-// EXISTS subqueries on the grouping dimension so stats match visible rows.
-// For 1:1 views, falls back to the default subject+sender search.
-func (e *DuckDBEngine) buildStatsSearchConditions(searchQuery string, groupBy ViewType) ([]string, []any) {
-	if searchQuery == "" {
+// For 1:N views (Recipients, RecipientNames, Labels), text terms also filter
+// via EXISTS subqueries on the grouping dimension so stats match visible rows.
+func (e *DuckDBEngine) buildStatsSearchConditions(q *search.Query, groupBy ViewType) ([]string, []any) {
+	if q.HasOR() {
+		return store.CombineOR(q, func(branch *search.Query) ([]string, []any) {
+			return e.buildStatsSearchConditions(branch, groupBy)
+		})
+	}
+	if q.IsEmpty() {
 		return nil, nil
 	}
 
-	q := search.Parse(searchQuery)
-
 	var conditions []string
 	var args []any
+	if groupBy == ViewLabels && (len(q.Labels) > 0 || len(q.TextTerms) > 0) {
+		var labelRowConditions []string
+		var labelRowArgs []any
+		if len(q.Labels) > 0 {
+			labelParts := make([]string, 0, len(q.Labels))
+			for _, label := range q.Labels {
+				labelParts = append(labelParts, `lbl_rs.name ILIKE ? ESCAPE '\'`)
+				labelRowArgs = append(labelRowArgs, "%"+escapeILIKE(label)+"%")
+			}
+			labelRowConditions = append(labelRowConditions,
+				"("+strings.Join(labelParts, " OR ")+")")
+			q.Labels = nil
+		}
+		for _, term := range q.TextTerms {
+			termPattern := "%" + escapeILIKE(term) + "%"
+			parts, termArgs := aggregateTextSearchParts(termPattern)
+			parts = append(parts, `lbl_rs.name ILIKE ? ESCAPE '\'`)
+			termArgs = append(termArgs, termPattern)
+			labelRowConditions = append(labelRowConditions,
+				"("+strings.Join(parts, " OR ")+")")
+			labelRowArgs = append(labelRowArgs, termArgs...)
+		}
+		q.TextTerms = nil
+		conditions = append(conditions, `EXISTS (
+			SELECT 1 FROM ml ml_rs
+			JOIN lbl lbl_rs ON lbl_rs.id = ml_rs.label_id
+			WHERE ml_rs.message_id = msg.id
+			  AND (`+strings.Join(labelRowConditions, " AND ")+`)
+		)`)
+		args = append(args, labelRowArgs...)
+	}
 
-	// Text terms — use EXISTS for 1:N views since the stats query has no
+	// Text terms always search subject, snippet, and sender. For 1:N views,
+	// also use EXISTS for the grouping key because the stats query has no
 	// participant/label joins.
 	for _, term := range q.TextTerms {
 		termPattern := "%" + escapeILIKE(term) + "%"
+		parts, termArgs := aggregateTextSearchParts(termPattern)
 		switch groupBy {
-		case ViewRecipients, ViewRecipientNames:
-			conditions = append(conditions, `EXISTS (
+		case ViewSenderNames, ViewRecipientNames:
+			recipientTypeCondition := "mr_rs.recipient_type = 'from'"
+			if groupBy == ViewRecipientNames {
+				recipientTypeCondition = "mr_rs.recipient_type IN ('to', 'cc', 'bcc')"
+			}
+			var keyParts []string
+			for _, col := range aggregateNameKeyColumns("mr_rs", "p_rs") {
+				keyParts = append(keyParts, "COALESCE("+col+", '') ILIKE ? ESCAPE '\\'")
+				termArgs = append(termArgs, termPattern)
+			}
+			parts = append(parts, fmt.Sprintf(`EXISTS (
+				SELECT 1 FROM mr mr_rs
+				JOIN p p_rs ON p_rs.id = mr_rs.participant_id
+				WHERE mr_rs.message_id = msg.id
+				  AND %s
+				  AND (%s)
+			)`, recipientTypeCondition, strings.Join(keyParts, " OR ")))
+		case ViewRecipients:
+			parts = append(parts, `EXISTS (
 				SELECT 1 FROM mr mr_rs
 				JOIN p p_rs ON p_rs.id = mr_rs.participant_id
 				WHERE mr_rs.message_id = msg.id
 				  AND mr_rs.recipient_type IN ('to', 'cc', 'bcc')
 				  AND (p_rs.email_address ILIKE ? ESCAPE '\' OR p_rs.display_name ILIKE ? ESCAPE '\')
 			)`)
-			args = append(args, termPattern, termPattern)
-		case ViewLabels:
-			conditions = append(conditions, `EXISTS (
-				SELECT 1 FROM ml ml_rs
-				JOIN lbl lbl_rs ON lbl_rs.id = ml_rs.label_id
-				WHERE ml_rs.message_id = msg.id
-				  AND lbl_rs.name ILIKE ? ESCAPE '\'
-			)`)
-			args = append(args, termPattern)
+			termArgs = append(termArgs, termPattern, termPattern)
 		default:
-			// Default: search subject, snippet, and sender
-			conditions = append(conditions, `(
-				msg.subject ILIKE ? ESCAPE '\' OR
-				COALESCE(msg.snippet, '') ILIKE ? ESCAPE '\' OR
-				EXISTS (
-					SELECT 1 FROM mr mr_search
-					JOIN p p_search ON p_search.id = mr_search.participant_id
-					WHERE mr_search.message_id = msg.id
-					  AND mr_search.recipient_type = 'from'
-					  AND (p_search.email_address ILIKE ? ESCAPE '\' OR p_search.display_name ILIKE ? ESCAPE '\')
-				)
-			)`)
-			args = append(args, termPattern, termPattern, termPattern, termPattern)
+			// Other views use only the shared message and sender predicates.
 		}
+		conditions = append(conditions, "("+strings.Join(parts, " OR ")+")")
+		args = append(args, termArgs...)
 	}
 
 	// Non-text filters (from:, to:, subject:, label:, etc.) are the same
@@ -1047,11 +1221,12 @@ func (e *DuckDBEngine) buildWhereClause(opts AggregateOptions, keyColumns ...str
 	var conditions []string
 	var args []any
 
-	if !hasExplicitMessageTypeSearch(opts.SearchQuery) {
+	if defaultsToEmail(search.ParseOR(opts.SearchQuery), nil, opts.AccountScopes) {
 		conditions = append(conditions, emailOnlyFilterMsg)
 	}
 	conditions = append(conditions, store.LiveMessagesWhere("msg", opts.HideDeletedFromSource))
 	conditions, args = appendSourceFilter(conditions, args, "msg.", opts.SourceID, opts.SourceIDs)
+	conditions, args = appendAccountScopeConditions(conditions, args, opts.AccountScopes, "msg")
 
 	if opts.After != nil {
 		conditions = append(conditions, "msg.sent_at >= CAST(? AS TIMESTAMP)")
@@ -1068,7 +1243,7 @@ func (e *DuckDBEngine) buildWhereClause(opts AggregateOptions, keyColumns ...str
 	}
 
 	// Text search filter for aggregates - filter on view's key columns
-	searchConds, searchArgs := e.buildAggregateSearchConditions(opts.SearchQuery, keyColumns...)
+	searchConds, searchArgs := e.buildAggregateSearchConditions(parseAnalyticsSearch(opts.SearchQuery, defaultsToEmail(nil, nil, opts.AccountScopes)), keyColumns...)
 	conditions = append(conditions, searchConds...)
 	args = append(args, searchArgs...)
 
@@ -1092,11 +1267,21 @@ func timeExpr(g TimeGranularity) string {
 
 // aggViewDef defines the varying parts of an aggregate query for each view type.
 type aggViewDef struct {
-	keyExpr    string // SQL expression for the grouping key (e.g. "p.email_address")
+	keyExpr    string // SQL expression returned as the grouping key (e.g. "p.email_address")
+	groupExpr  string // SQL expression used to group key-equivalent rows
 	joinClause string // JOIN clause specific to this view
 	nullGuard  string // WHERE condition to exclude NULL keys
 	// keyColumns for buildWhereClause search filtering (passed through to buildAggregateSearchConditions)
 	keyColumns []string
+}
+
+func aggregateNameKeyColumns(mrAlias, pAlias string) []string {
+	return []string{
+		mrAlias + ".display_name",
+		pAlias + ".email_address",
+		pAlias + ".display_name",
+		pAlias + ".phone_number",
+	}
 }
 
 // getViewDef returns the aggregate query definition for a given view type.
@@ -1129,7 +1314,7 @@ func getViewDef(view ViewType, granularity TimeGranularity, tablePrefix string) 
 			keyExpr:    nameExpr,
 			joinClause: fmt.Sprintf("JOIN mr %s ON %s.message_id = msg.id AND %s.recipient_type = 'from'\n\t\t\t\tJOIN p %s ON %s.id = %s.participant_id", mrAlias, mrAlias, mrAlias, pAlias, pAlias, mrAlias),
 			nullGuard:  nameExpr + " != ''",
-			keyColumns: []string{mrAlias + ".display_name", pAlias + ".email_address", pAlias + ".display_name", pAlias + ".phone_number"},
+			keyColumns: aggregateNameKeyColumns(mrAlias, pAlias),
 		}, nil
 	case ViewRecipients:
 		return aggViewDef{
@@ -1144,7 +1329,7 @@ func getViewDef(view ViewType, granularity TimeGranularity, tablePrefix string) 
 			keyExpr:    nameExpr,
 			joinClause: fmt.Sprintf("JOIN mr %s ON %s.message_id = msg.id AND %s.recipient_type IN ('to', 'cc', 'bcc')\n\t\t\t\tJOIN p %s ON %s.id = %s.participant_id", mrAlias, mrAlias, mrAlias, pAlias, pAlias, mrAlias),
 			nullGuard:  nameExpr + " != ''",
-			keyColumns: []string{mrAlias + ".display_name", pAlias + ".email_address", pAlias + ".display_name", pAlias + ".phone_number"},
+			keyColumns: aggregateNameKeyColumns(mrAlias, pAlias),
 		}, nil
 	case ViewDomains:
 		return aggViewDef{
@@ -1158,6 +1343,15 @@ func getViewDef(view ViewType, granularity TimeGranularity, tablePrefix string) 
 			joinClause: fmt.Sprintf("JOIN ml %s ON %s.message_id = msg.id\n\t\t\t\tJOIN lbl %s ON %s.id = %s.label_id", mlAlias, mlAlias, lblAlias, lblAlias, mlAlias),
 			nullGuard:  lblAlias + ".name IS NOT NULL",
 			keyColumns: []string{lblAlias + ".name"},
+		}, nil
+	case ViewLists:
+		return aggViewDef{
+			// List-Id drills compare case-insensitively. Group by that same
+			// equivalence relation, while MIN retains one unmodified stored
+			// spelling as the stable representative key.
+			keyExpr:   "MIN(msg.list_id)",
+			groupExpr: "LOWER(msg.list_id)",
+			nullGuard: "msg.list_id IS NOT NULL AND msg.list_id != ''",
 		}, nil
 	case ViewTime:
 		return aggViewDef{
@@ -1180,6 +1374,10 @@ func (e *DuckDBEngine) runAggregation(ctx context.Context, def aggViewDef, where
 	if def.nullGuard != "" {
 		fullWhere += " AND " + def.nullGuard
 	}
+	groupExpr := def.keyExpr
+	if def.groupExpr != "" {
+		groupExpr = def.groupExpr
+	}
 
 	query := fmt.Sprintf(`
 		WITH %s
@@ -1200,7 +1398,7 @@ func (e *DuckDBEngine) runAggregation(ctx context.Context, def aggViewDef, where
 		)
 		%s
 		LIMIT ?
-	`, e.parquetCTEs(), def.keyExpr, def.joinClause, fullWhere, def.keyExpr, e.sortClause(opts))
+	`, e.parquetCTEs(), def.keyExpr, def.joinClause, fullWhere, groupExpr, e.sortClause(opts))
 
 	args = append(args, limit)
 	return e.executeAggregateQuery(ctx, query, args)
@@ -1257,6 +1455,7 @@ func (e *DuckDBEngine) buildFilterConditions(filter MessageFilter) (string, []an
 
 	conditions = append(conditions, store.LiveMessagesWhere("msg", filter.HideDeletedFromSource))
 	conditions, args = appendSourceFilter(conditions, args, "msg.", filter.SourceID, filter.SourceIDs)
+	conditions, args = appendAccountScopeConditions(conditions, args, filter.AccountScopes, "msg")
 
 	if filter.ConversationID != nil {
 		conditions = append(conditions, "msg.conversation_id = ?")
@@ -1283,6 +1482,11 @@ func (e *DuckDBEngine) buildFilterConditions(filter MessageFilter) (string, []an
 			conditions = append(conditions, condition)
 			args = append(args, conditionArgs...)
 		}
+	}
+
+	if filter.ListID != "" {
+		conditions = append(conditions, "LOWER(msg.list_id) = LOWER(?)")
+		args = append(args, filter.ListID)
 	}
 
 	// Sender + sender-name filters - check both message_recipients (email)
@@ -1376,19 +1580,19 @@ func (e *DuckDBEngine) buildFilterConditions(filter MessageFilter) (string, []an
 			JOIN p ON p.id = mr.participant_id
 			WHERE mr.message_id = msg.id
 			  AND mr.recipient_type IN ('to', 'cc', 'bcc')
-			  AND p.email_address = ?
+			  AND (p.email_address = ? OR p.phone_number = ?)
 			  AND %s = ?
 		)`, recipientNameExpr("mr", "p")))
-		args = append(args, filter.Recipient, filter.RecipientName)
+		args = append(args, filter.Recipient, filter.Recipient, filter.RecipientName)
 	} else if filter.Recipient != "" {
 		conditions = append(conditions, `EXISTS (
 			SELECT 1 FROM mr
 			JOIN p ON p.id = mr.participant_id
 			WHERE mr.message_id = msg.id
 			  AND mr.recipient_type IN ('to', 'cc', 'bcc')
-			  AND p.email_address = ?
+			  AND (p.email_address = ? OR p.phone_number = ?)
 		)`)
-		args = append(args, filter.Recipient)
+		args = append(args, filter.Recipient, filter.Recipient)
 	} else if filter.MatchesEmpty(ViewRecipients) {
 		conditions = append(conditions, "NOT EXISTS (SELECT 1 FROM mr WHERE mr.message_id = msg.id AND mr.recipient_type IN ('to', 'cc', 'bcc'))")
 	}
@@ -1422,9 +1626,9 @@ func (e *DuckDBEngine) buildFilterConditions(filter MessageFilter) (string, []an
 			JOIN p ON p.id = mr.participant_id
 			WHERE mr.message_id = msg.id
 			  AND mr.recipient_type = 'from'
-			  AND p.domain = ?
+			  AND LOWER(p.domain) = ?
 		)`)
-		args = append(args, filter.Domain)
+		args = append(args, strings.ToLower(filter.Domain))
 	} else if filter.MatchesEmpty(ViewDomains) {
 		conditions = append(conditions, `NOT EXISTS (
 			SELECT 1 FROM mr
@@ -1478,6 +1682,17 @@ func inferTimeGranularity(base TimeGranularity, period string) TimeGranularity {
 // SubAggregate performs aggregation on a filtered subset of messages.
 // This is used for sub-grouping after drill-down.
 func (e *DuckDBEngine) SubAggregate(ctx context.Context, filter MessageFilter, groupBy ViewType, opts AggregateOptions) ([]AggregateRow, error) {
+	// SQLite owns body-aware aggregate search. Keep rendering on the same
+	// predicate used by aggregate deletion resolution so a body-only match
+	// cannot be staged from a row that DuckDB omitted.
+	if strings.TrimSpace(opts.SearchQuery) != "" && e.sqliteEngine != nil {
+		return e.sqliteEngine.SubAggregate(ctx, filter, groupBy, opts)
+	}
+	if opts.SourceIDs != nil || opts.SourceID != nil {
+		filter.SourceID = nil
+		filter.SourceIDs = nil
+	}
+
 	release, err := e.acquireQuerySlot(ctx)
 	if err != nil {
 		return nil, err
@@ -1495,14 +1710,15 @@ func (e *DuckDBEngine) SubAggregate(ctx context.Context, filter MessageFilter, g
 		filter.HideDeletedFromSource = true
 	}
 	where, args := e.buildFilterConditions(filter)
-	if strings.TrimSpace(filter.MessageType) == "" && !hasExplicitMessageTypeSearch(opts.SearchQuery) {
+	if defaultsToEmail(search.ParseOR(opts.SearchQuery), &filter, opts.AccountScopes) {
 		where += " AND " + emailOnlyFilterMsg
 	}
 
-	// Add opts-based conditions (source_id, date range, attachment filter)
-	if opts.SourceID != nil {
-		where += " AND msg.source_id = ?"
-		args = append(args, *opts.SourceID)
+	// Add opts-based conditions (source IDs, date range, attachment filter).
+	whereParts, args := appendSourceFilter(nil, args, "msg.", opts.SourceID, opts.SourceIDs)
+	whereParts, args = appendAccountScopeConditions(whereParts, args, opts.AccountScopes, "msg")
+	if len(whereParts) > 0 {
+		where += " AND " + strings.Join(whereParts, " AND ")
 	}
 	if opts.After != nil {
 		where += " AND msg.sent_at >= CAST(? AS TIMESTAMP)"
@@ -1517,7 +1733,7 @@ func (e *DuckDBEngine) SubAggregate(ctx context.Context, filter MessageFilter, g
 	}
 
 	// Add search query conditions using the view's key columns
-	searchConds, searchArgs := e.buildAggregateSearchConditions(opts.SearchQuery, def.keyColumns...)
+	searchConds, searchArgs := e.buildAggregateSearchConditions(parseAnalyticsSearch(opts.SearchQuery, defaultsToEmail(nil, &filter, opts.AccountScopes)), def.keyColumns...)
 	var whereSb1064 strings.Builder
 	for _, cond := range searchConds {
 		whereSb1064.WriteString(" AND " + cond)
@@ -1583,23 +1799,34 @@ func (e *DuckDBEngine) GetTotalStats(ctx context.Context, opts StatsOptions) (*T
 
 	var conditions []string
 	var args []any
-	// Generic analytics default to email; search-result stats opt into the
-	// broader search scope. NULL and '' are legacy email rows.
-	if shouldDefaultStatsToEmail(opts) {
-		conditions = append(conditions, emailOnlyFilterMsg)
-	}
-	conditions = append(conditions, store.LiveMessagesWhere("msg", opts.HideDeletedFromSource))
-	conditions, args = appendSourceFilter(conditions, args, "msg.", opts.SourceID, opts.SourceIDs)
+	if filter := effectiveStatsFilter(opts); filter != nil {
+		filterCondition, filterArgs := e.buildFilterConditions(*filter)
+		if filterCondition != "" {
+			conditions = append(conditions, filterCondition)
+			args = append(args, filterArgs...)
+		}
+		if filter.MessageType == "" && shouldDefaultStatsToEmail(opts) {
+			conditions = append(conditions, emailOnlyFilterMsg)
+		}
+	} else {
+		// Generic analytics default to email; search-result stats opt into the
+		// broader search scope. NULL and '' are legacy email rows.
+		if shouldDefaultStatsToEmail(opts) {
+			conditions = append(conditions, emailOnlyFilterMsg)
+		}
+		conditions = append(conditions, store.LiveMessagesWhere("msg", opts.HideDeletedFromSource))
+		conditions, args = appendSourceFilter(conditions, args, "msg.", opts.SourceID, opts.SourceIDs)
 
-	if opts.WithAttachmentsOnly {
-		conditions = append(conditions, "msg.has_attachments = 1")
+		if opts.WithAttachmentsOnly {
+			conditions = append(conditions, "msg.has_attachments = 1")
+		}
 	}
 
 	// Search filter — uses EXISTS subqueries so no row multiplication.
 	// For 1:N views (Recipients, RecipientNames, Labels), filter on the
 	// grouping key columns so stats match the visible aggregate rows.
 	if opts.SearchQuery != "" {
-		searchConds, searchArgs := e.buildStatsSearchConditions(opts.SearchQuery, opts.GroupBy)
+		searchConds, searchArgs := e.buildStatsSearchConditions(parseAnalyticsSearch(opts.SearchQuery, !opts.SearchScope && defaultsToEmail(nil, opts.Filter, nil)), opts.GroupBy)
 		conditions = append(conditions, searchConds...)
 		args = append(args, searchArgs...)
 	}
@@ -1662,6 +1889,15 @@ func (e *DuckDBEngine) GetTotalStats(ctx context.Context, opts StatsOptions) (*T
 	return stats, nil
 }
 
+// ListVirtualAccounts reads the virtual account catalog through the live
+// SQLite engine, or returns none when only the Parquet cache is available.
+func (e *DuckDBEngine) ListVirtualAccounts(ctx context.Context) (map[int64][]store.VirtualAccount, error) {
+	if e.sqliteEngine != nil {
+		return e.sqliteEngine.ListVirtualAccounts(ctx)
+	}
+	return map[int64][]store.VirtualAccount{}, nil
+}
+
 // ListAccounts returns accounts from SQLite via DuckDB's sqlite_scan,
 // or via direct SQLite connection on platforms without sqlite_scanner.
 func (e *DuckDBEngine) ListAccounts(ctx context.Context) ([]AccountInfo, error) {
@@ -1673,7 +1909,7 @@ func (e *DuckDBEngine) ListAccounts(ctx context.Context) ([]AccountInfo, error) 
 	}
 
 	rows, err := e.db.QueryContext(ctx, `
-		SELECT id, source_type, identifier, COALESCE(display_name, '')
+		SELECT id, source_type, identifier, COALESCE(display_name, ''), last_sync_at
 		FROM sqlite_db.sources
 		ORDER BY identifier
 	`)
@@ -1685,8 +1921,13 @@ func (e *DuckDBEngine) ListAccounts(ctx context.Context) ([]AccountInfo, error) 
 	var accounts []AccountInfo
 	for rows.Next() {
 		var acc AccountInfo
-		if err := rows.Scan(&acc.ID, &acc.SourceType, &acc.Identifier, &acc.DisplayName); err != nil {
+		var lastSyncAt sql.NullTime
+		if err := rows.Scan(&acc.ID, &acc.SourceType, &acc.Identifier, &acc.DisplayName, &lastSyncAt); err != nil {
 			return nil, fmt.Errorf("scan account: %w", err)
+		}
+		if lastSyncAt.Valid {
+			syncedAt := lastSyncAt.Time.UTC()
+			acc.LastSyncAt = &syncedAt
 		}
 		accounts = append(accounts, acc)
 	}
@@ -1965,10 +2206,10 @@ func (e *DuckDBEngine) GetMessage(ctx context.Context, id int64) (*MessageDetail
 
 // GetMessageBySourceID retrieves a message by source ID from SQLite.
 // Uses direct SQLite connection when available for better BLOB handling.
-func (e *DuckDBEngine) GetMessageBySourceID(ctx context.Context, sourceMessageID string) (*MessageDetail, error) {
+func (e *DuckDBEngine) GetMessageBySourceID(ctx context.Context, sourceMessageID string, sourceIDs []int64) (*MessageDetail, error) {
 	// Prefer direct SQLite for body/BLOB retrieval
 	if e.sqliteEngine != nil {
-		return e.sqliteEngine.GetMessageBySourceID(ctx, sourceMessageID)
+		return e.sqliteEngine.GetMessageBySourceID(ctx, sourceMessageID, sourceIDs)
 	}
 
 	// Fall back to sqlite_scan
@@ -1976,7 +2217,8 @@ func (e *DuckDBEngine) GetMessageBySourceID(ctx context.Context, sourceMessageID
 		return nil, errors.New("GetMessageBySourceID requires SQLite: pass sqlitePath to NewDuckDBEngine")
 	}
 
-	return e.getMessageByQuery(ctx, "m.source_message_id = ?", sourceMessageID)
+	conditions, args := appendSourceFilter([]string{"m.source_message_id = ?"}, []any{sourceMessageID}, "m.", nil, sourceIDs)
+	return e.getMessageByQuery(ctx, strings.Join(conditions, " AND "), args...)
 }
 
 // GetAttachment retrieves attachment metadata by ID.
@@ -2016,6 +2258,10 @@ func (e *DuckDBEngine) Search(ctx context.Context, q *search.Query, limit, offse
 	// Prefer direct SQLite for FTS5 support
 	if e.sqliteEngine != nil {
 		return e.sqliteEngine.Search(ctx, q, limit, offset)
+	}
+
+	if q.HasOR() {
+		return nil, errors.New("pipe OR requires a direct SQLite engine")
 	}
 
 	// Fall back to sqlite_scan with LIKE queries (no FTS)
@@ -2085,6 +2331,26 @@ func (e *DuckDBEngine) Search(ctx context.Context, q *search.Query, limit, offse
 		}
 	}
 
+	// List-Id filters use literal, case-insensitive substring matching.
+	// Keep one predicate per term so repeated list: operators are ANDed.
+	for _, listID := range q.ListIDs {
+		if strings.TrimSpace(listID) == "" {
+			continue
+		}
+		conditions = append(conditions, "m.list_id ILIKE ? ESCAPE '\\'")
+		args = append(args, "%"+escapeSQLiteLike(listID)+"%")
+	}
+	// account: and received: match the derived account projection.
+	if accountConditions, accountArgs := search.AccountConditions(q, "m"); len(accountConditions) > 0 {
+		conditions = append(conditions, accountConditions...)
+		args = append(args, accountArgs...)
+	}
+	conditions, args = appendAccountScopeConditions(conditions, args, q.AccountScopes, "m")
+	for _, filename := range q.Filenames {
+		conditions = append(conditions, `EXISTS (SELECT 1 FROM sqlite_db.attachments fa WHERE fa.message_id = m.id AND fa.filename ILIKE ? ESCAPE '\')`)
+		args = append(args, "%"+escapeILIKE(filename)+"%")
+	}
+
 	if len(q.MessageTypes) > 0 {
 		condition, conditionArgs := duckDBMessageTypeCondition("m", q.MessageTypes)
 		if condition != "" {
@@ -2130,6 +2396,9 @@ func (e *DuckDBEngine) Search(ctx context.Context, q *search.Query, limit, offse
 
 	// Account filter
 	conditions, args = appendSourceFilter(conditions, args, "m.", nil, q.AccountIDs)
+	conditions, args = appendConversationFilter(
+		conditions, args, "m.conversation_id", q.ConversationIDs,
+	)
 
 	if limit == 0 {
 		limit = 100
@@ -2217,10 +2486,32 @@ func (e *DuckDBEngine) Search(ctx context.Context, q *search.Query, limit, offse
 	return results, nil
 }
 
+// SearchDeep delegates complete filtered full-text search to the direct
+// transactional engine. The Parquet cache does not contain message bodies.
+func (e *DuckDBEngine) SearchDeep(
+	ctx context.Context, q *search.Query, filter MessageFilter, limit, offset int,
+) ([]MessageSummary, error) {
+	if e.sqliteEngine == nil {
+		return nil, errors.New("SearchDeep requires a direct SQLite engine")
+	}
+	return e.sqliteEngine.SearchDeep(ctx, q, filter, limit, offset)
+}
+
+// SearchDeepWithStats delegates to SQLite because the Parquet cache does not
+// contain message bodies.
+func (e *DuckDBEngine) SearchDeepWithStats(
+	ctx context.Context, q *search.Query, filter MessageFilter, limit, offset int,
+) (*SearchFastResult, error) {
+	if e.sqliteEngine == nil {
+		return nil, errors.New("SearchDeepWithStats requires a direct SQLite engine")
+	}
+	return e.sqliteEngine.SearchDeepWithStats(ctx, q, filter, limit, offset)
+}
+
 // SearchMessageBodies delegates to the direct SQLite engine so FTS5 can scope
 // MATCH to the indexed body column. The sqlite_scanner fallback is
 // intentionally unsupported: exact body search must never scan message_bodies.
-func (e *DuckDBEngine) SearchMessageBodies(ctx context.Context, q *search.Query, limit, offset int) ([]MessageSummary, error) {
+func (e *DuckDBEngine) SearchMessageBodies(ctx context.Context, q *search.Query, limit, offset int) (*SearchFastResult, error) {
 	if e.sqliteEngine == nil {
 		return nil, fmt.Errorf("%w: a direct SQLite engine is required; reopen the query engine with a SQLite connection", ErrMessageBodySearchUnavailable)
 	}
@@ -2230,18 +2521,16 @@ func (e *DuckDBEngine) SearchMessageBodies(ctx context.Context, q *search.Query,
 // SearchByDomains returns message summaries for the given sender domains.
 // It delegates to SQLite because domain search needs JOINs across
 // participants and message_recipients that the Parquet cache doesn't carry.
-func (e *DuckDBEngine) SearchByDomains(ctx context.Context, domains []string, after, before *time.Time, limit, offset int) ([]MessageSummary, error) {
+func (e *DuckDBEngine) SearchByDomains(ctx context.Context, domains []string, after, before *time.Time, limit, offset int, sourceIDs []int64) (DomainSearchResult, error) {
 	// Delegate to SQLite — domain search requires JOINs across participants
 	// and message_recipients which are not available in the Parquet cache.
 	if e.sqliteEngine != nil {
-		return e.sqliteEngine.SearchByDomains(ctx, domains, after, before, limit, offset)
+		return e.sqliteEngine.SearchByDomains(ctx, domains, after, before, limit, offset, sourceIDs)
 	}
-	return nil, errors.New("SearchByDomains requires SQLite engine (participant data not in Parquet cache)")
+	return DomainSearchResult{}, errors.New("SearchByDomains requires SQLite engine (participant data not in Parquet cache)")
 }
 
 func (e *DuckDBEngine) GetDeletionTargetsByFilter(ctx context.Context, filter MessageFilter) ([]DeletionTarget, error) {
-	// Delegate to SQLite for authoritative deletion status.
-	// Parquet cache may be stale if deletions occurred after the last build.
 	if e.sqliteEngine != nil {
 		return e.sqliteEngine.GetDeletionTargetsByFilter(ctx, filter)
 	}
@@ -2256,157 +2545,22 @@ func (e *DuckDBEngine) GetDeletionTargetsByFilter(ctx context.Context, filter Me
 	}
 	defer release()
 
-	var conditions []string
-	var args []any
+	// This surface feeds remote-deletion staging, so it always excludes
+	// source-deleted messages. Reuse the complete Parquet filter rather than
+	// maintaining a second, partial copy for the fallback path.
+	filter.HideDeletedFromSource = true
+	where, args := e.buildFilterConditions(filter)
+	where += " AND NOT msg.archive_only"
 
-	// Always exclude deleted messages.
-	// Always pass true: this surface feeds remote-deletion staging and
-	// must never honor an opt-in.
-	conditions = append(conditions, store.LiveMessagesWhere("msg", true))
-	conditions, args = appendSourceFilter(conditions, args, "msg.", filter.SourceID, filter.SourceIDs)
-	if filter.MessageType != "" {
-		condition, conditionArgs := duckDBMessageTypeCondition("msg", []string{filter.MessageType})
-		if condition != "" {
-			conditions = append(conditions, condition)
-			args = append(args, conditionArgs...)
-		}
-	}
-
-	// Use EXISTS subqueries for filtering (becomes semi-joins, no duplicates).
-	// When BOTH the email and the display name are filtered, they must match
-	// the SAME from-row (or the SAME direct sender), not two independent
-	// EXISTS that a multi-author message could satisfy via different rows.
-	if filter.Sender != "" && filter.SenderName != "" {
-		conditions = append(conditions, fmt.Sprintf(`(EXISTS (
-			SELECT 1 FROM mr
-			JOIN p ON p.id = mr.participant_id
-			WHERE mr.message_id = msg.id
-			  AND mr.recipient_type = 'from'
-			  AND (p.email_address = ? OR p.phone_number = ?)
-			  AND %s = ?
-		) OR EXISTS (
-			SELECT 1 FROM p
-			WHERE p.id = msg.sender_id
-			  AND (p.email_address = ? OR p.phone_number = ?)
-			  AND %s = ?
-		))`, recipientNameExpr("mr", "p"), participantNameExpr("p")))
-		args = append(args, filter.Sender, filter.Sender, filter.SenderName, filter.Sender, filter.Sender, filter.SenderName)
-	} else if filter.Sender != "" {
-		conditions = append(conditions, `(EXISTS (
-			SELECT 1 FROM mr
-			JOIN p ON p.id = mr.participant_id
-			WHERE mr.message_id = msg.id
-			  AND mr.recipient_type = 'from'
-			  AND (p.email_address = ? OR p.phone_number = ?)
-		) OR EXISTS (
-			SELECT 1 FROM p
-			WHERE p.id = msg.sender_id
-			  AND (p.email_address = ? OR p.phone_number = ?)
-		))`)
-		args = append(args, filter.Sender, filter.Sender, filter.Sender, filter.Sender)
-	} else if filter.SenderName != "" {
-		conditions = append(conditions, fmt.Sprintf(`(EXISTS (
-			SELECT 1 FROM mr
-			JOIN p ON p.id = mr.participant_id
-			WHERE mr.message_id = msg.id
-			  AND mr.recipient_type = 'from'
-			  AND %s = ?
-		) OR EXISTS (
-			SELECT 1 FROM p
-			WHERE p.id = msg.sender_id
-			  AND %s = ?
-		))`, recipientNameExpr("mr", "p"), participantNameExpr("p")))
-		args = append(args, filter.SenderName, filter.SenderName)
-	}
-
-	// When BOTH the recipient email and the display name are filtered, they
-	// must match the SAME to/cc/bcc row, not two independent EXISTS that a
-	// multi-recipient message could satisfy via different rows.
-	if filter.Recipient != "" && filter.RecipientName != "" {
-		conditions = append(conditions, fmt.Sprintf(`EXISTS (
-			SELECT 1 FROM mr
-			JOIN p ON p.id = mr.participant_id
-			WHERE mr.message_id = msg.id
-			  AND mr.recipient_type IN ('to', 'cc', 'bcc')
-			  AND p.email_address = ?
-			  AND %s = ?
-		)`, recipientNameExpr("mr", "p")))
-		args = append(args, filter.Recipient, filter.RecipientName)
-	} else if filter.Recipient != "" {
-		conditions = append(conditions, `EXISTS (
-			SELECT 1 FROM mr
-			JOIN p ON p.id = mr.participant_id
-			WHERE mr.message_id = msg.id
-			  AND mr.recipient_type IN ('to', 'cc', 'bcc')
-			  AND p.email_address = ?
-		)`)
-		args = append(args, filter.Recipient)
-	} else if filter.RecipientName != "" {
-		conditions = append(conditions, fmt.Sprintf(`EXISTS (
-			SELECT 1 FROM mr
-			JOIN p ON p.id = mr.participant_id
-			WHERE mr.message_id = msg.id
-			  AND mr.recipient_type IN ('to', 'cc', 'bcc')
-			  AND %s = ?
-		)`, recipientNameExpr("mr", "p")))
-		args = append(args, filter.RecipientName)
-	}
-
-	if filter.Domain != "" {
-		conditions = append(conditions, `EXISTS (
-			SELECT 1 FROM mr
-			JOIN p ON p.id = mr.participant_id
-			WHERE mr.message_id = msg.id
-			  AND mr.recipient_type = 'from'
-			  AND p.domain = ?
-		)`)
-		args = append(args, filter.Domain)
-	}
-
-	if filter.Label != "" {
-		conditions = append(conditions, `EXISTS (
-			SELECT 1 FROM ml
-			JOIN lbl ON lbl.id = ml.label_id
-			WHERE ml.message_id = msg.id
-			  AND lbl.name ILIKE ? ESCAPE '\'
-		)`)
-		args = append(args, escapeILIKE(filter.Label))
-	}
-
-	if filter.TimeRange.Period != "" {
-		granularity := inferTimeGranularity(filter.TimeRange.Granularity, filter.TimeRange.Period)
-		// GetDeletionTargetsByFilter uses strftime for time filtering (no year/month columns)
-		var te string
-		switch granularity {
-		case TimeYear:
-			te = "strftime(msg.sent_at, '%Y')"
-		case TimeDay:
-			te = "strftime(msg.sent_at, '%Y-%m-%d')"
-		default:
-			te = "strftime(msg.sent_at, '%Y-%m')"
-		}
-		conditions = append(conditions, te+" = ?")
-		args = append(args, filter.TimeRange.Period)
-	}
-
-	if filter.After != nil {
-		conditions = append(conditions, "msg.sent_at >= CAST(? AS TIMESTAMP)")
-		args = append(args, queryTimeUTC(*filter.After))
-	}
-	if filter.Before != nil {
-		conditions = append(conditions, "msg.sent_at < CAST(? AS TIMESTAMP)")
-		args = append(args, queryTimeUTC(*filter.Before))
-	}
-
-	// Build query — JOIN src to scope to Gmail sources authoritatively.
+	// Build query — JOIN src to scope to deletable sources authoritatively.
 	query := fmt.Sprintf(`
 		WITH %s
 		SELECT msg.id, msg.source_id, COALESCE(src.source_type, 'gmail'), src.account_email, msg.source_message_id
 		FROM msg
-		JOIN src ON src.id = msg.source_id AND COALESCE(src.source_type, 'gmail') = 'gmail'
+		JOIN src ON src.id = msg.source_id AND COALESCE(src.source_type, 'gmail') IN `+deletableSourceTypesSQL+`
 		WHERE %s
 		ORDER BY msg.sent_at DESC, msg.id DESC
-	`, e.parquetCTEs(), strings.Join(conditions, " AND "))
+	`, e.parquetCTEs(), where)
 
 	// Only add LIMIT if explicitly set (0 means no limit)
 	if filter.Pagination.Limit > 0 {
@@ -2421,6 +2575,35 @@ func (e *DuckDBEngine) GetDeletionTargetsByFilter(ctx context.Context, filter Me
 	defer func() { _ = rows.Close() }()
 
 	return collectDeletionTargets(rows)
+}
+
+func (e *DuckDBEngine) GetDeletionTargetsBySearch(
+	ctx context.Context,
+	searchQuery *search.Query,
+	filter MessageFilter,
+	mode DeletionSearchMode,
+) ([]DeletionTarget, error) {
+	// Search deletion eligibility is authoritative transactional state. The
+	// daemon opens DuckDB with this direct SQLite engine in normal operation.
+	if e.sqliteEngine == nil {
+		return nil, errors.New("GetDeletionTargetsBySearch requires a direct SQLite engine")
+	}
+	return e.sqliteEngine.GetDeletionTargetsBySearch(ctx, searchQuery, filter, mode)
+}
+
+// GetDeletionTargetsByAggregateSearch resolves the complete aggregate scope
+// against authoritative SQLite state.
+func (e *DuckDBEngine) GetDeletionTargetsByAggregateSearch(
+	ctx context.Context,
+	searchQuery string,
+	filter MessageFilter,
+	groupBy ViewType,
+	key string,
+) ([]DeletionTarget, error) {
+	if e.sqliteEngine == nil {
+		return nil, errors.New("GetDeletionTargetsByAggregateSearch requires a direct SQLite engine")
+	}
+	return e.sqliteEngine.GetDeletionTargetsByAggregateSearch(ctx, searchQuery, filter, groupBy, key)
 }
 
 func (e *DuckDBEngine) GetDeletionTargetsByMessageIDs(ctx context.Context, ids []int64) ([]DeletionTarget, error) {
@@ -2453,9 +2636,9 @@ func (e *DuckDBEngine) deletionTargetsForMessageIDChunk(ctx context.Context, ids
 		SELECT msg.id, msg.source_id, COALESCE(src.source_type, 'gmail'), src.account_email,
 		       msg.source_message_id, msg.sent_at
 		FROM msg
-		JOIN src ON src.id = msg.source_id AND COALESCE(src.source_type, 'gmail') = 'gmail'
-		WHERE %s AND msg.id IN (%s)
-	`, e.parquetCTEs(), store.LiveMessagesWhere("msg", true), strings.Join(placeholders, ","))
+		JOIN src ON src.id = msg.source_id AND COALESCE(src.source_type, 'gmail') IN `+deletableSourceTypesSQL+`
+		       WHERE %s AND %s AND NOT msg.archive_only AND COALESCE(msg.source_message_id, '') <> '' AND msg.id IN (%s)
+	`, e.parquetCTEs(), store.LiveMessagesWhere("msg", true), emailOnlyFilterMsg, strings.Join(placeholders, ","))
 	rows, err := e.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("get deletion targets by message ids: %w", err)
@@ -2479,10 +2662,13 @@ var RequiredParquetDirs = []string{
 	datasetConversationParticipants,
 	datasetOwnerParticipants,
 	datasetParticipantClusters,
+	datasetPersonDisplayNames,
 	identityindex.DatasetActivity,
 	identityindex.DatasetPeople,
 	identityindex.DatasetDomains,
 	identityindex.DatasetRelationshipDaily,
+	identityindex.DatasetLogicalContributions,
+	identityindex.DatasetTemperatureContributions,
 }
 
 // SearchFast searches message metadata in Parquet files (no body text).
@@ -2674,7 +2860,7 @@ func searchCacheKeyFor(conditions []string, args []any, cacheFP string) string {
 		A  []any    `json:"a"`
 		FP string   `json:"fp"`
 	}{conditions, args, cacheFP}
-	b, err := json.Marshal(key)
+	b, err := json.Marshal(key, json.Deterministic(true))
 	if err != nil {
 		// Fallback: should never happen with the types buildSearchConditions produces.
 		return fmt.Sprintf("%v#%v#%s", conditions, args, cacheFP)
@@ -2698,7 +2884,18 @@ func (e *DuckDBEngine) dropSearchCache() {
 
 // searchPageFromCache executes Phase 3 (paginated results) from the cached temp table.
 // Returns a SearchFastResult with cached count and stats.
-func (e *DuckDBEngine) searchPageFromCache(ctx context.Context, limit, offset int) (*SearchFastResult, error) {
+func (e *DuckDBEngine) searchPageFromCache(ctx context.Context, limit, offset int, includeStats bool) (*SearchFastResult, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if limit == 0 {
+		result := &SearchFastResult{TotalCount: e.searchCacheCount}
+		if includeStats && e.searchCacheStats != nil {
+			stats := *e.searchCacheStats
+			result.Stats = &stats
+		}
+		return result, nil
+	}
 	pageQuery := fmt.Sprintf(`
 		WITH %s,
 		page AS (
@@ -2748,7 +2945,7 @@ func (e *DuckDBEngine) searchPageFromCache(ctx context.Context, limit, offset in
 
 	// Return a copy of cached stats to prevent callers from mutating the cache
 	var statsCopy *TotalStats
-	if e.searchCacheStats != nil {
+	if includeStats && e.searchCacheStats != nil {
 		tmp := *e.searchCacheStats
 		statsCopy = &tmp
 	}
@@ -2873,12 +3070,13 @@ func (e *DuckDBEngine) SearchFastWithStats(ctx context.Context, q *search.Query,
 
 	conditions, args := e.buildSearchConditions(q, filter)
 
-	if limit == 0 {
-		limit = 100
-	}
+	includeStats := statsGroupBy != ViewNoStats
 
 	e.searchCacheMu.Lock()
 	defer e.searchCacheMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// Check cache: same conditions+args+Parquet fingerprint means same search,
 	// serve from cached table. The fingerprint was refreshed when the query
@@ -2888,10 +3086,17 @@ func (e *DuckDBEngine) SearchFastWithStats(ctx context.Context, q *search.Query,
 	cacheKey := searchCacheKeyFor(conditions, args, e.currentCacheFingerprint())
 	if cacheKey == e.searchCacheKey && e.searchCacheTable != "" {
 		// Retry stats if a previous attempt failed (transient error).
-		if e.searchCacheStats == nil {
-			e.searchCacheStats = e.computeSearchStats(ctx)
+		if includeStats && e.searchCacheStats == nil {
+			stats := e.computeSearchStats(ctx)
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			e.searchCacheStats = stats
 		}
-		return e.searchPageFromCache(ctx, limit, offset)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return e.searchPageFromCache(ctx, limit, offset, includeStats)
 	}
 
 	// Cache miss — drop old cache and materialize fresh.
@@ -2962,97 +3167,45 @@ func (e *DuckDBEngine) SearchFastWithStats(ctx context.Context, q *search.Query,
 		log.Printf("warning: search count query failed (using -1): %v", err)
 		count = -1
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	e.searchCacheCount = count
 
-	// Phase 4: Stats from temp table (compute before page so cache is fully populated).
-	e.searchCacheStats = e.computeSearchStats(ctx)
+	// Optional stats reuse the materialized matches; never cache canceled work.
+	if includeStats {
+		stats := e.computeSearchStats(ctx)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		e.searchCacheStats = stats
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// Store cache key — cache is now valid.
 	e.searchCacheKey = cacheKey
 
 	// Phase 3: Paginated results from cached temp table.
-	return e.searchPageFromCache(ctx, limit, offset)
+	return e.searchPageFromCache(ctx, limit, offset, includeStats)
 }
 
 // buildSearchConditions builds WHERE conditions for search queries.
 // Shared by SearchFast and SearchFastCount.
 // Note: These conditions reference msg and ms (msg_sender) CTEs.
 func (e *DuckDBEngine) buildSearchConditions(q *search.Query, filter MessageFilter) ([]string, []any) {
+	filterWhere, filterArgs := e.buildFilterConditions(filter)
+	conditions, args := e.buildSearchCriteria(q)
+	return append([]string{filterWhere}, conditions...), append(filterArgs, args...)
+}
+
+func (e *DuckDBEngine) buildSearchCriteria(q *search.Query) ([]string, []any) {
+	if q.HasOR() {
+		return store.CombineOR(q, e.buildSearchCriteria)
+	}
 	var conditions []string
 	var args []any
-
-	// Apply basic filter conditions (ignoring join flags for search - we handle those differently)
-	conditions = append(conditions,
-		store.LiveMessagesWhere("msg", filter.HideDeletedFromSource),
-	)
-	messageTypes, noMessageTypeMatches := ScopedMessageTypes(q.MessageTypes, filter.MessageType)
-	switch {
-	case noMessageTypeMatches:
-		conditions = append(conditions, "1=0")
-	case len(messageTypes) > 0:
-		condition, conditionArgs := duckDBMessageTypeCondition("msg", messageTypes)
-		if condition != "" {
-			conditions = append(conditions, condition)
-			args = append(args, conditionArgs...)
-		}
-	}
-	conditions, args = appendSourceFilter(conditions, args, "msg.", filter.SourceID, filter.SourceIDs)
-	if filter.After != nil {
-		conditions = append(conditions, "msg.sent_at >= CAST(? AS TIMESTAMP)")
-		args = append(args, duckDBDateParam(*filter.After))
-	}
-	if filter.Before != nil {
-		conditions = append(conditions, "msg.sent_at < CAST(? AS TIMESTAMP)")
-		args = append(args, duckDBDateParam(*filter.Before))
-	}
-	if filter.WithAttachmentsOnly {
-		conditions = append(conditions, "msg.has_attachments = true")
-	}
-	// Sender filter - check both message_recipients (email/phone) and direct sender_id (WhatsApp/chat)
-	if filter.Sender != "" {
-		conditions = append(conditions, `(EXISTS (
-			SELECT 1 FROM mr
-			JOIN p ON p.id = mr.participant_id
-			WHERE mr.message_id = msg.id
-			  AND mr.recipient_type = 'from'
-			  AND (p.email_address = ? OR p.phone_number = ?)
-		) OR EXISTS (
-			SELECT 1 FROM p
-			WHERE p.id = msg.sender_id
-			  AND (p.email_address = ? OR p.phone_number = ?)
-		))`)
-		args = append(args, filter.Sender, filter.Sender, filter.Sender, filter.Sender)
-	}
-	if filter.Domain != "" {
-		conditions = append(conditions, "ms.from_email ILIKE ?")
-		args = append(args, "%@"+filter.Domain)
-	}
-	// Recipient filter - use EXISTS subquery for drill-down context (checks email and phone)
-	if filter.Recipient != "" {
-		conditions = append(conditions, `EXISTS (
-			SELECT 1 FROM mr
-			JOIN p ON p.id = mr.participant_id
-			WHERE mr.message_id = msg.id
-			  AND mr.recipient_type IN ('to', 'cc', 'bcc')
-			  AND (p.email_address = ? OR p.phone_number = ?)
-		)`)
-		args = append(args, filter.Recipient, filter.Recipient)
-	}
-	// Label filter - use EXISTS subquery for drill-down context
-	if filter.Label != "" {
-		conditions = append(conditions, `EXISTS (
-			SELECT 1 FROM ml
-			JOIN lbl ON lbl.id = ml.label_id
-			WHERE ml.message_id = msg.id
-			  AND lbl.name ILIKE ? ESCAPE '\'
-		)`)
-		args = append(args, escapeILIKE(filter.Label))
-	}
-	if filter.TimeRange.Period != "" {
-		granularity := inferTimeGranularity(filter.TimeRange.Granularity, filter.TimeRange.Period)
-		conditions = append(conditions, timeExpr(granularity)+" = ?")
-		args = append(args, filter.TimeRange.Period)
-	}
 
 	// Text search terms - search subject, snippet, and every participant row
 	// without consulting message bodies (fast path). The EXISTS branch includes
@@ -3106,19 +3259,9 @@ func (e *DuckDBEngine) buildSearchConditions(q *search.Query, filter MessageFilt
 		}
 	}
 
-	// To filter - use EXISTS subquery to check recipients (email and phone)
-	if len(q.ToAddrs) > 0 {
-		for _, addr := range q.ToAddrs {
-			pattern := "%" + escapeILIKE(addr) + "%"
-			conditions = append(conditions, `EXISTS (
-				SELECT 1 FROM mr
-				JOIN p ON p.id = mr.participant_id
-				WHERE mr.message_id = msg.id AND mr.recipient_type IN ('to', 'cc', 'bcc')
-				AND (p.email_address ILIKE ? ESCAPE '\' OR p.phone_number ILIKE ? ESCAPE '\')
-			)`)
-			args = append(args, pattern, pattern)
-		}
-	}
+	conditions, args = appendDuckDBRecipientSearchCondition(conditions, args, q.ToAddrs, "to")
+	conditions, args = appendDuckDBRecipientSearchCondition(conditions, args, q.CcAddrs, "cc")
+	conditions, args = appendDuckDBRecipientSearchCondition(conditions, args, q.BccAddrs, "bcc")
 
 	// Subject filter
 	if len(q.SubjectTerms) > 0 {
@@ -3126,6 +3269,26 @@ func (e *DuckDBEngine) buildSearchConditions(q *search.Query, filter MessageFilt
 			conditions = append(conditions, "msg.subject ILIKE ? ESCAPE '\\'")
 			args = append(args, "%"+escapeILIKE(term)+"%")
 		}
+	}
+
+	// List-Id filters use literal, case-insensitive substring matching.
+	// Keep one predicate per term so repeated list: operators are ANDed.
+	for _, listID := range q.ListIDs {
+		if strings.TrimSpace(listID) == "" {
+			continue
+		}
+		conditions = append(conditions, `msg.list_id ILIKE ? ESCAPE '\'`)
+		args = append(args, "%"+escapeILIKE(listID)+"%")
+	}
+	// account: and received: match the derived account projection.
+	if accountConditions, accountArgs := search.AccountConditions(q, "msg"); len(accountConditions) > 0 {
+		conditions = append(conditions, accountConditions...)
+		args = append(args, accountArgs...)
+	}
+	conditions, args = appendAccountScopeConditions(conditions, args, q.AccountScopes, "msg")
+	for _, filename := range q.Filenames {
+		conditions = append(conditions, e.filenameCondition())
+		args = append(args, "%"+escapeILIKE(filename)+"%")
 	}
 
 	// Label filter - case-insensitive substring match
@@ -3174,6 +3337,9 @@ func (e *DuckDBEngine) buildSearchConditions(q *search.Query, filter MessageFilt
 
 	// Account filter
 	conditions, args = appendSourceFilter(conditions, args, "msg.", nil, q.AccountIDs)
+	conditions, args = appendConversationFilter(
+		conditions, args, "msg.conversation_id", q.ConversationIDs,
+	)
 
 	// Default conditions if none specified
 	if len(conditions) == 0 {
@@ -3181,4 +3347,64 @@ func (e *DuckDBEngine) buildSearchConditions(q *search.Query, filter MessageFilt
 	}
 
 	return conditions, args
+}
+
+func appendDuckDBRecipientSearchCondition(
+	conditions []string,
+	args []any,
+	addresses []string,
+	recipientType string,
+) ([]string, []any) {
+	if len(addresses) == 0 {
+		return conditions, args
+	}
+
+	addressParts := make([]string, 0, len(addresses))
+	recipientArgs := []any{recipientType}
+	for _, address := range addresses {
+		address = strings.ToLower(address)
+		if strings.HasPrefix(address, "@") {
+			addressParts = append(addressParts, `LOWER(p_recipient.email_address) LIKE ? ESCAPE '\'`)
+			recipientArgs = append(recipientArgs, "%"+escapeILIKE(address))
+		} else {
+			addressParts = append(addressParts,
+				"(LOWER(p_recipient.email_address) = ? OR p_recipient.phone_number = ?)")
+			recipientArgs = append(recipientArgs, address, address)
+		}
+	}
+	conditions = append(conditions, fmt.Sprintf(`EXISTS (
+		SELECT 1 FROM mr mr_recipient
+		JOIN p p_recipient ON p_recipient.id = mr_recipient.participant_id
+		WHERE mr_recipient.message_id = msg.id
+		  AND mr_recipient.recipient_type = ?
+		  AND (%s)
+	)`, strings.Join(addressParts, " OR ")))
+	args = append(args, recipientArgs...)
+	return conditions, args
+}
+
+var errOriginalMessageNeedsSQLite = fmt.Errorf("original message export requires the SQLite archive: %w", ErrOriginalExportUnsupported)
+
+// ReadOriginalMessage reads from SQLite; the Parquet cache holds no raw MIME.
+func (e *DuckDBEngine) ReadOriginalMessage(ctx context.Context, ref MessageRef, maxBytes int64) (*OriginalMessage, error) {
+	if e.sqliteEngine == nil {
+		return nil, errOriginalMessageNeedsSQLite
+	}
+	return e.sqliteEngine.ReadOriginalMessage(ctx, ref, maxBytes)
+}
+
+// ResolveMessageID reads from SQLite because the Parquet cache can lag recent syncs.
+func (e *DuckDBEngine) ResolveMessageID(ctx context.Context, ref string) (int64, string, error) {
+	if e.sqliteEngine == nil {
+		return 0, "", errOriginalMessageNeedsSQLite
+	}
+	return e.sqliteEngine.ResolveMessageID(ctx, ref)
+}
+
+// ListThread reads from SQLite because the Parquet cache can lag recent syncs.
+func (e *DuckDBEngine) ListThread(ctx context.Context, q ThreadQuery) (*ThreadPage, error) {
+	if e.sqliteEngine == nil {
+		return nil, errOriginalMessageNeedsSQLite
+	}
+	return e.sqliteEngine.ListThread(ctx, q)
 }

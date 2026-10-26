@@ -9,10 +9,12 @@ import (
 )
 
 const (
-	DatasetActivity          = "relationship_activity"
-	DatasetPeople            = "relationship_people"
-	DatasetDomains           = "relationship_domains"
-	DatasetRelationshipDaily = "relationship_daily"
+	DatasetActivity                 = "relationship_activity"
+	DatasetPeople                   = "relationship_people"
+	DatasetDomains                  = "relationship_domains"
+	DatasetRelationshipDaily        = "relationship_daily"
+	DatasetLogicalContributions     = "relationship_logical_contributions"
+	DatasetTemperatureContributions = "relationship_temperature_contributions"
 
 	ModalityEmail   uint8 = 1
 	ModalityChat    uint8 = 2
@@ -25,7 +27,7 @@ const (
 var (
 	TextMessageTypes = []string{
 		"google_chat", "whatsapp", "imessage", "sms", "mms", "rcs",
-		"google_voice_text", "teams", "discord", "beeper", "slack", "fbmessenger",
+		"google_voice_text", "teams", "discord", "beeper", "slack", "fbmessenger", "matrix", "chatwoot",
 	}
 	ChatFallbackMessageTypes = []string{"", "chat", "text"}
 	ChatConversationTypes    = []string{"direct_chat", "group_chat", "channel", "chat"}
@@ -35,6 +37,8 @@ var (
 		DatasetPeople,
 		DatasetDomains,
 		DatasetRelationshipDaily,
+		DatasetLogicalContributions,
+		DatasetTemperatureContributions,
 	}
 )
 
@@ -45,8 +49,8 @@ type CacheStatsSummary struct {
 	Sources             int64  `json:"sources"`
 	UniqueSenders       int64  `json:"unique_senders"`
 	UniqueDomains       int64  `json:"unique_domains"`
-	MinYear             *int64 `json:"min_year,omitempty"`
-	MaxYear             *int64 `json:"max_year,omitempty"`
+	MinYear             *int64 `json:"min_year,omitzero"`
+	MaxYear             *int64 `json:"max_year,omitzero"`
 	TotalSizeBytes      int64  `json:"total_size_bytes"`
 	AttachmentSizeBytes int64  `json:"attachment_size_bytes"`
 }

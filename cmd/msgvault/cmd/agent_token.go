@@ -1,0 +1,245 @@
+package cmd
+
+import (
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
+	"fmt"
+	"strconv"
+	"strings"
+	"text/tabwriter"
+	"time"
+
+	"github.com/spf13/cobra"
+	"go.kenn.io/msgvault/pkg/client/generated"
+)
+
+var (
+	agentTokenExpires     string
+	agentTokenLabel       string
+	agentTokenPermissions []string
+	agentTokenSourceIDs   string // comma-separated source IDs
+	agentTokenSenders     []string
+	agentTokenJSON        bool
+)
+
+var agentTokenCmd = &cobra.Command{
+	Use:   "agent-token",
+	Short: "Manage restricted agent grant tokens",
+	Long: "Create, list, and revoke restricted agent grant tokens.\n\n" +
+		"Agent tokens allow delegated callers (e.g. AI agents) to perform a\n" +
+		"limited set of operations on behalf of the archive owner without\n" +
+		"exposing the full owner API key. Each token declares the permissions\n" +
+		"and source IDs it may access. A grant is valid until revoked or until\n" +
+		"its optional expiry, or until the daemon restarts.\n\n" +
+		"Requires agent_access = true and api_key to be set in config.toml.",
+}
+
+var agentTokenIssueCmd = &cobra.Command{
+	Use:   "issue",
+	Short: "Issue a new agent grant token",
+	Args:  cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		if agentTokenLabel == "" {
+			return errors.New("--label is required")
+		}
+		sourceIDs, err := parseAgentTokenSourceIDs(agentTokenSourceIDs)
+		if err != nil {
+			return err
+		}
+		senderSelections, err := parseAgentTokenSenders(agentTokenSenders)
+		if err != nil {
+			return err
+		}
+		expires, err := parseAgentTokenExpiry(agentTokenExpires, time.Now())
+		if err != nil {
+			return err
+		}
+		client, _, err := OpenHTTPStore(cmd.Context())
+		if err != nil {
+			return err
+		}
+		result, err := client.IssueAgentToken(cmd.Context(), agentTokenLabel, agentTokenPermissions, sourceIDs, senderSelections, expires)
+		if err != nil {
+			return err
+		}
+		if agentTokenJSON {
+			return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), result, json.Deterministic(true)) // issue output intentionally contains the one-time secret
+		}
+		printAgentTokenIssueResult(cmd, result)
+		return nil
+	},
+}
+
+var agentTokenListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List agent grant tokens, including expired ones",
+	Args:  cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, _ []string) error {
+		client, _, err := OpenHTTPStore(cmd.Context())
+		if err != nil {
+			return err
+		}
+		tokens, err := client.ListAgentTokens(cmd.Context())
+		if err != nil {
+			return err
+		}
+		if agentTokenJSON {
+			return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), map[string]any{"tokens": tokens}, json.Deterministic(true))
+		}
+		printAgentTokenList(cmd, tokens)
+		return nil
+	},
+}
+
+var agentTokenRevokeCmd = &cobra.Command{
+	Use:   "revoke <token-id>",
+	Short: "Revoke an agent grant token by ID",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		id := strings.TrimSpace(args[0])
+		if id == "" {
+			return errors.New("token ID must not be empty")
+		}
+		client, _, err := OpenHTTPStore(cmd.Context())
+		if err != nil {
+			return err
+		}
+		if err := client.RevokeAgentToken(cmd.Context(), id); err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Token revoked.")
+		return nil
+	},
+}
+
+// parseAgentTokenSourceIDs parses the comma-separated source IDs flag.
+func parseAgentTokenSourceIDs(raw string) ([]int64, error) {
+	var ids []int64
+	for part := range strings.SplitSeq(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(part, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid source ID %q: %w", part, err)
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+func parseAgentTokenSenders(values []string) (map[int64][]string, error) {
+	if len(values) == 0 {
+		return nil, nil //nolint:nilnil // Omitted sender selections use the daemon's default.
+	}
+	result := make(map[int64][]string)
+	for _, value := range values {
+		sourceID, address, ok := strings.Cut(value, "=")
+		if !ok || strings.TrimSpace(address) == "" {
+			return nil, errors.New("--sender must use SOURCE_ID=ADDRESS")
+		}
+		id, err := strconv.ParseInt(strings.TrimSpace(sourceID), 10, 64)
+		if err != nil || id <= 0 {
+			return nil, errors.New("invalid sender source ID " + strconv.Quote(sourceID))
+		}
+		result[id] = append(result[id], strings.TrimSpace(address))
+	}
+	return result, nil
+}
+
+func printAgentTokenIssueResult(cmd *cobra.Command, r *generated.AgentTokenIssueResponse) {
+	w := cmd.OutOrStdout()
+	_, _ = fmt.Fprintf(w, "ID:          %s\n", r.ID)
+	_, _ = fmt.Fprintf(w, "Label:       %s\n", r.Label)
+	_, _ = fmt.Fprintf(w, "Permissions: %s\n", strings.Join(r.Permissions, ", "))
+	if len(r.Sources) > 0 {
+		parts := make([]string, len(r.Sources))
+		for i, s := range r.Sources {
+			parts[i] = fmt.Sprintf("%d (%s; senders: %s)", s.ID, s.Identifier, strings.Join(s.SenderKeys, ","))
+		}
+		_, _ = fmt.Fprintf(w, "Sources:     %s\n", strings.Join(parts, ", "))
+	}
+	_, _ = fmt.Fprintf(w, "Created:     %s\n", r.CreatedAt.Format(time.RFC3339))
+	if r.ExpiresAt != nil {
+		_, _ = fmt.Fprintf(w, "Valid until: %s, revocation, or daemon restart\n", r.ExpiresAt.Format(time.RFC3339))
+	} else {
+		_, _ = fmt.Fprintf(w, "Valid until: revoked or daemon restart\n")
+	}
+	if r.DaemonURL != "" {
+		_, _ = fmt.Fprintf(w, "Daemon URL:  %s\n", r.DaemonURL)
+	}
+	_, _ = fmt.Fprintf(w, "\nSecret (store immediately — not shown again):\n%s\n", r.Secret)
+}
+
+func printAgentTokenList(cmd *cobra.Command, tokens []generated.AgentTokenView) {
+	if len(tokens) == 0 {
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "No agent tokens.")
+		return
+	}
+	tw := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
+	_, _ = fmt.Fprintln(tw, "ID\tLABEL\tPERMISSIONS\tSOURCES\tCREATED\tEXPIRES")
+	for _, t := range tokens {
+		sourceParts := make([]string, len(t.Sources))
+		for i, s := range t.Sources {
+			sourceParts[i] = fmt.Sprintf("%d/%s/%s[%s]", s.ID, s.Type, s.Identifier, strings.Join(s.SenderKeys, ","))
+		}
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%s\t%s\t%s\n",
+			t.ID,
+			t.Label,
+			strings.Join(t.Permissions, ","),
+			strings.Join(sourceParts, ";"),
+			t.CreatedAt.Format(time.RFC3339),
+			agentExpiryLabel(t.ExpiresAt),
+		)
+	}
+	_ = tw.Flush()
+}
+
+func init() {
+	rootCmd.AddCommand(agentTokenCmd)
+	agentTokenCmd.AddCommand(agentTokenIssueCmd, agentTokenListCmd, agentTokenRevokeCmd)
+
+	agentTokenIssueCmd.Flags().StringVar(&agentTokenExpires, "expires", "", "Expiry as RFC3339 timestamp or positive duration (e.g. 24h)")
+	agentTokenIssueCmd.Flags().StringVar(&agentTokenLabel, "label", "",
+		"Human-readable label for the token (required)")
+	agentTokenIssueCmd.Flags().StringSliceVar(&agentTokenPermissions, "permissions", nil,
+		"Comma-separated permissions (search.read, message.read, attachment.read, stats.read, draft.create, draft.edit, draft.delete, calendar.read, calendar.event.read, calendar.write, calendar.invite)")
+	agentTokenIssueCmd.Flags().StringVar(&agentTokenSourceIDs, "source-ids", "",
+		"Comma-separated list of source IDs the token may access")
+	agentTokenIssueCmd.Flags().StringArrayVar(&agentTokenSenders, "sender", nil,
+		"Restrict one source's sender identity (repeat as SOURCE_ID=ADDRESS)")
+	agentTokenIssueCmd.Flags().BoolVar(&agentTokenJSON, flagJSON, false, "Output as JSON")
+	agentTokenListCmd.Flags().BoolVar(&agentTokenJSON, flagJSON, false, "Output as JSON")
+}
+
+func parseAgentTokenExpiry(raw string, now time.Time) (time.Time, error) {
+	if raw == "" {
+		return time.Time{}, nil
+	}
+	if d, err := time.ParseDuration(raw); err == nil {
+		if d <= 0 {
+			return time.Time{}, errors.New("--expires must be in the future")
+		}
+		return now.Add(d), nil
+	}
+	value, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}, errors.New("--expires must be an RFC3339 timestamp or duration")
+	}
+	if !value.After(now) {
+		return time.Time{}, errors.New("--expires must be in the future")
+	}
+	return value, nil
+}
+
+func agentExpiryLabel(expires *time.Time) string {
+	if expires == nil {
+		return "none"
+	}
+	if !time.Now().Before(*expires) {
+		return expires.Format(time.RFC3339) + " (expired)"
+	}
+	return expires.Format(time.RFC3339)
+}

@@ -5,9 +5,11 @@ import (
 	"database/sql"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/emailtags"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
 )
@@ -476,6 +478,140 @@ func TestApplyIMAPMailboxDeltas_RetiresMailboxesAbsentFromAuthoritativeTopology(
 	})
 }
 
+func TestMergeSourcesIMAPArchiveHistorySurvivesDestinationMembershipReconciliation(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newIMAPMembershipFixture(t)
+	destination, err := f.store.GetOrCreateSource("imap", "destination@example.test")
+	require.NoError(err)
+	liveID := f.createMessage(t, "live-history", "<live-history@example.test>")
+	tombstonedID := f.createMessage(t, "removed-history", "<removed-history@example.test>")
+	require.NoError(f.store.ApplyIMAPMailboxDeltas(f.source.ID, []store.IMAPMailboxDelta{{
+		Mailbox: "INBOX",
+		State:   store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 8, UIDNext: 3},
+		Memberships: []store.IMAPMembershipObservation{
+			{UID: 1, SourceMessageID: "live-history"},
+			{UID: 2, SourceMessageID: "removed-history"},
+		},
+	}}))
+	tombstoneAt := time.Date(2026, 10, 6, 12, 0, 0, 0, time.UTC)
+	_, err = f.store.DB().Exec(f.store.Rebind(`
+		UPDATE messages SET deleted_from_source_at = ? WHERE id = ?
+	`), tombstoneAt, tombstonedID)
+	require.NoError(err)
+
+	_, err = f.store.MergeSourcesContext(t.Context(), store.MergeSourcesRequest{
+		FromSourceID: f.source.ID,
+		IntoSourceID: destination.ID,
+	})
+	require.NoError(err)
+
+	var liveBefore, tombstonedBefore sql.NullTime
+	require.NoError(f.store.DB().QueryRow(f.store.Rebind(`
+		SELECT deleted_from_source_at FROM messages WHERE id = ?
+	`), liveID).Scan(&liveBefore))
+	require.NoError(f.store.DB().QueryRow(f.store.Rebind(`
+		SELECT deleted_from_source_at FROM messages WHERE id = ?
+	`), tombstonedID).Scan(&tombstonedBefore))
+	assert.False(liveBefore.Valid)
+	assert.True(tombstonedBefore.Valid)
+	assert.Equal(tombstoneAt, tombstonedBefore.Time.UTC())
+
+	require.NoError(f.store.ApplyIMAPMailboxDeltas(destination.ID, []store.IMAPMailboxDelta{{
+		Mailbox: "INBOX",
+		State:   store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 9, UIDNext: 1},
+		Reset:   true,
+	}}))
+
+	var liveAfter, tombstonedAfter sql.NullTime
+	require.NoError(f.store.DB().QueryRow(f.store.Rebind(`
+		SELECT deleted_from_source_at FROM messages WHERE id = ?
+	`), liveID).Scan(&liveAfter))
+	require.NoError(f.store.DB().QueryRow(f.store.Rebind(`
+		SELECT deleted_from_source_at FROM messages WHERE id = ?
+	`), tombstonedID).Scan(&tombstonedAfter))
+	assert.Equal([]string{"INBOX"}, messageLabels(t, f.store, liveID))
+	assert.Equal([]string{"INBOX"}, messageLabels(t, f.store, tombstonedID))
+	assert.Equal(liveBefore, liveAfter)
+	assert.Equal(tombstonedBefore, tombstonedAfter)
+}
+
+func TestApplyIMAPMailboxDeltas_MergedRFC822HistoryResolvesToLiveMessage(t *testing.T) {
+	for _, scenario := range []string{"ordinary secondary mailbox", "UIDVALIDITY reset"} {
+		t.Run(scenario, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			f := newIMAPMembershipFixture(t)
+
+			// The older source's row sorts first by ID after the merge. Its marker
+			// must keep RFC822 fallback pointed at the destination's live copy.
+			historyID := f.createMessage(t, "history|1", "<shared-history@example.test>")
+			destination, err := f.store.GetOrCreateSource("imap", "destination@example.test")
+			require.NoError(err)
+			liveConversationID, err := f.store.EnsureConversation(
+				destination.ID, "destination-thread", "Destination thread",
+			)
+			require.NoError(err)
+			liveID, err := f.store.UpsertMessage(&store.Message{
+				ConversationID:  liveConversationID,
+				SourceID:        destination.ID,
+				SourceMessageID: "INBOX|1",
+				RFC822MessageID: sql.NullString{String: "<shared-history@example.test>", Valid: true},
+				MessageType:     "email",
+			})
+			require.NoError(err)
+
+			_, err = f.store.MergeSourcesContext(t.Context(), store.MergeSourcesRequest{
+				FromSourceID: f.source.ID,
+				IntoSourceID: destination.ID,
+			})
+			require.NoError(err)
+			f.source = destination
+			var archiveOnly int
+			require.NoError(f.store.DB().QueryRow(f.store.Rebind(`
+				SELECT COUNT(*) FROM source_merge_archive_only_messages WHERE message_id = ?
+			`), historyID).Scan(&archiveOnly))
+			require.Equal(1, archiveOnly, "the merged history row must be archive-only")
+
+			var uidValidity uint32 = 12
+			uid := uint32(1)
+			observation := store.IMAPMembershipObservation{
+				UID: uid, SourceMessageID: "secondary|1",
+				RFC822MessageID: "<shared-history@example.test>",
+			}
+			mailbox := "INBOX"
+			if scenario == "UIDVALIDITY reset" {
+				uidValidity = 20
+				require.NoError(f.store.ApplyIMAPMailboxDeltas(f.source.ID, []store.IMAPMailboxDelta{{
+					Mailbox: mailbox,
+					State:   store.IMAPFolderState{Mailbox: mailbox, UIDValidity: uidValidity, UIDNext: 2},
+					Memberships: []store.IMAPMembershipObservation{{
+						UID: uid, SourceMessageID: "INBOX|1",
+						RFC822MessageID: "<shared-history@example.test>",
+					}},
+				}}))
+				gotID, _ := membershipMessageAndFlags(t, f.store, f.source.ID, uidValidity, uid)
+				assert.Equal(liveID, gotID)
+				uidValidity = 21
+			}
+
+			require.NoError(f.store.ApplyIMAPMailboxDeltas(f.source.ID, []store.IMAPMailboxDelta{{
+				Mailbox: mailbox,
+				State:   store.IMAPFolderState{Mailbox: mailbox, UIDValidity: uidValidity, UIDNext: 2},
+				Reset:   scenario == "UIDVALIDITY reset",
+				Memberships: []store.IMAPMembershipObservation{{
+					UID: uid, SourceMessageID: observation.SourceMessageID,
+					RFC822MessageID: observation.RFC822MessageID,
+				}},
+			}}))
+
+			gotID, _ := membershipMessageAndFlags(t, f.store, f.source.ID, uidValidity, uid)
+			assert.Equal(liveID, gotID)
+			assert.NotEqual(historyID, gotID)
+		})
+	}
+}
+
 func TestApplyIMAPMailboxDeltas_InitialBaselineReconcilesPreviouslyArchivedMessages(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -614,6 +750,8 @@ func TestApplyIMAPMailboxDeltas_AmbiguousRawDigestFallsBackToExactSourceID(t *te
 			{UID: 1, SourceMessageID: "[Gmail]/All Mail|1"},
 			{UID: 2, SourceMessageID: "[Gmail]/All Mail|2"},
 		},
+	}, {
+		Mailbox: "INBOX", State: store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 17, UIDNext: 2},
 	}}))
 
 	require.NoError(f.store.ApplyIMAPMailboxDeltas(f.source.ID, []store.IMAPMailboxDelta{
@@ -805,4 +943,268 @@ func TestApplyIMAPMailboxDeltas_ConflictingDeltaIdentityRollsBackEverything(t *t
 			assert.False(messageTombstoned(t, f.store, messageID))
 		})
 	}
+}
+func TestGetIMAPSourceMessageAliases_ReturnsOnlyRequestedUIDs(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newIMAPMembershipFixture(t)
+	f.createMessage(t, "[Gmail]/All Mail|1", "")
+	f.createMessage(t, "INBOX|1", "")
+	f.createMessage(t, "INBOX|2", "")
+	f.createMessage(t, "INBOX|3", "")
+
+	require.NoError(f.store.ApplyIMAPMailboxDeltas(f.source.ID, []store.IMAPMailboxDelta{{
+		Mailbox: "INBOX",
+		State: store.IMAPFolderState{
+			Mailbox: "INBOX", UIDValidity: 17, UIDNext: 4, HighestModSeq: 100,
+		},
+		Memberships: []store.IMAPMembershipObservation{
+			{UID: 1, SourceMessageID: "INBOX|1",
+				CanonicalSourceMessageID: "[Gmail]/All Mail|1"},
+			{UID: 2, SourceMessageID: "INBOX|2"},
+			{UID: 3, SourceMessageID: "INBOX|3"},
+		},
+	}}))
+
+	aliases, err := f.store.GetIMAPSourceMessageAliases(f.source.ID, "INBOX", []uint32{1, 3})
+	require.NoError(err)
+	assert.Equal(map[string]string{
+		"INBOX|1": "[Gmail]/All Mail|1",
+		"INBOX|3": "INBOX|3",
+	}, aliases, "UID 2 was not asked for, so it must not be read")
+
+	empty, err := f.store.GetIMAPSourceMessageAliases(f.source.ID, "INBOX", nil)
+	require.NoError(err)
+	assert.Empty(empty, "a run that lists nothing must not query at all")
+}
+
+func TestGetIMAPSourceMessageAliases_AccumulatesEveryUIDChunk(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newIMAPMembershipFixture(t)
+	f.createMessage(t, "INBOX|1", "")
+	f.createMessage(t, "INBOX|950", "")
+
+	require.NoError(f.store.ApplyIMAPMailboxDeltas(f.source.ID, []store.IMAPMailboxDelta{{
+		Mailbox: "INBOX",
+		State: store.IMAPFolderState{
+			Mailbox: "INBOX", UIDValidity: 17, UIDNext: 951, HighestModSeq: 100,
+		},
+		Memberships: []store.IMAPMembershipObservation{
+			{UID: 1, SourceMessageID: "INBOX|1"},
+			{UID: 950, SourceMessageID: "INBOX|950"},
+		},
+	}}))
+
+	// A full mailbox listing asks for every UID it enumerated, which crosses
+	// the bound-parameter chunk size. Both chunks must reach the same map.
+	uids := make([]uint32, 1000)
+	for i := range uids {
+		uids[i] = uint32(i + 1)
+	}
+	aliases, err := f.store.GetIMAPSourceMessageAliases(f.source.ID, "INBOX", uids)
+	require.NoError(err)
+	assert.Equal(map[string]string{
+		"INBOX|1":   "INBOX|1",
+		"INBOX|950": "INBOX|950",
+	}, aliases)
+}
+
+const membershipStamp = "1999-01-01 00:00:00"
+
+// stampMemberships rewrites updated_at on every saved membership so a later
+// apply can be measured by which rows moved off the stamp.
+func stampMemberships(t *testing.T, st *store.Store, sourceID int64) {
+	t.Helper()
+	_, err := st.DB().Exec(st.Rebind(`
+		UPDATE imap_message_memberships SET updated_at = ? WHERE source_id = ?
+	`), membershipStamp, sourceID)
+	require.NoError(t, err)
+}
+
+// membershipsWritten counts the rows an apply inserted or updated since the
+// last stampMemberships call.
+func membershipsWritten(t *testing.T, st *store.Store, sourceID int64) int {
+	t.Helper()
+	var count int
+	require.NoError(t, st.DB().QueryRow(st.Rebind(`
+		SELECT COUNT(*) FROM imap_message_memberships
+		WHERE source_id = ? AND updated_at <> ?
+	`), sourceID, membershipStamp).Scan(&count))
+	return count
+}
+
+func TestApplyIMAPMailboxDeltas_UnchangedResetWritesNothing(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newIMAPMembershipFixture(t)
+	firstID := f.createMessage(t, "reset-first", "<reset-first@example.com>")
+	secondID := f.createMessage(t, "reset-second", "<reset-second@example.com>")
+	delta := store.IMAPMailboxDelta{
+		Mailbox: "INBOX",
+		State:   store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 5, UIDNext: 3, HighestModSeq: 40},
+		Memberships: []store.IMAPMembershipObservation{
+			{
+				Mailbox: "INBOX", UIDValidity: 5, UID: 1,
+				SourceMessageID: "reset-first", Flags: []string{"\\Seen"},
+			},
+			{Mailbox: "INBOX", UIDValidity: 5, UID: 2, SourceMessageID: "reset-second"},
+		},
+	}
+	require.NoError(f.store.ApplyIMAPMailboxDeltas(f.source.ID, []store.IMAPMailboxDelta{delta}))
+	stampMemberships(t, f.store, f.source.ID)
+
+	delta.Reset = true
+	require.NoError(f.store.ApplyIMAPMailboxDeltas(f.source.ID, []store.IMAPMailboxDelta{delta}))
+
+	assert.Equal(0, membershipsWritten(t, f.store, f.source.ID),
+		"a reset that observes the saved set must rewrite no membership")
+	assert.Equal(2, membershipCount(t, f.store, f.source.ID))
+	assert.Equal([]string{"INBOX"}, messageLabels(t, f.store, firstID))
+	assert.Equal([]string{"INBOX"}, messageLabels(t, f.store, secondID))
+	assert.False(messageTombstoned(t, f.store, firstID))
+	assert.False(messageTombstoned(t, f.store, secondID))
+}
+
+func TestApplyIMAPMailboxDeltas_ReorderedFlagsAfterTagSaveWriteNothing(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newAttrFixture(t, "imap", attrSink)
+	f.confirm(attrSink)
+	messageID := f.persist(attrMail{
+		raw: "From: " + attrSink + "\r\n\r\nbody", from: []string{attrSink}, sourceMsgKey: "INBOX|1",
+	})
+	delta := store.IMAPMailboxDelta{
+		Mailbox: "INBOX",
+		State:   store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 5, UIDNext: 2},
+		Memberships: []store.IMAPMembershipObservation{{
+			UID: 1, SourceMessageID: "INBOX|1", Flags: []string{"\\Seen", "Next"},
+		}},
+	}
+	require.NoError(f.st.ApplyIMAPMailboxDeltas(f.source.ID, []store.IMAPMailboxDelta{delta}))
+	target, err := f.st.EmailTagTargetContext(t.Context(), messageID, "INBOX")
+	require.NoError(err)
+	require.NoError(f.st.SaveEmailTagsContext(t.Context(), target, &emailtags.MessageTagResult{
+		Provider: "imap", Mailbox: "INBOX", UIDValidity: 5, UID: 1,
+		Flags: []string{"Next", "\\Seen"}, Tags: []string{"Next"}, Verified: true,
+	}))
+	_, path := attribution(t, f.st, messageID)
+	require.Equal("sent", path.String)
+	stampMemberships(t, f.st, f.source.ID)
+	_, err = f.st.DB().Exec(`CREATE TABLE reset_write_audit (kind TEXT NOT NULL)`)
+	require.NoError(err)
+	auditSQL := `
+		CREATE TRIGGER audit_reset_labels AFTER DELETE ON message_labels
+		BEGIN INSERT INTO reset_write_audit VALUES ('label'); END;
+		CREATE TRIGGER audit_reset_attribution
+		AFTER UPDATE OF account_address, account_path ON messages
+		BEGIN INSERT INTO reset_write_audit VALUES ('attribution'); END;
+	`
+	if f.st.IsPostgreSQL() {
+		auditSQL = `
+			CREATE FUNCTION audit_reset_write() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN INSERT INTO reset_write_audit VALUES (TG_TABLE_NAME); RETURN NULL; END $$;
+			CREATE TRIGGER audit_reset_labels AFTER DELETE ON message_labels
+			FOR EACH ROW EXECUTE FUNCTION audit_reset_write();
+			CREATE TRIGGER audit_reset_attribution
+			AFTER UPDATE OF account_address, account_path ON messages
+			FOR EACH ROW EXECUTE FUNCTION audit_reset_write();
+		`
+	}
+	_, err = f.st.DB().Exec(auditSQL)
+	require.NoError(err)
+
+	delta.Reset = true
+	require.NoError(f.st.ApplyIMAPMailboxDeltas(f.source.ID, []store.IMAPMailboxDelta{delta}))
+
+	assert.Zero(membershipsWritten(t, f.st, f.source.ID), "flag order must not rewrite a saved membership")
+	var writes int
+	require.NoError(f.st.DB().QueryRow(`SELECT COUNT(*) FROM reset_write_audit`).Scan(&writes))
+	assert.Zero(writes, "flag order must not rebuild labels or account attribution")
+}
+
+func TestApplyIMAPMailboxDeltas_ResetWritesOnlyChangedMemberships(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newIMAPMembershipFixture(t)
+	expungedID := f.createMessage(t, "reset-expunged", "<reset-expunged@example.com>")
+	keptID := f.createMessage(t, "reset-kept", "<reset-kept@example.com>")
+	arrivedID := f.createMessage(t, "reset-arrived", "<reset-arrived@example.com>")
+	require.NoError(f.store.ApplyIMAPMailboxDeltas(f.source.ID, []store.IMAPMailboxDelta{{
+		Mailbox: "INBOX",
+		State:   store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 5, UIDNext: 3, HighestModSeq: 40},
+		Memberships: []store.IMAPMembershipObservation{
+			{Mailbox: "INBOX", UIDValidity: 5, UID: 1, SourceMessageID: "reset-expunged"},
+			{Mailbox: "INBOX", UIDValidity: 5, UID: 2, SourceMessageID: "reset-kept"},
+		},
+	}}))
+	stampMemberships(t, f.store, f.source.ID)
+
+	require.NoError(f.store.ApplyIMAPMailboxDeltas(f.source.ID, []store.IMAPMailboxDelta{{
+		Mailbox: "INBOX",
+		State:   store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 5, UIDNext: 4, HighestModSeq: 41},
+		Reset:   true,
+		Memberships: []store.IMAPMembershipObservation{
+			{Mailbox: "INBOX", UIDValidity: 5, UID: 2, SourceMessageID: "reset-kept"},
+			{Mailbox: "INBOX", UIDValidity: 5, UID: 3, SourceMessageID: "reset-arrived"},
+		},
+	}}))
+
+	assert.Equal(1, membershipsWritten(t, f.store, f.source.ID),
+		"only the arrival is written; the kept UID keeps its stamp")
+	known, err := f.store.GetIMAPKnownUIDs(f.source.ID)
+	require.NoError(err)
+	assert.Equal(map[string][]uint32{"INBOX": {2, 3}}, known)
+	gotKeptID, _ := membershipMessageAndFlags(t, f.store, f.source.ID, 5, 2)
+	assert.Equal(keptID, gotKeptID)
+	assert.True(messageTombstoned(t, f.store, expungedID))
+	assert.Empty(messageLabels(t, f.store, expungedID))
+	assert.Equal([]string{"INBOX"}, messageLabels(t, f.store, arrivedID))
+	assert.False(messageTombstoned(t, f.store, keptID))
+}
+
+func TestApplyIMAPMailboxDeltas_ResetPersistsFlagChange(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newIMAPMembershipFixture(t)
+	f.createMessage(t, "reset-flagged", "<reset-flagged@example.com>")
+	f.createMessage(t, "reset-steady", "<reset-steady@example.com>")
+	require.NoError(f.store.ApplyIMAPMailboxDeltas(f.source.ID, []store.IMAPMailboxDelta{{
+		Mailbox: "INBOX",
+		State:   store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 5, UIDNext: 3, HighestModSeq: 40},
+		Memberships: []store.IMAPMembershipObservation{
+			{
+				Mailbox: "INBOX", UIDValidity: 5, UID: 1,
+				SourceMessageID: "reset-flagged", Flags: []string{"\\Seen"},
+			},
+			{
+				Mailbox: "INBOX", UIDValidity: 5, UID: 2,
+				SourceMessageID: "reset-steady", Flags: []string{"\\Seen"},
+			},
+		},
+	}}))
+	stampMemberships(t, f.store, f.source.ID)
+
+	require.NoError(f.store.ApplyIMAPMailboxDeltas(f.source.ID, []store.IMAPMailboxDelta{{
+		Mailbox: "INBOX",
+		State:   store.IMAPFolderState{Mailbox: "INBOX", UIDValidity: 5, UIDNext: 3, HighestModSeq: 41},
+		Reset:   true,
+		Memberships: []store.IMAPMembershipObservation{
+			{
+				Mailbox: "INBOX", UIDValidity: 5, UID: 1,
+				SourceMessageID: "reset-flagged", Flags: []string{"\\Seen", "\\Flagged"},
+			},
+			{
+				Mailbox: "INBOX", UIDValidity: 5, UID: 2,
+				SourceMessageID: "reset-steady", Flags: []string{"\\Seen"},
+			},
+		},
+	}}))
+
+	assert.Equal(1, membershipsWritten(t, f.store, f.source.ID),
+		"a flag change must still be written, and only it")
+	_, gotFlags := membershipMessageAndFlags(t, f.store, f.source.ID, 5, 1)
+	assert.JSONEq(`["\\Seen","\\Flagged"]`, gotFlags)
+	_, gotSteadyFlags := membershipMessageAndFlags(t, f.store, f.source.ID, 5, 2)
+	assert.JSONEq(`["\\Seen"]`, gotSteadyFlags)
 }

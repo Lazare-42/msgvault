@@ -1,12 +1,11 @@
 package triage
 
 import (
-	"testing"
-	"time"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/query"
+	"testing"
+	"time"
 )
 
 func msg(id int64, labels ...string) query.MessageSummary {
@@ -139,6 +138,7 @@ func TestClassify(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
 			res := Classify(tt.msgs, tt.opts)
 
 			moveIDs := make([]int64, 0, len(res.Move))
@@ -149,12 +149,11 @@ func TestClassify(t *testing.T) {
 			for _, m := range res.Replied {
 				repliedIDs = append(repliedIDs, m.ID)
 			}
-
-			assert.Equal(t, tt.wantMoveIDs, nilIfEmpty(moveIDs))
-			assert.Equal(t, tt.wantRepliedIDs, nilIfEmpty(repliedIDs))
-			assert.Equal(t, tt.wantSkippedTreated, res.SkippedTreated)
-			assert.Equal(t, tt.wantSkippedByID, res.SkippedByID)
-			assert.Equal(t, tt.wantSkippedAlreadyQueued, res.SkippedAlreadyQueued)
+			assert.Equal(tt.wantMoveIDs, nilIfEmpty(moveIDs))
+			assert.Equal(tt.wantRepliedIDs, nilIfEmpty(repliedIDs))
+			assert.Equal(tt.wantSkippedTreated, res.SkippedTreated)
+			assert.Equal(tt.wantSkippedByID, res.SkippedByID)
+			assert.Equal(tt.wantSkippedAlreadyQueued, res.SkippedAlreadyQueued)
 		})
 	}
 }

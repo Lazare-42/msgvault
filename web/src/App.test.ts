@@ -1,38 +1,116 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
-import { describe, expect, it, vi } from 'vitest';
-
+import { getHealth as generatedGetHealth } from './lib/api/generated/api/api';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import App from './App.svelte';
 import { createAPIClient } from './lib/api/client';
 import { createSessionController } from './lib/api/session.svelte';
-import { SEARCH_MODE_PREFERENCE_KEY } from './lib/search/modes';
+import { resolveInitialSearchMode, SEARCH_MODE_PREFERENCE_KEY } from './lib/search/modes';
 import { chooseSelectOption } from './test/kit-ui';
-
+import * as sessionReporting from './lib/telemetry/session';
 describe('application foundation', () => {
+  it('reports resolved workspaces and standalone messages', async () => {
+    const events: Array<{ event: string; properties?: { screen?: string; surface?: string } }> = [];
+    const session = createSessionController(async (input) => {
+      const request = input as Request;
+      const path = new URL(request.url).pathname;
+      if (path === '/api/session') return Response.json({ auth_mode: 'loopback', https: false });
+      if (path === '/api/v1/telemetry/events') {
+        events.push(await request.json());
+        return Response.json({ status: 'queued' }, { status: 202 });
+      }
+      if (path === '/api/v1/settings') return Response.json({ settings: [], pending_restart: false });
+      if (path === '/api/v1/explore') return Response.json({ rows: [], total_count: 0, cache_revision: 'screens', search_provenance: {} });
+      return Response.json({}, { status: 404 });
+    });
+    window.history.replaceState(null, '', '/?workspace=everything');
+    render(App, { session });
+    for (const [label, name] of [
+      ['Everything', 'everything'], ['Directory', 'directory'], ['Reviews', 'directory_review'],
+      ['Files', 'files'], ['Operations', 'operations'], ['Relationships', 'relationships'],
+      ['Saved views', 'saved_views'], ['Sources', 'sources'], ['Deletions', 'deletions'], ['Settings', 'settings'],
+    ]) {
+      await fireEvent.click(await screen.findByRole('button', { name: label }));
+      await waitFor(() => expect(events.some((event) => event.properties?.screen === name)).toBe(true));
+    }
+    window.history.replaceState(null, '', '/messages/123');
+    await fireEvent(window, new PopStateEvent('popstate'));
+    await waitFor(() => expect(events.at(-1)?.properties?.screen).toBe('message'));
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    localStorage.removeItem(SEARCH_MODE_PREFERENCE_KEY);
+    sessionStorage.removeItem('msgvault.appearance.override');
+    document.documentElement.classList.remove('dark');
+    window.history.replaceState(null, '', '/');
+  });
   it('mounts the Relationships landmark once bootstrap succeeds', async () => {
     const session = createSessionController(async () =>
-      Response.json({ auth_mode: 'loopback', https: false, plain_http_warning: true })
+      Response.json({ auth_mode: 'loopback', https: false, plain_http_warning: true }),
     );
     render(App, { session });
-
     expect(await screen.findByRole('main', { name: 'Relationships' })).toBeDefined();
   });
-
+  it('keeps the archive mounted after telemetry expires', async () => {
+    const telemetryRequests: Request[] = [];
+    const session = createSessionController(async (input) => {
+      const path = new URL((input as Request).url).pathname;
+      if (path === '/api/session') return Response.json({ auth_mode: 'loopback', https: false, csrf_token: 'csrf-token' });
+      if (path === '/api/v1/telemetry/events') telemetryRequests.push(input as Request);
+      if (path === '/api/v1/telemetry/events' || path === '/api/v1/expired') return Response.json({ error: 'unauthorized' }, { status: 401 });
+      if (path === '/api/v1/settings') return Response.json({ settings: [], pending_restart: false });
+      return Response.json({}, { status: 404 });
+    });
+    const transport = vi.spyOn(session.telemetryClient, 'fetch');
+    render(App, { session });
+    await waitFor(() => expect(transport).toHaveBeenCalled());
+    await Promise.all(transport.mock.results.map((result) => result.value));
+    expect(telemetryRequests[0].headers.get('X-CSRF-Token')).toBe('csrf-token');
+    expect(await screen.findByRole('main', { name: 'Relationships' })).toBeDefined();
+    expect(screen.queryByRole('form', { name: 'Log in' })).toBeNull();
+  });
   it('shows a quiet connecting state until bootstrap resolves, then login when required', async () => {
     const session = createSessionController(async () =>
-      Response.json({ auth_mode: 'required', https: false, plain_http_warning: true })
+      Response.json({ auth_mode: 'required', https: false, plain_http_warning: true }),
     );
     render(App, { session });
-
     expect(screen.getByRole('main', { name: 'Connecting' })).toBeDefined();
     expect(screen.queryByRole('main', { name: 'Relationships' })).toBeNull();
     expect(screen.queryByRole('form', { name: 'Log in' })).toBeNull();
-
     await session.bootstrap();
-
     expect(await screen.findByRole('form', { name: 'Log in' })).toBeDefined();
     expect(screen.queryByRole('main', { name: 'Relationships' })).toBeNull();
   });
-
+  it('titles the connecting screen msgvault', () => {
+    const session = createSessionController(() => new Promise<Response>(() => undefined));
+    render(App, { session });
+    expect(screen.getByRole('main', { name: 'Connecting' })).toBeDefined();
+    expect(document.title).toBe('msgvault');
+  });
+  it('shows the OAuth callback in the same layout as connecting', () => {
+    vi.stubGlobal(
+      'BroadcastChannel',
+      class {
+        postMessage(): void {}
+        close(): void {}
+      },
+    );
+    const close = vi.spyOn(window, 'close').mockImplementation(() => undefined);
+    window.history.replaceState(null, '', '/?state=msgvault-carddav-synthetic&code=synthetic');
+    try {
+      render(App, { session: createSessionController(vi.fn<typeof fetch>()) });
+      const main = screen.getByRole('main');
+      expect(main.className).toContain('boot-screen');
+      expect(within(main).getByText('msgvault').className).toContain('boot-screen__brand');
+      expect(
+        within(main).getByText('Return to CardDAV settings to finish connecting. You can close this window.'),
+      ).toBeDefined();
+    } finally {
+      close.mockRestore();
+      vi.unstubAllGlobals();
+      window.history.replaceState(null, '', '/');
+    }
+  });
   it('shows a bootstrap error with retry instead of the shell, and recovers on retry', async () => {
     let sessionCalls = 0;
     const fetchFn = vi.fn<typeof fetch>(async (input) => {
@@ -46,7 +124,7 @@ describe('application foundation', () => {
       if (path === '/api/v1/settings') {
         return Response.json({
           settings: [{ key: 'web.density', value: { string: 'comfortable' } }],
-          pending_restart: false
+          pending_restart: false,
         });
       }
       if (path === '/api/v1/explore') {
@@ -56,49 +134,40 @@ describe('application foundation', () => {
     });
     const session = createSessionController(fetchFn);
     render(App, { session });
-
     const retry = await screen.findByRole('button', { name: 'Retry' });
     expect(screen.getByRole('main', { name: 'Connection error' })).toBeDefined();
     expect(screen.getByRole('alert')).toBeDefined();
     expect(screen.queryByRole('main', { name: 'Relationships' })).toBeNull();
     expect(screen.queryByRole('form', { name: 'Log in' })).toBeNull();
-
     await fireEvent.click(retry);
-
     expect(await screen.findByRole('main', { name: 'Relationships' })).toBeDefined();
     expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
     await waitFor(() => expect(document.documentElement.dataset.density).toBe('comfortable'));
   });
-
   it('routes an unauthorized bootstrap to login, not the connection error state', async () => {
     const session = createSessionController(async () =>
-      Response.json({ error: 'unauthorized', message: 'Session expired' }, { status: 401 })
+      Response.json({ error: 'unauthorized', message: 'Session expired' }, { status: 401 }),
     );
     render(App, { session });
-
     expect(await screen.findByRole('form', { name: 'Log in' })).toBeDefined();
     expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
     expect(screen.queryByRole('main', { name: 'Connection error' })).toBeNull();
   });
-
   it('requests health from the same-origin API', async () => {
     const fetchFn = vi.fn<typeof fetch>(async () =>
       Response.json({
         status: 'ok',
-        version: 'test'
-      })
+        version: 'test',
+      }),
     );
     const client = createAPIClient(fetchFn);
-
-    await client.GET('/api/v1/health');
-
+    await generatedGetHealth(client);
     expect(fetchFn).toHaveBeenCalledOnce();
     const request = fetchFn.mock.calls[0]?.[0];
     expect(request).toBeInstanceOf(Request);
     expect(new URL((request as Request).url).pathname).toBe('/api/v1/health');
     expect(new URL((request as Request).url).origin).toBe(window.location.origin);
   });
-
   it('navigates to settings and uses the session-aware mutation client', async () => {
     const requests: Request[] = [];
     const fetchFn = vi.fn<typeof fetch>(async (input) => {
@@ -109,7 +178,7 @@ describe('application foundation', () => {
           auth_mode: 'session',
           csrf_token: 'csrf-token',
           https: true,
-          plain_http_warning: false
+          plain_http_warning: false,
         });
       }
       if (request.method === 'GET') {
@@ -119,19 +188,17 @@ describe('application foundation', () => {
     });
     const session = createSessionController(fetchFn);
     render(App, { session });
-
     await session.bootstrap();
     await fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
     await chooseSelectOption(await screen.findByLabelText('Theme'), 'Dark');
-    await fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
-
+    await fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
     await waitFor(() => expect(requests.some((request) => request.method === 'PATCH')).toBe(true));
     const patch = requests.find((request) => request.method === 'PATCH');
     expect(patch?.headers.get('X-CSRF-Token')).toBe('csrf-token');
     expect(patch?.headers.get('If-Match')).toBe('"etag-a"');
   });
-
   it('returns to login when a settings mutation is unauthorized', async () => {
+    window.history.replaceState(null, '', '/?workspace=settings');
     const fetchFn = vi.fn<typeof fetch>(async (input) => {
       const request = input instanceof Request ? input : new Request(input);
       const path = new URL(request.url).pathname;
@@ -140,23 +207,21 @@ describe('application foundation', () => {
           auth_mode: 'session',
           csrf_token: 'csrf-token',
           https: true,
-          plain_http_warning: false
+          plain_http_warning: false,
         });
       }
       if (request.method === 'GET') return settingsResponse('system', '"etag-a"');
+      if (path === '/api/v1/telemetry/events') return Response.json({ status: 'disabled' }, { status: 202 });
       return Response.json({ error: 'unauthorized', message: 'Session expired' }, { status: 401 });
     });
     const session = createSessionController(fetchFn);
     render(App, { session });
-
     await session.bootstrap();
     await fireEvent.click(await screen.findByRole('button', { name: 'Settings' }));
     await chooseSelectOption(await screen.findByLabelText('Theme'), 'Dark');
-    await fireEvent.click(screen.getByRole('button', { name: 'Save settings' }));
-
+    await fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
     expect(await screen.findByRole('form', { name: 'Log in' })).toBeDefined();
   });
-
   it('loads appearance once after interactive login while a session override wins', async () => {
     window.history.replaceState(null, '', '/');
     sessionStorage.setItem('msgvault.appearance.override', JSON.stringify({ theme: 'light' }));
@@ -169,7 +234,10 @@ describe('application foundation', () => {
       }
       if (path === '/api/session/login') {
         return Response.json({
-          auth_mode: 'session', csrf_token: 'csrf-token', https: true, plain_http_warning: false
+          auth_mode: 'session',
+          csrf_token: 'csrf-token',
+          https: true,
+          plain_http_warning: false,
         });
       }
       if (path === '/api/v1/settings') {
@@ -177,9 +245,9 @@ describe('application foundation', () => {
         return Response.json({
           settings: [
             { key: 'web.theme', value: { string: 'dark' } },
-            { key: 'web.density', value: { string: 'comfortable' } }
+            { key: 'web.density', value: { string: 'comfortable' } },
           ],
-          pending_restart: false
+          pending_restart: false,
         });
       }
       if (path === '/api/v1/explore') {
@@ -190,75 +258,428 @@ describe('application foundation', () => {
     const session = createSessionController(fetchFn);
     render(App, { session });
     expect(await screen.findByRole('form', { name: 'Log in' })).toBeDefined();
-
     await fireEvent.input(screen.getByLabelText('API key'), { target: { value: 'test-key' } });
     await fireEvent.click(screen.getByRole('button', { name: 'Log in' }));
-
     await waitFor(() => expect(document.documentElement.dataset.density).toBe('comfortable'));
     expect(document.documentElement.classList.contains('dark')).toBe(false);
     expect(settingsRequests).toBe(1);
     await new Promise((resolve) => setTimeout(resolve));
     expect(settingsRequests).toBe(1);
   });
-
+  it('forwards sign-in changes across reauthentication', async () => {
+    const startReporting = vi.spyOn(sessionReporting, 'startSessionReporting');
+    window.history.replaceState(null, '', '/');
+    const telemetryRequests: Request[] = [];
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      const path = new URL(request.url).pathname;
+      if (path === '/api/session') {
+        return Response.json({ auth_mode: 'required', https: true, plain_http_warning: false });
+      }
+      if (path === '/api/session/login') {
+        return Response.json({
+          auth_mode: 'session',
+          csrf_token: 'csrf-token',
+          https: true,
+          plain_http_warning: false,
+        });
+      }
+      if (path === '/api/v1/telemetry/events') {
+        const event = (await request.clone().json()).event;
+        if (event === 'app_opened') telemetryRequests.push(request);
+        return Response.json({ status: 'queued' }, { status: 202 });
+      }
+      if (path === '/api/v1/expired') return Response.json({ error: 'unauthorized' }, { status: 401 });
+      if (path === '/api/v1/settings') return Response.json({ settings: [], pending_restart: false });
+      if (path === '/api/v1/explore') {
+        return Response.json({ rows: [], total_count: 0, cache_revision: 'login', search_provenance: {} });
+      }
+      return Response.json({}, { status: 404 });
+    });
+    vi.stubGlobal('fetch', fetchFn);
+    const session = createSessionController(fetchFn);
+    render(App, { session });
+    expect(await screen.findByRole('form', { name: 'Log in' })).toBeDefined();
+    expect(startReporting).not.toHaveBeenCalled();
+    expect(telemetryRequests).toHaveLength(0);
+    await fireEvent.input(screen.getByLabelText('API key'), { target: { value: 'test-key' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Log in' }));
+    expect(await screen.findByRole('main', { name: 'Relationships' })).toBeDefined();
+    await waitFor(() => expect(telemetryRequests).toHaveLength(1));
+    expect(startReporting).toHaveBeenCalledTimes(1);
+    expect(telemetryRequests[0].method).toBe('POST');
+    const signedIn = vi.spyOn(startReporting.mock.results[0].value, 'signedIn');
+    await session.client.fetch('/api/v1/expired');
+    expect(await screen.findByRole('form', { name: 'Log in' })).toBeDefined();
+    expect(signedIn).toHaveBeenLastCalledWith(false);
+    await fireEvent.input(screen.getByLabelText('API key'), { target: { value: 'test-key' } });
+    await fireEvent.click(screen.getByRole('button', { name: 'Log in' }));
+    expect(await screen.findByRole('main', { name: 'Relationships' })).toBeDefined();
+    expect(signedIn).toHaveBeenLastCalledWith(true);
+    expect(startReporting).toHaveBeenCalledTimes(1);
+    await new Promise((resolve) => setTimeout(resolve));
+    expect(screen.queryByRole('form', { name: 'Log in' })).toBeNull();
+    expect(screen.getByRole('main', { name: 'Relationships' })).toBeDefined();
+  });
   it.each([
     ['semantic', 'Semantic'],
-    ['magic', 'Full text']
-  ])('starts in the configured default search mode %s when URL and browser preference are silent', async (configured, expectedLabel) => {
+    ['magic', 'Full text'],
+  ])(
+    'starts in the configured default search mode %s when URL and browser preference are silent',
+    async (configured, expectedLabel) => {
+      localStorage.removeItem(SEARCH_MODE_PREFERENCE_KEY);
+      window.history.replaceState(
+        null,
+        '',
+        `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`,
+      );
+      const fetchFn = vi.fn<typeof fetch>(async (input) => {
+        const request = input instanceof Request ? input : new Request(input);
+        const path = new URL(request.url).pathname;
+        if (path === '/api/session') {
+          return Response.json({ auth_mode: 'loopback', https: false, plain_http_warning: false });
+        }
+        if (path === '/api/v1/settings') {
+          return Response.json({
+            settings: [{ key: 'web.default_search_mode', value: { string: configured } }],
+            pending_restart: false,
+          });
+        }
+        if (path === '/api/v1/explore') {
+          return Response.json({ rows: [], total_count: 0, cache_revision: 'boot', search_provenance: {} });
+        }
+        return Response.json({}, { status: 404 });
+      });
+      const session = createSessionController(fetchFn);
+      render(App, { session });
+      await session.bootstrap();
+      const settingsLoaded = () =>
+        fetchFn.mock.calls.some((call) => {
+          const request = call[0];
+          return request instanceof Request && new URL(request.url).pathname === '/api/v1/settings';
+        });
+      await waitFor(() => expect(settingsLoaded()).toBe(true));
+      await new Promise((resolve) => setTimeout(resolve));
+      await waitFor(() =>
+        expect(screen.getByRole('radio', { name: expectedLabel }).getAttribute('aria-checked')).toBe('true'),
+      );
+      window.history.replaceState(null, '', '/');
+    },
+  );
+  it('applies a saved theme and density to the open tab', async () => {
+    sessionStorage.removeItem('msgvault.appearance.override');
+    await openAppearance(appearanceDaemon());
+    await chooseSelectOption(screen.getByLabelText('Theme'), 'Dark');
+    await chooseSelectOption(screen.getByLabelText('Density'), 'Comfortable');
+    await fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+    await waitFor(() => expect(document.documentElement.classList.contains('dark')).toBe(true));
+    expect(document.documentElement.dataset.density).toBe('comfortable');
+  });
+  it('keeps a saved theme when the browser-defaults load finishes after the save', async () => {
+    sessionStorage.removeItem('msgvault.appearance.override');
+    const daemon = appearanceDaemon();
+    let releaseFirstLoad: (() => void) | undefined;
+    let settingsReads = 0;
+    const fetchFn = vi.fn<typeof fetch>(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      const path = new URL(request.url).pathname;
+      if (path === '/api/v1/settings' && request.method === 'GET' && ++settingsReads === 2) {
+        // The browser-defaults load reads the daemon before the save, then stalls.
+        const stale = await daemon(request.clone());
+        const body = await stale.json();
+        body.settings.find((setting: { key: string }) => setting.key === 'web.density').value = { string: 'comfortable' };
+        await new Promise<void>((resolve) => { releaseFirstLoad = resolve; });
+        return Response.json(body);
+      }
+      return daemon(request);
+    });
+    await openAppearance(fetchFn);
+    await chooseSelectOption(screen.getByLabelText('Theme'), 'Dark');
+    await fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+    await waitFor(() => expect(document.documentElement.classList.contains('dark')).toBe(true));
+    await waitFor(() => expect(releaseFirstLoad).toBeDefined());
+    releaseFirstLoad?.();
+    await waitFor(() => expect(document.documentElement.dataset.density).toBe('comfortable'));
+    expect(document.documentElement.classList.contains('dark')).toBe(true);
+  });
+  it('keeps the open view mode when the browser-defaults load finishes after a saved search mode', async () => {
     localStorage.removeItem(SEARCH_MODE_PREFERENCE_KEY);
+    const daemon = appearanceDaemon();
+    let releaseDefaultsLoad: (() => void) | undefined;
+    let settingsReads = 0;
+    const fetchFn = vi.fn<typeof fetch>(async (input, init) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      const path = new URL(request.url).pathname;
+      if (path === '/api/v1/settings' && request.method === 'GET' && ++settingsReads === 2) {
+        // The browser-defaults load reads an older daemon default, then stalls past the save.
+        const stale = await daemon(request.clone());
+        const body = await stale.json();
+        body.settings.find((setting: { key: string }) => setting.key === 'web.default_search_mode').value = { string: 'semantic' };
+        // An unsaved density change shows when the late load has been applied.
+        body.settings.find((setting: { key: string }) => setting.key === 'web.density').value = { string: 'comfortable' };
+        await new Promise<void>((resolve) => { releaseDefaultsLoad = resolve; });
+        return Response.json(body);
+      }
+      return daemon(request);
+    });
+    await openAppearance(fetchFn);
+    const before = window.location.search;
+    await chooseSelectOption(screen.getByLabelText('Default search mode'), 'Hybrid');
+    await fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+    await waitFor(() => expect(localStorage.getItem(SEARCH_MODE_PREFERENCE_KEY)).toBe('hybrid'));
+    await waitFor(() => expect(releaseDefaultsLoad).toBeDefined());
+    releaseDefaultsLoad?.();
+    await waitFor(() => expect(document.documentElement.dataset.density).toBe('comfortable'));
+    expect(screen.getByRole('radio', { name: 'Full text' }).getAttribute('aria-checked')).toBe('true');
+    expect(window.location.search).toBe(before);
+    expect(localStorage.getItem(SEARCH_MODE_PREFERENCE_KEY)).toBe('hybrid');
+  });
+  it('keeps a Display menu theme override ahead of a saved theme', async () => {
+    sessionStorage.setItem('msgvault.appearance.override', JSON.stringify({ theme: 'light' }));
+    await openAppearance(appearanceDaemon());
+    await chooseSelectOption(screen.getByLabelText('Theme'), 'Dark');
+    await fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Save changes' })).toBeNull());
+    expect(document.documentElement.classList.contains('dark')).toBe(false);
+  });
+  it('remembers a saved default search mode without changing the open view', async () => {
+    localStorage.removeItem(SEARCH_MODE_PREFERENCE_KEY);
+    await openAppearance(appearanceDaemon());
+    const before = window.location.search;
+    await chooseSelectOption(screen.getByLabelText('Default search mode'), 'Hybrid');
+    await fireEvent.click(screen.getByRole('button', { name: 'Save changes' }));
+    await waitFor(() => expect(localStorage.getItem(SEARCH_MODE_PREFERENCE_KEY)).toBe('hybrid'));
+    expect(window.location.search).toBe(before);
+    expect(screen.getByRole('radio', { name: 'Full text' }).getAttribute('aria-checked')).toBe('true');
+    expect(resolveInitialSearchMode(undefined, localStorage, 'full_text')).toBe('hybrid');
+  });
+  it('threads repeated same-conflict handoffs through AppShell as distinct exactly-once live events', async () => {
     window.history.replaceState(
-      null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`
+      null,
+      '',
+      `/?explore=${encodeURIComponent(
+        JSON.stringify({
+          workspace: 'directory',
+          directoryPersonID: 7,
+        }),
+      )}`,
     );
+    const detailRequests: number[] = [];
     const fetchFn = vi.fn<typeof fetch>(async (input) => {
       const request = input instanceof Request ? input : new Request(input);
       const path = new URL(request.url).pathname;
       if (path === '/api/session') {
         return Response.json({ auth_mode: 'loopback', https: false, plain_http_warning: false });
       }
-      if (path === '/api/v1/settings') {
+      if (path === '/api/v1/settings') return settingsResponse('system', '"etag-carddav"');
+      if (path === '/api/v1/people/directory')
         return Response.json({
-          settings: [{ key: 'web.default_search_mode', value: { string: configured } }],
-          pending_restart: false
+          people: [
+            {
+              id: 7,
+              revision: 1,
+              display_name: 'Synthetic Person',
+              contact_state: 'active',
+              categories: [],
+              organizations: [],
+            },
+          ],
+        });
+      if (path === '/api/v1/carddav/publications/7')
+        return Response.json({
+          person_id: 7,
+          state: 'conflict',
+          desired: true,
+          conflict_id: 41,
+          address_book: { id: 5, name: 'Synthetic contacts' },
+        });
+      if (path === '/api/v1/carddav/conflicts/41') {
+        detailRequests.push(41);
+        return Response.json({
+          id: 41,
+          address_book: { id: 5, name: 'Synthetic contacts' },
+          status: 'unresolved',
+          base: { state: 'present', display_name: 'Base person', emails: [], phones: [] },
+          local: { state: 'present', display_name: 'Local person', emails: [], phones: [] },
+          remote: { state: 'deleted', emails: [], phones: [] },
+          allowed_resolutions: ['keep_local', 'keep_remote'],
+          created_at: '2026-08-28T10:00:00Z',
+          updated_at: '2026-08-28T11:00:00Z',
         });
       }
-      if (path === '/api/v1/explore') {
-        return Response.json({ rows: [], total_count: 0, cache_revision: 'boot', search_provenance: {} });
-      }
+      if (path === '/api/v1/carddav/status')
+        return Response.json({
+          configured: true,
+          available: true,
+          credential_configured: true,
+          enabled: false,
+          scheduled: false,
+          schedule: '',
+        });
+      if (path === '/api/v1/carddav/books') return Response.json({ books: [] });
+      if (path === '/api/v1/carddav/runs') return Response.json({ runs: [] });
+      if (path === '/api/v1/carddav/conflicts') return Response.json({ conflicts: [] });
+      if (path === '/api/v1/people/7')
+        return Response.json({
+          id: 7,
+          revision: 1,
+          display_name: 'Synthetic Person',
+          participant_ids: [],
+          vcard_uid: '',
+          created_at: '2026-08-01T00:00:00Z',
+          updated_at: '2026-08-01T00:00:00Z',
+        });
+      if (path === '/api/v1/people/7/profile')
+        return Response.json({
+          person: { id: 7, revision: 1, display_name: 'Synthetic Person' },
+          names: [],
+          contact_points: [],
+          addresses: [],
+          dates: [],
+          categories: [],
+          media: [],
+        });
+      if (path === '/api/v1/people/7/attributes') return Response.json({ person_id: 7, attributes: [] });
+      if (path === '/api/v1/people/7/contact-state')
+        return Response.json({
+          person_id: 7,
+          cadence_status: 'current',
+          interaction_count: 0,
+          computed_at: '2026-08-28T10:00:00Z',
+          stale: false,
+        });
+      if (path === '/api/v1/people/7/employments') return Response.json({ employments: [] });
+      if (path === '/api/v1/people/7/relationships') return Response.json({ relationships: [] });
+      if (path === '/api/v1/people/7/days') return Response.json({ person_id: 7, days: [], total_count: 0 });
+      if (path === '/api/v1/people/7/files/search')
+        return Response.json({
+          files: [],
+          total_count: 0,
+          cache_revision: 'synthetic',
+          search_provenance: {},
+        });
+      if (path === '/api/v1/people/7/merges') return Response.json({ merges: [], limit: 100, offset: 0 });
+      if (path === '/api/v1/explore')
+        return Response.json({
+          rows: [],
+          total_count: 0,
+          cache_revision: 'synthetic',
+          search_provenance: {},
+        });
       return Response.json({}, { status: 404 });
     });
     const session = createSessionController(fetchFn);
-    render(App, { session });
+    const rendered = render(App, { session });
     await session.bootstrap();
-
-    const settingsLoaded = () => fetchFn.mock.calls.some((call) => {
-      const request = call[0];
-      return request instanceof Request && new URL(request.url).pathname === '/api/v1/settings';
-    });
-    await waitFor(() => expect(settingsLoaded()).toBe(true));
-    await new Promise((resolve) => setTimeout(resolve));
-
-    await waitFor(() => expect(
-      screen.getByRole('radio', { name: expectedLabel }).getAttribute('aria-checked')
-    ).toBe('true'));
+    await fireEvent.click(await screen.findByRole('tab', { name: 'Maintenance' }));
+    await fireEvent.click(await screen.findByRole('button', { name: 'Review CardDAV conflict 41' }));
+    const detailHeading = await screen.findByRole('heading', { name: 'Conflict comparison' });
+    await waitFor(() => expect(document.activeElement).toBe(detailHeading));
+    expect(detailRequests).toEqual([41]);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.getByRole('status', { name: 'Operation status' }).textContent).toBe(
+      'Opening CardDAV conflict 41 in Settings.',
+    );
+    const firstAnnouncement = screen.getByRole('status', { name: 'Operation status' }).firstElementChild;
+    expect(firstAnnouncement).not.toBeNull();
+    window.history.back();
+    await new Promise((resolve) => window.addEventListener('popstate', resolve, { once: true }));
+    await fireEvent.click(await screen.findByRole('tab', { name: 'Maintenance' }));
+    await fireEvent.click(await screen.findByRole('button', { name: 'Review CardDAV conflict 41' }));
+    const repeatedStatus = screen.getByRole('status', { name: 'Operation status' });
+    await waitFor(() => expect(repeatedStatus.firstElementChild).not.toBe(firstAnnouncement));
+    expect(repeatedStatus.textContent).toBe('Opening CardDAV conflict 41 in Settings.');
+    expect(screen.getAllByRole('status', { name: 'Operation status' })).toHaveLength(1);
+    await waitFor(() => expect(detailRequests).toEqual([41, 41]));
+    rendered.unmount();
     window.history.replaceState(null, '', '/');
   });
 });
-
 function settingsResponse(theme: string, etag: string, pendingRestart = false): Response {
   return Response.json(
     {
+      groups: [{ id: 'browser', label: 'Appearance', description: 'How the web app looks.' }],
       settings: [
         {
           key: 'web.theme',
           group: 'browser',
+          label: 'Theme',
           kind: 'string',
           value: { string: theme },
           options: ['system', 'light', 'dark'],
-          restart_required: true
-        }
+          restart_required: true,
+        },
       ],
-      pending_restart: pendingRestart
+      pending_restart: pendingRestart,
     },
-    { headers: { ETag: etag } }
+    { headers: { ETag: etag } },
   );
+}
+function appearanceDaemon() {
+  const current = { theme: 'system', density: 'compact', mode: 'full_text' };
+  const document = () =>
+    Response.json(
+      {
+        groups: [{ id: 'browser', label: 'Appearance', description: 'How the web app looks.' }],
+        settings: [
+          {
+            key: 'web.theme',
+            group: 'browser',
+            label: 'Theme',
+            kind: 'string',
+            value: { string: current.theme },
+            options: ['system', 'light', 'dark'],
+            restart_required: false,
+          },
+          {
+            key: 'web.density',
+            group: 'browser',
+            label: 'Density',
+            kind: 'string',
+            value: { string: current.density },
+            options: ['compact', 'comfortable'],
+            restart_required: false,
+          },
+          {
+            key: 'web.default_search_mode',
+            group: 'browser',
+            label: 'Default search mode',
+            kind: 'string',
+            value: { string: current.mode },
+            options: ['full_text', 'semantic', 'hybrid'],
+            restart_required: false,
+          },
+        ],
+        pending_restart: false,
+      },
+      { headers: { ETag: '"appearance"' } },
+    );
+  return vi.fn<typeof fetch>(async (input) => {
+    const request = input instanceof Request ? input : new Request(input);
+    const path = new URL(request.url).pathname;
+    if (path === '/api/session') {
+      return Response.json({ auth_mode: 'loopback', https: false, plain_http_warning: false });
+    }
+    if (path === '/api/v1/settings' && request.method === 'PATCH') {
+      const body = (await request.json()) as { updates: Array<{ key: string; value: { string: string } }> };
+      for (const { key, value } of body.updates) {
+        if (key === 'web.theme') current.theme = value.string;
+        if (key === 'web.density') current.density = value.string;
+        if (key === 'web.default_search_mode') current.mode = value.string;
+      }
+      return document();
+    }
+    if (path === '/api/v1/settings') return document();
+    if (path === '/api/v1/explore') {
+      return Response.json({ rows: [], total_count: 0, cache_revision: 'appearance', search_provenance: {} });
+    }
+    return Response.json({}, { status: 404 });
+  });
+}
+async function openAppearance(fetchFn: ReturnType<typeof appearanceDaemon>) {
+  window.history.replaceState(null, '', '/?workspace=settings');
+  const session = createSessionController(fetchFn);
+  render(App, { session });
+  await session.bootstrap();
+  await screen.findByRole('heading', { level: 2, name: 'Appearance' });
 }

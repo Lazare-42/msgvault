@@ -2,7 +2,7 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
@@ -23,10 +23,16 @@ var ErrDerivedRefreshRequiresFullBuild = errors.New(
 
 var derivedPublishBeforeMarkerHook func() error
 
+// derivedRefreshBeforeSnapshotHook is a deterministic test seam for writes
+// that commit after a staleness check selects a refresh but before the refresh
+// pins its source snapshot.
+var derivedRefreshBeforeSnapshotHook func()
+
 func refreshDerivedDatasetsOnly(
 	ctx context.Context,
 	dbPath, analyticsDir string,
 	locking cachePublishLocking,
+	repairRelated bool,
 	builderOverrides ...duckdbutil.BuilderOverrides,
 ) (*buildResult, error) {
 	readiness, err := query.InspectCacheReadiness(analyticsDir)
@@ -75,9 +81,17 @@ func refreshDerivedDatasetsOnly(
 		return nil, fmt.Errorf("read derived-data revision: %w", err)
 	}
 	if derivedDataRevision != state.DerivedDataRevision {
-		_ = st.Close()
-		return nil, fmt.Errorf("%w: derived-data revision changed",
-			ErrDerivedRefreshRequiresFullBuild)
+		relatedOnly, relatedErr := st.RelatedDerivedRevisionsOnly(ctx,
+			state.DerivedDataRevision, derivedDataRevision)
+		if relatedErr != nil {
+			_ = st.Close()
+			return nil, fmt.Errorf("classify derived-data revision: %w", relatedErr)
+		}
+		if !repairRelated || !relatedOnly {
+			_ = st.Close()
+			return nil, fmt.Errorf("%w: derived-data revision changed",
+				ErrDerivedRefreshRequiresFullBuild)
+		}
 	}
 	accountIdentityRevision, err := st.AccountIdentityRevision()
 	if err != nil {
@@ -99,6 +113,11 @@ func refreshDerivedDatasetsOnly(
 		_ = st.Close()
 		return nil, fmt.Errorf("read participant display-name revision: %w", err)
 	}
+	personDisplayNameRevision, err := st.PersonDisplayNameRevision()
+	if err != nil {
+		_ = st.Close()
+		return nil, fmt.Errorf("read person display-name revision: %w", err)
+	}
 	clusters, err := st.ParticipantClusters()
 	if err != nil {
 		_ = st.Close()
@@ -117,20 +136,80 @@ func refreshDerivedDatasetsOnly(
 		return nil, fmt.Errorf("open bounded DuckDB for derived refresh: %w", err)
 	}
 	defer func() { _ = duckDB.Close() }()
+	textRepairs := &cacheTextRepairs{}
+	if err := registerCacheTextFunctions(ctx, duckDB, textRepairs); err != nil {
+		return nil, err
+	}
 
+	if derivedRefreshBeforeSnapshotHook != nil {
+		derivedRefreshBeforeSnapshotHook()
+	}
 	sourceSnapshot, err := openCacheSourceSnapshot(duckDB, dbPath)
 	if err != nil {
 		return nil, err
 	}
 	defer func() { _ = sourceSnapshot.Close() }()
-	if err := sourceSnapshot.PrepareDatasets(
+	datasets := []string{
 		tableMessages,
 		tableConversations,
 		tableConversationParticipants,
 		"account_identities",
 		tableParticipants,
 		tableParticipantIdentifiers,
-	); err != nil {
+		"persons", "person_participants",
+	}
+	var relatedChangeSeq int64
+	var relatedKinds relatedChangeKinds
+	if repairRelated {
+		// A late terminal sync can add children to an already-exported parent.
+		// Acknowledge its addition counter only from the same snapshot used to
+		// repair those children. Changed facts or interrupted runs remain full repairs.
+		counters, err := readCacheSyncCounters(sourceSnapshot)
+		if err != nil {
+			return nil, fmt.Errorf("read related-refresh sync counters: %w", err)
+		}
+		if counters.updates != state.LastCacheUpdateCount ||
+			counters.failedRunCount != state.LastFailedSyncRunCount ||
+			counters.failedRunIDSum != state.LastFailedSyncRunIDSum ||
+			counters.additions < state.LastCacheAdditionCount {
+			return nil, fmt.Errorf("%w: sync counters require a full repair",
+				ErrDerivedRefreshRequiresFullBuild)
+		}
+		if counters.additions != state.LastCacheAdditionCount {
+			if err := verifyRelatedOnlyAdditions(sourceSnapshot, state); err != nil {
+				return nil, err
+			}
+		}
+		state.LastCacheAdditionCount = counters.additions
+		if err := sourceSnapshot.QueryRow(`SELECT COALESCE((SELECT seq FROM sqlite_sequence
+			WHERE name = 'cache_related_change_journal'), 0)`).Scan(&relatedChangeSeq); err != nil {
+			return nil, fmt.Errorf("read related-change boundary: %w", err)
+		}
+		if err := inspectRelatedSnapshotColumns(sourceSnapshot); err != nil {
+			return nil, err
+		}
+		// The CSV fallback closes its SQLite transaction during preparation.
+		// Read journal metadata while that snapshot is still available.
+		relatedKinds, err = inspectRelatedChangeKinds(sourceSnapshot,
+			state.LastRelatedChangeSeq, relatedChangeSeq, state.LastMessageID)
+		if err != nil {
+			return nil, err
+		}
+		if relatedKinds.other {
+			return nil, fmt.Errorf("%w: unsupported related-row journal dataset",
+				ErrDerivedRefreshRequiresFullBuild)
+		}
+	}
+	relatedExports := make(map[string]int64)
+	relatedReplacements := make(map[string]bool)
+	for dataset, changed := range relatedKinds.datasets() {
+		if changed {
+			relatedExports[dataset] = 0
+			datasets = append(datasets, dataset)
+			relatedReplacements[dataset] = true
+		}
+	}
+	if err := sourceSnapshot.PrepareDatasets(datasets...); err != nil {
 		return nil, err
 	}
 	exportDB := sourceSnapshot.DuckDB()
@@ -152,9 +231,10 @@ func refreshDerivedDatasetsOnly(
 		return nil, err
 	}
 
-	if identityRevision == state.IdentityRevision &&
+	if !repairRelated && identityRevision == state.IdentityRevision &&
 		participantIdentifierRevision == state.ParticipantIdentifierRevision &&
 		participantDisplayNameRevision == state.ParticipantDisplayNameRevision &&
+		personDisplayNameRevision == state.PersonDisplayNameRevision &&
 		conversationFingerprint == state.ConversationParticipantsFingerprint &&
 		typesFingerprint == state.ConversationTypesFingerprint {
 		// Nothing the derived datasets read has changed (the account-identity
@@ -163,23 +243,58 @@ func refreshDerivedDatasetsOnly(
 		// it active pagination cursors — for no analytical difference.
 		return &buildResult{OutputDir: analyticsDir, IdentityOnly: true, Skipped: true}, nil
 	}
+	if repairRelated && !relatedKinds.recipients &&
+		identityRevision == state.IdentityRevision &&
+		participantIdentifierRevision == state.ParticipantIdentifierRevision &&
+		participantDisplayNameRevision == state.ParticipantDisplayNameRevision &&
+		personDisplayNameRevision == state.PersonDisplayNameRevision &&
+		conversationFingerprint == state.ConversationParticipantsFingerprint &&
+		typesFingerprint == state.ConversationTypesFingerprint {
+		// Labels and attachment metadata do not enter relationship_activity.
+		// Publish their child rows and marker directly, avoiding a scan of the
+		// expanded relationship population for a small metadata correction.
+		if err := exportRelatedDatasets(ctx, exportDB, sourceSnapshot,
+			state.LastMessageID, staging.root, relatedExports); err != nil {
+			return nil, err
+		}
+		if err := refreshRelatedCacheStats(ctx, exportDB, &state, relatedKinds); err != nil {
+			return nil, err
+		}
+		if err := sourceSnapshot.Close(); err != nil {
+			return nil, fmt.Errorf("close SQLite related-refresh snapshot: %w", err)
+		}
+		state.DerivedDataRevision = derivedDataRevision
+		state.LastRelatedChangeSeq = relatedChangeSeq
+		plan := cachePublishPlan{
+			Append:  map[string]bool{},
+			Replace: relatedReplacements,
+		}
+		if err := publishDerivedCache(staging, analyticsDir, plan, state, locking); err != nil {
+			return nil, err
+		}
+		reportCacheTextRepairs(os.Stderr, textRepairs)
+		warnRelatedChangePrune(dbPath, relatedChangeSeq, derivedDataRevision)
+		return &buildResult{OutputDir: analyticsDir, IdentityOnly: true}, nil
+	}
 
-	if err := exportDerivedOwnerParticipants(ctx, exportDB, staging.root); err != nil {
+	derivedCopy := func(table, selectSQL string) error {
+		return copyParquet(ctx, exportDB, filepath.Join(staging.root, table), table+".parquet", selectSQL)
+	}
+	if err := derivedCopy(tableOwnerParticipants, ownerParticipantsSelectSQL(
+		sourceSnapshot.identityPresenceSQL("email_address", "primary_email_present"))); err != nil {
+		return nil, fmt.Errorf("export derived owner participants: %w", err)
+	}
+	if err := stageParticipantClusters(ctx, exportDB, clusters); err != nil {
 		return nil, err
 	}
-	if err := exportDerivedParticipantClusters(ctx, exportDB, clusters, staging.root); err != nil {
-		return nil, err
+	if err := derivedCopy(tableParticipantClusters, participantClustersSelectSQL); err != nil {
+		return nil, fmt.Errorf("export derived participant clusters: %w", err)
 	}
 	conversationChanged :=
 		conversationFingerprint != state.ConversationParticipantsFingerprint
 	if conversationChanged {
-		if err := exportDerivedConversationParticipants(
-			ctx,
-			exportDB,
-			state.LastMessageID,
-			staging.root,
-		); err != nil {
-			return nil, err
+		if err := derivedCopy(tableConversationParticipants, conversationParticipantsSelectSQL(state.LastMessageID)); err != nil {
+			return nil, fmt.Errorf("export derived conversation participants: %w", err)
 		}
 	}
 	identifiersChanged :=
@@ -189,8 +304,8 @@ func refreshDerivedDatasetsOnly(
 		// participant_identifiers base dataset (relationship_people search
 		// values and label fallbacks), so a changed mapping must be re-staged
 		// and republished alongside the derived index.
-		if err := exportDerivedParticipantIdentifiers(ctx, exportDB, staging.root); err != nil {
-			return nil, err
+		if err := derivedCopy(tableParticipantIdentifiers, sourceSnapshot.participantIdentifiersExportSelectSQL()); err != nil {
+			return nil, fmt.Errorf("export derived participant identifiers: %w", err)
 		}
 	}
 	displayNamesChanged :=
@@ -199,8 +314,15 @@ func refreshDerivedDatasetsOnly(
 		// Participant identifiers can create participant rows, and display-name
 		// mutations change the row already present in participants.parquet. Both
 		// changes must replace that base dataset before rebuilding the directory.
-		if err := exportDerivedParticipants(ctx, exportDB, staging.root); err != nil {
-			return nil, err
+		if err := derivedCopy(tableParticipants, sourceSnapshot.participantsExportSelectSQL()); err != nil {
+			return nil, fmt.Errorf("export derived participants: %w", err)
+		}
+	}
+	personDisplayNamesChanged := personDisplayNameRevision != state.PersonDisplayNameRevision
+	identityChanged := identityRevision != state.IdentityRevision
+	if personDisplayNamesChanged || identityChanged {
+		if err := derivedCopy(tablePersonDisplayNames, sourceSnapshot.personDisplayNamesExportSelectSQL()); err != nil {
+			return nil, fmt.Errorf("export derived person_display_names: %w", err)
 		}
 	}
 	typesChanged := typesFingerprint != state.ConversationTypesFingerprint
@@ -209,12 +331,15 @@ func refreshDerivedDatasetsOnly(
 		// base dataset, and the analytical view joins it live — both must
 		// see the current types, so the dataset is re-staged and republished
 		// alongside the derived index.
-		if err := exportDerivedConversations(
-			ctx,
-			exportDB,
-			state.LastMessageID,
-			staging.root,
-		); err != nil {
+		if err := derivedCopy(tableConversations, sourceSnapshot.conversationsExportSelectSQL(state.LastMessageID)); err != nil {
+			return nil, fmt.Errorf("export derived conversations: %w", err)
+		}
+	}
+	if repairRelated {
+		if err := exportRelatedDatasets(ctx, exportDB, sourceSnapshot, state.LastMessageID, staging.root, relatedExports); err != nil {
+			return nil, err
+		}
+		if err := refreshRelatedCacheStats(ctx, exportDB, &state, relatedKinds); err != nil {
 			return nil, err
 		}
 	}
@@ -239,20 +364,37 @@ func refreshDerivedDatasetsOnly(
 	}
 
 	state.IdentityRevision = identityRevision
+	if repairRelated {
+		state.DerivedDataRevision = derivedDataRevision
+	}
 	state.ParticipantIdentifierRevision = participantIdentifierRevision
 	state.ParticipantDisplayNameRevision = participantDisplayNameRevision
+	state.PersonDisplayNameRevision = personDisplayNameRevision
 	state.ConversationParticipantsFingerprint = conversationFingerprint
 	state.ConversationTypesFingerprint = typesFingerprint
-	// Stats describe the unchanged committed raw snapshot. Preserve them
-	// byte-for-byte instead of scanning Parquet again.
+	if repairRelated {
+		state.LastRelatedChangeSeq = relatedChangeSeq
+	}
+	// The message snapshot remains unchanged; child-row statistics were
+	// refreshed above when their source rows changed.
 	plan := derivedCachePublishPlan(
 		conversationChanged,
 		typesChanged,
 		identifiersChanged,
 		identifiersChanged || displayNamesChanged,
+		personDisplayNamesChanged || identityChanged,
 	)
+	if repairRelated {
+		for dataset := range relatedReplacements {
+			plan.Replace[dataset] = true
+		}
+	}
 	if err := publishDerivedCache(staging, analyticsDir, plan, state, locking); err != nil {
 		return nil, err
+	}
+	reportCacheTextRepairs(os.Stderr, textRepairs)
+	if repairRelated {
+		warnRelatedChangePrune(dbPath, relatedChangeSeq, derivedDataRevision)
 	}
 	return &buildResult{OutputDir: analyticsDir, IdentityOnly: true}, nil
 }
@@ -288,9 +430,9 @@ func fingerprintConversationParticipantsFromSnapshot(
 // fingerprintConversationTypesFromSnapshot mirrors
 // sourceConversationTypesFingerprint over the export snapshot, so the stamp
 // written at publish time describes exactly the type/title metadata the staged
-// datasets baked. The normalizations match the staleness query (and the CSV
-// snapshot view), not the exported Parquet values; fingerprints only compare
-// against each other.
+// datasets baked. The query applies the same NULL defaults as the staleness
+// query. FingerprintConversationMetadata repairs invalid UTF-8 on both paths
+// before hashing.
 func fingerprintConversationTypesFromSnapshot(
 	ctx context.Context,
 	db sqlRunner,
@@ -321,170 +463,48 @@ func fingerprintConversationTypesFromSnapshot(
 	return fingerprint, err
 }
 
-// exportDerivedConversations re-stages the conversations base dataset with
-// the full export query so an index-only refresh triggered by type drift
-// rebuilds relationship_activity from current types and republishes the
-// dataset the analytical view joins.
-func exportDerivedConversations(
-	ctx context.Context,
-	db sqlRunner,
-	lastMessageID int64,
-	stagingRoot string,
-) error {
-	dir := filepath.Join(stagingRoot, tableConversations)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create derived conversations directory: %w", err)
+// stageParticipantClusters loads the Go-computed clusters into a DuckDB temp
+// table that participantClustersSelectSQL reads.
+func stageParticipantClusters(ctx context.Context, db sqlRunner, clusters map[int64]int64) error {
+	if _, err := db.ExecContext(ctx,
+		`CREATE TEMP TABLE tmp_participant_clusters (participant_id BIGINT, canonical_id BIGINT)`); err != nil {
+		return fmt.Errorf("create participant clusters temp table: %w", err)
 	}
-	path := filepath.Join(dir, "conversations.parquet")
-	_, err := db.ExecContext(ctx, fmt.Sprintf(`
-		COPY (
-			%s
-		) TO '%s' (FORMAT PARQUET, COMPRESSION 'zstd')
-	`, conversationsExportSelectSQL(lastMessageID), quoteCacheSQL(path)))
-	if err != nil {
-		return fmt.Errorf("export derived conversations: %w", err)
+	if len(clusters) == 0 {
+		return nil
+	}
+	values := make([]string, 0, len(clusters))
+	for participantID, canonicalID := range clusters {
+		values = append(values, fmt.Sprintf("(%d,%d)", participantID, canonicalID))
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO tmp_participant_clusters VALUES `+strings.Join(values, ",")); err != nil {
+		return fmt.Errorf("populate participant clusters temp table: %w", err)
 	}
 	return nil
 }
 
-func exportDerivedOwnerParticipants(
-	ctx context.Context,
-	db sqlRunner,
-	stagingRoot string,
-) error {
-	dir := filepath.Join(stagingRoot, tableOwnerParticipants)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create derived owner participants directory: %w", err)
-	}
-	path := filepath.Join(dir, "owner_participants.parquet")
-	_, err := db.ExecContext(ctx, fmt.Sprintf(`
-		COPY (%s
-		) TO '%s' (FORMAT PARQUET, COMPRESSION 'zstd')
-	`, ownerParticipantsSelectSQL, quoteCacheSQL(path)))
-	if err != nil {
-		return fmt.Errorf("export derived owner participants: %w", err)
-	}
-	return nil
+const participantClustersSelectSQL = `SELECT participant_id, canonical_id FROM tmp_participant_clusters`
+
+func conversationParticipantsSelectSQL(maxMessageID int64) string {
+	return fmt.Sprintf(`SELECT cp.conversation_id, cp.participant_id
+		FROM sqlite_db.conversation_participants cp
+		WHERE EXISTS (
+			SELECT 1
+			FROM sqlite_db.messages m
+			WHERE m.conversation_id = cp.conversation_id
+			  AND %s
+			  AND TRY_CAST(m.id AS BIGINT) <= %d
+		)`, exportableMessageWhere("m"), maxMessageID)
 }
 
-// exportDerivedParticipants re-stages the participants base dataset when an
-// identifier creates a participant or a display-name mutation changes an
-// existing row. The relationship directory reads this dataset directly.
-func exportDerivedParticipants(
-	ctx context.Context,
-	db sqlRunner,
-	stagingRoot string,
-) error {
-	dir := filepath.Join(stagingRoot, tableParticipants)
+// copyParquet writes selectSQL to dir/file as zstd Parquet, creating dir.
+func copyParquet(ctx context.Context, db sqlRunner, dir, file, selectSQL string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create derived participants directory: %w", err)
+		return err
 	}
-	path := filepath.Join(dir, "participants.parquet")
-	_, err := db.ExecContext(ctx, fmt.Sprintf(`
-		COPY (
-			%s
-		) TO '%s' (FORMAT PARQUET, COMPRESSION 'zstd')
-	`, participantsExportSelectSQL(), quoteCacheSQL(path)))
-	if err != nil {
-		return fmt.Errorf("export derived participants: %w", err)
-	}
-	return nil
-}
-
-// exportDerivedParticipantIdentifiers re-stages the participant_identifiers
-// base dataset with the full export query so an index-only refresh triggered
-// by identifier drift rebuilds the identity directory from current mappings
-// and republishes the dataset participant-label fallbacks join.
-func exportDerivedParticipantIdentifiers(
-	ctx context.Context,
-	db sqlRunner,
-	stagingRoot string,
-) error {
-	dir := filepath.Join(stagingRoot, tableParticipantIdentifiers)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create derived participant identifiers directory: %w", err)
-	}
-	path := filepath.Join(dir, "participant_identifiers.parquet")
-	_, err := db.ExecContext(ctx, fmt.Sprintf(`
-		COPY (
-			%s
-		) TO '%s' (FORMAT PARQUET, COMPRESSION 'zstd')
-	`, participantIdentifiersExportSelectSQL(), quoteCacheSQL(path)))
-	if err != nil {
-		return fmt.Errorf("export derived participant identifiers: %w", err)
-	}
-	return nil
-}
-
-func exportDerivedParticipantClusters(
-	ctx context.Context,
-	db sqlRunner,
-	clusters map[int64]int64,
-	stagingRoot string,
-) error {
-	if _, err := db.ExecContext(ctx, `
-		CREATE TEMP TABLE tmp_derived_participant_clusters (
-			participant_id BIGINT,
-			canonical_id BIGINT
-		)
-	`); err != nil {
-		return fmt.Errorf("create derived participant clusters table: %w", err)
-	}
-	if len(clusters) > 0 {
-		values := make([]string, 0, len(clusters))
-		for participantID, canonicalID := range clusters {
-			values = append(values, fmt.Sprintf("(%d,%d)", participantID, canonicalID))
-		}
-		if _, err := db.ExecContext(ctx, `
-			INSERT INTO tmp_derived_participant_clusters
-			VALUES `+strings.Join(values, ",")); err != nil {
-			return fmt.Errorf("populate derived participant clusters: %w", err)
-		}
-	}
-	dir := filepath.Join(stagingRoot, tableParticipantClusters)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create derived participant clusters directory: %w", err)
-	}
-	path := filepath.Join(dir, "participant_clusters.parquet")
-	if _, err := db.ExecContext(ctx, fmt.Sprintf(`
-		COPY (
-			SELECT participant_id, canonical_id
-			FROM tmp_derived_participant_clusters
-		) TO '%s' (FORMAT PARQUET, COMPRESSION 'zstd')
-	`, quoteCacheSQL(path))); err != nil {
-		return fmt.Errorf("export derived participant clusters: %w", err)
-	}
-	return nil
-}
-
-func exportDerivedConversationParticipants(
-	ctx context.Context,
-	db sqlRunner,
-	lastMessageID int64,
-	stagingRoot string,
-) error {
-	dir := filepath.Join(stagingRoot, tableConversationParticipants)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fmt.Errorf("create derived conversation participants directory: %w", err)
-	}
-	path := filepath.Join(dir, "conversation_participants.parquet")
-	_, err := db.ExecContext(ctx, fmt.Sprintf(`
-		COPY (
-			SELECT cp.conversation_id, cp.participant_id
-			FROM sqlite_db.conversation_participants cp
-			WHERE EXISTS (
-				SELECT 1
-				FROM sqlite_db.messages m
-				WHERE m.conversation_id = cp.conversation_id
-				  AND %s
-				  AND TRY_CAST(m.id AS BIGINT) <= %d
-			)
-		) TO '%s' (FORMAT PARQUET, COMPRESSION 'zstd')
-	`, exportableMessageWhere("m"), lastMessageID, quoteCacheSQL(path)))
-	if err != nil {
-		return fmt.Errorf("export derived conversation participants: %w", err)
-	}
-	return nil
+	_, err := db.ExecContext(ctx, fmt.Sprintf(`COPY (%s) TO '%s' (FORMAT PARQUET, COMPRESSION 'zstd')`,
+		selectSQL, quoteCacheSQL(filepath.Join(dir, file))))
+	return err
 }
 
 func quoteCacheSQL(value string) string {
@@ -493,7 +513,7 @@ func quoteCacheSQL(value string) string {
 
 func derivedCachePublishPlan(
 	includeConversationParticipants, includeConversations,
-	includeParticipantIdentifiers, includeParticipants bool,
+	includeParticipantIdentifiers, includeParticipants, includePersonDisplayNames bool,
 ) cachePublishPlan {
 	plan := cachePublishPlan{
 		Append:  make(map[string]bool),
@@ -506,6 +526,8 @@ func derivedCachePublishPlan(
 		identityindex.DatasetPeople,
 		identityindex.DatasetDomains,
 		identityindex.DatasetRelationshipDaily,
+		identityindex.DatasetLogicalContributions,
+		identityindex.DatasetTemperatureContributions,
 	} {
 		plan.Replace[dataset] = true
 	}
@@ -521,6 +543,9 @@ func derivedCachePublishPlan(
 	if includeParticipants {
 		plan.Replace[tableParticipants] = true
 	}
+	if includePersonDisplayNames {
+		plan.Replace[tablePersonDisplayNames] = true
+	}
 	return plan
 }
 
@@ -531,7 +556,7 @@ func publishDerivedCache(
 	state query.CacheSyncState,
 	locking cachePublishLocking,
 ) error {
-	data, err := json.Marshal(state)
+	data, err := json.Marshal(state, json.Deterministic(true))
 	if err != nil {
 		return fmt.Errorf("encode derived cache marker: %w", err)
 	}
@@ -543,4 +568,33 @@ func publishDerivedCache(
 		derivedPublishBeforeMarkerHook,
 		locking,
 	)
+}
+
+// verifyRelatedOnlyAdditions confirms that new sync additions changed only
+// child rows of cached messages. A refresh may then record the new addition
+// count. Any change to the message population needs a full build instead:
+// an old message that became exportable inside the cached boundary, or an
+// exportable message above it. The staleness check ignores a message deleted
+// at the source when it looks for new messages, so such a message above the
+// boundary would otherwise stay out of the cache.
+func verifyRelatedOnlyAdditions(snapshot *cacheSourceSnapshot, state syncState) error {
+	var coveredCount int64
+	if err := snapshot.QueryRow(coveredCacheMessageCountSQL(), state.LastMessageID).
+		Scan(&coveredCount); err != nil {
+		return fmt.Errorf("check related-refresh message population: %w", err)
+	}
+	if coveredCount != state.Stats.TotalMessages {
+		return fmt.Errorf("%w: cached message population changed",
+			ErrDerivedRefreshRequiresFullBuild)
+	}
+	var uncachedExportable bool
+	if err := snapshot.QueryRow(`SELECT EXISTS (SELECT 1 FROM messages WHERE id > ? AND `+
+		exportableMessageWhere("")+`)`, state.LastMessageID).Scan(&uncachedExportable); err != nil {
+		return fmt.Errorf("check related-refresh message boundary: %w", err)
+	}
+	if uncachedExportable {
+		return fmt.Errorf("%w: exportable messages above the cached boundary",
+			ErrDerivedRefreshRequiresFullBuild)
+	}
+	return nil
 }

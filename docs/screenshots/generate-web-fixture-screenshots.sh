@@ -5,7 +5,6 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 repo_root="$(cd "$script_dir/../.." && pwd -P)"
 fixture_lock="$repo_root/docs/fixtures/fixture.lock.json"
 output_dir="${MSGVAULT_DOCS_SCREENSHOT_OUTPUT_DIR:-$repo_root/docs/assets/static}"
-original_home="${HOME:-}"
 platform="${MSGVAULT_DOCS_SCREENSHOT_PLATFORM:-darwin}"
 
 case "$platform" in
@@ -20,8 +19,6 @@ done
 
 umask 077
 scratch="$(mktemp -d /tmp/msgvault-docs-capture.XXXXXX)"
-go_modcache="$(go env GOMODCACHE)"
-go_cache="$(go env GOCACHE)"
 daemon_pid=""
 cleanup() {
   local exit_code="$?"
@@ -39,22 +36,14 @@ trap cleanup EXIT INT TERM
 bash "$repo_root/docs/fixtures/hydrate-fixture.sh" --output-dir "$scratch/fixture"
 fixture_dir="$scratch/fixture"
 home_dir="$scratch/home"
-os_home="$scratch/os-home"
-mkdir -p "$home_dir" "$os_home" "$scratch/xdg-config" "$scratch/xdg-cache" "$scratch/output"
-if [[ -z "${PLAYWRIGHT_BROWSERS_PATH:-}" ]]; then
-  if [[ -d "$original_home/Library/Caches/ms-playwright" ]]; then
-    export PLAYWRIGHT_BROWSERS_PATH="$original_home/Library/Caches/ms-playwright"
-  elif [[ -d /ms-playwright ]]; then
-    export PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-  fi
-fi
-export HOME="$os_home"
+mkdir -p "$home_dir" "$scratch/output"
+# --home and MSGVAULT_HOME confine the archive, config, credentials, and daemon
+# runtime record. Keep the host home and caches so toolchain shims still work.
 export MSGVAULT_HOME="$home_dir"
 export MSGVAULT_DATA_DIR="$home_dir"
-export XDG_CONFIG_HOME="$scratch/xdg-config"
-export XDG_CACHE_HOME="$scratch/xdg-cache"
-export GOMODCACHE="$go_modcache"
-export GOCACHE="$go_cache"
+if [[ -z "${PLAYWRIGHT_BROWSERS_PATH:-}" && -d /ms-playwright ]]; then
+  export PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+fi
 
 cat > "$home_dir/config.toml" <<'EOF'
 [server]
@@ -71,7 +60,7 @@ EOF
 
 (cd "$repo_root" && make web-embed >/dev/null)
 binary="$scratch/msgvault"
-CGO_ENABLED=1 go build -buildvcs=false -tags "fts5 sqlite_vec" -trimpath -o "$binary" "$repo_root/cmd/msgvault"
+CGO_ENABLED=1 go build -buildvcs=false -tags "fts5 sqlite_vec kit_posthog_disabled" -trimpath -o "$binary" "$repo_root/cmd/msgvault"
 plain_mbox="$scratch/enron-web-fixture.mbox"
 gzip -dc "$fixture_dir/enron-web-fixture.mbox.gz" > "$plain_mbox"
 owner_identifier="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["fixture"]["owner_identifier"])' "$fixture_dir/manifest.json")"

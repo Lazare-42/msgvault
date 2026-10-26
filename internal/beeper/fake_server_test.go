@@ -93,11 +93,16 @@ type fakeBeeper struct {
 	failChatGets map[string]bool
 	chats        []*fakeChat
 	assets       map[string][]byte // asset URL (mxc://...) -> bytes served by /v1/assets/serve
+	// assetErrors makes /v1/assets/serve answer with the given status and
+	// body for the listed asset URLs.
+	assetErrors map[string]fakeAssetError
 	// failMessageGets makes GET /v1/chats/{id}/messages/{mid} answer 400
 	// (a non-retryable transient error) for the listed message IDs.
 	failMessageGets map[string]bool
 	// failMessageLists does the same for GET /v1/chats/{id}/messages.
 	failMessageLists map[string]bool
+	// failMessageListsTimes fails the next N message-list fetches of a chat.
+	failMessageListsTimes map[string]int
 	// cancelAfterPages invokes cancelFn once after that many message-list
 	// pages have been fully served (0 = disabled), emulating a mid-walk
 	// interrupt between pages.
@@ -107,13 +112,20 @@ type fakeBeeper struct {
 	// cancelOnMessageListChatID invokes cancelFn once after serving a
 	// message-list response for the named chat.
 	cancelOnMessageListChatID string
+	blockMessageListChatID    string
+	messageListStarted        chan struct{}
 	reqs                      []string // "PATH?QUERY" per request, in order
 }
 
 func newFakeBeeper(t *testing.T) *fakeBeeper {
 	t.Helper()
+	// Retries are exercised without real waits.
+	oldBackoff := fetchRetryBackoff
+	fetchRetryBackoff = []time.Duration{0, 0}
+	t.Cleanup(func() { fetchRetryBackoff = oldBackoff })
+	t.Helper()
 	return &fakeBeeper{t: t, pageSize: 20, assets: map[string][]byte{}, failMessageGets: map[string]bool{},
-		failMessageLists: map[string]bool{}, failChatGets: map[string]bool{}}
+		failMessageLists: map[string]bool{}, failMessageListsTimes: map[string]int{}, failChatGets: map[string]bool{}}
 }
 
 // setMessageListFailure toggles a 400 response for message-list fetches of a chat.
@@ -123,6 +135,13 @@ func (f *fakeBeeper) setMessageListFailure(chatID string, fail bool) {
 	f.failMessageLists[chatID] = fail
 }
 
+// failMessageListTimes makes the next n message-list fetches of a chat fail.
+func (f *fakeBeeper) failMessageListTimes(chatID string, n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failMessageListsTimes[chatID] = n
+}
+
 // setMessageGetFailure toggles a 400 response for single-message fetches of id.
 func (f *fakeBeeper) setMessageGetFailure(id string, fail bool) {
 	f.mu.Lock()
@@ -130,11 +149,28 @@ func (f *fakeBeeper) setMessageGetFailure(id string, fail bool) {
 	f.failMessageGets[id] = fail
 }
 
-// setAsset makes an asset URL downloadable via /v1/assets/serve.
+type fakeAssetError struct {
+	status int
+	body   string
+}
+
+// setAssetError makes /v1/assets/serve fail for url with status and body.
+func (f *fakeBeeper) setAssetError(url string, status int, body string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.assetErrors == nil {
+		f.assetErrors = map[string]fakeAssetError{}
+	}
+	f.assetErrors[url] = fakeAssetError{status: status, body: body}
+}
+
+// setAsset makes an asset URL downloadable via /v1/assets/serve, replacing
+// any failure set by setAssetError.
 func (f *fakeBeeper) setAsset(url string, data []byte) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.assets[url] = data
+	delete(f.assetErrors, url)
 }
 
 // addAccount makes an account visible to GET /v1/accounts.
@@ -235,7 +271,11 @@ func (f *fakeBeeper) cancelMessageListFor(chatID string, cancelFn func()) {
 }
 
 func (f *fakeBeeper) server() *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return httptest.NewServer(f.handler())
+}
+
+func (f *fakeBeeper) handler() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		entry := r.URL.Path
 		if r.URL.RawQuery != "" {
@@ -259,6 +299,18 @@ func (f *fakeBeeper) server() *httptest.Server {
 			case len(parts) == 1:
 				f.writeChat(w, parts[0])
 			case len(parts) == 2 && parts[1] == "messages":
+				f.mu.Lock()
+				blocked := f.blockMessageListChatID == parts[0]
+				started := f.messageListStarted
+				if blocked {
+					f.blockMessageListChatID = ""
+				}
+				f.mu.Unlock()
+				if blocked {
+					close(started)
+					<-r.Context().Done()
+					return
+				}
 				f.writeMessages(w, r, parts[0])
 			case len(parts) == 3 && parts[1] == "messages":
 				f.writeMessage(w, parts[0], parts[2])
@@ -268,12 +320,16 @@ func (f *fakeBeeper) server() *httptest.Server {
 		default:
 			http.Error(w, `{"error":"not found"}`, http.StatusNotFound)
 		}
-	}))
+	}
 }
 
 func (f *fakeBeeper) writeAsset(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if failure, failing := f.assetErrors[r.URL.Query().Get("url")]; failing {
+		http.Error(w, failure.body, failure.status)
+		return
+	}
 	data, ok := f.assets[r.URL.Query().Get("url")]
 	if !ok {
 		http.Error(w, `{"error":"asset not found"}`, http.StatusNotFound)
@@ -429,6 +485,11 @@ func (f *fakeBeeper) writeMessages(w http.ResponseWriter, r *http.Request, chatI
 	}
 	if f.failMessageLists[chatID] {
 		http.Error(w, `{"error":"transient"}`, http.StatusBadRequest)
+		return
+	}
+	if f.failMessageListsTimes[chatID] > 0 {
+		f.failMessageListsTimes[chatID]--
+		http.Error(w, `{"error":"timeout"}`, http.StatusRequestTimeout)
 		return
 	}
 	q := r.URL.Query()

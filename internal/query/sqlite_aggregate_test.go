@@ -329,6 +329,69 @@ func TestAggregateByTime(t *testing.T) {
 	})
 }
 
+// TestSQLiteEngine_ListsAggregateAndDrill catches a scalar list dimension
+// being treated like a label join, which would multiply its counts or apply a
+// substring drill predicate.
+func TestSQLiteEngine_ListsAggregateAndDrill(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	env := newTestEnv(t)
+	_, err := env.DB.Exec(`UPDATE messages SET list_id = CASE id
+		WHEN 1 THEN '<dev_1@example.test>'
+		WHEN 2 THEN '<DEV_1@EXAMPLE.TEST>'
+		WHEN 3 THEN '<devA1@example.test>'
+		WHEN 4 THEN ''
+		ELSE NULL END`)
+	require.NoError(err)
+
+	rows, err := env.Engine.Aggregate(env.Ctx, ViewLists, DefaultAggregateOptions())
+	require.NoError(err)
+	assertAggregateCounts(t, rows, map[string]int64{
+		"<DEV_1@EXAMPLE.TEST>": 2,
+		"<devA1@example.test>": 1,
+	})
+	announceRow := requireAggregateRow(t, rows, "<DEV_1@EXAMPLE.TEST>")
+	assert.Equal(int64(3000), announceRow.TotalSize)
+	assert.Equal(int64(15000), announceRow.AttachmentSize)
+	assert.Equal(int64(2), announceRow.AttachmentCount)
+	assert.Equal(int64(2), announceRow.TotalUnique)
+
+	filter := MessageFilter{ListID: "<DEV_1@EXAMPLE.TEST>"}
+	messages, err := env.Engine.ListMessages(env.Ctx, filter)
+	require.NoError(err)
+	assert.Len(messages, 2)
+	assert.ElementsMatch([]int64{1, 2}, []int64{messages[0].ID, messages[1].ID})
+
+	labels, err := env.Engine.SubAggregate(env.Ctx, filter, ViewLabels, DefaultAggregateOptions())
+	require.NoError(err)
+	assertAggregateCounts(t, labels, map[string]int64{"INBOX": 2, "IMPORTANT": 1, "Work": 1})
+}
+
+// TestSQLiteEngine_ListsUnicodeCaseFold catches SQLite's built-in LOWER being
+// used for List-Id grouping or exact drill predicates. SQLite LOWER is ASCII
+// only, so the two spellings must be folded by the registered Unicode helper.
+func TestSQLiteEngine_ListsUnicodeCaseFold(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	env := newTestEnv(t)
+	_, err := env.DB.Exec(`UPDATE messages SET list_id = CASE id
+		WHEN 1 THEN '<ÉCOLE@example.test>'
+		WHEN 2 THEN '<école@example.test>'
+		ELSE NULL END`)
+	require.NoError(err)
+
+	rows, err := env.Engine.Aggregate(env.Ctx, ViewLists, DefaultAggregateOptions())
+	require.NoError(err)
+	require.Len(rows, 1)
+	assert.Equal(int64(2), rows[0].Count)
+
+	messages, err := env.Engine.ListMessages(
+		env.Ctx, MessageFilter{ListID: "<école@example.test>"})
+	require.NoError(err)
+	require.Len(messages, 2)
+	assert.ElementsMatch([]int64{1, 2}, []int64{messages[0].ID, messages[1].ID})
+}
+
 func TestAggregateWithDateFilter(t *testing.T) {
 	env := newTestEnv(t)
 
@@ -449,6 +512,78 @@ func TestSubAggregates(t *testing.T) {
 			results, err := env.Engine.SubAggregate(env.Ctx, tc.filter, tc.view, DefaultAggregateOptions())
 			require.NoError(t, err, "SubAggregate")
 			assertAggRows(t, results, tc.want)
+		})
+	}
+}
+
+func TestSQLiteEngine_SubAggregateSourceScopePrecedence(t *testing.T) {
+	env := newTestEnv(t)
+	sourceOne := int64(1)
+	sourceTwo := env.AddSource(dbtest.SourceOpts{Identifier: "scope@example.com"})
+	senderID := env.AddParticipant(dbtest.ParticipantOpts{
+		Email: new("scope-sender@example.com"), DisplayName: new("Scope Sender"), Domain: "example.com",
+	})
+	conversationID := env.AddConversation(dbtest.ConversationOpts{SourceID: sourceTwo, Title: "Scoped"})
+	env.AddMessage(dbtest.MessageOpts{
+		SourceID: sourceTwo, ConversationID: conversationID, FromID: senderID,
+		Subject: "Scoped message", SentAt: "2024-06-01 10:00:00",
+	})
+
+	sourceTwoID := sourceTwo
+	cases := []struct {
+		name   string
+		filter MessageFilter
+		opts   AggregateOptions
+		want   []aggExpectation
+	}{
+		{
+			name:   "option multi overrides filter single",
+			filter: MessageFilter{SourceID: &sourceOne, Sender: "scope-sender@example.com"},
+			opts:   AggregateOptions{SourceIDs: []int64{sourceTwo}},
+			want:   []aggExpectation{{"scope-sender@example.com", 1}},
+		},
+		{
+			name:   "option single overrides filter multi",
+			filter: MessageFilter{SourceIDs: []int64{sourceOne}, Sender: "scope-sender@example.com"},
+			opts:   AggregateOptions{SourceID: &sourceTwoID},
+			want:   []aggExpectation{{"scope-sender@example.com", 1}},
+		},
+		{
+			name:   "option single overrides empty filter",
+			filter: MessageFilter{SourceIDs: []int64{}, Sender: "scope-sender@example.com"},
+			opts:   AggregateOptions{SourceID: &sourceTwoID},
+			want:   []aggExpectation{{"scope-sender@example.com", 1}},
+		},
+		{
+			name:   "explicit empty option overrides filter",
+			filter: MessageFilter{SourceID: &sourceTwo, Sender: "scope-sender@example.com"},
+			opts:   AggregateOptions{SourceIDs: []int64{}},
+			want:   nil,
+		},
+		{
+			name:   "filter remains when options are nil",
+			filter: MessageFilter{SourceID: &sourceTwo, Sender: "scope-sender@example.com"},
+			opts:   DefaultAggregateOptions(),
+			want:   []aggExpectation{{"scope-sender@example.com", 1}},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			filter := tc.filter
+			opts := DefaultAggregateOptions()
+			opts.SourceID = tc.opts.SourceID
+			opts.SourceIDs = tc.opts.SourceIDs
+			rows, err := env.Engine.SubAggregate(env.Ctx, filter, ViewSenders, opts)
+			require.NoError(err, "SubAggregate")
+			assertAggRows(t, rows, tc.want)
+			if tc.filter.SourceID != nil {
+				require.NotNil(filter.SourceID)
+				assert.Equal(*tc.filter.SourceID, *filter.SourceID)
+			}
+			assert.Equal(tc.filter.SourceIDs, filter.SourceIDs)
 		})
 	}
 }
@@ -724,6 +859,48 @@ func TestAggregateByLabel_WithSearchQuery(t *testing.T) {
 	}
 }
 
+func TestAggregateLabelSearchStatsMatchRepeatedFilterRows(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	env := newTestEnv(t)
+	searchQuery := "label:work label:important"
+
+	rows, err := env.Engine.Aggregate(env.Ctx, ViewLabels,
+		AggregateOptions{SearchQuery: searchQuery})
+	require.NoError(err)
+	assertAggRows(t, rows, []aggExpectation{{"Work", 2}, {"IMPORTANT", 1}})
+
+	stats, err := env.Engine.GetTotalStats(env.Ctx, StatsOptions{
+		SearchQuery: searchQuery,
+		SearchScope: true,
+		GroupBy:     ViewLabels,
+	})
+	require.NoError(err)
+	assert.Equal(int64(3), stats.MessageCount)
+}
+
+func TestAggregateLabelSearchStatsCorrelateFilterAndText(t *testing.T) {
+	env := newTestEnv(t)
+	needle := env.AddLabel(dbtest.LabelOpts{Name: "Needle"})
+	env.AddMessageLabel(1, needle)
+	workNeedle := env.AddLabel(dbtest.LabelOpts{Name: "Work Needle"})
+	env.AddMessageLabel(2, workNeedle)
+	searchQuery := "label:Work Needle"
+
+	rows, err := env.Engine.Aggregate(env.Ctx, ViewLabels,
+		AggregateOptions{SearchQuery: searchQuery})
+	require.NoError(t, err)
+	assertAggRows(t, rows, []aggExpectation{{"Work Needle", 1}})
+
+	stats, err := env.Engine.GetTotalStats(env.Ctx, StatsOptions{
+		SearchQuery: searchQuery,
+		SearchScope: true,
+		GroupBy:     ViewLabels,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, int64(1), stats.MessageCount)
+}
+
 // TestSubAggregate_WithSearchQuery verifies that SubAggregate applies
 // SearchQuery to filter results (not silently dropped).
 func TestSubAggregate_WithSearchQuery(t *testing.T) {
@@ -740,6 +917,75 @@ func TestSubAggregate_WithSearchQuery(t *testing.T) {
 	// Should return exactly the "Work" label, not all labels for alice
 	require.Len(t, rows, 1, "expected 1 label row")
 	assert.Equal(t, "Work", rows[0].Key)
+}
+
+func TestAggregateSearchMatchesDisplayedKeysAndStats(t *testing.T) {
+	tests := []struct {
+		name    string
+		query   string
+		wantKey string
+		view    ViewType
+		setup   func(*testEnv)
+	}{
+		{
+			name:    "label",
+			query:   "LabelOnly Needle",
+			wantKey: "LabelOnly Needle",
+			view:    ViewLabels,
+			setup: func(env *testEnv) {
+				labelID := env.AddLabel(dbtest.LabelOpts{Name: "LabelOnly Needle"})
+				env.AddMessageLabel(1, labelID)
+				env.AddMessageLabel(2, env.AddLabel(dbtest.LabelOpts{Name: "LabelOnly"}))
+				env.AddMessageLabel(2, env.AddLabel(dbtest.LabelOpts{Name: "Needle"}))
+			},
+		},
+		{
+			name:    "sender name",
+			query:   "SenderNameOnlyNeedle",
+			wantKey: "SenderNameOnlyNeedle",
+			view:    ViewSenderNames,
+			setup: func(env *testEnv) {
+				env.SetFromName(1, "SenderNameOnlyNeedle")
+			},
+		},
+		{
+			name:    "recipient name",
+			query:   "RecipientNameOnlyNeedle",
+			wantKey: "RecipientNameOnlyNeedle",
+			view:    ViewRecipientNames,
+			setup: func(env *testEnv) {
+				env.SetRecipientName(1, env.MustLookupParticipant("bob@company.org"), "RecipientNameOnlyNeedle")
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+
+			env := newTestEnv(t)
+			env.EnableFTS()
+			tt.setup(env)
+			filter := MessageFilter{MessageType: messageTypeEmail}
+
+			rows, err := env.Engine.SubAggregate(env.Ctx, filter, tt.view,
+				AggregateOptions{SearchQuery: tt.query})
+			require.NoError(err)
+			require.Len(rows, 1)
+			assert.Equal(tt.wantKey, rows[0].Key)
+			assert.Equal(int64(1), rows[0].Count)
+
+			stats, err := env.Engine.GetTotalStats(env.Ctx, StatsOptions{
+				Filter:      &filter,
+				SearchQuery: tt.query,
+				SearchScope: true,
+				GroupBy:     tt.view,
+			})
+			require.NoError(err)
+			assert.Equal(int64(1), stats.MessageCount)
+		})
+	}
 }
 
 // TestEscapeSQLiteLike verifies that wildcard characters are escaped

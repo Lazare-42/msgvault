@@ -1,7 +1,7 @@
 package cmd
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"go.kenn.io/kit/atomicfile"
 	"go.kenn.io/kit/daemon"
 	"go.kenn.io/msgvault/internal/identityindex"
 	"go.kenn.io/msgvault/internal/query"
@@ -136,9 +137,12 @@ func cachePublishPlanForMode(replaceAll bool) cachePublishPlan {
 		tableConversationParticipants,
 		tableOwnerParticipants,
 		tableParticipantClusters,
+		tablePersonDisplayNames,
 		identityindex.DatasetPeople,
 		identityindex.DatasetDomains,
 		identityindex.DatasetRelationshipDaily,
+		identityindex.DatasetLogicalContributions,
+		identityindex.DatasetTemperatureContributions,
 	} {
 		plan.Replace[dataset] = true
 	}
@@ -261,8 +265,8 @@ func syncStagedMoveContents(source string) error {
 		return err
 	}
 	for _, directory := range slices.Backward(directories) {
-		if err := syncDirectory(directory); err != nil {
-			return err
+		if err := atomicfile.SyncDir(directory); err != nil {
+			return fmt.Errorf("sync staged directory: %w", err)
 		}
 	}
 	return nil
@@ -277,8 +281,8 @@ func syncStagedMoveContents(source string) error {
 func syncDestinationParents(destination, analyticsDir string) error {
 	root := filepath.Clean(analyticsDir)
 	for dir := filepath.Dir(filepath.Clean(destination)); ; dir = filepath.Dir(dir) {
-		if err := syncDirectory(dir); err != nil {
-			return err
+		if err := atomicfile.SyncDir(dir); err != nil {
+			return fmt.Errorf("sync destination parent: %w", err)
 		}
 		if dir == root || dir == filepath.Dir(dir) {
 			return nil
@@ -359,7 +363,7 @@ func publishCacheWithBeforeMarker(
 		} else if err := os.MkdirAll(filepath.Dir(move.destination), 0o755); err != nil {
 			return fmt.Errorf("create cache append directory for %s: %w", move.dataset, err)
 		}
-		if err := os.Rename(move.source, move.destination); err != nil {
+		if err := atomicfile.Replace(move.source, move.destination); err != nil {
 			return fmt.Errorf("publish cache dataset %s: %w", move.dataset, err)
 		}
 		if err := syncDestinationParents(move.destination, analyticsDir); err != nil {
@@ -386,28 +390,16 @@ func publishCacheWithBeforeMarker(
 	}
 	state.PublishedAt = time.Now().UTC()
 	state.DatasetFingerprint = fingerprint
-	stateData, err = json.Marshal(state)
+	stateData, err = json.Marshal(state, json.Deterministic(true))
 	if err != nil {
 		return fmt.Errorf("encode committed cache sync state: %w", err)
 	}
-	return commitCacheMarker(analyticsDir, staging.buildID, stateData)
+	return commitCacheMarker(analyticsDir, stateData)
 }
 
-func commitCacheMarker(analyticsDir, buildID string, stateData []byte) error {
-	statePath := query.CacheStatePath(analyticsDir)
-	tempPath := filepath.Join(analyticsDir, ".last-sync-"+buildID+".tmp")
-	if err := buildCacheWriteStateFile(tempPath, stateData, 0o600); err != nil {
-		return fmt.Errorf("write staged cache marker: %w", err)
-	}
-	defer func() { _ = os.Remove(tempPath) }()
-	if err := syncFile(tempPath); err != nil {
-		return fmt.Errorf("sync staged cache marker: %w", err)
-	}
-	if err := os.Rename(tempPath, statePath); err != nil {
+func commitCacheMarker(analyticsDir string, stateData []byte) error {
+	if err := buildCacheWriteStateFile(query.CacheStatePath(analyticsDir), stateData, 0o600); err != nil {
 		return fmt.Errorf("commit cache marker: %w", err)
-	}
-	if err := syncDirectory(analyticsDir); err != nil {
-		return fmt.Errorf("sync committed cache marker: %w", err)
 	}
 	return nil
 }

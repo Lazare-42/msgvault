@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -20,6 +21,11 @@ var ocrExecutorCmd = &cobra.Command{
 	Long:  "Run a single-concurrency Poppler/Tesseract executor on a Unix socket. It never opens a msgvault archive or database.",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, _ []string) error {
+		state := invocationFromCommand(cmd)
+		if state == nil || state.cfg == nil {
+			return errors.New("configuration is unavailable")
+		}
+		cfg := state.cfg
 		socket := cfg.OCR.Socket
 		if ocrExecutorSocket != "" {
 			socket = ocrExecutorSocket

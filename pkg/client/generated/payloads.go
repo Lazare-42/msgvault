@@ -2,9 +2,15 @@
 
 package generated
 
+import (
+	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
+)
+
 type LoginSessionBody = SessionLoginRequest
 
 type AddAccountBody = AddAccountRequest
+
+type IssueAgentTokenBody = AgentTokenIssueRequest
 
 type CreateAttributeDefinitionBody = CreateAttributeDefinitionRequest
 
@@ -14,6 +20,8 @@ type UploadTokenBody = TokenUploadRequest
 
 type EndBackupFreezeBody = BackupFreezeEndRequest
 
+type ControlCalendarBody = CalendarRequest
+
 type SaveCardDAVAccountBody = CardDAVAccountRequest
 
 type TestCardDAVAccountBody = CardDAVAccountRequest
@@ -22,9 +30,17 @@ type UpdateCardDAVBookRolesBody = CardDAVBookRolesRequest
 
 type ResolveCardDAVConflictBody = CardDAVResolveRequest
 
+type BeginGoogleCardDAVAuthorizationBody = CardDAVGoogleAuthorizeRequest
+
+type CompleteGoogleCardDAVAuthorizationBody = CardDAVGoogleCallbackRequest
+
+type ApproveCardDAVPublicationBody = CardDAVPublicationApprovalRequest
+
 type SyncCardDAVBody = CardDAVSyncRequest
 
 type UpdateCLIAccountBody = UpdateRequest
+
+type MergeCLIAccountsBody = MergeRequest
 
 type PlanCLIAddCalendarBody = CLIAddCalendarPlanRequest
 
@@ -53,6 +69,8 @@ type AddCLIIdentityBody = AddRequest
 type DiscoverCLIIdentitiesBody = DiscoverRequest
 
 type ImportCLIIdentitiesBody = ImportRequest
+
+type RepairMessageCLIBody = CLIRepairMessageRequest
 
 type RunCLIBody = CLIRunRequest
 
@@ -90,17 +108,45 @@ type GroupFilesBody = FileGroupsHTTPRequest
 
 type SearchFilesBody = FileSearchHTTPRequest
 
+type SuggestFilesBody = FileSuggestionHTTPRequest
+
 type SearchAttachmentTextBody = OcrSearchRequest
 
 type LinkIdentityParticipantsBody = IdentityLinkRequest
 
-type AcceptIdentityMatchCandidateBody = DecideIdentityMatchRequest
+type ReviewAcceptIdentityMatchCandidateBody = DecideIdentityMatchReviewedRequest
 
-type RejectIdentityMatchCandidateBody = DecideIdentityMatchRequest
+type ReviewRejectIdentityMatchCandidateBody = DecideIdentityMatchReviewedRequest
+
+type PersonMatchScoringConsentBody = PersonMatchConsentDecisionRequest
+
+type PersonMatchScoringRevokeBody = PersonMatchConsentDecisionRequest
+
+type RunPersonMatchScoringBody = PersonMatchScoringRequest
 
 type UnlinkIdentityParticipantsBody = IdentityLinkRequest
 
 type ImportMeetingBody = MeetingImportRequest
+
+type ImportMuesliBody = MuesliRemoteRequest
+
+type ImportMuesliRecordingBody = runtime.File
+
+type CreateImportJobBody = ImportJobRequest
+
+type PrepareKataEvidenceBody = KataEvidencePrepareRequest
+
+type CreateKataIssueBody = KataIssueCreateRequest
+
+type LinkKataEvidenceBody = KataEvidenceLinkRequest
+
+type ListMeetingActionItemsBody = MeetingActionsRequest
+
+type GetMeetingContextBody = MeetingContextRequest
+
+type GetMeetingMetricsBody = MeetingMetricsRequest
+
+type UpdateMessageTagsBody = MessageTagChange
 
 type CreateOrLinkMessageTaskBody = TaskLinkMutationRequest
 
@@ -132,11 +178,23 @@ type SearchPeopleBody = PersonSearchRequest
 
 type PatchPersonBody = PatchPersonRequest
 
+type CreatePersonAgendaItemBody = PersonAgendaCreateRequest
+
+type LinkPersonAgendaItemBody = PersonAgendaLinkRequest
+
+type UpdatePersonAgendaItemBody = PersonAgendaUpdateRequest
+
 type SetPersonAttributeBody = SetPersonAttributeRequest
+
+type SetPersonBriefEnrollmentBody = PutPersonBriefEnrollmentRequest
+
+type RejectPersonBriefBody = RejectPersonBriefRequest
 
 type SetPersonFactPinBody = SetPersonFactPinRequest
 
 type SearchPersonFilesBody = PersonFileSearchHTTPRequest
+
+type SuggestPersonFilesBody = PersonFileSuggestionHTTPRequest
 
 type MergePersonsBody = MergePersonRequest
 
@@ -156,6 +214,8 @@ type PatchPersonRelationshipBody = PatchPersonRelationshipRequest
 
 type RunQueryBody = QueryRequest
 
+type RunArchiveQueryBody = QueryRequest
+
 type CreateRelationshipTypeBody = CreateRelationshipTypeRequest
 
 type PatchRelationshipTypeBody = PatchRelationshipTypeRequest
@@ -170,8 +230,28 @@ type CreateSavedViewBody = CreateSavedViewRequest
 
 type PatchSavedViewBody = PatchSavedViewRequest
 
+type RunSavedViewBody = RunSavedViewRequest
+
 type SearchVisualAttachmentsBody = VisualTextSearchRequest
 
 type GetSearchCoverageBody = SearchCoverageRequest
 
 type PatchSettingsBody = SettingsPatchRequest
+
+type StartSettingsPeopleCodexLoginBody = PeopleCodexLoginRequest
+
+type PutSettingsPeopleCodexProfileBody = PeopleCodexProfileRequest
+
+type PutSettingsPeopleInferencePresetBody = PeopleInferencePresetCreateRequest
+
+type ConsentSettingsPeopleInferenceProviderBody = PeopleInferenceConsentRequest
+
+type PutSettingsPeopleInferenceKeyBody = PeopleInferenceKeyWriteRequest
+
+type SelectSettingsPeopleInferenceBody = PeopleInferenceSelectionRequest
+
+type PutSettingsPersonEnrichmentProviderBody = PersonEnrichmentProviderUpdate
+
+type PutSettingsProviderCredentialBody = ProviderCredentialWriteRequest
+
+type CaptureTelemetryEventBody = TelemetryEventRequest

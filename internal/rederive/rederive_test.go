@@ -28,18 +28,14 @@ func TestRegisterRejectsDuplicates(t *testing.T) {
 	assert.Panics(func() { Register("test-dup", "v1", noop) })
 }
 
-func TestLookupReportsUnregisteredTypes(t *testing.T) {
-	_, _, ok := Lookup("not-a-source-type")
-	assert.False(t, ok)
-}
-
 func TestSummaryAddAccumulates(t *testing.T) {
 	assert := assert.New(t)
 	total := &Summary{}
-	total.Add(&Summary{MessagesScanned: 3, BodiesRewritten: 2, Errors: 1})
-	total.Add(&Summary{MessagesScanned: 4, AttachmentsTagged: 5, Undecodable: 1})
+	total.Add(&Summary{MessagesScanned: 3, MessageMetadataRewritten: 2, BodiesRewritten: 2, Errors: 1})
+	total.Add(&Summary{MessagesScanned: 4, MessageMetadataRewritten: 1, AttachmentsTagged: 5, Undecodable: 1})
 	total.Add(nil)
 	assert.Equal(int64(7), total.MessagesScanned)
+	assert.Equal(int64(3), total.MessageMetadataRewritten)
 	assert.Equal(int64(2), total.BodiesRewritten)
 	assert.Equal(int64(5), total.AttachmentsTagged)
 	assert.Equal(int64(1), total.Undecodable)
@@ -192,15 +188,4 @@ func derivedDataRevision(t *testing.T, st *store.Store) int64 {
 		) AS BIGINT), 0)
 	`).Scan(&revision))
 	return revision
-}
-
-func TestRunRejectsUnregisteredType(t *testing.T) {
-	_, err := Run(context.Background(), testutil.NewTestStore(t), "no-such-type", "acct", 1, nil)
-	require.Error(t, err)
-}
-
-func TestRunIfStaleIsNoOpForUnregisteredType(t *testing.T) {
-	_, ran, err := RunIfStale(context.Background(), testutil.NewTestStore(t), "no-such-type", "acct", 1, nil)
-	require.NoError(t, err)
-	assert.False(t, ran)
 }

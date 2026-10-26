@@ -2,9 +2,11 @@ package beeper
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -80,14 +82,15 @@ func TestClientNotFound(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, `{"error":"nope"}`, http.StatusNotFound)
+		http.Error(w, expiredAssetBody, http.StatusNotFound)
 	}))
 	defer srv.Close()
 
 	c := NewClient(srv.URL, testToken, 1000)
 	_, err := c.GetMessage(context.Background(), "!c:x", "1")
 	require.Error(err)
-	assert.ErrorIs(err, ErrNotFound)
+	require.ErrorIs(err, ErrNotFound)
+	assert.NotErrorIs(err, ErrAssetUnavailable)
 }
 
 func TestClientContextCancelDuringBackoff(t *testing.T) {
@@ -98,7 +101,7 @@ func TestClientContextCancelDuringBackoff(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond) //nolint:kennlint // the deadline is the expected result; the server always fails, so only the context ends the backoff
 	defer cancel()
 
 	c := NewClient(srv.URL, testToken, 1000)
@@ -187,4 +190,239 @@ func TestListMessagesPagination(t *testing.T) {
 	after, err := c.ListMessagesPage(ctx, "!p:x", "20", "after")
 	require.NoError(err)
 	assert.Len(after.Items, 20)
+}
+
+// expiredAssetBody is the error body Beeper returns when the network has
+// deleted the media from its servers.
+const expiredAssetBody = `{"message":"Failed to download asset: Transfer failed for localmxc://local-whatsapp/example: downloadFileWithParams failed: Media is no longer available on WhatsApp"}`
+
+type assetResponse struct {
+	status     int
+	retryAfter string
+	body       string
+}
+
+// assetServer serves responses in order, repeating the last one, and counts
+// requests.
+func assetServer(t *testing.T, responses ...assetResponse) (*Client, *atomic.Int32) {
+	t.Helper()
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		n := int(calls.Add(1))
+		resp := responses[min(n, len(responses))-1]
+		if resp.retryAfter != "" {
+			w.Header().Set("Retry-After", resp.retryAfter)
+		}
+		w.WriteHeader(resp.status)
+		_, _ = w.Write([]byte(resp.body))
+	}))
+	t.Cleanup(srv.Close)
+	c := NewClient(srv.URL, testToken, 10000)
+	c.retryAfterMax = time.Millisecond
+	return c, &calls
+}
+
+// TestGetAssetBytesClassification covers the asset outcomes: the two
+// phrase-table sentinels and their precedence, a bare 404, statuses that win
+// over the phrase table, transient retries, and unhandled 4xx statuses.
+func TestGetAssetBytesClassification(t *testing.T) {
+	tests := []struct {
+		name        string
+		responses   []assetResponse
+		wantCalls   int32
+		wantOK      bool
+		wantData    string
+		unavailable bool
+		notFound    bool
+		bare404     bool // ErrNotFound: an ordinary failure, not an asset sentinel
+		permanent   bool // no sentinel: falls through like any other 4xx
+	}{
+		{
+			name:        "definitive phrase on a 5xx is not retried",
+			responses:   []assetResponse{{status: http.StatusInternalServerError, body: expiredAssetBody}},
+			wantCalls:   1,
+			unavailable: true,
+		},
+		{
+			name:        "definitive phrase on a client error",
+			responses:   []assetResponse{{status: http.StatusBadRequest, body: "MEDIA IS NO LONGER AVAILABLE"}},
+			wantCalls:   1,
+			unavailable: true,
+		},
+		{
+			name:        "definitive phrase wins over a bare 404",
+			responses:   []assetResponse{{status: http.StatusNotFound, body: expiredAssetBody}},
+			wantCalls:   1,
+			unavailable: true,
+		},
+		{
+			name:      "bare 404 with no phrase is an ordinary not-found",
+			responses: []assetResponse{{status: http.StatusNotFound}},
+			wantCalls: 1,
+			bare404:   true,
+		},
+		{
+			name:      "telegram bridge not-found wrapped in a 502",
+			responses: []assetResponse{{status: 502, body: `{"message":"Failed to download asset: Transfer failed for mxc://example.test/a downloadFileWithParams failed: Media not found","code":"SERVE_ASSET_ERROR"}`}},
+			wantCalls: 1,
+			notFound:  true,
+		},
+		{
+			name:      "matrix bridge M_NOT_FOUND wrapped in a 502",
+			responses: []assetResponse{{status: 502, body: `{"message":"Failed to download asset: Transfer failed for mxc://example.test/a downloadFileWithParams failed: failed to download file: M_NOT_FOUND (HTTP 404): ","code":"SERVE_ASSET_ERROR"}`}},
+			wantCalls: 1,
+			notFound:  true,
+		},
+		{
+			name:      "instagram bridge HTTP 404 wrapped in a 502",
+			responses: []assetResponse{{status: 502, body: `{"message":"Failed to download asset: Transfer failed for mxc://example.test/a downloadFileWithParams failed: failed to download file: HTTP 404","code":"SERVE_ASSET_ERROR"}`}},
+			wantCalls: 1,
+			notFound:  true,
+		},
+		{
+			name:      "not-found phrase match is case-insensitive",
+			responses: []assetResponse{{status: 502, body: "mEdIa NoT fOuNd"}},
+			wantCalls: 1,
+			notFound:  true,
+		},
+		{
+			name: "a not-found preceded by a transient failure in the same call is not a clean not-found",
+			responses: []assetResponse{
+				{status: 500},
+				{status: 502, body: "M_NOT_FOUND"},
+				{status: 200},
+			},
+			wantCalls: 2,
+			// Neither sentinel: a transient failure happened earlier in
+			// this same call, so the cross-run confirmation policy must
+			// not treat this as a clean repeat; it's an ordinary failure.
+		},
+		{
+			name:        "both phrases in one body resolve to the definitive one",
+			responses:   []assetResponse{{status: 502, body: "Media not found: Media is no longer available"}},
+			wantCalls:   1,
+			unavailable: true,
+		},
+		{
+			name:      "a successful body is never scanned",
+			responses: []assetResponse{{status: 200, body: "Media not found"}},
+			wantCalls: 1,
+			wantOK:    true,
+			wantData:  "Media not found",
+		},
+		{
+			name:      "401 wins over a not-found phrase",
+			responses: []assetResponse{{status: 401, body: "Media not found"}},
+			wantCalls: 1,
+			permanent: true,
+		},
+		{
+			name:      "429 wins over a not-found phrase",
+			responses: []assetResponse{{status: 429, body: "Media not found"}},
+			wantCalls: 3,
+		},
+		{
+			name:      "403 with no matching phrase falls through like any unhandled status",
+			responses: []assetResponse{{status: 403, body: "access denied"}},
+			wantCalls: 1,
+			permanent: true,
+		},
+		{
+			name: "throttling is transient whatever its body says",
+			responses: []assetResponse{
+				{status: http.StatusTooManyRequests, body: expiredAssetBody},
+				{status: http.StatusTooManyRequests, body: expiredAssetBody},
+				{status: http.StatusOK, body: "bytes"},
+			},
+			wantCalls: 3,
+			wantOK:    true,
+			wantData:  "bytes",
+		},
+		{
+			name:      "throttling is transient but bounded",
+			responses: []assetResponse{{status: http.StatusTooManyRequests, retryAfter: "0"}},
+			wantCalls: 3,
+		},
+		{
+			name:      "unknown server errors are capped",
+			responses: []assetResponse{{status: http.StatusInternalServerError, body: `{"message":"boom"}`}},
+			wantCalls: 3,
+		},
+		{
+			name:      "server Retry-After counts toward the cap",
+			responses: []assetResponse{{status: http.StatusServiceUnavailable, retryAfter: "0"}},
+			wantCalls: 3,
+		},
+		{
+			name: "throttling counts toward the asset retry cap",
+			responses: []assetResponse{
+				{status: http.StatusInternalServerError},
+				{status: http.StatusTooManyRequests},
+				{status: http.StatusTooManyRequests},
+				{status: http.StatusInternalServerError},
+				{status: http.StatusOK, body: "bytes"},
+			},
+			wantCalls: 3,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			c, calls := assetServer(t, tt.responses...)
+			data, err := c.GetAssetBytes(context.Background(), "mxc://example.test/a", 1<<20)
+			assert.Equal(tt.wantCalls, calls.Load())
+			if tt.wantOK {
+				require.NoError(err)
+				if tt.wantData != "" {
+					assert.Equal(tt.wantData, string(data))
+				}
+				return
+			}
+			require.Error(err)
+			assert.Equal(tt.unavailable, errors.Is(err, ErrAssetUnavailable), "error: %v", err)
+			assert.Equal(tt.notFound, errors.Is(err, ErrAssetNotFound), "error: %v", err)
+			assert.Equal(tt.bare404, errors.Is(err, ErrNotFound), "error: %v", err)
+			if tt.permanent {
+				require.ErrorIs(err, errPermanentResponse)
+			}
+			require.NotErrorIs(err, ErrAssetTooLarge)
+		})
+	}
+}
+
+func TestGetAssetBytesLargeErrorBodyIsNotSizeCap(t *testing.T) {
+	assert := assert.New(t)
+	body := expiredAssetBody + strings.Repeat(" ", 2048)
+	c, calls := assetServer(t, assetResponse{status: http.StatusInternalServerError, body: body})
+	_, err := c.GetAssetBytes(context.Background(), "mxc://example.test/a", 16)
+	require.Error(t, err)
+	require.NotErrorIs(t, err, ErrAssetTooLarge, "an error body is not the asset")
+	require.ErrorIs(t, err, ErrAssetUnavailable)
+	assert.EqualValues(1, calls.Load())
+}
+
+func TestClientPermanentPhraseIgnoredOffAssets(t *testing.T) {
+	assert := assert.New(t)
+	c, calls := assetServer(t,
+		assetResponse{status: http.StatusInternalServerError, body: expiredAssetBody},
+		assetResponse{status: http.StatusOK, body: `[]`},
+	)
+	accounts, err := c.ListAccounts(context.Background())
+	require.NoError(t, err)
+	assert.Empty(accounts)
+	assert.EqualValues(2, calls.Load())
+}
+
+func TestClientDoesNotSleepAfterFinalAttempt(t *testing.T) {
+	assert := assert.New(t)
+	c, calls := assetServer(t, assetResponse{status: http.StatusInternalServerError})
+	c.retryAfterMax = 500 * time.Millisecond
+	start := time.Now()
+	_, err := c.GetAssetBytes(context.Background(), "mxc://example.test/a", 1<<20)
+	require.Error(t, err)
+	assert.EqualValues(3, calls.Load())
+	// Two capped waits (1s total) separate three attempts; a third wait
+	// after the last attempt would push this to at least 1.5s.
+	assert.Less(time.Since(start), 1400*time.Millisecond)
 }

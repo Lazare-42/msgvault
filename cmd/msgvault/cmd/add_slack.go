@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"strings"
 
@@ -21,23 +22,30 @@ var (
 )
 
 func newAddSlackCmd() *cobra.Command {
+	return newAddSlackCmdWithClientFactory(func(token string) *slack.Client {
+		return slack.NewClient("", token)
+	})
+}
+
+func newAddSlackCmdWithClientFactory(clientFactory func(token string) *slack.Client) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "add-slack",
 		Short: "Add a Slack workspace as an archive source",
 		Long: `Add a Slack workspace as an archive source.
 
-Archives your own view of the workspace — public/private channels you are a
-member of, group DMs, and 1:1 DMs — via the Slack Web API.
+Archives conversations allowed by your Slack user token. A token limited to
+public-channel scopes archives all public channels, including ones you have
+not joined. Broader tokens archive your channel memberships and DMs.
 
 Requires a user token (xoxp-...) from an internal Slack app you create:
 
   1. https://api.slack.com/apps > Create New App > From scratch, in your
      workspace.
-  2. OAuth & Permissions > User Token Scopes, add:
-       channels:history groups:history im:history mpim:history
-       channels:read groups:read im:read mpim:read
-       users:read users:read.email files:read reactions:read team:read
-       search:read
+  2. OAuth & Permissions > User Token Scopes, for public channels only:
+       channels:history channels:read users:read users:read.email
+     To also archive private channels and DMs you belong to, add:
+       groups:history groups:read im:history im:read mpim:history mpim:read
+     Optional: files:read for downloads; search:read for faster reply discovery.
   3. Install to Workspace, then copy the "User OAuth Token".
 
 Internal apps you create yourself are not subject to Slack's non-Marketplace
@@ -46,12 +54,23 @@ rate limits, so backfills run at full speed.
 Provide the token via --token-file, the MSGVAULT_SLACK_TOKEN environment
 variable, or the interactive prompt.
 
+Without search:read, each sync revisits channel history to find replies on old
+threads. search:read can read private conversations through search; files:read
+and reactions:read also grant access beyond public-channel messages. Omit them
+for a public-channel-only token. Use a fresh app when reducing permissions;
+reinstalling an existing app can retain previously granted scopes.
+
 Examples:
   msgvault add-slack
   msgvault add-slack --token-file ~/slack-token.txt
   MSGVAULT_SLACK_TOKEN="xoxp-..." msgvault add-slack`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			state := invocationFromCommand(cmd)
+			if state == nil || state.cfg == nil {
+				return errors.New("configuration is unavailable")
+			}
+			cfg := state.cfg
 			if !isDaemonCLISubprocess() {
 				token, err := readAddSlackToken(cmd)
 				if err != nil {
@@ -66,14 +85,9 @@ Examples:
 			if token == "" {
 				return errors.New("missing Slack token in daemon subprocess (set MSGVAULT_SLACK_TOKEN)")
 			}
-			client := slack.NewClient("", token)
+			client := clientFactory(token)
 			auth, err := client.AuthTest(cmd.Context())
 			if err != nil {
-				return err
-			}
-			// The reply sweep needs search:read; catch an under-scoped token
-			// here, where the fix is cheap, not on every future sync.
-			if err := client.ValidateSearchScope(cmd.Context()); err != nil {
 				return err
 			}
 			teamDomain := strings.TrimSuffix(strings.TrimPrefix(auth.URL, "https://"), ".slack.com/")
@@ -81,7 +95,7 @@ Examples:
 				return fmt.Errorf("save slack token: %w", err)
 			}
 
-			s, cleanup, err := openWritableStoreAndInitForIngest()
+			s, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
 			if err != nil {
 				return err
 			}
@@ -93,13 +107,13 @@ Examples:
 				return fmt.Errorf("create source for %s: %w", identifier, err)
 			}
 			displayName := "Slack " + auth.Team
-			if err := s.UpdateSourceDisplayName(source.ID, displayName); err != nil {
+			if err := updateSourceDisplayNameForRegistration(s, source.ID, displayName, state.logger); err != nil {
 				return fmt.Errorf("set display name for %s: %w", identifier, err)
 			}
 			if !noDefaultIdentityAddSlack {
-				confirmDefaultSlackIdentity(cmd.OutOrStdout(), s, source.ID, auth.TeamID, auth.UserID)
+				confirmDefaultSlackIdentity(cmd.OutOrStdout(), s, source.ID, auth.TeamID, auth.UserID, state.logger)
 			}
-			if err := runPostSourceCreateMigrations(s); err != nil {
+			if err := runPostSourceCreateMigrationsForInvocation(s, state); err != nil {
 				return fmt.Errorf("post-source-create migrations: %w", err)
 			}
 
@@ -119,9 +133,9 @@ func writeAddedSlackWorkspace(out io.Writer, team, teamID, identifier string) {
 		textutil.SanitizeTerminal(team), teamID, identifier)
 }
 
-func confirmDefaultSlackIdentity(out io.Writer, s *store.Store, sourceID int64, teamID, userID string) {
+func confirmDefaultSlackIdentity(out io.Writer, s *store.Store, sourceID int64, teamID, userID string, logger *slog.Logger) {
 	account := teamID + ":" + userID
-	confirmDefaultIdentity(out, s, sourceID, account, account, "account-identifier")
+	confirmDefaultIdentity(out, s, sourceID, account, account, "account-identifier", logger)
 }
 
 // readAddSlackToken resolves the user token: env var, then --token-file,

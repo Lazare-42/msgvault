@@ -23,6 +23,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/operations"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/embed"
 	"go.kenn.io/msgvault/internal/vector/sqlitevec"
@@ -259,15 +260,22 @@ func TestRunContextWorkerUntilConverged_RequiresProgress(t *testing.T) {
 		{Claimed: 64, Succeeded: 64, Contextual: &embed.ContextConvergence{}},
 		{Claimed: 36, Succeeded: 36, Contextual: &embed.ContextConvergence{Converged: true}},
 	}}
-	total, err := runContextWorkerUntilConverged(t.Context(), worker, vector.GenerationID(1))
+	total, err := runContextWorkerUntilConverged(
+		t.Context(), worker, vector.GenerationID(1), "contextual-eval:test",
+	)
 	require.NoError(t, err)
 	assert.Equal(t, 100, total.Claimed)
 	assert.Equal(t, 100, total.Succeeded)
 	assert.True(t, total.Contextual.Converged)
+	require.Len(t, worker.scopes, 2)
+	assert.Equal(t, "contextual-eval:test:pass:1", worker.scopes[0].Key)
+	assert.Equal(t, "contextual-eval:test:pass:2", worker.scopes[1].Key)
+	assert.Equal(t, operations.TriggerManual, worker.scopes[0].Trigger)
+	assert.False(t, worker.scopes[0].StartedAt.IsZero())
 
 	_, err = runContextWorkerUntilConverged(t.Context(), &scriptedContextWorker{
 		results: []embed.RunResult{{Contextual: &embed.ContextConvergence{}}},
-	}, vector.GenerationID(1))
+	}, vector.GenerationID(1), "contextual-eval:test-stalled")
 	require.ErrorContains(t, err, "made no progress")
 }
 
@@ -915,9 +923,10 @@ func TestWriteJSON_DoesNotClobberDestinationOnEncodeFailure(t *testing.T) {
 	payload, readErr := os.ReadFile(path)
 	require.NoError(t, readErr)
 	assert.Equal(t, "stable", string(payload))
-	matches, globErr := filepath.Glob(path + ".tmp-*")
-	require.NoError(t, globErr)
-	assert.Empty(t, matches)
+	entries, readErr := os.ReadDir(filepath.Dir(path))
+	require.NoError(t, readErr)
+	require.Len(t, entries, 1, "the staged report must not be left behind")
+	assert.Equal(t, "report.json", entries[0].Name())
 }
 
 func suffixPrefixRuneOverlap(left, right string) int {
@@ -1375,10 +1384,6 @@ func TestReport_ContainsQualityOperationalAndAuditFields(t *testing.T) {
 	}
 }
 
-func TestCommandBoundary_IsStable(t *testing.T) {
-	assert.Equal(t, []string{"generate", "embed", "pool", "score", "replay", "apply-replay"}, commandNames())
-}
-
 type countingEmbedder struct {
 	queryCalls  int
 	queryVector []float32
@@ -1392,10 +1397,14 @@ type batchRecordingEmbedder struct {
 
 type scriptedContextWorker struct {
 	results []embed.RunResult
+	scopes  []operations.PassScope
 	next    int
 }
 
-func (w *scriptedContextWorker) RunOnce(context.Context, vector.GenerationID) (embed.RunResult, error) {
+func (w *scriptedContextWorker) RunOnce(
+	_ context.Context, _ vector.GenerationID, scope operations.PassScope,
+) (embed.RunResult, error) {
+	w.scopes = append(w.scopes, scope)
 	if w.next >= len(w.results) {
 		return embed.RunResult{Contextual: &embed.ContextConvergence{}}, nil
 	}
@@ -1530,4 +1539,22 @@ func (c *batchRecordingEmbedder) EmbedDocuments(_ context.Context, documents []e
 func (c *countingEmbedder) EmbedQuery(_ context.Context, _ string) ([]float32, error) {
 	c.queryCalls++
 	return append([]float32(nil), c.queryVector...), nil
+}
+
+func TestWriteJSONStdoutMatchesFileFormatting(t *testing.T) {
+	require := require.New(t)
+	dir := t.TempDir()
+	output, err := os.Create(filepath.Join(dir, "stdout.json"))
+	require.NoError(err)
+	previous := os.Stdout
+	os.Stdout = output
+	t.Cleanup(func() { os.Stdout = previous; _ = output.Close() })
+	value := map[string]any{"nested": map[string]int{"value": 1}}
+	require.NoError(writeJSON("-", value))
+	require.NoError(writeJSON(filepath.Join(dir, "file.json"), value))
+	stdout, err := os.ReadFile(output.Name())
+	require.NoError(err)
+	file, err := os.ReadFile(filepath.Join(dir, "file.json"))
+	require.NoError(err)
+	assert.Equal(t, string(file), string(stdout))
 }

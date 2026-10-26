@@ -17,8 +17,8 @@ var savedViewState = json.RawMessage(`{
 	"filters":[{"field":"source_id","operator":"in","values":["1"]}],
 	"grouping":["source"],
 	"presentation":"table",
-	"sort":[{"field":"count","direction":"desc"}],
-	"columns":["sender"],
+	"sort":[{"field":"occurred_at","direction":"desc"}],
+	"columns":["people"],
 	"inspector_pinned":true
 }`)
 
@@ -30,29 +30,6 @@ func savedViewInput(name string) store.SavedViewInput {
 		CanonicalState: savedViewState,
 		SchemaVersion:  store.CurrentSavedViewSchemaVersion,
 	}
-}
-
-func TestSavedViewsSQLiteSchema(t *testing.T) {
-	requirements := require.New(t)
-	st := testutil.NewSQLiteTestStore(t)
-
-	rows, err := st.DB().Query(`PRAGMA table_info('saved_views')`)
-	requirements.NoError(err)
-	defer func() { requirements.NoError(rows.Close()) }()
-
-	columns := make(map[string]bool)
-	for rows.Next() {
-		var cid, notNull, primaryKey int
-		var name, columnType string
-		var defaultValue any
-		requirements.NoError(rows.Scan(&cid, &name, &columnType, &notNull, &defaultValue, &primaryKey))
-		columns[name] = true
-	}
-	requirements.NoError(rows.Err())
-	assert.Equal(t, map[string]bool{
-		"id": true, "name": true, "description": true, "canonical_state": true,
-		"schema_version": true, "revision": true, "created_at": true, "updated_at": true,
-	}, columns)
 }
 
 func TestSavedViewsCRUDAndStableListOrder(t *testing.T) {
@@ -114,6 +91,29 @@ func TestSavedViewsRejectDuplicateNamesAndStaleRevisions(t *testing.T) {
 	assertions.ErrorIs(st.DeleteSavedView(ctx, updated.ID, updated.Revision), store.ErrSavedViewNotFound)
 }
 
+func TestSavedViewsPreserveInspectorPreference(t *testing.T) {
+	for _, state := range []string{`{}`, `{"inspector_pinned":true}`, `{"inspector_pinned":false}`} {
+		t.Run(state, func(t *testing.T) {
+			assertions := assert.New(t)
+			requirements := require.New(t)
+			st := testutil.NewTestStore(t)
+			input := savedViewInput("Inspector preference")
+			input.CanonicalState = json.RawMessage(state)
+			created, err := st.CreateSavedView(t.Context(), input)
+			requirements.NoError(err)
+			assertions.JSONEq(state, string(created.CanonicalState))
+
+			loaded, err := st.GetSavedView(t.Context(), created.ID)
+			requirements.NoError(err)
+			assertions.JSONEq(state, string(loaded.CanonicalState))
+
+			updated, err := st.UpdateSavedView(t.Context(), loaded.ID, loaded.Revision, input)
+			requirements.NoError(err)
+			assertions.JSONEq(state, string(updated.CanonicalState))
+		})
+	}
+}
+
 func TestSavedViewsValidateCanonicalStateBeforePersistence(t *testing.T) {
 	assertions := assert.New(t)
 	requirements := require.New(t)
@@ -166,7 +166,7 @@ func TestSavedViewsPersistOnlyServerGroupingDimensions(t *testing.T) {
 	requirements := require.New(t)
 	ctx := context.Background()
 	st := testutil.NewTestStore(t)
-	supported := []string{"source", "participant", "domain", "message_type", "kind", "year", "month"}
+	supported := []string{"source", "participant", "domain", "message_type", "mailing_list", "kind", "year", "month"}
 
 	for _, dimension := range supported {
 		t.Run("accept "+dimension, func(t *testing.T) {

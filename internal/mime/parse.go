@@ -44,6 +44,7 @@ type Message struct {
 	ReplyTo       []Address
 	MessageID     string
 	InReplyTo     string
+	ListID        string
 	References    []string
 	BodyText      string
 	BodyHTML      string
@@ -69,14 +70,37 @@ type Attachment struct {
 	ContentHash string // SHA-256 of content
 	Content     []byte
 	IsInline    bool
+	// IsApplePlaceholder marks a part whose body Apple Mail keeps in a sibling
+	// cache file. Its empty Content is unavailable data, not a zero-byte file.
+	IsApplePlaceholder bool
+}
+
+// DistinctAttachments drops the second copy of a part that enmime lists as
+// both an attachment and an inline; PartKey is the part's identity.
+func DistinctAttachments(parts []Attachment) []Attachment {
+	seen := make(map[string]bool, len(parts))
+	out := make([]Attachment, 0, len(parts))
+	for _, part := range parts {
+		if part.PartKey != "" && seen[part.PartKey] {
+			continue
+		}
+		seen[part.PartKey] = true
+		out = append(out, part)
+	}
+	return out
 }
 
 // Parse parses raw MIME data into a Message.
 func Parse(raw []byte) (*Message, error) {
+	return parse(raw, nil)
+}
+
+func parse(raw []byte, inspect func(*enmime.Part)) (*Message, error) {
 	root, err := envelopeParser.ReadParts(bytes.NewReader(raw))
 	if err != nil {
 		return nil, fmt.Errorf("read MIME envelope: Failed to ReadParts: %w", err)
 	}
+	restoreDeclaredUTF8(raw, root)
 	normalizeMalformedContentTypes(root)
 
 	env, err := envelopeParser.EnvelopeFromPart(root)
@@ -91,6 +115,7 @@ func Parse(raw []byte) (*Message, error) {
 		Subject:   env.GetHeader("Subject"),
 		MessageID: env.GetHeader("Message-ID"),
 		InReplyTo: env.GetHeader("In-Reply-To"),
+		ListID:    NormalizeListID(env.GetHeader("List-Id")),
 		BodyText:  env.Text,
 		BodyHTML:  env.HTML,
 	}
@@ -123,12 +148,18 @@ func Parse(raw []byte) (*Message, error) {
 	msg.Attachments = append(msg.Attachments, processParts(env.Attachments, false)...)
 	msg.Attachments = append(msg.Attachments, processParts(env.Inlines, true)...)
 	msg.Attachments = append(msg.Attachments, processMalformedOtherParts(env.OtherParts)...)
+	// enmime can list one inline octet-stream part in both categories.
+	// Preserve physical occurrences so parsed evidence matches keyed storage.
+	msg.Attachments = DistinctAttachments(msg.Attachments)
 
 	// Collect any parsing errors
 	for _, e := range env.Errors {
 		msg.Errors = append(msg.Errors, e.Error())
 	}
 
+	if inspect != nil {
+		inspect(root)
+	}
 	return msg, nil
 }
 
@@ -136,7 +167,11 @@ func Parse(raw []byte) (*Message, error) {
 // malformed MIME structure prevents full envelope parsing. Body content and
 // attachments remain unavailable after a fatal parse error.
 func ParseWithRecovery(raw []byte, fallbackSubject string) (*Message, error) {
-	msg, err := Parse(raw)
+	return parseWithRecovery(raw, fallbackSubject, nil)
+}
+
+func parseWithRecovery(raw []byte, fallbackSubject string, inspect func(*enmime.Part)) (*Message, error) {
+	msg, err := parse(raw, inspect)
 	if err == nil {
 		return msg, nil
 	}
@@ -160,6 +195,7 @@ func salvageHeaders(raw []byte) *Message {
 		ReceivedDates: ParseReceivedChain(headers["received"]),
 		MessageID:     strings.ToValidUTF8(firstHeader(headers, "message-id"), "\uFFFD"),
 		InReplyTo:     strings.ToValidUTF8(firstHeader(headers, "in-reply-to"), "\uFFFD"),
+		ListID:        NormalizeListID(firstHeader(headers, "list-id")),
 	}
 
 	if dateHeader := firstHeader(headers, "date"); dateHeader != "" {
@@ -368,6 +404,24 @@ func processMalformedOtherParts(parts []*enmime.Part) []Attachment {
 	return result
 }
 
+// NormalizeListID extracts the complete angle-bracketed token from a List-Id
+// header. When the header is malformed or unbracketed, it preserves the
+// trimmed raw value.
+func NormalizeListID(value string) string {
+	value = strings.TrimSpace(value)
+	start := strings.LastIndex(value, "<")
+	if start < 0 {
+		return value
+	}
+
+	end := strings.Index(value[start+1:], ">")
+	if end < 0 {
+		return value
+	}
+
+	return value[start : start+2+end]
+}
+
 // parseAddressList parses an address header using enmime's AddressList method.
 func parseAddressList(env *enmime.Envelope, header string) []Address {
 	list, err := env.AddressList(header)
@@ -517,8 +571,8 @@ func stripAddressDecorations(value string) string {
 
 // extractDomain extracts the domain from an email address.
 func extractDomain(email string) string {
-	if idx := strings.LastIndex(email, "@"); idx >= 0 {
-		return strings.ToLower(email[idx+1:])
+	if _, domain, ok := strings.CutLast(email, "@"); ok {
+		return strings.ToLower(domain)
 	}
 	return ""
 }
@@ -580,15 +634,16 @@ func makeAttachment(part *enmime.Part, isInline bool) Attachment {
 	}
 
 	return Attachment{
-		Filename:    part.FileName,
-		ContentType: contentType,
-		ContentID:   part.ContentID,
-		Disposition: disposition,
-		PartKey:     partKey,
-		Size:        len(content),
-		ContentHash: hex.EncodeToString(hash[:]),
-		Content:     content,
-		IsInline:    isInline,
+		Filename:           part.FileName,
+		ContentType:        contentType,
+		ContentID:          part.ContentID,
+		Disposition:        disposition,
+		PartKey:            partKey,
+		Size:               len(content),
+		ContentHash:        hex.EncodeToString(hash[:]),
+		Content:            content,
+		IsInline:           isInline || disposition == "inline",
+		IsApplePlaceholder: len(part.Header.Values("X-Apple-Content-Length")) > 0,
 	}
 }
 

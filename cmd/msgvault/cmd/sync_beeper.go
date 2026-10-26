@@ -5,15 +5,21 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/beeper"
+	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/jobctx"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/textutil"
 )
 
 var (
@@ -45,11 +51,16 @@ Examples:
   msgvault sync-beeper --full`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			state := invocationFromCommand(cmd)
+			if state == nil || state.cfg == nil {
+				return errors.New("configuration is unavailable")
+			}
+			cfg := state.cfg
 			if !isDaemonCLISubprocess() {
 				return runDaemonCLICommandHTTPFromCobra(cmd, args)
 			}
 
-			imp, accountIDs, dbPath, cleanup, err := openBeeperImporter(syncBeeperAccounts)
+			imp, s, accountIDs, dbPath, cleanup, err := openBeeperImporter(syncBeeperAccounts, state, false)
 			if err != nil {
 				return err
 			}
@@ -57,34 +68,19 @@ Examples:
 			ctx, stop := withInterruptCancel(cmd, "\nInterrupted. Saving checkpoint...")
 			defer stop()
 
-			var syncErrors []string
-			for _, accountID := range accountIDs {
-				if ctx.Err() != nil {
-					break
-				}
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Syncing Beeper account %s\n", accountID)
-				opts := beeperImportOptions(accountID)
-				opts.Limit = syncBeeperLimit
-				opts.Full = syncBeeperFull
-				opts.NoMedia = opts.NoMedia || syncBeeperNoMedia
-				opts.Progress = func(s string) { _, _ = fmt.Fprintln(cmd.OutOrStdout(), "  "+s) }
-				sum, err := imp.Import(ctx, opts)
-				if ctx.Err() != nil {
-					break
-				}
-				// One broken network must not block the others; collect and
-				// keep syncing (same convention as the multi-account sync
-				// commands and the beeper scheduler path).
-				if err != nil {
-					syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", accountID, err))
-					continue
-				}
-				printBeeperSummary(cmd, accountID, sum)
-			}
+			syncErrors := runBeeperSyncAccounts(ctx, cmd.OutOrStdout(), s, accountIDs,
+				func(ctx context.Context, accountID string) (*beeper.ImportSummary, error) {
+					opts := beeperImportOptions(accountID, cfg)
+					opts.Limit = syncBeeperLimit
+					opts.Full = syncBeeperFull
+					opts.NoMedia = opts.NoMedia || syncBeeperNoMedia
+					opts.Progress = func(s string) { _, _ = fmt.Fprintln(cmd.OutOrStdout(), "  "+s) }
+					return imp.Import(ctx, opts)
+				})
 
 			// Successful accounts' messages must reach the analytics cache
 			// regardless of interruptions or per-account failures.
-			cacheErr := rebuildCacheAfterWrite(dbPath)
+			cacheErr := rebuildCacheAfterManualSync(dbPath, state)
 			if ctx.Err() != nil {
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "\nInterrupted — re-run sync-beeper to resume.")
 				return cacheErr
@@ -109,41 +105,137 @@ Examples:
 	return cmd
 }
 
-func printBeeperSummary(cmd *cobra.Command, accountID string, sum *beeper.ImportSummary) {
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  %s done in %s: %d chats, %d messages (%d added)",
-		accountID, sum.Duration.Round(time.Second), sum.ChatsProcessed, sum.MessagesProcessed, sum.MessagesAdded)
+func runBeeperSyncAccounts(ctx context.Context, out io.Writer, s *store.Store, accountIDs []string,
+	importAccount func(context.Context, string) (*beeper.ImportSummary, error),
+) []string {
+	var syncErrors []string
+	for _, accountID := range accountIDs {
+		if ctx.Err() != nil {
+			break
+		}
+		_, _ = fmt.Fprintf(out, "Syncing Beeper account %s\n", textutil.SanitizeTerminal(accountID))
+		sum, err := importAccount(ctx, accountID)
+		if ctx.Err() != nil {
+			break
+		}
+		var partial *beeper.PartialSyncError
+		if sum != nil && (err == nil || errors.As(err, &partial)) {
+			printBeeperSummary(out, accountID, sum)
+		}
+		writeBeeperRunFailures(ctx, out, s, sum, accountID, "sync-beeper")
+		if err != nil {
+			syncErrors = append(syncErrors, fmt.Sprintf("%s: %v", accountID, err))
+		}
+	}
+	return syncErrors
+}
+
+func writeBeeperRunFailures(ctx context.Context, out io.Writer, s *store.Store, sum *beeper.ImportSummary, accountID, fetchCmd string) {
+	const mediaCmd = "backfill-beeper-media"
+	if sum == nil || sum.Errors == 0 {
+		return
+	}
+	ids := make([]string, 0, len(sum.FailedChats))
+	var total, fetch, media int64
+	for id, cf := range sum.FailedChats {
+		ids = append(ids, id)
+		fetch += cf.FetchErrors
+		media += cf.MediaErrors
+	}
+	total = fetch + media
+	slices.SortFunc(ids, func(a, b string) int {
+		ac, bc := sum.FailedChats[a], sum.FailedChats[b]
+		if diff := ac.FetchErrors + ac.MediaErrors - bc.FetchErrors - bc.MediaErrors; diff != 0 {
+			if diff > 0 {
+				return -1
+			}
+			return 1
+		}
+		return strings.Compare(a, b)
+	})
+	titles, _ := s.ConversationTitlesBatchContext(ctx, sum.SourceID, ids[:min(len(ids), 20)])
+	if len(ids) > 0 {
+		_, _ = fmt.Fprintf(out, "  Failed chats (%d errors in %d chats):\n", total, len(ids))
+	}
+	for i, id := range ids {
+		if i == 20 {
+			_, _ = fmt.Fprintf(out, "    ...and %d more chats\n", len(ids)-i)
+			break
+		}
+		cf := sum.FailedChats[id]
+		label := textutil.SanitizeTerminal(id)
+		if title := textutil.SanitizeTerminal(titles[id]); title != "" {
+			label = fmt.Sprintf("%s (%s)", title, label)
+		}
+		var phases []string
+		if cf.MediaErrors > 0 {
+			phases = append(phases, fmt.Sprintf("%d attachment", cf.MediaErrors))
+		}
+		if cf.FetchErrors > 0 {
+			phases = append(phases, fmt.Sprintf("%d fetch", cf.FetchErrors))
+		}
+		_, _ = fmt.Fprintf(out, "    %s: %s %s; last: %s\n", label, strings.Join(phases, ", "), plural(cf.MediaErrors+cf.FetchErrors, "error", "errors"), textutil.TruncateRunes(textutil.SanitizeTerminal(cf.LastError), 160))
+	}
+	if remaining := sum.Errors - total; remaining > 0 {
+		_, _ = fmt.Fprintf(out, "  %d other %s listed by chat; re-run to retry.\n", remaining, plural(remaining, "error isn't", "errors aren't"))
+	}
+	if total > 0 {
+		_, _ = fmt.Fprintln(out, "  Retry with the same global options (such as --local):")
+		if fetch > 0 && media > 0 && fetchCmd == mediaCmd {
+			_, _ = fmt.Fprintf(out, "    msgvault %s --account %s\n", fetchCmd, textutil.SanitizeTerminal(accountID))
+			return
+		}
+		if fetch > 0 {
+			_, _ = fmt.Fprintf(out, "    fetch errors: msgvault %s --account %s\n", fetchCmd, textutil.SanitizeTerminal(accountID))
+		}
+		if media > 0 {
+			_, _ = fmt.Fprintf(out, "    attachment errors: msgvault %s --account %s\n", mediaCmd, textutil.SanitizeTerminal(accountID))
+		}
+	}
+}
+
+func plural(n int64, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+func printBeeperSummary(out io.Writer, accountID string, sum *beeper.ImportSummary) {
+	_, _ = fmt.Fprintf(out, "  %s done in %s: %d chats, %d messages (%d added)",
+		textutil.SanitizeTerminal(accountID), sum.Duration.Round(time.Second), sum.ChatsProcessed, sum.MessagesProcessed, sum.MessagesAdded)
 	if sum.ReactionsRefreshed > 0 {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), ", %d reactions refreshed", sum.ReactionsRefreshed)
+		_, _ = fmt.Fprintf(out, ", %d reactions refreshed", sum.ReactionsRefreshed)
 	}
 	if sum.ChatsReopened > 0 {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), ", %d chats reopened for backfilled history", sum.ChatsReopened)
+		_, _ = fmt.Fprintf(out, ", %d chats reopened for backfilled history", sum.ChatsReopened)
 	}
 	if sum.ObservationsRecorded > 0 {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), ", %d address observations", sum.ObservationsRecorded)
+		_, _ = fmt.Fprintf(out, ", %d address observations", sum.ObservationsRecorded)
 	}
 	if sum.IdentityAutoResolved > 0 {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), ", %d identities resolved", sum.IdentityAutoResolved)
+		_, _ = fmt.Fprintf(out, ", %d identities resolved", sum.IdentityAutoResolved)
 	}
 	if sum.IdentityCandidates > 0 {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), ", %d identity suggestions", sum.IdentityCandidates)
+		_, _ = fmt.Fprintf(out, ", %d identity suggestions", sum.IdentityCandidates)
 	}
 	if sum.IdentityConflicts > 0 {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), ", %d identity conflicts", sum.IdentityConflicts)
+		_, _ = fmt.Fprintf(out, ", %d identity conflicts", sum.IdentityConflicts)
 	}
 	if sum.IdentityReplayErrors > 0 {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), ", %d identity replay pending", sum.IdentityReplayErrors)
+		_, _ = fmt.Fprintf(out, ", %d identity replay pending", sum.IdentityReplayErrors)
 	}
 	if sum.AttachmentsDownloaded > 0 {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), ", %d attachments", sum.AttachmentsDownloaded)
+		_, _ = fmt.Fprintf(out, ", %d attachments", sum.AttachmentsDownloaded)
 	}
 	if sum.AttachmentsPending > 0 {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), ", %d media pending (see backfill-beeper-media)", sum.AttachmentsPending)
+		_, _ = fmt.Fprintf(out, ", %d media pending (see backfill-beeper-media)", sum.AttachmentsPending)
 	}
-	writeBeeperMediaSkipSummary(cmd.OutOrStdout(), sum)
+	writeBeeperMediaSkipSummary(out, sum)
 	if sum.Errors > 0 {
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), ", %d errors", sum.Errors)
+		_, _ = fmt.Fprintf(out, ", %d errors", sum.Errors)
 	}
-	_, _ = fmt.Fprintln(cmd.OutOrStdout())
+	_, _ = fmt.Fprintln(out)
 }
 
 func writeBeeperMediaSkipSummary(out io.Writer, sum *beeper.ImportSummary) {
@@ -159,27 +251,49 @@ func writeBeeperMediaSkipSummary(out io.Writer, sum *beeper.ImportSummary) {
 	if otherSkipped > 0 {
 		_, _ = fmt.Fprintf(out, ", %d media skipped by policy", otherSkipped)
 	}
+	if sum.AttachmentsUnavailable > 0 {
+		_, _ = fmt.Fprintf(out, ", %d media no longer available at source", sum.AttachmentsUnavailable)
+	}
 }
 
 // resolveBeeperSyncAccounts returns the Beeper accountIDs to sync: the
 // explicit flag values, or every registered beeper source that passes the
 // config include/exclude filters.
-func resolveBeeperSyncAccounts(s *store.Store, flagAccounts []string) ([]string, error) {
+func resolveBeeperSyncAccounts(s *store.Store, flagAccounts []string, cfg *config.Config) ([]string, error) {
+	return resolveBeeperAccounts(s, flagAccounts, cfg, false)
+}
+
+func resolveBeeperAccounts(s *store.Store, flagAccounts []string, cfg *config.Config, allowHistoryOnly bool) ([]string, error) {
 	sources, err := s.ListSources(sourceTypeBeeper)
 	if err != nil {
 		return nil, fmt.Errorf("list beeper sources: %w", err)
 	}
 	if len(flagAccounts) > 0 {
-		registered := make(map[string]struct{}, len(sources))
+		registered := make(map[string]*store.Source, len(sources))
+		aliases := make(map[string]*store.Source, len(sources))
 		for _, src := range sources {
-			registered[src.Identifier] = struct{}{}
+			registered[src.Identifier] = src
+			if src.Alias != "" {
+				aliases[strings.ToLower(src.Alias)] = src
+			}
 		}
 		seen := make(map[string]struct{}, len(flagAccounts))
 		out := make([]string, 0, len(flagAccounts))
 		for _, accountID := range flagAccounts {
-			if _, ok := registered[accountID]; !ok {
+			src, ok := registered[accountID]
+			if !ok {
+				src, ok = aliases[strings.ToLower(accountID)]
+			}
+			if !ok {
 				return nil, fmt.Errorf("beeper account %q is not registered (run 'add-beeper' first)", accountID)
 			}
+			if src.MergedIntoSourceID != 0 {
+				return nil, fmt.Errorf("beeper source %d: %w", src.ID, store.ErrSourceRetired)
+			}
+			if src.HistoryOnly && !allowHistoryOnly {
+				return nil, fmt.Errorf("beeper source %d is history-only; use update-account --source-id %d --history-only=false before syncing", src.ID, src.ID)
+			}
+			accountID = src.Identifier
 			if _, duplicate := seen[accountID]; duplicate {
 				continue
 			}
@@ -189,20 +303,57 @@ func resolveBeeperSyncAccounts(s *store.Store, flagAccounts []string) ([]string,
 		return out, nil
 	}
 	var out []string
+	if cfg == nil {
+		return nil, errors.New("configuration is unavailable")
+	}
 	for _, src := range sources {
+		if (src.HistoryOnly && !allowHistoryOnly) || src.MergedIntoSourceID != 0 {
+			continue
+		}
 		if cfg.Beeper.AccountIncluded(src.Identifier) {
 			out = append(out, src.Identifier)
 		}
 	}
-	if len(out) == 0 {
+	if len(sources) == 0 {
 		return nil, errors.New("no Beeper accounts registered (run 'add-beeper' first)")
 	}
 	return out, nil
 }
 
+// filterBeeperReanchorMarkedAccounts leaves accounts that scheduled sync may
+// safely import. A source marked by an anchor mismatch stays out of the
+// rotation until a manual import verifies it against the current installation.
+func filterBeeperReanchorMarkedAccounts(
+	ctx context.Context,
+	s *store.Store,
+	accountIDs []string,
+) ([]string, error) {
+	eligible := make([]string, 0, len(accountIDs))
+	for _, accountID := range accountIDs {
+		source, err := s.GetSourceByTypeAndIdentifier(sourceTypeBeeper, accountID)
+		if err != nil {
+			return nil, fmt.Errorf("resolve beeper source %q for anchor marker: %w", accountID, err)
+		}
+		if source.HistoryOnly || source.MergedIntoSourceID != 0 {
+			continue
+		}
+		reason, marked, err := s.GetArchiveMarker(ctx, store.BeeperReanchorMarkerKey(source.ID))
+		if err != nil {
+			return nil, err
+		}
+		if marked {
+			slog.Warn("skipping scheduled Beeper sync until manual anchor verification",
+				"account", accountID, "reason", reason)
+			continue
+		}
+		eligible = append(eligible, accountID)
+	}
+	return eligible, nil
+}
+
 // beeperImportOptions builds the config-derived import options shared by the
 // CLI and scheduler paths (flag overlays are applied by the CLI caller).
-func beeperImportOptions(accountID string) beeper.ImportOptions {
+func beeperImportOptions(accountID string, cfg *config.Config) beeper.ImportOptions {
 	policy := cfg.Beeper.MediaPolicy(accountID)
 	return beeper.ImportOptions{
 		AccountID:      accountID,
@@ -215,22 +366,30 @@ func beeperImportOptions(accountID string) beeper.ImportOptions {
 // openBeeperImporter performs the shared beeper-command prologue: open the
 // store, load the token, resolve the target accounts, and build the importer.
 // The returned cleanup closes the store.
-func openBeeperImporter(flagAccounts []string) (imp *beeper.Importer, accountIDs []string, dbPath string, cleanup func(), err error) {
-	s, cleanup, err := openWritableStoreAndInitForIngest()
+func openBeeperImporter(flagAccounts []string, state *invocation, allowHistoryOnly bool) (imp *beeper.Importer, s *store.Store, accountIDs []string, dbPath string, cleanup func(), err error) {
+	if state == nil {
+		return nil, nil, nil, "", nil, errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	s, cleanup, err = openWritableStoreAndInitForIngestInvocation(state)
 	if err != nil {
-		return nil, nil, "", nil, err
+		return nil, nil, nil, "", nil, err
 	}
 	token, err := beeper.LoadToken(cfg.TokensDir())
 	if err != nil {
 		cleanup()
-		return nil, nil, "", nil, err
+		return nil, nil, nil, "", nil, err
 	}
-	accountIDs, err = resolveBeeperSyncAccounts(s, flagAccounts)
+	accountIDs, err = resolveBeeperAccounts(s, flagAccounts, cfg, allowHistoryOnly)
 	if err != nil {
 		cleanup()
-		return nil, nil, "", nil, err
+		return nil, nil, nil, "", nil, err
 	}
-	return beeper.NewImporter(s, beeperClient(token)), accountIDs, cfg.DatabaseDSN(), cleanup, nil
+	if len(accountIDs) == 0 {
+		cleanup()
+		return nil, nil, nil, "", nil, errors.New("no active Beeper accounts to sync")
+	}
+	return beeper.NewImporter(s, beeperClient(cfg, token)), s, accountIDs, cfg.DatabaseDSN(), cleanup, nil
 }
 
 // withInterruptCancel derives a context canceled on SIGINT/SIGTERM, printing
@@ -255,39 +414,125 @@ func withInterruptCancel(cmd *cobra.Command, note string) (context.Context, func
 // so one broken account does not starve the others, and the analytics cache is
 // rebuilt after any attempt so partial writes become visible too.
 func runConfiguredBeeperSync(ctx context.Context, s *store.Store) error {
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	accountIDs, err := resolveBeeperSyncAccounts(s, nil, cfg)
+	if err != nil {
+		return err
+	}
+	accountIDs, err = filterBeeperReanchorMarkedAccounts(ctx, s, accountIDs)
+	if err != nil {
+		return err
+	}
+	if len(accountIDs) == 0 {
+		return nil
+	}
 	token, err := beeper.LoadToken(cfg.TokensDir())
 	if err != nil {
+		for _, id := range accountIDs {
+			_ = recordSyncAttempt(ctx, sourceTypeBeeper, id, err)
+		}
 		return err
 	}
-	accountIDs, err := resolveBeeperSyncAccounts(s, nil)
-	if err != nil {
-		return err
+	imp := beeper.NewImporter(s, beeperClient(cfg, token))
+	deadline := time.Now().Add(scheduledBeeperBudget - 15*time.Second)
+	shouldStop := func() bool {
+		return time.Now().After(deadline) || jobctx.PreemptionRequested(ctx)
 	}
-	imp := beeper.NewImporter(s, beeperClient(token))
-	return runScheduledBeeperAttempts(ctx, accountIDs,
-		func(accountID string) error {
-			_, err := imp.Import(ctx, beeperImportOptions(accountID))
-			return err
+	return runScheduledBeeperAttempts(ctx, accountIDs, scheduledBeeperRotation, shouldStop,
+		func(accountID string) (bool, error) {
+			opts := beeperImportOptions(accountID, cfg)
+			opts.Scheduled = true
+			opts.ShouldStop = shouldStop
+			opts.StopAt = deadline
+			sum, err := imp.Import(ctx, opts)
+			return sum != nil && sum.Stopped, err
 		},
 		func() error { return rebuildCacheAfterScheduledSync(context.WithoutCancel(ctx), "beeper") },
 	)
 }
 
+// scheduledBeeperBudget bounds one scheduled Beeper job across all accounts.
+// Imports stop at the next chat or backfill-page boundary once it is spent
+// and resume from their cursors on the next run. Fifteen seconds are reserved
+// for bounded checkpoint and terminal sync writes after imports stop.
+const scheduledBeeperBudget = 3 * time.Minute
+
+// scheduledBeeperRotation remembers where the last budget-limited scheduled
+// run stopped, so accounts late in store order are not starved.
+var scheduledBeeperRotation = &beeperAccountRotation{}
+
+// beeperAccountRotation orders scheduled Beeper accounts starting from the
+// account after the previous run's last attempt.
+type beeperAccountRotation struct {
+	mu   sync.Mutex
+	next string
+}
+
+func (r *beeperAccountRotation) order(accountIDs []string) []string {
+	r.mu.Lock()
+	next := r.next
+	r.mu.Unlock()
+	start := slices.Index(accountIDs, next)
+	if start <= 0 {
+		return slices.Clone(accountIDs)
+	}
+	return append(slices.Clone(accountIDs[start:]), accountIDs[:start]...)
+}
+
+func (r *beeperAccountRotation) resumeAt(accountID string) {
+	r.mu.Lock()
+	r.next = accountID
+	r.mu.Unlock()
+}
+
 // runScheduledBeeperAttempts keeps per-account failures isolated while
 // rebuilding analytics after any import attempt, since even a failed or
-// canceled attempt may have committed messages from healthy chats.
-func runScheduledBeeperAttempts(ctx context.Context, accountIDs []string, attempt func(string) error, rebuild func() error) error {
+// canceled attempt may have committed messages from healthy chats. An
+// attempt that reports it stopped early, or a spent budget (shouldStop)
+// before the next account, ends the job; the rotation starts the next run
+// with the next account.
+func runScheduledBeeperAttempts(
+	ctx context.Context,
+	accountIDs []string,
+	rotation *beeperAccountRotation,
+	shouldStop func() bool,
+	attempt func(string) (bool, error),
+	rebuild func() error,
+) error {
 	var errs []error
 	attempted := 0
-	for _, accountID := range accountIDs {
+	resumeAt := ""
+	ordered := rotation.order(accountIDs)
+	for idx, accountID := range ordered {
 		if ctx.Err() != nil {
+			// Cancelled between accounts (a yield or shutdown): start here next.
+			resumeAt = accountID
+			break
+		}
+		if attempted > 0 && shouldStop != nil && shouldStop() {
+			resumeAt = accountID
 			break
 		}
 		attempted++
-		if err := attempt(accountID); err != nil {
+		stopped, err := attempt(accountID)
+		if err != nil || !stopped {
+			_ = recordSyncAttempt(ctx, sourceTypeBeeper, accountID, err)
+		}
+		if err != nil {
 			errs = append(errs, fmt.Errorf("beeper %s: %w", accountID, err))
 		}
+		if stopped || ctx.Err() != nil {
+			// A large account must not consume every tick. Its own cursors
+			// preserve progress while the next account gets a turn.
+			resumeAt = ordered[(idx+1)%len(ordered)]
+			break
+		}
 	}
+	rotation.resumeAt(resumeAt)
 	if attempted > 0 {
 		if err := rebuild(); err != nil {
 			errs = append(errs, err)
@@ -300,5 +545,5 @@ func runScheduledBeeperAttempts(ctx context.Context, accountIDs []string, attemp
 }
 
 func init() {
-	rootCmd.AddCommand(newSyncBeeperCmd())
+	rootCmd.AddCommand(addManualSyncCacheFlags(newSyncBeeperCmd()))
 }

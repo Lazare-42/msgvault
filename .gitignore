@@ -1,5 +1,6 @@
 # Go binaries
 /msgvault
+/msgvault-codex-bridge
 /msgvault.exe
 /mimeshootout
 
@@ -25,6 +26,8 @@ oauth_client*.json
 .beads/
 .mcp.json
 .worktrees/
+/tmp/
+/web/tmp/
 
 # Python
 __pycache__/
@@ -48,9 +51,8 @@ __pycache__/
 *.swo
 .projects/
 
-# Nix
+# direnv
 .direnv/
-result
 
 # Claude Code
 .claude/
@@ -71,6 +73,7 @@ docs/assets/generated/
 docs/screenshots/demo-data/
 .docs-fixture-staging/
 .kata.local.toml
+/contextual-retrieval-eval
 
 # wealthfolio runtime data — personal financial documents, NEVER commit
 integrations/*/outbox/
@@ -79,4 +82,3 @@ integrations/*/lazare-local.*
 
 # personal financial/legal scratch documents (real PII) — NEVER commit
 PHildev/
-/contextual-retrieval-eval

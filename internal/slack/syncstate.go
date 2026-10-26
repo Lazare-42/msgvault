@@ -1,7 +1,7 @@
 package slack
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 )
 
@@ -18,7 +18,7 @@ type PendingThread struct {
 	// run budget at recording time and converted to actuals as the drain
 	// fetches replies. Pacing and progress only — never a completeness
 	// signal (counts can be stale).
-	Forecast int `json:"forecast,omitempty"`
+	Forecast int `json:"forecast,omitzero"`
 	// Floor is the entry's coverage claim: replies are owed strictly after
 	// it ("" = from the root, the walks' full-drain claim; tail entries
 	// carry their seed). The entry has covered (Floor, DrainedTo] and will
@@ -45,7 +45,11 @@ type ConvState struct {
 	Cursor         string `json:"cursor,omitempty"`
 	BackfillCursor string `json:"backfill_cursor,omitempty"`
 	BackfillLatest string `json:"backfill_latest,omitempty"`
-	Done           bool   `json:"done,omitempty"`
+	Done           bool   `json:"done,omitzero"`
+	// LastSkippedAt lets unreadable conversations rotate behind older work
+	// across interrupted runs. It is only a scheduling marker, not a claim
+	// that any history or replies were archived.
+	LastSkippedAt string `json:"last_skipped_at,omitempty"`
 	// ThreadsPending marks conversation-level thread debt: any initial
 	// walk under --no-threads (unconditionally — a message can become a
 	// thread root after the walk), or a non-channel conversation
@@ -56,7 +60,7 @@ type ConvState struct {
 	// the walk was started under — page cursors are only valid against the
 	// bound they were minted with), so limited runs drain the walk across
 	// runs instead of restarting it.
-	ThreadsPending bool   `json:"threads_pending,omitempty"`
+	ThreadsPending bool   `json:"threads_pending,omitzero"`
 	CatchUpCursor  string `json:"catch_up_cursor,omitempty"`
 	CatchUpLatest  string `json:"catch_up_latest,omitempty"`
 	// TruncatedSweepThrough is the exclusive day boundary through which a
@@ -86,7 +90,7 @@ type ConvState struct {
 	AuditedThrough string `json:"audited_through,omitempty"`
 	// AuditPending distinguishes a periodic canonical audit from other
 	// ThreadsPending causes so completion can advance AuditedThrough.
-	AuditPending bool `json:"audit_pending,omitempty"`
+	AuditPending bool `json:"audit_pending,omitzero"`
 }
 
 // SyncState holds per-conversation cursors plus the reply-sweep watermark
@@ -98,7 +102,15 @@ type ConvState struct {
 // those fields no longer exist (an upgraded mid-window checkpoint re-walks
 // at most one window into idempotent upserts).
 type SyncState struct {
-	Conversations map[string]*ConvState `json:"conversations"` // key = channel ID
+	// ScopedSweepAfter resumes channel-scoped search after the last attempted
+	// channel so a limited run cannot spend every budget on the same channel.
+	ScopedSweepAfter string                `json:"scoped_sweep_after,omitempty"`
+	PrincipalID      string                `json:"principal_id,omitempty"`
+	Conversations    map[string]*ConvState `json:"conversations"` // key = channel ID
+	// HistoryPass remembers visits across interruptions when late replies
+	// require walking history. A retry must not start another audit of a
+	// channel already visited by this pass.
+	HistoryPass *HistoryPass `json:"history_pass,omitempty"`
 	// SweepWatermark is the pin of the last completed workspace sweep for
 	// the current target set (each conversation's own boundary is its
 	// SweptThrough). The trailing margin is re-covered by the next sweep,
@@ -108,14 +120,24 @@ type SyncState struct {
 	// SweepOffset records the user tz_offset (seconds) in effect when the
 	// watermark was written. Audit trail only: sweep-day arithmetic always
 	// uses the IANA zone current at query time (probed live).
-	SweepOffset int `json:"sweep_offset,omitempty"`
+	SweepOffset int `json:"sweep_offset,omitzero"`
 	// RepairPending marks an in-flight --full repair session. While set,
 	// every run — full, plain, or limited — continues the repair through
 	// the ordinary resumable walks; it clears when every eligible
 	// conversation is Done with all thread debt paid. The --full reset it
 	// rides on needs no lineage marker: resume selection is newest-blob-
 	// wins (see loadResumeState), so the reset state simply supersedes.
-	RepairPending bool `json:"repair_pending,omitempty"`
+	RepairPending bool `json:"repair_pending,omitzero"`
+}
+
+// HistoryPass is traversal progress, separate from each channel's coverage.
+// Changing the requested work starts another traversal without losing cursors.
+type HistoryPass struct {
+	Limit       int             `json:"limit,omitzero"`
+	Visited     map[string]bool `json:"visited"`
+	FetchErrors int             `json:"fetch_errors,omitzero"`
+	NoThreads   bool            `json:"no_threads,omitzero"`
+	Maintenance bool            `json:"maintenance,omitzero"`
 }
 
 func NewSyncState() *SyncState {
@@ -132,6 +154,9 @@ func LoadSyncState(blob string) (*SyncState, error) {
 	}
 	if s.Conversations == nil {
 		s.Conversations = map[string]*ConvState{}
+	}
+	if s.HistoryPass != nil && s.HistoryPass.Visited == nil {
+		s.HistoryPass.Visited = map[string]bool{}
 	}
 	for channelID, cs := range s.Conversations {
 		if cs == nil {
@@ -155,7 +180,7 @@ func LoadSyncState(blob string) (*SyncState, error) {
 }
 
 func (s *SyncState) Marshal() (string, error) {
-	b, err := json.Marshal(s)
+	b, err := json.Marshal(s, json.Deterministic(true))
 	return string(b), err
 }
 

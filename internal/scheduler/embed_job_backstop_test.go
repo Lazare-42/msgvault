@@ -14,7 +14,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/msgvault/internal/operations"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/embed"
 	"go.kenn.io/msgvault/internal/vector/sqlitevec"
@@ -62,23 +64,25 @@ func (s *e2eWorkStore) SetEmbedGen(ctx context.Context, ids []int64, target int6
 	return err
 }
 
-func (s *e2eWorkStore) SetEmbedGenIfUnchanged(ctx context.Context, items []store.EmbedGenStamp, target int64) (missed []int64, err error) {
+func (s *e2eWorkStore) SetEmbedGenIfUnchanged(ctx context.Context, items []store.EmbedGenStamp, target int64) (missed []int64, covered int, err error) {
 	for _, it := range items {
 		res, err := s.db.ExecContext(ctx,
 			`UPDATE messages SET embed_gen = ? WHERE id = ? AND last_modified = ?`,
 			target, it.ID, it.LastModified)
 		if err != nil {
-			return missed, err
+			return missed, covered, err
 		}
 		n, err := res.RowsAffected()
 		if err != nil {
-			return missed, err
+			return missed, covered, err
 		}
 		if n == 0 {
 			missed = append(missed, it.ID)
+		} else {
+			covered++
 		}
 	}
-	return missed, nil
+	return missed, covered, nil
 }
 
 // e2eCoverage satisfies EmbedCoverage from the live main DB so the
@@ -206,11 +210,15 @@ END;`)
 		Backend: backend, VectorsDB: vecDB, MainDB: mainDB,
 		Store: ws, Client: &e2eClient{dim: 4}, BatchSize: 8,
 		LastModifiedExpr: "CAST(m.last_modified AS TEXT)",
+		Recorder:         testutil.NewTestStore(t),
 	})
 
 	// Drain the corpus fully via the worker so every message is embedded +
 	// stamped and the per-gen watermark advances to the max id.
-	_, err = worker.RunOnce(ctx, gen)
+	_, err = worker.RunOnce(ctx, gen, operations.PassScope{
+		Key: "test:scheduler:backstop:seed", Trigger: operations.TriggerScheduled,
+		StartedAt: time.Date(2026, 8, 30, 0, 0, 0, 0, time.UTC),
+	})
 	require.NoError(
 		err, "initial drain")
 

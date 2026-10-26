@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"bytes"
-	"context"
 	"io"
 	"path/filepath"
 	"testing"
@@ -12,6 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/importer"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
 func saveImportPstState(t *testing.T) func() {
@@ -41,14 +41,9 @@ func TestImportPstRunsPostSourceMigrationForEligibleSourceTypes(t *testing.T) {
 	t.Cleanup(saveImportPstState(t))
 	testCfg := lifecycleTestConfig(tmp)
 	testCfg.Identity.Addresses = []string{"legacy@example.com"}
-	withStoreResolverConfig(t, testCfg)
+	testCtx := withStoreResolverConfig(t, testCfg)
 
-	st, err := store.Open(testCfg.DatabaseDSN())
-	require.NoError(
-		err, "open seed store")
-
-	require.NoError(
-		st.InitSchema(), "init seed schema")
+	st := testutil.NewSQLiteTestStoreAt(t, testCfg.DatabaseDSN())
 
 	emailSource, err := st.GetOrCreateSource("gmail", "mailbox@example.com")
 	require.NoError(
@@ -68,7 +63,8 @@ func TestImportPstRunsPostSourceMigrationForEligibleSourceTypes(t *testing.T) {
 
 	var stdout bytes.Buffer
 	cmd := &cobra.Command{Use: "import-pst"}
-	cmd.SetContext(context.Background())
+	cmd.SetContext(testCtx)
+	cmd.SetContext(testCtx)
 	cmd.SetOut(&stdout)
 	cmd.SetErr(io.Discard)
 
@@ -115,15 +111,10 @@ func TestRunPstPostImportMigrationsConfirmsDefaultIdentityBeforeHardErrorMigrati
 	tmp := t.TempDir()
 	testCfg := lifecycleTestConfig(tmp)
 	testCfg.Identity.Addresses = []string{"legacy@example.com"}
-	withStoreResolverConfig(t, testCfg)
+	testCtx := withStoreResolverConfig(t, testCfg)
+	_ = testCtx
 
-	st, err := store.Open(testCfg.DatabaseDSN())
-	require.NoError(
-		err, "open store")
-
-	t.Cleanup(func() { _ = st.Close() })
-	require.NoError(
-		st.InitSchema(), "init schema")
+	st := testutil.NewSQLiteTestStoreAt(t, testCfg.DatabaseDSN())
 
 	src, err := st.GetOrCreateSource("mbox", "archive@example.com")
 	require.NoError(
@@ -132,7 +123,7 @@ func TestRunPstPostImportMigrationsConfirmsDefaultIdentityBeforeHardErrorMigrati
 	err = runPstPostImportMigrations(io.Discard, st, &importer.PstImportSummary{
 		SourceID:   src.ID,
 		HardErrors: true,
-	}, "mbox", "archive@example.com")
+	}, "mbox", "archive@example.com", invocationFromContext(testCtx))
 	require.NoError(
 		err, "post-import migrations")
 

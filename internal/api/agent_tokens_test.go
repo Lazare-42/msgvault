@@ -1,0 +1,760 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/agentgrant"
+	"go.kenn.io/msgvault/internal/apiprotocol"
+	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/vector"
+)
+
+// TestAgentTokensDoNotSurviveRestart tests proof matrix row 13 (second half).
+// Grants issued against one in-memory registry are not visible in a fresh
+// registry (simulating a daemon restart).
+func TestAgentTokensDoNotSurviveRestart(t *testing.T) {
+	t.Parallel()
+	// First "instance": issue a grant.
+	_, reg1 := newAgentTokenTestServer(t)
+	src := agentgrant.SourceRef{ID: 1, Type: "imap", Identifier: "alice@example.com"}
+	_, secret, _, err := reg1.Issue("pre-restart", []agentgrant.Permission{agentgrant.PermissionDraftCreate}, []agentgrant.SourceRef{src}, time.Time{})
+	require.NoError(t, err)
+
+	// Confirm the grant is valid in the first registry.
+	_, ok := reg1.Lookup(secret)
+	require.True(t, ok, "grant must be valid in the first registry")
+
+	// Second "instance": fresh registry with no knowledge of the previous grant.
+	srv2, _ := newAgentTokenTestServer(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	req.Header.Set(apiprotocol.AgentTokenHeader, secret)
+	w := httptest.NewRecorder()
+	srv2.Router().ServeHTTP(w, req)
+	assert.Equal(t, http.StatusUnauthorized, w.Code, "grant from old registry must not authenticate against new registry")
+}
+
+// TestDelegatedHealthUsesPublicProjection covers restricted health views alongside owner detail.
+func TestDelegatedHealthUsesPublicProjection(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+	gate := NewSerialOperationGate()
+	stub := &stubSourceStore{
+		src: &store.Source{ID: 1, SourceType: "imap", Identifier: "alice@example.com"},
+	}
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			APIKey:        agentTokenTestAPIKey,
+			AgentAccess:   true,
+			RemoteClients: []config.RemoteClientConfig{{ClientID: "reader", APIKey: remoteClientTestReaderKey}},
+		},
+	}
+	srv := NewServerWithOptions(ServerOptions{
+		Config:        cfg,
+		Store:         stub,
+		Logger:        testLogger(),
+		Scheduler:     newMockScheduler(),
+		OperationGate: gate,
+		VectorCfg:     vector.Config{Enabled: true},
+		VectorStatus:  VectorStatusReady,
+	})
+	reg := agentgrant.NewRegistry()
+	srv.agentGrants = reg
+
+	src := agentgrant.SourceRef{ID: 1, Type: "imap", Identifier: "alice@example.com"}
+	_, secret, _, err := reg.Issue("health-check", []agentgrant.Permission{agentgrant.PermissionDraftCreate}, []agentgrant.SourceRef{src}, time.Time{})
+	require.NoError(err)
+
+	// Hold the gate with a label so operationHealth() returns a labelled entry
+	// and operationBusyHealth() returns Busy only.
+	releaseGate, ok := gate.BeginLabeledWorkContext(context.Background(), "test-operation")
+	require.True(ok, "must acquire gate")
+	defer releaseGate()
+
+	srv.SetVectorInitError(errors.New("synthetic provider detail"))
+
+	// Owner caller.
+	reqO := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	reqO.Header.Set("X-Api-Key", agentTokenTestAPIKey)
+	wO := httptest.NewRecorder()
+	srv.Router().ServeHTTP(wO, reqO)
+	require.Equal(http.StatusOK, wO.Code, "owner health: %s", wO.Body.String())
+
+	var ownerResp HealthResponse
+	require.NoError(json.NewDecoder(wO.Body).Decode(&ownerResp))
+
+	for _, credential := range []struct{ header, key string }{
+		{apiprotocol.AgentTokenHeader, secret},
+		{"X-Api-Key", remoteClientTestReaderKey},
+	} {
+		reqD := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+		reqD.Header.Set(credential.header, credential.key)
+		wD := httptest.NewRecorder()
+		srv.Router().ServeHTTP(wD, reqD)
+		require.Equal(http.StatusOK, wD.Code, "restricted health: %s", wD.Body.String())
+
+		var restrictedResp HealthResponse
+		require.NoError(json.NewDecoder(wD.Body).Decode(&restrictedResp))
+
+		assert.Equal("ok", restrictedResp.Status)
+		assert.Equal(ownerResp.APISchemaVersion, restrictedResp.APISchemaVersion)
+		require.NotNil(restrictedResp.Operation)
+		assert.True(restrictedResp.Operation.Busy)
+		assert.Empty(restrictedResp.Operation.Label)
+		require.NotNil(restrictedResp.Vector)
+		assert.NotContains(restrictedResp.Vector.Error, "synthetic provider detail")
+		assert.Nil(restrictedResp.Vector.TextEnabled)
+		assert.Nil(restrictedResp.Vector.VisualEnabled)
+	}
+	assert.Equal("ok", ownerResp.Status)
+	assert.NotEmpty(ownerResp.APISchemaVersion)
+	require.NotNil(ownerResp.Operation)
+	assert.Equal("test-operation", ownerResp.Operation.Label)
+	require.NotNil(ownerResp.Vector)
+	require.NotNil(ownerResp.Vector.TextEnabled)
+	require.NotNil(ownerResp.Vector.VisualEnabled)
+	assert.True(*ownerResp.Vector.TextEnabled)
+	assert.False(*ownerResp.Vector.VisualEnabled)
+}
+
+const agentTokenTestAPIKey = "owner-api-key-for-agent-tests"
+
+func newAgentTokenTestServer(t *testing.T) (*Server, *agentgrant.Registry) {
+	t.Helper()
+	reg := agentgrant.NewRegistry()
+	stub := &stubSourceStore{
+		src: &store.Source{
+			ID:         1,
+			SourceType: "imap",
+			Identifier: "alice@example.com",
+		},
+	}
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			APIKey:      agentTokenTestAPIKey,
+			AgentAccess: true,
+		},
+	}
+	srv := NewServerWithOptions(ServerOptions{
+		Config:    cfg,
+		Store:     stub,
+		Logger:    testLogger(),
+		Scheduler: newMockScheduler(),
+	})
+	srv.agentGrants = reg
+	return srv, reg
+}
+
+type agentTokenIdentityStore struct {
+	*stubSourceStore
+
+	identities []store.AccountIdentity
+}
+
+func (s *agentTokenIdentityStore) ListAccountIdentitiesContext(_ context.Context, sourceID int64) ([]store.AccountIdentity, error) {
+	result := make([]store.AccountIdentity, 0, len(s.identities))
+	for _, identity := range s.identities {
+		if identity.SourceID == sourceID {
+			result = append(result, identity)
+		}
+	}
+	return result, nil
+}
+
+func TestAgentTokenSenderSelectionsSnapshotConfirmedIdentities(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	stub := &agentTokenIdentityStore{
+		stubSourceStore: &stubSourceStore{src: &store.Source{ID: 1, SourceType: "imap", Identifier: "alice@example.com"}},
+		identities: []store.AccountIdentity{
+			{SourceID: 1, Address: "Alice@example.com", ConfirmedAt: time.Now()},
+			{SourceID: 1, Address: "alias@example.com", ConfirmedAt: time.Now()},
+			{SourceID: 1, Address: "unconfirmed@example.com"},
+		},
+	}
+	cfg := &config.Config{Server: config.ServerConfig{APIKey: agentTokenTestAPIKey, AgentAccess: true}}
+	srv := NewServerWithOptions(ServerOptions{Config: cfg, Store: stub, Logger: testLogger(), Scheduler: newMockScheduler()})
+	reg := agentgrant.NewRegistry()
+	srv.agentGrants = reg
+
+	issue := func(selections map[string][]string) agentTokenIssueResponse {
+		body, err := json.Marshal(agentTokenIssueRequest{
+			Label: "sender-test", Permissions: []string{string(agentgrant.PermissionDraftCreate)},
+			SourceIDs: []int64{1}, SenderSelections: selections,
+		})
+		requirements.NoError(err)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/agent-tokens", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Api-Key", agentTokenTestAPIKey)
+		resp := httptest.NewRecorder()
+		srv.Router().ServeHTTP(resp, req)
+		requirements.Equal(http.StatusCreated, resp.Code, resp.Body.String())
+		var result agentTokenIssueResponse
+		requirements.NoError(json.NewDecoder(resp.Body).Decode(&result))
+		return result
+	}
+
+	explicit := issue(map[string][]string{"1": {"Alice <ALICE@example.com>"}})
+	requirements.Len(explicit.Sources, 1)
+	assertions.Equal([]string{"alice@example.com"}, explicit.Sources[0].SenderKeys)
+	grant, ok := reg.Lookup(explicit.Secret)
+	requirements.True(ok)
+	assertions.True(grant.AllowsSender(agentgrant.PermissionDraftCreate, agentgrant.SourceRef{Type: "imap", Identifier: "alice@example.com"}, "alice@example.com"))
+
+	defaulted := issue(nil)
+	assertions.Equal([]string{"alice@example.com", "alias@example.com"}, defaulted.Sources[0].SenderKeys)
+
+	badBody, err := json.Marshal(agentTokenIssueRequest{
+		Label: "bad-sender", Permissions: []string{string(agentgrant.PermissionDraftCreate)},
+		SourceIDs: []int64{1}, SenderSelections: map[string][]string{"1": {"unknown@example.com"}},
+	})
+	requirements.NoError(err)
+	badReq := httptest.NewRequest(http.MethodPost, "/api/v1/agent-tokens", bytes.NewReader(badBody))
+	badReq.Header.Set("Content-Type", "application/json")
+	badReq.Header.Set("X-Api-Key", agentTokenTestAPIKey)
+	badResp := httptest.NewRecorder()
+	srv.Router().ServeHTTP(badResp, badReq)
+	assertions.Equal(http.StatusBadRequest, badResp.Code)
+}
+
+// TestAgentTokenIssueRequiresOwnerKey verifies proof matrix row 15:
+// issue/list/revoke require owner API key; browser session and delegated get 401.
+func TestAgentTokenIssueRequiresOwnerKey(t *testing.T) {
+	t.Parallel()
+	srv, reg := newAgentTokenTestServer(t)
+
+	reqBody := agentTokenIssueRequest{
+		Label:       "test-agent",
+		Permissions: []string{string(agentgrant.PermissionDraftCreate)},
+		SourceIDs:   []int64{1},
+	}
+	bodyBytes, err := json.Marshal(reqBody)
+	require.NoError(t, err)
+
+	t.Run("no auth gets 401", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/agent-tokens", bytes.NewReader(bodyBytes))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		srv.Router().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+	})
+
+	t.Run("owner API key gets 201", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/agent-tokens", bytes.NewReader(bodyBytes))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Api-Key", agentTokenTestAPIKey)
+		w := httptest.NewRecorder()
+		srv.Router().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
+	})
+
+	t.Run("delegated token gets 401", func(t *testing.T) {
+		// Issue a grant first
+		src := agentgrant.SourceRef{ID: 1, Type: "imap", Identifier: "alice@example.com"}
+		_, secret, _, issuErr := reg.Issue("delegated-caller", []agentgrant.Permission{agentgrant.PermissionDraftCreate}, []agentgrant.SourceRef{src}, time.Time{})
+		require.NoError(t, issuErr)
+
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/agent-tokens", bytes.NewReader(bodyBytes))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set(apiprotocol.AgentTokenHeader, secret)
+		w := httptest.NewRecorder()
+		srv.Router().ServeHTTP(w, req)
+		// delegated mode is not in the allowed list for issueAgentToken
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+	})
+}
+
+func TestIssueAgentTokenUsesEffectiveRequestOrigin(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+	reg := agentgrant.NewRegistry()
+	stub := &stubSourceStore{
+		src: &store.Source{ID: 1, SourceType: "imap", Identifier: "alice@example.com"},
+	}
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			APIKey:         agentTokenTestAPIKey,
+			AgentAccess:    true,
+			TrustedProxies: []string{"127.0.0.1/32"},
+		},
+	}
+	srv := NewServerWithOptions(ServerOptions{
+		Config:    cfg,
+		Store:     stub,
+		Logger:    testLogger(),
+		Scheduler: newMockScheduler(),
+	})
+	srv.agentGrants = reg
+
+	body, err := json.Marshal(agentTokenIssueRequest{
+		Label:       "proxy-issued-agent",
+		Permissions: []string{string(agentgrant.PermissionDraftCreate)},
+		SourceIDs:   []int64{1},
+	})
+	require.NoError(err)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agent-tokens", bytes.NewReader(body))
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Host = "127.0.0.1:8080"
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Api-Key", agentTokenTestAPIKey)
+	req.Header.Set("Forwarded", "for=192.0.2.20;proto=https;host=archive.example")
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+
+	require.Equal(http.StatusCreated, w.Code, w.Body.String())
+	var response agentTokenIssueResponse
+	require.NoError(json.NewDecoder(w.Body).Decode(&response))
+	assert.Equal("https://archive.example", response.DaemonURL)
+	assert.NotEmpty(response.Secret)
+}
+
+// TestAgentTokenListRequiresOwnerKey verifies proof matrix row 15.
+func TestAgentTokenListRequiresOwnerKey(t *testing.T) {
+	t.Parallel()
+	srv, _ := newAgentTokenTestServer(t)
+
+	t.Run("no auth gets 401", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/agent-tokens", nil)
+		w := httptest.NewRecorder()
+		srv.Router().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+	})
+
+	t.Run("owner API key gets 200", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/agent-tokens", nil)
+		req.Header.Set("X-Api-Key", agentTokenTestAPIKey)
+		w := httptest.NewRecorder()
+		srv.Router().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	})
+}
+
+// TestAgentTokenRevokeRequiresOwnerKey verifies proof matrix rows 15 and 16.
+func TestAgentTokenRevokeRequiresOwnerKey(t *testing.T) {
+	t.Parallel()
+	srv, _ := newAgentTokenTestServer(t)
+
+	t.Run("no auth gets 401", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodDelete, "/api/v1/agent-tokens/nonexistent", nil)
+		w := httptest.NewRecorder()
+		srv.Router().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusUnauthorized, w.Code)
+	})
+
+	t.Run("owner API key revoke nonexistent ID returns 204", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodDelete, "/api/v1/agent-tokens/nonexistent-id", nil)
+		req.Header.Set("X-Api-Key", agentTokenTestAPIKey)
+		w := httptest.NewRecorder()
+		srv.Router().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusNoContent, w.Code, "body: %s", w.Body.String())
+	})
+}
+
+// TestAgentTokenSecretNotInListResponse verifies proof matrix row 16:
+// secret appears once in issue response and never in list response.
+func TestAgentTokenSecretNotInListResponse(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+	srv, _ := newAgentTokenTestServer(t)
+
+	reqBody := agentTokenIssueRequest{
+		Label:       "secret-test",
+		Permissions: []string{string(agentgrant.PermissionDraftCreate)},
+		SourceIDs:   []int64{1},
+	}
+	bodyBytes, err := json.Marshal(reqBody)
+	require.NoError(err)
+
+	// Issue the token
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/agent-tokens", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Api-Key", agentTokenTestAPIKey)
+	w := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w, req)
+	require.Equal(http.StatusCreated, w.Code, "body: %s", w.Body.String())
+
+	var issueResp agentTokenIssueResponse
+	require.NoError(json.NewDecoder(w.Body).Decode(&issueResp))
+	require.NotEmpty(issueResp.Secret, "secret must be present in issue response")
+	assert.Greater(len(issueResp.Secret), 10, "secret must be non-trivial")
+
+	// List the tokens - secret must NOT appear
+	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/agent-tokens", nil)
+	req2.Header.Set("X-Api-Key", agentTokenTestAPIKey)
+	w2 := httptest.NewRecorder()
+	srv.Router().ServeHTTP(w2, req2)
+	require.Equal(http.StatusOK, w2.Code, "body: %s", w2.Body.String())
+
+	var listResp agentTokenListResponse
+	require.NoError(json.NewDecoder(w2.Body).Decode(&listResp))
+	require.Len(listResp.Tokens, 1)
+	for _, tok := range listResp.Tokens {
+		assert.NotEmpty(tok.Label, "token view should have label")
+		assert.NotEmpty(tok.ID, "token view should have ID")
+	}
+	// Verify no secret field in list body
+	assert.NotContains(w2.Body.String(), issueResp.Secret, "secret must not appear in list response")
+}
+
+// TestAgentTokenRoutesExemptFromOperationGate proves the P1 fix: revoke and
+// issue succeed with a 204/201 while the operation gate is held by another
+// operation. This is the kill-switch invariant: a leaked agent token can be
+// revoked even during a multi-hour sync or import, and the revoked grant is
+// gone immediately.
+func TestAgentTokenRoutesExemptFromOperationGate(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	gate := NewSerialOperationGate()
+	stub := &stubSourceStore{
+		src: &store.Source{ID: 1, SourceType: "imap", Identifier: "alice@example.com"},
+	}
+	cfg := &config.Config{
+		Server: config.ServerConfig{
+			APIKey:      agentTokenTestAPIKey,
+			AgentAccess: true,
+		},
+	}
+	srv := NewServerWithOptions(ServerOptions{
+		Config:        cfg,
+		Store:         stub,
+		Logger:        testLogger(),
+		Scheduler:     newMockScheduler(),
+		OperationGate: gate,
+	})
+	reg := agentgrant.NewRegistry()
+	srv.agentGrants = reg
+
+	// Issue a grant before holding the gate so we have an ID to revoke.
+	prereq := agentTokenIssueRequest{
+		Label:       "pre-hold",
+		Permissions: []string{string(agentgrant.PermissionDraftCreate)},
+		SourceIDs:   []int64{1},
+	}
+	prereqBytes, err := json.Marshal(prereq)
+	require.NoError(err)
+	preReq := httptest.NewRequest(http.MethodPost, "/api/v1/agent-tokens", bytes.NewReader(prereqBytes))
+	preReq.Header.Set("Content-Type", "application/json")
+	preReq.Header.Set("X-Api-Key", agentTokenTestAPIKey)
+	preW := httptest.NewRecorder()
+	srv.Router().ServeHTTP(preW, preReq)
+	require.Equal(http.StatusCreated, preW.Code, "pre-hold issue: %s", preW.Body.String())
+	var preIssued agentTokenIssueResponse
+	require.NoError(json.NewDecoder(preW.Body).Decode(&preIssued))
+	require.NotEmpty(preIssued.ID)
+
+	// Hold the gate so all normal mutations would block.
+	release, ok := gate.BeginLabeledWorkContext(context.Background(), "msgvault sync alice@example.com")
+	require.True(ok, "must acquire gate")
+	defer release()
+
+	// Revoke must succeed (204) while gate is held.
+	t.Run("revoke succeeds under gate contention", func(t *testing.T) {
+		revokeReq := httptest.NewRequest(http.MethodDelete, "/api/v1/agent-tokens/"+preIssued.ID, nil)
+		revokeReq.Header.Set("X-Api-Key", agentTokenTestAPIKey)
+		revokeW := httptest.NewRecorder()
+		srv.Router().ServeHTTP(revokeW, revokeReq)
+		assert.Equal(t, http.StatusNoContent, revokeW.Code, "revoke while gate held: %s", revokeW.Body.String())
+
+		// Grant must be gone immediately.
+		grants := reg.List()
+		for _, g := range grants {
+			assert.NotEqual(t, preIssued.ID, g.ID, "revoked grant must not appear in registry")
+		}
+	})
+
+	// Issue must also succeed (201) while gate is held.
+	t.Run("issue succeeds under gate contention", func(t *testing.T) {
+		issueReq := agentTokenIssueRequest{
+			Label:       "under-contention",
+			Permissions: []string{string(agentgrant.PermissionDraftCreate)},
+			SourceIDs:   []int64{1},
+		}
+		issueBytes, marshalErr := json.Marshal(issueReq)
+		require.NoError(marshalErr)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/agent-tokens", bytes.NewReader(issueBytes))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Api-Key", agentTokenTestAPIKey)
+		w := httptest.NewRecorder()
+		srv.Router().ServeHTTP(w, req)
+		assert.Equal(t, http.StatusCreated, w.Code, "issue while gate held: %s", w.Body.String())
+	})
+}
+
+// TestHandleIssueAgentTokenValidation covers every validation branch added by
+// this diff to handleIssueAgentToken. The registry enforces the same rules
+// independently, but these tests pin the HTTP error contract (status + code)
+// documented in docs/cli-reference.md.
+func TestHandleIssueAgentTokenValidation(t *testing.T) {
+	t.Parallel()
+	validBody := agentTokenIssueRequest{
+		Label:       "test-agent",
+		Permissions: []string{string(agentgrant.PermissionDraftCreate)},
+		SourceIDs:   []int64{1},
+	}
+
+	cases := []struct {
+		name       string
+		body       any
+		rawBody    string
+		wantStatus int
+		wantCode   string
+		agentGrant bool // if false, server has agentGrants == nil
+		srcErr     error
+		noResolver bool // if true, use a store that does not implement agentGrantSourceResolver
+	}{
+		{
+			name:       "agent_access_disabled",
+			body:       validBody,
+			wantStatus: http.StatusServiceUnavailable,
+			wantCode:   "agent_access_disabled",
+			agentGrant: false,
+		},
+		{
+			name:       "invalid_json_body",
+			rawBody:    `{not valid json`,
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "invalid_request",
+			agentGrant: true,
+		},
+		{
+			name:       "trailing_json",
+			rawBody:    `{"label":"test","permissions":["draft.create"],"source_ids":[1]} {}`,
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "invalid_request",
+			agentGrant: true,
+		},
+		{
+			name:       "oversized_body",
+			rawBody:    `{"label":"` + strings.Repeat("x", 1<<20) + `","permissions":["draft.create"],"source_ids":[1]}`,
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "invalid_request",
+			agentGrant: true,
+		},
+		{
+			name:       "source_lookup_failure",
+			body:       validBody,
+			wantStatus: http.StatusInternalServerError,
+			wantCode:   "internal_error",
+			agentGrant: true,
+			srcErr:     assert.AnError,
+		},
+		{
+			name: "label_required",
+			body: agentTokenIssueRequest{
+				Permissions: []string{string(agentgrant.PermissionDraftCreate)},
+				SourceIDs:   []int64{1},
+			},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "invalid_request",
+			agentGrant: true,
+		},
+		{
+			name: "permissions_required",
+			body: agentTokenIssueRequest{
+				Label:     "test",
+				SourceIDs: []int64{1},
+			},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "invalid_request",
+			agentGrant: true,
+		},
+		{
+			name: "source_ids_required",
+			body: agentTokenIssueRequest{
+				Label:       "test",
+				Permissions: []string{string(agentgrant.PermissionDraftCreate)},
+			},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "invalid_request",
+			agentGrant: true,
+		},
+		{
+			name: "invalid_permission",
+			body: agentTokenIssueRequest{
+				Label:       "test",
+				Permissions: []string{"unknown.operation"},
+				SourceIDs:   []int64{1},
+			},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "invalid_permission",
+			agentGrant: true,
+		},
+		{
+			name:       "store_does_not_support_source_resolution",
+			body:       validBody,
+			wantStatus: http.StatusInternalServerError,
+			wantCode:   "internal_error",
+			agentGrant: true,
+			noResolver: true,
+		},
+		{
+			name:       "invalid_source",
+			body:       validBody,
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "invalid_source",
+			agentGrant: true,
+			srcErr:     fmt.Errorf("lookup source: %w", store.ErrSourceNotFound),
+		},
+		{
+			name: "issue_error_remapped_to_400",
+			// Two source IDs that both resolve to the same (Type, Identifier)
+			// via the stub store trigger the registry's duplicate-source guard.
+			body: agentTokenIssueRequest{
+				Label:       "dup-source",
+				Permissions: []string{string(agentgrant.PermissionDraftCreate)},
+				SourceIDs:   []int64{1, 2},
+			},
+			wantStatus: http.StatusBadRequest,
+			wantCode:   "invalid_request",
+			agentGrant: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var st MessageStore
+			if tc.noResolver {
+				// mockStore does not implement agentGrantSourceResolver.
+				st = &mockStore{}
+			} else {
+				stub := &stubSourceStore{
+					src: &store.Source{ID: 1, SourceType: "imap", Identifier: "alice@example.com"},
+				}
+				if tc.srcErr != nil {
+					stub.src = nil
+					stub.srcErr = tc.srcErr
+				}
+				st = stub
+			}
+			assert := assert.New(t)
+			cfg := &config.Config{
+				Server: config.ServerConfig{
+					APIKey:      agentTokenTestAPIKey,
+					AgentAccess: tc.agentGrant,
+				},
+			}
+			srv := NewServerWithOptions(ServerOptions{
+				Config:    cfg,
+				Store:     st,
+				Logger:    testLogger(),
+				Scheduler: newMockScheduler(),
+			})
+			if tc.agentGrant {
+				srv.agentGrants = agentgrant.NewRegistry()
+			}
+
+			var bodyBytes []byte
+			if tc.rawBody != "" {
+				bodyBytes = []byte(tc.rawBody)
+			} else {
+				var marshalErr error
+				bodyBytes, marshalErr = json.Marshal(tc.body)
+				require.NoError(t, marshalErr)
+			}
+
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/agent-tokens", bytes.NewReader(bodyBytes))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("X-Api-Key", agentTokenTestAPIKey)
+			w := httptest.NewRecorder()
+			srv.Router().ServeHTTP(w, req)
+
+			assert.Equal(tc.wantStatus, w.Code, "status: %s", w.Body.String())
+			var errResp struct {
+				Error string `json:"error"`
+			}
+			if assert.NoError(json.NewDecoder(w.Body).Decode(&errResp)) {
+				assert.Equal(tc.wantCode, errResp.Error, "error code")
+			}
+		})
+	}
+}
+
+// TestRevocationDeniesSubsequentAuthentication verifies the full HTTP
+// issue → authenticate → revoke → authenticate cycle using only the HTTP
+// endpoints (POST /api/v1/agent-tokens, GET /api/v1/health,
+// DELETE /api/v1/agent-tokens/{id}).
+func TestRevocationDeniesSubsequentAuthentication(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+	srv, _ := newAgentTokenTestServer(t)
+
+	// Step 1: issue a grant via HTTP.
+	reqBody := agentTokenIssueRequest{
+		Label:       "revoke-http-test",
+		Permissions: []string{string(agentgrant.PermissionDraftCreate)},
+		SourceIDs:   []int64{1},
+	}
+	bodyBytes, err := json.Marshal(reqBody)
+	require.NoError(err)
+	issueReq := httptest.NewRequest(http.MethodPost, "/api/v1/agent-tokens", bytes.NewReader(bodyBytes))
+	issueReq.Header.Set("Content-Type", "application/json")
+	issueReq.Header.Set("X-Api-Key", agentTokenTestAPIKey)
+	issueW := httptest.NewRecorder()
+	srv.Router().ServeHTTP(issueW, issueReq)
+	require.Equal(http.StatusCreated, issueW.Code, "issue: %s", issueW.Body.String())
+
+	var issued agentTokenIssueResponse
+	require.NoError(json.NewDecoder(issueW.Body).Decode(&issued))
+	require.NotEmpty(issued.ID)
+	require.NotEmpty(issued.Secret)
+
+	// Step 2: prove the token authenticates.
+	healthReq1 := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	healthReq1.Header.Set(apiprotocol.AgentTokenHeader, issued.Secret)
+	healthW1 := httptest.NewRecorder()
+	srv.Router().ServeHTTP(healthW1, healthReq1)
+	assert.Equal(http.StatusOK, healthW1.Code, "pre-revocation: token must authenticate")
+
+	// Step 3: revoke via HTTP.
+	revokeReq := httptest.NewRequest(http.MethodDelete, "/api/v1/agent-tokens/"+issued.ID, nil)
+	revokeReq.Header.Set("X-Api-Key", agentTokenTestAPIKey)
+	revokeW := httptest.NewRecorder()
+	srv.Router().ServeHTTP(revokeW, revokeReq)
+	assert.Equal(http.StatusNoContent, revokeW.Code, "revoke: %s", revokeW.Body.String())
+
+	// Step 4: prove the token no longer authenticates.
+	healthReq2 := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
+	healthReq2.Header.Set(apiprotocol.AgentTokenHeader, issued.Secret)
+	healthW2 := httptest.NewRecorder()
+	srv.Router().ServeHTTP(healthW2, healthReq2)
+	assert.Equal(http.StatusUnauthorized, healthW2.Code, "post-revocation: revoked token must return 401")
+}
+
+func TestAgentTokenManagementDisabled(t *testing.T) {
+	t.Parallel()
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Server: config.ServerConfig{APIKey: agentTokenTestAPIKey}},
+		Store:  &mockStore{}, Logger: testLogger(), Scheduler: newMockScheduler(),
+	})
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, agentTokensPath},
+		{http.MethodDelete, agentTokensPath + "/nonexistent"},
+	} {
+		t.Run(tc.method, func(t *testing.T) {
+			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req.Header.Set("X-Api-Key", agentTokenTestAPIKey)
+			w := httptest.NewRecorder()
+			srv.Router().ServeHTTP(w, req)
+			assert.Equal(t, http.StatusServiceUnavailable, w.Code)
+			var response ErrorResponse
+			require.NoError(t, json.NewDecoder(w.Body).Decode(&response))
+			assert.Equal(t, "agent_access_disabled", response.Error)
+		})
+	}
+}

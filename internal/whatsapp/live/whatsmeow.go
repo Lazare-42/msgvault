@@ -2,7 +2,7 @@ package live
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -25,9 +25,8 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/proto"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "github.com/mattn/go-sqlite3" // Register the SQLite driver for the WhatsApp session store.
 )
 
 // maxMediaDownloadBytes caps a single media download by its declared size,
@@ -223,7 +222,10 @@ func (t *WhatsmeowTransport) Status(ctx context.Context) (Status, error) {
 
 func (t *WhatsmeowTransport) Connect(ctx context.Context) error {
 	t.registerEventHandler(ctx)
-	return t.client.ConnectContext(ctx)
+	if err := t.client.ConnectContext(ctx); err != nil {
+		return fmt.Errorf("connect whatsapp: %w", err)
+	}
+	return nil
 }
 
 func (t *WhatsmeowTransport) Logout(ctx context.Context, req TransportLogoutRequest) (TransportLogoutResult, error) {
@@ -279,7 +281,7 @@ func (t *WhatsmeowTransport) clearLocalSession(ctx context.Context) error {
 		t.client.Disconnect()
 		if t.client.Store != nil && t.client.Store.ID != nil {
 			if err := t.client.Store.Delete(ctx); err != nil {
-				return err
+				return fmt.Errorf("delete whatsapp device: %w", err)
 			}
 		}
 	}
@@ -342,7 +344,10 @@ func (t *WhatsmeowTransport) Close() error {
 		t.client.Disconnect()
 	}
 	if t.container != nil {
-		return t.container.Close()
+		if err := t.container.Close(); err != nil {
+			return fmt.Errorf("close whatsapp session: %w", err)
+		}
+		return nil
 	}
 	return nil
 }
@@ -430,7 +435,7 @@ func (t *WhatsmeowTransport) runQRPairing(pairingCtx context.Context, handlerCtx
 		default:
 			t.finishQRPairing(QRPairingState{
 				Event: item.Event,
-				Error: fmt.Sprintf("whatsapp pairing ended: %s", item.Event),
+				Error: "whatsapp pairing ended: " + item.Event,
 			})
 			return
 		}
@@ -463,7 +468,7 @@ func (t *WhatsmeowTransport) finishQRPairing(state QRPairingState) {
 func (t *WhatsmeowTransport) SendMessage(ctx context.Context, req TransportSendMessageRequest) (TransportSendResult, error) {
 	chat, err := ParseChatJID(req.ChatID)
 	if err != nil {
-		return TransportSendResult{}, err
+		return TransportSendResult{}, fmt.Errorf("send whatsapp message: %w", err)
 	}
 	var msg *waE2E.Message
 	if len(req.Mentions) > 0 {
@@ -472,21 +477,21 @@ func (t *WhatsmeowTransport) SendMessage(ctx context.Context, req TransportSendM
 		// name and pings them (group participants resolve via pushname/LID).
 		msg = &waE2E.Message{
 			ExtendedTextMessage: &waE2E.ExtendedTextMessage{
-				Text: proto.String(req.Body),
+				Text: new(req.Body),
 				ContextInfo: &waE2E.ContextInfo{
 					MentionedJID: req.Mentions,
 				},
 			},
 		}
 	} else {
-		msg = &waE2E.Message{Conversation: proto.String(req.Body)}
+		msg = &waE2E.Message{Conversation: new(req.Body)}
 	}
 	resp, err := t.client.SendMessage(ctx, chat, msg)
 	if err != nil {
-		return TransportSendResult{}, err
+		return TransportSendResult{}, fmt.Errorf("send whatsapp message: %w", err)
 	}
 	return TransportSendResult{
-		RemoteMessageID: string(resp.ID),
+		RemoteMessageID: resp.ID,
 		ChatJID:         chat.ToNonAD().String(),
 		Timestamp:       resp.Timestamp,
 	}, nil
@@ -495,19 +500,19 @@ func (t *WhatsmeowTransport) SendMessage(ctx context.Context, req TransportSendM
 func (t *WhatsmeowTransport) SendReaction(ctx context.Context, req TransportSendReactionRequest) (TransportSendResult, error) {
 	chat, err := ParseChatJID(req.ChatJID)
 	if err != nil {
-		return TransportSendResult{}, err
+		return TransportSendResult{}, fmt.Errorf("send whatsapp message: %w", err)
 	}
 	sender, err := ParseChatJID(req.SenderJID)
 	if err != nil {
 		return TransportSendResult{}, fmt.Errorf("sender_jid: %w", err)
 	}
-	msg := t.client.BuildReaction(chat, sender, types.MessageID(req.RemoteMessageID), req.Emoji)
+	msg := t.client.BuildReaction(chat, sender, req.RemoteMessageID, req.Emoji)
 	resp, err := t.client.SendMessage(ctx, chat, msg)
 	if err != nil {
-		return TransportSendResult{}, err
+		return TransportSendResult{}, fmt.Errorf("send whatsapp message: %w", err)
 	}
 	return TransportSendResult{
-		RemoteMessageID: string(resp.ID),
+		RemoteMessageID: resp.ID,
 		ChatJID:         chat.ToNonAD().String(),
 		Timestamp:       resp.Timestamp,
 	}, nil
@@ -541,11 +546,9 @@ func (t *WhatsmeowTransport) RequestHistorySync(ctx context.Context, req Transpo
 	}
 
 	anchor := &types.MessageInfo{
-		MessageSource: types.MessageSource{
-			Chat:     chat,
-			IsFromMe: req.AnchorIsFromMe,
-		},
-		ID:        types.MessageID(req.AnchorMessageID),
+		Chat:      chat,
+		IsFromMe:  req.AnchorIsFromMe,
+		ID:        req.AnchorMessageID,
 		Timestamp: req.AnchorTimestamp,
 	}
 	msg := t.client.BuildHistorySyncRequest(anchor, count)
@@ -568,10 +571,10 @@ func (t *WhatsmeowTransport) RequestHistorySync(ctx context.Context, req Transpo
 func (t *WhatsmeowTransport) LinkQR(ctx context.Context, w io.Writer) error {
 	qrChan, err := t.client.GetQRChannel(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("open whatsapp QR channel: %w", err)
 	}
 	if err := t.client.ConnectContext(ctx); err != nil {
-		return err
+		return fmt.Errorf("connect whatsapp: %w", err)
 	}
 	for item := range qrChan {
 		switch item.Event {
@@ -592,10 +595,10 @@ func (t *WhatsmeowTransport) LinkQR(ctx context.Context, w io.Writer) error {
 func (t *WhatsmeowTransport) PairPhone(ctx context.Context, phone string, w io.Writer) error {
 	qrChan, err := t.client.GetQRChannel(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("open whatsapp QR channel: %w", err)
 	}
 	if err := t.client.ConnectContext(ctx); err != nil {
-		return err
+		return fmt.Errorf("connect whatsapp: %w", err)
 	}
 	select {
 	case item := <-qrChan:
@@ -607,7 +610,7 @@ func (t *WhatsmeowTransport) PairPhone(ctx context.Context, phone string, w io.W
 	}
 	code, err := t.client.PairPhone(ctx, phone, false, whatsmeow.PairClientChrome, "Chrome (Linux)")
 	if err != nil {
-		return err
+		return fmt.Errorf("pair whatsapp phone: %w", err)
 	}
 	_, _ = fmt.Fprintf(w, "WhatsApp pairing code: %s\n", code)
 	return nil
@@ -637,7 +640,7 @@ func (t *WhatsmeowTransport) registerEventHandler(ctx context.Context) {
 			case t.messageEvents <- event:
 			default:
 				t.client.Log.Warnf("WhatsApp message queue full; archiving %s synchronously", event.Info.ID)
-				if _, err := t.convertAndArchiveMessage(ctx, event, ""); err != nil {
+				if err := t.convertAndArchiveMessage(ctx, event, ""); err != nil {
 					t.client.Log.Warnf("Failed to archive WhatsApp message %s: %v", event.Info.ID, err)
 				}
 			}
@@ -662,7 +665,7 @@ func (t *WhatsmeowTransport) processMessageQueue() {
 		case <-t.bgCtx.Done():
 			return
 		case event := <-t.messageEvents:
-			if _, err := t.convertAndArchiveMessage(t.bgCtx, event, ""); err != nil {
+			if err := t.convertAndArchiveMessage(t.bgCtx, event, ""); err != nil {
 				if t.log != nil {
 					t.log.Warnf("Failed to archive WhatsApp message %s: %v", event.Info.ID, err)
 				}
@@ -671,19 +674,19 @@ func (t *WhatsmeowTransport) processMessageQueue() {
 	}
 }
 
-func (t *WhatsmeowTransport) convertAndArchiveMessage(ctx context.Context, msg *events.Message, chatTitle string) (bool, error) {
+func (t *WhatsmeowTransport) convertAndArchiveMessage(ctx context.Context, msg *events.Message, chatTitle string) error {
 	inbound, ok := t.convertMessage(ctx, msg)
 	if !ok {
-		return false, nil
+		return nil
 	}
 	inbound.ChatTitle = strings.TrimSpace(chatTitle)
 	t.mu.Lock()
 	handler := t.inbound
 	t.mu.Unlock()
 	if handler == nil {
-		return false, nil
+		return nil
 	}
-	return true, handler(ctx, inbound)
+	return handler(ctx, inbound)
 }
 
 // convertedHistoryMessage is one history-sync message's conversion outcome,
@@ -747,10 +750,9 @@ func (t *WhatsmeowTransport) archiveHistorySync(ctx context.Context, event *even
 		var g errgroup.Group
 		g.SetLimit(historySyncDownloadConcurrency)
 		for i, historyMessage := range historyMessages {
-			i, historyMessage := i, historyMessage
 			g.Go(func() error {
 				if err := ctx.Err(); err != nil {
-					return nil
+					return err
 				}
 				// History-sync messages parse into the same *waE2E.Message shape as
 				// live events (ParseWebMessage sets RawMessage = webMsg.GetMessage()),
@@ -761,7 +763,7 @@ func (t *WhatsmeowTransport) archiveHistorySync(ctx context.Context, event *even
 				parsed, err := t.client.ParseWebMessage(chatJID, historyMessage.GetMessage())
 				if err != nil {
 					results[i] = convertedHistoryMessage{parseFailed: true}
-					return nil
+					return nil //nolint:nilerr // Parse failures are aggregated per item after all workers finish.
 				}
 				// convertMessage derives downloadCtx from ctx (not gctx), so
 				// canceling ctx unblocks an in-flight download promptly even
@@ -862,7 +864,7 @@ func (t *WhatsmeowTransport) convertMessage(ctx context.Context, evt *events.Mes
 			Account:   t.account,
 			ChatJID:   chat,
 			SenderJID: sender,
-			MessageID: string(evt.Info.ID),
+			MessageID: evt.Info.ID,
 			PushName:  evt.Info.PushName,
 			Timestamp: evt.Info.Timestamp,
 			IsFromMe:  evt.Info.IsFromMe,
@@ -888,7 +890,7 @@ func (t *WhatsmeowTransport) convertMessage(ctx context.Context, evt *events.Mes
 		Account:    t.account,
 		ChatJID:    chat,
 		SenderJID:  sender,
-		MessageID:  string(evt.Info.ID),
+		MessageID:  evt.Info.ID,
 		PushName:   evt.Info.PushName,
 		Text:       text,
 		Timestamp:  evt.Info.Timestamp,
@@ -1106,7 +1108,7 @@ func ParseChatJID(raw string) (types.JID, error) {
 	if strings.Contains(raw, "@") {
 		jid, err := types.ParseJID(raw)
 		if err != nil {
-			return types.JID{}, err
+			return types.JID{}, fmt.Errorf("parse whatsapp JID: %w", err)
 		}
 		return jid.ToNonAD(), nil
 	}
@@ -1127,6 +1129,7 @@ func ensureSessionFile(path string) error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("create whatsapp session dir: %w", err)
 	}
+	//nolint:gosec // This is a directory: owner traversal is required; group and world have no access.
 	if err := os.Chmod(dir, 0700); err != nil {
 		return fmt.Errorf("chmod whatsapp session dir: %w", err)
 	}
@@ -1141,6 +1144,9 @@ func ensureSessionFile(path string) error {
 }
 
 func RawMessageJSON(msg InboundMessage) []byte {
-	raw, _ := json.Marshal(msg)
+	raw, err := json.Marshal(msg)
+	if err != nil {
+		return nil
+	}
 	return raw
 }

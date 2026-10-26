@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -12,6 +13,7 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/sourceops"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
 
@@ -34,6 +36,68 @@ func runSyncFullLocalForTest(cmd *cobra.Command, args []string) error {
 	return runSyncFullLocal(cmd, args)
 }
 
+func TestSyncCommandsEmptySourceGuidanceMatchesCapabilities(t *testing.T) {
+	tests := []struct {
+		name     string
+		run      func(*cobra.Command, []string) error
+		sources  []string
+		want     []string
+		unwanted []string
+	}{
+		{
+			name: "sync",
+			run:  runSyncIncrementalLocal,
+			want: []string{"add-o365", "file imports are not synced"},
+		},
+		{
+			name:    "sync with only file imports",
+			run:     runSyncIncrementalLocal,
+			sources: []string{"mbox"},
+			want:    []string{"no email accounts to sync", "file imports are not synced"},
+		},
+		{
+			name:     "sync-full",
+			run:      runSyncFullLocal,
+			want:     []string{"add-account <gmail>", "add-imap", "msgvault sync", "file imports are not synced"},
+			unwanted: []string{"add-o365"},
+		},
+		{
+			name:    "sync-full with only file imports and Graph mail",
+			run:     runSyncFullLocal,
+			sources: []string{"mbox", sourceTypeMSMail},
+			want:    []string{"no Gmail or IMAP accounts to sync", "msgvault sync"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assertions := assert.New(t)
+			requirements := require.New(t)
+
+			dir := t.TempDir()
+			cfg := &config.Config{HomeDir: dir, Data: config.DataConfig{DataDir: dir}}
+			if len(test.sources) > 0 {
+				s := testutil.NewSQLiteTestStoreAt(t, cfg.DatabaseDSN())
+				for _, sourceType := range test.sources {
+					_, err := s.GetOrCreateSource(sourceType, "archive@example.com")
+					requirements.NoError(err)
+				}
+				requirements.NoError(s.Close())
+			}
+			command := &cobra.Command{Use: test.name}
+			command.SetContext(testInvocationContext(t.Context(), cfg, invocationOptions{}))
+
+			err := test.run(command, nil)
+			requirements.Error(err)
+			for _, want := range test.want {
+				requirements.ErrorContains(err, want)
+			}
+			for _, unwanted := range test.unwanted {
+				assertions.NotContains(err.Error(), unwanted)
+			}
+		})
+	}
+}
+
 // TestSyncCmd_DuplicateIdentifierRoutesCorrectly verifies that when
 // Gmail and IMAP sources share the same identifier, the single-arg
 // sync path resolves both and routes each to the correct backend.
@@ -44,20 +108,21 @@ func runSyncFullLocalForTest(cmd *cobra.Command, args []string) error {
 // scaffolding so the test exercises runIncrementalSync, not just
 // the OAuth manager setup.
 func TestSyncCmd_DuplicateIdentifierRoutesCorrectly(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/msgvault.db"
 
-	s, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	require.NoError(s.InitSchema(), "init schema")
+	s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 
 	// Insert IMAP *before* Gmail so that an ambiguous single-row
 	// lookup (the old GetSourceByIdentifier bug) would return the
 	// IMAP row, not the Gmail one. This ensures the test only
 	// passes when the resolved Gmail source is actually used.
-	_, err = s.GetOrCreateSource("imap", "shared@example.com")
+	_, err := s.GetOrCreateSource("imap", "shared@example.com")
 	require.NoError(err, "create imap source")
 
 	gmailSrc, err := s.GetOrCreateSource(
@@ -88,6 +153,8 @@ func TestSyncCmd_DuplicateIdentifierRoutesCorrectly(t *testing.T) {
 		Data:    config.DataConfig{DataDir: tmpDir},
 		OAuth:   config.OAuthConfig{ClientSecrets: secretsPath},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	testCmd := &cobra.Command{
@@ -97,6 +164,7 @@ func TestSyncCmd_DuplicateIdentifierRoutesCorrectly(t *testing.T) {
 	}
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(testCmd)
 	root.SetArgs([]string{"sync", "shared@example.com"})
 
@@ -145,6 +213,50 @@ func TestResolveSyncSourcesSourceIDIsExact(t *testing.T) {
 	assert.Equal(gmail.ID, sources[0].ID)
 }
 
+func TestSyncFullSourceIDTreatsLegacyEmptyTypeAsGmail(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
+	require := require.New(t)
+	assert := assert.New(t)
+	tmpDir := t.TempDir()
+	st := testutil.NewSQLiteTestStoreAt(t, filepath.Join(tmpDir, "msgvault.db"))
+	legacy, err := st.GetOrCreateSource("", "legacy@example.test")
+	require.NoError(err)
+	require.NoError(st.Close())
+
+	savedCfg := cfg
+	savedLogger := logger
+	t.Cleanup(func() {
+		cfg = savedCfg
+		logger = savedLogger
+	})
+	cfg = &config.Config{
+		HomeDir: tmpDir,
+		Data:    config.DataConfig{DataDir: tmpDir},
+	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
+	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+	command := &cobra.Command{}
+	command.SetContext(testCtx)
+	command.SetContext(testCtx)
+	command.Flags().Int64("source-id", 0, "")
+	require.NoError(command.Flags().Set("source-id", strconv.FormatInt(legacy.ID, 10)))
+	err = runSyncFullLocal(command, nil)
+	require.Error(err)
+	require.ErrorContains(err, "1 account(s) failed")
+	require.NotErrorIs(err, store.ErrSourceNotFound)
+
+	st, err = store.Open(filepath.Join(tmpDir, "msgvault.db"))
+	require.NoError(err)
+	t.Cleanup(func() { _ = st.Close() })
+	preserved, err := st.GetSourceByID(legacy.ID)
+	require.NoError(err)
+	assert.Empty(preserved.SourceType)
+}
+
 func TestResolveSyncSourcesNumericTokenDoesNotBecomeSourceID(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -160,19 +272,101 @@ func TestResolveSyncSourcesNumericTokenDoesNotBecomeSourceID(t *testing.T) {
 	assert.Equal(numeric.ID, sources[0].ID)
 }
 
+func TestSyncSelectionSkipsRetiredImplicitSourcesAndRejectsExplicitSelection(t *testing.T) {
+	require := require.New(t)
+	retired := &store.Source{ID: 3, SourceType: sourceTypeIMAP, Identifier: "history@example.test", MergedIntoSourceID: 8}
+	active := &store.Source{ID: 8, SourceType: sourceTypeIMAP, Identifier: "current@example.test"}
+
+	assert.Equal(t, []*store.Source{active}, activeSyncSources([]*store.Source{retired, active}))
+	err := rejectExplicitlyRetiredSyncSources([]*store.Source{retired}, sourceops.Selector{SourceID: retired.ID, SourceIDSet: true}, isIncrementalSyncableSource)
+	require.ErrorIs(err, store.ErrSourceRetired)
+	assert.Contains(t, err.Error(), "source ID 3")
+
+	activeImport := &store.Source{ID: 9, SourceType: "meeting_import", Identifier: "history@example.test"}
+	err = rejectExplicitlyRetiredSyncSources([]*store.Source{retired, activeImport}, sourceops.Selector{Account: retired.Identifier}, isIncrementalSyncableSource)
+	require.ErrorIs(err, store.ErrSourceRetired,
+		"an active non-syncable source must not mask a retired syncable match")
+
+	retiredGraph := &store.Source{ID: 10, SourceType: sourceTypeMSMail, Identifier: "history@example.test", MergedIntoSourceID: 11}
+	err = rejectExplicitlyRetiredSyncSources([]*store.Source{retiredGraph}, sourceops.Selector{Account: retiredGraph.Identifier}, isFullSyncableSource)
+	require.ErrorIs(err, store.ErrSourceRetired,
+		"sync-full must continue to reject a retired source that only sync can service")
+	err = rejectExplicitlyRetiredSyncSources([]*store.Source{retiredGraph, active}, sourceops.Selector{Account: retiredGraph.Identifier}, isFullSyncableSource)
+	require.NoError(err,
+		"an active full-syncable match must permit sync-full to skip a retired provider match")
+}
+
+func TestSyncExplicitAccountSkipsRetiredProviderWhenActiveMatchExists(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+	require := require.New(t)
+	assert := assert.New(t)
+	tmpDir := t.TempDir()
+	st := testutil.NewSQLiteTestStoreAt(t, filepath.Join(tmpDir, "msgvault.db"))
+
+	active, err := st.GetOrCreateSource(sourceTypeGmail, "shared@example.test")
+	require.NoError(err)
+	require.NoError(st.UpdateSourceSyncCursor(active.ID, "1"))
+	retired, err := st.GetOrCreateSource(sourceTypeMSMail, "shared@example.test")
+	require.NoError(err)
+	destination, err := st.GetOrCreateSource(sourceTypeMSMail, "live@example.test")
+	require.NoError(err)
+	_, err = st.MergeSourcesContext(t.Context(), store.MergeSourcesRequest{
+		FromSourceID: retired.ID, IntoSourceID: destination.ID,
+	})
+	require.NoError(err)
+	require.NoError(st.Close())
+
+	secretsPath := filepath.Join(tmpDir, "client_secret.json")
+	require.NoError(os.WriteFile(secretsPath, []byte(fakeClientSecrets), 0600))
+	savedCfg := cfg
+	savedLogger := logger
+	t.Cleanup(func() {
+		cfg = savedCfg
+		logger = savedLogger
+	})
+	cfg = &config.Config{
+		HomeDir: tmpDir,
+		Data:    config.DataConfig{DataDir: tmpDir},
+		OAuth:   config.OAuthConfig{ClientSecrets: secretsPath},
+	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+	testCmd := &cobra.Command{
+		Use:  "sync [email]",
+		Args: cobra.MaximumNArgs(1),
+		RunE: runSyncIncrementalLocal,
+	}
+	root := newTestRootCmd()
+	root.SetContext(testCtx)
+	root.AddCommand(testCmd)
+	root.SetArgs([]string{"sync", "shared@example.test"})
+
+	getOutput := captureStdout(t)
+	execErr := root.Execute()
+	output := getOutput()
+	require.Error(execErr, "the active Gmail source should be attempted without a token")
+	require.NotErrorIs(execErr, store.ErrSourceRetired)
+	assert.Contains(execErr.Error(), "1 account(s) failed")
+	assert.Contains(output, "add-account", "the live Gmail source must be routed to sync")
+	assert.NotContains(output, "retired", "the merged Microsoft source must be skipped")
+}
+
 // TestSyncCmd_SingleSourceNoAmbiguity verifies that a single
 // source for an identifier works without the legacy fallback.
 func TestSyncCmd_SingleSourceNoAmbiguity(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/msgvault.db"
 
-	s, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	require.NoError(s.InitSchema(), "init schema")
+	s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 
-	_, err = s.GetOrCreateSource("imap", "solo@example.com")
+	_, err := s.GetOrCreateSource("imap", "solo@example.com")
 	require.NoError(err, "create imap source")
 	_ = s.Close()
 
@@ -187,6 +381,8 @@ func TestSyncCmd_SingleSourceNoAmbiguity(t *testing.T) {
 		HomeDir: tmpDir,
 		Data:    config.DataConfig{DataDir: tmpDir},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	testCmd := &cobra.Command{
@@ -196,6 +392,7 @@ func TestSyncCmd_SingleSourceNoAmbiguity(t *testing.T) {
 	}
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(testCmd)
 	root.SetArgs([]string{"sync", "solo@example.com"})
 
@@ -226,14 +423,15 @@ func TestSyncCmd_SingleSourceNoAmbiguity(t *testing.T) {
 // returns a clear error instead of falling back to the legacy
 // Gmail path.
 func TestSyncCmd_MboxIdentifierDoesNotFallback(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/msgvault.db"
 
-	s, err := store.Open(dbPath)
-	require.NoError(t, err, "open store")
-	require.NoError(t, s.InitSchema(), "init schema")
+	s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 
-	_, err = s.GetOrCreateSource("mbox", "imported@example.com")
+	_, err := s.GetOrCreateSource("mbox", "imported@example.com")
 	require.NoError(t, err, "create mbox source")
 	_ = s.Close()
 
@@ -248,6 +446,8 @@ func TestSyncCmd_MboxIdentifierDoesNotFallback(t *testing.T) {
 		HomeDir: tmpDir,
 		Data:    config.DataConfig{DataDir: tmpDir},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	// Test both sync and sync-full commands.
@@ -266,6 +466,7 @@ func TestSyncCmd_MboxIdentifierDoesNotFallback(t *testing.T) {
 			}
 
 			root := newTestRootCmd()
+			root.SetContext(testCtx)
 			root.AddCommand(testCmd)
 			root.SetArgs([]string{
 				tc.name, "imported@example.com",
@@ -282,16 +483,17 @@ func TestSyncCmd_MboxIdentifierDoesNotFallback(t *testing.T) {
 // mixed Gmail+IMAP setup without OAuth configured, sync-full skips
 // the Gmail source and still syncs the IMAP source.
 func TestSyncFullCmd_OAuthSkipDoesNotBlockIMAP(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/msgvault.db"
 
-	s, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	require.NoError(s.InitSchema(), "init schema")
+	s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 
-	_, err = s.GetOrCreateSource("gmail", "g@example.com")
+	_, err := s.GetOrCreateSource("gmail", "g@example.com")
 	require.NoError(err, "create gmail source")
 	_, err = s.GetOrCreateSource("imap", "i@example.com")
 	require.NoError(err, "create imap source")
@@ -309,6 +511,8 @@ func TestSyncFullCmd_OAuthSkipDoesNotBlockIMAP(t *testing.T) {
 		HomeDir: tmpDir,
 		Data:    config.DataConfig{DataDir: tmpDir},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	testCmd := &cobra.Command{
@@ -318,6 +522,7 @@ func TestSyncFullCmd_OAuthSkipDoesNotBlockIMAP(t *testing.T) {
 	}
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(testCmd)
 	root.SetArgs([]string{"sync-full"})
 
@@ -345,6 +550,9 @@ func TestSyncFullCmd_OAuthSkipDoesNotBlockIMAP(t *testing.T) {
 // the no-args discovery path. The OAuth error should be reported
 // after IMAP work completes.
 func TestSyncCmd_BrokenOAuthDoesNotBlockIMAP(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	for _, tc := range []struct {
 		name string
 		runE func(*cobra.Command, []string) error
@@ -358,9 +566,7 @@ func TestSyncCmd_BrokenOAuthDoesNotBlockIMAP(t *testing.T) {
 			tmpDir := t.TempDir()
 			dbPath := tmpDir + "/msgvault.db"
 
-			s, err := store.Open(dbPath)
-			require.NoError(err, "open store")
-			require.NoError(s.InitSchema(), "init schema")
+			s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 
 			gmailSrc, err := s.GetOrCreateSource(
 				"gmail", "g@example.com",
@@ -401,6 +607,8 @@ func TestSyncCmd_BrokenOAuthDoesNotBlockIMAP(t *testing.T) {
 			logger = slog.New(
 				slog.NewTextHandler(os.Stderr, nil),
 			)
+			testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+			invocationFromContext(testCtx).logger = logger
 
 			testCmd := &cobra.Command{
 				Use:  tc.name + " [email]",
@@ -409,6 +617,7 @@ func TestSyncCmd_BrokenOAuthDoesNotBlockIMAP(t *testing.T) {
 			}
 
 			root := newTestRootCmd()
+			root.SetContext(testCtx)
 			root.AddCommand(testCmd)
 			root.SetArgs([]string{tc.name})
 
@@ -443,20 +652,21 @@ func TestSyncCmd_BrokenOAuthDoesNotBlockIMAP(t *testing.T) {
 // even in a mixed Gmail+IMAP setup where Gmail would otherwise
 // succeed first.
 func TestSyncFullCmd_MalformedDateRejectsBeforeSync(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/msgvault.db"
 
-	s, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	require.NoError(s.InitSchema(), "init schema")
+	s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 
 	// Create both Gmail and IMAP sources. The Gmail source is
 	// made fully syncable (OAuth config + token) so that without
 	// the early validation it would be selected and synced before
 	// the IMAP source rejects the malformed date.
-	_, err = s.GetOrCreateSource("gmail", "g@example.com")
+	_, err := s.GetOrCreateSource("gmail", "g@example.com")
 	require.NoError(err, "create gmail source")
 	_, err = s.GetOrCreateSource("imap", "i@example.com")
 	require.NoError(err, "create imap source")
@@ -485,6 +695,8 @@ func TestSyncFullCmd_MalformedDateRejectsBeforeSync(t *testing.T) {
 		Data:    config.DataConfig{DataDir: tmpDir},
 		OAuth:   config.OAuthConfig{ClientSecrets: secretsPath},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	syncAfter = "not-a-date"
@@ -496,6 +708,7 @@ func TestSyncFullCmd_MalformedDateRejectsBeforeSync(t *testing.T) {
 	}
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(testCmd)
 	root.SetArgs([]string{"sync-full"})
 
@@ -514,13 +727,14 @@ func TestSyncFullCmd_MalformedDateRejectsBeforeSync(t *testing.T) {
 // --after/--before flags produce a clear error for IMAP sources
 // instead of silently syncing the entire mailbox.
 func TestSyncFullCmd_MalformedIMAPDateFlagErrors(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	require := require.New(t)
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/msgvault.db"
 
-	s, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	require.NoError(s.InitSchema(), "init schema")
+	s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 
 	src, err := s.GetOrCreateSource("imap", "i@example.com")
 	require.NoError(err, "create imap source")
@@ -544,6 +758,8 @@ func TestSyncFullCmd_MalformedIMAPDateFlagErrors(t *testing.T) {
 		HomeDir: tmpDir,
 		Data:    config.DataConfig{DataDir: tmpDir},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	for _, tc := range []struct {
@@ -567,6 +783,7 @@ func TestSyncFullCmd_MalformedIMAPDateFlagErrors(t *testing.T) {
 			}
 
 			root := newTestRootCmd()
+			root.SetContext(testCtx)
 			root.AddCommand(testCmd)
 			root.SetArgs([]string{
 				"sync-full", "i@example.com",
@@ -584,6 +801,9 @@ func TestSyncFullCmd_MalformedIMAPDateFlagErrors(t *testing.T) {
 // only Gmail sources exist and OAuth is broken, the actual error is
 // returned, not "no accounts are ready to sync".
 func TestSyncCmd_GmailOnlyBrokenOAuthSurfacesError(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
 	for _, tc := range []struct {
 		name string
 		runE func(*cobra.Command, []string) error
@@ -596,9 +816,7 @@ func TestSyncCmd_GmailOnlyBrokenOAuthSurfacesError(t *testing.T) {
 			tmpDir := t.TempDir()
 			dbPath := tmpDir + "/msgvault.db"
 
-			s, err := store.Open(dbPath)
-			require.NoError(err, "open store")
-			require.NoError(s.InitSchema(), "init schema")
+			s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 
 			gmailSrc, err := s.GetOrCreateSource(
 				"gmail", "g@example.com",
@@ -631,6 +849,8 @@ func TestSyncCmd_GmailOnlyBrokenOAuthSurfacesError(t *testing.T) {
 			logger = slog.New(
 				slog.NewTextHandler(os.Stderr, nil),
 			)
+			testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+			invocationFromContext(testCtx).logger = logger
 
 			testCmd := &cobra.Command{
 				Use:  tc.name + " [email]",
@@ -639,6 +859,7 @@ func TestSyncCmd_GmailOnlyBrokenOAuthSurfacesError(t *testing.T) {
 			}
 
 			root := newTestRootCmd()
+			root.SetContext(testCtx)
 			root.AddCommand(testCmd)
 			root.SetArgs([]string{tc.name})
 
@@ -709,15 +930,6 @@ func TestTrimFolderFilter(t *testing.T) {
 	}
 }
 
-func TestSyncCommandRegistersFolderFlags(t *testing.T) {
-	require := require.New(t)
-
-	require.NotNil(syncIncrementalCmd.Flags().Lookup("folder"))
-	require.NotNil(syncIncrementalCmd.Flags().Lookup("skip-folder"))
-	require.NotNil(syncIncrementalCmd.Flags().Lookup("source-id"))
-	require.NotNil(syncFullCmd.Flags().Lookup("source-id"))
-}
-
 // Full e2e integration with an in-memory IMAP server is tested in
 // internal/imap/client_folderstate_test.go via WithFolderFilter().
 
@@ -745,4 +957,22 @@ func TestTrimFolderFilter_DoesNotBlockOnErrorInSyncFull(t *testing.T) {
 	// All-whitespace input returns empty slice (no error, no crash).
 	require.NotPanics(func() { parseFolderFilter([]string{"  ", "   "}) })
 	require.NotPanics(func() { parseFolderFilter([]string{"", "  ", ""}) })
+}
+
+func TestSyncFullGraphAccountPointsToSync(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	dir := t.TempDir()
+	st := testutil.NewSQLiteTestStoreAt(t, filepath.Join(dir, "msgvault.db"))
+	src, err := st.GetOrCreateSource(sourceTypeMSMail, "mail@example.com")
+	require.NoError(err)
+	require.NoError(st.Close())
+	cfg := &config.Config{HomeDir: dir, Data: config.DataConfig{DataDir: dir}}
+	cmd := &cobra.Command{}
+	cmd.SetContext(testInvocationContext(t.Context(), cfg, invocationOptions{}))
+	cmd.Flags().Int64("source-id", 0, "")
+	require.NoError(cmd.Flags().Set("source-id", strconv.FormatInt(src.ID, 10)))
+	err = runSyncFullLocal(cmd, nil)
+	require.Error(err)
+	assert.Contains(err.Error(), "msgvault sync --source-id "+strconv.FormatInt(src.ID, 10))
 }

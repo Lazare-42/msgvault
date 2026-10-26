@@ -11,7 +11,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
@@ -22,117 +24,51 @@ import (
 	"go.kenn.io/msgvault/internal/contentverify"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/store"
 	apiclient "go.kenn.io/msgvault/pkg/client"
 	"go.kenn.io/msgvault/pkg/client/generated"
 )
 
-func TestNew_RejectsHTTPWithoutAllowInsecure(t *testing.T) {
-	_, err := New(Config{
-		URL:    "http://nas:8080",
-		APIKey: "key",
-	})
-	require.Error(t, err, "New() should reject http:// without AllowInsecure")
-}
-
-func TestNew_AllowsHTTPWithAllowInsecure(t *testing.T) {
-	s, err := New(Config{
-		URL:           "http://nas:8080",
-		APIKey:        "key",
-		AllowInsecure: true,
-	})
-	require.NoError(t, err, "New()")
-	require.NotNil(t, s, "New() returned nil store")
-}
-
-func TestNew_AllowsHTTPS(t *testing.T) {
-	s, err := New(Config{
-		URL:    "https://nas:8080",
-		APIKey: "key",
-	})
-	require.NoError(t, err, "New()")
-	require.NotNil(t, s, "New() returned nil store")
-}
-
-func TestNew_RejectsEmptyURL(t *testing.T) {
-	_, err := New(Config{APIKey: "key"})
-	require.Error(t, err, "New() should reject empty URL")
-}
-
-func TestNew_RejectsInvalidScheme(t *testing.T) {
-	_, err := New(Config{
-		URL:    "ftp://nas:8080",
-		APIKey: "key",
-	})
-	require.Error(t, err, "New() should reject ftp:// scheme")
-	assert.ErrorContains(t, err, "http or https")
-}
-
-func TestNew_RejectsEmptyHost(t *testing.T) {
-	_, err := New(Config{
-		URL:           "http://",
-		APIKey:        "key",
-		AllowInsecure: true,
-	})
-	require.Error(t, err, "New() should reject URL with empty host")
-	assert.ErrorContains(t, err, "must include a host")
-}
-
-func TestNew_TrimsTrailingSlash(t *testing.T) {
-	s, err := New(Config{
-		URL:           "http://nas:8080/",
-		APIKey:        "key",
-		AllowInsecure: true,
-	})
-	require.NoError(t, err, "New()")
-	assert.Equal(t, "http://nas:8080", s.BaseURL(), "baseURL should have trailing slash trimmed")
-}
-
-func TestNew_DefaultTimeout(t *testing.T) {
-	s, err := New(Config{
-		URL:    "https://nas:8080",
-		APIKey: "key",
-	})
-	require.NoError(t, err, "New()")
-	assert.Equal(t, 30*time.Second, s.Timeout(), "httpClient.Timeout should have a 30-second default")
-}
-
 func TestRunCLISyncStreamsWithoutAbsoluteClientTimeout(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
+	synctest.Test(t, func(t *testing.T) {
+		assert := assert.New(t)
+		require := require.New(t)
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(http.MethodPost, r.Method, "method")
-		assert.Equal("/api/v1/cli/sync-full", r.URL.Path, "path")
-		assert.Equal(apiprotocol.ClientClassCLI, r.Header.Get(apiprotocol.ClientClassHeader), "client class")
+		srv := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(http.MethodPost, r.Method, "method")
+			assert.Equal("/api/v1/cli/sync-full", r.URL.Path, "path")
+			assert.Equal(apiprotocol.ClientClassCLI, r.Header.Get(apiprotocol.ClientClassHeader), "client class")
 
-		w.Header().Set("Content-Type", "application/x-ndjson")
-		_, _ = w.Write([]byte(`{"type":"stdout","data":"begin\n"}` + "\n"))
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		}
-		time.Sleep(50 * time.Millisecond)
-		_, _ = w.Write([]byte(`{"type":"complete"}` + "\n"))
-	}))
-	t.Cleanup(srv.Close)
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			_, _ = w.Write([]byte(`{"type":"stdout","data":"begin\n"}` + "\n"))
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			time.Sleep(50 * time.Millisecond)
+			_, _ = w.Write([]byte(`{"type":"complete"}` + "\n"))
+		}))
+		httpClient := srv.Client()
 
-	st, err := New(Config{
-		URL:           srv.URL,
-		AllowInsecure: true,
-		Timeout:       10 * time.Millisecond,
-		HTTPClient:    srv.Client(),
-		RequestMode:   RequestModeCLI,
+		st, err := New(Config{
+			URL:           "http://127.0.0.1",
+			AllowInsecure: true,
+			Timeout:       10 * time.Millisecond,
+			HTTPClient:    httpClient,
+			RequestMode:   RequestModeCLI,
+		})
+		require.NoError(err, "New")
+		st.httpClient.Timeout = 10 * time.Millisecond
+
+		var output strings.Builder
+		err = st.RunCLISync(context.Background(), CLISyncRequest{Full: true}, func(stream, data string) error {
+			assert.Equal("stdout", stream, "stream")
+			_, _ = output.WriteString(data)
+			return nil
+		})
+		require.NoError(err, "streaming CLI sync should not use http.Client.Timeout as an absolute body-read timeout")
+		assert.Equal("begin\n", output.String(), "streamed output")
 	})
-	require.NoError(err, "New")
-
-	var output strings.Builder
-	err = st.RunCLISync(context.Background(), CLISyncRequest{Full: true}, func(stream, data string) error {
-		assert.Equal("stdout", stream, "stream")
-		_, _ = output.WriteString(data)
-		return nil
-	})
-	require.NoError(err, "streaming CLI sync should not use http.Client.Timeout as an absolute body-read timeout")
-	assert.Equal("begin\n", output.String(), "streamed output")
 }
 
 func TestLegacyAdapterUsesClientRootContext(t *testing.T) {
@@ -172,14 +108,11 @@ func TestLegacyAdapterUsesClientRootContext(t *testing.T) {
 	}
 	cancel()
 
-	require.Eventually(func() bool {
-		select {
-		case <-requestCanceled:
-			return true
-		default:
-			return false
-		}
-	}, 2*time.Second, 10*time.Millisecond, "root cancellation reaches HTTP request")
+	select {
+	case <-requestCanceled:
+	case <-time.After(2 * time.Second):
+		require.FailNow("root cancellation reaches HTTP request")
+	}
 	require.Error(<-done, "canceled compatibility request")
 }
 
@@ -250,6 +183,71 @@ func TestRunCLISyncRejectsOldDaemonBeforeStartingSourceScopedSync(t *testing.T) 
 	}, func(string, string) error { return nil })
 	require.ErrorContains(t, err, "requires daemon API schema 2.4.0")
 	assert.Zero(t, syncCalls, "source-scoped sync must not start on an older daemon")
+}
+
+func TestRunCLISyncCacheFlagsRequireCompatibleDaemon(t *testing.T) {
+	for _, mode := range []struct {
+		name string
+		full bool
+	}{
+		{name: "sync"},
+		{name: "sync-full", full: true},
+	} {
+		for _, test := range []struct {
+			name        string
+			version     string
+			build       bool
+			skip        bool
+			healthError bool
+			wantError   string
+		}{
+			{name: "default on older daemon", version: "2.30.0"},
+			{name: "build on older daemon", version: "2.30.0", build: true, wantError: "upgrade the daemon"},
+			{name: "skip on older daemon", version: "2.30.0", skip: true, wantError: "upgrade the daemon"},
+			{name: "build on supported daemon", version: "2.31.0", build: true},
+			{name: "skip on supported daemon", version: "2.31.0", skip: true},
+			{name: "health unavailable", build: true, healthError: true, wantError: "check daemon sync cache flags capability"},
+		} {
+			t.Run(mode.name+"/"+test.name, func(t *testing.T) {
+				assertions := assert.New(t)
+				requirements := require.New(t)
+				var syncCalls, healthCalls atomic.Int32
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.URL.Path == "/api/v1/health" {
+						healthCalls.Add(1)
+						if test.healthError {
+							http.Error(w, "health unavailable", http.StatusBadGateway)
+							return
+						}
+						writeJSONResponse(t, w, map[string]any{"status": "ok", "api_schema_version": test.version})
+						return
+					}
+					syncCalls.Add(1)
+					assertions.Equal("/api/v1/cli/"+mode.name, r.URL.Path)
+					assertions.Equal(http.MethodPost, r.Method)
+					assertions.Equal(test.build, r.URL.Query().Get("build-cache") == "true")
+					assertions.Equal(test.skip, r.URL.Query().Get("no-build-cache") == "true")
+					w.Header().Set("Content-Type", "application/x-ndjson")
+					_, _ = w.Write([]byte("{\"type\":\"complete\"}\n"))
+				}))
+				t.Cleanup(srv.Close)
+				st := newTestStore(srv, "")
+				err := st.RunCLISync(t.Context(), CLISyncRequest{
+					Full: mode.full, BuildCache: test.build, NoBuildCache: test.skip,
+				}, nil)
+				if test.wantError != "" {
+					requirements.ErrorContains(err, test.wantError)
+					assertions.Zero(syncCalls.Load(), "unsupported flags must fail before sync starts")
+				} else {
+					requirements.NoError(err)
+					assertions.Equal(int32(1), syncCalls.Load())
+				}
+				if !test.build && !test.skip {
+					assertions.Zero(healthCalls.Load(), "default sync needs no cache flag capability check")
+				}
+			})
+		}
+	}
 }
 
 func TestRunCLICommandStreamsOutput(t *testing.T) {
@@ -491,6 +489,7 @@ func TestPlanCLIDeleteStagedUsesGeneratedClientAdapter(t *testing.T) {
 			"scope_escalation_body_lines":  []string{"Batch deletion requires elevated Gmail permissions."},
 			"scope_escalation_cancel_hint": "Cancelled.",
 			"scope_escalation_account":     "alice@example.com",
+			"scope_escalation_source_type": "gmail",
 			"scope_escalation_oauth_app":   "acme",
 			"remote_delete_env_var":        "MSGVAULT_ENABLE_REMOTE_DELETE",
 		}), "encode response") {
@@ -518,6 +517,7 @@ func TestPlanCLIDeleteStagedUsesGeneratedClientAdapter(t *testing.T) {
 	assert.Equal("permanent", got.ConfirmationMode, "confirmation mode")
 	assert.Equal([]string{"batch-123"}, got.PlannedBatchIDs, "planned batch ids")
 	assert.Equal("fp-client", got.PlanFingerprint, "plan fingerprint")
+	assert.Equal("gmail", got.ScopeEscalationSourceType, "authorization provider")
 	assert.True(got.NeedsScopeEscalation, "needs scope escalation")
 	assert.Equal("PERMISSION UPGRADE REQUIRED", got.ScopeEscalationHeadline, "scope headline")
 	assert.Equal([]string{"Batch deletion requires elevated Gmail permissions."}, got.ScopeEscalationBodyLines, "scope body")
@@ -534,10 +534,12 @@ func TestCreateCLIDeletionManifestUsesGeneratedClientAdapter(t *testing.T) {
 		ID: 42, Type: "gmail", Identifier: "account@example.invalid",
 	})
 	manifest.CreatedBy = "tui"
+	manifest.Filters.ListIDs = []string{"announce.example.org"}
+	manifest.RawFilter = json.RawMessage(`{"scope":"all_matches","search_query":"invoice","match_filter":{"attachments_only":true}}`)
 
 	s := newGeneratedClientAdapterStore(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/v1/health" {
-			writeJSONResponse(t, w, map[string]any{"status": "ok", "api_schema_version": "2.4.0"})
+			writeJSONResponse(t, w, map[string]any{"status": "ok", "api_schema_version": "2.14.0"})
 			return
 		}
 		assert.Equal(http.MethodPost, r.Method, "method")
@@ -550,6 +552,8 @@ func TestCreateCLIDeletionManifestUsesGeneratedClientAdapter(t *testing.T) {
 		assert.Equal(manifest.ID, body.ID, "manifest id")
 		assert.Equal("tui", body.CreatedBy, "created by")
 		assert.Equal([]string{"gid1", "gid2"}, body.GmailIDs, "gmail ids")
+		assert.Equal([]string{"announce.example.org"}, body.Filters.ListIDs, "list ids")
+		assert.JSONEq(string(manifest.RawFilter), string(body.RawFilter), "raw filter")
 		if !assert.NotNil(body.Source) {
 			http.Error(w, "missing source", http.StatusBadRequest)
 			return
@@ -596,9 +600,17 @@ func TestPlanCLIDeduplicateUsesGeneratedClientAdapter(t *testing.T) {
 	require := require.New(t)
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			assert.Equal(http.MethodGet, r.Method, "health method")
+			writeJSONResponse(t, w, map[string]any{
+				"status": "ok", "api_schema_version": "2.13.0",
+			})
+			return
+		}
 		assert.Equal(http.MethodPost, r.Method, "method")
 		assert.Equal("/api/v1/cli/deduplicate/plan", r.URL.Path, "path")
 		var body struct {
+			PlanProtocol               string `json:"plan_protocol"`
 			Account                    string `json:"account"`
 			Collection                 string `json:"collection"`
 			Prefer                     string `json:"prefer"`
@@ -610,6 +622,7 @@ func TestPlanCLIDeduplicateUsesGeneratedClientAdapter(t *testing.T) {
 			return
 		}
 		assert.Equal("alice@example.com", body.Account, "account")
+		assert.Equal(apiprotocol.DeduplicatePlanProtocol, body.PlanProtocol, "plan protocol")
 		assert.Empty(body.Collection, "collection")
 		assert.Equal("gmail,mbox", body.Prefer, "prefer")
 		assert.True(body.ContentHash, "content hash")
@@ -620,14 +633,14 @@ func TestPlanCLIDeduplicateUsesGeneratedClientAdapter(t *testing.T) {
 			"prefix_stdout": "Deduping across collection\n",
 			"items": []map[string]any{
 				{
-					"source_id":           42,
-					"scope_label":         "alice@example.com",
-					"scope_is_collection": false,
-					"stdout":              "Duplicate groups found: 1\n",
-					"duplicate_messages":  2,
-					"backfilled_count":    3,
-					"plan_fingerprint":    "fp-client",
-					"needs_confirmation":  true,
+					"source_id":              42,
+					"scope_label":            "alice@example.com",
+					"scope_is_collection":    false,
+					"stdout":                 "Duplicate groups found: 1\n",
+					"duplicate_messages":     2,
+					"pending_backfill_count": 3,
+					"plan_fingerprint":       "fp-client",
+					"needs_confirmation":     true,
 				},
 			},
 			"footer_stdout": "No duplicates found in any source.\n",
@@ -656,9 +669,28 @@ func TestPlanCLIDeduplicateUsesGeneratedClientAdapter(t *testing.T) {
 	assert.Equal("alice@example.com", got.Items[0].ScopeLabel, "scope label")
 	assert.Equal("Duplicate groups found: 1\n", got.Items[0].Stdout, "stdout")
 	assert.Equal(2, got.Items[0].DuplicateMessages, "duplicate messages")
-	assert.Equal(int64(3), got.Items[0].BackfilledCount, "backfilled count")
+	assert.Equal(int64(3), got.Items[0].PendingBackfillCount, "pending backfill count")
 	assert.Equal("fp-client", got.Items[0].PlanFingerprint, "fingerprint")
 	assert.True(got.Items[0].NeedsConfirmation, "needs confirmation")
+}
+
+func TestPlanCLIDeduplicateRejectsOldDaemonBeforeSubmittingPlan(t *testing.T) {
+	planPosts := 0
+	s := newGeneratedClientAdapterStore(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			writeJSONResponse(t, w, map[string]any{
+				"status": "ok", "api_schema_version": "2.12.0",
+			})
+			return
+		}
+		planPosts++
+		writeJSONResponse(t, w, map[string]any{"items": []any{}})
+	})
+
+	_, err := s.PlanCLIDeduplicate(context.Background(), CLIDeduplicatePlanRequest{})
+
+	require.ErrorContains(t, err, "deduplicate planning requires daemon API schema 2.13.0")
+	assert.Zero(t, planPosts, "plan must not be submitted to an older daemon")
 }
 
 // newTestStore creates a Client pointing at the given httptest server.
@@ -743,33 +775,6 @@ func writeJSONResponse(t *testing.T, w http.ResponseWriter, value any) {
 	require.NoError(t, json.NewEncoder(w).Encode(value), "encode JSON response")
 }
 
-func TestGeneratedClientUsesStoreTransportAndAuth(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(http.MethodPost, r.Method, "method")
-		assert.Equal("/api/v1/query", r.URL.Path, "path")
-		assert.Equal("secret-key", r.Header.Get("X-Api-Key"), "api key")
-		assert.Equal("application/json", r.Header.Get("Accept"), "accept")
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"columns":["n"],"rows":[[1]],"row_count":1}`))
-	}))
-	t.Cleanup(srv.Close)
-
-	s := newTestStore(srv, "secret-key")
-	c, err := s.GeneratedClient()
-	require.NoError(err, "generated client")
-
-	got, err := c.RunQuery(context.Background(), &generated.RunQueryRequestOptions{
-		Body: &generated.RunQueryBody{SQL: "SELECT 1"},
-	})
-
-	require.NoError(err, "RunQuery")
-	assert.Equal([]string{"n"}, got.Columns, "columns")
-	require.Len(got.Rows, 1, "rows")
-	assert.InDelta(float64(1), got.Rows[0][0], 0, "scalar cell")
-}
-
 func TestGeneratedCLIResponseErrorRejectsMissingJSON200Payload(t *testing.T) {
 	err := CLIResponseError(&generated.CreateCLICollectionResp{
 		StatusCode: http.StatusOK,
@@ -811,21 +816,6 @@ func TestCreateCLICollectionRejectsEmptyGeneratedOKBody(t *testing.T) {
 
 	require.Error(err, "empty 200 mutation body must fail")
 	assert.NotContains(err.Error(), "API error (200)", "empty success decode failures are not API errors")
-}
-
-func TestHandleErrorResponse_JSONBody(t *testing.T) {
-	body := `{"error":"not_found","message":"Message 42 not found"}`
-	resp := &http.Response{
-		StatusCode: http.StatusNotFound,
-		Body:       http.NoBody,
-	}
-	// Use a real body
-	resp.Body = readCloser(body)
-
-	err := HandleErrorResponse(resp)
-	require.Error(t, err, "HandleErrorResponse should return error")
-	require.ErrorContains(t, err, "404", "error should contain status code")
-	assert.ErrorContains(t, err, "Message 42 not found", "error should contain API message")
 }
 
 func TestHandleErrorResponse_PlainTextBody(t *testing.T) {
@@ -942,29 +932,6 @@ func TestGetStats_ErrorResponse(t *testing.T) {
 	assert.ErrorContains(t, err, "database locked")
 }
 
-func TestGetStats_Success(t *testing.T) {
-	assert := assert.New(t)
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(generated.StatsResponse{
-			TotalMessages:     100,
-			TotalThreads:      50,
-			TotalAccounts:     2,
-			TotalLabels:       10,
-			TotalAttachments:  5,
-			DatabaseSizeBytes: 1024,
-		})
-	}))
-	defer srv.Close()
-
-	s := newTestStore(srv, "key")
-	stats, err := s.GetStats()
-	require.NoError(t, err, "GetStats error")
-	assert.Equal(int64(100), stats.MessageCount, "MessageCount")
-	assert.Equal(int64(50), stats.ThreadCount, "ThreadCount")
-	assert.Equal(int64(2), stats.SourceCount, "SourceCount")
-}
-
 func TestGetStatsUsesGeneratedClientAdapter(t *testing.T) {
 	assert := assert.New(t)
 
@@ -976,7 +943,7 @@ func TestGetStatsUsesGeneratedClientAdapter(t *testing.T) {
 			TotalAccounts:     2,
 			TotalLabels:       10,
 			TotalAttachments:  5,
-			DatabaseSizeBytes: 1024,
+			DatabaseSizeBytes: int64Ptr(1024),
 		})
 	})
 
@@ -988,71 +955,6 @@ func TestGetStatsUsesGeneratedClientAdapter(t *testing.T) {
 	assert.Equal(int64(10), stats.LabelCount, "LabelCount")
 	assert.Equal(int64(5), stats.AttachmentCount, "AttachmentCount")
 	assert.Equal(int64(1024), stats.DatabaseSize, "DatabaseSize")
-}
-
-func TestVectorSearchAvailable(t *testing.T) {
-	tests := []struct {
-		name string
-		body string
-		want bool
-	}{
-		{
-			name: "status initializing is capable",
-			body: `{"vector_status":"initializing"}`,
-			want: true,
-		},
-		{
-			name: "status ready is capable",
-			body: `{"vector_status":"ready","vector_search":{"enabled":true}}`,
-			want: true,
-		},
-		{
-			name: "status stale is capable",
-			body: `{"vector_status":"stale"}`,
-			want: true,
-		},
-		{
-			name: "status error is capable",
-			body: `{"vector_status":"error"}`,
-			want: true,
-		},
-		{
-			name: "status disabled is not capable",
-			body: `{"vector_status":"disabled"}`,
-			want: false,
-		},
-		{
-			name: "old daemon without status falls back to enabled flag",
-			body: `{"vector_search":{"enabled":true}}`,
-			want: true,
-		},
-		{
-			name: "old daemon without status and disabled flag is not capable",
-			body: `{"vector_search":{"enabled":false}}`,
-			want: false,
-		},
-		{
-			name: "old daemon without vector fields is not capable",
-			body: `{}`,
-			want: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				assert.Equal(t, "/api/v1/stats", r.URL.Path, "path")
-				w.Header().Set("Content-Type", "application/json")
-				_, _ = w.Write([]byte(tt.body))
-			}))
-			defer srv.Close()
-
-			s := newTestStore(srv, "key")
-			got, err := s.VectorSearchAvailable(context.Background())
-			require.NoError(t, err, "VectorSearchAvailable")
-			assert.Equal(t, tt.want, got, "capable")
-		})
-	}
 }
 
 func TestGetCLIStats_Success(t *testing.T) {
@@ -1182,10 +1084,39 @@ func TestGetCLISearch_DeletionScopeRequiresCompatibleDaemon(t *testing.T) {
 	}
 }
 
+func TestGetCLISearchRejectsListIDAgainstOlderDaemonBeforeRequest(t *testing.T) {
+	var searchRequests int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			writeJSONResponse(t, w, map[string]any{
+				"status":             "ok",
+				"api_schema_version": "2.13.0",
+			})
+			return
+		}
+		searchRequests++
+		http.Error(w, "unexpected search request", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	_, err := newTestStore(srv, "").GetCLISearch(t.Context(), CLISearchRequest{
+		Query: "needle list:dev@example.test",
+	})
+	require.ErrorContains(t, err, "List-ID filter requires daemon API schema 2.14.0 or newer")
+	assert.Zero(t, searchRequests, "List-ID CLI search must not reach an older daemon")
+}
+
 func TestGetCLIHybridSearch_Success(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			writeJSONResponse(t, w, map[string]any{
+				"status":             "ok",
+				"api_schema_version": "2.14.0",
+			})
+			return
+		}
 		assert.Equal("/api/v1/search", r.URL.Path, "path")
 		assert.Equal("lunch", r.URL.Query().Get("q"), "query")
 		assert.Equal("vector", r.URL.Query().Get("mode"), "mode query")
@@ -1200,6 +1131,7 @@ func TestGetCLIHybridSearch_Success(t *testing.T) {
 		assert.Equal("bob@example.com", r.URL.Query().Get("recipient"), "recipient query")
 		assert.Equal("example.com", r.URL.Query().Get("domain"), "domain query")
 		assert.Equal("Work", r.URL.Query().Get("label"), "label query")
+		assert.Equal("<dev@example.test>", r.URL.Query().Get("list_id"), "list_id query")
 		assert.Equal("2025-02", r.URL.Query().Get("time_period"), "time_period query")
 		assert.Equal("month", r.URL.Query().Get("time_granularity"), "time_granularity query")
 		assert.Equal("77", r.URL.Query().Get("source_id"), "source_id query")
@@ -1272,6 +1204,7 @@ func TestGetCLIHybridSearch_Success(t *testing.T) {
 				Recipient:           "bob@example.com",
 				Domain:              "example.com",
 				Label:               "Work",
+				ListID:              "<dev@example.test>",
 				TimeRange:           query.TimeRange{Period: "2025-02", Granularity: query.TimeMonth},
 				SourceID:            &sourceID,
 				WithAttachmentsOnly: true,
@@ -1368,6 +1301,29 @@ func TestGetCLIHybridSearchUsesGeneratedClientAdapter(t *testing.T) {
 	assert.Equal("alice@example.com", resp.Results[0].FromEmail, "result FromEmail")
 }
 
+func TestGetCLIHybridSearchRejectsListIDAgainstOlderDaemonBeforeRequest(t *testing.T) {
+	var searchRequests int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			writeJSONResponse(t, w, map[string]any{
+				"status":             "ok",
+				"api_schema_version": "2.13.0",
+			})
+			return
+		}
+		searchRequests++
+		http.Error(w, "unexpected search request", http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	_, err := newTestStore(srv, "").GetCLIHybridSearch(t.Context(), CLIHybridSearchRequest{
+		Query: "needle list:dev@example.test",
+		Mode:  "hybrid",
+	})
+	require.ErrorContains(t, err, "List-ID filter requires daemon API schema 2.14.0 or newer")
+	assert.Zero(t, searchRequests, "List-ID hybrid search must not reach an older daemon")
+}
+
 func TestGetCLIAccounts_Success(t *testing.T) {
 	require :=
 		require.
@@ -1376,6 +1332,7 @@ func TestGetCLIAccounts_Success(t *testing.T) {
 	assert := assert.New(t)
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal("/api/v1/cli/accounts", r.URL.Path, "path")
+		assert.Equal("true", r.Header.Get(apiprotocol.AllowPendingCountsHeader))
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"accounts": [{
@@ -1383,6 +1340,7 @@ func TestGetCLIAccounts_Success(t *testing.T) {
 				"email": "alice@example.com",
 				"type": "gmail",
 				"display_name": "Alice",
+				"alias": "archive",
 				"message_count": 1234,
 				"last_sync": "2024-01-02T03:04:05Z"
 			}, {
@@ -1398,7 +1356,7 @@ func TestGetCLIAccounts_Success(t *testing.T) {
 	defer srv.Close()
 
 	s := newTestStore(srv, "key")
-	accounts, err := s.GetCLIAccounts(context.Background())
+	accounts, _, err := s.GetCLIAccounts(context.Background())
 	require.NoError(
 		err, "GetCLIAccounts")
 
@@ -1407,13 +1365,14 @@ func TestGetCLIAccounts_Success(t *testing.T) {
 	assert.Equal("alice@example.com", accounts[0].Email, "Email")
 	assert.Equal("gmail", accounts[0].Type, "Type")
 	assert.Equal("Alice", accounts[0].DisplayName, "DisplayName")
+	assert.Equal("archive", accounts[0].Alias, "Alias")
 	assert.Equal(int64(1234), accounts[0].MessageCount, "MessageCount")
 	require.NotNil(accounts[0].LastSync, "LastSync")
 	assert.Equal("2024-01-02T03:04:05Z", accounts[0].LastSync.UTC().Format(time.RFC3339), "LastSync")
 	assert.Empty(accounts[0].SyncConfig, "gmail SyncConfig empty")
 
 	assert.Equal("imap", accounts[1].Type, "imap Type")
-	assert.Equal(`{"host":"imap.example.com","port":993}`, accounts[1].SyncConfig, "imap SyncConfig")
+	assert.JSONEq(`{"host":"imap.example.com","port":993}`, accounts[1].SyncConfig, "imap SyncConfig")
 }
 
 func TestCLICollectionMutations(t *testing.T) {
@@ -1578,6 +1537,180 @@ func TestRunCLIRepairEncodingStreamsOutput(t *testing.T) {
 	assert.Equal([]string{"stdout:Scanning messages\n", "stderr:repair warning\n"}, output, "output")
 }
 
+func TestRunCLIRepairMessageUsesGeneratedRequestAndStreamsOutput(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+
+	var paths []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/api/v1/health":
+			writeJSONResponse(t, w, map[string]any{
+				"status": "ok", "api_schema_version": "2.15.0",
+			})
+		case "/api/v1/cli/repair-message":
+			assertions.Equal(http.MethodPost, r.Method)
+			assertions.Empty(r.URL.RawQuery, "repair request is encoded in the generated JSON body")
+			var body generated.CLIRepairMessageRequest
+			if !assertions.NoError(json.NewDecoder(r.Body).Decode(&body)) {
+				return
+			}
+			if !assertions.NotNil(body.Reference) {
+				return
+			}
+			assertions.Equal("gmail-42", *body.Reference)
+			if !assertions.NotNil(body.SourceID) {
+				return
+			}
+			assertions.Equal(int64(7), *body.SourceID)
+			assertions.Nil(body.Audit)
+			assertions.Nil(body.JSON)
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			_, _ = w.Write([]byte(`{"type":"stdout","data":"repaired\n"}` + "\n"))
+			_, _ = w.Write([]byte(`{"type":"stderr","data":"repair warning\n"}` + "\n"))
+			_, _ = w.Write([]byte(`{"type":"complete"}` + "\n"))
+		default:
+			http.Error(w, "unexpected endpoint", http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	s := newTestStore(srv, "secret")
+	reference := "gmail-42"
+	sourceID := int64(7)
+	var output []string
+	err := s.RunCLIRepairMessage(context.Background(), generated.CLIRepairMessageRequest{
+		Reference: &reference,
+		SourceID:  &sourceID,
+	}, func(stream, data string) error {
+		output = append(output, stream+":"+data)
+		return nil
+	})
+
+	requirements.NoError(err)
+	assertions.Equal([]string{"/api/v1/health", "/api/v1/cli/repair-message"}, paths)
+	assertions.Equal([]string{"stdout:repaired\n", "stderr:repair warning\n"}, output)
+}
+
+func TestRunCLIRepairMessageWithPreflightChecksCapabilityBeforePreflightAndRequest(t *testing.T) {
+	assert := assert.New(t)
+	var sequence atomic.Int32
+	var capabilityStep atomic.Int32
+	var repairStep atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/health":
+			capabilityStep.Store(sequence.Add(1))
+			writeJSONResponse(t, w, map[string]any{
+				"status": "ok", "api_schema_version": "2.15.0",
+			})
+		case "/api/v1/cli/repair-message":
+			repairStep.Store(sequence.Add(1))
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			_, _ = w.Write([]byte(`{"type":"complete"}` + "\n"))
+		default:
+			http.Error(w, "unexpected endpoint", http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	s := newTestStore(srv, "secret")
+	reference := "gmail-42"
+	var preflightStep atomic.Int32
+	err := s.RunCLIRepairMessageWithPreflight(
+		context.Background(),
+		generated.CLIRepairMessageRequest{Reference: &reference},
+		func(context.Context) error {
+			preflightStep.Store(sequence.Add(1))
+			return nil
+		},
+		nil,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(int32(1), capabilityStep.Load())
+	assert.Equal(int32(2), preflightStep.Load())
+	assert.Equal(int32(3), repairStep.Load())
+}
+
+func TestRunCLIRepairMessageFailsClosedWithoutCompatibleSchema(t *testing.T) {
+	tests := []struct {
+		name          string
+		healthPayload string
+		wantVersion   string
+	}{
+		{name: "missing version", healthPayload: `{"status":"ok"}`, wantVersion: `daemon reports ""`},
+		{name: "malformed version", healthPayload: `{"status":"ok","api_schema_version":"2.13"}`, wantVersion: `daemon reports "2.13"`},
+		{name: "older version", healthPayload: `{"status":"ok","api_schema_version":"2.13.0"}`, wantVersion: `daemon reports "2.13.0"`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var nonHealthRequests atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/v1/health" {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(test.healthPayload))
+					return
+				}
+				nonHealthRequests.Add(1)
+				w.Header().Set("Content-Type", "application/x-ndjson")
+				_, _ = w.Write([]byte(`{"type":"complete"}` + "\n"))
+			}))
+			t.Cleanup(srv.Close)
+
+			s := newTestStore(srv, "")
+			reference := "gmail-42"
+			err := s.RunCLIRepairMessage(context.Background(), generated.CLIRepairMessageRequest{
+				Reference: &reference,
+			}, nil)
+
+			require.ErrorContains(t, err, "requires daemon API schema 2.15.0")
+			require.ErrorContains(t, err, test.wantVersion)
+			assert.Zero(t, nonHealthRequests.Load(), "incompatible daemon must receive neither repair nor sync requests")
+		})
+	}
+}
+
+func TestRunCLIRepairMessagePropagatesCancellation(t *testing.T) {
+	repairStarted := make(chan struct{})
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			writeJSONResponse(t, w, map[string]any{
+				"status": "ok", "api_schema_version": "2.15.0",
+			})
+			return
+		}
+		assert.Equal(t, "/api/v1/cli/repair-message", r.URL.Path)
+		close(repairStarted)
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(func() {
+		close(release)
+		srv.Close()
+	})
+
+	s := newTestStore(srv, "")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	audit := true
+	go func() {
+		done <- s.RunCLIRepairMessage(ctx, generated.CLIRepairMessageRequest{Audit: &audit}, nil)
+	}()
+	select {
+	case <-repairStarted:
+	case <-time.After(2 * time.Second):
+		require.FailNow(t, "repair request did not start")
+	}
+	cancel()
+
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
 func TestRebuildCLIFTSUsesGeneratedClientAdapter(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -1660,6 +1793,7 @@ func TestGetCLIMessage_Success(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{
 			"id": 42,
+            "related_message_id": 43,
 			"source_message_id": "remote-42",
 			"conversation_id": 7,
 			"subject": "Test Subject",
@@ -1682,14 +1816,18 @@ func TestGetCLIMessage_Success(t *testing.T) {
 
 	require.NotNil(t, msg, "message")
 	assert.Equal(int64(42), msg.ID, "ID")
+	assert.Equal(new(int64(43)), msg.RelatedMessageID)
 	assert.Equal("remote-42", msg.SourceMessageID, "SourceMessageID")
+	assert.Empty(msg.RFC822MessageID, "older daemons may omit the RFC Message-ID")
 	assert.Equal("Test Subject", msg.Subject, "Subject")
 	assert.Equal("alice@example.com", msg.From[0].Email, "From")
 	assert.Equal("Hello over HTTP", msg.BodyText, "BodyText")
 }
 
 func TestGetCLIMessage_NotFound(t *testing.T) {
+	var requests atomic.Int32
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte(`{"error":"not_found","message":"Message not found"}`))
 	}))
@@ -1698,26 +1836,135 @@ func TestGetCLIMessage_NotFound(t *testing.T) {
 	s := newTestStore(srv, "key")
 	_, err := s.GetCLIMessage(context.Background(), "missing")
 	require.ErrorIs(t, err, store.ErrMessageNotFound, "GetCLIMessage(missing)")
+	assert.Equal(t, int32(1), requests.Load(), "a missing message must not be retried")
 }
 
-func TestGetCLIMessageRaw_Success(t *testing.T) {
-	assert := assert.New(t)
-	raw := []byte("From: alice@example.com\r\nSubject: Raw\r\n\r\nBody")
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal("/api/v1/cli/message/raw", r.URL.Path, "path")
-		assert.Equal("gmail-42", r.URL.Query().Get("id"), "id query")
-		w.Header().Set("Content-Type", "message/rfc822")
-		w.Header().Set("X-Msgvault-Source-Message-Id", "gmail-42")
-		_, _ = w.Write(raw)
-	}))
-	defer srv.Close()
+func TestGetCLIMessagePlainTextErrorBodies(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		status int
+		check  func(t *testing.T, err error)
+	}{
+		{
+			name:   "not found",
+			status: http.StatusNotFound,
+			check: func(t *testing.T, err error) {
+				t.Helper()
+				assert.ErrorIs(t, err, store.ErrMessageNotFound)
+			},
+		},
+		{
+			name:   "server error",
+			status: http.StatusInternalServerError,
+			check: func(t *testing.T, err error) {
+				t.Helper()
+				apiErr, ok := errors.AsType[*APIError](err)
+				require.True(t, ok, "want *APIError, got %v", err)
+				assert.Equal(t, http.StatusInternalServerError, apiErr.Status)
+				assert.Equal(t, "upstream unavailable\n", apiErr.Message)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte("upstream unavailable\n"))
+			}))
+			defer srv.Close()
 
-	s := newTestStore(srv, "key")
-	got, sourceMessageID, err := s.GetCLIMessageRaw(context.Background(), "gmail-42")
-	require.NoError(t, err, "GetCLIMessageRaw")
+			s := newTestStore(srv, "key")
+			_, err := s.GetCLIMessage(context.Background(), "missing")
+			require.Error(t, err)
+			var decodeErr *runtime.ResponseDecodeError
+			assert.NotErrorAs(t, err, &decodeErr, "a plain-text error page is not a contract failure")
+			tc.check(t, err)
+		})
+	}
+}
 
-	assert.Equal(raw, got, "raw")
-	assert.Equal("gmail-42", sourceMessageID, "SourceMessageID")
+func TestGetCLIMessageRateLimitRetryAfter(t *testing.T) {
+	for _, dateHeader := range []bool{false, true} {
+		t.Run(fmt.Sprintf("date=%t", dateHeader), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				assert := assert.New(t)
+				require := require.New(t)
+				start := time.Now()
+				const refusals = 6 // Shared daemon traffic can consume several refill windows.
+				var requests atomic.Int32
+				srv := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					assert.Equal("/api/v1/cli/message", r.URL.Path)
+					assert.Equal("42", r.URL.Query().Get("id"))
+					w.Header().Set("Content-Type", "application/json")
+					if requests.Add(1) <= refusals {
+						retryAfter := "2"
+						if dateHeader {
+							retryAfter = time.Now().Add(2 * time.Second).UTC().Format(http.TimeFormat)
+						}
+						w.Header().Set("Retry-After", retryAfter)
+						w.WriteHeader(http.StatusTooManyRequests)
+						_, _ = w.Write([]byte(`{"error":"rate_limit_exceeded","message":"Try again later"}`))
+						return
+					}
+					_, _ = w.Write([]byte(`{"id":42,"conversation_id":7,"body_text":"Synthetic reply"}`))
+				}))
+				httpClient := srv.Client()
+				client, err := New(Config{URL: srv.URL, AllowInsecure: true, HTTPClient: httpClient})
+				require.NoError(err)
+
+				message, err := client.GetCLIMessage(t.Context(), "42")
+				require.NoError(err)
+				assert.Equal(int64(42), message.ID)
+				assert.Equal(int32(refusals+1), requests.Load())
+				assert.Equal(refusals*2*time.Second, time.Since(start))
+			})
+		})
+	}
+}
+
+func TestGetCLIMessageRateLimitWaitIsBounded(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		deadline time.Duration
+		elapsed  time.Duration
+		requests int32
+	}{
+		{"context cancellation", time.Second, time.Second, 1},
+		{"retry budget", 2 * time.Minute, time.Minute, 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				assert := assert.New(t)
+				require := require.New(t)
+				var requests atomic.Int32
+				srv := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					requests.Add(1)
+					w.Header().Set("Content-Type", "application/json")
+					w.Header().Set("Retry-After", "30")
+					w.WriteHeader(http.StatusTooManyRequests)
+					_, _ = w.Write([]byte(`{"error":"rate_limit_exceeded","message":"Try again later"}`))
+				}))
+				httpClient := srv.Client()
+				client, err := New(Config{URL: srv.URL, AllowInsecure: true, HTTPClient: httpClient})
+				require.NoError(err)
+				ctx, cancel := context.WithTimeout(t.Context(), tc.deadline)
+				defer cancel()
+				start := time.Now()
+
+				_, err = client.GetCLIMessage(ctx, "42")
+				if tc.deadline == time.Second {
+					require.ErrorIs(err, context.DeadlineExceeded)
+				} else {
+					var apiErr *APIError
+					require.ErrorAs(err, &apiErr)
+					assert.Equal(http.StatusTooManyRequests, apiErr.Status)
+					require.NoError(ctx.Err(), "the retry budget must expire before the caller's deadline")
+				}
+				assert.Equal(tc.elapsed, time.Since(start))
+				assert.Equal(tc.requests, requests.Load())
+			})
+		})
+	}
 }
 
 func TestGetCLIMessageRawUsesGeneratedClientAdapter(t *testing.T) {
@@ -1779,25 +2026,6 @@ func TestGetCLIMessageRaw_NotFoundPreservesGeneratedDecodeError(t *testing.T) {
 	assert.NotContains(t, err.Error(), "API error (404)", "decode failures are contract errors, not daemon API messages")
 }
 
-func TestGetCLIAttachment_Success(t *testing.T) {
-	assert := assert.New(t)
-	data := []byte("attachment bytes")
-	contentHash := fmt.Sprintf("%x", sha256.Sum256(data))
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal("/api/v1/cli/attachment", r.URL.Path, "path")
-		assert.Equal(contentHash, r.URL.Query().Get("content_hash"), "content_hash query")
-		w.Header().Set("Content-Type", "application/octet-stream")
-		_, _ = w.Write(data)
-	}))
-	defer srv.Close()
-
-	s := newTestStore(srv, "key")
-	got, err := s.GetCLIAttachment(context.Background(), contentHash)
-	require.NoError(t, err, "GetCLIAttachment")
-
-	assert.Equal(data, got, "data")
-}
-
 func TestGetCLIAttachmentUsesGeneratedClientAdapter(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -1813,29 +2041,6 @@ func TestGetCLIAttachmentUsesGeneratedClientAdapter(t *testing.T) {
 
 	got, err := s.GetCLIAttachment(context.Background(), contentHash)
 	require.NoError(err, "GetCLIAttachment")
-	assert.Equal(data, got, "data")
-}
-
-func TestOpenCLIAttachment_Success(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	data := []byte("attachment bytes")
-	contentHash := fmt.Sprintf("%x", sha256.Sum256(data))
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal("/api/v1/cli/attachment", r.URL.Path, "path")
-		assert.Equal(contentHash, r.URL.Query().Get("content_hash"), "content_hash query")
-		w.Header().Set("Content-Type", "application/octet-stream")
-		_, _ = w.Write(data)
-	}))
-	defer srv.Close()
-
-	s := newTestStore(srv, "key")
-	body, err := s.OpenCLIAttachment(context.Background(), contentHash)
-	require.NoError(err, "OpenCLIAttachment")
-	defer func() { _ = body.Close() }()
-
-	got, err := io.ReadAll(body)
-	require.NoError(err, "read stream")
 	assert.Equal(data, got, "data")
 }
 
@@ -1915,14 +2120,15 @@ func TestGetMessage_Success(t *testing.T) {
 		assert.Equal("/api/v1/messages/42", r.URL.Path, "path")
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(generated.MessageDetail{
-			ID:      42,
-			Subject: "Test Subject",
-			From:    "sender@example.com",
-			To:      []string{"receiver@example.com"},
-			SentAt:  "2024-01-15T10:30:00Z",
-			Snippet: "preview",
-			Labels:  []string{"INBOX"},
-			Body:    "Hello, world!",
+			ID:               42,
+			RelatedMessageID: new(int64(43)),
+			Subject:          "Test Subject",
+			From:             "sender@example.com",
+			To:               []string{"receiver@example.com"},
+			SentAt:           "2024-01-15T10:30:00Z",
+			Snippet:          "preview",
+			Labels:           []string{"INBOX"},
+			Body:             "Hello, world!",
 			Attachments: []generated.AttachmentInfo{
 				{Filename: "doc.pdf", MimeType: "application/pdf", SizeBytes: 1024},
 			},
@@ -1936,6 +2142,8 @@ func TestGetMessage_Success(t *testing.T) {
 	require.NotNil(msg, "GetMessage returned nil")
 	assert.Equal("Test Subject", msg.Subject, "Subject")
 	assert.Equal("Hello, world!", msg.Body, "Body")
+	assert.Equal(new(int64(43)), msg.RelatedMessageID)
+	assert.Equal(msg.RelatedMessageID, queryDetailFromAPIMessage(msg).RelatedMessageID)
 	require.Len(msg.Attachments, 1, "len(Attachments)")
 	assert.Equal("doc.pdf", msg.Attachments[0].Filename, "Attachments[0].Filename")
 }
@@ -2101,21 +2309,6 @@ func TestSearchMessages_ZeroLimit(t *testing.T) {
 	assert.Empty(msgs, "len(msgs)")
 }
 
-func TestSearchMessages_QueryEncoding(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		q := r.URL.Query().Get("q")
-		assert.Equal(t, "hello world", q, "q")
-		resp := generated.SearchResult{Query: "hello world", Total: 0, Page: 1, PageSize: 20}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
-	}))
-	defer srv.Close()
-
-	s := newTestStore(srv, "test")
-	_, _, err := s.SearchMessages("hello world", 0, 20)
-	require.NoError(t, err, "SearchMessages error")
-}
-
 func TestSearchMessagesUsesGeneratedClientAdapter(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -2194,28 +2387,6 @@ func TestListMessages_PageCalculation(t *testing.T) {
 	}
 }
 
-func TestListAccounts_Success(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal("/api/v1/accounts", r.URL.Path, "path")
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(generated.AccountListResponse{
-			Accounts: []generated.AccountInfo{
-				{Email: "user@gmail.com", Enabled: true, Schedule: stringPtr("0 2 * * *")},
-			},
-		})
-	}))
-	defer srv.Close()
-
-	s := newTestStore(srv, "key")
-	accounts, err := s.ListAccounts()
-	require.NoError(err, "ListAccounts error")
-	require.Len(accounts, 1, "len(accounts)")
-	assert.Equal("user@gmail.com", accounts[0].Email, "Email")
-}
-
 func TestListAccountsUsesGeneratedClientAdapter(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -2263,4 +2434,76 @@ type readCloserImpl struct {
 
 func (rc *readCloserImpl) Close() error {
 	return nil
+}
+
+func TestGetCLISearchRejectsFilenameOnOlderDaemon(t *testing.T) {
+	for _, version := range []string{"3.3.0", "3.4.0", "3.5.0", "3.7.0", "3.8.0", "3.9.0", "3.10.0", "3.11.0", "3.12.0", "3.13.0", "3.14.0"} {
+		t.Run(version, func(t *testing.T) {
+			require := require.New(t)
+			var searches atomic.Int64
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/api/v1/health" {
+					writeJSONResponse(t, w, map[string]any{"status": "ok", "api_schema_version": version})
+					return
+				}
+				searches.Add(1)
+				writeJSONResponse(t, w, map[string]any{"results": []any{}, "messages": []any{}})
+			}))
+			t.Cleanup(srv.Close)
+			client := newTestStore(srv, "")
+			check := func(err error) {
+				t.Helper()
+				if version == "3.14.0" {
+					require.NoError(err)
+				} else {
+					require.ErrorContains(err, "filename filter requires daemon API schema 3.14.0")
+				}
+			}
+			_, err := client.GetCLISearch(t.Context(), CLISearchRequest{Query: "filename:plan.pdf"})
+			check(err)
+			_, err = client.GetCLIHybridSearch(t.Context(), CLIHybridSearchRequest{Query: "intent filename:plan.pdf", Mode: "hybrid"})
+			check(err)
+			_, err = NewEngineAdapter(client).Search(t.Context(), search.Parse("filename:plan.pdf"), 1, 0)
+			check(err)
+			if version == "3.14.0" {
+				assert.Equal(t, int64(3), searches.Load())
+			} else {
+				assert.Zero(t, searches.Load())
+			}
+		})
+	}
+}
+
+func TestGetCLIHybridSearchAttachmentMetadataAvailability(t *testing.T) {
+	zero, three := int64(0), int64(3)
+	for _, tc := range []struct {
+		name  string
+		count *int64
+		names []string
+	}{
+		{name: "unavailable"},
+		{name: "known empty", count: &zero, names: []string{}},
+		{name: "partial names", count: &three, names: []string{"plan.pdf", "budget.csv"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			s := newGeneratedClientAdapterStore(t, func(w http.ResponseWriter, r *http.Request) {
+				item := map[string]any{"id": 42, "subject": "Plan", "from": "sender@example.com", "sent_at": "2026-01-01T00:00:00Z", "snippet": "preview", "has_attachments": true, "size_bytes": 12}
+				if tc.count != nil {
+					item["attachment_count"] = *tc.count
+				}
+				if tc.names != nil {
+					item["attachment_names"] = tc.names
+				}
+				writeJSONResponse(t, w, map[string]any{"query": "plan", "mode": "hybrid", "returned": 1, "took_ms": 0, "pool_saturated": false, "scope_source_count": 0, "generation": map[string]any{"id": 1, "model": "synthetic", "dimension": 4, "fingerprint": "synthetic:4", "state": "active"}, "results": []any{item}})
+			})
+			page, err := s.GetCLIHybridSearch(t.Context(), CLIHybridSearchRequest{Query: "plan", Mode: "hybrid"})
+			require.NoError(err)
+			require.Len(page.Results, 1)
+			assert.Equal(tc.count, page.Results[0].AttachmentCount)
+			assert.Equal(tc.names, page.Results[0].Message.AttachmentNames)
+			assert.True(page.Results[0].Message.HasAttachments)
+		})
+	}
 }

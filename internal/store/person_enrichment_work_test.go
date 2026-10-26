@@ -73,7 +73,7 @@ func (f *enrichmentWorkFixture) enqueue(t *testing.T) {
 func (f *enrichmentWorkFixture) claim(t *testing.T, runID int64, owner string) *personenrichment.WorkLease {
 	t.Helper()
 	lease, err := f.store.ClaimWork(t.Context(), personenrichment.ClaimOptions{
-		RunID: runID, Owner: owner, ProviderName: f.profile.Name,
+		RunID: runID, Owner: owner, ProviderName: f.profile.Name, ProfileFingerprint: f.profile.Fingerprint,
 		Now: f.now, LeaseDuration: 5 * time.Minute,
 	})
 	require.NoError(t, err)
@@ -291,7 +291,96 @@ func TestPersonEnrichmentProfileCleanupRejectsAuthorizedDispatch(t *testing.T) {
 	stored, err = f.store.GetPersonEnrichmentAttemptContext(t.Context(), attempt.ID)
 	requirements.NoError(err)
 	checks.Equal("terminal", stored.State)
-	checks.Empty(f.work(t))
+	requirements.Len(f.work(t), 1)
+
+	// Re-enable the same profile after cleanup canceled the unfinished lookup.
+	requirements.NoError(f.store.CancelPersonEnrichmentWorkOutsideProfilesContext(
+		t.Context(), []string{f.profile.Fingerprint}))
+	queued, err := f.store.EnqueueDuePersonEnrichmentContext(
+		t.Context(), f.now, 200, []string{f.profile.Fingerprint})
+	requirements.NoError(err)
+	requirements.Zero(queued)
+	resumed := f.claim(t, run.ID, "reenabled-worker")
+	checks.NotEqual(lease.Trigger.Generation, resumed.Trigger.Generation)
+	start := testAttemptStart(&f, run.ID, "e")
+	start.Trigger = resumed.Trigger
+	restarted, created, err := f.store.BeginAttempt(t.Context(), resumed.Token, start)
+	requirements.NoError(err)
+	requirements.True(created)
+	checks.NotEqual(attempt.ID, restarted.ID)
+	requirements.NoError(f.store.MarkTerminal(t.Context(), restarted.Token, personenrichment.SafeFailure{
+		Class: personenrichment.FailureInvalidOutput, Message: "invalid provider output",
+	}))
+	queued, err = f.store.EnqueueDuePersonEnrichmentContext(
+		t.Context(), f.now, 200, []string{f.profile.Fingerprint})
+	requirements.NoError(err)
+	checks.Zero(queued, "a later provider failure must stay terminal")
+}
+
+func TestPersonEnrichmentProfileCleanupPreservesNewWork(t *testing.T) {
+	for _, kind := range []personenrichment.TriggerKind{personenrichment.TriggerManual, personenrichment.TriggerIdentity} {
+		for _, active := range []bool{false, true} {
+			t.Run(string(kind)+"/active="+strconv.FormatBool(active), func(t *testing.T) {
+				require := require.New(t)
+				assert := assert.New(t)
+				f := newEnrichmentWorkFixture(t)
+				run := f.startRun(t, "before-disable")
+				f.enqueue(t)
+				lease := f.claim(t, run.ID, "before-disable-worker")
+				attempt, _, err := f.store.BeginAttempt(t.Context(), lease.Token, testAttemptStart(&f, run.ID, "a"))
+				require.NoError(err)
+				if !active {
+					require.NoError(f.store.MarkTerminal(t.Context(), attempt.Token, personenrichment.SafeFailure{
+						Class: personenrichment.FailureInvalidOutput, Message: "invalid provider output",
+					}))
+				}
+				trigger := personenrichment.Trigger{Kind: kind, Generation: "later-operation"}
+				require.NoError(f.store.EnqueuePersonEnrichmentContext(t.Context(), store.EnrichmentTriggerInput{
+					PersonID: f.person.ID, ProfileFingerprint: f.profile.Fingerprint,
+					Kind: trigger.Kind, Generation: trigger.Generation, DueAt: f.now.Add(time.Hour),
+				}))
+				queued := f.work(t)
+				require.Len(queued, 1)
+				require.NoError(f.store.CancelPersonEnrichmentWorkOutsideProfilesContext(t.Context(), nil))
+				require.NoError(f.store.CancelPersonEnrichmentWorkOutsideProfilesContext(t.Context(), nil))
+				preserved := f.work(t)
+				require.Len(preserved, 1, "cleanup must retain the new operation")
+				assert.Equal(queued[0].TriggerMask, preserved[0].TriggerMask)
+				assert.Equal(trigger.Generation, preserved[0].TriggerGeneration)
+				assert.True(queued[0].DueAt.Equal(preserved[0].DueAt))
+				assert.Nil(preserved[0].ActiveAttemptID)
+				assert.Nil(preserved[0].RunID)
+				assert.Nil(preserved[0].LeaseOwner)
+				require.NoError(f.store.CompleteRun(t.Context(), run.ID, personenrichment.RunCompletion{CompletedAt: f.now}))
+
+				require.NoError(f.store.CancelPersonEnrichmentWorkOutsideProfilesContext(t.Context(), []string{f.profile.Fingerprint}))
+				f.setNow(f.now.Add(time.Hour))
+				nextRun := f.startRun(t, "after-enable")
+				resumed := f.claim(t, nextRun.ID, "after-enable-worker")
+				assert.Equal(trigger, resumed.Trigger)
+				start := testAttemptStart(&f, nextRun.ID, "b")
+				start.Trigger = trigger
+				next, created, err := f.store.BeginAttempt(t.Context(), resumed.Token, start)
+				require.NoError(err)
+				require.True(created)
+				assert.NotEqual(attempt.ID, next.ID)
+				require.NoError(f.store.MarkTerminal(t.Context(), next.Token, personenrichment.SafeFailure{
+					Class: personenrichment.FailureInvalidOutput, Message: "invalid provider output",
+				}))
+				count, err := f.store.EnqueueDuePersonEnrichmentContext(t.Context(), f.now, 200, []string{f.profile.Fingerprint})
+				require.NoError(err)
+				assert.Zero(count)
+				assert.Empty(f.work(t), "failure of the new operation must stay stopped")
+				if !active {
+					original, err := f.store.GetPersonEnrichmentAttemptContext(t.Context(), attempt.ID)
+					require.NoError(err)
+					assert.Equal("terminal", original.State)
+					require.NotNil(original.FailureClass)
+					assert.Equal(string(personenrichment.FailureInvalidOutput), *original.FailureClass)
+				}
+			})
+		}
+	}
 }
 
 func TestPersonEnrichmentProfileIdentityMutationInvalidatesProviderBindingAndAttempt(t *testing.T) {
@@ -523,7 +612,7 @@ func TestPersonEnrichmentSuppressionSerializesAttemptCreation(t *testing.T) {
 	select {
 	case <-suppressionSnapshotted:
 		require.Fail("suppression acquired authority before attempt creation released it")
-	case <-time.After(250 * time.Millisecond):
+	case <-time.After(250 * time.Millisecond): //nolint:kennlint // absence check: attempt creation holds authority, keeping the suppression waiting
 	}
 	close(releaseBegin)
 	result := <-beginDone
@@ -823,7 +912,7 @@ func TestPersonEnrichmentClaimRejectsCorruptDurableAttemptTargets(t *testing.T) 
 
 	f.setNow(lease.LeaseUntil.Add(time.Nanosecond))
 	_, err = f.store.ClaimWork(t.Context(), personenrichment.ClaimOptions{
-		RunID: run.ID, Owner: "worker-b", ProviderName: f.profile.Name,
+		RunID: run.ID, Owner: "worker-b", ProviderName: f.profile.Name, ProfileFingerprint: f.profile.Fingerprint,
 		Now: f.now, LeaseDuration: 5 * time.Minute,
 	})
 	assert.ErrorContains(t, err, "durable attempt targets")
@@ -1297,7 +1386,7 @@ func TestPersonEnrichmentWorkLoadsCurrentMinimumRequestInput(t *testing.T) {
 		DueAt:   f.now,
 	}))
 	lease, err := f.store.ClaimWork(t.Context(), personenrichment.ClaimOptions{
-		RunID: run.ID, Owner: "worker", ProviderName: profile.Name,
+		RunID: run.ID, Owner: "worker", ProviderName: profile.Name, ProfileFingerprint: profile.Fingerprint,
 		Now: f.now, LeaseDuration: time.Minute,
 	})
 	require.NoError(err)

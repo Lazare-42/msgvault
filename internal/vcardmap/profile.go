@@ -271,7 +271,11 @@ func projectPersonName(name store.PersonName) (projectedProperty, bool, error) {
 	if err := appendNameParameters(&property, name); err != nil {
 		return projectedProperty{}, false, err
 	}
-	return ownedProjection(owner, name.Envelope, nameOwnedParameters, property), true, nil
+	projected := ownedProjection(owner, name.Envelope, nameOwnedParameters, property)
+	if name.Envelope.Source == store.ProvenanceCardDAVImport {
+		projected.CarriedParameters = []string{"TYPE", "PREF"}
+	}
+	return projected, true, nil
 }
 
 // personNameValue picks the property, owner field, and raw value one name row
@@ -356,8 +360,8 @@ func appendNameParameters(property *vcard.Property, name store.PersonName) error
 // derivedFullName synthesizes FN when no name row projects one. It reports
 // false when the profile offers nothing to derive from. The result is only a
 // fallback: the merge drops it again when the card already carries an FN of
-// its own, and a card that truly lacks one is rejected by rendering, where the
-// mandatory-FN rule belongs. Components are ordered as the render layer
+// its own. Rendering supplies a contact-point or placeholder fallback when
+// needed to meet the mandatory-FN rule. Components are ordered as the render layer
 // orders the five vCard 3 components (prefix, given, additional, family,
 // suffix), with the RFC 9554 secondary surname and generation after family.
 func derivedFullName(profile store.PersonProfile) (projectedProperty, bool, error) {
@@ -475,6 +479,9 @@ func projectContactPoint(point store.PersonContactPoint) (projectedProperty, boo
 		return projectedProperty{}, false, err
 	}
 	projected := ownedProjection(ownerContactPoint, point.Envelope, valueOwnedParameters, property)
+	if point.Envelope.Source == store.ProvenanceCardDAVImport {
+		projected.CarriedParameters = []string{"TYPE", "PREF"}
+	}
 	return projected, true, nil
 }
 

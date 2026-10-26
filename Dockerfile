@@ -1,18 +1,17 @@
 # Frontend build stage. Bun is present only here; the release image contains
 # neither a JavaScript runtime nor a filesystem web distribution.
-FROM oven/bun:1.3.14@sha256:e10577f0db68676a7024391c6e5cb4b879ebd17188ab750cf10024a6d700e5c4 AS web-builder
+FROM oven/bun:1.4.4@sha256:1d22548f177f4ff38e0c15baa3c2c46c6c2060ba2d1bc573bb4720b407548f1d AS web-builder
 
 WORKDIR /src
 COPY web/package.json web/bun.lock ./web/
 RUN cd web && bun install --frozen-lockfile
 COPY api/openapi.yaml ./api/openapi.yaml
-COPY scripts/generate-web-client.mjs ./scripts/generate-web-client.mjs
 COPY web/ ./web/
 RUN cd web && bun run generate && bun run build
 
 # Go build stage.
 # Pin by digest for reproducibility; update periodically.
-FROM golang:1.27.0-bookworm@sha256:484ef6066fa69acb059fdfeda7ba2b8f7391f2ef6abc6f9b8411e669ebd56466 AS builder
+FROM golang:1.27.3-bookworm@sha256:972b4110ba0f47539a975c31e52c64765e1ff19f2d74469ae4a595c6676e80a5 AS builder
 
 # Install build dependencies for CGO (SQLite, DuckDB).
 # libsqlite3-dev provides sqlite3.h, required to compile the sqlite-vec
@@ -26,6 +25,9 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
+
+# Fall back to the module's source repo on any proxy error, not just 404/410.
+ENV GOPROXY=https://proxy.golang.org|direct
 
 # Download dependencies first (layer caching)
 COPY go.mod go.sum ./
@@ -43,18 +45,22 @@ ARG COMMIT=unknown
 ARG BUILD_DATE=unknown
 
 # Note: Module path must match go.mod (go.kenn.io/msgvault)
-RUN CGO_ENABLED=1 go build \
+RUN CGO_ENABLED=0 go build -trimpath -buildvcs=false \
+        -o /msgvault-codex-bridge ./cmd/msgvault-codex-bridge \
+    && bridge_digest=$(sha256sum /msgvault-codex-bridge | cut -d' ' -f1) \
+    && CGO_ENABLED=1 go build \
     -tags "fts5 sqlite_vec" \
     -trimpath \
     -ldflags="-s -w \
         -X go.kenn.io/msgvault/cmd/msgvault/cmd.Version=${VERSION} \
         -X go.kenn.io/msgvault/cmd/msgvault/cmd.Commit=${COMMIT} \
-        -X go.kenn.io/msgvault/cmd/msgvault/cmd.BuildDate=${BUILD_DATE}" \
+        -X go.kenn.io/msgvault/cmd/msgvault/cmd.BuildDate=${BUILD_DATE} \
+        -X go.kenn.io/msgvault/internal/peoplesweep.codexBridgeSHA256=${bridge_digest}" \
     -o /msgvault \
     ./cmd/msgvault
 
 # Runtime stage - Debian provides current glibc for CGO/DuckDB bindings
-FROM debian:bookworm-slim@sha256:96e378d7e6531ac9a15ad505478fcc2e69f371b10f5cdf87857c4b8188404716
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8
 
 # Install runtime dependencies (libstdc++ required for CGO/DuckDB)
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -62,6 +68,8 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-ins
     tzdata \
     wget \
     libstdc++6 \
+    libpcre2-8-0 \
+    bubblewrap \
     && rm -rf /var/lib/apt/lists/*
 
 # Create non-root user
@@ -70,6 +78,7 @@ RUN groupadd --gid 1000 msgvault \
 
 # Copy binary from builder
 COPY --from=builder /msgvault /usr/local/bin/msgvault
+COPY --from=builder --chown=msgvault:msgvault /msgvault-codex-bridge /usr/local/bin/msgvault-codex-bridge
 
 # Set up data directory with correct ownership
 ENV MSGVAULT_HOME=/data
@@ -79,6 +88,10 @@ VOLUME /data
 # Switch to non-root user
 USER msgvault
 WORKDIR /data
+
+# Exercise this runtime before exporting it, without shipping smoke data/scripts.
+RUN --network=none --mount=type=bind,source=scripts/smoke-image.sh,target=/tmp/smoke-image.sh \
+    sh /tmp/smoke-image.sh
 
 # Health check using wget (curl not included to keep image small)
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

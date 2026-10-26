@@ -7,6 +7,9 @@ package query
 import (
 	"maps"
 	"time"
+
+	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/store"
 )
 
 // AggregateRow represents a single row in an aggregate view.
@@ -23,8 +26,12 @@ type AggregateRow struct {
 // MessageSummary represents a message in list views.
 // Contains enough information for display without fetching the full body.
 type MessageSummary struct {
+	AttachmentNames []string `json:"attachment_names,omitzero"`
+	MatchSnippet    string   `json:"match_snippet,omitempty"`
+	// WebURL is derived by the daemon client for browser navigation.
+	WebURL                       string     `json:"web_url,omitempty"`
 	ID                           int64      `json:"id"`
-	SourceID                     int64      `json:"source_id,omitempty"`
+	SourceID                     int64      `json:"source_id,omitzero"`
 	SourceMessageID              string     `json:"source_message_id"`
 	ConversationID               int64      `json:"conversation_id"`
 	SourceConversationID         string     `json:"source_conversation_id"` // Gmail Thread ID
@@ -61,25 +68,25 @@ type DeletionTarget struct {
 
 // MessageDetail represents a full message with body and attachments.
 type MessageDetail struct {
-	ID                   int64  `json:"id"`
-	SourceID             int64  `json:"source_id,omitempty"`
-	SourceMessageID      string `json:"source_message_id"`
-	ConversationID       int64  `json:"conversation_id"`
-	SourceConversationID string `json:"source_conversation_id"` // Gmail Thread ID
-	// RFC822MessageID is the RFC 5322 Message-ID header (e.g.
-	// "<abc@mail.gmail.com>"). Pass it as create_draft's in_reply_to to
-	// compose a true reply that threads correctly in every mail client.
-	// Empty for messages whose source did not record a Message-ID.
-	RFC822MessageID string     `json:"rfc822_message_id,omitempty"`
-	Subject         string     `json:"subject"`
-	MessageType     string     `json:"message_type,omitempty"`
-	Snippet         string     `json:"snippet"`
-	SentAt          time.Time  `json:"sent_at"`
-	ReceivedAt      *time.Time `json:"received_at,omitempty"`
-	DeletedAt       *time.Time `json:"deleted_at,omitempty"` // When message was deleted from source (nil if not deleted)
-	SizeEstimate    int64      `json:"size_estimate"`
-	HasAttachments  bool       `json:"has_attachments"`
-	IsFromMe        bool       `json:"is_from_me"`
+	RelatedMessageID  *int64 `json:"related_message_id,omitempty"`
+	ConversationTitle string `json:"conversation_title,omitempty"`
+	// WebURL is derived by the daemon client for browser navigation.
+	WebURL               string     `json:"web_url,omitempty"`
+	ID                   int64      `json:"id"`
+	SourceID             int64      `json:"source_id,omitzero"`
+	SourceMessageID      string     `json:"source_message_id"`
+	RFC822MessageID      string     `json:"rfc822_message_id"`
+	ConversationID       int64      `json:"conversation_id"`
+	SourceConversationID string     `json:"source_conversation_id"` // Gmail Thread ID
+	Subject              string     `json:"subject"`
+	MessageType          string     `json:"message_type,omitempty"`
+	Snippet              string     `json:"snippet"`
+	SentAt               time.Time  `json:"sent_at"`
+	ReceivedAt           *time.Time `json:"received_at,omitempty"`
+	DeletedAt            *time.Time `json:"deleted_at,omitempty"` // When message was deleted from source (nil if not deleted)
+	SizeEstimate         int64      `json:"size_estimate"`
+	HasAttachments       bool       `json:"has_attachments"`
+	IsFromMe             bool       `json:"is_from_me"`
 
 	// Participants
 	From []Address `json:"from"`
@@ -104,7 +111,9 @@ type Address struct {
 
 // AttachmentInfo represents attachment metadata.
 type AttachmentInfo struct {
+	Docbank     []store.DocbankAttachmentRef `json:"docbank,omitempty"`
 	ID          int64
+	SourceID    int64 `json:"-"`
 	Filename    string
 	MimeType    string
 	Size        int64
@@ -116,6 +125,10 @@ type AttachmentInfo struct {
 // ViewType represents the type of aggregate view.
 type ViewType int
 
+// ViewNoStats suppresses optional aggregates in SearchFastWithStats. It is not
+// an aggregate view and does not change the numeric values of existing views.
+const ViewNoStats ViewType = -1
+
 const (
 	ViewSenders ViewType = iota
 	ViewSenderNames
@@ -123,6 +136,7 @@ const (
 	ViewRecipientNames
 	ViewDomains
 	ViewLabels
+	ViewLists
 	ViewTime
 
 	// ViewTypeCount is the total number of view types. Must be last.
@@ -143,6 +157,8 @@ func (v ViewType) String() string {
 		return "Domains"
 	case ViewLabels:
 		return "Labels"
+	case ViewLists:
+		return "Lists"
 	case ViewTime:
 		return "Time"
 	default:
@@ -219,6 +235,8 @@ const (
 
 // MessageFilter specifies which messages to retrieve.
 type MessageFilter struct {
+	AccountScopes []search.AccountScope // picker account selections; intersect with source filters
+
 	// Filter by aggregate key
 	Sender        string // filter by sender email
 	SenderName    string // filter by sender display name (COALESCE(display_name, email))
@@ -226,6 +244,7 @@ type MessageFilter struct {
 	RecipientName string // filter by recipient display name (COALESCE(display_name, email))
 	Domain        string // filter by sender domain
 	Label         string // filter by label name
+	ListID        string // filter by exact RFC 2919 List-Id (case-insensitive)
 	MessageType   string // filter by messages.message_type
 
 	// Filter by conversation (thread)
@@ -307,18 +326,22 @@ func (f *MessageFilter) HasEmptyTargets() bool {
 // copy would share the underlying map between the original and copy.
 func (f *MessageFilter) Clone() MessageFilter {
 	clone := *f
+	clone.AccountScopes = search.CloneAccountScopes(f.AccountScopes)
 	if f.EmptyValueTargets != nil {
 		clone.EmptyValueTargets = make(map[ViewType]bool, len(f.EmptyValueTargets))
 		maps.Copy(clone.EmptyValueTargets, f.EmptyValueTargets)
 	}
 	if f.SourceIDs != nil {
-		clone.SourceIDs = append([]int64(nil), f.SourceIDs...)
+		clone.SourceIDs = make([]int64, len(f.SourceIDs))
+		copy(clone.SourceIDs, f.SourceIDs)
 	}
 	return clone
 }
 
 // AggregateOptions configures an aggregate query.
 type AggregateOptions struct {
+	AccountScopes []search.AccountScope
+
 	// Account filter
 	SourceID  *int64  // nil means all accounts
 	SourceIDs []int64 // multi-source filter (collections)
@@ -357,19 +380,28 @@ func DefaultAggregateOptions() AggregateOptions {
 
 // AccountInfo represents a source account.
 type AccountInfo struct {
+	// VirtualAccounts lists the source's identity and unattributed children,
+	// filled only by callers that load the catalog.
+	VirtualAccounts []store.VirtualAccount `json:"virtual_accounts,omitempty"`
+
 	ID          int64
 	SourceType  string
 	Identifier  string // email address
 	DisplayName string
+	// LastSyncAt is the source's most recent sync activity. Provider
+	// messages newer than this may not be archived yet. Nil when the
+	// source has never synced.
+	LastSyncAt *time.Time `json:",omitzero"`
 }
 
 // StatsOptions configures a stats query.
 type StatsOptions struct {
-	SourceID              *int64   // nil means all accounts
-	SourceIDs             []int64  // multi-source filter (collections)
-	WithAttachmentsOnly   bool     // only count messages with attachments
-	HideDeletedFromSource bool     // exclude messages where deleted_from_source_at IS NOT NULL
-	SearchQuery           string   // when set, stats reflect only messages matching this search
-	SearchScope           bool     // include all message types when SearchQuery has no explicit message_type
-	GroupBy               ViewType // when set, search filters on this view's key columns instead of subject+sender
+	Filter                *MessageFilter // complete message scope; nil preserves legacy top-level filtering
+	SourceID              *int64         // nil means all accounts
+	SourceIDs             []int64        // multi-source filter (collections)
+	WithAttachmentsOnly   bool           // only count messages with attachments
+	HideDeletedFromSource bool           // exclude messages where deleted_from_source_at IS NOT NULL
+	SearchQuery           string         // when set, stats reflect only messages matching this search
+	SearchScope           bool           // include all message types when SearchQuery has no explicit message_type
+	GroupBy               ViewType       // when set, search filters on this view's key columns instead of subject+sender
 }

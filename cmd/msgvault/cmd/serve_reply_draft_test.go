@@ -1,0 +1,1178 @@
+package cmd
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/mail"
+	"net/textproto"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	emersionimap "github.com/emersion/go-imap/v2"
+	"github.com/emersion/go-imap/v2/imapclient"
+	"github.com/spf13/cobra"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/agentgrant"
+	"go.kenn.io/msgvault/internal/api"
+	"go.kenn.io/msgvault/internal/config"
+	imaplib "go.kenn.io/msgvault/internal/imap"
+	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
+)
+
+func TestDraftSenderRecipientSelection(t *testing.T) {
+	identities := []store.AccountIdentity{
+		{Address: "primary@example.test", ConfirmedAt: time.Now()},
+		{Address: "shop@example.test", ConfirmedAt: time.Now()},
+		{Address: "unconfirmed@example.test"},
+		{Address: "malformed", ConfirmedAt: time.Now()},
+	}
+	for _, tc := range []struct {
+		name, requested, want, code string
+		recipients                  []string
+		fallbackOnly                bool
+		grantSenders                []string
+	}{
+		{name: "unique", recipients: []string{"shop@example.test"}, want: "<shop@example.test>"},
+		{name: "canonical duplicates", recipients: []string{"SHOP@example.test", "shop@example.test"}, want: "<shop@example.test>"},
+		{name: "two matches", recipients: []string{"shop@example.test", "primary@example.test"}, code: "from_ambiguous"},
+		{name: "two matches one granted", recipients: []string{"shop@example.test", "primary@example.test"}, grantSenders: []string{"primary@example.test"}, want: "<primary@example.test>"},
+		{name: "two matches none granted", recipients: []string{"shop@example.test", "primary@example.test"}, grantSenders: []string{"other@example.test"}, code: "not_permitted"},
+		{name: "no match", recipients: []string{"other@example.test", "unconfirmed@example.test", "malformed"}, code: "from_ambiguous"},
+		{name: "fallback only", recipients: []string{"primary@example.test"}, fallbackOnly: true, code: "from_ambiguous"},
+		{name: "explicit", requested: `"Example, Owner" <primary@example.test>`, recipients: []string{"shop@example.test"}, want: `"Example, Owner" <primary@example.test>`},
+		{name: "malformed explicit", requested: "broken", recipients: []string{"shop@example.test"}, code: "invalid_from"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requirements, assertions := require.New(t), assert.New(t)
+			recipients := make([]store.MessageRecipient, 0, len(tc.recipients))
+			for _, address := range tc.recipients {
+				recipient := store.MessageRecipient{EmailAddress: address}
+				if !tc.fallbackOnly {
+					recipient.EnvelopeAddress = address
+				}
+				recipients = append(recipients, recipient)
+			}
+			var grant *agentgrant.Grant
+			if tc.grantSenders != nil {
+				grant = &agentgrant.Grant{Permissions: []agentgrant.Permission{agentgrant.PermissionDraftCreate}, Sources: []agentgrant.SourceRef{{ID: 1, SenderKeys: tc.grantSenders}}}
+			}
+			from, selves, err := (&storeAPIAdapter{}).selectDraftSender(identities, recipients, tc.requested, grant, &store.Source{ID: 1})
+			if tc.code != "" {
+				requirements.EqualError(err, tc.code)
+				return
+			}
+			requirements.NoError(err)
+			assertions.Equal(tc.want, from)
+			assertions.ElementsMatch([]string{"primary@example.test", "shop@example.test"}, selves)
+		})
+	}
+}
+
+func (f draftReplyFixture) runInferred(t *testing.T, adapter *storeAPIAdapter, grant *agentgrant.Grant, flags ...string) ([]api.CLIRunEvent, error) {
+	t.Helper()
+	args := append([]string{"draft-reply", strconv.FormatInt(f.parentID, 10)}, flags...)
+	var events []api.CLIRunEvent
+	err := adapter.runCLIReplyDraft(t.Context(), api.CLIRunRequest{Args: args, Grant: grant}, func(event api.CLIRunEvent) error {
+		events = append(events, event)
+		return nil
+	})
+	return events, err
+}
+
+func setDraftParentRecipient(t *testing.T, st *store.Store, parentID int64, role string) {
+	t.Helper()
+	const address = "shop@example.test"
+	requirements := require.New(t)
+	_, err := st.DB().Exec(st.Rebind("UPDATE message_recipients SET recipient_type = ?, email_address = ? WHERE message_id = ? AND recipient_type IN ('to', 'cc', 'bcc')"), role, address, parentID)
+	requirements.NoError(err)
+	raw, err := st.GetMessageRaw(parentID)
+	requirements.NoError(err)
+	message, err := mail.ReadMessage(bytes.NewReader(raw))
+	requirements.NoError(err)
+	for _, oldRole := range []string{"To", "Cc", "Bcc"} {
+		if value := message.Header.Get(oldRole); value != "" {
+			raw = []byte(strings.Replace(string(raw), oldRole+": "+value+"\r\n", textproto.CanonicalMIMEHeaderKey(role)+": "+address+"\r\n", 1))
+			break
+		}
+	}
+	requirements.NoError(st.UpsertMessageRaw(parentID, raw))
+}
+
+func TestDraftReplyInfersRecipientIdentity(t *testing.T) {
+	for _, role := range []string{"to", "cc", "bcc"} {
+		t.Run(role, func(t *testing.T) {
+			requirements, assertions := require.New(t), assert.New(t)
+			f := newDraftReplyFixture(t)
+			requirements.NoError(f.store.AddAccountIdentity(f.source.ID, "shop@example.test", "manual"))
+			setDraftParentRecipient(t, f.store, f.parentID, role)
+			events, err := f.runInferred(t, f.grantedAdapter(), nil, "--body", "reply", "--json")
+			requirements.NoError(err)
+			requirements.Len(events, 1)
+			var id int64
+			requirements.NoError(f.store.DB().QueryRow(f.store.Rebind("SELECT id FROM messages WHERE source_id = ? AND source_message_id = ?"), f.source.ID, "Drafts|1").Scan(&id))
+			raw, err := f.store.GetMessageRaw(id)
+			requirements.NoError(err)
+			message, err := mail.ReadMessage(bytes.NewReader(raw))
+			requirements.NoError(err)
+			assertions.Equal("<shop@example.test>", message.Header.Get("From"))
+		})
+	}
+}
+
+func TestDraftReplyInferredSenderGrantBoundary(t *testing.T) {
+	requirements, assertions := require.New(t), assert.New(t)
+	f := newDraftReplyFixture(t)
+	requirements.NoError(f.store.AddAccountIdentity(f.source.ID, "shop@example.test", "manual"))
+	setDraftParentRecipient(t, f.store, f.parentID, "to")
+	ref := draftSourceRef(f.source)
+	ref.SenderKeys = []string{store.NormalizeIdentifierForCompare(testutil.IMAPTestUsername)}
+	grant := &agentgrant.Grant{Permissions: []agentgrant.Permission{agentgrant.PermissionDraftCreate}, Sources: []agentgrant.SourceRef{ref}}
+	adapter := f.grantedAdapter()
+	calls := 0
+	adapter.draftClientFactory = func(context.Context, *store.Source) (*imaplib.Client, error) {
+		calls++
+		return nil, errors.New("unexpected provider call")
+	}
+	events, err := f.runInferred(t, adapter, grant, "--source-id", strconv.FormatInt(f.source.ID, 10), "--body", "reply", "--json")
+	requirements.EqualError(err, "not_permitted")
+	assertions.Empty(events)
+	assertions.Zero(calls)
+}
+
+func TestDraftReplyUsesStructuredRecipientIdentity(t *testing.T) {
+	for _, mode := range []string{"preserved", "null", "encoded to", "raw cc"} {
+		t.Run(mode, func(t *testing.T) {
+			requirements, assertions := require.New(t), assert.New(t)
+			f := newDraftReplyFixture(t)
+			requirements.NoError(f.store.AddAccountIdentity(f.source.ID, "shop@example.test", "manual"))
+			shopID, err := f.store.EnsureParticipant("shop@example.test", "Shop", "")
+			requirements.NoError(err)
+			primaryID, err := f.store.EnsureParticipant(testutil.IMAPTestUsername, "", "")
+			requirements.NoError(err)
+			requirements.NoError(f.store.ReplaceMessageRecipients(f.parentID, "to", []int64{shopID}, []string{"Shop"}))
+			setDraftParentRecipient(t, f.store, f.parentID, "to")
+			if mode == "encoded to" {
+				raw, err := f.store.GetMessageRaw(f.parentID)
+				requirements.NoError(err)
+				raw = bytes.Replace(raw, []byte("To: shop@example.test"), []byte("To: =?windows-1252?Q?Andr=E9?= <shop@example.test>"), 1)
+				requirements.Contains(string(raw), "To: =?windows-1252?Q?Andr=E9?= <shop@example.test>")
+				requirements.NoError(f.store.UpsertMessageRaw(f.parentID, raw))
+			}
+			if mode == "raw cc" {
+				setDraftParentRecipient(t, f.store, f.parentID, "cc")
+			}
+			if mode != "preserved" {
+				_, err = f.store.DB().Exec(f.store.Rebind("UPDATE message_recipients SET email_address = NULL WHERE message_id = ? AND recipient_type IN ('to', 'cc')"), f.parentID)
+				requirements.NoError(err)
+			}
+			requirements.NoError(f.store.MergeParticipants(shopID, primaryID))
+			role := "to"
+			if mode == "raw cc" {
+				role = "cc"
+			}
+			recipients, err := f.store.GetMessageRecipientsContext(t.Context(), f.parentID, role)
+			requirements.NoError(err)
+			requirements.Len(recipients, 1)
+			assertions.Equal(primaryID, recipients[0].ParticipantID)
+			if mode != "preserved" {
+				assertions.Equal(testutil.IMAPTestUsername, recipients[0].EmailAddress)
+				assertions.Empty(recipients[0].EnvelopeAddress)
+			} else {
+				assertions.Equal("shop@example.test", recipients[0].EmailAddress)
+				assertions.Equal("shop@example.test", recipients[0].EnvelopeAddress)
+			}
+			_, err = f.runInferred(t, f.grantedAdapter(), nil, "--body", "reply")
+			requirements.NoError(err)
+			var id int64
+			requirements.NoError(f.store.DB().QueryRow(f.store.Rebind("SELECT id FROM messages WHERE source_id = ? AND source_message_id = ?"), f.source.ID, "Drafts|1").Scan(&id))
+			raw, err := f.store.GetMessageRaw(id)
+			requirements.NoError(err)
+			message, err := mail.ReadMessage(bytes.NewReader(raw))
+			requirements.NoError(err)
+			assertions.Equal("<shop@example.test>", message.Header.Get("From"))
+		})
+	}
+}
+
+func TestDraftReplyCombinesOriginalRecipientEvidence(t *testing.T) {
+	for _, mode := range []string{"populated snapshot", "repeated To"} {
+		t.Run(mode, func(t *testing.T) {
+			requirements, assertions := require.New(t), assert.New(t)
+			f := newDraftReplyFixture(t)
+			requirements.NoError(f.store.AddAccountIdentity(f.source.ID, "shop@example.test", "manual"))
+			setDraftParentRecipient(t, f.store, f.parentID, "to")
+			raw, err := f.store.GetMessageRaw(f.parentID)
+			requirements.NoError(err)
+			headers := "To: shop@example.test, " + testutil.IMAPTestUsername
+			if mode != "populated snapshot" {
+				headers = "To: shop@example.test\r\nTo: " + testutil.IMAPTestUsername
+				_, err = f.store.DB().Exec(f.store.Rebind("UPDATE message_recipients SET email_address = NULL WHERE message_id = ?"), f.parentID)
+				requirements.NoError(err)
+			}
+			raw = bytes.Replace(raw, []byte("To: shop@example.test"), []byte(headers), 1)
+			requirements.Contains(string(raw), headers)
+			requirements.NoError(f.store.UpsertMessageRaw(f.parentID, raw))
+			recipients, err := f.store.GetMessageRecipientsContext(t.Context(), f.parentID, "to")
+			requirements.NoError(err)
+			requirements.Len(recipients, 1)
+			if mode == "populated snapshot" {
+				assertions.Equal("shop@example.test", recipients[0].EnvelopeAddress)
+			} else {
+				assertions.Empty(recipients[0].EnvelopeAddress)
+			}
+			adapter := f.grantedAdapter()
+			calls := 0
+			adapter.draftClientFactory = func(context.Context, *store.Source) (*imaplib.Client, error) {
+				calls++
+				return nil, errors.New("unexpected provider call")
+			}
+			events, err := f.runInferred(t, adapter, nil, "--body", "reply")
+			requirements.EqualError(err, "from_ambiguous")
+			assertions.Empty(events)
+			assertions.Zero(calls)
+		})
+	}
+}
+
+func TestDraftReplyInferredSenderSourceIsolation(t *testing.T) {
+	requirements, assertions := require.New(t), assert.New(t)
+	f := newDraftReplyFixture(t)
+	requirements.NoError(f.store.AddAccountIdentity(f.source.ID, "second@example.test", "manual"))
+	other, err := f.store.GetOrCreateSource("imap", "other@example.test")
+	requirements.NoError(err)
+	requirements.NoError(f.store.AddAccountIdentity(other.ID, "shop@example.test", "manual"))
+	setDraftParentRecipient(t, f.store, f.parentID, "to")
+	target, from, selves, err := f.grantedAdapter().resolveDraftTarget(t.Context(), &f.parentID, "", 0, false, "", nil, true)
+	requirements.EqualError(err, "from_ambiguous")
+	assertions.Empty(target)
+	assertions.Empty(from)
+	assertions.Empty(selves)
+}
+
+func TestDraftRecipientInferenceIsReplyOnly(t *testing.T) {
+	f := newDraftReplyFixture(t)
+	require.NoError(t, f.store.AddAccountIdentity(f.source.ID, "shop@example.test", "manual"))
+	adapter := f.grantedAdapter()
+	setDraftParentRecipient(t, f.store, f.parentID, "to")
+	for _, command := range []string{"draft-compose", "draft-forward"} {
+		t.Run(command, func(t *testing.T) {
+			args := []string{command}
+			if command == "draft-forward" {
+				args = append(args, strconv.FormatInt(f.parentID, 10))
+			}
+			args = append(args, "--source-id", strconv.FormatInt(f.source.ID, 10), "--to", "recipient@example.test", "--body", "body")
+			if command == "draft-compose" {
+				args = append(args, "--subject", "Subject")
+			}
+			err := adapter.RunCLICommand(t.Context(), api.CLIRunRequest{Args: args}, func(api.CLIRunEvent) error { return nil })
+			require.EqualError(t, err, "from_ambiguous")
+		})
+	}
+}
+
+func TestDraftReplyPolicyStates(t *testing.T) {
+	cases := []struct {
+		name    string
+		policy  []config.IMAPDraftSource
+		source  int64
+		typ     string
+		mailbox string
+		code    string
+	}{
+		{name: "disabled", policy: []config.IMAPDraftSource{{SourceID: 42, Mailbox: "Drafts"}}, source: 42, typ: "imap", code: "draft_disabled"},
+		{name: "wrong source", policy: []config.IMAPDraftSource{{SourceID: 42, Enabled: true, Mailbox: "Drafts"}}, source: 41, typ: "imap", code: "draft_disabled"},
+		{name: "wrong provider", policy: []config.IMAPDraftSource{{SourceID: 42, Enabled: true, Mailbox: "Drafts"}}, source: 42, typ: "gmail", code: "draft_disabled"},
+		{name: "blank mailbox", policy: []config.IMAPDraftSource{{SourceID: 42, Enabled: true, Mailbox: " "}}, source: 42, typ: "imap", code: "invalid_mailbox"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			requirements := require.New(t)
+			assertions := assert.New(t)
+			mailbox, err := authorizeIMAPDraft(tc.policy, tc.source, tc.typ)
+			requirements.Error(err)
+			assertions.Empty(mailbox)
+			assertions.Equal(tc.code, err.Error())
+			coded, ok := errors.AsType[*api.CLIRunCodedError](err)
+			requirements.True(ok)
+			assertions.Error(coded.Err)
+		})
+	}
+}
+
+func TestRunCLIReplyDraftUsesTypedRoute(t *testing.T) {
+	run := false
+	adapter := &storeAPIAdapter{}
+	err := adapter.runCLICommandWithRunner(context.Background(), api.CLIRunRequest{
+		Args: []string{"draft-reply"},
+	}, nil, func(context.Context, []string, map[string]string, string, func(string, string) error) error {
+		run = true
+		return nil
+	})
+	require.ErrorContains(t, err, "invalid_args")
+	assert.False(t, run)
+}
+
+func TestDraftPolicySnapshotRequiresDaemonRestart(t *testing.T) {
+	cfg := config.Config{IMAP: config.IMAPConfig{Drafts: []config.IMAPDraftSource{{SourceID: 42, Enabled: true, Mailbox: "Drafts"}}}}
+	testCtx := testInvocationContext(t.Context(), &cfg, invocationOptions{})
+	_ = testCtx
+	snapshot := snapshotIMAPDraftPolicy(&cfg)
+	cfg.IMAP.Drafts[0].Enabled = false
+	assert.True(t, snapshot[0].Enabled)
+}
+
+func TestConfirmedSourceIdentityRejectsMismatch(t *testing.T) {
+	identities := []store.AccountIdentity{{Address: "user@example.com", ConfirmedAt: time.Now()}}
+	eligible, _ := confirmedDraftIdentities(identities)
+	assert.NotContains(t, eligible, store.NormalizeIdentifierForCompare("other@example.com"))
+	assert.Contains(t, eligible, store.NormalizeIdentifierForCompare("USER@example.com"))
+	adapter := &storeAPIAdapter{}
+	_, _, err := adapter.selectDraftSender(
+		[]store.AccountIdentity{
+			{Address: "user@example.com", ConfirmedAt: time.Now()},
+			{Address: "alias@example.com", ConfirmedAt: time.Now()},
+		}, nil, "", nil, &store.Source{ID: 1, SourceType: "imap", Identifier: "alice@example.com"},
+	)
+	assert.ErrorContains(t, err, "from_ambiguous")
+}
+
+// draftReplyFixture is one archived IMAP parent message on a source backed by
+// an in-memory IMAP server that advertises UIDPLUS.
+type draftReplyFixture struct {
+	store    *store.Store
+	source   *store.Source
+	parentID int64
+	config   *imaplib.Config
+	// refreshed records every analytics cache refresh label the route requested.
+	refreshed *[]string
+}
+
+func newDraftReplyFixture(t *testing.T) draftReplyFixture {
+	t.Helper()
+	addr, _ := testutil.StartIMAPMemServerForDrafts(t, testutil.IMAPDraftServerOptions{
+		MessagesPerMailbox: map[string]int{"Drafts": 0},
+		Caps:               emersionimap.CapSet{emersionimap.CapIMAP4rev1: {}, emersionimap.CapUIDPlus: {}},
+	})
+	host, portText, err := net.SplitHostPort(addr)
+	require.NoError(t, err)
+	port, err := strconv.Atoi(portText)
+	require.NoError(t, err)
+	imapConfig := &imaplib.Config{Host: host, Port: port, Username: testutil.IMAPTestUsername}
+
+	st := testutil.NewTestStore(t)
+	source, err := st.GetOrCreateSource("imap", imapConfig.Identifier())
+	require.NoError(t, err)
+	configJSON, err := imapConfig.ToJSON()
+	require.NoError(t, err)
+	// Request-side draft settings smuggled into the source JSON must be ignored.
+	configJSON = strings.TrimSuffix(configJSON, "}") + `,"draft_enabled":false,"drafts_mailbox":"AttackerMailbox"}`
+	require.NoError(t, st.UpdateSourceSyncConfig(source.ID, configJSON))
+	require.NoError(t, st.AddAccountIdentity(source.ID, testutil.IMAPTestUsername, "manual"))
+	conversationID, err := st.EnsureConversation(source.ID, "thread-666", "Question")
+	require.NoError(t, err)
+	senderID, err := st.EnsureParticipant("sender@example.com", "Sender", "example.com")
+	require.NoError(t, err)
+	ownerID, err := st.EnsureParticipant(testutil.IMAPTestUsername, "", "example.com")
+	require.NoError(t, err)
+	parentRaw := []byte("From: Sender <sender@example.com>\r\n" +
+		"To: " + testutil.IMAPTestUsername + "\r\n" +
+		"Subject: Question\r\n" +
+		"Message-ID: <parent@example.com>\r\n\r\n" +
+		"Parent body\r\n")
+	parentID, err := st.PersistMessage(&store.MessagePersistData{
+		Message: &store.Message{
+			SourceID: source.ID, SourceMessageID: "INBOX|9",
+			ConversationID: conversationID, RFC822MessageID: sql.NullString{String: "parent@example.com", Valid: true},
+			MessageType: store.MessageTypeEmail, SenderID: sql.NullInt64{Int64: senderID, Valid: true},
+			Subject:      sql.NullString{String: "Question", Valid: true},
+			SentAt:       sql.NullTime{Time: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), Valid: true},
+			SizeEstimate: int64(len(parentRaw)),
+		},
+		BodyText: sql.NullString{String: "Parent body", Valid: true}, RawMIME: parentRaw,
+		Recipients: []store.RecipientSet{
+			{Type: "from", ParticipantIDs: []int64{senderID}, EmailAddresses: []string{"sender@example.com"}},
+			{Type: "to", ParticipantIDs: []int64{ownerID}, EmailAddresses: []string{testutil.IMAPTestUsername}},
+		},
+	})
+	require.NoError(t, err)
+	return draftReplyFixture{store: st, source: source, parentID: parentID, config: imapConfig, refreshed: new([]string)}
+}
+
+func (f draftReplyFixture) grantedAdapter() *storeAPIAdapter {
+	return &storeAPIAdapter{
+		store:       f.store,
+		draftPolicy: []config.IMAPDraftSource{{SourceID: f.source.ID, Enabled: true, Mailbox: "Drafts"}},
+		draftClientFactory: func(context.Context, *store.Source) (*imaplib.Client, error) {
+			return imaplib.NewClient(f.config, testutil.IMAPTestPassword), nil
+		},
+		draftCacheRefresh: func(ctx context.Context, label string) error {
+			// The refresh must run with the source lock already released.
+			execution, err := f.store.AcquireSyncExecutionContext(ctx, f.source.ID)
+			if err != nil {
+				return fmt.Errorf("source still locked during cache refresh: %w", err)
+			}
+			*f.refreshed = append(*f.refreshed, label)
+			return execution.Release()
+		},
+	}
+}
+
+func fetchDraftMailboxMessage(
+	t *testing.T,
+	config *imaplib.Config,
+	receipt store.IMAPDraftReceipt,
+) ([]emersionimap.Flag, []byte) {
+	t.Helper()
+	requirements := require.New(t)
+	client, err := imapclient.DialInsecure(config.Addr(), nil)
+	requirements.NoError(err)
+	t.Cleanup(func() { _ = client.Close() })
+	requirements.NoError(client.Login(testutil.IMAPTestUsername, testutil.IMAPTestPassword).Wait())
+	_, err = client.Select(receipt.Mailbox, nil).Wait()
+	requirements.NoError(err)
+	section := &emersionimap.FetchItemBodySection{}
+	uidSet := emersionimap.UIDSetNum(emersionimap.UID(receipt.UID))
+	fetched, err := client.Fetch(uidSet, &emersionimap.FetchOptions{
+		UID: true, Flags: true, BodySection: []*emersionimap.FetchItemBodySection{section},
+	}).Collect()
+	requirements.NoError(err)
+	requirements.Len(fetched, 1)
+	requirements.Equal(emersionimap.UID(receipt.UID), fetched[0].UID)
+	return fetched[0].Flags, fetched[0].FindBodySection(section)
+}
+
+func TestDraftReplyOfflineParentWithLiveDestination(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	fixture := newDraftReplyFixture(t)
+
+	parentSource, err := fixture.store.GetOrCreateSource("mbox", "imported-parent@example.test")
+	requirements.NoError(err)
+	conversationID, err := fixture.store.EnsureConversation(parentSource.ID, "offline-thread", "Imported question")
+	requirements.NoError(err)
+	senderID, err := fixture.store.EnsureParticipant("sender@example.test", "Sender", "example.test")
+	requirements.NoError(err)
+	ownerID, err := fixture.store.EnsureParticipant(testutil.IMAPTestUsername, "", "example.test")
+	requirements.NoError(err)
+	parentRaw := []byte("From: Sender <sender@example.test>\r\n" +
+		"To: " + testutil.IMAPTestUsername + "\r\n" +
+		"Subject: Imported question\r\n" +
+		"Message-ID: <offline-parent@example.test>\r\n\r\n" +
+		"Imported body\r\n")
+	parentID, err := fixture.store.PersistMessage(&store.MessagePersistData{
+		Message: &store.Message{
+			SourceID: parentSource.ID, SourceMessageID: "mbox|offline-parent",
+			RFC822MessageID: sql.NullString{String: "offline-parent@example.test", Valid: true},
+			ConversationID:  conversationID, MessageType: store.MessageTypeEmail,
+			SenderID:     sql.NullInt64{Int64: senderID, Valid: true},
+			Subject:      sql.NullString{String: "Imported question", Valid: true},
+			SizeEstimate: int64(len(parentRaw)),
+		},
+		BodyText: sql.NullString{String: "Imported body", Valid: true},
+		RawMIME:  parentRaw,
+		Recipients: []store.RecipientSet{
+			{Type: "from", ParticipantIDs: []int64{senderID}, EmailAddresses: []string{"sender@example.test"}},
+			{Type: "to", ParticipantIDs: []int64{ownerID}, EmailAddresses: []string{testutil.IMAPTestUsername}},
+		},
+	})
+	requirements.NoError(err)
+	fixture.parentID = parentID
+
+	adapter := fixture.grantedAdapter()
+	providerCalls := 0
+	clientFactory := adapter.draftClientFactory
+	adapter.draftClientFactory = func(ctx context.Context, source *store.Source) (*imaplib.Client, error) {
+		providerCalls++
+		return clientFactory(ctx, source)
+	}
+
+	events, err := fixture.run(t, adapter, "--body", "reply body")
+	requirements.Error(err)
+	assertions.Empty(events)
+	assertions.Equal("invalid_source", err.Error())
+	assertions.Zero(providerCalls)
+
+	server := httptest.NewServer(api.NewServerWithOptions(api.ServerOptions{
+		Config: &config.Config{
+			HomeDir: t.TempDir(),
+			Server:  config.ServerConfig{APIKey: "owner-test-key", AgentAccess: true},
+		},
+		Store:  adapter,
+		Logger: slog.New(slog.DiscardHandler),
+	}).Router())
+	t.Cleanup(server.Close)
+
+	issue := func(sourceIDs ...int64) string {
+		senderSelections := map[string][]string{}
+		for _, sourceID := range sourceIDs {
+			if sourceID == fixture.source.ID {
+				senderSelections[strconv.FormatInt(sourceID, 10)] = []string{testutil.IMAPTestUsername}
+			}
+		}
+		body, err := json.Marshal(map[string]any{
+			"label": "offline-reply-agent", "permissions": []string{"draft.create"},
+			"source_ids": sourceIDs, "sender_selections": senderSelections,
+		})
+		requirements.NoError(err)
+		request, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/agent-tokens", bytes.NewReader(body))
+		requirements.NoError(err)
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-Api-Key", "owner-test-key")
+		response, err := http.DefaultClient.Do(request)
+		requirements.NoError(err)
+		defer func() { _ = response.Body.Close() }()
+		requirements.Equal(http.StatusCreated, response.StatusCode)
+		var issued agentTokenIssueFixture
+		requirements.NoError(json.NewDecoder(response.Body).Decode(&issued))
+		return issued.Secret
+	}
+	run := func(secret string) []api.CLIRunEvent {
+		args := []string{
+			"draft-reply", strconv.FormatInt(parentID, 10),
+			"--source-id", strconv.FormatInt(fixture.source.ID, 10),
+			"--from", testutil.IMAPTestUsername, "--body", "reply body", "--json",
+		}
+		body, err := json.Marshal(map[string]any{"args": args})
+		requirements.NoError(err)
+		request, err := http.NewRequest(http.MethodPost, server.URL+"/api/v1/cli/run", bytes.NewReader(body))
+		requirements.NoError(err)
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-Msgvault-Agent-Token", secret)
+		response, err := http.DefaultClient.Do(request)
+		requirements.NoError(err)
+		defer func() { _ = response.Body.Close() }()
+		requirements.Equal(http.StatusOK, response.StatusCode)
+		var events []api.CLIRunEvent
+		scanner := bufio.NewScanner(response.Body)
+		for scanner.Scan() {
+			var event api.CLIRunEvent
+			requirements.NoError(json.Unmarshal(scanner.Bytes(), &event))
+			events = append(events, event)
+		}
+		requirements.NoError(scanner.Err())
+		return events
+	}
+	events = run(issue(parentSource.ID, fixture.source.ID))
+	requirements.Len(events, 2)
+	var result draftReplyOutput
+	requirements.NoError(json.Unmarshal([]byte(events[0].Data), &result))
+	assertions.Equal(cliStreamStdout, events[0].Type)
+	assertions.Equal("complete", events[1].Type)
+	assertions.Equal(draftReplyStatusCreated, result.Status)
+	assertions.Equal(fixture.source.ID, result.SourceID)
+	assertions.Equal("Drafts", result.Mailbox)
+	assertions.NotZero(result.UID)
+	assertions.NotZero(result.UIDValidity)
+	assertions.Equal(int64(1), result.Revision)
+	assertions.Equal(1, providerCalls)
+
+	draft, err := fixture.store.GetIMAPDraft(result.DraftID)
+	requirements.NoError(err)
+	assertions.Equal(result.MessageID, draft.CurrentMessageID)
+	assertions.Equal(result.UID, draft.CurrentReceipt.UID)
+	assertions.Equal(fixture.source.ID, draft.CurrentReceipt.SourceID)
+
+	message, err := fixture.store.GetMessage(result.MessageID)
+	requirements.NoError(err)
+	assertions.Equal(fixture.source.ID, message.SourceID)
+	assertions.Equal(
+		"draft-reply-"+strconv.FormatInt(parentSource.ID, 10)+"-"+
+			strconv.FormatInt(fixture.source.ID, 10)+"-offline-thread",
+		message.SourceConversationID,
+	)
+	replyTo, err := fixture.store.GetMessageReplyToMessageIDContext(t.Context(), result.MessageID)
+	requirements.NoError(err)
+	requirements.True(replyTo.Valid)
+	assertions.Equal(parentID, replyTo.Int64)
+
+	storedRaw, err := fixture.store.GetMessageRaw(result.MessageID)
+	requirements.NoError(err)
+	assertions.Contains(string(storedRaw), "In-Reply-To: <offline-parent@example.test>")
+	assertions.Contains(string(storedRaw), "References: <offline-parent@example.test>")
+	flags, fetchedRaw := fetchDraftMailboxMessage(t, fixture.config, draft.CurrentReceipt)
+	assertions.Contains(flags, emersionimap.FlagDraft)
+	assertions.Equal(storedRaw, fetchedRaw)
+
+	for _, scope := range [][]int64{{fixture.source.ID}, {parentSource.ID}} {
+		events = run(issue(scope...))
+		requirements.Len(events, 1)
+		assertions.Equal("error", events[0].Type)
+		assertions.Equal("not_permitted", events[0].Error)
+	}
+	assertions.Equal(1, providerCalls, "both source grants must be checked before provider work")
+}
+
+func (f draftReplyFixture) run(t *testing.T, adapter *storeAPIAdapter, flags ...string) ([]api.CLIRunEvent, error) {
+	t.Helper()
+	args := append([]string{"draft-reply", strconv.FormatInt(f.parentID, 10), "--from", testutil.IMAPTestUsername}, flags...)
+	var events []api.CLIRunEvent
+	err := adapter.runCLIReplyDraft(t.Context(), api.CLIRunRequest{Args: args}, func(event api.CLIRunEvent) error {
+		events = append(events, event)
+		return nil
+	})
+	return events, err
+}
+
+// runAs drives draft-reply with a delegated grant attached to the request, the
+// way handleCLIRun does for an agent-token caller.
+func (f draftReplyFixture) runAs(t *testing.T, adapter *storeAPIAdapter, grant *agentgrant.Grant, flags ...string) ([]api.CLIRunEvent, error) {
+	t.Helper()
+	args := append([]string{"draft-reply", strconv.FormatInt(f.parentID, 10), "--from", testutil.IMAPTestUsername}, flags...)
+	var events []api.CLIRunEvent
+	err := adapter.runCLIReplyDraft(t.Context(), api.CLIRunRequest{Args: args, Grant: grant}, func(event api.CLIRunEvent) error {
+		events = append(events, event)
+		return nil
+	})
+	return events, err
+}
+
+// TestDelegatedDraftReplyCreatesDraft drives the allow branch of
+// authorizeDelegatedDraftSource through to the user-facing outcome. Without it
+// an inverted predicate would leave every deny test green while no delegated
+// caller could ever create a draft.
+func TestDelegatedDraftReplyCreatesDraft(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	fixture := newDraftReplyFixture(t)
+	adapter := fixture.grantedAdapter()
+
+	grant := &agentgrant.Grant{
+		ID:          "g-in-grant",
+		Permissions: []agentgrant.Permission{agentgrant.PermissionDraftCreate},
+		Sources: []agentgrant.SourceRef{{
+			ID:         fixture.source.ID,
+			Type:       fixture.source.SourceType,
+			Identifier: fixture.source.Identifier,
+			SenderKeys: []string{store.NormalizeIdentifierForCompare(testutil.IMAPTestUsername)},
+		}},
+	}
+
+	events, err := fixture.runAs(t, adapter, grant, "--body", "reply body", "--json")
+	requirements.NoError(err)
+	requirements.Len(events, 1)
+	var result map[string]any
+	requirements.NoError(json.Unmarshal([]byte(events[0].Data), &result))
+	assertions.Equal("created", result["status"])
+	assertions.Equal("Drafts", result["mailbox"])
+	assertions.Contains(result["operation_ref"], fmt.Sprintf("%d:Drafts|", fixture.source.ID))
+
+	// The draft is durable locally, not merely reported.
+	var localID int64
+	requirements.NoError(fixture.store.DB().QueryRow(fixture.store.Rebind(`
+		SELECT id FROM messages WHERE source_id = ? AND source_message_id = ?
+	`), fixture.source.ID, "Drafts|1").Scan(&localID))
+	assertions.NotZero(localID)
+}
+
+func TestRunCLIReplyDraftPublishesRemoteAndLocalRows(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	fixture := newDraftReplyFixture(t)
+	adapter := fixture.grantedAdapter()
+
+	events, err := fixture.run(t, adapter, "--body", "reply body", "--json")
+	requirements.NoError(err)
+	requirements.Len(events, 1)
+	var result map[string]any
+	requirements.NoError(json.Unmarshal([]byte(events[0].Data), &result))
+	assertions.Equal("created", result["status"])
+	assertions.Equal("Drafts", result["mailbox"])
+	assertions.Contains(result["operation_ref"], fmt.Sprintf("%d:Drafts|", fixture.source.ID))
+	assertions.NotContains(events[0].Data, "reply body")
+	assertions.Equal([]string{fixture.source.Identifier}, *fixture.refreshed)
+
+	events, err = fixture.run(t, adapter, "--log-level=debug", "--verbose", "--body", "second body", "--log-sql-slow-ms", "50")
+	requirements.NoError(err)
+	requirements.Len(events, 1)
+	assertions.Len(*fixture.refreshed, 2)
+	var latestUIDValidity, latestUID uint32
+	requirements.NoError(fixture.store.DB().QueryRow(fixture.store.Rebind(`
+		SELECT uidvalidity, uid FROM imap_message_memberships
+		WHERE source_id = ? AND mailbox = ? ORDER BY uid DESC LIMIT 1
+	`), fixture.source.ID, "Drafts").Scan(&latestUIDValidity, &latestUID))
+	assertions.Contains(events[0].Data, fmt.Sprintf("Drafts|%d|%d", latestUIDValidity, latestUID))
+	assertions.Contains(events[0].Data, fmt.Sprintf("operation %d:Drafts|%d:%d", fixture.source.ID, latestUIDValidity, latestUID))
+
+	var localID int64
+	requirements.NoError(fixture.store.DB().QueryRow(fixture.store.Rebind(`
+		SELECT id FROM messages WHERE source_id = ? AND source_message_id = ?
+	`), fixture.source.ID, "Drafts|1").Scan(&localID))
+	assertions.NotZero(localID)
+	var replyTo sql.NullInt64
+	requirements.NoError(fixture.store.DB().QueryRow(fixture.store.Rebind(`SELECT reply_to_message_id FROM messages WHERE id = ?`), localID).Scan(&replyTo))
+	assertions.Equal(fixture.parentID, replyTo.Int64)
+	assertions.True(replyTo.Valid)
+	var rfc822MessageID string
+	requirements.NoError(fixture.store.DB().QueryRow(fixture.store.Rebind(`SELECT rfc822_message_id FROM messages WHERE id = ?`), localID).Scan(&rfc822MessageID))
+	assertions.True(strings.HasPrefix(rfc822MessageID, "<"))
+	assertions.True(strings.HasSuffix(rfc822MessageID, ">"))
+	var membershipCount, cursorCount int
+	requirements.NoError(fixture.store.DB().QueryRow(fixture.store.Rebind(`SELECT COUNT(*) FROM imap_message_memberships WHERE message_id = ?`), localID).Scan(&membershipCount))
+	var membershipMailbox, membershipFlags string
+	requirements.NoError(fixture.store.DB().QueryRow(fixture.store.Rebind(`SELECT mailbox, flags FROM imap_message_memberships WHERE message_id = ?`), localID).Scan(&membershipMailbox, &membershipFlags))
+	requirements.NoError(fixture.store.DB().QueryRow(fixture.store.Rebind(`SELECT COUNT(*) FROM imap_folder_state WHERE source_id = ?`), fixture.source.ID).Scan(&cursorCount))
+	assertions.Equal(1, membershipCount)
+	assertions.Equal("Drafts", membershipMailbox)
+	assertions.Equal(`["\\Draft"]`, membershipFlags)
+	assertions.Zero(cursorCount)
+	raw, err := fixture.store.GetMessageRaw(localID)
+	requirements.NoError(err)
+	assertions.Contains(string(raw), "In-Reply-To: <parent@example.com>")
+	assertions.Contains(string(raw), "reply body")
+}
+
+func TestRunCLIReplyDraftDeniesBeforeConnecting(t *testing.T) {
+	fixture := newDraftReplyFixture(t)
+	refuseConnect := func(context.Context, *store.Source) (*imaplib.Client, error) {
+		return nil, errors.New("denied requests must not open an IMAP connection")
+	}
+	cases := []struct {
+		name    string
+		adapter *storeAPIAdapter
+		flags   []string
+		code    string
+		cause   string
+	}{
+		{
+			name:    "no grant",
+			adapter: &storeAPIAdapter{store: fixture.store, draftClientFactory: refuseConnect},
+			flags:   []string{"--body", "reply body"},
+			code:    "draft_disabled",
+			cause:   "no enabled [[imap.drafts]] grant",
+		},
+		{
+			name: "duplicate from flag",
+			adapter: &storeAPIAdapter{
+				store:              fixture.store,
+				draftPolicy:        []config.IMAPDraftSource{{SourceID: fixture.source.ID, Enabled: true, Mailbox: "Drafts"}},
+				draftClientFactory: refuseConnect,
+			},
+			flags: []string{"--from", "other@example.com", "--body", "reply body"},
+			code:  "invalid_args",
+			cause: "--from given more than once",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			requirements := require.New(t)
+			assertions := assert.New(t)
+			events, err := fixture.run(t, tc.adapter, tc.flags...)
+			requirements.Error(err)
+			assertions.Empty(events)
+			assertions.Equal(tc.code, err.Error())
+			coded, ok := errors.AsType[*api.CLIRunCodedError](err)
+			requirements.True(ok)
+			requirements.ErrorContains(coded.Err, tc.cause)
+		})
+	}
+
+	t.Run("cwd", func(t *testing.T) {
+		adapter := &storeAPIAdapter{store: fixture.store, draftClientFactory: refuseConnect}
+		var events []api.CLIRunEvent
+		err := adapter.runCLIReplyDraft(t.Context(), api.CLIRunRequest{
+			Args: []string{"draft-reply", strconv.FormatInt(fixture.parentID, 10), "--body", "reply body"},
+			Cwd:  "/tmp",
+		}, func(event api.CLIRunEvent) error {
+			events = append(events, event)
+			return nil
+		})
+		requirements := require.New(t)
+		assertions := assert.New(t)
+		requirements.Error(err)
+		assertions.Empty(events)
+		assertions.Equal("invalid_args", err.Error())
+		coded, ok := errors.AsType[*api.CLIRunCodedError](err)
+		requirements.True(ok)
+		requirements.ErrorContains(coded.Err, "working directory")
+	})
+
+	t.Run("unconfirmed identity", func(t *testing.T) {
+		adapter := &storeAPIAdapter{
+			store:              fixture.store,
+			draftPolicy:        []config.IMAPDraftSource{{SourceID: fixture.source.ID, Enabled: true, Mailbox: "Drafts"}},
+			draftClientFactory: refuseConnect,
+		}
+		var events []api.CLIRunEvent
+		err := adapter.runCLIReplyDraft(t.Context(), api.CLIRunRequest{
+			Args: []string{"draft-reply", strconv.FormatInt(fixture.parentID, 10), "--from", "other@example.com", "--body", "reply body"},
+		}, func(event api.CLIRunEvent) error {
+			events = append(events, event)
+			return nil
+		})
+		requirements := require.New(t)
+		assertions := assert.New(t)
+		requirements.Error(err)
+		assertions.Empty(events)
+		assertions.Equal("invalid_from", err.Error())
+		coded, ok := errors.AsType[*api.CLIRunCodedError](err)
+		requirements.True(ok)
+		requirements.ErrorContains(coded.Err, "not a confirmed identity")
+		assertions.NotContains(coded.Err.Error(), "other@example.com")
+	})
+}
+
+func TestRunCLIReplyDraftRefusesWhileSourceSyncs(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	fixture := newDraftReplyFixture(t)
+	execution, err := fixture.store.AcquireSyncExecutionContext(t.Context(), fixture.source.ID)
+	requirements.NoError(err)
+	defer func() { _ = execution.Release() }()
+	adapter := fixture.grantedAdapter()
+	adapter.draftClientFactory = func(context.Context, *store.Source) (*imaplib.Client, error) {
+		return nil, errors.New("a request refused for an active sync must not open an IMAP connection")
+	}
+
+	events, err := fixture.run(t, adapter, "--body", "reply body")
+	requirements.Error(err)
+	assertions.Empty(events)
+	assertions.Equal("sync_active", err.Error())
+	coded, ok := errors.AsType[*api.CLIRunCodedError](err)
+	requirements.True(ok)
+	requirements.ErrorIs(coded.Err, store.ErrSyncAlreadyActive)
+	assertions.NotContains(coded.Err.Error(), "reply body")
+}
+
+func TestRunCLIReplyDraftReportsLocalPersistenceFailure(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	fixture := newDraftReplyFixture(t)
+	// Occupy the provider key the first APPEND into the empty mailbox will
+	// receive, so the remote accepts the draft but local publication conflicts.
+	conversationID, err := fixture.store.EnsureConversation(fixture.source.ID, "thread-stale", "Stale")
+	requirements.NoError(err)
+	_, err = fixture.store.PersistMessage(&store.MessagePersistData{
+		Message: &store.Message{
+			SourceID: fixture.source.ID, SourceMessageID: "Drafts|1", ConversationID: conversationID,
+			MessageType: store.MessageTypeEmail, Subject: sql.NullString{String: "Stale", Valid: true},
+		},
+		BodyText: sql.NullString{String: "stale", Valid: true}, RawMIME: []byte("Subject: Stale\r\n\r\nstale\r\n"),
+	})
+	requirements.NoError(err)
+
+	events, err := fixture.run(t, fixture.grantedAdapter(), "--body", "reply body", "--json")
+	requirements.Error(err)
+	assertions.Equal("remote_accepted_local_failed", err.Error())
+	coded, ok := errors.AsType[*api.CLIRunCodedError](err)
+	requirements.True(ok)
+	requirements.ErrorContains(coded.Err, "source_key_conflict")
+	requirements.Len(events, 1)
+	assertions.Equal(cliStreamStderr, events[0].Type)
+	var result map[string]any
+	requirements.NoError(json.Unmarshal([]byte(events[0].Data), &result))
+	assertions.Equal("remote_accepted_local_failed", result["status"])
+	assertions.Equal(fmt.Sprintf("%d:Drafts|%v:%v", fixture.source.ID, result["uidvalidity"], result["uid"]), result["operation_ref"])
+	assertions.NotContains(events[0].Data, "reply body")
+	var membershipCount int
+	requirements.NoError(fixture.store.DB().QueryRow(fixture.store.Rebind(`SELECT COUNT(*) FROM imap_message_memberships WHERE source_id = ?`), fixture.source.ID).Scan(&membershipCount))
+	assertions.Zero(membershipCount)
+	assertions.Empty(*fixture.refreshed)
+}
+
+func TestAppendDraftReplyRetainsFailureCause(t *testing.T) {
+	addr, _ := testutil.StartIMAPMemServerForDrafts(t, testutil.IMAPDraftServerOptions{
+		MessagesPerMailbox: map[string]int{"Drafts": 0},
+		Caps:               emersionimap.CapSet{emersionimap.CapIMAP4rev1: {}},
+	})
+	host, portText, err := net.SplitHostPort(addr)
+	require.NoError(t, err)
+	port, err := strconv.Atoi(portText)
+	require.NoError(t, err)
+	adapter := &storeAPIAdapter{
+		draftClientFactory: func(context.Context, *store.Source) (*imaplib.Client, error) {
+			return imaplib.NewClient(&imaplib.Config{Host: host, Port: port, Username: testutil.IMAPTestUsername}, testutil.IMAPTestPassword), nil
+		},
+	}
+	for _, tc := range []struct{ name, mailbox, code, cause string }{
+		{"missing UIDPLUS", "Drafts", "uidplus_required", "IMAP server does not advertise UIDPLUS"},
+		{"invalid mailbox", "", "invalid_mailbox", "mailbox must be nonblank"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requirements := require.New(t)
+			assertions := assert.New(t)
+			var events []api.CLIRunEvent
+			client, err := adapter.draftClientFactory(t.Context(), &store.Source{})
+			requirements.NoError(err)
+			t.Cleanup(func() { _ = client.Close() })
+			_, err = adapter.appendDraftReplyWithClient(t.Context(), client, draftReplyTarget{source: &store.Source{}, mailbox: tc.mailbox}, []byte("Subject: Reply\r\n\r\nreply body\r\n"), func(event api.CLIRunEvent) error {
+				events = append(events, event)
+				return nil
+			})
+			requirements.EqualError(err, tc.code)
+			coded, ok := errors.AsType[*api.CLIRunCodedError](err)
+			requirements.True(ok)
+			requirements.EqualError(coded.Err, tc.cause)
+			assertions.Equal([]api.CLIRunEvent{{Type: cliStreamStderr, Data: tc.code + "\n"}}, events)
+		})
+	}
+}
+
+func TestDraftReplyCLIFailureOutput(t *testing.T) {
+	for _, failure := range []string{"local persistence", "APPEND rejected", "no result"} {
+		for _, asJSON := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/json=%t", failure, asJSON), func(t *testing.T) {
+				requirements := require.New(t)
+				assertions := assert.New(t)
+				fixture := newDraftReplyFixture(t)
+				adapter := fixture.grantedAdapter()
+				switch failure {
+				case "local persistence":
+					// The remote accepts UID 1, but the archive already owns its key.
+					conversationID, err := fixture.store.EnsureConversation(fixture.source.ID, "stale", "Stale")
+					requirements.NoError(err)
+					_, err = fixture.store.PersistMessage(&store.MessagePersistData{
+						Message: &store.Message{
+							SourceID: fixture.source.ID, SourceMessageID: "Drafts|1",
+							ConversationID: conversationID,
+							MessageType:    store.MessageTypeEmail,
+						},
+						BodyText: sql.NullString{String: "stale", Valid: true},
+						RawMIME:  []byte("Subject: Stale\r\n\r\nstale\r\n"),
+					})
+					requirements.NoError(err)
+				case "APPEND rejected":
+					adapter.draftPolicy[0].Mailbox = "Missing"
+				case "no result":
+					adapter.draftPolicy = nil
+				}
+				server := httptest.NewServer(api.NewServerWithOptions(api.ServerOptions{
+					Config: &config.Config{HomeDir: t.TempDir()},
+					Store:  adapter,
+					Logger: slog.New(slog.DiscardHandler),
+				}).Router())
+				t.Cleanup(server.Close)
+				testCtx := configureRemoteDaemonForTest(t, server.URL)
+				root := &cobra.Command{Use: "msgvault"}
+				root.SetContext(testCtx)
+				root.AddCommand(newDraftReplyCommand())
+				silenceUsageInRunE(root)
+				var stdout, stderr bytes.Buffer
+				root.SetOut(&stdout)
+				root.SetErr(&stderr)
+				args := []string{"draft-reply", strconv.FormatInt(fixture.parentID, 10), "--from", testutil.IMAPTestUsername, "--body", "reply body"}
+				if asJSON {
+					args = append(args, "--json")
+				}
+				root.SetArgs(args)
+				requirements.Error(root.ExecuteContext(testCtx))
+				assertions.Empty(stdout.String())
+				assertions.Len(strings.Split(strings.TrimSpace(stderr.String()), "\n"), 1, stderr.String())
+				switch failure {
+				case "local persistence":
+					if asJSON {
+						var result draftReplyOutput
+						requirements.NoError(json.Unmarshal(stderr.Bytes(), &result), stderr.String())
+						assertions.Equal(draftReplyStatusLocalFailed, result.Status)
+						assertions.NotEmpty(result.OperationRef)
+					} else {
+						assertions.Contains(stderr.String(), "remote accepted; local persistence failed, inspect operation ")
+					}
+				case "APPEND rejected":
+					assertions.Equal("append_rejected\n", stderr.String())
+				case "no result":
+					assertions.Contains(stderr.String(), "Error:")
+					assertions.Contains(stderr.String(), "draft_disabled")
+				}
+			})
+		}
+	}
+}
+
+// TestDelegatedDraftRefusesOutOfGrantSource tests proof matrix row 1.
+// When the caller presents a grant that does not include the message's source,
+// resolveDraftReplyTarget must return not_permitted — never draft_disabled or
+// invalid_source — to prevent source disclosure.
+func TestDelegatedDraftRefusesOutOfGrantSource(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	fixture := newDraftReplyFixture(t)
+	adapter := fixture.grantedAdapter()
+
+	// A grant that references a different source entirely.
+	outOfScopeGrant := &agentgrant.Grant{
+		ID:          "g-out-of-scope",
+		Permissions: []agentgrant.Permission{agentgrant.PermissionDraftCreate},
+		Sources: []agentgrant.SourceRef{
+			{ID: fixture.source.ID + 999, Type: "imap", Identifier: "other@example.com"},
+		},
+	}
+
+	intent := draftReplyIntent{
+		MessageID: fixture.parentID,
+		From:      testutil.IMAPTestUsername,
+		Body:      "reply body",
+	}
+	target, selectedFrom, selfAddresses, err := adapter.resolveDraftTarget(t.Context(), &intent.MessageID, "", 0, false, intent.From, outOfScopeGrant, false)
+	assertions.Empty(target)
+	assertions.Empty(selectedFrom)
+	assertions.Empty(selfAddresses)
+	requirements.Error(err)
+	assertions.Equal("not_permitted", err.Error())
+	coded, ok := errors.AsType[*api.CLIRunCodedError](err)
+	requirements.True(ok)
+	assertions.Error(coded.Err)
+}
+
+// TestDraftRequiresBothChecks tests proof matrix row 20.
+// It verifies that authorizeDelegatedDraftSource runs BEFORE authorizeIMAPDraft
+// so an out-of-grant source cannot infer whether drafting is configured.
+func TestDraftRequiresBothChecks(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	fixture := newDraftReplyFixture(t)
+
+	inGrantRef := agentgrant.SourceRef{
+		ID:         fixture.source.ID,
+		Type:       fixture.source.SourceType,
+		Identifier: fixture.source.Identifier,
+		SenderKeys: []string{store.NormalizeIdentifierForCompare(testutil.IMAPTestUsername)},
+	}
+	inGrant := &agentgrant.Grant{
+		ID:          "g-in-grant",
+		Permissions: []agentgrant.Permission{agentgrant.PermissionDraftCreate},
+		Sources:     []agentgrant.SourceRef{inGrantRef},
+	}
+	outOfGrant := &agentgrant.Grant{
+		ID:          "g-other",
+		Permissions: []agentgrant.Permission{agentgrant.PermissionDraftCreate},
+		Sources:     []agentgrant.SourceRef{{ID: 9999, Type: "imap", Identifier: "stranger@example.com"}},
+	}
+
+	intent := draftReplyIntent{
+		MessageID: fixture.parentID,
+		From:      testutil.IMAPTestUsername,
+		Body:      "reply body",
+	}
+
+	t.Run("grant in-scope but no draft policy returns draft_disabled", func(t *testing.T) {
+		// Grant allows the source but [[imap.drafts]] policy is absent.
+		// The error must be draft_disabled (from authorizeIMAPDraft), not not_permitted.
+		adapter := &storeAPIAdapter{
+			store:       fixture.store,
+			draftPolicy: nil,
+		}
+		target, selectedFrom, selfAddresses, err := adapter.resolveDraftTarget(t.Context(), &intent.MessageID, "", 0, false, intent.From, inGrant, false)
+		assertions.Empty(target)
+		assertions.Empty(selectedFrom)
+		assertions.Empty(selfAddresses)
+		requirements.Error(err)
+		assertions.Equal("draft_disabled", err.Error())
+	})
+
+	t.Run("grant out-of-scope but draft policy exists returns not_permitted", func(t *testing.T) {
+		// The [[imap.drafts]] policy permits the source, but the grant doesn't.
+		// authorizeDelegatedDraftSource runs first, so the code is not_permitted,
+		// not draft_disabled — the caller cannot infer whether drafting is configured.
+		adapter := fixture.grantedAdapter()
+		target, selectedFrom, selfAddresses, err := adapter.resolveDraftTarget(t.Context(), &intent.MessageID, "", 0, false, intent.From, outOfGrant, false)
+		assertions.Empty(target)
+		assertions.Empty(selectedFrom)
+		assertions.Empty(selfAddresses)
+		requirements.Error(err)
+		assertions.Equal("not_permitted", err.Error())
+	})
+
+	t.Run("grant without the selected sender returns not_permitted", func(t *testing.T) {
+		adapter := fixture.grantedAdapter()
+		grantWithoutSender := &agentgrant.Grant{
+			ID:          "g-no-sender",
+			Permissions: []agentgrant.Permission{agentgrant.PermissionDraftCreate},
+			Sources:     []agentgrant.SourceRef{{ID: fixture.source.ID, Type: "imap", Identifier: fixture.source.Identifier}},
+		}
+		target, selectedFrom, selfAddresses, err := adapter.resolveDraftTarget(
+			t.Context(), &intent.MessageID, "", 0, false, intent.From, grantWithoutSender, false,
+		)
+		assertions.Empty(target)
+		assertions.Empty(selectedFrom)
+		assertions.Empty(selfAddresses)
+		requirements.Error(err)
+		assertions.Equal("not_permitted", err.Error())
+	})
+
+	t.Run("automatic sender selection respects the frozen grant", func(t *testing.T) {
+		adapter := fixture.grantedAdapter()
+		grantWithoutCurrentSender := &agentgrant.Grant{
+			ID:          "g-other-sender",
+			Permissions: []agentgrant.Permission{agentgrant.PermissionDraftCreate},
+			Sources:     []agentgrant.SourceRef{{ID: fixture.source.ID, Type: "imap", Identifier: fixture.source.Identifier, SenderKeys: []string{"alias@example.com"}}},
+		}
+		from := ""
+		target, selectedFrom, selfAddresses, err := adapter.resolveDraftTarget(
+			t.Context(), &intent.MessageID, "", 0, false, from, grantWithoutCurrentSender, false,
+		)
+		assertions.Empty(target)
+		assertions.Empty(selectedFrom)
+		assertions.Empty(selfAddresses)
+		requirements.Error(err)
+		assertions.Equal("not_permitted", err.Error())
+	})
+
+	t.Run("destination resolution hides missing sources from grants", func(t *testing.T) {
+		adapter := fixture.grantedAdapter()
+		target, selectedFrom, selfAddresses, err := adapter.resolveDraftTarget(
+			t.Context(), &intent.MessageID, "", fixture.source.ID+999, true, intent.From, inGrant, false,
+		)
+		assertions.Empty(target)
+		assertions.Empty(selectedFrom)
+		assertions.Empty(selfAddresses)
+		requirements.Error(err)
+		assertions.Equal("not_permitted", err.Error())
+	})
+
+	t.Run("non-email parent is refused before MIME parsing", func(t *testing.T) {
+		_, updateErr := fixture.store.DB().Exec(
+			fixture.store.Rebind("UPDATE messages SET message_type = ? WHERE id = ?"),
+			store.MessageTypeGoogleChat, fixture.parentID,
+		)
+		requirements.NoError(updateErr)
+		adapter := fixture.grantedAdapter()
+		_, _, _, err := adapter.resolveDraftTarget(
+			t.Context(), &intent.MessageID, "", 0, false, intent.From, inGrant, false,
+		)
+		requirements.Error(err)
+		assertions.Equal("invalid_parent", err.Error())
+	})
+}
+
+func TestDraftReplyPersistDataScopesCrossSourceConversation(t *testing.T) {
+	requirements := require.New(t)
+	parentRaw := []byte("From: sender@example.com\r\nMessage-ID: <parent@example.com>\r\nSubject: Imported\r\n\r\nold\r\n")
+	reply, err := imaplib.BuildReply(parentRaw, "owner@example.com", "reply", time.Now(), "draft@example.com")
+	requirements.NoError(err)
+	target := draftReplyTarget{
+		parent:       &store.APIMessage{ID: 7, SourceConversationID: "INBOX|9"},
+		parentSource: &store.Source{ID: 1},
+		source:       &store.Source{ID: 2},
+	}
+	data := draftReplyPersistData(target, reply, store.IMAPDraftReceipt{SourceID: 2, Mailbox: "Drafts", UIDValidity: 1, UID: 4}, "draft@example.com", []int64{1, 2})
+	requirements.Equal("draft-reply-1-2-INBOX|9", data.Conversation.SourceConversationID)
+}
+
+func TestDraftReplyPersistDataScopesComposeConversationByUIDValidity(t *testing.T) {
+	requirements := require.New(t)
+	parentRaw := []byte("From: sender@example.com\r\nMessage-ID: <parent@example.com>\r\nSubject: Imported\r\n\r\nold\r\n")
+	reply, err := imaplib.BuildReply(parentRaw, "owner@example.com", "compose", time.Now(), "draft@example.com")
+	requirements.NoError(err)
+	target := draftReplyTarget{source: &store.Source{ID: 2}}
+	first := draftReplyPersistData(target, reply, store.IMAPDraftReceipt{SourceID: 2, Mailbox: "Drafts", UIDValidity: 1, UID: 4}, "draft@example.com", []int64{1, 2})
+	second := draftReplyPersistData(target, reply, store.IMAPDraftReceipt{SourceID: 2, Mailbox: "Drafts", UIDValidity: 2, UID: 4}, "draft@example.com", []int64{1, 2})
+
+	requirements.NotEqual(first.Conversation.SourceConversationID, second.Conversation.SourceConversationID)
+	requirements.Equal("draft-compose-2-1-Drafts|4", first.Conversation.SourceConversationID)
+	requirements.Equal("draft-compose-2-2-Drafts|4", second.Conversation.SourceConversationID)
+	requirements.Equal("Drafts|4", first.Message.SourceMessageID)
+	requirements.Equal("Drafts|4", second.Message.SourceMessageID)
+}

@@ -38,6 +38,7 @@ func decodePersonAttributes(
 }
 
 func TestPersonAttributesHTTPListsDefinitionsSetsHistoryAndClears(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, person := newPersonAttributeFixture(t)
@@ -74,7 +75,53 @@ func TestPersonAttributesHTTPListsDefinitionsSetsHistoryAndClears(t *testing.T) 
 	require.Equal(http.StatusOK, cleared.Code, cleared.Body.String())
 }
 
+// This catches coupling the writable preferred-channel attribute to the
+// Directory's observed last-contact channel and its filter membership.
+func TestPersonAttributesHTTPPreferredChannelDoesNotChangeDirectoryObservedChannel(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	srv, st := newIdentityLinkTestServer(t)
+	person := createDirectoryHTTPPerson(
+		t, st, "Channel Fixture", "channel@example.test", "friend", "Example Org", true,
+	)
+	path := personAttributesPath(person.ID) + "/" + store.AttributeSlugPrimaryChannel
+
+	assertObservedEmail := func() {
+		email := personRequest(t, srv, http.MethodGet,
+			peoplePath+"/directory?primary_channel=email", nil, "")
+		require.Equal(http.StatusOK, email.Code, email.Body.String())
+		var page DirectoryPeopleResponse
+		require.NoError(json.Unmarshal(email.Body.Bytes(), &page))
+		require.Len(page.People, 1)
+		assert.Equal(t, person.ID, page.People[0].ID)
+		assert.Equal(t, "email", page.People[0].PrimaryChannel)
+
+		chat := personRequest(t, srv, http.MethodGet,
+			peoplePath+"/directory?primary_channel=chat", nil, "")
+		require.Equal(http.StatusOK, chat.Code, chat.Body.String())
+		var chatPage DirectoryPeopleResponse
+		require.NoError(json.Unmarshal(chat.Body.Bytes(), &chatPage))
+		assert.Empty(t, chatPage.People)
+	}
+
+	assertObservedEmail()
+	set := attributeRequest(t, srv, http.MethodPut, path,
+		[]byte(`{"value":{"type":"text","text":"chat"},"source":"user"}`), "")
+	require.Equal(http.StatusOK, set.Code, set.Body.String())
+	var write store.PersonAttributeWrite
+	require.NoError(json.Unmarshal(set.Body.Bytes(), &write))
+	require.NotNil(write.Value)
+	require.NotNil(write.Value.Value.Text)
+	assert.Equal(t, "chat", *write.Value.Value.Text)
+	assertObservedEmail()
+
+	cleared := attributeRequest(t, srv, http.MethodDelete, path, nil, "")
+	require.Equal(http.StatusOK, cleared.Code, cleared.Body.String())
+	assertObservedEmail()
+}
+
 func TestHTTPAppendPersonNoteUsesAtomicStorePath(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, st := newIdentityLinkTestServer(t)
@@ -142,6 +189,7 @@ func TestHTTPAppendPersonNoteUsesAtomicStorePath(t *testing.T) {
 }
 
 func TestPersonAttributesHTTPClearRejectsStaleExpectedValueID(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, person := newPersonAttributeFixture(t)
@@ -179,6 +227,7 @@ func TestPersonAttributesHTTPClearRejectsStaleExpectedValueID(t *testing.T) {
 }
 
 func TestPersonAttributesHTTPPreservesLegacySlugAcrossSeedCollision(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, st := newIdentityLinkTestServer(t)
@@ -232,6 +281,7 @@ func seededAttributeDefinitionInputBySlug(
 }
 
 func TestPersonAttributesHTTPRejectsDerivedInvalidUnknownAndSupportsDryRun(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, person := newPersonAttributeFixture(t)
@@ -283,6 +333,7 @@ func TestPersonAttributesHTTPRejectsDerivedInvalidUnknownAndSupportsDryRun(t *te
 }
 
 func TestPersonAttributesHTTPKeepsInactiveDefinitionValuesVisibleAndClearable(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, st := newIdentityLinkTestServer(t)

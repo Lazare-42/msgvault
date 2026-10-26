@@ -1,6 +1,10 @@
 package query
 
-import "time"
+import (
+	"time"
+
+	"go.kenn.io/msgvault/internal/search"
+)
 
 // ExploreRequest is the canonical modality-neutral analytical request. The
 // API layer validates the finite grouping/sort catalog before constructing it.
@@ -29,7 +33,7 @@ type IdentityPredicate struct {
 	ParticipantIDs []int64
 	// EmailIdentifier carries the confirmed address when it is email-shaped.
 	// Non-empty, it switches recipient-row matching to the immutable
-	// envelope snapshot (message_recipients.email_address, compared
+	// envelope snapshot (message_recipients.envelope_address, compared
 	// case-insensitively like every email rule): participant merges repoint
 	// recipient rows onto a survivor that may carry several aliases, so a
 	// participant-only match would let one alias's filter select another
@@ -50,6 +54,8 @@ type IdentityPredicate struct {
 
 // Context narrows the archive before logical chat rows are aggregated.
 type Context struct {
+	AccountScopes []search.AccountScope `json:"account_scopes,omitempty"`
+
 	SourceIDs      []int64            `json:"source_ids,omitempty"`
 	ParticipantIDs []int64            `json:"participant_ids,omitempty"`
 	Domains        []string           `json:"domains,omitempty"`
@@ -65,11 +71,16 @@ type Context struct {
 	// AdditionalDomainGroups is the domain analogue of
 	// AdditionalParticipantGroups: each inner slice is OR'd internally, the
 	// groups are AND'd together and AND'd with the primary Domains group.
-	AdditionalDomainGroups [][]string     `json:"additional_domain_groups,omitempty"`
-	MessageTypes           []string       `json:"message_types,omitempty"`
-	After                  *time.Time     `json:"after,omitempty"`
-	Before                 *time.Time     `json:"before,omitempty"`
-	Deletion               DeletionFilter `json:"deletion,omitempty"`
+	AdditionalDomainGroups [][]string `json:"additional_domain_groups,omitempty"`
+	MessageTypes           []string   `json:"message_types,omitempty"`
+	// MailingLists is an exact case-insensitive scalar membership group.
+	// AdditionalMailingListGroups preserves repeated API filter conjunctions;
+	// values within each group are OR'd, while groups are AND'd.
+	MailingLists                []string       `json:"mailing_lists,omitempty"`
+	AdditionalMailingListGroups [][]string     `json:"additional_mailing_list_groups,omitempty"`
+	After                       *time.Time     `json:"after,omitempty"`
+	Before                      *time.Time     `json:"before,omitempty"`
+	Deletion                    DeletionFilter `json:"deletion,omitempty"`
 }
 
 type DeletionFilter string
@@ -130,8 +141,8 @@ type SortSpec struct {
 }
 
 type PageSpec struct {
-	Limit  int `json:"limit,omitempty"`
-	Offset int `json:"offset,omitempty"`
+	Limit  int `json:"limit,omitzero"`
+	Offset int `json:"offset,omitzero"`
 }
 
 type EntryKind string
@@ -145,14 +156,14 @@ const (
 )
 
 type MatchSummary struct {
-	LexicalMatchCount *int64   `json:"lexical_match_count,omitempty"`
+	LexicalMatchCount *int64   `json:"lexical_match_count,omitzero" nullable:"false"`
 	StrongestExcerpt  string   `json:"strongest_excerpt,omitempty"`
-	SemanticScore     *float64 `json:"semantic_score,omitempty"`
+	SemanticScore     *float64 `json:"semantic_score,omitzero" nullable:"false"`
 }
 
 type SearchProvenance struct {
 	LexicalIndexRevision string `json:"lexical_index_revision,omitempty"`
-	VectorGeneration     *int64 `json:"vector_generation,omitempty"`
+	VectorGeneration     *int64 `json:"vector_generation,omitzero" nullable:"false"`
 }
 
 // EntryRow is one logical archive row. Chat/text rows aggregate messages only
@@ -160,8 +171,8 @@ type SearchProvenance struct {
 type EntryRow struct {
 	Key                        string       `json:"key"`
 	Kind                       EntryKind    `json:"kind"`
-	AnchorMessageID            *int64       `json:"anchor_message_id,omitempty"`
-	ConversationID             *int64       `json:"conversation_id,omitempty"`
+	AnchorMessageID            *int64       `json:"anchor_message_id,omitzero" nullable:"false"`
+	ConversationID             *int64       `json:"conversation_id,omitzero" nullable:"false"`
 	OccurredAt                 time.Time    `json:"occurred_at"`
 	Match                      MatchSummary `json:"match"`
 	SourceID                   int64        `json:"source_id"`
@@ -189,7 +200,7 @@ type EntryRow struct {
 	// message-relative sender cluster (see buildExploreSQL). It is nil when no
 	// owner can be identified or every participant on the entry is the owner:
 	// never guessed from participant_ids[0] alone.
-	CounterpartParticipantID *int64 `json:"counterpart_participant_id,omitempty"`
+	CounterpartParticipantID *int64 `json:"counterpart_participant_id,omitzero" nullable:"false"`
 }
 
 type ExploreResponse struct {
@@ -205,7 +216,7 @@ type ExploreResponse struct {
 // conversation rows.
 type ExploreCoverageRequest struct {
 	Context   Context `json:"context"`
-	BatchSize int     `json:"batch_size,omitempty"`
+	BatchSize int     `json:"batch_size,omitzero"`
 }
 
 // ExploreCoverageResult reports one full coverage scan: the set-wise

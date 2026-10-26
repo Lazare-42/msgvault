@@ -20,7 +20,11 @@ var (
 	ErrPersonReferenced                   = errors.New("person is referenced by another profile")
 	ErrPersonCardDAVPublished             = errors.New("person has CardDAV publication state")
 	ErrPersonMergeActive                  = errors.New("person has active merge lineage")
+	ErrPersonUIDAmbiguous                 = errors.New("person UID resolves to multiple people")
 	ErrPersonEnrichmentDispatchInProgress = errors.New("person enrichment provider dispatch is in progress")
+	ErrInvalidDirectoryQuery              = errors.New("invalid directory query")
+	ErrInvalidDirectoryCursor             = errors.New("invalid directory cursor")
+	ErrDirectoryProjectionStale           = errors.New("directory projection is stale")
 )
 
 // PersonBindingConflictError reports the curated people that would be
@@ -43,13 +47,14 @@ func (e *PersonBindingConflictError) Unwrap() error {
 // edge never deletes or moves them, so one person may intentionally span
 // multiple clusters until the user re-links or unbinds those participants.
 type Person struct {
-	ID             int64     `json:"id"`
-	VCardUID       string    `json:"vcard_uid"`
-	DisplayName    *string   `json:"display_name,omitempty"`
-	Revision       int64     `json:"revision"`
-	ParticipantIDs []int64   `json:"participant_ids"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
+	ID              int64            `json:"id"`
+	VCardUID        string           `json:"vcard_uid"`
+	CardDAVBindings []CardDAVBinding `json:"carddav_bindings,omitempty"`
+	DisplayName     *string          `json:"display_name,omitzero" nullable:"false"`
+	Revision        int64            `json:"revision"`
+	ParticipantIDs  []int64          `json:"participant_ids"`
+	CreatedAt       time.Time        `json:"created_at"`
+	UpdatedAt       time.Time        `json:"updated_at"`
 }
 
 func (s *Store) CreatePersonFromParticipant(participantID int64) (*Person, bool, error) {
@@ -63,6 +68,15 @@ func (s *Store) CreatePersonFromParticipant(participantID int64) (*Person, bool,
 // can distinguish creation from an idempotent re-promotion.
 func (s *Store) CreatePersonFromParticipantContext(
 	ctx context.Context, participantID int64,
+) (*Person, bool, error) {
+	return s.CreatePersonFromParticipantWithDisplayNameContext(ctx, participantID, nil)
+}
+
+// CreatePersonFromParticipantWithDisplayNameContext promotes a cluster with
+// an optional initial name. A nil name seeds the first observed cluster name;
+// an explicit blank stores no name. Existing profiles retain their saved name.
+func (s *Store) CreatePersonFromParticipantWithDisplayNameContext(
+	ctx context.Context, participantID int64, displayName *string,
 ) (*Person, bool, error) {
 	if participantID <= 0 {
 		return nil, false, fmt.Errorf("promote participant %d: %w", participantID, ErrInvalidParticipantID)
@@ -99,12 +113,19 @@ func (s *Store) CreatePersonFromParticipantContext(
 		}
 		created = len(personIDs) == 0
 		if created {
+			if displayName == nil {
+				displayName, err = observedPersonDisplayNameTx(ctx, tx, members)
+				if err != nil {
+					return err
+				}
+			}
+			displayName = normalizePersonDisplayName(displayName)
 			uid, err := newVCardUID()
 			if err != nil {
 				return err
 			}
 			if err := tx.QueryRowContext(ctx,
-				`INSERT INTO persons (vcard_uid) VALUES (?) RETURNING id`, uid,
+				`INSERT INTO persons (vcard_uid, display_name) VALUES (?, ?) RETURNING id`, uid, displayName,
 			).Scan(&personID); err != nil {
 				return fmt.Errorf("create person: %w", err)
 			}
@@ -141,6 +162,35 @@ func (s *Store) CreatePersonFromParticipantContext(
 		return nil, false, err
 	}
 	return person, created, nil
+}
+
+// observedPersonDisplayNameTx follows the observed cluster label's name tier:
+// the first named participant by ID wins. Normalize before selection so a
+// whitespace-only member cannot hide a named alias.
+func observedPersonDisplayNameTx(ctx context.Context, tx *loggedTx, members []int64) (*string, error) {
+	placeholders, args := sortedIDPlaceholders(members)
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+		SELECT display_name FROM participants WHERE id IN (%s) ORDER BY id
+	`, placeholders), args...)
+	if err != nil {
+		return nil, fmt.Errorf("look up observed person display name: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	for rows.Next() {
+		var name sql.NullString
+		if err := rows.Scan(&name); err != nil {
+			return nil, fmt.Errorf("scan observed person display name: %w", err)
+		}
+		if name.Valid {
+			if normalized := normalizePersonDisplayName(&name.String); normalized != nil {
+				return normalized, nil
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate observed person display names: %w", err)
+	}
+	return nil, nil //nolint:nilnil // A cluster without an observed name has no default.
 }
 
 // bindPersonParticipantsTx binds every member to the person, ignoring
@@ -278,7 +328,7 @@ func (s *Store) deletePersonOnce(ctx context.Context, input DeletePersonEnrichme
 		}
 		var hasCardDAVPublication bool
 		if err := tx.QueryRowContext(ctx,
-			`SELECT EXISTS (SELECT 1 FROM carddav_publications WHERE person_id = ?)`, id,
+			`SELECT EXISTS (SELECT 1 FROM carddav_publications WHERE person_id = ? UNION ALL SELECT 1 FROM carddav_conflicts c JOIN carddav_resources r ON r.address_book_id=c.address_book_id AND r.href=c.href WHERE c.status='unresolved' AND c.local_mutation_intent IS NOT NULL AND r.person_id=?)`, id, id,
 		).Scan(&hasCardDAVPublication); err != nil {
 			return fmt.Errorf("check CardDAV publication for person %d: %w", id, err)
 		}
@@ -403,19 +453,37 @@ func (s *Store) deletePersonOnce(ctx context.Context, input DeletePersonEnrichme
 		if err := s.bumpPersonDeletionCounterpartVCardProjectionsTx(ctx, tx, id); err != nil {
 			return err
 		}
-		var deletedID int64
+		if _, err := tx.ExecContext(ctx, `UPDATE carddav_resources SET owns_display_name = FALSE WHERE person_id = ?`, id); err != nil {
+			return fmt.Errorf("clear deleted person's display-name ownership: %w", err)
+		}
+
+		var deletedUID string
 		err = tx.QueryRowContext(ctx,
-			`DELETE FROM persons WHERE id = ? AND revision = ? RETURNING id`,
-			id, expectedRevision).Scan(&deletedID)
+			`DELETE FROM persons WHERE id = ? AND revision = ? RETURNING vcard_uid`,
+			id, expectedRevision).Scan(&deletedUID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return s.personCASMissTx(ctx, tx, id)
 		}
 		if err != nil {
 			return fmt.Errorf("delete person %d: %w", id, err)
 		}
+		if err := retireDeletedPersonUIDTx(ctx, tx, deletedUID); err != nil {
+			return err
+		}
 		_, err = s.bumpIdentityRevisionContext(ctx, tx)
 		return err
 	})
+}
+
+// retireDeletedPersonUIDTx reserves a deleted person's UID so no later
+// person, including one imported from a CardDAV card, can adopt it.
+func retireDeletedPersonUIDTx(ctx context.Context, tx *loggedTx, uid string) error {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO person_uid_aliases
+		(retired_uid, surviving_person_id, reason) VALUES (?, NULL, 'deletion')
+		ON CONFLICT (retired_uid) DO NOTHING`, uid); err != nil {
+		return fmt.Errorf("retire deleted person UID: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) deleteIdentityMatchCandidatesForPersonTx(
@@ -454,6 +522,96 @@ func (s *Store) GetPersonContext(ctx context.Context, id int64) (*Person, error)
 		return nil, err
 	}
 	return person, nil
+}
+
+// GetPersonByUIDContext resolves a current person UID, a retired UID that
+// still aliases a surviving person, or a UID on a CardDAV resource bound to
+// one person. It rejects a remote UID that identifies different people in
+// different address books.
+func (s *Store) GetPersonByUIDContext(ctx context.Context, uid string) (*Person, error) {
+	uid = strings.TrimSpace(uid)
+	if uid == "" {
+		return nil, ErrPersonNotFound
+	}
+	var person *Person
+	err := s.withReadSnapshotContext(ctx, func(tx *loggedTx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT person_id FROM (
+			SELECT id AS person_id FROM persons WHERE vcard_uid = ?
+			UNION
+			SELECT surviving_person_id AS person_id FROM person_uid_aliases
+				WHERE retired_uid = ? AND surviving_person_id IS NOT NULL
+			UNION
+			SELECT person_id FROM carddav_resources
+				WHERE remote_uid = ? AND person_id IS NOT NULL
+		) resolved ORDER BY person_id`, uid, uid, uid)
+		if err != nil {
+			return fmt.Errorf("resolve person UID: %w", err)
+		}
+		defer func() { _ = rows.Close() }()
+		var personID int64
+		count := 0
+		for rows.Next() {
+			if err := rows.Scan(&personID); err != nil {
+				return fmt.Errorf("scan person UID resolution: %w", err)
+			}
+			count++
+			if count > 1 {
+				return ErrPersonUIDAmbiguous
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("iterate person UID resolution: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("close person UID resolution: %w", err)
+		}
+		if count == 0 {
+			return ErrPersonNotFound
+		}
+		person, err = s.getPersonTx(ctx, tx, personID)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return person, nil
+}
+
+// ListPersonUIDsContext returns the person's canonical vCard UID followed by
+// every retired UID that currently resolves to that person. Cross-system
+// links can keep using an old UID across a merge and split reversal.
+func (s *Store) ListPersonUIDsContext(ctx context.Context, id int64) ([]string, error) {
+	var result []string
+	err := s.withTxContext(ctx, func(tx *loggedTx) error {
+		person, err := s.getPersonTx(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		result = append(result, person.VCardUID)
+		rows, err := tx.QueryContext(ctx, `SELECT retired_uid
+			FROM person_uid_aliases
+			WHERE surviving_person_id = ?
+			ORDER BY retired_uid`, id)
+		if err != nil {
+			return fmt.Errorf("list retired UIDs for person %d: %w", id, err)
+		}
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var uid string
+			if err := rows.Scan(&uid); err != nil {
+				return fmt.Errorf("scan retired UID for person %d: %w", id, err)
+			}
+			result = append(result, uid)
+		}
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("iterate retired UIDs for person %d: %w", id, err)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
 }
 
 func (s *Store) ListPersons() ([]Person, error) {
@@ -501,8 +659,19 @@ func (s *Store) updatePersonDisplayNameOnce(
 		if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
 			return err
 		}
+		var previousName sql.NullString
+		err := tx.QueryRowContext(ctx,
+			`SELECT display_name FROM persons WHERE id = ? AND revision = ?`,
+			id, expectedRevision,
+		).Scan(&previousName)
+		if errors.Is(err, sql.ErrNoRows) {
+			return s.personCASMissTx(ctx, tx, id)
+		}
+		if err != nil {
+			return fmt.Errorf("read person %d display name: %w", id, err)
+		}
 		var updatedID int64
-		err := tx.QueryRowContext(ctx, fmt.Sprintf(`
+		err = tx.QueryRowContext(ctx, fmt.Sprintf(`
 			UPDATE persons
 			SET display_name = ?, revision = revision + 1,
 			    vcard_projection_revision = vcard_projection_revision + 1,
@@ -515,6 +684,21 @@ func (s *Store) updatePersonDisplayNameOnce(
 		}
 		if err != nil {
 			return fmt.Errorf("update person %d: %w", id, err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE carddav_resources SET owns_display_name = FALSE WHERE person_id = ?`, updatedID); err != nil {
+			return fmt.Errorf("retain local display-name ownership: %w", err)
+		}
+
+		// Preserve the person revision contract, but invalidate analytics only
+		// when the normalized display name actually changed.
+		nameChanged := previousName.Valid
+		if displayName != nil {
+			nameChanged = !previousName.Valid || previousName.String != *displayName
+		}
+		if nameChanged {
+			if err := s.bumpPersonDisplayNameRevisionContext(ctx, tx); err != nil {
+				return err
+			}
 		}
 		if err := s.bumpDisplayNameCounterpartVCardProjectionsTx(
 			ctx, tx, updatedID,
@@ -579,6 +763,16 @@ func (s *Store) getPersonTx(ctx context.Context, tx *loggedTx, id int64) (*Perso
 	if person == nil {
 		return nil, ErrPersonNotFound
 	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close person %d rows: %w", id, err)
+	}
+	bindings, err := s.listCardDAVBindingsTx(ctx, tx, []int64{id})
+	if err != nil {
+		return nil, err
+	}
+	if len(bindings[id]) > 0 {
+		person.CardDAVBindings = bindings[id]
+	}
 	return person, nil
 }
 
@@ -613,6 +807,18 @@ func (s *Store) listPersonsTx(ctx context.Context, tx *loggedTx) ([]Person, erro
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate persons: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close person list rows: %w", err)
+	}
+	bindings, err := s.listAllCardDAVBindingsTx(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	for index := range persons {
+		if len(bindings[persons[index].ID]) > 0 {
+			persons[index].CardDAVBindings = bindings[persons[index].ID]
+		}
 	}
 	return persons, nil
 }

@@ -25,6 +25,7 @@ import (
 	"go.kenn.io/msgvault/internal/backupapp"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
 func TestBackupRestorePackedTargetSelection(t *testing.T) {
@@ -44,6 +45,8 @@ func TestBackupRestorePackedTargetSelection(t *testing.T) {
 }
 
 func TestBackupRestoreTargetCoordinatorMatchesConfiguredDatabasePath(t *testing.T) {
+	cfg := testConfigValue()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	lockDir := t.TempDir()
@@ -55,7 +58,9 @@ func TestBackupRestoreTargetCoordinatorMatchesConfiguredDatabasePath(t *testing.
 		DataDir:     lockDir,
 		DatabaseURL: "file:" + filepath.Join(target, "msgvault.db"),
 	}}
-	coordinator, coordinated, err := backupRestoreTargetCoordinator(target, true)
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
+	coordinator, coordinated, err := backupRestoreTargetCoordinator(target, true, cfg)
 	require.NoError(err, "select restore coordination by configured database path")
 	require.True(coordinated, "restoring the configured database requires ownership coordination")
 	require.NotNil(coordinator, "configured database target receives a coordinator")
@@ -63,7 +68,7 @@ func TestBackupRestoreTargetCoordinatorMatchesConfiguredDatabasePath(t *testing.
 	root, err := os.OpenRoot(target)
 	require.NoError(err, "pin restore target")
 	t.Cleanup(func() { require.NoError(root.Close(), "close restore target root") })
-	lease, err := coordinator.AcquireRestoreTarget(context.Background(), root)
+	lease, err := coordinator.AcquireRestoreTarget(testCtx, root)
 	require.NoError(err, "acquire configured database restore coordination")
 	t.Cleanup(func() { require.NoError(lease.Release(), "release restore coordination") })
 
@@ -81,21 +86,28 @@ func TestBackupRestoreTargetCoordinatorMatchesConfiguredDatabasePath(t *testing.
 }
 
 func TestBackupRestoreTargetCoordinatorRejectsPrimaryDatabaseAsVectorBackend(t *testing.T) {
+	cfg := testConfigValue()
+
 	require := require.New(t)
 	target := t.TempDir()
 
 	savedCfg := cfg
 	t.Cleanup(func() { cfg = savedCfg })
 	cfg = &config.Config{Data: config.DataConfig{DataDir: target}}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
+	_ = testCtx
 	cfg.Vector.DBPath = filepath.Join(target, "msgvault.db")
 
-	coordinator, coordinated, err := backupRestoreTargetCoordinator(target, true)
+	coordinator, coordinated, err := backupRestoreTargetCoordinator(target, true, cfg)
 	require.ErrorContains(err, "vector database path resolves to the restored archive database")
 	require.Nil(coordinator)
 	require.False(coordinated)
 }
 
 func TestBackupRestoreTargetCoordinatorDefersMissingCaseVariantMatch(t *testing.T) {
+	cfg := testConfigValue()
+
 	require := require.New(t)
 	parent := t.TempDir()
 	probe := filepath.Join(parent, "CaseProbe")
@@ -114,8 +126,10 @@ func TestBackupRestoreTargetCoordinatorDefersMissingCaseVariantMatch(t *testing.
 	savedCfg := cfg
 	t.Cleanup(func() { cfg = savedCfg })
 	cfg = &config.Config{Data: config.DataConfig{DataDir: configuredDataDir}}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 
-	coordinator, coordinated, err := backupRestoreTargetCoordinator(target, false)
+	coordinator, coordinated, err := backupRestoreTargetCoordinator(target, false, cfg)
 	require.NoError(err, "select conditional restore coordination")
 	require.True(coordinated,
 		"missing case variants require comparison after Kit pins the target")
@@ -126,7 +140,7 @@ func TestBackupRestoreTargetCoordinatorDefersMissingCaseVariantMatch(t *testing.
 	root, err := os.OpenRoot(target)
 	require.NoError(err, "pin folded restore target")
 	t.Cleanup(func() { require.NoError(root.Close(), "close folded restore target root") })
-	lease, err := coordinator.AcquireRestoreTarget(context.Background(), root)
+	lease, err := coordinator.AcquireRestoreTarget(testCtx, root)
 	require.NoError(err, "acquire folded restore target coordination")
 	t.Cleanup(func() { require.NoError(lease.Release(), "release folded restore coordination") })
 
@@ -140,15 +154,14 @@ func TestBackupRestoreTargetCoordinatorDefersMissingCaseVariantMatch(t *testing.
 }
 
 func TestRunBackupRestorePackedDefaultAndExplicitLooseCleanup(t *testing.T) {
+	cfg := testConfigValue()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	ctx := context.Background()
 	dataDir := t.TempDir()
 	dbPath := filepath.Join(dataDir, "msgvault.db")
-	st, err := store.OpenForTest(dbPath)
-	require.NoError(err)
-	t.Cleanup(func() { _ = st.Close() })
-	require.NoError(st.InitSchema())
+	st := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	source, err := st.GetOrCreateSource("gmail", "restore-cli@example.com")
 	require.NoError(err)
 	conversationID, err := st.EnsureConversation(source.ID, "restore-cli-thread", "Restore CLI")
@@ -231,6 +244,8 @@ func TestRunBackupRestorePackedDefaultAndExplicitLooseCleanup(t *testing.T) {
 		backupRestoreIntegrityCheck = savedIntegrityCheck
 	})
 	cfg = &config.Config{Data: config.DataConfig{DataDir: filepath.Join(t.TempDir(), "live")}}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	backupRestoreRepo = repoPath
 	backupRestoreOverwrite = false
 	backupRestoreForceUnlock = false
@@ -241,7 +256,7 @@ func TestRunBackupRestorePackedDefaultAndExplicitLooseCleanup(t *testing.T) {
 	backupRestoreIntegrityCheck = false
 	var packedOutput bytes.Buffer
 	packedCmd := &cobra.Command{Use: "restore"}
-	packedCmd.SetContext(ctx)
+	packedCmd.SetContext(testCtx)
 	packedCmd.SetOut(&packedOutput)
 	require.NoError(runBackupRestore(packedCmd, nil))
 	assert.Contains(packedOutput.String(), "1 packed in 1 pack(s), 0 loose")
@@ -259,7 +274,7 @@ func TestRunBackupRestorePackedDefaultAndExplicitLooseCleanup(t *testing.T) {
 	backupRestoreIntegrityCheck = true
 	var looseOutput bytes.Buffer
 	looseCmd := &cobra.Command{Use: "restore"}
-	looseCmd.SetContext(ctx)
+	looseCmd.SetContext(testCtx)
 	looseCmd.SetOut(&looseOutput)
 	require.NoError(runBackupRestore(looseCmd, nil))
 	assert.Contains(looseOutput.String(), "Pack metadata cleared")
@@ -270,14 +285,14 @@ func TestRunBackupRestorePackedDefaultAndExplicitLooseCleanup(t *testing.T) {
 }
 
 func TestRunBackupRestoreIntoNonexistentConfiguredDataDir(t *testing.T) {
+	cfg := testConfigValue()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	ctx := context.Background()
 	sourceDir := t.TempDir()
 	dbPath := filepath.Join(sourceDir, "msgvault.db")
-	st, err := store.OpenForTest(dbPath)
-	require.NoError(err, "open source store")
-	require.NoError(st.InitSchema(), "initialize source schema")
+	st := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	require.NoError(st.Close(), "close source store")
 	attachmentsDir := filepath.Join(sourceDir, "attachments")
 	require.NoError(os.MkdirAll(attachmentsDir, 0o700), "create source attachments")
@@ -310,6 +325,8 @@ func TestRunBackupRestoreIntoNonexistentConfiguredDataDir(t *testing.T) {
 	})
 	target := filepath.Join(t.TempDir(), "fresh-archive")
 	cfg = &config.Config{Data: config.DataConfig{DataDir: target}}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	backupRestoreRepo = repoPath
 	backupRestoreTarget = target
 	backupRestoreOverwrite = false
@@ -320,7 +337,7 @@ func TestRunBackupRestoreIntoNonexistentConfiguredDataDir(t *testing.T) {
 	assert.NoDirExists(target, "restore target starts absent")
 
 	cmd := &cobra.Command{Use: "restore"}
-	cmd.SetContext(ctx)
+	cmd.SetContext(testCtx)
 	cmd.SetOut(io.Discard)
 	require.NoError(runBackupRestore(cmd, nil), "restore into fresh configured archive home")
 	assert.FileExists(filepath.Join(target, "msgvault.db"), "restored database")
@@ -331,14 +348,14 @@ func TestRunBackupRestoreIntoNonexistentConfiguredDataDir(t *testing.T) {
 }
 
 func TestRunBackupRestoreRejectsDaemonClaimAfterPreflight(t *testing.T) {
+	cfg := testConfigValue()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	ctx := context.Background()
 	sourceDir := t.TempDir()
 	dbPath := filepath.Join(sourceDir, "msgvault.db")
-	st, err := store.OpenForTest(dbPath)
-	require.NoError(err, "open source store")
-	require.NoError(st.InitSchema(), "initialize source schema")
+	st := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	require.NoError(st.Close(), "close source store")
 	attachmentsDir := filepath.Join(sourceDir, "attachments")
 	require.NoError(os.MkdirAll(attachmentsDir, 0o700), "create source attachments")
@@ -376,6 +393,8 @@ func TestRunBackupRestoreRejectsDaemonClaimAfterPreflight(t *testing.T) {
 	require.NoError(os.WriteFile(filepath.Join(target, "msgvault.db"), liveDatabase, 0o600),
 		"seed live target database")
 	cfg = &config.Config{Data: config.DataConfig{DataDir: target}}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	backupRestoreRepo = repoPath
 	backupRestoreTarget = target
 	backupRestoreOverwrite = true
@@ -395,7 +414,7 @@ func TestRunBackupRestoreRejectsDaemonClaimAfterPreflight(t *testing.T) {
 	})
 
 	cmd := &cobra.Command{Use: "restore"}
-	cmd.SetContext(ctx)
+	cmd.SetContext(testCtx)
 	cmd.SetOut(io.Discard)
 	err = runBackupRestore(cmd, nil)
 	require.ErrorContains(err, "daemon is already running",
@@ -406,14 +425,14 @@ func TestRunBackupRestoreRejectsDaemonClaimAfterPreflight(t *testing.T) {
 }
 
 func TestDaemonRestoreTargetCoordinatorHoldsDaemonAndWriteLeasesThroughoutRestore(t *testing.T) {
+	cfg := testConfigValue()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	ctx := context.Background()
 	sourceDir := t.TempDir()
 	dbPath := filepath.Join(sourceDir, "msgvault.db")
-	st, err := store.OpenForTest(dbPath)
-	require.NoError(err, "open source store")
-	require.NoError(st.InitSchema(), "initialize source schema")
+	st := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	require.NoError(st.Close(), "close source store")
 	attachmentsDir := filepath.Join(sourceDir, "attachments")
 	require.NoError(os.MkdirAll(attachmentsDir, 0o700), "create source attachments")
@@ -439,8 +458,10 @@ func TestDaemonRestoreTargetCoordinatorHoldsDaemonAndWriteLeasesThroughoutRestor
 	savedCfg := cfg
 	t.Cleanup(func() { cfg = savedCfg })
 	cfg = &config.Config{Data: config.DataConfig{DataDir: target}}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	cfg.Vector.DBPath = customVectorPath
-	coordinator, coordinated, err := backupRestoreTargetCoordinator(target, true)
+	coordinator, coordinated, err := backupRestoreTargetCoordinator(target, true, cfg)
 	require.NoError(err, "select configured restore coordination")
 	require.True(coordinated, "configured archive restore requires ownership coordination")
 	require.NotNil(coordinator, "configured archive restore receives a coordinator")
@@ -486,6 +507,8 @@ func TestDaemonRestoreTargetCoordinatorHoldsDaemonAndWriteLeasesThroughoutRestor
 }
 
 func TestDaemonRestoreTargetCoordinatorPreservesVectorsWithoutPublication(t *testing.T) {
+	cfg := testConfigValue()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	target := t.TempDir()
@@ -499,15 +522,17 @@ func TestDaemonRestoreTargetCoordinatorPreservesVectorsWithoutPublication(t *tes
 	savedCfg := cfg
 	t.Cleanup(func() { cfg = savedCfg })
 	cfg = &config.Config{Data: config.DataConfig{DataDir: target}}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	cfg.Vector.DBPath = customVectorPath
-	coordinator, coordinated, err := backupRestoreTargetCoordinator(target, true)
+	coordinator, coordinated, err := backupRestoreTargetCoordinator(target, true, cfg)
 	require.NoError(err, "select configured restore coordination")
 	require.True(coordinated, "configured archive restore requires ownership coordination")
 
 	root, err := os.OpenRoot(target)
 	require.NoError(err, "pin restore target")
 	t.Cleanup(func() { require.NoError(root.Close(), "close restore target root") })
-	lease, err := coordinator.AcquireRestoreTarget(t.Context(), root)
+	lease, err := coordinator.AcquireRestoreTarget(testCtx, root)
 	require.NoError(err, "acquire restore coordination")
 	require.NoError(lease.Release(), "release without publishing a restored database")
 
@@ -543,13 +568,13 @@ func TestDaemonRestoreTargetLeaseRefusesToRemovePublishedDatabase(t *testing.T) 
 }
 
 func TestDaemonRestoreTargetCoordinatorCanonicalizesMissingSymlinkedParent(t *testing.T) {
+	cfg := testConfigValue()
+
 	require := require.New(t)
 	ctx := context.Background()
 	sourceDir := t.TempDir()
 	dbPath := filepath.Join(sourceDir, "msgvault.db")
-	st, err := store.OpenForTest(dbPath)
-	require.NoError(err, "open source store")
-	require.NoError(st.InitSchema(), "initialize source schema")
+	st := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	require.NoError(st.Close(), "close source store")
 	attachmentsDir := filepath.Join(sourceDir, "attachments")
 	require.NoError(os.MkdirAll(attachmentsDir, 0o700), "create source attachments")
@@ -576,7 +601,9 @@ func TestDaemonRestoreTargetCoordinatorCanonicalizesMissingSymlinkedParent(t *te
 	savedCfg := cfg
 	t.Cleanup(func() { cfg = savedCfg })
 	cfg = &config.Config{Data: config.DataConfig{DataDir: configuredDataDir}}
-	coordinator, coordinated, err := backupRestoreTargetCoordinator(target, false)
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
+	coordinator, coordinated, err := backupRestoreTargetCoordinator(target, false, cfg)
 	require.NoError(err, "select restore target coordination")
 	require.True(coordinated,
 		"resolved target must match an absent configured archive beneath a symlinked parent")
@@ -616,7 +643,7 @@ func assertRestoredCLIBlob(t *testing.T, target, hash string, want []byte, packe
 	restored, err := store.OpenForTest(filepath.Join(target, "msgvault.db"))
 	require.NoError(err)
 	defer func() { require.NoError(restored.Close()) }()
-	records, err := restored.ListPackRecords()
+	records, err := restored.ListPackRecordsContext(t.Context())
 	require.NoError(err)
 	indexed, err := restored.ListIndexedBlobHashes()
 	require.NoError(err)
@@ -720,6 +747,8 @@ func TestPrintBackupRestoreSummaryReportsPackedMixedAndLooseLayouts(t *testing.T
 const restorePackAForOutput = "01hzy3v7q8r9s0t1a2v3w4x5y6"
 
 func TestResolveBackupRepoPrecedence(t *testing.T) {
+	cfg := testConfigValue()
+
 	savedCfg := cfg
 	defer func() { cfg = savedCfg }()
 
@@ -758,7 +787,7 @@ func TestResolveBackupRepoPrecedence(t *testing.T) {
 			assert := assert.New(t)
 			cfg = &config.Config{Backup: config.BackupConfig{Repo: tt.configRepo}}
 
-			repo, err := resolveBackupRepo(tt.flagValue)
+			repo, err := resolveBackupRepo(tt.flagValue, cfg)
 
 			if tt.wantErr {
 				require.Error(err)
@@ -777,6 +806,8 @@ func TestResolveBackupRepoPrecedence(t *testing.T) {
 // the compatible-runtime lookup, yet it still owns the archive's SQLite
 // database, so restoring into its home must be refused all the same.
 func TestRefuseRestoreIntoLiveDaemonHomeBlocksIncompatibleDaemon(t *testing.T) {
+	cfg := testConfigValue()
+
 	require := require.New(t)
 	dataDir := t.TempDir()
 	server := httptest.NewServer(daemon.NewPingHandler(daemon.PingHandlerOptions{
@@ -810,11 +841,13 @@ func TestRefuseRestoreIntoLiveDaemonHomeBlocksIncompatibleDaemon(t *testing.T) {
 	savedCfg := cfg
 	defer func() { cfg = savedCfg }()
 	cfg = &config.Config{Data: config.DataConfig{DataDir: dataDir}}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 
-	err = refuseRestoreIntoLiveDaemonHome(dataDir)
+	err = refuseRestoreIntoLiveDaemonHome(dataDir, cfg)
 	require.ErrorContains(err, "running daemon",
 		"restore into the live archive home must be refused even when the daemon is incompatible")
-	require.NoError(refuseRestoreIntoLiveDaemonHome(t.TempDir()),
+	require.NoError(refuseRestoreIntoLiveDaemonHome(t.TempDir(), cfg),
 		"a target outside the archive home stays allowed")
 
 	// The guard compares filesystem identity, not path strings, so an
@@ -824,11 +857,13 @@ func TestRefuseRestoreIntoLiveDaemonHomeBlocksIncompatibleDaemon(t *testing.T) {
 	if err := os.Symlink(dataDir, alias); err != nil {
 		t.Skip("symlinks not supported on this platform")
 	}
-	require.ErrorContains(refuseRestoreIntoLiveDaemonHome(alias), "running daemon",
+	require.ErrorContains(refuseRestoreIntoLiveDaemonHome(alias, cfg), "running daemon",
 		"an aliased path to the archive home must be refused")
 }
 
 func TestRefuseRestoreIntoLiveDaemonHomeBlocksUnverifiableDaemonOwner(t *testing.T) {
+	cfg := testConfigValue()
+
 	require := require.New(t)
 	dataDir := t.TempDir()
 	owner, err := tryAcquireDaemonOwnerLock(dataDir)
@@ -850,13 +885,17 @@ func TestRefuseRestoreIntoLiveDaemonHomeBlocksUnverifiableDaemonOwner(t *testing
 	savedCfg := cfg
 	t.Cleanup(func() { cfg = savedCfg })
 	cfg = &config.Config{Data: config.DataConfig{DataDir: dataDir}}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 
-	err = refuseRestoreIntoLiveDaemonHome(dataDir)
+	err = refuseRestoreIntoLiveDaemonHome(dataDir, cfg)
 	require.ErrorContains(err, "running daemon",
 		"held daemon ownership must block restore even when endpoint identity is unverifiable")
 }
 
 func TestRefuseRestoreIntoLiveDaemonHomeFailsClosedWhenLockCannotBeProbed(t *testing.T) {
+	cfg := testConfigValue()
+
 	require := require.New(t)
 	dataDir := t.TempDir()
 	require.NoError(os.Mkdir(daemonOwnerLockPath(dataDir), 0o700),
@@ -865,18 +904,22 @@ func TestRefuseRestoreIntoLiveDaemonHomeFailsClosedWhenLockCannotBeProbed(t *tes
 	savedCfg := cfg
 	t.Cleanup(func() { cfg = savedCfg })
 	cfg = &config.Config{Data: config.DataConfig{DataDir: dataDir}}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 
-	err := refuseRestoreIntoLiveDaemonHome(dataDir)
+	err := refuseRestoreIntoLiveDaemonHome(dataDir, cfg)
 	require.ErrorContains(err, "inspect daemon ownership",
 		"restore must fail closed when daemon ownership cannot be determined")
 }
 
 func TestResolveBackupRepoNilConfig(t *testing.T) {
+	cfg := testConfigValue()
+
 	savedCfg := cfg
 	defer func() { cfg = savedCfg }()
 	cfg = nil
 
-	repo, err := resolveBackupRepo("/flag/repo")
+	repo, err := resolveBackupRepo("/flag/repo", cfg)
 
 	require.NoError(t, err)
 	assert.Equal(t, "/flag/repo", repo)

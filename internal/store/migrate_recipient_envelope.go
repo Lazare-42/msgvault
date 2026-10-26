@@ -47,7 +47,7 @@ func (c recipientOrphanCleanup) total() int64 {
 // only after success, so the next open retries.
 func (s *Store) ensureRecipientEnvelopeUniqueIndex(ctx context.Context) error {
 	return s.runOnceMigration(
-		ctx, migrationRecipientEnvelopeUnique, false,
+		ctx, migrationRecipientEnvelopeUnique, 1, false,
 		func(ctx context.Context) error {
 			var (
 				cleanup recipientOrphanCleanup
@@ -73,6 +73,9 @@ func (s *Store) ensureRecipientEnvelopeUniqueIndex(ctx context.Context) error {
 					return fmt.Errorf("create idx_message_recipients_envelope: %w", err)
 				}
 				if rebuilt {
+					if err := ensureRecipientCacheJournalTriggers(boundQuerier{ctx: ctx, q: tx}); err != nil {
+						return err
+					}
 					if err := s.dialect.EnsureTriggers(boundQuerier{ctx: ctx, q: tx}); err != nil {
 						return fmt.Errorf("restore triggers after rebuilding message_recipients: %w", err)
 					}
@@ -98,6 +101,41 @@ func (s *Store) ensureRecipientEnvelopeUniqueIndex(ctx context.Context) error {
 			return nil
 		},
 	)
+}
+
+// Install after schema creation and after a legacy recipient table rebuild.
+// From rows determine owner_participant_id in message shards even when
+// replacing them leaves messages.is_from_me unchanged.
+func ensureRecipientCacheJournalTriggers(q querier) error {
+	for _, stmt := range []string{
+		`CREATE TRIGGER IF NOT EXISTS trg_cache_recipients_insert
+		AFTER INSERT ON message_recipients FOR EACH ROW BEGIN
+			INSERT INTO cache_related_change_journal (dataset, message_id)
+			VALUES (CASE WHEN NEW.recipient_type = 'from' THEN 'message_facts'
+				ELSE 'message_recipients' END, NEW.message_id);
+		END`,
+		`CREATE TRIGGER IF NOT EXISTS trg_cache_recipients_update
+		AFTER UPDATE ON message_recipients FOR EACH ROW BEGIN
+			INSERT INTO cache_related_change_journal (dataset, message_id)
+			VALUES (CASE WHEN OLD.recipient_type = 'from' OR NEW.recipient_type = 'from'
+				THEN 'message_facts' ELSE 'message_recipients' END, OLD.message_id);
+			INSERT INTO cache_related_change_journal (dataset, message_id)
+			SELECT CASE WHEN NEW.recipient_type = 'from' THEN 'message_facts'
+				ELSE 'message_recipients' END, NEW.message_id
+			WHERE NEW.message_id <> OLD.message_id;
+		END`,
+		`CREATE TRIGGER IF NOT EXISTS trg_cache_recipients_delete
+		AFTER DELETE ON message_recipients FOR EACH ROW BEGIN
+			INSERT INTO cache_related_change_journal (dataset, message_id)
+			VALUES (CASE WHEN OLD.recipient_type = 'from' THEN 'message_facts'
+				ELSE 'message_recipients' END, OLD.message_id);
+		END`,
+	} {
+		if _, err := q.Exec(stmt); err != nil {
+			return fmt.Errorf("ensure recipient cache journal trigger: %w", err)
+		}
+	}
+	return nil
 }
 
 // dropRecipientTableUniqueConstraintsPG drops every UNIQUE constraint on

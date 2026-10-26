@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -38,7 +39,9 @@ func TestServeOwnershipEnsureRuntimeRecordRepublishesMissingRecord(t *testing.T)
 
 	dataDir := t.TempDir()
 	cfg := &config.Config{Data: config.DataConfig{DataDir: dataDir}}
-	owner, err := claimServeOwnership(context.Background(), cfg, "127.0.0.1", 8123, "v-test")
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
+	owner, err := claimServeOwnership(testCtx, cfg, "127.0.0.1", 8123, "v-test")
 	require.NoError(err, "claimServeOwnership")
 	t.Cleanup(func() { require.NoError(owner.Close(), "close ownership") })
 
@@ -70,68 +73,46 @@ func TestServeOwnershipEnsureRuntimeRecordRepublishesMissingRecord(t *testing.T)
 }
 
 func TestRuntimeRecordHeartbeatRepublishesUntilCancelled(t *testing.T) {
-	require := require.New(t)
-
-	dataDir := t.TempDir()
-	cfg := &config.Config{Data: config.DataConfig{DataDir: dataDir}}
-	owner, err := claimServeOwnership(context.Background(), cfg, "127.0.0.1", 8123, "v-test")
-	require.NoError(err, "claimServeOwnership")
-	t.Cleanup(func() { require.NoError(owner.Close(), "close ownership") })
-
-	path, err := daemonRuntimeStore(dataDir).Path(owner.record.PID)
-	require.NoError(err, "runtime record path")
-	require.NoError(os.Remove(path), "remove runtime record")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		runtimeRecordHeartbeat(ctx, owner, 10*time.Millisecond)
-	}()
-
-	require.Eventually(func() bool {
+	synctest.Test(t, func(t *testing.T) {
+		require := require.New(t)
+		dataDir := t.TempDir()
+		cfg := &config.Config{Data: config.DataConfig{DataDir: dataDir}}
+		owner, err := claimServeOwnership(context.Background(), cfg, "127.0.0.1", 8123, "v-test")
+		require.NoError(err, "claimServeOwnership")
+		path, err := daemonRuntimeStore(dataDir).Path(owner.record.PID)
+		require.NoError(err, "runtime record path")
+		require.NoError(os.Remove(path), "remove runtime record")
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { defer close(done); runtimeRecordHeartbeat(ctx, owner, 10*time.Millisecond) }()
+		t.Cleanup(func() { cancel(); <-done; require.NoError(owner.Close(), "close ownership") })
+		synctest.Sleep(10 * time.Millisecond)
+		synctest.Wait()
 		_, statErr := os.Stat(path)
-		return statErr == nil
-	}, 5*time.Second, 10*time.Millisecond, "heartbeat republishes the pruned record")
-
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		require.FailNow("heartbeat did not stop after context cancellation")
-	}
+		require.NoError(statErr, "heartbeat republishes the pruned record")
+	})
 }
 
 func TestRuntimeRecordHeartbeatDoesNotRepublishAfterOwnershipClose(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-
-	dataDir := t.TempDir()
-	cfg := &config.Config{Data: config.DataConfig{DataDir: dataDir}}
-	owner, err := claimServeOwnership(context.Background(), cfg, "127.0.0.1", 8123, "v-test")
-	require.NoError(err, "claimServeOwnership")
-
-	path, err := daemonRuntimeStore(dataDir).Path(owner.record.PID)
-	require.NoError(err, "runtime record path")
-
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		runtimeRecordHeartbeat(ctx, owner, time.Millisecond)
-	}()
-	t.Cleanup(func() {
-		cancel()
-		<-done
-	})
-
-	require.NoError(owner.Close(), "close ownership")
-	require.NoError(owner.SetStartupPhase("still starting"), "startup phase update after close")
-	assert.Never(func() bool {
+	synctest.Test(t, func(t *testing.T) {
+		assert := assert.New(t)
+		require := require.New(t)
+		dataDir := t.TempDir()
+		cfg := &config.Config{Data: config.DataConfig{DataDir: dataDir}}
+		owner, err := claimServeOwnership(context.Background(), cfg, "127.0.0.1", 8123, "v-test")
+		require.NoError(err, "claimServeOwnership")
+		path, err := daemonRuntimeStore(dataDir).Path(owner.record.PID)
+		require.NoError(err, "runtime record path")
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { defer close(done); runtimeRecordHeartbeat(ctx, owner, time.Millisecond) }()
+		t.Cleanup(func() { cancel(); <-done; require.NoError(owner.Close(), "close ownership") })
+		require.NoError(owner.Close(), "close ownership")
+		require.NoError(owner.SetStartupPhase("still starting"), "startup phase update after close")
+		synctest.Sleep(100 * time.Millisecond)
 		_, statErr := os.Stat(path)
-		return statErr == nil
-	}, 100*time.Millisecond, time.Millisecond, "closed ownership must stay unpublished")
+		assert.ErrorIs(statErr, os.ErrNotExist, "closed ownership must stay unpublished")
+	})
 }
 
 func TestRuntimeRecordHeartbeatSerializesStartupPhaseUpdates(t *testing.T) {
@@ -140,14 +121,16 @@ func TestRuntimeRecordHeartbeatSerializesStartupPhaseUpdates(t *testing.T) {
 
 	dataDir := t.TempDir()
 	cfg := &config.Config{Data: config.DataConfig{DataDir: dataDir}}
-	owner, err := claimServeOwnership(context.Background(), cfg, "127.0.0.1", 8123, "v-test")
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
+	owner, err := claimServeOwnership(testCtx, cfg, "127.0.0.1", 8123, "v-test")
 	require.NoError(err, "claimServeOwnership")
 	t.Cleanup(func() { require.NoError(owner.Close(), "close ownership") })
 
 	path, err := daemonRuntimeStore(dataDir).Path(owner.record.PID)
 	require.NoError(err, "runtime record path")
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(testCtx)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -177,8 +160,10 @@ func TestClaimServeOwnershipLocksAndPublishesRuntime(t *testing.T) {
 
 	dataDir := t.TempDir()
 	cfg := &config.Config{Data: config.DataConfig{DataDir: dataDir}}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 
-	owner, err := claimServeOwnership(context.Background(), cfg, "127.0.0.1", 8123, "v-test")
+	owner, err := claimServeOwnership(testCtx, cfg, "127.0.0.1", 8123, "v-test")
 	require.NoError(
 		err, "claimServeOwnership")
 
@@ -215,7 +200,9 @@ func TestServeOwnershipStartupPhaseUpdatesRuntimeRecord(t *testing.T) {
 
 	dataDir := t.TempDir()
 	cfg := &config.Config{Data: config.DataConfig{DataDir: dataDir}}
-	owner, err := claimServeOwnership(context.Background(), cfg, "127.0.0.1", 8123, "v-test")
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
+	owner, err := claimServeOwnership(testCtx, cfg, "127.0.0.1", 8123, "v-test")
 	require.NoError(err, "claimServeOwnership")
 	t.Cleanup(func() { require.NoError(owner.Close(), "close ownership") })
 
@@ -246,7 +233,9 @@ func TestServeOwnershipStartupCacheBuildOutcomeUpdatesRuntimeRecord(t *testing.T
 
 	dataDir := t.TempDir()
 	cfg := &config.Config{Data: config.DataConfig{DataDir: dataDir}}
-	owner, err := claimServeOwnership(context.Background(), cfg, "127.0.0.1", 8123, "v-test")
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
+	owner, err := claimServeOwnership(testCtx, cfg, "127.0.0.1", 8123, "v-test")
 	require.NoError(err, "claimServeOwnership")
 	t.Cleanup(func() { require.NoError(owner.Close(), "close ownership") })
 
@@ -272,12 +261,14 @@ func TestServeOwnershipStartupCacheBuildOutcomeUpdatesRuntimeRecord(t *testing.T
 func TestClaimServeOwnershipRejectsSecondOwner(t *testing.T) {
 	dataDir := t.TempDir()
 	cfg := &config.Config{Data: config.DataConfig{DataDir: dataDir}}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 
 	first, err := tryAcquireWriteOwnerLock(dataDir)
 	require.NoError(t, err, "pre-held lock")
 	t.Cleanup(func() { require.NoError(t, first.Close(), "close pre-held lock") })
 
-	owner, err := claimServeOwnership(context.Background(), cfg, "127.0.0.1", 8123, "v-test")
+	owner, err := claimServeOwnership(testCtx, cfg, "127.0.0.1", 8123, "v-test")
 	assert.Nil(t, owner, "ownership")
 	require.ErrorAs(t, err, &writeOwnerLockHeldError{}, "error type")
 }
@@ -290,8 +281,10 @@ func TestClaimServeOwnershipSkipsSQLiteLockForPostgreSQL(t *testing.T) {
 		DataDir:     dataDir,
 		DatabaseURL: "postgres://user:pass@example.com:5432/msgvault",
 	}}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 
-	owner, err := claimServeOwnership(context.Background(), cfg, "127.0.0.1", 8123, "v-test")
+	owner, err := claimServeOwnership(testCtx, cfg, "127.0.0.1", 8123, "v-test")
 	require.NoError(
 		err, "claimServeOwnership")
 
@@ -320,14 +313,16 @@ func TestClaimServeOwnershipRejectsSecondPostgreSQLDaemon(t *testing.T) {
 		DataDir:     dataDir,
 		DatabaseURL: "postgres://user:pass@example.com:5432/msgvault",
 	}}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 
-	owner, err := claimServeOwnership(context.Background(), cfg, "127.0.0.1", 8123, "v-test")
+	owner, err := claimServeOwnership(testCtx, cfg, "127.0.0.1", 8123, "v-test")
 	require.NoError(
 		err, "claimServeOwnership")
 
 	t.Cleanup(func() { require.NoError(owner.Close(), "close ownership") })
 
-	second, err := claimServeOwnership(context.Background(), cfg, "127.0.0.1", 8124, "v-test")
+	second, err := claimServeOwnership(testCtx, cfg, "127.0.0.1", 8124, "v-test")
 	assert.Nil(second, "second owner")
 	require.Error(err, "second PostgreSQL daemon should be rejected")
 	assert.Contains(err.Error(), "daemon", "error names daemon ownership")

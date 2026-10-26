@@ -79,7 +79,8 @@ func (s *Store) RepairHistoricalAttachmentRolesBatch(
 			return AttachmentRoleRepairProgress{}, err
 		}
 		decodeLimit := min(int64(attachmentRoleRepairMaxMessageBytes), remainingBytes)
-		raw, bytesRead, decodeErr := decodeMessageRawBounded(compressed, compression, decodeLimit)
+		raw, bytesRead, decodeErr := decodeMessageRawBounded(
+			compressed, compression, decodeLimit, errAttachmentRoleRepairMessageTooLarge)
 		if errors.Is(decodeErr, errAttachmentRoleRepairMessageTooLarge) &&
 			decodeLimit < attachmentRoleRepairMaxMessageBytes {
 			hasMore = true
@@ -130,6 +131,10 @@ func (s *Store) RepairHistoricalAttachmentRolesBatch(
 				  AND attachment_role = 'unknown'
 				  AND source_part_key IS NULL
 				  AND content_hash = ?
+				  AND NOT EXISTS (
+					SELECT 1 FROM source_merge_preserved_attachments spa
+					WHERE spa.attachment_id = attachments.id
+				  )
 				  AND NOT EXISTS (
 					SELECT 1 FROM attachments keyed
 					WHERE keyed.message_id = ? AND keyed.source_part_key = ?
@@ -198,6 +203,10 @@ func mergeDuplicateAttachmentRoleRepair(
 		  AND attachment_role = 'unknown'
 		  AND source_part_key IS NULL
 		  AND content_hash = ?
+		  AND NOT EXISTS (
+			SELECT 1 FROM source_merge_preserved_attachments spa
+			WHERE spa.attachment_id = attachments.id
+		  )
 	`, update.attachmentID, update.messageID, update.contentHash)
 	if err != nil {
 		return false, err
@@ -236,6 +245,10 @@ func (s *Store) nextAttachmentRoleRepairMessageIDs(
 		  AND EXISTS (
 			SELECT 1 FROM attachments a
 			WHERE a.message_id = m.id AND a.attachment_role = 'unknown'
+			  AND NOT EXISTS (
+				SELECT 1 FROM source_merge_preserved_attachments spa
+				WHERE spa.attachment_id = a.id
+			  )
 		  )
 		ORDER BY m.id
 		LIMIT ?
@@ -278,17 +291,23 @@ func (s *Store) attachmentRoleRepairMessageRaw(
 	return compressed, compression, nil
 }
 
+// decodeMessageRawBounded decompresses at most maxBytes of a stored raw
+// record. Decompression is capped with an io.LimitReader of maxBytes+1, so a
+// stream larger than the cap is detected without materializing it, and the
+// caller-supplied tooLargeErr is returned instead. bytesRead reports how many
+// decompressed bytes were consumed before the cap or stream end.
 func decodeMessageRawBounded(
 	compressed []byte,
 	compression sql.NullString,
 	maxBytes int64,
+	tooLargeErr error,
 ) ([]byte, int64, error) {
 	if maxBytes <= 0 {
-		return nil, 0, errAttachmentRoleRepairMessageTooLarge
+		return nil, 0, tooLargeErr
 	}
 	if !compression.Valid || compression.String != "zlib" {
 		if int64(len(compressed)) > maxBytes {
-			return nil, maxBytes + 1, errAttachmentRoleRepairMessageTooLarge
+			return nil, maxBytes + 1, tooLargeErr
 		}
 		return compressed, int64(len(compressed)), nil
 	}
@@ -300,7 +319,7 @@ func decodeMessageRawBounded(
 	closeErr := reader.Close()
 	bytesRead := int64(len(data))
 	if bytesRead > maxBytes {
-		return nil, bytesRead, errAttachmentRoleRepairMessageTooLarge
+		return nil, bytesRead, tooLargeErr
 	}
 	if readErr != nil {
 		return nil, bytesRead, readErr
@@ -328,6 +347,10 @@ func (s *Store) prepareAttachmentRoleRepair(messageID int64, raw []byte) ([]atta
 		SELECT id, COALESCE(content_hash, '')
 		FROM attachments
 		WHERE message_id = ? AND attachment_role = 'unknown'
+		  AND NOT EXISTS (
+			SELECT 1 FROM source_merge_preserved_attachments spa
+			WHERE spa.attachment_id = attachments.id
+		  )
 	`, messageID)
 	if err != nil {
 		return nil, err
@@ -348,37 +371,9 @@ func (s *Store) prepareAttachmentRoleRepair(messageID int64, raw []byte) ([]atta
 		return nil, err
 	}
 
-	// Enmime can expose the same physical part through both Attachments and
-	// Inlines. PartKey is the source identity, so collapse that duplicate while
-	// preserving the stricter inline evidence. A key with conflicting bytes is
-	// corrupt/ambiguous and is excluded entirely.
-	partsByKey := make(map[string]internalmime.Attachment, len(parsed.Attachments))
-	conflictedKeys := make(map[string]struct{})
+	partsByHash := make(map[string][]internalmime.Attachment, len(parsed.Attachments))
 	for _, part := range parsed.Attachments {
 		if part.PartKey == "" {
-			continue
-		}
-		previous, exists := partsByKey[part.PartKey]
-		if !exists {
-			partsByKey[part.PartKey] = part
-			continue
-		}
-		if previous.ContentHash != part.ContentHash {
-			conflictedKeys[part.PartKey] = struct{}{}
-			continue
-		}
-		if part.IsInline || part.Disposition == "inline" || part.ContentID != "" {
-			previous.IsInline = true
-			previous.Disposition = "inline"
-			if previous.ContentID == "" {
-				previous.ContentID = part.ContentID
-			}
-			partsByKey[part.PartKey] = previous
-		}
-	}
-	partsByHash := make(map[string][]internalmime.Attachment, len(partsByKey))
-	for partKey, part := range partsByKey {
-		if _, conflicted := conflictedKeys[partKey]; conflicted {
 			continue
 		}
 		partsByHash[part.ContentHash] = append(partsByHash[part.ContentHash], part)

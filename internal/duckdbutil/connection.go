@@ -11,8 +11,6 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
-
-	_ "github.com/duckdb/duckdb-go/v2" // Register the DuckDB database/sql driver.
 )
 
 var duckDBSizePattern = regexp.MustCompile(`(?i)^[1-9][0-9]*(B|KB|MB|GB|TB|KIB|MIB|GIB|TIB)$`)
@@ -22,6 +20,17 @@ type Policy struct {
 	MemoryLimit          string
 	Threads              int
 	TempDirectory        string
+	MaxTempDirectorySize string
+}
+
+// InteractiveOverrides contains optional interactive/daemon-query policy
+// values. Empty size values and zero threads retain InteractivePolicy
+// defaults, which are sized for a laptop-scale archive: a query that spills
+// past max_temp_directory_size fails outright with a DuckDB out-of-memory
+// error rather than running slowly, so a large archive needs to raise them.
+type InteractiveOverrides struct {
+	MemoryLimit          string
+	Threads              int
 	MaxTempDirectorySize string
 }
 
@@ -41,6 +50,22 @@ func InteractivePolicy(tempDirectory string) Policy {
 		TempDirectory:        tempDirectory,
 		MaxTempDirectorySize: "2GB",
 	}
+}
+
+// InteractivePolicyWithOverrides applies non-zero overrides to
+// InteractivePolicy.
+func InteractivePolicyWithOverrides(tempDirectory string, overrides InteractiveOverrides) Policy {
+	policy := InteractivePolicy(tempDirectory)
+	if overrides.MemoryLimit != "" {
+		policy.MemoryLimit = overrides.MemoryLimit
+	}
+	if overrides.Threads != 0 {
+		policy.Threads = overrides.Threads
+	}
+	if overrides.MaxTempDirectorySize != "" {
+		policy.MaxTempDirectorySize = overrides.MaxTempDirectorySize
+	}
+	return policy
 }
 
 // BuilderPolicy returns the bounded policy for cache derivation processes.
@@ -71,6 +96,9 @@ func BuilderPolicyWithOverrides(tempDirectory string, overrides BuilderOverrides
 // Open creates one in-memory DuckDB connection and applies policy before any
 // analytical work can run.
 func Open(ctx context.Context, policy Policy) (*sql.DB, error) {
+	if !Available {
+		return nil, errors.New("DuckDB requires a build with CGO enabled")
+	}
 	db, err := sql.Open("duckdb", "")
 	if err != nil {
 		return nil, fmt.Errorf("open duckdb: %w", err)

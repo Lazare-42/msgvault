@@ -1,7 +1,8 @@
 package beeper
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"time"
 
 	"go.kenn.io/msgvault/internal/attachmentpolicy"
@@ -9,11 +10,20 @@ import (
 
 // ---- Beeper Desktop API objects (see /v1/spec, "Beeper Client API") ----
 
+// AccountBridge carries the provider's authoritative service identity.
+type AccountBridge struct {
+	ID       string `json:"id"`
+	Provider string `json:"provider"`
+	Type     string `json:"type"`
+}
+
 // Account is a chat account connected to Beeper Desktop (one per network login).
 type Account struct {
-	AccountID string `json:"accountID"`
-	Network   string `json:"network"` // human-friendly name; may be empty
-	User      User   `json:"user"`
+	Bridge    *AccountBridge `json:"bridge"`
+	Status    string         `json:"status"`
+	AccountID string         `json:"accountID"`
+	Network   string         `json:"network"` // human-friendly name; may be empty
+	User      User           `json:"user"`
 	// Discovered marks an account assembled from chat data because the
 	// accounts endpoint did not report it (see DiscoverAccounts). It is never
 	// decoded from the API.
@@ -32,7 +42,7 @@ type User struct {
 	// Raw holds the exact original JSON for this user object, captured during
 	// decode (see UnmarshalJSON). The documented providerID field is read from
 	// it (providerNativeUserID) without modelling every network's extra field.
-	Raw json.RawMessage `json:"-"`
+	Raw jsontext.Value `json:"-"`
 }
 
 // UnmarshalJSON decodes a User while retaining the exact original bytes in
@@ -44,7 +54,7 @@ func (u *User) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	*u = User(a)
-	u.Raw = append(json.RawMessage(nil), b...)
+	u.Raw = append(jsontext.Value(nil), b...)
 	return nil
 }
 
@@ -83,15 +93,25 @@ type ChatParticipants struct {
 	Total   int           `json:"total"`
 }
 
+// ChatMerge lists a merged container's underlying network chats.
+type ChatMerge struct {
+	ChatIDs       []string `json:"chatIDs"`
+	DefaultChatID string   `json:"defaultChatID"`
+}
+
 // Chat is a conversation on one account.
 type Chat struct {
-	ID           string           `json:"id"` // Matrix room ID, globally unique
-	AccountID    string           `json:"accountID"`
-	Network      string           `json:"network"`
-	Title        string           `json:"title"`
-	Type         string           `json:"type"` // "single" | "group"
-	Participants ChatParticipants `json:"participants"`
-	LastActivity time.Time        `json:"lastActivity"`
+	Merge            *ChatMerge       `json:"merge"`
+	MergedIntoChatID string           `json:"mergedIntoChatID"`
+	ID               string           `json:"id"` // Matrix room ID, globally unique
+	AccountID        string           `json:"accountID"`
+	Network          string           `json:"network"`
+	Title            string           `json:"title"`
+	Type             string           `json:"type"` // "single" | "group"
+	Participants     ChatParticipants `json:"participants"`
+	LastActivity     time.Time        `json:"lastActivity"`
+	// Draft is the composer draft as sent: absent, null, or an object.
+	Draft jsontext.Value `json:"draft"`
 }
 
 // Reaction is one participant's reaction to a message.
@@ -105,6 +125,7 @@ type Reaction struct {
 // Transcription is an attachment transcription (voice notes).
 type Transcription struct {
 	Transcription string `json:"transcription"`
+	Language      string `json:"language"`
 }
 
 // Attachment is a media attachment on a message. The id is typically an
@@ -150,7 +171,7 @@ type Message struct {
 	// Raw holds the exact original JSON for this message, captured during decode
 	// (see UnmarshalJSON). It is archived verbatim so no API field is lost to
 	// our partial struct modelling.
-	Raw json.RawMessage `json:"-"`
+	Raw jsontext.Value `json:"-"`
 }
 
 // UnmarshalJSON decodes a Message while retaining the exact original bytes in
@@ -162,7 +183,7 @@ func (m *Message) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	*m = Message(a)
-	m.Raw = append(json.RawMessage(nil), b...)
+	m.Raw = append(jsontext.Value(nil), b...)
 	return nil
 }
 
@@ -188,6 +209,9 @@ type SearchChatsOutput struct {
 // ImportOptions configures one Import run for a single Beeper account
 // (= one msgvault source).
 type ImportOptions struct {
+	// Route proof is obtained from the exact account endpoint during this run.
+	// Neither a display label nor a user/account identifier can replace it.
+	routeAccount *Account
 	// AccountID is the Beeper account to sync (e.g. "whatsapp", "signal").
 	// It doubles as the msgvault source identifier.
 	AccountID string
@@ -213,10 +237,31 @@ type ImportOptions struct {
 	// Progress, if non-nil, is called after each chat with a human-readable
 	// status line. Safe to leave nil (silent mode).
 	Progress func(msg string) `json:"-"`
+	// ShouldStop, if non-nil, is polled during chat enumeration and at message
+	// page boundaries in backfill, incremental, reconciliation, and tail-probe
+	// walks. Once it reports true the run stops at that boundary, checkpoints
+	// its cursors, keeps unvisited chats discoverable, and completes normally so
+	// the next run resumes. Scheduled runs use it for their time budget and to
+	// yield to queued work.
+	ShouldStop func() bool `json:"-"`
+	// StopAt bounds each provider request for scheduled imports. The parent
+	// import context remains live so a spent budget completes as resumable work.
+	StopAt time.Time `json:"-"`
+	// Scheduled keeps a source's re-anchor marker in place after verification;
+	// only a successful manual verification may clear that operator-visible
+	// marker.
+	Scheduled bool `json:"-"`
+}
+
+func (o ImportOptions) stopRequested() bool {
+	return (!o.StopAt.IsZero() && !time.Now().Before(o.StopAt)) || (o.ShouldStop != nil && o.ShouldStop())
 }
 
 type ImportSummary struct {
-	Duration          time.Duration
+	Duration time.Duration
+	// Stopped reports that ShouldStop ended the run before every chat was
+	// visited; the remaining work resumes on the next run.
+	Stopped           bool
 	SourceID          int64
 	ChatsProcessed    int64
 	MessagesProcessed int64
@@ -254,6 +299,10 @@ type ImportSummary struct {
 	AttachmentsDownloaded int64
 	AttachmentsPending    int64
 	AttachmentsSkipped    int64
+	// AttachmentsUnavailable counts newly terminal media: definitive source
+	// loss, or a not-found response that repeated on a separate, later run
+	// for a message at least 30 days old.
+	AttachmentsUnavailable int64
 	// AttachmentsOverCap is the size-specific subset of AttachmentsSkipped.
 	// AttachmentsOverCapBytes saturates while summing declared sizes or the
 	// minimum observed streamed size. AttachmentsOverCapUnknownSize is nonzero
@@ -266,4 +315,28 @@ type ImportSummary struct {
 	// affected chats are re-visited next run.
 	FetchErrors int64
 	Errors      int64
+	FailedChats map[string]*ChatFailure
+}
+
+// ChatFailure counts a chat's fetch and attachment errors during one run.
+type ChatFailure struct {
+	FetchErrors, MediaErrors int64
+	LastError                string
+}
+
+func (sum *ImportSummary) failChat(chatID string, media bool, err error) {
+	if sum.FailedChats == nil {
+		sum.FailedChats = make(map[string]*ChatFailure)
+	}
+	cf := sum.FailedChats[chatID]
+	if cf == nil {
+		cf = &ChatFailure{}
+		sum.FailedChats[chatID] = cf
+	}
+	if media {
+		cf.MediaErrors++
+	} else {
+		cf.FetchErrors++
+	}
+	cf.LastError = err.Error()
 }

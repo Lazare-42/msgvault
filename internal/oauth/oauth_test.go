@@ -1,16 +1,21 @@
 package oauth
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -18,6 +23,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/config"
 	"golang.org/x/oauth2"
 )
 
@@ -27,9 +33,10 @@ func setupTestManager(t *testing.T, scopes []string) *Manager {
 	tokensDir := filepath.Join(dir, "tokens")
 	require.NoError(t, os.MkdirAll(tokensDir, 0700))
 	return &Manager{
-		config:    &oauth2.Config{Scopes: scopes},
-		tokensDir: tokensDir,
-		logger:    slog.Default(),
+		config:     &oauth2.Config{Scopes: scopes},
+		tokensDir:  tokensDir,
+		tokenStore: NewTokenStore(tokensDir, config.OAuthTokenCommands{}),
+		logger:     slog.Default(),
 	}
 }
 
@@ -53,6 +60,13 @@ func writeLegacyTokenFile(t *testing.T, mgr *Manager, email string, token oauth2
 
 var testToken = oauth2.Token{AccessToken: "test", TokenType: "Bearer"}
 
+func callbackAddressFor(t *testing.T, listener net.Listener) string {
+	t.Helper()
+	addr, ok := listener.Addr().(*net.TCPAddr)
+	require.True(t, ok, "listener address must be TCP")
+	return net.JoinHostPort("localhost", strconv.Itoa(addr.Port))
+}
+
 // assertNoSend is a test helper to assert that a channel remains empty.
 // Uses a 100ms timeout to balance between flakiness on slow CI and detection
 // of late asynchronous sends.
@@ -62,44 +76,8 @@ func assertNoSend[T any](t *testing.T, ch <-chan T, chanName string) {
 	select {
 	case v := <-ch:
 		assert.Failf(t, "unexpected value", "unexpected value on %s: %v", chanName, v)
-	case <-time.After(noSendTimeout):
+	case <-time.After(noSendTimeout): //nolint:kennlint // absence check: callers assert nothing sends on the channel
 		// expected: no value arrived
-	}
-}
-
-func TestScopesToString(t *testing.T) {
-	tests := []struct {
-		name   string
-		scopes []string
-		want   string
-	}{
-		{
-			name:   "empty scopes",
-			scopes: []string{},
-			want:   "",
-		},
-		{
-			name:   "single scope",
-			scopes: []string{"https://www.googleapis.com/auth/gmail.readonly"},
-			want:   "https://www.googleapis.com/auth/gmail.readonly",
-		},
-		{
-			name:   "multiple scopes",
-			scopes: []string{"https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.modify"},
-			want:   "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.modify",
-		},
-		{
-			name:   "three scopes",
-			scopes: []string{"scope1", "scope2", "scope3"},
-			want:   "scope1 scope2 scope3",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := scopesToString(tt.scopes)
-			assert.Equal(t, tt.want, got, "scopesToString()")
-		})
 	}
 }
 
@@ -112,15 +90,15 @@ func TestHasScope(t *testing.T) {
 	})
 
 	// Has a scope that was saved
-	assert.True(t, mgr.HasScope("test@gmail.com", "https://www.googleapis.com/auth/gmail.readonly"),
+	assert.True(t, mgr.HasScope(t.Context(), "test@gmail.com", "https://www.googleapis.com/auth/gmail.readonly"),
 		"expected HasScope to return true for gmail.readonly")
 
 	// Does not have deletion scope
-	assert.False(t, mgr.HasScope("test@gmail.com", "https://mail.google.com/"),
+	assert.False(t, mgr.HasScope(t.Context(), "test@gmail.com", "https://mail.google.com/"),
 		"expected HasScope to return false for mail.google.com")
 
 	// Non-existent account
-	assert.False(t, mgr.HasScope("missing@gmail.com", "https://www.googleapis.com/auth/gmail.readonly"),
+	assert.False(t, mgr.HasScope(t.Context(), "missing@gmail.com", "https://www.googleapis.com/auth/gmail.readonly"),
 		"expected HasScope to return false for missing account")
 }
 
@@ -138,14 +116,14 @@ func TestTokenFileScopesRoundTrip(t *testing.T) {
 	require.NoError(mgr.saveToken("test@gmail.com", token, ScopesDeletion))
 
 	// Load and verify scopes were saved
-	tf, err := mgr.loadTokenFile("test@gmail.com")
+	tf, err := mgr.loadTokenFile(t.Context(), "test@gmail.com")
 	require.NoError(err)
 
 	require.Len(tf.Scopes, 1, "expected ScopesDeletion")
 	assert.Equal("https://mail.google.com/", tf.Scopes[0], "scopes[0]")
 
-	// loadToken should still work (returns just the token)
-	loaded, err := mgr.loadToken("test@gmail.com")
+	// The context-aware read retains token fields.
+	loaded, err := mgr.loadTokenFile(t.Context(), "test@gmail.com")
 	require.NoError(err)
 	assert.Equal("access", loaded.AccessToken, "access token")
 }
@@ -170,7 +148,7 @@ func TestSaveToken_OverwriteExisting(t *testing.T) {
 	require.NoError(mgr.saveToken("test@gmail.com", token2, Scopes),
 		"second saveToken should overwrite existing file")
 
-	loaded, err := mgr.loadToken("test@gmail.com")
+	loaded, err := mgr.loadTokenFile(t.Context(), "test@gmail.com")
 	require.NoError(err)
 	assert.Equal(t, "second", loaded.AccessToken, "access token after overwrite")
 }
@@ -180,7 +158,7 @@ func TestHasScope_LegacyToken(t *testing.T) {
 
 	writeLegacyTokenFile(t, mgr, "legacy@gmail.com", testToken)
 
-	assert.False(t, mgr.HasScope("legacy@gmail.com", "https://www.googleapis.com/auth/gmail.readonly"),
+	assert.False(t, mgr.HasScope(t.Context(), "legacy@gmail.com", "https://www.googleapis.com/auth/gmail.readonly"),
 		"expected HasScope to return false for legacy token")
 }
 
@@ -206,7 +184,7 @@ func TestHasScopeMetadata(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := mgr.HasScopeMetadata(tt.email)
+			got := mgr.HasScopeMetadata(t.Context(), tt.email)
 			assert.Equal(t, tt.want, got, "HasScopeMetadata(%q)", tt.email)
 		})
 	}
@@ -278,8 +256,9 @@ func TestTokenPath_SymlinkEscape(t *testing.T) {
 	}
 
 	mgr := &Manager{
-		config:    &oauth2.Config{Scopes: Scopes},
-		tokensDir: tokensDir,
+		config:     &oauth2.Config{Scopes: Scopes},
+		tokensDir:  tokensDir,
+		tokenStore: NewTokenStore(tokensDir, config.OAuthTokenCommands{}),
 	}
 
 	// Get the token path for "evil" - this should NOT return the symlink path
@@ -421,7 +400,7 @@ func TestParseClientSecrets(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := parseClientSecrets([]byte(tt.data), Scopes)
+			_, _, err := parseClientSecrets([]byte(tt.data), Scopes)
 			if tt.wantErr == "" {
 				assert.NoError(t, err)
 			} else {
@@ -533,6 +512,171 @@ func TestNewCallbackHandler(t *testing.T) {
 	}
 }
 
+func TestBrowserFlowUsesFixedCallbackWithPKCE(t *testing.T) {
+	for _, tc := range []struct {
+		kind              string
+		registersCallback bool
+	}{
+		{"installed", false},
+		{"web", true},
+	} {
+		t.Run(tc.kind, func(t *testing.T) {
+			assertions := assert.New(t)
+			required := require.New(t)
+			listener, err := net.Listen("tcp", "localhost:0")
+			required.NoError(err)
+			t.Cleanup(func() { _ = listener.Close() })
+			callbackAddress := callbackAddressFor(t, listener)
+			wantRedirectURI := "http://" + callbackAddress + "/callback"
+			redirects := []string{"http://localhost"}
+			if tc.registersCallback {
+				redirects = []string{"https://archive.example/", wantRedirectURI}
+			}
+			redirectsJSON, err := json.Marshal(redirects)
+			required.NoError(err)
+
+			var exchanged url.Values
+			tokenEndpoint := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !assertions.NoError(r.ParseForm()) {
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				exchanged = r.Form
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = fmt.Fprint(w, `{"access_token":"synthetic-access","token_type":"Bearer","expires_in":3600}`)
+			}))
+			t.Cleanup(tokenEndpoint.Close)
+
+			secretsPath := filepath.Join(t.TempDir(), "client.json")
+			secrets := fmt.Sprintf(`{%q:{"client_id":"synthetic-client","client_secret":"synthetic-secret","redirect_uris":%s}}`, tc.kind, redirectsJSON)
+			required.NoError(os.WriteFile(secretsPath, []byte(secrets), 0600))
+			mgr, err := NewManagerWithCredentials(t.Context(), config.OAuthApp{ClientSecrets: secretsPath}, t.TempDir(), config.OAuthTokenCommands{}, nil, Scopes)
+			required.NoError(err)
+			mgr.callbackAddress = callbackAddress
+			mgr.callbackListener = listener
+			mgr.config.Endpoint = oauth2.Endpoint{
+				AuthURL:   "https://accounts.example/authorize",
+				TokenURL:  tokenEndpoint.URL,
+				AuthStyle: oauth2.AuthStyleInParams,
+			}
+
+			readOutput, writeOutput, err := os.Pipe()
+			required.NoError(err)
+			oldStdout := os.Stdout
+			os.Stdout = writeOutput
+			t.Cleanup(func() {
+				os.Stdout = oldStdout
+				_ = writeOutput.Close()
+				_ = readOutput.Close()
+			})
+
+			result := make(chan error, 1)
+			go func() {
+				_, flowErr := mgr.browserFlow(t.Context(), "person@example.com", false)
+				result <- flowErr
+			}()
+
+			authorizationURL := make(chan string, 1)
+			go func() {
+				scanner := bufio.NewScanner(readOutput)
+				for scanner.Scan() {
+					line := strings.TrimSpace(scanner.Text())
+					if strings.HasPrefix(line, "https://accounts.example/authorize?") {
+						authorizationURL <- line
+						return
+					}
+				}
+			}()
+
+			var rawURL string
+			select {
+			case rawURL = <-authorizationURL:
+			case err := <-result:
+				required.NoError(err)
+			case <-time.After(5 * time.Second):
+				required.FailNow("terminal authorization did not publish a callback URL")
+			}
+
+			authURL, err := url.Parse(rawURL)
+			required.NoError(err)
+			redirectURI := authURL.Query().Get("redirect_uri")
+			redirect, err := url.Parse(redirectURI)
+			required.NoError(err)
+			assertions.Equal(wantRedirectURI, redirectURI)
+			assertions.Equal("S256", authURL.Query().Get("code_challenge_method"))
+			challenge := authURL.Query().Get("code_challenge")
+			required.NotEmpty(challenge)
+
+			callback := *redirect
+			query := callback.Query()
+			query.Set("state", authURL.Query().Get("state"))
+			query.Set("code", "one-time-code")
+			callback.RawQuery = query.Encode()
+			response, err := http.Get(callback.String()) //nolint:noctx // callback is the loopback listener created by this test.
+			required.NoError(err)
+			_ = response.Body.Close()
+			assertions.Equal(http.StatusOK, response.StatusCode)
+
+			select {
+			case err := <-result:
+				required.NoError(err)
+			case <-time.After(5 * time.Second):
+				required.FailNow("terminal authorization did not exchange the callback code")
+			}
+
+			assertions.Equal("one-time-code", exchanged.Get("code"))
+			assertions.Equal(redirectURI, exchanged.Get("redirect_uri"))
+			verifier := exchanged.Get("code_verifier")
+			required.NotEmpty(verifier)
+			digest := sha256.Sum256([]byte(verifier))
+			assertions.Equal(challenge, base64.RawURLEncoding.EncodeToString(digest[:]))
+		})
+	}
+}
+
+func TestBrowserFlowRejectsUnusableCallbackBeforePrintingURL(t *testing.T) {
+	for _, tc := range []struct {
+		name, kind, redirect, wantErr string
+		occupyPort                    bool
+	}{
+		{"unregistered web callback", "web", "https://archive.example/", "register http://localhost:8089/callback", false},
+		{"different loopback host", "web", "http://127.0.0.1:8089/callback", "register http://localhost:8089/callback", false},
+		{"busy port", "installed", "http://localhost", "listen for OAuth callback", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			required := require.New(t)
+			secretsPath := filepath.Join(t.TempDir(), "client.json")
+			secrets := fmt.Sprintf(`{%q:{"client_id":"synthetic-client","redirect_uris":[%q]}}`, tc.kind, tc.redirect)
+			required.NoError(os.WriteFile(secretsPath, []byte(secrets), 0600))
+			mgr, err := NewManagerWithCredentials(t.Context(), config.OAuthApp{ClientSecrets: secretsPath}, t.TempDir(), config.OAuthTokenCommands{}, nil, Scopes)
+			required.NoError(err)
+			// The Web-client cases fail before listening and keep the production
+			// callback, whose URL is the registration users are told to add.
+			if tc.occupyPort {
+				listener, err := net.Listen("tcp", "localhost:0")
+				required.NoError(err)
+				t.Cleanup(func() { _ = listener.Close() })
+				mgr.callbackAddress = callbackAddressFor(t, listener)
+			}
+			output, err := os.CreateTemp(t.TempDir(), "stdout")
+			required.NoError(err)
+			oldStdout := os.Stdout
+			os.Stdout = output
+			t.Cleanup(func() {
+				os.Stdout = oldStdout
+				_ = output.Close()
+			})
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			err = mgr.AuthorizeManual(ctx, "person@example.com")
+			required.ErrorContains(err, tc.wantErr)
+			printed, err := os.ReadFile(output.Name())
+			required.NoError(err)
+			assert.Empty(t, string(printed))
+		})
+	}
+}
+
 // TestAuthorize_SavesUnderOriginalIdentifier exercises the real
 // authorize() method end-to-end (with injected browserFlow and
 // profile server) to verify the token is saved under the original
@@ -573,12 +717,12 @@ func TestAuthorize_SavesUnderOriginalIdentifier(t *testing.T) {
 	require.NoError(mgr.Authorize(context.Background(), inputEmail), "Authorize")
 
 	// Token must be loadable under the original identifier.
-	loaded, err := mgr.loadToken(inputEmail)
+	loaded, err := mgr.loadTokenFile(t.Context(), inputEmail)
 	require.NoError(err, "loadToken(%q)", inputEmail)
 	assert.Equal("test-access-token", loaded.AccessToken, "access token")
 
 	// Token must NOT exist under the canonical email.
-	_, err = mgr.loadToken(canonicalEmail)
+	_, err = mgr.loadTokenFile(t.Context(), canonicalEmail)
 	assert.Error(err, "token should NOT exist under canonical %q", canonicalEmail)
 }
 
@@ -608,7 +752,7 @@ func TestAuthorize_CalendarOnlyUsesCalendarProfileID(t *testing.T) {
 
 	require.NoError(mgr.Authorize(context.Background(), "user@gmail.com"), "Authorize")
 
-	loaded, err := mgr.loadTokenFile("user@gmail.com")
+	loaded, err := mgr.loadTokenFile(t.Context(), "user@gmail.com")
 	require.NoError(err, "loadTokenFile")
 	assert.Equal("calendar-token", loaded.AccessToken, "access token")
 	assert.ElementsMatch(ScopesCalendar, loaded.Scopes, "saved scopes")
@@ -640,7 +784,7 @@ func TestAuthorize_SavesActualGrantedScopesFromTokenResponse(t *testing.T) {
 
 	require.NoError(mgr.Authorize(context.Background(), "user@gmail.com"), "Authorize")
 
-	loaded, err := mgr.loadTokenFile("user@gmail.com")
+	loaded, err := mgr.loadTokenFile(t.Context(), "user@gmail.com")
 	require.NoError(err, "loadTokenFile")
 	assert.Equal("actual-scope-token", loaded.AccessToken, "access token")
 	assert.ElementsMatch(granted, loaded.Scopes, "saved scopes")
@@ -679,7 +823,7 @@ func TestAuthorize_RejectsMissingGrantedScopeWithoutOverwritingToken(t *testing.
 	require.Error(err, "Authorize should reject a token missing calendar.readonly")
 	require.ErrorContains(err, ScopeCalendarReadonly)
 
-	loaded, loadErr := mgr.loadTokenFile("user@gmail.com")
+	loaded, loadErr := mgr.loadTokenFile(t.Context(), "user@gmail.com")
 	require.NoError(loadErr, "loadTokenFile")
 	assert.Equal("old-access", loaded.AccessToken, "existing token must not be overwritten")
 	assert.ElementsMatch(Scopes, loaded.Scopes, "existing scopes must be preserved")
@@ -719,7 +863,7 @@ func TestAuthorizeManualPreservingGrantedScopesRejectsTokenMissingPreservedScope
 	require.Error(err)
 	require.ErrorContains(err, ScopeCalendarReadonly)
 
-	loaded, loadErr := mgr.loadTokenFile("user@gmail.com")
+	loaded, loadErr := mgr.loadTokenFile(t.Context(), "user@gmail.com")
 	require.NoError(loadErr, "loadTokenFile")
 	assert.Equal("old-access", loaded.AccessToken, "existing token must not be overwritten")
 	assert.ElementsMatch(existingScopes, loaded.Scopes, "existing scopes must be preserved")
@@ -763,10 +907,64 @@ func TestAuthorizePreservingGrantedScopesRejectsTokenMissingPreservedScope(t *te
 	require.Error(err)
 	require.ErrorContains(err, ScopeCalendarReadonly)
 
-	loaded, loadErr := mgr.loadTokenFile("user@gmail.com")
+	loaded, loadErr := mgr.loadTokenFile(t.Context(), "user@gmail.com")
 	require.NoError(loadErr, "loadTokenFile")
 	assert.Equal("old-access", loaded.AccessToken, "existing token must not be overwritten")
 	assert.ElementsMatch(existingScopes, loaded.Scopes, "existing scopes must be preserved")
+}
+
+// saveToken seeds OAuth fixtures without a pending authorization or refresh.
+func (m *Manager) saveToken(email string, token *oauth2.Token, scopes []string) error {
+	return m.saveTokenComparedContext(context.Background(), email, token, scopes, nil)
+}
+
+func TestTerminalAuthorizationCannotOverwriteNewerAuthorization(t *testing.T) {
+	for _, mode := range []string{"browser", "manual", "preserve-browser", "preserve-manual"} {
+		t.Run(mode, func(t *testing.T) {
+			assertions := assert.New(t)
+			required := require.New(t)
+			const email = "person@example.com"
+			oldScopes := []string{ScopeCardDAV, ScopeUserinfoEmail, ScopeGmailReadonly}
+			newScopes := append(append([]string(nil), oldScopes...), ScopeCalendarReadonly)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.URL.Path == "/profile" {
+					_, _ = fmt.Fprintf(w, `{"email":%q}`, email)
+					return
+				}
+				_, _ = fmt.Fprintf(w, `{"access_token":"new-access","refresh_token":"new-refresh","token_type":"Bearer","expires_in":3600,"scope":%q}`, strings.Join(newScopes, " "))
+			}))
+			t.Cleanup(server.Close)
+			mgr := setupTestManager(t, oldScopes)
+			mgr.config.Endpoint = oauth2.Endpoint{AuthURL: "https://accounts.example/authorize", TokenURL: server.URL, AuthStyle: oauth2.AuthStyleInParams}
+			mgr.profileURL = server.URL + "/profile"
+			required.NoError(mgr.saveToken(email, &oauth2.Token{AccessToken: "initial-access"}, []string{ScopeGmailReadonly}))
+			newer, err := mgr.WithScopes(newScopes).BeginWebAuthorization(t.Context(), email, "https://archive.example/")
+			required.NoError(err)
+			// A browser wait lets another sign-in complete before the CLI returns.
+			mgr.browserFlowFn = func(ctx context.Context, _ string, _ bool) (*oauth2.Token, error) {
+				if err := newer.Complete(ctx, newer.State, "new"); err != nil {
+					return nil, err
+				}
+				return (&oauth2.Token{AccessToken: "old-access", RefreshToken: "old-refresh"}).WithExtra(map[string]any{"scope": strings.Join(oldScopes, " ")}), nil
+			}
+			switch mode {
+			case "browser":
+				err = mgr.Authorize(t.Context(), email)
+			case "manual":
+				err = mgr.AuthorizeManual(t.Context(), email)
+			case "preserve-browser":
+				err = mgr.AuthorizePreservingGrantedScopes(t.Context(), email)
+			case "preserve-manual":
+				err = mgr.AuthorizeManualPreservingGrantedScopes(t.Context(), email)
+			}
+			required.ErrorIs(err, ErrTokenChanged)
+			saved, err := mgr.loadTokenFile(t.Context(), email)
+			required.NoError(err)
+			assertions.Equal("new-refresh", saved.RefreshToken)
+			assertions.ElementsMatch(newScopes, saved.Scopes)
+		})
+	}
 }
 
 // TestAuthorize_RejectsMismatch verifies that authorize() rejects
@@ -805,9 +1003,9 @@ func TestAuthorize_RejectsMismatch(t *testing.T) {
 	assert.Equal("wrong@gmail.com", mismatch.Actual, "Actual")
 
 	// No token should have been saved under either address.
-	_, loadErr := mgr.loadToken("expected@gmail.com")
+	_, loadErr := mgr.loadTokenFile(t.Context(), "expected@gmail.com")
 	require.Error(loadErr, "token should NOT be saved under expected address")
-	_, loadErr = mgr.loadToken("wrong@gmail.com")
+	_, loadErr = mgr.loadTokenFile(t.Context(), "wrong@gmail.com")
 	assert.Error(loadErr, "token should NOT be saved under profile address")
 }
 
@@ -847,9 +1045,9 @@ func TestAuthorize_WorkspaceAliasMismatch(t *testing.T) {
 	assert.Equal("primary@company.com", mismatch.Actual, "Actual")
 
 	// No token should exist under either address.
-	_, loadErr := mgr.loadToken("alias@company.com")
+	_, loadErr := mgr.loadTokenFile(t.Context(), "alias@company.com")
 	require.Error(loadErr, "token should NOT be saved under alias address")
-	_, loadErr = mgr.loadToken("primary@company.com")
+	_, loadErr = mgr.loadTokenFile(t.Context(), "primary@company.com")
 	assert.Error(loadErr, "token should NOT be saved under primary address")
 }
 
@@ -907,8 +1105,8 @@ func TestSameGoogleAccount(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			got := sameGoogleAccount(tt.expected, tt.canonical)
-			assert.Equal(t, tt.want, got, "sameGoogleAccount(%q, %q)", tt.expected, tt.canonical)
+			got := SameGoogleAccount(tt.expected, tt.canonical)
+			assert.Equal(t, tt.want, got, "SameGoogleAccount(%q, %q)", tt.expected, tt.canonical)
 		})
 	}
 }
@@ -977,38 +1175,46 @@ func TestValidateBrowserURL(t *testing.T) {
 }
 
 func TestForceRefreshDetectsRevokedRefreshTokenBehindValidAccessToken(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	var tokenEndpointHits atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		tokenEndpointHits.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
-	}))
-	defer srv.Close()
+	for _, command := range []bool{false, true} {
+		t.Run(fmt.Sprintf("command=%v", command), func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			var tokenEndpointHits atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				tokenEndpointHits.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
+			}))
+			defer srv.Close()
 
-	mgr := setupTestManager(t, Scopes)
-	mgr.config.Endpoint = oauth2.Endpoint{TokenURL: srv.URL}
-	writeTokenFile(t, mgr, "test@gmail.com", oauth2.Token{
-		AccessToken:  "still-valid",
-		TokenType:    "Bearer",
-		RefreshToken: "revoked",
-		Expiry:       time.Now().Add(time.Hour),
-	}, Scopes)
+			mgr := setupTestManager(t, Scopes)
+			if command {
+				mgr, _ = commandManager(t)
+			}
+			mgr.config.Endpoint = oauth2.Endpoint{TokenURL: srv.URL}
+			require.NoError(mgr.saveToken("test@gmail.com", &oauth2.Token{
+				AccessToken:  "still-valid",
+				TokenType:    "Bearer",
+				RefreshToken: "revoked",
+				Expiry:       time.Now().Add(time.Hour),
+			}, Scopes))
 
-	// TokenSource is satisfied by the unexpired cached access token and never
-	// contacts the provider, so it cannot see that the refresh token is revoked.
-	_, err := mgr.TokenSource(context.Background(), "test@gmail.com")
-	require.NoError(err, "TokenSource should reuse the cached access token")
-	require.Equal(int32(0), tokenEndpointHits.Load(), "TokenSource should not hit the token endpoint")
+			// TokenSource is satisfied by the unexpired cached access token and never
+			// contacts the provider, so it cannot see that the refresh token is revoked.
+			_, err := mgr.TokenSource(context.Background(), "test@gmail.com")
+			require.NoError(err, "TokenSource should reuse the cached access token")
+			require.Equal(int32(0), tokenEndpointHits.Load(), "TokenSource should not hit the token endpoint")
 
-	err = mgr.ForceRefresh(context.Background(), "test@gmail.com")
-	require.Error(err, "ForceRefresh should surface the revoked refresh token")
-	var retrieveErr *oauth2.RetrieveError
-	require.ErrorAs(err, &retrieveErr)
-	assert.Equal("invalid_grant", retrieveErr.ErrorCode)
-	assert.Positive(tokenEndpointHits.Load(), "ForceRefresh must redeem the refresh token")
+			err = mgr.ForceRefresh(context.Background(), "test@gmail.com")
+			require.Error(err, "ForceRefresh should surface the revoked refresh token")
+			var retrieveErr *oauth2.RetrieveError
+			require.ErrorAs(err, &retrieveErr)
+			assert.Equal("invalid_grant", retrieveErr.ErrorCode)
+			assert.Positive(tokenEndpointHits.Load(), "ForceRefresh must redeem the refresh token")
+			assert.True(mgr.HasToken(t.Context(), "test@gmail.com"))
+		})
+	}
 }
 
 func TestForceRefreshSavesRefreshedToken(t *testing.T) {
@@ -1035,7 +1241,7 @@ func TestForceRefreshSavesRefreshedToken(t *testing.T) {
 
 	require.NoError(mgr.ForceRefresh(context.Background(), "test@gmail.com"))
 
-	tf, err := mgr.loadTokenFile("test@gmail.com")
+	tf, err := mgr.loadTokenFile(t.Context(), "test@gmail.com")
 	require.NoError(err)
 	assert.Equal("new-access", tf.AccessToken, "refreshed access token should be saved")
 	assert.Equal("refresh-1", tf.RefreshToken, "refresh token should be preserved")

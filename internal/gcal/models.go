@@ -1,4 +1,4 @@
-// Package gcal is a read-only Google Calendar API v3 client, structured as a
+// Package gcal implements Google Calendar API v3 reads and event control, with a
 // close mirror of internal/gmail: a hand-rolled net/http client with a dedicated
 // rate limiter, an API interface plus in-memory mock, and unexported wire types
 // mapped to exported domain types. It deliberately reuses internal/gmail's
@@ -7,7 +7,7 @@
 package gcal
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
 	"time"
 )
 
@@ -39,26 +39,28 @@ type Calendar struct {
 	Description string `json:"description,omitempty"`
 	TimeZone    string `json:"timeZone,omitempty"`
 	AccessRole  string `json:"accessRole,omitempty"` // owner | writer | reader | freeBusyReader
-	Primary     bool   `json:"primary,omitempty"`
-	Deleted     bool   `json:"deleted,omitempty"`
+	Primary     bool   `json:"primary,omitzero"`
+	Deleted     bool   `json:"deleted,omitzero"`
 }
 
 // Person is an organizer/creator reference on an event.
 type Person struct {
 	Email       string `json:"email,omitempty"`
 	DisplayName string `json:"displayName,omitempty"`
-	Self        bool   `json:"self,omitempty"`
+	Self        bool   `json:"self,omitzero"`
 }
 
 // Attendee is one invitee on an event.
 type Attendee struct {
-	Email          string `json:"email,omitempty"`
-	DisplayName    string `json:"displayName,omitempty"`
-	ResponseStatus string `json:"responseStatus,omitempty"` // needsAction | declined | tentative | accepted
-	Organizer      bool   `json:"organizer,omitempty"`
-	Self           bool   `json:"self,omitempty"`
-	Resource       bool   `json:"resource,omitempty"`
-	Optional       bool   `json:"optional,omitempty"`
+	Email            string `json:"email,omitempty"`
+	DisplayName      string `json:"displayName,omitempty"`
+	ResponseStatus   string `json:"responseStatus,omitempty"` // needsAction | declined | tentative | accepted
+	Organizer        bool   `json:"organizer,omitzero"`
+	Self             bool   `json:"self,omitzero"`
+	Resource         bool   `json:"resource,omitzero"`
+	Optional         bool   `json:"optional,omitzero"`
+	AdditionalGuests int    `json:"additionalGuests,omitzero"`
+	Comment          string `json:"comment,omitempty"`
 }
 
 // EventDateTime is an event start/end. Exactly one of DateTime (timed) or Date
@@ -95,6 +97,7 @@ func (e EventDateTime) Instant() (time.Time, bool) {
 // Event is a single calendar event (a master, a recurring instance, or an
 // exception). The full original JSON is preserved separately in message_raw.
 type Event struct {
+	ETag              string        `json:"etag,omitempty"`
 	ID                string        `json:"id,omitempty"`
 	Status            string        `json:"status,omitempty"`
 	HTMLLink          string        `json:"htmlLink,omitempty"`
@@ -112,17 +115,18 @@ type Event struct {
 	RecurringEventID  string        `json:"recurringEventId,omitempty"` // set on instances/exceptions of a series
 	OriginalStartTime EventDateTime `json:"originalStartTime,omitzero"`
 	ICalUID           string        `json:"iCalUID,omitempty"`
-	Sequence          int           `json:"sequence,omitempty"`
+	Sequence          int           `json:"sequence,omitzero"`
 	Attendees         []Attendee    `json:"attendees,omitempty"`
 	Transparency      string        `json:"transparency,omitempty"`
 	Visibility        string        `json:"visibility,omitempty"`
 	EventType         string        `json:"eventType,omitempty"`
+	Reminders         *Reminders    `json:"reminders,omitzero"`
 
 	// Raw is the original API JSON for this event, preserved verbatim for
 	// archival fidelity (stored in message_raw). It is not re-serialized from
 	// the mapped fields, so fields msgvault does not model (conferenceData,
 	// extendedProperties, ...) survive in the archive.
-	Raw json.RawMessage `json:"-"`
+	Raw jsontext.Value `json:"-"`
 }
 
 // IsCancelled reports whether the event is a cancellation/tombstone.

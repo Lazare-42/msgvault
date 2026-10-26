@@ -1,8 +1,13 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { startTelemetryReporting, stopTelemetryReporting } from '../../telemetry/actions';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createAPIClient } from '../../api/client';
+import { createCaptureClient } from '../../telemetry/capture.test-support';
 import FilesWorkspace from './FilesWorkspace.svelte';
+
+const telemetryEvents: Array<{ event: string; properties: { search_type: string } }> = [];
+beforeEach(() => { telemetryEvents.length = 0; });
+const createAPIClient = (fetchFn: typeof fetch) => createCaptureClient(fetchFn, telemetryEvents);
 
 function response() {
   return {
@@ -47,6 +52,102 @@ function installResizeObservers() {
 }
 
 describe('FilesWorkspace', () => {
+  it('reports each rejected image selection once as a search failure', async () => {
+    const events = telemetryEvents;
+    const client = createAPIClient(async () => Response.json(response()));
+    render(FilesWorkspace, { client, predicate: { filters: [], presentation: 'table' }, sort: { field: 'occurred_at', direction: 'desc' } });
+    await screen.findByText('fixture.pdf');
+    await fireEvent.click(screen.getByRole('switch', { name: 'Visual search' }));
+    await waitFor(() => expect(screen.getByRole('grid', { name: 'Files results' }).getAttribute('aria-busy')).toBe('false'));
+    const file = new File(['synthetic'], 'query.png', { type: 'image/png' });
+    Object.defineProperty(file, 'size', { value: 21 * 1024 * 1024 });
+    await fireEvent.change(screen.getByLabelText('Query image'), { target: { files: [file] } });
+    await waitFor(() => expect(screen.getAllByText('Visual query images must be 20 MiB or smaller.').length).toBeGreaterThan(0));
+    const failure = { event: 'error_shown', properties: { surface: 'web', kind: 'search' } };
+    await waitFor(() => expect(events.filter(event => event.event === 'error_shown')).toEqual([failure]));
+    await fireEvent.change(screen.getByLabelText('Query image'), { target: { files: [file] } });
+    await waitFor(() => expect(events.filter(event => event.event === 'error_shown')).toEqual([failure, failure]));
+  });
+  it.each(['submitted', 'image', 'visual', 'nonempty'])('counts only submitted empty %s searches', async (kind) => {
+    const events = telemetryEvents;
+    const fetchFn = vi.fn<typeof fetch>(async () => {
+      return Response.json(kind === 'nonempty' ? response() : { ...response(), files: [], total_count: 0 });
+    });
+    const client = createAPIClient(fetchFn);
+    const rendered = render(FilesWorkspace, {
+      client,
+      predicate: { query: kind === 'image' || kind === 'visual' ? '' : 'missing', search_mode: 'full_text', filters: [], presentation: 'table' },
+      sort: { field: 'occurred_at', direction: 'desc' },
+      submitted: kind === 'submitted' || kind === 'nonempty',
+    });
+    await waitFor(() => expect(screen.getByRole('grid', { name: 'Files results' }).getAttribute('aria-busy')).toBe('false'));
+    if (kind === 'visual') {
+      await fireEvent.click(screen.getByRole('switch', { name: 'Visual search' }));
+      const query = screen.getByRole('searchbox', { name: 'Search attachment pixels' });
+      await fireEvent.input(query, { target: { value: 'blue sky' } });
+      await waitFor(() => expect(events.some((event) => event.event === 'search_run')).toBe(true));
+      expect(events.some((event) => event.event === 'search_empty')).toBe(false);
+      await fireEvent.keyDown(query, { key: 'Enter' });
+    }
+    if (kind === 'image') {
+      await fireEvent.click(screen.getByRole('switch', { name: 'Visual search' }));
+      await fireEvent.change(screen.getByLabelText('Query image'), { target: { files: [new File(['synthetic'], 'query.png', { type: 'image/png' })] } });
+      await waitFor(() => expect(events.some((event) => event.event === 'search_empty')).toBe(true));
+    }
+    await waitFor(() => expect(events.some((event) => event.event === 'search_run')).toBe(true));
+    await waitFor(() => expect(events.filter((event) => event.event === 'search_empty')).toHaveLength(kind === 'nonempty' ? 0 : 1));
+    if (kind === 'submitted') {
+      // Today's search keys are already claimed, so the reporter's calls show what the unsubmitted search reported.
+      const daily = vi.spyOn(startTelemetryReporting(client), 'reportDaily');
+      await rendered.rerender({ submitted: false, sort: { field: 'occurred_at', direction: 'asc' }, filenameQuery: 'typed' });
+      await waitFor(() => expect(screen.getByRole('grid', { name: 'Files results' }).getAttribute('aria-busy')).toBe('false'));
+      await waitFor(() => expect(daily.mock.calls.map(([key]) => key)).toContain('search_run:text'));
+      expect(daily.mock.calls.map(([key]) => key)).not.toContain('search_empty:text');
+    }
+  });
+
+  it.each(['text', 'visual', 'image', 'combined'])('reports accepted %s searches', async (kind) => {
+    const events = telemetryEvents;
+    let textSearchRequests = 0, resolveStale!: (response: Response) => void;
+    const fetchFn = vi.fn<typeof fetch>(async (input): Promise<Response> => {
+      return kind === 'text' && ++textSearchRequests === 2 ? new Promise<Response>((resolve) => { resolveStale = resolve; }) : Response.json(response());
+    });
+    const client = createAPIClient(fetchFn);
+    const daily = vi.spyOn(startTelemetryReporting(client), 'reportDaily');
+    const rendered = render(FilesWorkspace, {
+      client, predicate: { query: kind === 'text' || kind === 'combined' ? 'needle' : '', search_mode: 'full_text', filters: [], presentation: 'table' },
+      sort: { field: 'occurred_at', direction: 'desc' },
+    });
+    await screen.findByText('fixture.pdf');
+    await waitFor(() => expect(events.map((e) => e.properties.search_type)).toEqual(kind === 'text' || kind === 'combined' ? ['text'] : []));
+    if (kind === 'text') {
+      const search = (query: string, search_mode: 'full_text' | 'semantic' = 'full_text') => rendered.rerender({ predicate: { query, search_mode, filters: [], presentation: 'table' } });
+      await search('superseded', 'semantic');
+      await waitFor(() => expect(resolveStale).toBeDefined());
+      await search('current');
+      await waitFor(() => expect(textSearchRequests).toBe(3));
+      resolveStale(Response.json(response()));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      expect(daily.mock.calls.map(([key]) => key)).toEqual(['search_run:text', 'search_run:text']);
+      await rendered.rerender({ sort: { field: 'occurred_at', direction: 'asc' } });
+      await waitFor(() => expect(daily.mock.calls.map(([key]) => key)).toEqual(['search_run:text', 'search_run:text', 'search_run:text']));
+      stopTelemetryReporting(client);
+      return;
+    }
+    await fireEvent.click(screen.getByRole('switch', { name: 'Visual search' }));
+    await waitFor(() => expect(screen.getByRole('grid', { name: 'Files results' }).getAttribute('aria-busy')).toBe('false'));
+    if (kind === 'combined') await waitFor(() => expect(daily.mock.calls.map(([key]) => key)).toEqual(['search_run:text', 'search_run:text']));
+    events.length = 0;
+    if (kind === 'image') {
+      await fireEvent.change(screen.getByLabelText('Query image'), { target: { files: [new File(['synthetic'], 'query.png', { type: 'image/png' })] } });
+    } else {
+      await fireEvent.input(screen.getByRole('searchbox', { name: 'Search attachment pixels' }), { target: { value: 'blue sky' } });
+    }
+    await waitFor(() => expect(events.at(-1)?.properties.search_type).toBe('semantic'), { timeout: 5000 });
+    expect(events.map((e) => e.properties.search_type)).toEqual(['semantic']);
+    stopTelemetryReporting(client);
+  });
+
   it.each([
     {
       state: 'loading',
@@ -88,6 +189,28 @@ describe('FilesWorkspace', () => {
     const grid = await screen.findByRole('grid', { name: 'Files results' });
     await screen.findByText(rendered);
     expect(grid.getAttribute('aria-rowcount')).toBe(expected);
+    expect(screen.queryByText('0 files') !== null).toBe(expected !== null);
+  });
+
+  it('reports a displayed file query failure and reloads after retry', async () => {
+    let failed = true;
+    const fetchFn: typeof fetch = async () => failed
+      ? Response.json({
+        error: 'query_resource_exhausted',
+        message: 'This query needs more memory or temporary disk space.',
+      }, { status: 503 })
+      : Response.json(response());
+    render(FilesWorkspace, {
+      client: createAPIClient(fetchFn), predicate: { filters: [], presentation: 'table' },
+      sort: { field: 'occurred_at', direction: 'desc' }
+    });
+
+    expect((await screen.findByRole('alert')).textContent).toContain('more memory or temporary disk space');
+    await waitFor(() => expect(telemetryEvents).toEqual([{ event: 'error_shown', properties: { surface: 'web', kind: 'other' } }]));
+    failed = false;
+    await fireEvent.click(screen.getByRole('button', { name: 'Retry request' }));
+    expect(await screen.findByText('fixture.pdf')).not.toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
   });
 
   it('owns headers and virtual rows in one focusable grid', async () => {
@@ -246,12 +369,34 @@ describe('FilesWorkspace', () => {
     });
 
     expect(await screen.findByText('fixture.pdf')).toBeDefined();
+    expect(new URL(requests[0]!.url).pathname).toBe('/api/v1/participants/1/files/search');
     await expect(requests[0]!.clone().json()).resolves.toMatchObject({
       directions: ['from_person'],
       mime_families: ['pdf', 'audio', 'text', 'document', 'archive', 'other']
     });
     expect(screen.getByRole('radio', { name: 'Files' }).getAttribute('aria-checked')).toBe('true');
     expect(screen.getByText('From them · Group conversation')).toBeDefined();
+  });
+
+  it('keeps durable-person file searches separate from analytical participant searches', async () => {
+    const requests: Request[] = [];
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      requests.push(request);
+      return Response.json(personResponse());
+    });
+    render(FilesWorkspace, {
+      client: createAPIClient(fetchFn), predicate: { filters: [], presentation: 'table' },
+      // The production union gains this explicit durable-person scope. The
+      // cast lets this regression prove the current fallback is unsafe.
+      identityScope: { kind: 'durable-person', id: 7 } as never,
+      sort: { field: 'occurred_at', direction: 'desc' }
+    });
+
+    await screen.findByText('fixture.pdf');
+    expect(new URL(requests[0]!.url).pathname).toBe('/api/v1/people/7/files/search');
+    expect(requests.some((request) => new URL(request.url).pathname === '/api/v1/participants/7/files/search')).toBe(false);
+    expect(requests.some((request) => new URL(request.url).pathname === '/api/v1/files/search')).toBe(false);
   });
 
   it('updates the person direction union without exposing controls outside person scope', async () => {
@@ -501,6 +646,36 @@ describe('FilesWorkspace', () => {
     expect(grid.getAttribute('aria-activedescendant')).toBe('file-row-900');
     expect(container.querySelector('#file-row-900')).not.toBeNull();
     expect(screen.getAllByRole('row')).toHaveLength(3);
+  });
+
+  it('pages with PageDown past the loaded rows and back with PageUp', async () => {
+    const first = response();
+    Object.assign(first, { total_count: 2, next_cursor: 'page-2' });
+    const second = response();
+    second.files[0] = { ...second.files[0]!, id: 8, key: 'file:8', filename: 'later.pdf' };
+    second.total_count = 2;
+    const cursors: Array<string | undefined> = [];
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      const body = await request.clone().json() as { cursor?: string };
+      cursors.push(body.cursor);
+      return Response.json(body.cursor === 'page-2' ? second : first);
+    });
+    const onActiveKey = vi.fn();
+    render(FilesWorkspace, {
+      client: createAPIClient(fetchFn), predicate: { filters: [], presentation: 'table' },
+      sort: { field: 'occurred_at', direction: 'desc' }, onActiveKey
+    });
+
+    const grid = await screen.findByRole('grid', { name: 'Files results' });
+    await screen.findByRole('row', { name: /fixture.pdf/ });
+    grid.focus();
+    await fireEvent.keyDown(grid, { key: 'PageDown' });
+    await waitFor(() => expect(onActiveKey).toHaveBeenLastCalledWith('file:8'));
+    expect(cursors).toEqual([undefined, 'page-2']);
+
+    await fireEvent.keyDown(grid, { key: 'PageUp' });
+    expect(onActiveKey).toHaveBeenLastCalledWith('file:7');
   });
 
   it('opens a file from keyboard focus and preserves containing navigation authority', async () => {
@@ -995,4 +1170,114 @@ describe('FilesWorkspace', () => {
     expect(screen.queryByText(/stale cursor failure/)).toBeNull();
     expect(screen.getByRole('row', { name: /fresh.pdf/ })).toBeDefined();
   });
+
+  describe('controls and rows', () => {
+    function renderFiles(props: Record<string, unknown> = {}) {
+      const fetchFn = vi.fn<typeof fetch>(async () => Response.json(personResponse()));
+      return render(FilesWorkspace, {
+        client: createAPIClient(fetchFn), predicate: { filters: [], presentation: 'table' },
+        sort: { field: 'occurred_at', direction: 'desc' }, ...props
+      });
+    }
+
+    async function typeMenuItems(): Promise<string[]> {
+      await fireEvent.click(await screen.findByRole('button', { name: 'Type' }));
+      const labels = ['Images', 'PDFs', 'Audio', 'Video', 'Text', 'Documents', 'Archives', 'Other'];
+      return labels.filter((label) => screen.queryByRole('button', { name: label }) !== null);
+    }
+
+    it('filters by type from a Type menu that says which types are included', async () => {
+      const onMIMEFamiliesChange = vi.fn();
+      renderFiles({ onMIMEFamiliesChange });
+      await screen.findByText('fixture.pdf');
+
+      expect(screen.queryByRole('checkbox', { name: 'pdf' })).toBeNull();
+      expect(await typeMenuItems())
+        .toEqual(['Images', 'PDFs', 'Audio', 'Video', 'Text', 'Documents', 'Archives', 'Other']);
+      expect(screen.getByRole('button', { name: 'Type' }).textContent).toContain('All types');
+      const pdfs = screen.getByRole('button', { name: 'PDFs' });
+      expect(describedBy(pdfs)).toBeUndefined();
+      expect(describedBy(screen.getByRole('button', { name: 'Images' }))).toBeUndefined();
+      await fireEvent.click(pdfs);
+      expect(onMIMEFamiliesChange).toHaveBeenCalledWith(['pdf']);
+    });
+
+    it('marks selected types as included', async () => {
+      renderFiles({ mimeFamilies: ['pdf'] });
+      await typeMenuItems();
+      expect(screen.getByRole('button', { name: 'Type' }).textContent).not.toContain('All types');
+      expect(describedBy(screen.getByRole('button', { name: 'PDFs' }))).toBe('Included');
+      expect(describedBy(screen.getByRole('button', { name: 'Images' }))).toBe('Not included');
+    });
+
+    it.each([
+      ['media', ['Images', 'Video']],
+      ['files', ['PDFs', 'Audio', 'Text', 'Documents', 'Archives', 'Other']]
+    ] as const)('limits a person %s Type menu to its own families', async (personPresentation, expected) => {
+      renderFiles({ identityScope: { kind: 'person', id: 1 }, personPresentation });
+      expect(await typeMenuItems()).toEqual(expected);
+    });
+
+    it('keeps the fusion score out of the row text and names a missing file plainly', async () => {
+      const base = response();
+      const fetchFn = vi.fn<typeof fetch>(async () => Response.json({
+        ...base,
+        files: [{ ...base.files[0]!, content_state: 'missing_blob', search_explain: { rrf: 0.0123 } }]
+      }));
+      render(FilesWorkspace, {
+        client: createAPIClient(fetchFn), predicate: { filters: [], presentation: 'table' },
+        sort: { field: 'occurred_at', direction: 'desc' }
+      });
+      const row = await screen.findByRole('row', { name: /fixture.pdf/ });
+      expect(row.textContent).not.toContain('RRF');
+      expect(within(row).getByText('fixture.pdf').closest('[role="gridcell"]')?.getAttribute('title'))
+        .toBe('Match score 0.0123');
+      expect(within(row).getByText('File missing')).toBeDefined();
+      expect(row.textContent).not.toContain('Missing blob');
+    });
+
+    it('shows a readable type and keeps the raw MIME type in the title', async () => {
+      renderFiles();
+      const row = await screen.findByRole('row', { name: /fixture.pdf/ });
+      const type = within(row).getByText('PDF');
+      expect(type.getAttribute('title')).toBe('application/pdf');
+      expect(within(row).queryByText('application/pdf')).toBeNull();
+    });
+
+    it('opens the containing item from its row without opening the viewer', async () => {
+      const onOpenItem = vi.fn();
+      const onSelectedKey = vi.fn();
+      renderFiles({ onOpenItem, onSelectedKey });
+      await screen.findByText('fixture.pdf');
+
+      await fireEvent.click(screen.getByRole('button', { name: 'Open containing item Containing item' }));
+      expect(onOpenItem).toHaveBeenCalledWith('message:11');
+      expect(onSelectedKey).not.toHaveBeenCalled();
+      expect(screen.queryByRole('dialog')).toBeNull();
+    });
+
+    it('shows the containing item as text when there is nowhere to open it', async () => {
+      renderFiles();
+      const row = await screen.findByRole('row', { name: /fixture.pdf/ });
+      expect(within(row).getByText('Containing item')).toBeDefined();
+      expect(within(row).queryByRole('button')).toBeNull();
+    });
+
+    it('leaves the landmark to the shell when embedded without a header', async () => {
+      renderFiles({ embedded: true, showHeader: false });
+      await screen.findByText('fixture.pdf');
+      expect(screen.queryByRole('region', { name: 'Files' })).toBeNull();
+      expect(screen.queryByRole('main', { name: 'Files' })).toBeNull();
+    });
+
+    it('keeps its own region when embedded with a header', async () => {
+      renderFiles({ embedded: true, identityScope: { kind: 'person', id: 1 } });
+      expect(await screen.findByRole('region', { name: 'Files' })).toBeDefined();
+    });
+  });
 });
+
+function describedBy(element: HTMLElement): string | undefined {
+  const id = element.getAttribute('aria-describedby');
+  return id ? document.getElementById(id)?.textContent?.trim() : undefined;
+}

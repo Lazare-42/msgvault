@@ -3,7 +3,8 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"strings"
@@ -301,12 +302,12 @@ func (s *Store) GetPersonMergeSnapshotContext(
 	if err != nil {
 		return nil, err
 	}
-	canonical, err := json.Marshal(snapshot)
+	canonical, err := json.Marshal(snapshot, json.Deterministic(true))
 	if err != nil {
 		return nil, fmt.Errorf("encode person merge snapshot response: %w", err)
 	}
 	return &PersonMergeSnapshotResponse{
-		Version: version, SHA256: hash, JSON: json.RawMessage(canonical),
+		Version: version, SHA256: hash, JSON: jsontext.Value(canonical),
 	}, nil
 }
 
@@ -332,6 +333,9 @@ func (s *Store) decidePersonMergeCandidateOnce(
 	var result *PersonMergeCandidateDecisionResult
 	err := s.withTxContext(ctx, func(tx *loggedTx) error {
 		if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
+			return err
+		}
+		if err := s.lockAttributeDefinitionCatalogTx(ctx, tx, false); err != nil {
 			return err
 		}
 		var revision int64
@@ -492,6 +496,13 @@ func (s *Store) acceptPersonMergeCandidateValueTx(
 	if !found || current.ID != candidate.SurvivorValueID {
 		return 0, ErrPersonMergeCandidateState
 	}
+	var inferenceBefore map[int64]personInferenceExportProjection
+	if provenanceIsInferred(absorbed.Source) {
+		inferenceBefore, err = s.captureInferenceExportPeopleTx(ctx, tx, candidate.PersonID)
+		if err != nil {
+			return 0, err
+		}
+	}
 	now := time.Now().UTC()
 	if _, err := s.closePersonAttributeValueTx(ctx, tx, current.ID, now, now); err != nil {
 		return 0, err
@@ -507,6 +518,9 @@ func (s *Store) acceptPersonMergeCandidateValueTx(
 			SourceRef: absorbed.SourceRef, Confidence: absorbed.Confidence, Actor: &actor,
 		}, absorbed.Ordinal, now, now)
 	if err != nil {
+		return 0, err
+	}
+	if err := s.invalidateInferenceExportChangesTx(ctx, tx, inferenceBefore); err != nil {
 		return 0, err
 	}
 	return inserted.ID, nil

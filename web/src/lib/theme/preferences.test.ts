@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   createAppearancePreferences,
+  mergeSavedAppearance,
   rebaseVirtualScroll,
   tableViewportHeight
 } from './preferences.svelte';
@@ -21,6 +22,14 @@ describe('appearance preferences', () => {
     expect(preferences.current).toEqual({ theme: 'dark', density: 'comfortable', overridden: false });
     expect(document.documentElement.dataset.density).toBe('comfortable');
     expect(document.documentElement.classList.contains('dark')).toBe(true);
+  });
+
+  it('merges only valid saved appearance values', () => {
+    const current = { theme: 'system', density: 'compact' } as const;
+    expect(mergeSavedAppearance(current, { theme: 'dark' })).toEqual({ theme: 'dark', density: 'compact' });
+    expect(mergeSavedAppearance(current, { density: 'comfortable', defaultSearchMode: 'hybrid' }))
+      .toEqual({ theme: 'system', density: 'comfortable' });
+    expect(mergeSavedAppearance(current, { theme: 'neon', density: 'roomy' })).toEqual(current);
   });
 
   it('keeps temporary overrides session-scoped and leaves daemon defaults unchanged', () => {

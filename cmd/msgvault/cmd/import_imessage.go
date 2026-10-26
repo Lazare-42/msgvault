@@ -2,7 +2,9 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -55,11 +57,15 @@ Examples:
 }
 
 func runImportImessage(cmd *cobra.Command, args []string) error {
+	state := invocationFromCommand(cmd)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
 	if !isDaemonCLISubprocess() {
 		return runDaemonCLICommandHTTPFromCobra(cmd, args)
 	}
 
-	s, cleanup, err := openWritableStoreAndInitForIngest()
+	s, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
 	if err != nil {
 		return err
 	}
@@ -70,7 +76,7 @@ func runImportImessage(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	clientOpts, err := buildImessageOpts()
+	clientOpts, err := buildImessageOpts(state.logger)
 	if err != nil {
 		return err
 	}
@@ -90,7 +96,7 @@ func runImportImessage(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("get or create source: %w", err)
 	}
-	if err := runPostSourceCreateMigrations(s); err != nil {
+	if err := runPostSourceCreateMigrationsForInvocation(s, state); err != nil {
 		return fmt.Errorf("post-source-create migrations: %w", err)
 	}
 
@@ -122,20 +128,23 @@ func runImportImessage(cmd *cobra.Command, args []string) error {
 		if ctx.Err() != nil {
 			fmt.Println("\nImport interrupted.")
 			printImessageSummary(summary, startTime)
-			return finishImessageImport(s)
+			return finishImessageImport(s, state, summary)
 		}
 		return fmt.Errorf("import failed: %w", err)
 	}
 
 	printImessageSummary(summary, startTime)
-	return finishImessageImport(s)
+	return finishImessageImport(s, state, summary)
 }
 
 // finishImessageImport runs the post-import name backfill, refreshes
-// generated chat titles, and triggers an analytics cache rebuild that picks up
-// the participant/conversation changes (the default staleness check only
-// notices new/deleted messages, not title or display_name updates).
-func finishImessageImport(s *store.Store) error {
+// generated chat titles, and rebuilds the analytics cache when those changes
+// affect existing rows inside the published message boundary.
+func finishImessageImport(s *store.Store, state *invocation, summary *imessage.ImportSummary) error {
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
 	mutated := false
 
 	if importImessageContacts != "" {
@@ -149,11 +158,11 @@ func finishImessageImport(s *store.Store) error {
 	}
 
 	dbPath := cfg.DatabaseDSN()
-	if mutated {
+	if !store.IsPostgresURL(dbPath) && (mutated || (summary != nil && summary.DatesCleared > 0)) {
 		// Title/display_name updates aren't visible to the message-id-keyed
 		// staleness check, so the standard rebuildCacheAfterWrite would skip.
-		// Force a full rebuild so conversations.parquet and
-		// participants.parquet are re-exported and the TUI sees the new names.
+		// A date clear also leaves the message ID unchanged, so it must re-export
+		// messages.parquet as well as the affected conversation datasets.
 		if _, err := buildCache(
 			dbPath,
 			cfg.AnalyticsDir(),
@@ -165,7 +174,7 @@ func finishImessageImport(s *store.Store) error {
 		return nil
 	}
 
-	return rebuildCacheAfterWrite(dbPath)
+	return rebuildCacheAfterWrite(dbPath, state)
 }
 
 func retitleImessageChats(s *store.Store) bool {
@@ -276,7 +285,7 @@ func resolveChatDBPath() (string, error) {
 	return path, nil
 }
 
-func buildImessageOpts() ([]imessage.ClientOption, error) {
+func buildImessageOpts(logger *slog.Logger) ([]imessage.ClientOption, error) {
 	var opts []imessage.ClientOption
 	opts = append(opts, imessage.WithImessageLogger(logger))
 
@@ -341,6 +350,9 @@ func printImessageSummary(
 	fmt.Printf("  Participants:     %d resolved\n", summary.ParticipantsResolved)
 	if summary.Skipped > 0 {
 		fmt.Printf("  Skipped:          %d\n", summary.Skipped)
+	}
+	if summary.DatesCleared > 0 {
+		fmt.Printf("  Dates cleared:    %d\n", summary.DatesCleared)
 	}
 	if summary.MessagesImported > 0 && elapsed.Seconds() > 0 {
 		rate := float64(summary.MessagesImported) / elapsed.Seconds()

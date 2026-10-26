@@ -9,6 +9,25 @@ import (
 	"go.kenn.io/msgvault/internal/search"
 )
 
+func TestDuckDBSearchFastPipeOR(t *testing.T) {
+	b := NewTestDataBuilder(t)
+	b.AddSource("test@example.com")
+	first := b.AddMessage(MessageOpt{Subject: "alpha beta"})
+	second := b.AddMessage(MessageOpt{Subject: "gamma"})
+	b.AddMessage(MessageOpt{Subject: "alpha only"})
+	other := b.AddSource("other@example.com")
+	b.AddMessage(MessageOpt{Subject: "gamma", SourceID: other})
+	engine := b.BuildEngine()
+	q := search.ParseOR("alpha beta | gamma")
+	filter := MessageFilter{SourceIDs: []int64{1}, HideDeletedFromSource: true}
+	rows, err := engine.SearchFast(t.Context(), q, filter, 50, 0)
+	require.NoError(t, err)
+	assertMessageIDs(t, rows, []int64{first, second})
+	count, err := engine.SearchFastCount(t.Context(), q, filter)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), count)
+}
+
 func TestDuckDBSearchFast_RecipientMetadata(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -53,6 +72,60 @@ func TestDuckDBSearchFast_AllFromParticipantsMetadata(t *testing.T) {
 	count, err := engine.SearchFastCount(context.Background(), q, MessageFilter{})
 	require.NoError(err, "SearchFastCount")
 	assert.Equal(int64(len(messages)), count, "result/count agreement")
+}
+
+func TestDuckDBSearchFast_DomainFilterTreatsWildcardsLiterally(t *testing.T) {
+	b := NewTestDataBuilder(t)
+	b.AddSource("test@example.com")
+	wantedSenderID := b.AddParticipant("sender@team_ops.example", "team_ops.example", "Wanted Sender")
+	otherSenderID := b.AddParticipant("sender@teamXops.example", "teamXops.example", "Other Sender")
+	wantedMessageID := b.AddMessage(MessageOpt{Subject: "domain filter needle"})
+	otherMessageID := b.AddMessage(MessageOpt{Subject: "domain filter needle"})
+	secondaryMatchMessageID := b.AddMessage(MessageOpt{Subject: "domain filter needle"})
+	b.AddFrom(wantedMessageID, wantedSenderID, "Wanted Sender")
+	b.AddFrom(otherMessageID, otherSenderID, "Other Sender")
+	b.AddFrom(secondaryMatchMessageID, otherSenderID, "Other Sender")
+	b.AddFrom(secondaryMatchMessageID, wantedSenderID, "Wanted Sender")
+	engine := b.BuildEngine()
+
+	messages, err := engine.SearchFast(context.Background(), search.Parse("domain filter needle"), MessageFilter{
+		Domain: "team_ops.example",
+	}, 50, 0)
+	require.NoError(t, err)
+	gotIDs := make([]int64, len(messages))
+	for i := range messages {
+		gotIDs[i] = messages[i].ID
+	}
+	assert.ElementsMatch(t, []int64{wantedMessageID, secondaryMatchMessageID}, gotIDs)
+}
+
+func TestDuckDBSearchFast_AppliesCompleteViewFilter(t *testing.T) {
+	t.Run("sender name", func(t *testing.T) {
+		engine := newParquetEngine(t)
+		messages, err := engine.SearchFast(context.Background(), search.Parse("Preview"), MessageFilter{
+			SenderName: "Alice",
+		}, 50, 0)
+		require.NoError(t, err)
+		assertMessageIDs(t, messages, []int64{1, 2, 3})
+	})
+
+	t.Run("recipient name", func(t *testing.T) {
+		engine := newParquetEngine(t)
+		messages, err := engine.SearchFast(context.Background(), search.Parse("Preview"), MessageFilter{
+			RecipientName: "Bob",
+		}, 50, 0)
+		require.NoError(t, err)
+		assertMessageIDs(t, messages, []int64{1, 2, 3})
+	})
+
+	t.Run("empty sender", func(t *testing.T) {
+		engine := newEmptyBucketsEngine(t)
+		messages, err := engine.SearchFast(context.Background(), search.Parse("No"), MessageFilter{
+			EmptyValueTargets: map[ViewType]bool{ViewSenders: true},
+		}, 50, 0)
+		require.NoError(t, err)
+		assertMessageIDs(t, messages, []int64{3})
+	})
 }
 
 func TestDuckDBSearchFast_UnscopedIncludesCachedMessageTypes(t *testing.T) {
@@ -178,10 +251,10 @@ func TestDuckDBSearchMessageBodies_DelegatesToDirectSQLite(t *testing.T) {
 	messages, err := engine.SearchMessageBodies(context.Background(),
 		&search.Query{TextTerms: []string{"body 1"}}, 50, 0)
 	require.NoError(err, "SearchMessageBodies")
-	require.Len(messages, 1, "body-only hit")
-	assert.Equal(int64(1), messages[0].ID, "body-only hit ID")
-	require.NotEmpty(messages[0].BodyContextSnippets, "body-only hit context")
-	assert.Contains(messages[0].BodyContextSnippets[0], "body 1")
+	require.Len(messages.Messages, 1, "body-only hit")
+	assert.Equal(int64(1), messages.Messages[0].ID, "body-only hit ID")
+	require.NotEmpty(messages.Messages[0].BodyContextSnippets, "body-only hit context")
+	assert.Contains(messages.Messages[0].BodyContextSnippets[0], "body 1")
 }
 
 func TestDuckDBSearchMessageBodies_RequiresDirectSQLite(t *testing.T) {

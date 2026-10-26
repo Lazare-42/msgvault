@@ -10,7 +10,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -281,7 +280,7 @@ func TestImport_AccountIdentityControlsFromMe(t *testing.T) {
 	}
 	f := &fakeSource{
 		meetings: map[string]json.RawMessage{
-			"primary": meetingFor("primary", "USER-A@EXAMPLE.COM"),
+			"primary": meetingFor("primary", " User-A@Example.COM "),
 			"alias":   meetingFor("alias", "user-b@example.com"),
 			"other":   meetingFor("other", "user-c@example.com"),
 		},
@@ -316,6 +315,13 @@ func TestImport_AccountIdentityControlsFromMe(t *testing.T) {
 	}
 
 	msgID := circlebackMessageIDFor(t, st, "primary")
+	var sender string
+	require.NoError(st.DB().QueryRow(st.Rebind(`
+		SELECT p.email_address
+		FROM messages m
+		JOIN participants p ON p.id = m.sender_id
+		WHERE m.id = ?`), msgID).Scan(&sender))
+	assert.Equal("user-a@example.com", sender)
 	assert.Equal("work", circlebackMetadataMap(t, st, msgID)["account_identifier"],
 		"metadata preserves the source label")
 }
@@ -771,12 +777,12 @@ func TestPendingTranscript_FailedRunRecoversPersistedRetryBeforeCreationCutoff(t
 	var archived Meeting
 	require.NoError(json.Unmarshal(meetings[oldID], &archived))
 	archived.Raw = meetings[oldID]
-	added, changed, err := imp.ingestMeeting(
-		prior.SourceID, "alice@example.com", nil, &archived, nil, transcriptStateUnavailable, false,
+	result, err := imp.ingestMeeting(
+		t.Context(), prior.SourceID, ImportOptions{Identifier: "alice@example.com"}, nil, &archived, nil, transcriptStateUnavailable,
 	)
 	require.NoError(err)
-	assert.True(added)
-	assert.True(changed)
+	assert.True(result.Created)
+	assert.True(result.Changed)
 
 	failed, err := imp.Import(context.Background(), ImportOptions{
 		Identifier: "alice@example.com",
@@ -807,10 +813,12 @@ func TestPendingTranscript_FailedRunRecoversPersistedRetryBeforeCreationCutoff(t
 	assert.EqualValues(1, retried.MeetingsProcessed)
 	assert.Equal([]string{oldID}, f.readIDs)
 	assert.Equal([]string{oldID}, f.transcriptIDs)
-	assert.Equal(1, countLoggedSQLStatements(t, &sqlLogs, "SELECT source_message_id, id, metadata"),
-		"the search page should batch archive metadata")
-	assert.Equal(2, countLoggedSQLStatements(t, &sqlLogs, "SELECT metadata FROM messages WHERE id"),
-		"only hydration and persistence, not discovery filtering, should read per-message metadata")
+	assert.Equal(3, countLoggedSQLStatements(t, &sqlLogs, "SELECT source_message_id, id, metadata"),
+		"the search page should batch archive metadata; the hash check and Upsert each read the one meeting")
+	assert.Equal(1, countLoggedSQLStatements(t, &sqlLogs, "SELECT metadata FROM messages WHERE id"),
+		"only hydration, not discovery filtering, should read per-message metadata")
+	assert.Zero(countLoggedSQLStatements(t, &sqlLogs, "SELECT raw_data, compression FROM message_raw"),
+		"a changed snapshot hash already decides the rewrite; Upsert must not re-read the stored raw")
 	assert.Equal("present", circlebackMetadataMap(t, st, msgID)["transcript_state"])
 }
 
@@ -1254,6 +1262,7 @@ func TestImport_RoundTrip(t *testing.T) {
 	assert.Equal("Update mockups", meta.ActionItems[0].Title)
 	assert.Equal([]string{"design"}, meta.Tags)
 	assert.Equal(2, meta.TranscriptSegments)
+	assert.Equal("47e732fd185a8fbccd822ef2d3b75cdaa628a03b01ff9dfaf735af7c50556ef5", meta.SnapshotHash)
 
 	// Raw archive composes both verbatim payloads.
 	raw, err := st.GetMessageRaw(msgID)
@@ -1301,6 +1310,23 @@ func TestImport_IdempotentRefreshAndWatermark(t *testing.T) {
 	var count int
 	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&count))
 	assert.Equal(1, count)
+
+	// An incremental sync leaves a stale derived preview alone when the
+	// evidence is unchanged; --full must rewrite it.
+	const snippetQuery = `SELECT snippet FROM messages WHERE source_message_id = ?`
+	var snippet string
+	require.NoError(st.DB().QueryRow(st.Rebind(snippetQuery), "meeting:42").Scan(&snippet))
+	_, err = st.DB().Exec(st.Rebind(
+		`UPDATE messages SET snippet = ? WHERE source_message_id = ?`), "stale", "meeting:42")
+	require.NoError(err)
+	forced, err := imp.Import(context.Background(),
+		ImportOptions{Identifier: "alice@example.com", Full: true})
+	require.NoError(err)
+	assert.EqualValues(0, forced.MeetingsAdded)
+	assert.EqualValues(1, forced.MeetingsUpdated)
+	var repaired string
+	require.NoError(st.DB().QueryRow(st.Rebind(snippetQuery), "meeting:42").Scan(&repaired))
+	assert.Equal(snippet, repaired)
 
 	// Failing run: watermark holds.
 	f.failRead = true
@@ -1769,16 +1795,6 @@ func TestImport_TranscriptFailureStillArchivesNotes(t *testing.T) {
 	assert.NotContains(body, "Transcript:")
 }
 
-func TestSnippetPreservesUTF8(t *testing.T) {
-	assert := assert.New(t)
-	body := strings.Repeat("a", 199) + "é" + "tail"
-
-	got := snippet(body)
-
-	assert.True(utf8.ValidString(got))
-	assert.Equal(strings.Repeat("a", 199)+"é", got)
-}
-
 func TestImport_TranscriptFailurePreservesArchivedTranscript(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -2061,6 +2077,7 @@ func TestIngestMeeting_RawFailureRollsBackCanonicalRefresh(t *testing.T) {
 	require.NoError(err)
 	msgID := circlebackMessageID(t, st)
 	before := circlebackPersistenceSnapshot(t, st, msgID)
+	participantsBefore := circlebackStringRows(t, st, `SELECT email_address FROM participants ORDER BY email_address`)
 
 	_, err = st.DB().Exec(`
 		CREATE TRIGGER fail_circleback_raw_archive
@@ -2078,15 +2095,17 @@ func TestIngestMeeting_RawFailureRollsBackCanonicalRefresh(t *testing.T) {
 	recoveredTranscript, err := decodeTranscript(json.RawMessage(transcript42))
 	require.NoError(err)
 
-	added, changed, err := imp.ingestMeeting(
-		initial.SourceID, "alice@example.com", nil, &refreshed, recoveredTranscript, transcriptStatePresent, false,
+	result, err := imp.ingestMeeting(
+		t.Context(), initial.SourceID, ImportOptions{Identifier: "alice@example.com"}, nil, &refreshed, recoveredTranscript, transcriptStatePresent,
 	)
 	require.Error(err)
-	assert.False(added)
-	assert.False(changed)
+	assert.False(result.Created)
+	assert.False(result.Changed)
 	assert.Contains(err.Error(), "upsert raw")
 	assert.Equal(before, circlebackPersistenceSnapshot(t, st, msgID),
 		"a late canonical write failure must roll back the message and every related row")
+	assert.Equal(participantsBefore, circlebackStringRows(t, st, `SELECT email_address FROM participants ORDER BY email_address`),
+		"a late canonical write failure must not leave new participants behind")
 }
 
 func TestImport_MessageLookupFailureMarksSyncFailed(t *testing.T) {

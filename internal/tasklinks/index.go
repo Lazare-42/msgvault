@@ -2,7 +2,7 @@ package tasklinks
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"go.kenn.io/kit/atomicfile"
 	"go.kenn.io/msgvault/internal/taskclient"
 )
 
@@ -181,35 +182,17 @@ func (i *Index) save(data indexFile) error {
 		return err
 	}
 	data.FormatVersion = indexFormatV1
-	encoded, err := json.Marshal(data)
+	encoded, err := json.Marshal(data, json.Deterministic(true))
 	if err != nil {
 		return err
 	}
 	if len(encoded) > MaxCacheFileBytes {
 		return fmt.Errorf("task reverse index exceeds %d bytes", MaxCacheFileBytes)
 	}
-	tmp, err := os.CreateTemp(dir, ".reverse-index-*")
-	if err != nil {
-		return err
+	if err := atomicfile.WriteFile(i.path, encoded); err != nil {
+		return fmt.Errorf("write task reverse index: %w", err)
 	}
-	name := tmp.Name()
-	defer func() { _ = os.Remove(name) }()
-	if err := secureCacheFile(tmp); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(encoded); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(name, i.path)
+	return nil
 }
 
 func preparePrivateCacheDir(dir string) error {

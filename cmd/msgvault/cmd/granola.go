@@ -4,10 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"os/signal"
-	"strings"
-	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -24,7 +20,7 @@ var (
 
 var (
 	newGranolaClient                      = granola.NewClient
-	rebuildGranolaCacheAfterWrite         = rebuildCacheAfterWrite
+	rebuildGranolaCacheAfterWrite         = rebuildCacheAfterManualSync
 	rebuildGranolaCacheAfterScheduledSync = rebuildCacheAfterScheduledSync
 )
 
@@ -37,29 +33,15 @@ const granolaConfigHint = `Add to your config.toml:
   enabled = true
   # schedule = "0 */6 * * *"       # optional daemon schedule`
 
-// resolveGranolaSource picks the [[granola]] entry for an optional CLI
-// argument: an explicit identifier must match a configured entry; with no
-// argument there must be exactly one entry.
-func resolveGranolaSource(args []string) (*config.GranolaSource, error) {
-	if len(cfg.Granola) == 0 {
-		return nil, errors.New("no [[granola]] sources configured\n\n" + granolaConfigHint)
+func granolaSources(cfg *config.Config) meetingSources[config.GranolaSource] {
+	sources := meetingSources[config.GranolaSource]{
+		table: "granola", hint: granolaConfigHint,
 	}
-	if len(args) > 0 {
-		src := cfg.GetGranolaSource(args[0])
-		if src == nil {
-			var ids []string
-			for _, s := range cfg.Granola {
-				ids = append(ids, s.Identifier)
-			}
-			return nil, fmt.Errorf("no [[granola]] entry with identifier %q (configured: %s)", args[0], strings.Join(ids, ", "))
-		}
-		return src, nil
+	if cfg != nil {
+		sources.configured, sources.lookup = cfg.Granola, cfg.GetGranolaSource
+		sources.identifier = func(s config.GranolaSource) string { return s.Identifier }
 	}
-	if len(cfg.Granola) > 1 {
-		return nil, errors.New("multiple [[granola]] sources configured; pass an identifier")
-	}
-	src := cfg.Granola[0]
-	return &src, nil
+	return sources
 }
 
 var addGranolaCmd = &cobra.Command{
@@ -76,11 +58,16 @@ Examples:
   msgvault add-granola you@example.com`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		state := invocationFromCommand(cmd)
+		if state == nil || state.cfg == nil {
+			return errors.New("configuration is unavailable")
+		}
+		cfg := state.cfg
 		if !isDaemonCLISubprocess() {
 			return runDaemonCLICommandHTTPFromCobra(cmd, args)
 		}
 
-		src, err := resolveGranolaSource(args)
+		src, err := granolaSources(cfg).one(args)
 		if err != nil {
 			return err
 		}
@@ -98,7 +85,7 @@ Examples:
 			return fmt.Errorf("validate Granola API key: %w", err)
 		}
 
-		s, cleanup, err := openWritableStoreAndInitForIngest()
+		s, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
 		if err != nil {
 			return err
 		}
@@ -109,7 +96,7 @@ Examples:
 		); err != nil {
 			return err
 		}
-		if err := runPostSourceCreateMigrations(s); err != nil {
+		if err := runPostSourceCreateMigrationsForInvocation(s, state); err != nil {
 			return fmt.Errorf("post-source-create migrations: %w", err)
 		}
 
@@ -139,22 +126,18 @@ Examples:
   msgvault sync-granola --full --after 2024-01-01`,
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		state := invocationFromCommand(cmd)
+		if state == nil || state.cfg == nil {
+			return errors.New("configuration is unavailable")
+		}
+		cfg := state.cfg
 		if !isDaemonCLISubprocess() {
 			return runDaemonCLICommandHTTPFromCobra(cmd, args)
 		}
 
-		var sources []config.GranolaSource
-		if len(args) > 0 || len(cfg.Granola) == 1 {
-			src, err := resolveGranolaSource(args)
-			if err != nil {
-				return err
-			}
-			sources = []config.GranolaSource{*src}
-		} else {
-			sources = cfg.Granola
-		}
-		if len(sources) == 0 {
-			return errors.New("no [[granola]] sources configured\n\n" + granolaConfigHint)
+		sources, err := granolaSources(cfg).selected(args)
+		if err != nil {
+			return err
 		}
 
 		var after time.Time
@@ -183,28 +166,23 @@ Examples:
 			})
 		}
 
-		s, cleanup, err := openWritableStoreAndInitForIngest()
+		s, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
 		if err != nil {
 			return err
 		}
 		defer cleanup()
 		dbPath := cfg.DatabaseDSN()
 
-		ctx, cancel := context.WithCancel(cmd.Context())
-		defer cancel()
-		sigChan := make(chan os.Signal, 1)
-		signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-		defer signal.Stop(sigChan)
-		go func() {
-			select {
-			case <-sigChan:
-				_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "\nInterrupted. Finishing current note...")
-				cancel()
-			case <-ctx.Done():
-			}
-		}()
+		ctx, stop := withInterruptCancel(cmd, "\nInterrupted. Finishing current note...")
+		defer stop()
 
-		pendingCacheWrites := &granola.ImportSummary{}
+		var pendingWrites int64
+		finish := func(identifier string, err error) error {
+			run := meetingSyncRun{
+				provider: "granola", identifier: identifier, writes: pendingWrites, err: err,
+			}
+			return run.finish(func() error { return rebuildGranolaCacheAfterWrite(dbPath, state) })
+		}
 		for _, validated := range validatedSources {
 			src := validated.source
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Syncing Granola for %s\n\n", src.Identifier)
@@ -219,18 +197,13 @@ Examples:
 				Progress:     func(line string) { _, _ = fmt.Fprintln(cmd.OutOrStdout(), "  "+line) },
 			})
 			if sum != nil {
-				pendingCacheWrites.NotesAdded += sum.NotesAdded
-				pendingCacheWrites.NotesUpdated += sum.NotesUpdated
+				pendingWrites += sum.NotesAdded + sum.NotesUpdated
 			}
 			if ctx.Err() != nil {
 				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "\nInterrupted — re-run sync-granola to resume.")
-				return finishGranolaImport(src.Identifier, pendingCacheWrites, ctx.Err(), func() error {
-					return rebuildGranolaCacheAfterWrite(dbPath)
-				})
+				return finish(src.Identifier, ctx.Err())
 			}
-			if finishErr := finishGranolaImport(src.Identifier, pendingCacheWrites, err, func() error {
-				return rebuildGranolaCacheAfterWrite(dbPath)
-			}); finishErr != nil {
+			if finishErr := finish(src.Identifier, err); finishErr != nil {
 				return finishErr
 			}
 
@@ -244,66 +217,45 @@ Examples:
 			}
 		}
 
-		return rebuildGranolaCacheAfterWrite(dbPath)
+		return rebuildGranolaCacheAfterWrite(dbPath, state)
 	},
-}
-
-func finishGranolaImport(
-	identifier string,
-	sum *granola.ImportSummary,
-	importErr error,
-	refreshCache func() error,
-) error {
-	if importErr == nil {
-		return nil
-	}
-	var refreshErr error
-	if sum != nil && sum.NotesAdded+sum.NotesUpdated > 0 && refreshCache != nil {
-		refreshErr = refreshCache()
-	}
-	return errors.Join(fmt.Errorf("granola sync %s failed: %w", identifier, importErr), refreshErr)
 }
 
 // runConfiguredGranolaSync is the daemon-scheduler entry point for one
 // [[granola]] source.
 func runConfiguredGranolaSync(ctx context.Context, st *store.Store, src config.GranolaSource) error {
-	refreshCtx := context.WithoutCancel(ctx)
 	// Generic scheduler jobs and mutating daemon requests share the operation
 	// gate, so a registered source cannot be removed between this precheck and
 	// the importer's existing-source GetOrCreateSource call.
-	registered, err := st.ListSources(granola.SourceType)
+	notRegistered := fmt.Errorf("granola source %q is not registered; run msgvault add-granola %s",
+		src.Identifier, src.Identifier)
+	registered, err := requireRegisteredMeetingSource(st, granola.SourceType, src.Identifier, notRegistered)
 	if err != nil {
-		return fmt.Errorf("list registered Granola sources: %w", err)
+		return recordSyncAttempt(ctx, granola.SourceType, src.Identifier, err)
 	}
-	found := false
-	for _, candidate := range registered {
-		if candidate.Identifier == src.Identifier {
-			found = true
-			break
-		}
-	}
-	if !found {
-		return fmt.Errorf("granola source %q is not registered; run msgvault add-granola %s",
-			src.Identifier, src.Identifier)
+	if registered.MergedIntoSourceID != 0 {
+		return nil
 	}
 	if src.APIKey == "" {
-		return fmt.Errorf("granola source %q has no api_key", src.Identifier)
+		return recordSyncAttempt(ctx, granola.SourceType, src.Identifier, fmt.Errorf("granola source %q has no api_key", src.Identifier))
 	}
 	accountEmail, err := src.EffectiveAccountEmail()
 	if err != nil {
-		return err
+		return recordSyncAttempt(ctx, granola.SourceType, src.Identifier, err)
 	}
 	imp := granola.NewImporter(st, newGranolaClient(granola.DefaultBaseURL, src.APIKey))
 	sum, err := imp.Import(ctx, granola.ImportOptions{
 		Identifier:   src.Identifier,
 		AccountEmail: accountEmail,
 	})
-	if err := finishGranolaImport(src.Identifier, sum, err, func() error {
-		return rebuildGranolaCacheAfterScheduledSync(refreshCtx, "granola:"+src.Identifier)
-	}); err != nil {
-		return err
+	var writes int64
+	if sum != nil {
+		writes = sum.NotesAdded + sum.NotesUpdated
 	}
-	return rebuildGranolaCacheAfterScheduledSync(refreshCtx, "granola:"+src.Identifier)
+	run := meetingSyncRun{provider: "granola", identifier: src.Identifier, writes: writes, err: err}
+	_ = recordSyncAttempt(ctx, granola.SourceType, src.Identifier, err)
+	return run.finishScheduled(ctx, "granola:"+src.Identifier,
+		rebuildGranolaCacheAfterScheduledSync)
 }
 
 func init() {
@@ -311,5 +263,5 @@ func init() {
 	syncGranolaCmd.Flags().StringVar(&syncGranolaAfter, "after", "", "full-sync only notes created after this date (YYYY-MM-DD; implies --full)")
 	syncGranolaCmd.Flags().BoolVar(&syncGranolaFull, "full", false, "ignore stored cursor and re-fetch every note (repairs existing rows in place)")
 	rootCmd.AddCommand(addGranolaCmd)
-	rootCmd.AddCommand(syncGranolaCmd)
+	rootCmd.AddCommand(addManualSyncCacheFlags(syncGranolaCmd))
 }

@@ -1,10 +1,12 @@
 package meetingimport
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"strings"
 	"time"
+
+	"go.kenn.io/msgvault/internal/meetingarchive"
 )
 
 type Snapshot struct {
@@ -23,17 +25,18 @@ type Snapshot struct {
 }
 
 type canonicalMeeting struct {
-	ExternalID         string              `json:"external_id"`
-	Title              string              `json:"title,omitempty"`
-	StartedAt          string              `json:"started_at"`
-	EndedAt            string              `json:"ended_at,omitempty"`
-	SummaryMarkdown    string              `json:"summary_markdown,omitempty"`
-	SummaryText        string              `json:"summary_text,omitempty"`
-	Transcript         string              `json:"transcript,omitempty"`
-	TranscriptSegments []TranscriptSegment `json:"transcript_segments,omitempty"`
-	Organizer          *MeetingPerson      `json:"organizer,omitempty"`
-	Attendees          []MeetingPerson     `json:"attendees,omitempty"`
-	Metadata           map[string]any      `json:"metadata,omitempty"`
+	ActionItems        *[]MeetingActionItem `json:"action_items,omitzero"`
+	ExternalID         string               `json:"external_id"`
+	Title              string               `json:"title,omitempty"`
+	StartedAt          string               `json:"started_at"`
+	EndedAt            string               `json:"ended_at,omitempty"`
+	SummaryMarkdown    string               `json:"summary_markdown,omitempty"`
+	SummaryText        string               `json:"summary_text,omitempty"`
+	Transcript         string               `json:"transcript,omitempty"`
+	TranscriptSegments []TranscriptSegment  `json:"transcript_segments,omitempty"`
+	Organizer          *MeetingPerson       `json:"organizer,omitzero"`
+	Attendees          []MeetingPerson      `json:"attendees,omitempty"`
+	Metadata           map[string]any       `json:"metadata,omitempty"`
 }
 
 type messageMetadata struct {
@@ -59,11 +62,11 @@ func BuildSnapshot(req NormalizedRequest) (Snapshot, error) {
 	}
 
 	body := buildBody(title, meeting)
-	raw, err := json.Marshal(buildCanonicalMeeting(meeting))
+	raw, err := json.Marshal(buildCanonicalMeeting(meeting), json.Deterministic(true))
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("marshal canonical meeting: %w", err)
 	}
-	metadata, err := json.Marshal(buildMessageMetadata(req))
+	metadata, err := json.Marshal(buildMessageMetadata(req), json.Deterministic(true))
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("marshal meeting metadata: %w", err)
 	}
@@ -76,7 +79,7 @@ func BuildSnapshot(req NormalizedRequest) (Snapshot, error) {
 		Title:             title,
 		StartedAt:         meeting.StartedAt.UTC(),
 		Body:              body,
-		Snippet:           snippet(body),
+		Snippet:           meetingarchive.Snippet(body),
 		Metadata:          metadata,
 		Raw:               raw,
 		Organizer:         meeting.Organizer,
@@ -116,6 +119,26 @@ func buildBody(title string, meeting NormalizedMeeting) string {
 		writeLine(summary)
 	}
 
+	if meeting.ActionItems != nil && len(*meeting.ActionItems) > 0 {
+		b.WriteString("\nAction items:\n")
+		for _, action := range *meeting.ActionItems {
+			writeLine("- " + action.Title)
+			writeLine(action.Description)
+			if action.AssigneeName != "" {
+				writeLine("Assignee: " + action.AssigneeName)
+			}
+			if action.AssigneeEmail != "" {
+				writeLine("Email: " + action.AssigneeEmail)
+			}
+			if action.Status != "" {
+				writeLine("Status: " + action.Status)
+			}
+			if action.DueDate != "" {
+				writeLine("Due: " + action.DueDate)
+			}
+		}
+	}
+
 	if meeting.Transcript != "" {
 		b.WriteString("\nTranscript:\n")
 		writeLine(meeting.Transcript)
@@ -151,21 +174,13 @@ func formatSegment(segment TranscriptSegment) string {
 	return fmt.Sprintf("[%02d:%02d] %s", minutes, seconds, label)
 }
 
-func snippet(body string) string {
-	const maxRunes = 200
-	runes := []rune(strings.TrimSpace(body))
-	if len(runes) <= maxRunes {
-		return string(runes)
-	}
-	return string(runes[:maxRunes])
-}
-
 func buildCanonicalMeeting(meeting NormalizedMeeting) canonicalMeeting {
 	endedAt := ""
 	if meeting.EndedAt != nil {
 		endedAt = meeting.EndedAt.UTC().Format(time.RFC3339Nano)
 	}
 	return canonicalMeeting{
+		ActionItems:        meeting.ActionItems,
 		ExternalID:         meeting.ExternalID,
 		Title:              meeting.Title,
 		StartedAt:          meeting.StartedAt.UTC().Format(time.RFC3339Nano),

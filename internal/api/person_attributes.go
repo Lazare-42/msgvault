@@ -49,30 +49,30 @@ type PersonAttributesResponse struct {
 type PersonAttributeConflictResponse struct {
 	Error          string                      `json:"error"`
 	Message        string                      `json:"message,omitempty"`
-	CurrentValueID *int64                      `json:"current_value_id,omitempty"`
-	CurrentValue   *store.PersonAttributeValue `json:"current_value,omitempty"`
+	CurrentValueID *int64                      `json:"current_value_id,omitzero" nullable:"false"`
+	CurrentValue   *store.PersonAttributeValue `json:"current_value,omitzero" nullable:"false"`
 }
 
 // SetPersonAttributeRequest carries a typed value and its provenance.
 type SetPersonAttributeRequest struct {
 	Value           store.AttributeValue `json:"value"`
-	Ordinal         *int64               `json:"ordinal,omitempty"`
+	Ordinal         *int64               `json:"ordinal,omitzero" nullable:"false"`
 	Source          string               `json:"source,omitempty" enum:"user,carddav_import,vcard_import,archive_observation,extraction,enrichment,system"`
-	SourceRef       *string              `json:"source_ref,omitempty"`
-	Confidence      *float64             `json:"confidence,omitempty"`
-	Actor           *string              `json:"actor,omitempty"`
+	SourceRef       *string              `json:"source_ref,omitzero" nullable:"false"`
+	Confidence      *float64             `json:"confidence,omitzero" nullable:"false"`
+	Actor           *string              `json:"actor,omitzero" nullable:"false"`
 	ActiveFrom      *time.Time           `json:"active_from,omitempty"`
 	ActiveUntil     *time.Time           `json:"active_until,omitempty"`
-	ExpectedValueID *int64               `json:"expected_value_id,omitempty"`
+	ExpectedValueID *int64               `json:"expected_value_id,omitzero" nullable:"false"`
 }
 
 // AppendPersonNoteRequest carries one note fragment and its provenance.
 type AppendPersonNoteRequest struct {
 	Text       string   `json:"text"`
 	Source     string   `json:"source,omitempty" enum:"user,carddav_import,vcard_import,archive_observation,extraction,enrichment,system"`
-	SourceRef  *string  `json:"source_ref,omitempty"`
-	Confidence *float64 `json:"confidence,omitempty"`
-	Actor      *string  `json:"actor,omitempty"`
+	SourceRef  *string  `json:"source_ref,omitzero" nullable:"false"`
+	Confidence *float64 `json:"confidence,omitzero" nullable:"false"`
+	Actor      *string  `json:"actor,omitzero" nullable:"false"`
 }
 
 func (s *Server) registerPersonAttributeRoutes(api huma.API) {
@@ -301,39 +301,14 @@ func (s *Server) handleClearPersonAttribute(w http.ResponseWriter, r *http.Reque
 	if !ok {
 		return
 	}
-	dryRun, _, err := queryBool(r, "dry_run")
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+	query, ok := s.attributeClearQuery(w, r)
+	if !ok {
 		return
-	}
-	expectedValueID, hasExpectedValueID, err := queryInt64(r, "expected_value_id")
-	if err != nil {
-		s.rejectBadParam(w, err)
-		return
-	}
-	if hasExpectedValueID && expectedValueID < 1 {
-		writeError(w, http.StatusBadRequest, "invalid_expected_value_id",
-			"expected_value_id must be a positive integer")
-		return
-	}
-	var expectedValueIDPtr *int64
-	if hasExpectedValueID {
-		expectedValueIDPtr = &expectedValueID
-	}
-	var ordinal *int64
-	if raw := strings.TrimSpace(r.URL.Query().Get("ordinal")); raw != "" {
-		parsed, parseErr := strconv.ParseInt(raw, 10, 64)
-		if parseErr != nil || parsed < 0 {
-			writeError(w, http.StatusBadRequest, "invalid_ordinal",
-				"ordinal must be a non-negative integer")
-			return
-		}
-		ordinal = &parsed
 	}
 	write, err := attributes.SupersedePersonAttributeValueContext(r.Context(),
 		store.PersonAttributeSupersedeInput{
-			PersonID: personID, DefinitionSlug: slug, Ordinal: ordinal,
-			ExpectedValueID: expectedValueIDPtr, DryRun: dryRun,
+			PersonID: personID, DefinitionSlug: slug, Ordinal: query.ordinal,
+			ExpectedValueID: query.expectedValueID, DryRun: query.dryRun,
 		})
 	if err != nil {
 		s.writeAttributeError(w, err)
@@ -398,6 +373,45 @@ func personAttributeTarget(w http.ResponseWriter, r *http.Request) (int64, strin
 		return 0, "", false
 	}
 	return personID, slug, true
+}
+
+// attributeClearParams holds the query parameters both attribute clear routes accept.
+type attributeClearParams struct {
+	ordinal, expectedValueID *int64
+	dryRun                   bool
+}
+
+func (s *Server) attributeClearQuery(w http.ResponseWriter, r *http.Request) (attributeClearParams, bool) {
+	var params attributeClearParams
+	dryRun, _, err := queryBool(r, "dry_run")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", err.Error())
+		return params, false
+	}
+	params.dryRun = dryRun
+	expectedValueID, hasExpectedValueID, err := queryInt64(r, "expected_value_id")
+	if err != nil {
+		s.rejectBadParam(w, err)
+		return params, false
+	}
+	if hasExpectedValueID {
+		if expectedValueID < 1 {
+			writeError(w, http.StatusBadRequest, "invalid_expected_value_id",
+				"expected_value_id must be a positive integer")
+			return params, false
+		}
+		params.expectedValueID = &expectedValueID
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("ordinal")); raw != "" {
+		parsed, parseErr := strconv.ParseInt(raw, 10, 64)
+		if parseErr != nil || parsed < 0 {
+			writeError(w, http.StatusBadRequest, "invalid_ordinal",
+				"ordinal must be a non-negative integer")
+			return params, false
+		}
+		params.ordinal = &parsed
+	}
+	return params, true
 }
 
 func (s *Server) requirePersonForAttributes(

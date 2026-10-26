@@ -3,13 +3,16 @@ package api
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 	"go.kenn.io/msgvault/internal/store"
@@ -26,9 +29,13 @@ const (
 // PersonProfileStore is the feature-local capability for durable curated
 // people. The daemon adapter passes these calls directly to *store.Store.
 type PersonProfileStore interface {
-	CreatePersonFromParticipantContext(ctx context.Context, participantID int64) (*store.Person, bool, error)
+	CreatePersonFromParticipantWithDisplayNameContext(
+		ctx context.Context, participantID int64, displayName *string,
+	) (*store.Person, bool, error)
 	GetPersonContext(ctx context.Context, id int64) (*store.Person, error)
+	GetPersonByUIDContext(ctx context.Context, uid string) (*store.Person, error)
 	ListPersonsContext(ctx context.Context) ([]store.Person, error)
+	DirectoryPeoplePageContext(ctx context.Context, query store.DirectoryPeopleQuery) (*store.DirectoryPeoplePage, error)
 	UpdatePersonDisplayNameContext(
 		ctx context.Context, id, expectedRevision int64, displayName *string,
 	) (*store.Person, error)
@@ -47,7 +54,8 @@ type PersonProfileStore interface {
 }
 
 type CreatePersonRequest struct {
-	ParticipantID int64 `json:"participant_id"`
+	ParticipantID int64   `json:"participant_id"`
+	DisplayName   *string `json:"display_name,omitzero" nullable:"true"`
 }
 
 type PatchPersonRequest struct {
@@ -56,6 +64,13 @@ type PatchPersonRequest struct {
 
 type PeopleResponse struct {
 	People []store.Person `json:"people"`
+}
+
+// DirectoryPeopleResponse is the non-sensitive, paginated Directory view of
+// durable person roots.
+type DirectoryPeopleResponse struct {
+	People     []store.DirectoryPersonSummary `json:"people"`
+	NextCursor string                         `json:"next_cursor,omitempty"`
 }
 
 // PersonSearchEngine is the semantic people service consumed by the HTTP
@@ -67,7 +82,7 @@ type PersonSearchEngine interface {
 
 type PersonSearchRequest struct {
 	Query string `json:"query" minLength:"1"`
-	Limit int    `json:"limit,omitempty" minimum:"0" maximum:"100" default:"20"`
+	Limit int    `json:"limit,omitzero" minimum:"0" maximum:"100" default:"20"`
 }
 
 type PersonSearchResult struct {
@@ -95,9 +110,20 @@ func (s *Server) registerPersonProfileRoutes(api huma.API) {
 	addErrorResponses(api, list.Responses, http.StatusServiceUnavailable)
 	registerRawHumaRoute(api, list, s.handleListPeople)
 
+	directory := rawAPIV1Operation("listDirectoryPeople", http.MethodGet, "/people/directory",
+		"Query durable people for the Directory")
+	directory.Description = "Returns one stable, non-sensitive page of promoted durable people."
+	addDirectoryPeopleParameters(&directory)
+	directory.Responses = jsonResponsesFor[DirectoryPeopleResponse](api)
+	addErrorResponses(api, directory.Responses, http.StatusBadRequest, http.StatusServiceUnavailable)
+	registerRawHumaRoute(api, directory, s.handleDirectoryPeople)
+
 	create := rawAPIV1Operation("createPerson", http.MethodPost, "/people", "Promote a participant cluster to a durable person")
 	create.Description = "Returns 201 when a new person is created, or 200 when the cluster is already " +
-		"represented by a person (idempotent re-promotion, which also binds any unbound cluster members)."
+		"represented by a person (idempotent re-promotion, which also binds any unbound cluster members). " +
+		"New profiles default to the first nonblank observed cluster name by participant ID. " +
+		"An explicit display_name takes precedence; an empty or whitespace-only string leaves the name unset. " +
+		"Omitted or null uses the default. Re-promotion preserves the existing name, including a cleared name."
 	create.RequestBody = jsonRequestBodyFor[CreatePersonRequest](api)
 	create.Responses = jsonResponsesFor[store.Person](api, http.StatusOK, http.StatusCreated)
 	addPersonETagHeader(create.Responses[httpStatusKey(http.StatusOK)])
@@ -111,6 +137,17 @@ func (s *Server) registerPersonProfileRoutes(api huma.API) {
 	addPersonETagHeader(get.Responses[httpStatusKey(http.StatusOK)])
 	addErrorResponses(api, get.Responses, http.StatusNotFound, http.StatusServiceUnavailable)
 	registerRawHumaRoute(api, get, s.handleGetPersonProfile)
+
+	getByUID := rawAPIV1Operation("getPersonByUID", http.MethodGet,
+		"/people/by-uid", "Look up a durable person by vCard or CardDAV UID")
+	getByUID.Description = "Resolves the person's current vCard UID, a retired UID that still aliases the person, " +
+		"or the UID of a CardDAV resource mapped to the person. Returns a conflict when one remote UID maps to " +
+		"different people."
+	addPersonUIDParameter(&getByUID)
+	getByUID.Responses = jsonResponsesFor[store.Person](api)
+	addErrorResponses(api, getByUID.Responses, http.StatusBadRequest, http.StatusNotFound,
+		http.StatusConflict, http.StatusServiceUnavailable)
+	registerRawHumaRoute(api, getByUID, s.handleGetPersonByUID)
 
 	patch := rawAPIV1Operation("patchPerson", http.MethodPatch, "/people/{id}", "Update a durable person's display name")
 	addPersonIDParameter(&patch)
@@ -170,7 +207,7 @@ func (s *Server) handleSemanticPersonSearch(w http.ResponseWriter, r *http.Reque
 	}
 	results, err := engine.Search(r.Context(), request.Query, request.Limit)
 	if err != nil {
-		s.writePersonSearchError(w, err)
+		s.writePersonSearchError(r.Context(), w, err)
 		return
 	}
 	response := PersonSearchResponse{Results: make([]PersonSearchResult, len(results))}
@@ -180,7 +217,7 @@ func (s *Server) handleSemanticPersonSearch(w http.ResponseWriter, r *http.Reque
 	writeJSON(w, http.StatusOK, response)
 }
 
-func (s *Server) writePersonSearchError(w http.ResponseWriter, err error) {
+func (s *Server) writePersonSearchError(ctx context.Context, w http.ResponseWriter, err error) {
 	if s.writeIfContextError(w, err) {
 		return
 	}
@@ -197,8 +234,10 @@ func (s *Server) writePersonSearchError(w http.ResponseWriter, err error) {
 			"Semantic person search cannot verify the current semantic person embedding policy or exact consent; check the live configuration and consent store")
 	case errors.Is(err, vector.ErrNotEnabled):
 		writeError(w, http.StatusServiceUnavailable, "vector_not_enabled", "Vector search is not configured")
-	case errors.Is(err, vector.ErrIndexStale):
+	case errors.Is(err, vector.ErrSemanticPersonEmbeddingRuntimeStale):
 		writeError(w, http.StatusServiceUnavailable, "index_stale", "The vector index does not match configured embedding settings")
+	case errors.Is(err, vector.ErrIndexStale):
+		s.writeIndexStale(ctx, w, err)
 	case errors.Is(err, personsearch.ErrPersonCoverageIncomplete):
 		var coverageErr *personsearch.CoverageIncompleteError
 		if errors.As(err, &coverageErr) && coverageErr.Rejected > 0 {
@@ -233,7 +272,9 @@ func (s *Server) handleCreatePerson(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_participant_id", "participant_id must be a positive integer")
 		return
 	}
-	person, created, err := profiles.CreatePersonFromParticipantContext(r.Context(), request.ParticipantID)
+	person, created, err := profiles.CreatePersonFromParticipantWithDisplayNameContext(
+		r.Context(), request.ParticipantID, request.DisplayName,
+	)
 	if err != nil {
 		s.writePersonError(w, err)
 		return
@@ -282,6 +323,24 @@ func (s *Server) handleGetPersonProfile(w http.ResponseWriter, r *http.Request) 
 	writePerson(w, http.StatusOK, person)
 }
 
+func (s *Server) handleGetPersonByUID(w http.ResponseWriter, r *http.Request) {
+	profiles, ok := s.personProfileStore(w)
+	if !ok {
+		return
+	}
+	uid := strings.TrimSpace(r.URL.Query().Get("uid"))
+	if uid == "" {
+		writeError(w, http.StatusBadRequest, "invalid_person_uid", "vCard UID must not be empty")
+		return
+	}
+	person, err := profiles.GetPersonByUIDContext(r.Context(), uid)
+	if err != nil {
+		s.writePersonError(w, err)
+		return
+	}
+	writePerson(w, http.StatusOK, person)
+}
+
 func (s *Server) handleListPeople(w http.ResponseWriter, r *http.Request) {
 	profiles, ok := s.personProfileStore(w)
 	if !ok {
@@ -294,6 +353,85 @@ func (s *Server) handleListPeople(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, PeopleResponse{People: persons})
+}
+
+func (s *Server) handleDirectoryPeople(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	query, err := directoryPeopleQuery(r.URL.Query())
+	if err != nil {
+		s.rejectBadParam(w, err)
+		return
+	}
+	profiles, ok := s.personProfileStore(w)
+	if !ok {
+		return
+	}
+	page, err := profiles.DirectoryPeoplePageContext(r.Context(), query)
+	if err != nil {
+		s.writeDirectoryPeopleError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, DirectoryPeopleResponse{People: page.People, NextCursor: page.NextCursor})
+}
+
+// directoryPeopleQuery reads each Directory query parameter once so the route
+// has one canonical request representation for validation and pagination.
+func directoryPeopleQuery(values url.Values) (store.DirectoryPeopleQuery, error) {
+	query := store.DirectoryPeopleQuery{
+		Query:          values.Get("q"),
+		Cursor:         values.Get("cursor"),
+		ContactState:   values.Get("contact_state"),
+		Category:       values.Get("category"),
+		Organization:   values.Get("organization"),
+		PrimaryChannel: values.Get("primary_channel"),
+		Sort:           values.Get("sort"),
+	}
+	for _, field := range []struct {
+		name   string
+		target **time.Time
+	}{
+		{name: "last_contact_after", target: &query.LastContactAfter},
+		{name: "last_contact_before", target: &query.LastContactBefore},
+	} {
+		value := strings.TrimSpace(values.Get(field.name))
+		if value == "" {
+			continue
+		}
+		parsed, err := time.Parse(time.RFC3339, value)
+		if err != nil {
+			return store.DirectoryPeopleQuery{}, fmt.Errorf("%w: %s must be RFC3339", store.ErrInvalidDirectoryQuery, field.name)
+		}
+		*field.target = &parsed
+	}
+	limit := strings.TrimSpace(values.Get("limit"))
+	if limit == "" {
+		return query, nil
+	}
+	parsed, err := strconv.Atoi(limit)
+	if err != nil {
+		return store.DirectoryPeopleQuery{}, newParamError("limit",
+			fmt.Sprintf("query parameter %q must be an integer, got %q", "limit", limit))
+	}
+	query.Limit = parsed
+	return query, nil
+}
+
+func (s *Server) writeDirectoryPeopleError(w http.ResponseWriter, err error) {
+	if s.writeIfContextError(w, err) {
+		return
+	}
+	switch {
+	case errors.Is(err, store.ErrInvalidDirectoryCursor):
+		writeError(w, http.StatusBadRequest, "invalid_cursor", "Directory cursor is invalid")
+	case errors.Is(err, store.ErrInvalidDirectoryQuery):
+		writeError(w, http.StatusBadRequest, "invalid_query", "Directory query is invalid")
+	case errors.Is(err, store.ErrDirectoryProjectionStale):
+		writeError(w, http.StatusServiceUnavailable, "directory_projection_stale",
+			"Directory data is refreshing; retry shortly")
+	default:
+		s.logger.Error("directory people query failed", "error", err)
+		writeError(w, http.StatusServiceUnavailable, "directory_unavailable", "Directory is unavailable")
+	}
 }
 
 func (s *Server) handlePatchPerson(w http.ResponseWriter, r *http.Request) {
@@ -328,6 +466,9 @@ func (s *Server) handlePatchPerson(w http.ResponseWriter, r *http.Request) {
 		s.writePersonError(w, err)
 		return
 	}
+	// The rename has committed. Refresh the cache before subsequent people
+	// queries, while retaining the mutation result if refresh fails.
+	s.refreshIdentityCacheState(r.Context())
 	writePerson(w, http.StatusOK, person)
 }
 
@@ -346,6 +487,8 @@ func (s *Server) writePersonError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, store.ErrPersonNotFound):
 		writeError(w, http.StatusNotFound, "person_profile_not_found", "Person profile not found")
+	case errors.Is(err, store.ErrPersonUIDAmbiguous):
+		writeError(w, http.StatusConflict, "person_uid_ambiguous", "UID is bound to multiple person profiles")
 	case errors.Is(err, store.ErrPersonRevisionConflict):
 		writeError(w, http.StatusConflict, "person_revision_conflict", "Person profile changed; reload and retry")
 	case errors.Is(err, store.ErrPersonBindingConflict):
@@ -384,6 +527,40 @@ func addPersonIDParameter(operation *huma.Operation) {
 		Name: "id", In: pathKey, Required: true, Description: "Durable person ID",
 		Schema: &huma.Schema{Type: huma.TypeInteger, Format: formatInt64},
 	})
+}
+
+func addPersonUIDParameter(operation *huma.Operation) {
+	minimumLength := 1
+	operation.Parameters = append(operation.Parameters, &huma.Param{
+		Name: "uid", In: queryParamLocation, Required: true,
+		Description: "Exact vCard UID or CardDAV resource UID",
+		Schema:      &huma.Schema{Type: huma.TypeString, MinLength: &minimumLength},
+	})
+}
+
+func addDirectoryPeopleParameters(operation *huma.Operation) {
+	lastContactAfter := queryStringParam("last_contact_after", "Return people contacted at or after this RFC3339 timestamp", false)
+	lastContactAfter.Schema.Format = "date-time"
+	lastContactBefore := queryStringParam("last_contact_before", "Return people contacted at or before this RFC3339 timestamp", false)
+	lastContactBefore.Schema.Format = "date-time"
+	sortParam := queryStringParam("sort", "Directory order: name, last_contact_desc, or last_contact_asc", false)
+	sortParam.Schema.Enum = []any{
+		store.DirectoryPeopleSortName,
+		store.DirectoryPeopleSortLastContactDesc,
+		store.DirectoryPeopleSortLastContactAsc,
+	}
+	operation.Parameters = append(operation.Parameters,
+		queryStringParam("q", "Lexical query over person names, contact points, and organizations", false),
+		queryStringParam("cursor", "Opaque cursor returned by the previous Directory page", false),
+		queryIntegerParam("limit", "Maximum rows to return (default 50, max 100)"),
+		queryStringParam("contact_state", "Current contact state: active or inactive", false),
+		queryStringParam("category", "Current person category", false),
+		queryStringParam("organization", "Current organization", false),
+		queryStringParam("primary_channel", "Primary communication channel", false),
+		lastContactAfter,
+		lastContactBefore,
+		sortParam,
+	)
 }
 
 func addPersonIfMatchParameter(operation *huma.Operation) {
@@ -452,7 +629,7 @@ func decodePersonRequest(w http.ResponseWriter, r *http.Request, target any) boo
 
 func decodePersonRequestFields(
 	w http.ResponseWriter, r *http.Request, target any,
-) (map[string]json.RawMessage, bool) {
+) (map[string]jsontext.Value, bool) {
 	return decodeEntityRequestFields(w, r, target, "person")
 }
 
@@ -466,24 +643,24 @@ func decodeEntityRequest(w http.ResponseWriter, r *http.Request, target any, ent
 
 func decodeEntityRequestFields(
 	w http.ResponseWriter, r *http.Request, target any, entity string,
-) (map[string]json.RawMessage, bool) {
+) (map[string]jsontext.Value, bool) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid "+entity+" request")
 		return nil, false
 	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(target); err != nil {
+	decoder := jsontext.NewDecoder(bytes.NewReader(body), json.RejectUnknownMembers(true))
+
+	if err := json.UnmarshalDecode(decoder, target); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid "+entity+" request: "+err.Error())
 		return nil, false
 	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+	if err := json.UnmarshalDecode(decoder, &struct{}{}); !errors.Is(err, io.EOF) {
 		writeError(w, http.StatusBadRequest, "bad_request",
 			capitalizeASCII(entity)+" request must contain one JSON object")
 		return nil, false
 	}
-	var fields map[string]json.RawMessage
+	var fields map[string]jsontext.Value
 	if err := json.Unmarshal(body, &fields); err != nil || fields == nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid "+entity+" request")
 		return nil, false

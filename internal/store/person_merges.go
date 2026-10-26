@@ -6,7 +6,8 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"slices"
@@ -121,7 +122,7 @@ type PersonMerge struct {
 	ID                     int64     `json:"id"`
 	SurvivorPersonID       int64     `json:"survivor_person_id"`
 	AbsorbedPersonID       int64     `json:"absorbed_person_id"`
-	CurrentPersonID        *int64    `json:"current_person_id,omitempty"`
+	CurrentPersonID        *int64    `json:"current_person_id,omitzero" nullable:"false"`
 	SurvivorVCardUID       string    `json:"survivor_vcard_uid"`
 	AbsorbedVCardUID       string    `json:"absorbed_vcard_uid"`
 	SurvivorRevisionBefore int64     `json:"survivor_revision_before"`
@@ -143,8 +144,8 @@ type PersonMergeReviewCandidate struct {
 	SurvivorValueID   int64      `json:"survivor_value_id"`
 	AbsorbedValueID   int64      `json:"absorbed_value_id"`
 	State             string     `json:"state"`
-	ResolutionValueID *int64     `json:"resolution_value_id,omitempty"`
-	ReviewedBy        *string    `json:"reviewed_by,omitempty"`
+	ResolutionValueID *int64     `json:"resolution_value_id,omitzero" nullable:"false"`
+	ReviewedBy        *string    `json:"reviewed_by,omitzero" nullable:"false"`
 	ReviewedAt        *time.Time `json:"reviewed_at,omitempty"`
 	CreatedAt         time.Time  `json:"created_at"`
 }
@@ -167,7 +168,7 @@ type PersonSplit struct {
 // snapshot payload.
 type PersonMergeRowRef struct {
 	TableName     string `json:"table_name"`
-	OriginalRowID *int64 `json:"original_row_id,omitempty"`
+	OriginalRowID *int64 `json:"original_row_id,omitzero" nullable:"false"`
 	OriginalKey   string `json:"original_row_key"`
 	Action        string `json:"action"`
 }
@@ -200,22 +201,22 @@ type PersonMergeParticipant struct {
 	MergeID       int64  `json:"merge_id"`
 	ParticipantID int64  `json:"participant_id"`
 	OriginSide    string `json:"origin_side"`
-	SplitID       *int64 `json:"split_id,omitempty"`
+	SplitID       *int64 `json:"split_id,omitzero" nullable:"false"`
 }
 
 type PersonMergeRow struct {
 	MergeID        int64   `json:"merge_id"`
 	TableName      string  `json:"table_name"`
-	OriginalRowID  *int64  `json:"original_row_id,omitempty"`
+	OriginalRowID  *int64  `json:"original_row_id,omitzero" nullable:"false"`
 	OriginalRowKey string  `json:"original_row_key"`
-	CurrentRowID   *int64  `json:"current_row_id,omitempty"`
-	CurrentRowKey  *string `json:"current_row_key,omitempty"`
+	CurrentRowID   *int64  `json:"current_row_id,omitzero" nullable:"false"`
+	CurrentRowKey  *string `json:"current_row_key,omitzero" nullable:"false"`
 	OriginSide     string  `json:"origin_side"`
 	ProvenanceKind string  `json:"provenance_kind"`
-	ParticipantID  *int64  `json:"participant_id,omitempty"`
+	ParticipantID  *int64  `json:"participant_id,omitzero" nullable:"false"`
 	Action         string  `json:"action"`
 	SnapshotPath   string  `json:"snapshot_path"`
-	SplitID        *int64  `json:"split_id,omitempty"`
+	SplitID        *int64  `json:"split_id,omitzero" nullable:"false"`
 }
 
 type PersonMergeSummary struct {
@@ -236,9 +237,9 @@ type PersonMergeDetail struct {
 }
 
 type PersonMergeSnapshotResponse struct {
-	Version int             `json:"version"`
-	SHA256  string          `json:"sha256"`
-	JSON    json.RawMessage `json:"snapshot"`
+	Version int            `json:"version"`
+	SHA256  string         `json:"sha256"`
+	JSON    jsontext.Value `json:"snapshot"`
 }
 
 type PersonMergeCandidateDecision string
@@ -326,6 +327,10 @@ func (s *Store) mergePersonsOnce(
 			return err
 		}
 
+		inferenceBefore, err := s.captureInferenceExportPeopleTx(ctx, tx, survivor.ID)
+		if err != nil {
+			return err
+		}
 		snapshot, err := s.capturePersonMergeSnapshotTx(ctx, tx, survivor.ID, absorbed.ID)
 		if err != nil {
 			return err
@@ -389,7 +394,7 @@ func (s *Store) mergePersonsOnce(
 			return fmt.Errorf("rebind absorbed person participants: %w", err)
 		}
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE carddav_resources SET person_id = ? WHERE person_id = ?`,
+			`UPDATE carddav_resources SET person_id = ?, owns_display_name = FALSE WHERE person_id = ?`,
 			survivor.ID, absorbed.ID); err != nil {
 			return fmt.Errorf("rebind absorbed CardDAV resources: %w", err)
 		}
@@ -453,6 +458,9 @@ func (s *Store) mergePersonsOnce(
 		); err != nil {
 			return err
 		}
+		if err := s.invalidateInferenceExportChangesTx(ctx, tx, inferenceBefore); err != nil {
+			return err
+		}
 		if err := s.recordPersonMergePostRowsTx(
 			ctx, tx, mergeID, absorbed.ID, snapshot,
 		); err != nil {
@@ -467,7 +475,7 @@ func (s *Store) mergePersonsOnce(
 			return err
 		}
 		result.IdentityRevision = identityRevision
-		encodedResult, err := json.Marshal(result)
+		encodedResult, err := json.Marshal(result, json.Deterministic(true))
 		if err != nil {
 			return fmt.Errorf("encode person merge result: %w", err)
 		}
@@ -516,7 +524,7 @@ func personMergeRequestHash(request PersonMergeRequest) (string, error) {
 		ExpectedSurvivorRevision: request.ExpectedSurvivorRevision,
 		ExpectedAbsorbedRevision: request.ExpectedAbsorbedRevision,
 		Actor:                    request.Actor,
-	})
+	}, json.Deterministic(true))
 	if err != nil {
 		return "", fmt.Errorf("encode person merge request: %w", err)
 	}
@@ -612,7 +620,8 @@ func ensurePersonMergeCardDAVStateTx(
 	var published bool
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
 		SELECT 1 FROM carddav_publications WHERE person_id IN (?, ?)
-	)`, survivorID, absorbedID).Scan(&published); err != nil {
+ UNION ALL SELECT 1 FROM carddav_conflicts c JOIN carddav_resources r ON r.address_book_id=c.address_book_id AND r.href=c.href WHERE c.status='unresolved' AND c.local_mutation_intent IS NOT NULL AND r.person_id IN (?,?)
+	)`, survivorID, absorbedID, survivorID, absorbedID).Scan(&published); err != nil {
 		return fmt.Errorf("check person merge CardDAV publications: %w", err)
 	}
 	if published {
@@ -792,15 +801,15 @@ func (s *Store) recordPersonMergePostRowsTx(
 		if len(currentRows) != 1 {
 			return fmt.Errorf("%w: current %s row is missing", ErrPersonMergeInvalid, entry.table)
 		}
-		postJSON, err := json.Marshal(currentRows[0])
+		postJSON, err := json.Marshal(currentRows[0], json.Deterministic(true))
 		if err != nil {
 			return fmt.Errorf("encode %s merge post-state: %w", entry.table, err)
 		}
-		originalColumns, err := json.Marshal(original.Columns)
+		originalColumns, err := json.Marshal(original.Columns, json.Deterministic(true))
 		if err != nil {
 			return fmt.Errorf("encode %s merge original state: %w", entry.table, err)
 		}
-		postColumns, err := json.Marshal(currentRows[0].Columns)
+		postColumns, err := json.Marshal(currentRows[0].Columns, json.Deterministic(true))
 		if err != nil {
 			return fmt.Errorf("encode %s merge current state: %w", entry.table, err)
 		}
@@ -878,6 +887,10 @@ func (s *Store) moveCorePersonProfileTx(
 	if err := s.reconcilePersonTrackingTx(ctx, tx, mergeID, survivorID, absorbedID); err != nil {
 		return err
 	}
+	if err := s.reconcilePersonBriefEnrollmentTx(
+		ctx, tx, mergeID, survivorID, absorbedID); err != nil {
+		return err
+	}
 	projectionPersonIDs, err := personMergeRowIDsTx(ctx, tx, `SELECT person_id
 		FROM person_attribute_values
 		WHERE value_record_type = 'person' AND value_record_id = ?
@@ -953,6 +966,43 @@ func (s *Store) reconcilePersonTrackingTx(
 	}
 	return s.setPersonMergeRowDispositionTx(
 		ctx, tx, mergeID, "person_tracking", absorbedID, "moved", &survivorID,
+	)
+}
+
+// reconcilePersonBriefEnrollmentTx moves the absorbed person's brief
+// enrollment to the survivor when the survivor has none, and deduplicates it
+// otherwise. It runs after tracking reconciliation, so the tracking row the
+// enrollment depends on has already moved with it.
+func (s *Store) reconcilePersonBriefEnrollmentTx(
+	ctx context.Context, tx *loggedTx, mergeID, survivorID, absorbedID int64,
+) error {
+	var survivorEnrolled, absorbedEnrolled bool
+	if err := tx.QueryRowContext(ctx, `SELECT
+		EXISTS (SELECT 1 FROM person_brief_enrollments WHERE person_id = ?),
+		EXISTS (SELECT 1 FROM person_brief_enrollments WHERE person_id = ?)`,
+		survivorID, absorbedID,
+	).Scan(&survivorEnrolled, &absorbedEnrolled); err != nil {
+		return fmt.Errorf("inspect person brief enrollment before merge: %w", err)
+	}
+	if !absorbedEnrolled {
+		return nil
+	}
+	if survivorEnrolled {
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM person_brief_enrollments WHERE person_id = ?`, absorbedID); err != nil {
+			return fmt.Errorf("deduplicate absorbed person brief enrollment: %w", err)
+		}
+		return s.setPersonMergeRowDispositionTx(
+			ctx, tx, mergeID, "person_brief_enrollments", absorbedID,
+			personMergeActionDeduplicated, &survivorID,
+		)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE person_brief_enrollments
+		SET person_id = ? WHERE person_id = ?`, survivorID, absorbedID); err != nil {
+		return fmt.Errorf("move absorbed person brief enrollment: %w", err)
+	}
+	return s.setPersonMergeRowDispositionTx(
+		ctx, tx, mergeID, "person_brief_enrollments", absorbedID, "moved", &survivorID,
 	)
 }
 

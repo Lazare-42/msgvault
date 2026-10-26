@@ -54,6 +54,21 @@ func TestMeetingListViewUsesPlaceholderForUnknownSource(t *testing.T) {
 	assert.Contains(t, view, "—")
 }
 
+func TestMeetingViewLabelsNotionSource(t *testing.T) {
+	model := NewBuilder().WithAccounts(
+		query.AccountInfo{ID: 8, SourceType: meetingSourceNotion, Identifier: "notion-notes"},
+	).WithSize(100, 24).Build()
+	model.mode = modeMeetings
+	model.loading = false
+	model.meetingState.messages = []query.MessageSummary{{
+		ID: 11, SourceID: 8, Subject: "Notion meeting", SentAt: time.Now(),
+	}}
+
+	view := stripANSI(model.renderView())
+	assert.Contains(t, view, "Notion")
+	assert.Equal(t, "Notion", model.meetingSourceLabel(8))
+}
+
 func TestMeetingEmptyStateGuidesSourceSetup(t *testing.T) {
 	model := NewBuilder().WithSize(100, 24).Build()
 	model.mode = modeMeetings
@@ -195,4 +210,19 @@ func TestMeetingListFitsNarrowTerminal(t *testing.T) {
 	for line := range strings.SplitSeq(view, "\n") {
 		assert.LessOrEqual(lipgloss.Width(line), 32, "line exceeds terminal width: %q", stripANSI(line))
 	}
+}
+
+func TestMeetingViewLabelsMuesliSource(t *testing.T) {
+	model := NewBuilder().WithAccounts(
+		query.AccountInfo{ID: 9, SourceType: "muesli", Identifier: "mac"},
+	).WithSize(100, 24).Build()
+	model.mode = modeMeetings
+	model.loading = false
+	model.meetingState.messages = []query.MessageSummary{{
+		ID: 12, SourceID: 9, Subject: "Muesli meeting", SentAt: time.Now(),
+	}}
+
+	view := stripANSI(model.renderView())
+	assert.Contains(t, view, "Muesli")
+	assert.Equal(t, "Muesli", model.meetingSourceLabel(9))
 }

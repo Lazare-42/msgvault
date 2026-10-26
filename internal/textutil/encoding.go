@@ -136,6 +136,18 @@ func TruncateRunes(s string, maxRunes int) string {
 	return string(runes[:maxRunes-3]) + "..."
 }
 
+// PrefixRunes returns the first n runes of s, or s when it is shorter, with no suffix.
+func PrefixRunes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n])
+}
+
 // FirstLine returns the first line of a string, capped at 200 runes.
 // Useful for extracting clean error messages from multi-line outputs
 // where the first line itself may be excessively long (e.g. enmime
@@ -250,4 +262,46 @@ func sanitizeTerminal(s string, multiline bool) string {
 		i += size
 	}
 	return b.String()
+}
+
+// RuneSlice returns s from rune startRune up to endRune, and false when that
+// range is empty or falls outside s.
+func RuneSlice(s string, startRune, endRune int) (string, bool) {
+	startByte, endByte, ok := RuneByteRange(s, startRune, endRune)
+	if !ok {
+		return "", false
+	}
+	return s[startByte:endByte], true
+}
+
+// RuneByteRange converts a rune range of s to byte offsets.
+func RuneByteRange(s string, startRune, endRune int) (int, int, bool) {
+	if s == "" || startRune < 0 || endRune <= startRune {
+		return 0, 0, false
+	}
+	startByte := -1
+	runeIndex := 0
+	for byteOffset := range s {
+		if runeIndex == startRune {
+			startByte = byteOffset
+		}
+		if runeIndex == endRune {
+			return startByte, byteOffset, startByte >= 0
+		}
+		runeIndex++
+	}
+	if runeIndex == endRune && startByte >= 0 {
+		return startByte, len(s), true
+	}
+	return 0, 0, false
+}
+
+// SnippetFromBody returns a body preview of up to 200 runes.
+func SnippetFromBody(body string) string {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return ""
+	}
+	line := FirstLine(body)
+	return TruncateRunes(line, 200)
 }

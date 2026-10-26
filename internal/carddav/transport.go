@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -16,6 +17,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/icholy/digest"
+
+	"go.kenn.io/msgvault/internal/httpretry"
 	"go.kenn.io/msgvault/internal/netguard"
 )
 
@@ -24,6 +28,9 @@ type Client struct {
 	origin             *url.URL
 	username           string
 	password           string
+	bearerToken        func(context.Context) (string, error)
+	bearerRejected     func()
+	digest             *digestState
 	requestTimeout     time.Duration
 	operationTimeout   time.Duration
 	responseBytes      int64
@@ -31,6 +38,8 @@ type Client struct {
 	resolver           *net.Resolver
 	dialContext        func(context.Context, string, string) (net.Conn, error)
 	allowPrivateOrigin bool // test seam for local httptest servers
+	trustedOrigin      *url.URL
+	trustedAddresses   []netip.Addr
 }
 
 // NewClient creates a client with the task-wide default time and byte limits
@@ -43,7 +52,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 	if !validHTTPURL(&origin) {
 		return nil, fmt.Errorf("credential origin: %w", ErrUnsafeTarget)
 	}
-	if origin.Scheme != "https" && (options.Username != "" || options.Password != "") &&
+	if origin.Scheme != "https" && (options.Username != "" || options.Password != "" || options.BearerToken != nil) &&
 		!options.AllowInsecureCredentials {
 		return nil, fmt.Errorf("credential origin requires HTTPS: %w", ErrUnsafeTarget)
 	}
@@ -51,6 +60,10 @@ func NewClient(options ClientOptions) (*Client, error) {
 	origin.RawPath = ""
 	origin.RawQuery = ""
 	origin.Fragment = ""
+	trustedOrigin, trustedAddresses, err := netguard.ValidateTrustedDestination(options.TrustedOrigin, options.TrustedAddresses)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", err, ErrUnsafeTarget)
+	}
 
 	if options.RequestTimeout <= 0 {
 		options.RequestTimeout = defaultRequestTimeout
@@ -72,10 +85,13 @@ func NewClient(options ClientOptions) (*Client, error) {
 		options.DialContext = dialer.DialContext
 	}
 	return &Client{
-		origin: originURL(&origin), username: options.Username, password: options.Password,
+		origin: originURL(&origin), username: options.Username, password: options.Password, bearerToken: options.BearerToken,
+		bearerRejected: options.BearerTokenRejected,
+		digest:         new(digestState),
 		requestTimeout: options.RequestTimeout, operationTimeout: options.OperationTimeout,
 		responseBytes: options.ResponseBytes, operationBytes: options.OperationBytes,
 		resolver: options.Resolver, dialContext: options.DialContext,
+		trustedOrigin: trustedOrigin, trustedAddresses: trustedAddresses,
 	}, nil
 }
 
@@ -96,7 +112,36 @@ func (c *Client) Do(ctx context.Context, request Request) (*Response, error) {
 		if err != nil {
 			return nil, err
 		}
-		response, status, err := c.doPinned(operationCtx, target, pinned, request, &operationBytes)
+		var response *Response
+		var status int
+		for digestResponses := 0; ; {
+			challenge, nonceCount := c.digest.next()
+			authorization := ""
+			if challenge != nil {
+				credentials, digestErr := digest.Digest(challenge, digest.Options{
+					Username: c.username, Password: c.password, Method: request.Method,
+					URI: target.RequestURI(), Count: nonceCount,
+				})
+				if digestErr != nil {
+					return nil, fmt.Errorf("CardDAV Digest authorization: %w", ErrUnsafeTarget)
+				}
+				authorization = credentials.String()
+				digestResponses++
+			}
+			response, status, err = c.doPinned(operationCtx, target, pinned, request, authorization, &operationBytes)
+			if err != nil || status != http.StatusUnauthorized || c.bearerToken != nil || (c.username == "" && c.password == "") {
+				break
+			}
+			next, challengeErr := selectDigestChallenge(response.Header)
+			if challengeErr != nil {
+				break
+			}
+			if digestResponses == 0 || (digestResponses == 1 && next.Stale && next.Nonce != challenge.Nonce) {
+				c.digest.remember(next)
+				continue
+			}
+			break
+		}
 		if response != nil {
 			response.transferredBytes = operationBytes
 		}
@@ -119,9 +164,11 @@ func (c *Client) Do(ctx context.Context, request Request) (*Response, error) {
 			continue
 		}
 		if status >= http.StatusBadRequest {
+			logRequestFailure(operationCtx, request.Method, status, response.Body)
+			retryDelay, _ := httpretry.ParseRetryAfter(response.Header.Get("Retry-After"), time.Hour, time.Now())
 			return response, &StatusError{
 				StatusCode:   status,
-				RetryAfter:   retryAfter(response.Header.Get("Retry-After"), time.Now()),
+				RetryAfter:   retryDelay,
 				Precondition: davErrorPrecondition(response.Body),
 			}
 		}
@@ -132,7 +179,7 @@ func (c *Client) Do(ctx context.Context, request Request) (*Response, error) {
 }
 
 func (c *Client) doWithBudget(
-	ctx context.Context, request Request, budget *operationBudget,
+	ctx context.Context, request Request, budget *Budget,
 ) (*Response, error) {
 	if budget == nil {
 		return c.Do(ctx, request)
@@ -149,6 +196,25 @@ func (c *Client) doWithBudget(
 		}
 	}
 	return response, err
+}
+
+// logRequestFailure records the upstream status at WARN and a bounded body
+// excerpt only at DEBUG. Response bodies are arbitrary server text, so they
+// require opting into debug logging. Absent resources and precondition failures
+// are expected outcomes of member fetches and conditional publications, so they
+// are logged at DEBUG only. The URL is omitted because it can embed the account
+// identity.
+func logRequestFailure(ctx context.Context, method string, status int, body []byte) {
+	const excerptLimit = 512
+	excerpt := strings.TrimSpace(string(body))
+	if len(excerpt) > excerptLimit {
+		excerpt = excerpt[:excerptLimit] + "..."
+	}
+	excerpt = strings.ToValidUTF8(excerpt, "")
+	if !isAbsentStatusCode(status) && status != http.StatusPreconditionFailed {
+		slog.WarnContext(ctx, "CardDAV request failed", "method", method, "status", status)
+	}
+	slog.DebugContext(ctx, "CardDAV request failed", "method", method, "status", status, "body", excerpt)
 }
 
 func davErrorPrecondition(body []byte) string {
@@ -169,9 +235,16 @@ func (c *Client) validateTarget(ctx context.Context, target *url.URL) ([]netip.A
 	if !validHTTPURL(target) || !sameOrigin(c.origin, target) {
 		return nil, fmt.Errorf("DAV URL: %w", ErrUnsafeTarget)
 	}
-	port, err := targetPort(target)
+	port, err := netguard.TargetPort(target)
 	if err != nil {
 		return nil, fmt.Errorf("DAV URL port: %w", ErrUnsafeTarget)
+	}
+	if c.trustedOrigin != nil && sameOrigin(c.trustedOrigin, target) {
+		pinned := make([]netip.AddrPort, 0, len(c.trustedAddresses))
+		for _, addr := range c.trustedAddresses {
+			pinned = append(pinned, netip.AddrPortFrom(addr, port))
+		}
+		return pinned, nil
 	}
 	host := target.Hostname()
 	if literal, parseErr := netip.ParseAddr(host); parseErr == nil {
@@ -202,7 +275,7 @@ func (c *Client) validateTarget(ctx context.Context, target *url.URL) ([]netip.A
 	return pinned, nil
 }
 
-func (c *Client) doPinned(ctx context.Context, target *url.URL, pinned []netip.AddrPort, davRequest Request, operationBytes *int64) (*Response, int, error) {
+func (c *Client) doPinned(ctx context.Context, target *url.URL, pinned []netip.AddrPort, davRequest Request, authorization string, operationBytes *int64) (*Response, int, error) {
 	requestCtx, cancelRequest := context.WithTimeout(ctx, c.requestTimeout)
 	defer cancelRequest()
 	transport := &http.Transport{
@@ -255,7 +328,18 @@ func (c *Client) doPinned(ctx context.Context, target *url.URL, pinned []netip.A
 	} else if davRequest.ETag != "" {
 		req.Header.Set("If-Match", davRequest.ETag)
 	}
-	if c.username != "" || c.password != "" {
+	if authorization != "" {
+		req.Header.Set("Authorization", authorization)
+	} else if c.bearerToken != nil {
+		token, err := c.bearerToken(requestCtx)
+		if err != nil {
+			return nil, 0, fmt.Errorf("CardDAV authorization: %w", err)
+		}
+		if token == "" {
+			return nil, 0, errors.New("CardDAV authorization returned an empty token")
+		}
+		req.Header.Set("Authorization", "Bearer "+token)
+	} else if c.username != "" || c.password != "" {
 		req.SetBasicAuth(c.username, c.password)
 	}
 	httpResponse, err := client.Do(req)
@@ -263,6 +347,10 @@ func (c *Client) doPinned(ctx context.Context, target *url.URL, pinned []netip.A
 		return nil, 0, fmt.Errorf("DAV request: %w", err)
 	}
 	defer func() { _ = httpResponse.Body.Close() }()
+	if authorization == "" && c.bearerToken != nil && c.bearerRejected != nil &&
+		httpResponse.StatusCode == http.StatusUnauthorized {
+		c.bearerRejected()
+	}
 	body, err := c.readResponseBody(httpResponse.Body, operationBytes)
 	response := &Response{StatusCode: httpResponse.StatusCode, Header: httpResponse.Header.Clone(), Body: body}
 	if err != nil {
@@ -343,31 +431,7 @@ func sameOrigin(left, right *url.URL) bool {
 	}
 	return strings.EqualFold(left.Scheme, right.Scheme) &&
 		strings.EqualFold(left.Hostname(), right.Hostname()) &&
-		originPort(left) == originPort(right)
-}
-
-func originPort(target *url.URL) string {
-	if port := target.Port(); port != "" {
-		return port
-	}
-	if strings.EqualFold(target.Scheme, "https") {
-		return "443"
-	}
-	return "80"
-}
-
-func targetPort(target *url.URL) (uint16, error) {
-	if rawPort := target.Port(); rawPort != "" {
-		port, err := strconv.ParseUint(rawPort, 10, 16)
-		if err != nil || port == 0 {
-			return 0, errors.New("invalid port")
-		}
-		return uint16(port), nil
-	}
-	if target.Scheme == "https" {
-		return 443, nil
-	}
-	return 80, nil
+		netguard.EffectivePort(left) == netguard.EffectivePort(right)
 }
 
 func isRedirect(status int) bool {
@@ -376,15 +440,4 @@ func isRedirect(status int) bool {
 
 func isDAVMutation(method string) bool {
 	return method == http.MethodPut || method == http.MethodDelete
-}
-
-func retryAfter(value string, now time.Time) time.Duration {
-	const maximum = time.Hour
-	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds >= 0 {
-		return min(time.Duration(seconds)*time.Second, maximum)
-	}
-	if deadline, err := http.ParseTime(value); err == nil && deadline.After(now) {
-		return min(time.Until(deadline), maximum)
-	}
-	return 0
 }

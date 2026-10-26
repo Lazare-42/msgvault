@@ -34,9 +34,11 @@ type mutationFixture struct {
 	deleteTimeout       bool
 	throttleDeletes     int
 	putStatus           int
+	putRetryAfter       string
 	deleteStatus        int
 	putFailures         int
 	href                string
+	exactGet            bool
 }
 
 func (f *mutationFixture) handler(t *testing.T) http.HandlerFunc {
@@ -71,6 +73,9 @@ func (f *mutationFixture) handler(t *testing.T) http.HandlerFunc {
 				assert.Empty(t, r.Header.Get("If-None-Match"))
 			}
 			if f.putStatus != 0 {
+				if f.putRetryAfter != "" {
+					w.Header().Set("Retry-After", f.putRetryAfter)
+				}
 				w.WriteHeader(f.putStatus)
 				return
 			}
@@ -101,7 +106,11 @@ func (f *mutationFixture) handler(t *testing.T) http.HandlerFunc {
 				return
 			}
 			w.Header().Set("ETag", f.etag)
-			_, err := w.Write(append(append([]byte(nil), f.body[:len(f.body)-len("END:VCARD\r\n")]...), []byte("PRODID:-//Server//EN\r\nEND:VCARD\r\n")...))
+			body := f.body
+			if !f.exactGet {
+				body = append(append([]byte(nil), f.body[:len(f.body)-len("END:VCARD\r\n")]...), []byte("PRODID:-//Server//EN\r\nEND:VCARD\r\n")...)
+			}
+			_, err := w.Write(body)
 			assert.NoError(t, err)
 		case http.MethodDelete:
 			f.deletes++
@@ -181,7 +190,7 @@ func seededMutationService(t *testing.T, fixture *mutationFixture) (*Service, *s
 	server := httptest.NewServer(fixture.handler(t))
 	t.Cleanup(server.Close)
 	service, st, book := newPullService(t, server, false)
-	service.client.requestTimeout = 250 * time.Millisecond
+	service.dav().client.requestTimeout = 250 * time.Millisecond
 	var personID int64
 	err := st.DB().QueryRow(st.Rebind(`INSERT INTO persons (vcard_uid, display_name)
 		VALUES (?, ?) RETURNING id`), "person", "Alice Example").Scan(&personID)
@@ -190,6 +199,7 @@ func seededMutationService(t *testing.T, fixture *mutationFixture) (*Service, *s
 }
 
 func TestPublishPersonCreatesConditionallyAndCommitsCanonicalCard(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -213,6 +223,7 @@ func TestPublishPersonCreatesConditionallyAndCommitsCanonicalCard(t *testing.T) 
 }
 
 func TestPublishThenSyncAcceptsEscapedUIDChild(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -235,6 +246,7 @@ func TestPublishThenSyncAcceptsEscapedUIDChild(t *testing.T) {
 }
 
 func TestPublishPersonSkipsSemanticallyUnchangedMappedCard(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -258,6 +270,7 @@ func TestPublishPersonSkipsSemanticallyUnchangedMappedCard(t *testing.T) {
 }
 
 func TestTimedOutUpdatePersistsIntentAndSyncRecoveryDoesNotReplay(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -287,6 +300,7 @@ func TestTimedOutUpdatePersistsIntentAndSyncRecoveryDoesNotReplay(t *testing.T) 
 }
 
 func TestTimedOutCreateRecoveryProvesCanonicalResourceWithoutReplay(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -314,6 +328,7 @@ func TestTimedOutCreateRecoveryProvesCanonicalResourceWithoutReplay(t *testing.T
 }
 
 func TestTimedOutCreateRecoveryAdoptsResourceMaterializedByPull(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -322,7 +337,7 @@ func TestTimedOutCreateRecoveryAdoptsResourceMaterializedByPull(t *testing.T) {
 
 	require.Error(service.PublishPerson(t.Context(), personID))
 	assert.Equal(1, fixture.puts)
-	service.client.requestTimeout = 2 * time.Second
+	service.dav().client.requestTimeout = 2 * time.Second
 	_, err := service.Sync(t.Context(), SyncOptions{Full: true})
 	require.NoError(err)
 	assert.Equal(1, fixture.puts, "create recovery after pull must not replay PUT")
@@ -332,6 +347,7 @@ func TestTimedOutCreateRecoveryAdoptsResourceMaterializedByPull(t *testing.T) {
 }
 
 func TestCreateRecoveryAcceptsOneConditional412OnlyAfterCanonicalProof(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -370,7 +386,7 @@ func TestCreateRecoveryAcceptsOneConditional412OnlyAfterCanonicalProof(t *testin
 	}))
 	t.Cleanup(server.Close)
 	service, st, personID, _ := seededMutationServiceForServer(t, server)
-	service.client.requestTimeout = 250 * time.Millisecond
+	service.dav().client.requestTimeout = 250 * time.Millisecond
 
 	require.Error(service.PublishPerson(t.Context(), personID))
 	require.NoError(service.PublishPerson(t.Context(), personID))
@@ -382,6 +398,7 @@ func TestCreateRecoveryAcceptsOneConditional412OnlyAfterCanonicalProof(t *testin
 }
 
 func TestCreateRecoveryRetriesAfterRepeatedTransientFailures(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -400,6 +417,7 @@ func TestCreateRecoveryRetriesAfterRepeatedTransientFailures(t *testing.T) {
 }
 
 func TestDefinitiveCreateRejectionClearsPendingIntent(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -419,6 +437,7 @@ func TestDefinitiveCreateRejectionClearsPendingIntent(t *testing.T) {
 }
 
 func TestDefinitiveMappedMutationRejectionRestoresFence(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name   string
 		mutate func(*testing.T, *mutationFixture, *Service, *store.Store, int64) error
@@ -442,6 +461,7 @@ func TestDefinitiveMappedMutationRejectionRestoresFence(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			assert := assert.New(t)
 			require := require.New(t)
 			fixture := &mutationFixture{}
@@ -465,6 +485,7 @@ func TestDefinitiveMappedMutationRejectionRestoresFence(t *testing.T) {
 }
 
 func TestDefinitiveCreateRecoveryRejectionClearsPendingIntent(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -482,6 +503,7 @@ func TestDefinitiveCreateRecoveryRejectionClearsPendingIntent(t *testing.T) {
 }
 
 func TestMutationRejectsExplicitlyDeniedCapabilityBeforeNetwork(t *testing.T) {
+	t.Parallel()
 	for _, test := range []struct {
 		name       string
 		capability string
@@ -521,6 +543,7 @@ func TestMutationRejectsExplicitlyDeniedCapabilityBeforeNetwork(t *testing.T) {
 		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
 			fixture := &mutationFixture{}
 			service, st, personID, book := seededMutationService(t, fixture)
 			test.prepare(t, service, st, personID)
@@ -537,6 +560,7 @@ func TestMutationRejectsExplicitlyDeniedCapabilityBeforeNetwork(t *testing.T) {
 }
 
 func TestConditionalCreateCollisionRecordsResolvableConflict(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	remoteBody := []byte("BEGIN:VCARD\r\nVERSION:4.0\r\nUID:remote-owner\r\nFN:Remote Owner\r\nEND:VCARD\r\n")
@@ -575,6 +599,7 @@ func TestConditionalCreateCollisionRecordsResolvableConflict(t *testing.T) {
 }
 
 func TestTimedOutCreateRecoveryRoutesDivergentCanonicalCardToConflict(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	fixture := &mutationFixture{timeout: true}
@@ -598,6 +623,7 @@ func TestTimedOutCreateRecoveryRoutesDivergentCanonicalCardToConflict(t *testing
 }
 
 func TestUnpublishPersonDeletesConditionallyButKeepsPerson(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 
 	fixture := &mutationFixture{}
@@ -613,13 +639,14 @@ func TestUnpublishPersonDeletesConditionallyButKeepsPerson(t *testing.T) {
 }
 
 func TestUnpublishRemoteImportWithoutPublicationPreservesSource(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
 	remoteBody := []byte("BEGIN:VCARD\r\nVERSION:4.0\r\nUID:remote-import\r\nFN:Remote Import\r\nEND:VCARD\r\n")
 	fixture := &mutationFixture{body: remoteBody, etag: `"remote-import"`}
 	service, st, _, book := seededMutationService(t, fixture)
-	account, err := st.GetCardDAVAccountContext(t.Context())
+	account, err := st.GetCardDAVAccountByIDContext(t.Context(), store.DefaultCardDAVAccountID)
 	require.NoError(err)
 	href := book.CanonicalURL + "remote-import.vcf"
 	_, err = st.ApplyCardDAVSyncPlanContext(t.Context(), store.CardDAVSyncPlan{
@@ -651,8 +678,10 @@ func TestUnpublishRemoteImportWithoutPublicationPreservesSource(t *testing.T) {
 }
 
 func TestUnpublishPersonTreatsAbsentRemoteAsComplete(t *testing.T) {
+	t.Parallel()
 	for _, status := range []int{http.StatusNotFound, http.StatusGone} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Parallel()
 			fixture := &mutationFixture{}
 			service, _, personID, _ := seededMutationService(t, fixture)
 			require.NoError(t, service.PublishPerson(t.Context(), personID))
@@ -665,6 +694,7 @@ func TestUnpublishPersonTreatsAbsentRemoteAsComplete(t *testing.T) {
 }
 
 func TestTimedOutDeleteRecoveryAcceptsPullTombstoneWithoutReplay(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -690,6 +720,7 @@ func TestTimedOutDeleteRecoveryAcceptsPullTombstoneWithoutReplay(t *testing.T) {
 }
 
 func TestTimedOutDeleteRecoveryAcceptsCanonicalGoneWithoutReplay(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -707,6 +738,7 @@ func TestTimedOutDeleteRecoveryAcceptsCanonicalGoneWithoutReplay(t *testing.T) {
 }
 
 func TestPublishPersonUsesV4ForV4OnlyWriteTarget(t *testing.T) {
+	t.Parallel()
 	fixture := &mutationFixture{}
 	service, st, personID, book := seededMutationService(t, fixture)
 	_, err := st.DB().Exec(st.Rebind(`UPDATE carddav_address_books
@@ -718,6 +750,7 @@ func TestPublishPersonUsesV4ForV4OnlyWriteTarget(t *testing.T) {
 }
 
 func TestPublishPersonRejectsWildcardStoredETagBeforeNetwork(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 
 	fixture := &mutationFixture{}
@@ -733,6 +766,7 @@ func TestPublishPersonRejectsWildcardStoredETagBeforeNetwork(t *testing.T) {
 }
 
 func TestRetryAfterRollsBackIntentAndClampsGateToOneHour(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -747,7 +781,7 @@ func TestRetryAfterRollsBackIntentAndClampsGateToOneHour(t *testing.T) {
 	publication, getErr := st.GetCardDAVPublicationContext(t.Context(), personID)
 	require.NoError(getErr)
 	assert.Empty(publication.PendingOperation)
-	gate, getErr := st.GetCardDAVRetryAfterContext(t.Context())
+	gate, getErr := st.GetCardDAVRetryAfterContext(t.Context(), store.DefaultCardDAVAccountID)
 	require.NoError(getErr)
 	require.NotNil(gate)
 	assert.WithinDuration(before.Add(time.Hour), *gate, 5*time.Second)
@@ -757,7 +791,36 @@ func TestRetryAfterRollsBackIntentAndClampsGateToOneHour(t *testing.T) {
 	assert.Equal(1, fixture.puts)
 }
 
+func TestNon429RetryAfterRollsBackIntentAndPersistsGate(t *testing.T) {
+	t.Parallel()
+	assertions := assert.New(t)
+	required := require.New(t)
+
+	fixture := &mutationFixture{}
+	service, st, personID, _ := seededMutationService(t, fixture)
+	required.NoError(service.PublishPerson(t.Context(), personID))
+	addProjectedEmail(t, st, personID)
+	fixture.putStatus = http.StatusServiceUnavailable
+	fixture.putRetryAfter = "17"
+	putsBefore := fixture.puts
+	before := time.Now()
+
+	err := service.PublishPerson(t.Context(), personID)
+	var status *StatusError
+	required.ErrorAs(err, &status)
+	assertions.Equal(http.StatusServiceUnavailable, status.StatusCode)
+	assertions.Equal(putsBefore+1, fixture.puts)
+	publication, getErr := st.GetCardDAVPublicationContext(t.Context(), personID)
+	required.NoError(getErr)
+	assertions.Empty(publication.PendingOperation)
+	gate, getErr := st.GetCardDAVRetryAfterContext(t.Context(), store.DefaultCardDAVAccountID)
+	required.NoError(getErr)
+	required.NotNil(gate)
+	assertions.WithinDuration(before.Add(17*time.Second), *gate, 5*time.Second)
+}
+
 func TestThrottledUnpublishRetriesAfterGateExpires(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -787,6 +850,7 @@ func TestThrottledUnpublishRetriesAfterGateExpires(t *testing.T) {
 }
 
 func TestActiveRetryGateStopsSyncBeforeAnyRequest(t *testing.T) {
+	t.Parallel()
 	fixture := &mutationFixture{}
 	service, st, _, _ := seededMutationService(t, fixture)
 	setRetryGate(t, st, time.Now().Add(time.Hour))
@@ -797,6 +861,7 @@ func TestActiveRetryGateStopsSyncBeforeAnyRequest(t *testing.T) {
 }
 
 func TestActiveRetryGateStopsPendingRecoveryBeforeAnyRequest(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -815,6 +880,7 @@ func TestActiveRetryGateStopsPendingRecoveryBeforeAnyRequest(t *testing.T) {
 }
 
 func TestCanonicalGet429PersistsGateAndPreservesAmbiguousUpdateIntent(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -841,7 +907,7 @@ func TestCanonicalGet429PersistsGateAndPreservesAmbiguousUpdateIntent(t *testing
 	resource, getErr := st.GetCardDAVResourceContext(t.Context(), book.ID, book.CanonicalURL+"person.vcf")
 	require.NoError(getErr)
 	assert.Equal(beforeResource.MappingRevision+1, resource.MappingRevision)
-	gate, getErr := st.GetCardDAVRetryAfterContext(t.Context())
+	gate, getErr := st.GetCardDAVRetryAfterContext(t.Context(), store.DefaultCardDAVAccountID)
 	require.NoError(getErr)
 	require.NotNil(gate)
 	assert.WithinDuration(before.Add(time.Hour), *gate, 5*time.Second)
@@ -853,6 +919,7 @@ func TestCanonicalGet429PersistsGateAndPreservesAmbiguousUpdateIntent(t *testing
 }
 
 func TestRecoveryGet429PersistsGateAndPreservesPendingIntent(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -876,13 +943,14 @@ func TestRecoveryGet429PersistsGateAndPreservesPendingIntent(t *testing.T) {
 	require.NoError(getErr)
 	assert.Equal(store.CardDAVMutationUpdate, publication.PendingOperation)
 	assert.NotEmpty(publication.OutgoingBody)
-	gate, getErr := st.GetCardDAVRetryAfterContext(t.Context())
+	gate, getErr := st.GetCardDAVRetryAfterContext(t.Context(), store.DefaultCardDAVAccountID)
 	require.NoError(getErr)
 	require.NotNil(gate)
 	assert.WithinDuration(before.Add(time.Hour), *gate, 5*time.Second)
 }
 
 func TestPull429PersistsAccountRetryGate(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -895,13 +963,14 @@ func TestPull429PersistsAccountRetryGate(t *testing.T) {
 	require.ErrorAs(err, &status)
 	assert.Equal(http.StatusTooManyRequests, status.StatusCode)
 	assert.Equal(1, fixture.reports)
-	gate, getErr := st.GetCardDAVRetryAfterContext(t.Context())
+	gate, getErr := st.GetCardDAVRetryAfterContext(t.Context(), store.DefaultCardDAVAccountID)
 	require.NoError(getErr)
 	require.NotNil(gate)
 	assert.WithinDuration(before.Add(time.Hour), *gate, 5*time.Second)
 }
 
 func TestConcurrent429sPreserveLongestAccountRetryGate(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -927,17 +996,13 @@ func TestConcurrent429sPreserveLongestAccountRetryGate(t *testing.T) {
 	service, st, book := newPullService(t, server, false)
 	shortResult := make(chan error, 1)
 	go func() {
-		_, err := service.doRequest(t.Context(), Request{
-			Method: http.MethodGet, URL: book.CanonicalURL + "short.vcf",
-		})
+		_, _, err := service.fetchCanonical(t.Context(), book.CanonicalURL+"short.vcf")
 		shortResult <- err
 	}()
 	<-shortStarted
 	before := time.Now()
 
-	_, longErr := service.doRequest(t.Context(), Request{
-		Method: http.MethodGet, URL: book.CanonicalURL + "long.vcf",
-	})
+	_, _, longErr := service.fetchCanonical(t.Context(), book.CanonicalURL+"long.vcf")
 	var longStatus *StatusError
 	require.ErrorAs(longErr, &longStatus)
 	assert.Equal(http.StatusTooManyRequests, longStatus.StatusCode)
@@ -947,7 +1012,7 @@ func TestConcurrent429sPreserveLongestAccountRetryGate(t *testing.T) {
 	require.ErrorAs(shortErr, &shortStatus)
 	assert.Equal(http.StatusTooManyRequests, shortStatus.StatusCode)
 
-	gate, err := st.GetCardDAVRetryAfterContext(t.Context())
+	gate, err := st.GetCardDAVRetryAfterContext(t.Context(), store.DefaultCardDAVAccountID)
 	require.NoError(err)
 	require.NotNil(gate)
 	assert.WithinDuration(before.Add(time.Hour), *gate, 5*time.Second)

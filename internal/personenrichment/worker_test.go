@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -111,7 +113,7 @@ func (f *workerFixture) options(configs map[string]personenrichment.ProviderConf
 	return personenrichment.WorkerOptions{
 		Owner: "worker-test", LeaseDuration: time.Minute, RenewEvery: 20 * time.Second,
 		Clock: time.Now, Jitter: func(time.Duration) time.Duration { return 0 },
-		ProviderConfigs: configs,
+		ProviderConfigs: configs, ProviderFingerprints: map[string]string{f.profile.Name: f.profile.Fingerprint},
 	}
 }
 
@@ -335,7 +337,11 @@ func TestWorkerCompletesSynchronousResultAndIsolatesProviderFailure(t *testing.T
 	configs := map[string]personenrichment.ProviderConfig{
 		failed.config.Name: failed.config, goodConfig.Name: goodConfig,
 	}
-	worker := failed.newWorker(t, factories, configs, func(string) (string, bool) { return "test-key", true })
+	options := failed.options(configs)
+	options.ProviderFingerprints[goodConfig.Name] = goodProfile.Fingerprint
+	worker, err := personenrichment.NewWorker(failed.store, failed.store,
+		failed.gate(t, func(string) (string, bool) { return "test-key", true }), factories, options)
+	requirements.NoError(err)
 
 	processed, err := worker.RunOnce(t.Context(), failed.run.ID)
 	requirements.NoError(err)
@@ -351,6 +357,50 @@ func TestWorkerCompletesSynchronousResultAndIsolatesProviderFailure(t *testing.T
 	requirements.Len(attempts, 2)
 	states := []string{attempts[0].State, attempts[1].State}
 	checks.ElementsMatch([]string{"succeeded", "terminal"}, states)
+}
+
+func TestWorkerPreservesQueuedWorkForUnavailableProfile(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newWorkerFixture(t, "profile-selection", nil)
+	f.enqueue(t)
+	replacementConfig := f.config
+	replacementConfig.Endpoint = "https://replacement.example.test/search"
+	replacement, err := replacementConfig.Profile(personfacts.Catalog{Targets: f.profile.Targets})
+	require.NoError(err)
+	_, err = f.store.EnsurePersonEnrichmentProfile(t.Context(), replacement)
+	require.NoError(err)
+	require.NoError(f.store.CancelPersonEnrichmentWorkOutsideProfilesContext(t.Context(), []string{replacement.Fingerprint}))
+	var starts atomic.Int64
+	factories := map[string]personenrichment.ProviderFactory{
+		f.config.Name: func(personenrichment.ProviderConfig, string) (personenrichment.Provider, error) {
+			return &functionProvider{start: func(context.Context, personenrichment.Request) (personenrichment.Attempt, error) {
+				starts.Add(1)
+				return personenrichment.Attempt{}, &personenrichment.ProviderError{Class: personenrichment.FailureInvalidOutput}
+			}}, nil
+		},
+	}
+	options := f.options(map[string]personenrichment.ProviderConfig{replacement.Name: replacementConfig})
+	options.ProviderFingerprints[replacement.Name] = replacement.Fingerprint
+	worker, err := personenrichment.NewWorker(f.store, f.store,
+		f.gate(t, func(string) (string, bool) { return "test-key", true }), factories, options)
+	require.NoError(err)
+	processed, err := worker.RunOnce(t.Context(), f.run.ID)
+	require.NoError(err)
+	assert.False(processed, "a replacement with the same name must leave the old profile's work queued")
+	assert.Zero(starts.Load())
+
+	require.NoError(f.store.CancelPersonEnrichmentWorkOutsideProfilesContext(t.Context(), []string{f.profile.Fingerprint}))
+	worker = f.newWorker(t, factories, map[string]personenrichment.ProviderConfig{f.config.Name: f.config},
+		func(string) (string, bool) { return "test-key", true })
+	processed, err = worker.RunOnce(t.Context(), f.run.ID)
+	require.NoError(err)
+	assert.True(processed, "re-enabling must resume the queued operation")
+	assert.Equal(int64(1), starts.Load())
+	processed, err = worker.RunOnce(t.Context(), f.run.ID)
+	require.NoError(err)
+	assert.False(processed, "a terminal failure must not be retried")
+	assert.Equal(int64(1), starts.Load())
 }
 
 func TestWorkerConcurrentRunOnceStartsProviderOnlyOnce(t *testing.T) {
@@ -1750,6 +1800,117 @@ func TestWorkerStopsRetryingActiveAttemptAtLimit(t *testing.T) {
 	checks.Equal(int64(2), attempts[0].AttemptCount)
 }
 
+func TestWorkerExaPeopleResults(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		state   string
+		failure string
+		claims  int
+	}{
+		{"duplicate employment", "succeeded", "", 2},
+		{"identity mismatch", "identity_rejected", "identity_rejected", 0},
+		{"invalid output", "terminal", "invalid_output", 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			var wire map[string]any
+			require.NoError(json.Unmarshal(exaFixture(t, "exa_people_success.json"), &wire))
+			results, ok := wire["results"].([]any)
+			require.True(ok)
+			require.NotEmpty(results)
+			row, ok := results[0].(map[string]any)
+			require.True(ok)
+			row["url"] = "https://profiles.example.test/worker-person"
+			entities, ok := row["entities"].([]any)
+			require.True(ok)
+			require.NotEmpty(entities)
+			entity, ok := entities[0].(map[string]any)
+			require.True(ok)
+			properties, ok := entity["properties"].(map[string]any)
+			require.True(ok)
+			switch test.name {
+			case "duplicate employment":
+				history, ok := properties["workHistory"].([]any)
+				require.True(ok)
+				require.NotEmpty(history)
+				work, ok := history[0].(map[string]any)
+				require.True(ok)
+				properties["workHistory"] = []any{work, work, map[string]any{
+					"title": " Engineer ", "location": "Test City", "dates": work["dates"],
+					"company": map[string]any{"name": " Example Labs "},
+				}, map[string]any{
+					"title": "Senior Engineer", "location": "Test City", "dates": work["dates"],
+					"company": work["company"],
+				}}
+			case "identity mismatch":
+				row["url"] = "https://profiles.example.test/different-person"
+			case "invalid output":
+				properties["workHistory"] = nil
+			}
+			body, err := json.Marshal(wire)
+			require.NoError(err)
+			var calls atomic.Int32
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				calls.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write(body)
+			}))
+			t.Cleanup(server.Close)
+			f := newWorkerFixture(t, "exa-people", func(cfg *personenrichment.ProviderConfig) {
+				cfg.Mode = "people"
+				cfg.Endpoint = server.URL
+				cfg.TargetKeys = []string{"system:employment"}
+			})
+			worker := f.newWorker(t,
+				map[string]personenrichment.ProviderFactory{f.config.Name: func(cfg personenrichment.ProviderConfig, key string) (personenrichment.Provider, error) {
+					return personenrichment.NewExaProvider(cfg, key, server.Client())
+				}}, map[string]personenrichment.ProviderConfig{f.config.Name: f.config},
+				func(string) (string, bool) { return "test-key", true },
+			)
+			processed, err := worker.RunOnce(t.Context(), f.run.ID)
+			require.NoError(err)
+			require.True(processed)
+			attempts, err := f.store.ListPersonEnrichmentAttemptsContext(t.Context(), store.PersonEnrichmentAttemptFilter{
+				PersonID: f.person.ID, RunID: f.run.ID, Limit: 10,
+			})
+			require.NoError(err)
+			require.Len(attempts, 1)
+			assert.Equal(test.state, attempts[0].State)
+			if test.failure == "" {
+				assert.Nil(attempts[0].FailureClass)
+			} else {
+				require.NotNil(attempts[0].FailureClass)
+				assert.Equal(test.failure, *attempts[0].FailureClass)
+			}
+			var claims int
+			require.NoError(f.store.DB().QueryRowContext(t.Context(), "SELECT COUNT(*) FROM person_fact_claims").Scan(&claims))
+			assert.Equal(test.claims, claims)
+			for range 2 {
+				queued, err := f.store.EnqueueDuePersonEnrichmentContext(t.Context(), time.Now().UTC(), 200, []string{f.profile.Fingerprint})
+				require.NoError(err)
+				assert.Zero(queued)
+				processed, err = worker.RunOnce(t.Context(), f.run.ID)
+				require.NoError(err)
+				assert.False(processed)
+			}
+			assert.Equal(int32(1), calls.Load())
+			require.NoError(f.store.CompleteRun(t.Context(), f.run.ID, personenrichment.RunCompletion{}))
+			run, err := f.store.GetPersonEnrichmentRunContext(t.Context(), f.run.ID)
+			require.NoError(err)
+			switch test.state {
+			case "identity_rejected":
+				assert.Equal(int64(1), run.IdentityRejectedCount)
+				assert.Zero(run.FailedCount)
+			case "terminal":
+				assert.Equal(int64(1), run.FailedCount)
+			default:
+				assert.Equal(int64(1), run.SucceededCount)
+			}
+		})
+	}
+}
+
 func TestWorkerInvalidOutputWritesNoResultState(t *testing.T) {
 	checks := assert.New(t)
 	requirements := require.New(t)
@@ -1848,18 +2009,17 @@ func TestWorkerRejectsStaleCommitAfterLeaseReclaim(t *testing.T) {
 	requirements := require.New(t)
 	f := newWorkerFixture(t, "stale-commit", nil)
 	f.enqueue(t)
+	claimTime := time.Now().UTC()
 	started := make(chan struct{})
 	release := make(chan struct{})
+	requestReady := make(chan personenrichment.Request, 1)
+	attemptReady := make(chan personenrichment.Attempt, 1)
 	provider := &functionProvider{
 		start: func(_ context.Context, request personenrichment.Request) (personenrichment.Attempt, error) {
 			close(started)
+			requestReady <- request
 			<-release
-			result := workerResult(t, request, f.target, "stale-request", "", false, "", personenrichment.Cost{})
-			return personenrichment.Attempt{
-				State: personenrichment.AttemptComplete, RequestID: result.RequestID,
-				AdapterVersion: result.AdapterVersion, SchemaVersion: result.SchemaVersion,
-				ProgramFingerprint: workerProgramFingerprint(t, false, ""), Result: &result,
-			}, nil
+			return <-attemptReady, nil
 		},
 		poll: func(context.Context, personenrichment.Attempt) (personenrichment.Result, error) {
 			return personenrichment.Result{}, errors.New("unexpected poll")
@@ -1868,6 +2028,7 @@ func TestWorkerRejectsStaleCommitAfterLeaseReclaim(t *testing.T) {
 	options := f.options(map[string]personenrichment.ProviderConfig{f.config.Name: f.config})
 	options.LeaseDuration = 60 * time.Millisecond
 	options.RenewEvery = 10 * time.Millisecond
+	options.Clock = func() time.Time { return claimTime }
 	worker, err := personenrichment.NewWorker(
 		noOpRenewStore{WorkStore: f.store}, f.store,
 		f.gate(t, func(string) (string, bool) { return "test-key", true }),
@@ -1881,10 +2042,16 @@ func TestWorkerRejectsStaleCommitAfterLeaseReclaim(t *testing.T) {
 		done <- runErr
 	}()
 	<-started
-	time.Sleep(80 * time.Millisecond)
+	request := <-requestReady
+	result := workerResult(t, request, f.target, "stale-request", "", false, "", personenrichment.Cost{})
+	attemptReady <- personenrichment.Attempt{
+		State: personenrichment.AttemptComplete, RequestID: result.RequestID,
+		AdapterVersion: result.AdapterVersion, SchemaVersion: result.SchemaVersion,
+		ProgramFingerprint: workerProgramFingerprint(t, false, ""), Result: &result,
+	}
 	reclaimed, err := f.store.ClaimWork(t.Context(), personenrichment.ClaimOptions{
-		RunID: f.run.ID, Owner: "replacement-worker", ProviderName: f.config.Name,
-		Now: time.Now().UTC(), LeaseDuration: time.Minute,
+		RunID: f.run.ID, Owner: "replacement-worker", ProviderName: f.config.Name, ProfileFingerprint: f.profile.Fingerprint,
+		Now: claimTime.Add(80 * time.Millisecond), LeaseDuration: time.Minute,
 	})
 	requirements.NoError(err)
 	requirements.NotNil(reclaimed)
@@ -2318,6 +2485,100 @@ func TestWorkerAsyncPollFencesConsentAndRechecksReturnedSuppression(t *testing.T
 			} else {
 				checks.Empty(work)
 			}
+		})
+	}
+}
+
+func TestWorkerSixtyfourDuplicateValues(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		values []string
+	}{
+		{"unique", []string{"Example value", "Different value"}},
+		{"duplicate", []string{"Example value", "Different value", "Example value", " Example value "}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			f := newWorkerFixture(t, "sixtyfour-values", nil)
+			organization, err := f.store.CreateOrganizationContext(t.Context(), store.OrganizationInput{Name: "Example Labs"})
+			require.NoError(err)
+			_, err = f.store.AddEmploymentContext(t.Context(), store.EmploymentInput{
+				PersonID: f.person.ID, OrganizationID: organization.ID,
+				IsCurrent: new(true), Source: store.ProvenanceUser,
+			})
+			require.NoError(err)
+			catalog, err := f.store.BuildPersonFactCatalogContext(t.Context(), true)
+			require.NoError(err)
+			var target personfacts.TargetDescriptor
+			for _, candidate := range catalog.Targets {
+				if candidate.Kind == personfacts.TargetAttribute && candidate.ValueType == personfacts.ValueText && candidate.Cardinality == personfacts.CardinalityMulti && !candidate.Sensitive {
+					target = candidate
+					break
+				}
+			}
+			require.NotEmpty(target.Key)
+			startBody := sixtyfourFixture(t, "sixtyfour_start.json")
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if r.Method == http.MethodPost {
+					_, _ = w.Write(startBody)
+					return
+				}
+				assert.NoError(json.NewEncoder(w).Encode(map[string]any{
+					"task_id": "opaque-job-42", "status": "completed", "charge_amount": 12,
+					"result": map[string]any{
+						"structured_data":  map[string]any{target.Key: test.values, "name": "Worker Person", "company": "Example Labs"},
+						"confidence_score": 9, "findings": []any{},
+					},
+				}))
+			}))
+			defer server.Close()
+			f.config = sixtyfourConfig(server.URL+"/start", server.URL+"/job-status")
+			f.config.TargetKeys = []string{target.Key}
+			f.config.RequestTimeout = 30 * time.Second
+			f.profile, err = f.config.Profile(catalog)
+			require.NoError(err)
+			_, err = f.store.EnsurePersonEnrichmentProfile(t.Context(), f.profile)
+			require.NoError(err)
+			_, _, err = f.store.GrantPersonEnrichmentConsent(t.Context(), f.profile.Fingerprint, "test")
+			require.NoError(err)
+			options := f.options(map[string]personenrichment.ProviderConfig{f.config.Name: f.config})
+			now := time.Now().UTC()
+			options.Clock = func() time.Time { return now }
+			worker, err := personenrichment.NewWorker(f.store, f.store,
+				f.gate(t, func(string) (string, bool) { return "test-key", true }),
+				map[string]personenrichment.ProviderFactory{f.config.Name: func(cfg personenrichment.ProviderConfig, key string) (personenrichment.Provider, error) {
+					return personenrichment.NewSixtyfourProvider(cfg, key, server.Client())
+				}}, options)
+			require.NoError(err)
+			processed, err := worker.RunOnce(t.Context(), f.run.ID)
+			require.NoError(err)
+			require.True(processed)
+			work, err := f.store.ListPersonEnrichmentWorkContext(t.Context(), store.PersonEnrichmentWorkFilter{
+				PersonID: f.person.ID, ProfileFingerprint: f.profile.Fingerprint, Limit: 10,
+			})
+			require.NoError(err)
+			require.Len(work, 1)
+			now = work[0].DueAt.Add(time.Second)
+			processed, err = worker.RunOnce(t.Context(), f.run.ID)
+			assert.True(processed)
+			require.NoError(err)
+			attempts, err := f.store.ListPersonEnrichmentAttemptsContext(t.Context(), store.PersonEnrichmentAttemptFilter{
+				PersonID: f.person.ID, ProfileFingerprint: f.profile.Fingerprint, Limit: 10,
+			})
+			require.NoError(err)
+			require.Len(attempts, 1)
+			assert.Equal("succeeded", attempts[0].State)
+			require.NotNil(attempts[0].FactGenerationKey)
+			var claims int
+			require.NoError(f.store.DB().QueryRowContext(t.Context(), f.store.Rebind(`
+				SELECT COUNT(*) FROM person_fact_claims
+				WHERE generation_id = (SELECT id FROM person_fact_generations WHERE generation_key = ?)`), *attempts[0].FactGenerationKey).Scan(&claims))
+			assert.Equal(2, claims)
+			processed, err = worker.RunOnce(t.Context(), f.run.ID)
+			require.NoError(err)
+			assert.False(processed, "the completed result must not be polled again")
 		})
 	}
 }

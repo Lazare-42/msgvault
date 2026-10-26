@@ -1,4 +1,5 @@
 ---
+last_edited: 2026-08-30
 title: Daemon Migration Guide
 description: What changes when CLI commands route through the msgvault daemon, and how to adapt scripts, environment variables, and workflows.
 ---
@@ -42,6 +43,10 @@ ready, then runs your command as usual. The daemon stays alive for 20 minutes
 after the last request (`[server].daemon_idle_timeout`, `"0s"` to disable) and
 then exits on its own; the next command starts it again.
 
+If the SQLite archive lacks the From-address index, startup builds it once.
+Large archives may take several minutes. The daemon logs `building index` and
+`built index` for `idx_message_recipients_email_from` in `serve.log`.
+
 Command output is unchanged: syncs, imports, and other long operations stream
 their normal stdout/stderr through the daemon back to your terminal, and
 Ctrl+C still cancels them.
@@ -67,6 +72,7 @@ older and restarts it automatically before issuing your command. This is the
 `[server].daemon_auto_restart = "newer"` default; set `"never"` if a
 supervisor (systemd, Docker) owns the daemon lifecycle, or `"always"` to
 restart on any version difference.
+If a supervisor runs `msgvault serve`, also set `[server].daemon_auto_start = false` so a CLI command never starts a competing daemon before the supervisor does.
 
 ## One writer, visible waits
 
@@ -100,10 +106,18 @@ process, which does **not** inherit your shell's environment. Most
 environment variables are deliberately not forwarded; a short allowlist is
 passed through from your shell automatically:
 
+Starting in v0.20.0, remote deletion remains permanently opt-in. The invoking
+CLI may enable it durably with `[deletion] remote_enabled = true` or for one
+command with `MSGVAULT_ENABLE_REMOTE_DELETE=1`. Both mechanisms are permanent;
+there is no planned automatic removal of the guardrail. The CLI forwards its
+effective consent with the operation. A remote daemon's own `[deletion]`
+section is not server policy for a command invoked elsewhere. Staging,
+listing, inspecting, and dry-running deletion batches remain ungated.
+
 | Variable | Used by |
 |---|---|
 | `MSGVAULT_IMAP_PASSWORD` | `add-imap` |
-| `MSGVAULT_ENABLE_REMOTE_DELETE` | `delete-staged` |
+| `MSGVAULT_ENABLE_REMOTE_DELETE` | One-command `delete-staged` consent; durable consent uses invoking-CLI config |
 | The variable named by `[vector.embeddings].api_key_env` | `embeddings build` / `embed` |
 
 If an operation needs any other environment variable (for example a proxy
@@ -122,7 +136,7 @@ With a `[remote]` server configured, tokens live on the remote host, so
 authorization happens there — same as pre-daemon remote behavior. For
 headless remote setups, keep using `add-account --headless` or
 `msgvault export-token` to push a locally minted token to the server (see
-[Remote Deployment](/guides/remote-deployment/)).
+[Remote Deployment](/docs/guides/remote-deployment/)).
 
 ## Gotcha: `--local` means "local daemon"
 
@@ -198,4 +212,4 @@ shows version, uptime, and vector-search state.
 **Something is off after upgrading. What is the first thing to try?**
 `msgvault daemon restart`. It re-reads config, picks up the current binary and
 environment, and re-registers the runtime record. See
-[Troubleshooting](/troubleshooting/) for more.
+[Troubleshooting](/docs/troubleshooting/) for more.

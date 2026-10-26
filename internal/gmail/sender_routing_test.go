@@ -33,6 +33,8 @@ func TestDraftRoutingHeaders(t *testing.T) {
 		assert.Equal("Owner, Example", replies[0].Name)
 		assert.Equal("owner@example.com", replies[0].Address)
 		assert.Equal("<parent@example.com>", msg.Header.Get("In-Reply-To"))
+		assert.NotEmpty(msg.Header.Get("Message-ID"))
+		assert.Contains(msg.Header.Get("From"), "reports@example.com")
 	}
 }
 
@@ -80,7 +82,7 @@ func TestGmailDraftRoutingRoundTrip(t *testing.T) {
 		assert.NoError(json.NewEncoder(w).Encode(map[string]any{"id": "draft-1", "message": map[string]any{"id": "msg-1", "payload": map[string]any{"headers": headers}}}))
 	}))
 	defer server.Close()
-	client := &Client{httpClient: &http.Client{Transport: &rewriteTransport{base: server.URL, wrapped: http.DefaultTransport}}, userID: "me", logger: slog.Default(), rateLimiter: NewRateLimiter(1000)}
+	client := NewLiveClient(&Client{httpClient: &http.Client{Transport: &rewriteTransport{base: server.URL, wrapped: http.DefaultTransport}}, userID: "me", logger: slog.Default(), rateLimiter: NewRateLimiter(1000)})
 	compose := &DraftCompose{From: "reports@example.com", ReplyTo: []string{`"Owner, Example" <owner@example.com>`}, Body: "body"}
 	created, err := client.CreateDraft(t.Context(), compose)
 	require.NoError(err)
@@ -107,7 +109,7 @@ func TestGmailSendUncertainDoesNotRetry(t *testing.T) {
 				assert.NoError(err)
 			}))
 			defer server.Close()
-			client := &Client{httpClient: &http.Client{Transport: &rewriteTransport{base: server.URL, wrapped: http.DefaultTransport}}, userID: "me", logger: slog.Default(), rateLimiter: NewRateLimiter(1000)}
+			client := NewLiveClient(&Client{httpClient: &http.Client{Transport: &rewriteTransport{base: server.URL, wrapped: http.DefaultTransport}}, userID: "me", logger: slog.Default(), rateLimiter: NewRateLimiter(1000)})
 			_, err := client.SendDraft(t.Context(), "draft-1")
 			var outcome *SendOutcomeError
 			require.ErrorAs(err, &outcome)

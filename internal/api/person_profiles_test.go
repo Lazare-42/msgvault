@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 
 	"github.com/danielgtaylor/huma/v2"
@@ -15,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/personsearch"
 )
@@ -35,6 +37,7 @@ func (e *fakePersonSearchEngine) Search(
 }
 
 func TestPersonProfileHTTPPromoteListGetUpdateAndConflictingLink(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, st := newIdentityLinkTestServer(t)
@@ -99,7 +102,413 @@ func TestPersonProfileHTTPPromoteListGetUpdateAndConflictingLink(t *testing.T) {
 	assert.Equal(http.StatusConflict, linkResponse.Code)
 }
 
+func TestPersonProfileHTTPExposesCardDAVBindingAndLooksUpEitherUID(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	srv, st := newIdentityLinkTestServer(t)
+	const (
+		remoteUID = "urn:uuid:77822e26-3cd5-40d0-a0fd-6f0ff63b204b"
+		email     = "person@example.test"
+	)
+	person := createDirectoryHTTPPerson(t, st, "Example Person", email, "friend", "Example", false)
+	personUID := person.VCardUID
+	personID := person.ID
+	account, books, err := st.ReplaceCardDAVDiscoveryContext(t.Context(), store.CardDAVDiscoveryInput{
+		ConnectionName: "personal", BaseURL: "https://contacts.example.test/dav", Username: "example",
+		PrincipalURL: "https://contacts.example.test/principal/",
+		HomeURL:      "https://contacts.example.test/books/",
+		Books: []store.CardDAVDiscoveredBook{{
+			CanonicalURL: "https://contacts.example.test/books/personal/", DisplayName: "Personal",
+		}},
+	})
+	require.NoError(err)
+	require.Len(books, 1)
+	body := []byte("BEGIN:VCARD\r\nVERSION:4.0\r\nUID:" + remoteUID +
+		"\r\nFN:Example Person\r\nEMAIL:" + email + "\r\nEND:VCARD\r\n")
+	_, err = st.ApplyCardDAVSyncPlanContext(t.Context(), store.CardDAVSyncPlan{
+		AddressBookID: books[0].ID, ConnectionGeneration: account.ConnectionGeneration,
+		SyncRevision: books[0].SyncRevision,
+		Upserts: []store.CardDAVRemoteResource{{
+			Href: books[0].CanonicalURL + "person.vcf", RemoteUID: remoteUID,
+			RemoteETag: `"one"`, RemoteBody: body, SemanticHash: "person-card",
+			DisplayName: "Example Person", Emails: []string{email},
+		}},
+	})
+	require.NoError(err)
+
+	response := personRequest(t, srv, http.MethodGet,
+		fmt.Sprintf("%s/%d", peoplePath, personID), nil, "")
+	require.Equal(http.StatusOK, response.Code, response.Body.String())
+	var responsePerson struct {
+		VCardUID        string `json:"vcard_uid"`
+		CardDAVBindings []struct {
+			Connection    string `json:"connection"`
+			Book          string `json:"book"`
+			Href          string `json:"href"`
+			RemoteUID     string `json:"remote_uid"`
+			MappingStatus string `json:"mapping_status"`
+		} `json:"carddav_bindings"`
+	}
+	require.NoError(json.Unmarshal(response.Body.Bytes(), &responsePerson))
+	assert.Equal(personUID, responsePerson.VCardUID)
+	require.Len(responsePerson.CardDAVBindings, 1)
+	assert.Equal("personal", responsePerson.CardDAVBindings[0].Connection)
+	assert.Equal("Personal", responsePerson.CardDAVBindings[0].Book)
+	assert.Equal(books[0].CanonicalURL+"person.vcf", responsePerson.CardDAVBindings[0].Href)
+	assert.Equal(remoteUID, responsePerson.CardDAVBindings[0].RemoteUID)
+	assert.Equal(string(store.CardDAVMappingMapped), responsePerson.CardDAVBindings[0].MappingStatus)
+
+	for _, uid := range []string{personUID, remoteUID} {
+		lookup := personRequest(t, srv, http.MethodGet, peoplePath+"/by-uid?uid="+url.QueryEscape(uid), nil, "")
+		require.Equal(http.StatusOK, lookup.Code, lookup.Body.String())
+		var resolved struct {
+			ID       int64  `json:"id"`
+			VCardUID string `json:"vcard_uid"`
+		}
+		require.NoError(json.Unmarshal(lookup.Body.Bytes(), &resolved))
+		assert.Equal(personID, resolved.ID)
+		assert.Equal(personUID, resolved.VCardUID)
+	}
+
+	directory := personRequest(t, srv, http.MethodGet, peoplePath+"/directory", nil, "")
+	require.Equal(http.StatusOK, directory.Code, directory.Body.String())
+	var directoryPage struct {
+		People []struct {
+			ID              int64  `json:"id"`
+			VCardUID        string `json:"vcard_uid"`
+			CardDAVBindings []struct {
+				RemoteUID string `json:"remote_uid"`
+			} `json:"carddav_bindings"`
+		} `json:"people"`
+	}
+	require.NoError(json.Unmarshal(directory.Body.Bytes(), &directoryPage))
+	require.Len(directoryPage.People, 1)
+	assert.Equal(personID, directoryPage.People[0].ID)
+	assert.Equal(personUID, directoryPage.People[0].VCardUID)
+	require.Len(directoryPage.People[0].CardDAVBindings, 1)
+	assert.Equal(remoteUID, directoryPage.People[0].CardDAVBindings[0].RemoteUID)
+}
+
+func TestPersonUIDLookupReturnsConflictForAmbiguousCardDAVUID(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	srv, st := newIdentityLinkTestServer(t)
+	_, books, err := st.ReplaceCardDAVDiscoveryContext(t.Context(), store.CardDAVDiscoveryInput{
+		ConnectionName: "personal", BaseURL: "https://contacts.example.test/dav", Username: "example",
+		PrincipalURL: "https://contacts.example.test/principal/",
+		HomeURL:      "https://contacts.example.test/books/",
+		Books: []store.CardDAVDiscoveredBook{
+			{CanonicalURL: "https://contacts.example.test/books/one/", DisplayName: "One"},
+			{CanonicalURL: "https://contacts.example.test/books/two/", DisplayName: "Two"},
+		},
+	})
+	require.NoError(err)
+	require.Len(books, 2)
+	const remoteUID = "urn:uuid:77822e26-3cd5-40d0-a0fd-6f0ff63b204b"
+	for i, book := range books {
+		name := fmt.Sprintf("Example Person %d", i+1)
+		var personID int64
+		require.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`INSERT INTO persons (vcard_uid, display_name)
+			VALUES (?, ?) RETURNING id`), fmt.Sprintf("person-uid-%d", i+1), name).Scan(&personID))
+		body := []byte("BEGIN:VCARD\r\nVERSION:4.0\r\nUID:" + remoteUID +
+			"\r\nFN:" + name + "\r\nEND:VCARD\r\n")
+		_, err := st.DB().ExecContext(t.Context(), st.Rebind(`INSERT INTO carddav_resources (
+			address_book_id, href, remote_uid, remote_etag, remote_body,
+			remote_semantic_hash, local_hash, mapping_status, governance, person_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, 'mapped', 'remote', ?)`),
+			book.ID, book.CanonicalURL+"person.vcf", remoteUID, `"one"`, body,
+			fmt.Sprintf("remote-hash-%d", i+1), fmt.Sprintf("local-hash-%d", i+1), personID)
+		require.NoError(err)
+	}
+
+	response := personRequest(t, srv, http.MethodGet,
+		peoplePath+"/by-uid?uid="+url.QueryEscape(remoteUID), nil, "")
+	require.Equal(http.StatusConflict, response.Code, response.Body.String())
+	var body struct {
+		Error string `json:"error"`
+	}
+	require.NoError(json.Unmarshal(response.Body.Bytes(), &body))
+	assert.Equal("person_uid_ambiguous", body.Error)
+}
+
+func TestDirectoryPeopleHTTPReturnsNoStorePage(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	srv, st := newIdentityLinkTestServer(t)
+	participant := st.mustParticipant(t, "alice@example.test", "Alice Example", "example.test")
+	person, _, err := st.CreatePersonFromParticipant(participant)
+	require.NoError(err)
+	name := "Alice Example"
+	person, err = st.UpdatePersonDisplayNameContext(t.Context(), person.ID, person.Revision, &name)
+	require.NoError(err)
+	_, err = st.AddPersonCategoryContext(t.Context(), person.ID, store.PersonCategoryInput{
+		OriginalValue: "friend", Envelope: store.ValueEnvelopeInput{Source: store.ProvenanceUser},
+	})
+	require.NoError(err)
+
+	response := personRequest(t, srv, http.MethodGet,
+		peoplePath+"/directory?q=alcie&category=friend&limit=1", nil, "")
+	require.Equal(http.StatusOK, response.Code)
+	assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+}
+
+func TestDirectoryPeopleHTTPMapsEveryQueryParameter(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	srv, st := newIdentityLinkTestServer(t)
+	alice := createDirectoryHTTPPerson(t, st, "Alice Example", "alice@example.test", "friend", "Acme", true)
+	bob := createDirectoryHTTPPerson(t, st, "Bob Example", "bob@example.test", "colleague", "Other", false)
+
+	for _, tc := range []struct {
+		name string
+		path string
+	}{
+		{name: "query", path: peoplePath + "/directory?q=alcie"},
+		{name: "contact state", path: peoplePath + "/directory?contact_state=active"},
+		{name: "category", path: peoplePath + "/directory?category=friend"},
+		{name: "organization", path: peoplePath + "/directory?organization=Acme"},
+		{name: "primary channel", path: peoplePath + "/directory?primary_channel=email"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := personRequest(t, srv, http.MethodGet, tc.path, nil, "")
+			require.Equal(http.StatusOK, response.Code)
+			assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+			assertDirectoryPeopleResponseIDs(t, response, alice.ID)
+		})
+	}
+
+	first := personRequest(t, srv, http.MethodGet, peoplePath+"/directory?limit=1", nil, "")
+	require.Equal(http.StatusOK, first.Code)
+	var page DirectoryPeopleResponse
+	require.NoError(json.Unmarshal(first.Body.Bytes(), &page))
+	require.NotEmpty(page.NextCursor)
+	second := personRequest(t, srv, http.MethodGet,
+		peoplePath+"/directory?limit=1&cursor="+page.NextCursor, nil, "")
+	require.Equal(http.StatusOK, second.Code)
+	assertDirectoryPeopleResponseIDs(t, second, bob.ID)
+}
+
+func TestDirectoryPeopleHTTPFiltersSortsAndReturnsLastContact(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	srv, st := newIdentityLinkTestServer(t)
+	recent := createDirectoryHTTPPerson(t, st, "Alpha Recent", "recent@example.test", "friend", "Acme", true)
+	older := createDirectoryHTTPPerson(t, st, "Zulu Older", "older@example.test", "friend", "Acme", true)
+	never := createDirectoryHTTPPerson(t, st, "Bravo Never", "never@example.test", "friend", "Acme", false)
+	_, err := st.DB().ExecContext(t.Context(), st.Rebind(`UPDATE person_contact_state SET last_contact_at = ? WHERE person_id = ?`), "2026-08-20T10:00:00Z", recent.ID)
+	require.NoError(err)
+	_, err = st.DB().ExecContext(t.Context(), st.Rebind(`UPDATE person_contact_state SET last_contact_at = ? WHERE person_id = ?`), "2026-01-10T09:00:00Z", older.ID)
+	require.NoError(err)
+
+	after := url.QueryEscape("2026-06-01T00:00:00Z")
+	filtered := personRequest(t, srv, http.MethodGet,
+		peoplePath+"/directory?sort=last_contact_desc&last_contact_after="+after, nil, "")
+	require.Equal(http.StatusOK, filtered.Code, filtered.Body.String())
+	var filteredPage struct {
+		People []struct {
+			ID            int64   `json:"id"`
+			LastContactAt *string `json:"last_contact_at"`
+		} `json:"people"`
+	}
+	require.NoError(json.Unmarshal(filtered.Body.Bytes(), &filteredPage))
+	require.Len(filteredPage.People, 1)
+	assert.Equal(recent.ID, filteredPage.People[0].ID)
+	require.NotNil(filteredPage.People[0].LastContactAt)
+	assert.Equal("2026-08-20T10:00:00Z", *filteredPage.People[0].LastContactAt)
+
+	first := personRequest(t, srv, http.MethodGet,
+		peoplePath+"/directory?contact_state=active&sort=last_contact_asc&limit=1", nil, "")
+	require.Equal(http.StatusOK, first.Code, first.Body.String())
+	var firstPage DirectoryPeopleResponse
+	require.NoError(json.Unmarshal(first.Body.Bytes(), &firstPage))
+	assert.Equal([]int64{older.ID}, directoryHTTPPersonIDs(firstPage.People))
+	require.NotEmpty(firstPage.NextCursor)
+
+	second := personRequest(t, srv, http.MethodGet,
+		peoplePath+"/directory?contact_state=active&sort=last_contact_asc&limit=1&cursor="+url.QueryEscape(firstPage.NextCursor), nil, "")
+	require.Equal(http.StatusOK, second.Code, second.Body.String())
+	var secondPage DirectoryPeopleResponse
+	require.NoError(json.Unmarshal(second.Body.Bytes(), &secondPage))
+	assert.Equal([]int64{recent.ID}, directoryHTTPPersonIDs(secondPage.People))
+	assert.Empty(secondPage.NextCursor)
+	assert.NotEqual(never.ID, secondPage.People[0].ID)
+}
+
+func TestDirectoryPeopleHTTPRejectsInvalidLastContactQuery(t *testing.T) {
+	t.Parallel()
+	srv, _ := newIdentityLinkTestServer(t)
+	for _, test := range []struct {
+		path string
+		code string
+	}{
+		{path: peoplePath + "/directory?sort=oldestish", code: "invalid_query"},
+		{path: peoplePath + "/directory?last_contact_after=yesterday", code: "invalid_parameter"},
+		{path: peoplePath + "/directory?last_contact_before=tomorrow", code: "invalid_parameter"},
+	} {
+		response := personRequest(t, srv, http.MethodGet, test.path, nil, "")
+		assert.Equal(t, http.StatusBadRequest, response.Code, test.path)
+		assertDirectoryPeopleError(t, response, test.code)
+	}
+}
+
+func TestDirectoryPeopleHTTPRejectsInvalidParametersAndStaleProjection(t *testing.T) {
+	t.Parallel()
+	srv, _ := newIdentityLinkTestServer(t)
+	for _, tc := range []struct {
+		name string
+		path string
+		code string
+	}{
+		{name: "cursor", path: peoplePath + "/directory?cursor=not-a-cursor", code: "invalid_cursor"},
+		{name: "query", path: peoplePath + "/directory?contact_state=unknown", code: "invalid_query"},
+		{name: "limit", path: peoplePath + "/directory?limit=many", code: "invalid_limit"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			response := personRequest(t, srv, http.MethodGet, tc.path, nil, "")
+			require.Equal(t, http.StatusBadRequest, response.Code)
+			assert.Equal(t, "no-store", response.Header().Get("Cache-Control"))
+			assertDirectoryPeopleError(t, response, tc.code)
+		})
+	}
+
+	staleServer := NewServer(&config.Config{Server: config.ServerConfig{APIPort: 8080}},
+		&staleDirectoryPeopleStore{stubIdentityCacheStore: newDirectoryTestStore(t)}, nil, testLogger())
+	stale := personRequest(t, staleServer, http.MethodGet, peoplePath+"/directory", nil, "")
+	require.Equal(t, http.StatusServiceUnavailable, stale.Code)
+	assert.Equal(t, "no-store", stale.Header().Get("Cache-Control"))
+	assertDirectoryPeopleError(t, stale, "directory_projection_stale")
+}
+
+func TestDirectoryPeopleHTTPAcceptsEveryPublishedContactState(t *testing.T) {
+	t.Parallel()
+	srv, _ := newIdentityLinkTestServer(t)
+	for _, state := range []string{"", "active", "inactive"} {
+		path := peoplePath + "/directory"
+		if state != "" {
+			path += "?contact_state=" + state
+		}
+		response := personRequest(t, srv, http.MethodGet, path, nil, "")
+		require.Equal(t, http.StatusOK, response.Code, state)
+	}
+}
+
+type staleDirectoryPeopleStore struct {
+	*stubIdentityCacheStore
+}
+
+func (s *staleDirectoryPeopleStore) DirectoryPeoplePageContext(
+	context.Context, store.DirectoryPeopleQuery,
+) (*store.DirectoryPeoplePage, error) {
+	return nil, store.ErrDirectoryProjectionStale
+}
+
+func newDirectoryTestStore(t *testing.T) *stubIdentityCacheStore {
+	t.Helper()
+	return &stubIdentityCacheStore{Store: testutil.NewTestStore(t)}
+}
+
+func createDirectoryHTTPPerson(
+	t *testing.T,
+	st *stubIdentityCacheStore,
+	displayName, email, category, organizationName string,
+	active bool,
+) *store.Person {
+	t.Helper()
+	participantID, err := st.EnsureParticipantByIdentifier("email", email, displayName)
+	require.NoError(t, err)
+	person, _, err := st.CreatePersonFromParticipantContext(t.Context(), participantID)
+	require.NoError(t, err)
+	person, err = st.UpdatePersonDisplayNameContext(t.Context(), person.ID, person.Revision, &displayName)
+	require.NoError(t, err)
+	_, err = st.AddPersonContactPointContext(t.Context(), person.ID, store.PersonContactPointInput{
+		AddressKind: store.ContactAddressEmail, OriginalValue: email,
+		Envelope: store.ValueEnvelopeInput{Source: store.ProvenanceUser},
+	})
+	require.NoError(t, err)
+	_, err = st.AddPersonCategoryContext(t.Context(), person.ID, store.PersonCategoryInput{
+		OriginalValue: category, Envelope: store.ValueEnvelopeInput{Source: store.ProvenanceUser},
+	})
+	require.NoError(t, err)
+	organization, err := st.CreateOrganizationContext(t.Context(), store.OrganizationInput{
+		Name: organizationName, Kind: store.OrganizationKindCompany,
+	})
+	require.NoError(t, err)
+	_, err = st.AddEmploymentContext(t.Context(), store.EmploymentInput{
+		PersonID: person.ID, OrganizationID: organization.ID, Source: store.ProvenanceUser,
+	})
+	require.NoError(t, err)
+	if active {
+		_, err = st.DB().ExecContext(t.Context(), st.Rebind(`INSERT INTO person_contact_state (
+			person_id, last_contact_channel, last_contact_at, interaction_count
+		) VALUES (?, 'email', CURRENT_TIMESTAMP, 1)`), person.ID)
+		require.NoError(t, err)
+	}
+	return person
+}
+
+func assertDirectoryPeopleResponseIDs(t *testing.T, response *httptest.ResponseRecorder, want ...int64) {
+	t.Helper()
+	var page DirectoryPeopleResponse
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &page))
+	got := make([]int64, len(page.People))
+	for i, person := range page.People {
+		got[i] = person.ID
+	}
+	assert.Equal(t, want, got)
+}
+
+func directoryHTTPPersonIDs(people []store.DirectoryPersonSummary) []int64 {
+	ids := make([]int64, 0, len(people))
+	for _, person := range people {
+		ids = append(ids, person.ID)
+	}
+	return ids
+}
+
+func TestDirectoryPeopleHTTPAlwaysEmitsArrays(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	srv, st := newIdentityLinkTestServer(t)
+	participantID, err := st.EnsureParticipantByIdentifier("email", "arrays@example.test", "Array Person")
+	require.NoError(err)
+	_, _, err = st.CreatePersonFromParticipantContext(t.Context(), participantID)
+	require.NoError(err)
+	response := personRequest(t, srv, http.MethodGet, peoplePath+"/directory", nil, "")
+	require.Equal(http.StatusOK, response.Code)
+	var body struct {
+		People []struct {
+			Categories    []string `json:"categories"`
+			Organizations []string `json:"organizations"`
+		} `json:"people"`
+	}
+	require.NoError(json.Unmarshal(response.Body.Bytes(), &body))
+	require.Len(body.People, 1)
+	assert.NotNil(body.People)
+	assert.NotNil(body.People[0].Categories)
+	assert.NotNil(body.People[0].Organizations)
+	assert.Empty(body.People[0].Categories)
+	assert.Empty(body.People[0].Organizations)
+}
+
+func TestListPeopleHTTPEncodesNilSliceAsArray(t *testing.T) {
+	t.Parallel()
+	srv, _ := newIdentityLinkTestServer(t)
+	response := personRequest(t, srv, http.MethodGet, peoplePath, nil, "")
+	require.Equal(t, http.StatusOK, response.Code, response.Body.String())
+	assert.JSONEq(t, `{"people":[]}`, response.Body.String())
+}
+
+func assertDirectoryPeopleError(t *testing.T, response *httptest.ResponseRecorder, want string) {
+	t.Helper()
+	var body ErrorResponse
+	require.NoError(t, json.Unmarshal(response.Body.Bytes(), &body))
+	assert.Equal(t, want, body.Error)
+}
+
 func TestPersonProfileHTTPDelete(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, st := newIdentityLinkTestServer(t)
@@ -127,6 +536,7 @@ func TestPersonProfileHTTPDelete(t *testing.T) {
 }
 
 func TestPersonProfileHTTPDeleteReportsConflicts(t *testing.T) {
+	t.Parallel()
 	srv, _ := newIdentityLinkTestServer(t)
 	for _, test := range []struct {
 		name string
@@ -146,6 +556,7 @@ func TestPersonProfileHTTPDeleteReportsConflicts(t *testing.T) {
 }
 
 func TestPersonPatchSchemaRequiresNullableDisplayName(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	for _, document := range []*huma.OpenAPI{OpenAPIDocument(), openAPIClientDocument()} {
@@ -158,6 +569,7 @@ func TestPersonPatchSchemaRequiresNullableDisplayName(t *testing.T) {
 }
 
 func TestSemanticPersonSearchReturnsRankedDurableRootsWithScores(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	firstName := "Synthetic Architect"
@@ -166,6 +578,11 @@ func TestSemanticPersonSearchReturnsRankedDurableRootsWithScores(t *testing.T) {
 		{Person: store.Person{
 			ID: 22, VCardUID: "00000000-0000-4000-8000-000000000022",
 			DisplayName: &firstName, Revision: 4, ParticipantIDs: []int64{220},
+			CardDAVBindings: []store.CardDAVBinding{{
+				Connection: "personal", Book: "Personal",
+				Href:      "https://contacts.example.test/book/person.vcf",
+				RemoteUID: "urn:uuid:remote-22", MappingStatus: store.CardDAVMappingMapped,
+			}},
 		}, Score: 0.91},
 		{Person: store.Person{
 			ID: 11, VCardUID: "00000000-0000-4000-8000-000000000011",
@@ -184,6 +601,8 @@ func TestSemanticPersonSearchReturnsRankedDurableRootsWithScores(t *testing.T) {
 	require.NoError(json.Unmarshal(response.Body.Bytes(), &body))
 	require.Len(body.Results, 2)
 	assert.Equal(int64(22), body.Results[0].Person.ID)
+	require.Len(body.Results[0].Person.CardDAVBindings, 1)
+	assert.Equal("urn:uuid:remote-22", body.Results[0].Person.CardDAVBindings[0].RemoteUID)
 	assert.InDelta(0.91, body.Results[0].Score, 0.00001)
 	assert.Equal(int64(11), body.Results[1].Person.ID)
 	assert.InDelta(0.82, body.Results[1].Score, 0.00001)
@@ -192,6 +611,7 @@ func TestSemanticPersonSearchReturnsRankedDurableRootsWithScores(t *testing.T) {
 }
 
 func TestSemanticPersonSearchReturnsEmptyArrayAndPassesExplicitLimit(t *testing.T) {
+	t.Parallel()
 	engine := &fakePersonSearchEngine{results: []personsearch.Result{}}
 	srv := newSemanticPersonSearchServer(t, engine, VectorStatusReady, "")
 
@@ -203,6 +623,7 @@ func TestSemanticPersonSearchReturnsEmptyArrayAndPassesExplicitLimit(t *testing.
 }
 
 func TestSemanticPersonSearchValidatesQueryAndLimit(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		body string
@@ -223,6 +644,7 @@ func TestSemanticPersonSearchValidatesQueryAndLimit(t *testing.T) {
 }
 
 func TestSemanticPersonSearchRequiresAuthenticationAndNeverCaches(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	const apiKey = "person-search-test-key"
 	engine := &fakePersonSearchEngine{results: []personsearch.Result{}}
@@ -241,6 +663,7 @@ func TestSemanticPersonSearchRequiresAuthenticationAndNeverCaches(t *testing.T) 
 }
 
 func TestSemanticPersonSearchReportsEveryVectorStatusState(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name      string
 		status    VectorStatus
@@ -276,6 +699,7 @@ func TestSemanticPersonSearchReportsEveryVectorStatusState(t *testing.T) {
 }
 
 func TestSemanticPersonSearchClearsCachedStaleStatusBeforeServing(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	cfg := vector.Config{}
@@ -303,6 +727,7 @@ func TestSemanticPersonSearchClearsCachedStaleStatusBeforeServing(t *testing.T) 
 }
 
 func TestSemanticPersonSearchMapsGenerationAndEmbeddingErrors(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name        string
 		err         error
@@ -326,7 +751,6 @@ func TestSemanticPersonSearchMapsGenerationAndEmbeddingErrors(t *testing.T) {
 			wantCode:    "person_embedding_policy_unavailable",
 			wantMessage: "cannot verify the current semantic person embedding policy",
 		},
-		{name: "stale", err: vector.ErrIndexStale, wantCode: "index_stale"},
 		{name: "building", err: vector.ErrIndexBuilding, wantCode: "index_building"},
 		{
 			name: "person coverage incomplete", err: personsearch.ErrPersonCoverageIncomplete,
@@ -360,6 +784,47 @@ func TestSemanticPersonSearchMapsGenerationAndEmbeddingErrors(t *testing.T) {
 			}
 			if test.wantDetail != "" {
 				assertions.Contains(body.Message, test.wantDetail)
+			}
+		})
+	}
+}
+
+func TestSemanticPersonSearchDistinguishesIndexStaleFromProviderRuntimeStale(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name       string
+		err        error
+		wantStatus VectorStatus
+	}{
+		{name: "index stale", err: vector.ErrIndexStale, wantStatus: VectorStatusStale},
+		{name: "provider runtime stale", err: vector.ErrSemanticPersonEmbeddingRuntimeStale, wantStatus: VectorStatusReady},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			cfg := vector.Config{Enabled: true}
+			backend := &resolvingVectorBackend{fingerprint: cfg.GenerationFingerprint()}
+			engine := &fakePersonSearchEngine{err: test.err}
+			srv := NewServerWithOptions(ServerOptions{
+				Config: &config.Config{}, Logger: testLogger(),
+				Backend: backend, VectorCfg: cfg, VectorStatus: VectorStatusReady,
+				PersonSearchEngine: engine,
+			})
+			srv.refreshVectorStatus(t.Context())
+			backend.fingerprint = "rebuilt"
+			srv.SetVectorRestartFingerprint(func(context.Context) (string, error) { return "rebuilt", nil })
+
+			response := semanticPersonSearchRequest(t, srv, []byte(`{"query":"synthetic"}`), "")
+			require.Equal(http.StatusServiceUnavailable, response.Code, response.Body.String())
+			var body ErrorResponse
+			require.NoError(json.Unmarshal(response.Body.Bytes(), &body))
+			assert.Equal("index_stale", body.Error)
+			assert.Equal([]string{"synthetic"}, engine.queries)
+			status, detail := srv.VectorStatus()
+			assert.Equal(test.wantStatus, status)
+			if test.wantStatus == VectorStatusReady {
+				assert.Equal("The vector index does not match configured embedding settings", body.Message)
+				assert.Empty(detail)
 			}
 		})
 	}

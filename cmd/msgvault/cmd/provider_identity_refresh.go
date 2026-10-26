@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 
 	"go.kenn.io/msgvault/internal/gmail"
 	"go.kenn.io/msgvault/internal/provideridentity"
@@ -11,11 +12,16 @@ import (
 
 var fastmailIdentityInventoryFactory provideridentity.Factory = provideridentity.NewFastmailInventory
 
-func newMessageSyncer(client gmail.API, st *store.Store, opts *msgsync.Options) *msgsync.Syncer {
-	return withAutomaticProviderIdentityRefresh(msgsync.New(client, st, opts), st)
+func newMessageSyncer(client gmail.API, st *store.Store, opts *msgsync.Options, state *invocation) *msgsync.Syncer {
+	if opts == nil {
+		opts = msgsync.DefaultOptions()
+	}
+	configured := *opts
+	configured.RemoteImages = configuredRemoteImageFetcher(state.cfg)
+	return withAutomaticProviderIdentityRefresh(msgsync.New(client, st, &configured), st, state)
 }
 
-func withAutomaticProviderIdentityRefresh(syncer *msgsync.Syncer, st *store.Store) *msgsync.Syncer {
+func withAutomaticProviderIdentityRefresh(syncer *msgsync.Syncer, st *store.Store, state *invocation) *msgsync.Syncer {
 	return syncer.WithSuccessfulSyncHook(
 		"provider identity refresh",
 		func(ctx context.Context, source *store.Source, mailboxChanged bool) error {
@@ -26,9 +32,12 @@ func withAutomaticProviderIdentityRefresh(syncer *msgsync.Syncer, st *store.Stor
 			if !mailboxChanged {
 				refresh = provideridentity.AutoRefreshIfDue
 			}
+			if state == nil || state.cfg == nil {
+				return errors.New("configuration is unavailable")
+			}
 			_, _, err := refresh(
 				ctx,
-				cfg,
+				state.cfg,
 				st,
 				source.ID,
 				fastmailIdentityInventoryFactory,

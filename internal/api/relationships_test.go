@@ -165,6 +165,7 @@ func newRelationshipsDuckDBFixtureWithDir(t *testing.T, now time.Time) (*query.D
 			dir: "participant_clusters", file: "participant_clusters.parquet", columns: "participant_id, canonical_id",
 			values: `(2::BIGINT, 2::BIGINT), (3::BIGINT, 2::BIGINT)`,
 		},
+		{dir: "person_display_names", file: "person_display_names.parquet", columns: "participant_id, person_id, display_name", values: `(0::BIGINT, 0::BIGINT, '')`, empty: true},
 	}
 	for _, table := range tables {
 		dir := filepath.Join(analyticsDir, table.dir)
@@ -174,7 +175,11 @@ func newRelationshipsDuckDBFixtureWithDir(t *testing.T, now time.Time) (*query.D
 			where = " WHERE false"
 		}
 		path := filepath.ToSlash(filepath.Join(dir, table.file))
-		_, err := db.Exec(fmt.Sprintf("COPY (SELECT * FROM (VALUES %s) AS t(%s)%s) TO '%s' (FORMAT PARQUET)", table.values, table.columns, where, path))
+		projection := "*"
+		if strings.HasPrefix(table.dir, "messages/") {
+			projection += ", false AS archive_only"
+		}
+		_, err := db.Exec(fmt.Sprintf("COPY (SELECT %s FROM (VALUES %s) AS t(%s)%s) TO '%s' (FORMAT PARQUET)", projection, table.values, table.columns, where, path))
 		requirementsForTest.NoError(err, "write %s", table.dir)
 	}
 
@@ -243,6 +248,7 @@ func republishRelationshipsFixture(
 }
 
 func TestRelationshipsRanksAndGatesOverHTTP(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -271,6 +277,7 @@ func TestRelationshipsRanksAndGatesOverHTTP(t *testing.T) {
 }
 
 func TestRelationshipsResolvesSourceScopedIdentityBeforeRanking(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	now := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
@@ -326,6 +333,7 @@ func TestRelationshipsResolvesSourceScopedIdentityBeforeRanking(t *testing.T) {
 }
 
 func TestRelationshipsCursorConflictsOnRevisionDrift(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -373,6 +381,7 @@ func TestRelationshipsCursorConflictsOnRevisionDrift(t *testing.T) {
 // the committed cache state must still report identity_revision_changed,
 // not archive_revision_changed.
 func TestRelationshipsCursorReportsIdentityDriftDistinctlyFromArchiveDrift(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -400,6 +409,7 @@ func TestRelationshipsCursorReportsIdentityDriftDistinctlyFromArchiveDrift(t *te
 }
 
 func TestRelationshipsCursorConflictsOnAnchorDrift(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	now := time.Date(2026, 1, 10, 0, 0, 0, 0, time.UTC)
@@ -454,6 +464,7 @@ func relationshipRowOf(t *testing.T, page RelationshipsHTTPResponse, canonicalID
 }
 
 func TestRelationshipsPaginationPinsDecayDateAcrossUTCMidnight(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -493,6 +504,7 @@ func TestRelationshipsPaginationPinsDecayDateAcrossUTCMidnight(t *testing.T) {
 }
 
 func TestRelationshipsCursorWithoutDecayDateFallsBackToCurrentDate(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -522,6 +534,7 @@ func TestRelationshipsCursorWithoutDecayDateFallsBackToCurrentDate(t *testing.T)
 }
 
 func TestRelationshipsCursorRejectsInvalidDecayDate(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 1, 10, 23, 58, 0, 0, time.UTC)
 	srv := newTestServerWithEngine(t, newRelationshipsDuckDBFixture(t, now))
 	srv.clock = func() time.Time { return now }
@@ -551,6 +564,7 @@ func TestRelationshipsCursorRejectsInvalidDecayDate(t *testing.T) {
 }
 
 func TestRelationshipsRejectsOutOfRangeLimit(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -563,6 +577,7 @@ func TestRelationshipsRejectsOutOfRangeLimit(t *testing.T) {
 }
 
 func TestRelationshipsUnavailableUnderNonAnalyzerEngine(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 

@@ -1,6 +1,7 @@
 package daemonclient
 
 import (
+	"encoding/json/jsontext"
 	"fmt"
 	"strings"
 	"time"
@@ -52,7 +53,7 @@ func storeStatsFromGenerated(stats generated.StatsResponse) *store.Stats {
 		SourceCount:        stats.TotalAccounts,
 		LabelCount:         stats.TotalLabels,
 		AttachmentCount:    stats.TotalAttachments,
-		DatabaseSize:       stats.DatabaseSizeBytes,
+		DatabaseSize:       int64Value(stats.DatabaseSizeBytes),
 	}
 }
 
@@ -108,6 +109,7 @@ func cliDeleteStagedPlanFromGenerated(resp *generated.PlanCLIDeleteStagedRespons
 		ScopeEscalationBodyLines:  append([]string(nil), resp.ScopeEscalationBodyLines...),
 		ScopeEscalationCancelHint: stringValue(resp.ScopeEscalationCancelHint),
 		ScopeEscalationAccount:    stringValue(resp.ScopeEscalationAccount),
+		ScopeEscalationSourceType: stringValue(resp.ScopeEscalationSourceType),
 		ScopeEscalationOAuthApp:   stringValue(resp.ScopeEscalationOauthApp),
 		BlockedError:              stringValue(resp.BlockedError),
 		RemoteDeleteEnvVar:        stringValue(resp.RemoteDeleteEnvVar),
@@ -138,6 +140,10 @@ func cliDeletionManifestToGenerated(manifest *deletion.Manifest) generated.Creat
 		Status:      string(manifest.Status),
 		Version:     int64(manifest.Version),
 	}
+	if len(manifest.RawFilter) > 0 {
+		rawFilter := append(jsontext.Value(nil), manifest.RawFilter...)
+		out.RawFilter = &rawFilter
+	}
 	if manifest.Execution != nil {
 		out.Execution = cliDeletionExecutionToGenerated(manifest.Execution)
 	}
@@ -158,6 +164,7 @@ func cliDeletionFiltersToGenerated(filters deletion.Filters) generated.Filters {
 		After:         optionalString(filters.After),
 		Before:        optionalString(filters.Before),
 		Labels:        append([]string(nil), filters.Labels...),
+		ListIds:       append([]string(nil), filters.ListIDs...),
 		Recipients:    append([]string(nil), filters.Recipients...),
 		SenderDomains: append([]string(nil), filters.SenderDomains...),
 		Senders:       append([]string(nil), filters.Senders...),
@@ -207,14 +214,14 @@ func cliDeduplicatePlanFromGenerated(resp *generated.PlanCLIDeduplicateResponse)
 	items := make([]CLIDeduplicatePlanItem, len(resp.Items))
 	for i, item := range resp.Items {
 		items[i] = CLIDeduplicatePlanItem{
-			SourceID:          int64Value(item.SourceID),
-			ScopeLabel:        stringValue(item.ScopeLabel),
-			ScopeIsCollection: boolValue(item.ScopeIsCollection),
-			Stdout:            stringValue(item.Stdout),
-			DuplicateMessages: int(int64Value(item.DuplicateMessages)),
-			BackfilledCount:   int64Value(item.BackfilledCount),
-			PlanFingerprint:   stringValue(item.PlanFingerprint),
-			NeedsConfirmation: item.NeedsConfirmation,
+			SourceID:             int64Value(item.SourceID),
+			ScopeLabel:           stringValue(item.ScopeLabel),
+			ScopeIsCollection:    boolValue(item.ScopeIsCollection),
+			Stdout:               stringValue(item.Stdout),
+			DuplicateMessages:    int(int64Value(item.DuplicateMessages)),
+			PendingBackfillCount: int64Value(item.PendingBackfillCount),
+			PlanFingerprint:      stringValue(item.PlanFingerprint),
+			NeedsConfirmation:    item.NeedsConfirmation,
 		}
 	}
 	return &CLIDeduplicatePlan{
@@ -234,6 +241,7 @@ func cliSearchFromGenerated(resp *generated.SearchCLIResponse) *CLISearch {
 	}
 	return &CLISearch{
 		Results:          results,
+		HybridAvailable:  boolValue(resp.HybridAvailable),
 		ScopeLabel:       stringValue(resp.ScopeLabel),
 		ScopeSourceCount: intValue(resp.ScopeSourceCount),
 		IndexBuilt:       boolValue(resp.IndexBuilt),
@@ -260,7 +268,14 @@ func cliHybridSearchFromGenerated(resp generated.HybridSearchResponse) (*CLIHybr
 			Fingerprint: resp.Generation.Fingerprint,
 			State:       resp.Generation.State,
 		},
+		TookMS: resp.TookMs,
+		Timings: CLIHybridSearchTimings{
+			QueryEmbeddingMS: resp.Timings.QueryEmbeddingMs,
+			RetrievalMS:      resp.Timings.RetrievalMs,
+			HydrationMS:      resp.Timings.HydrationMs,
+		},
 		PoolSaturated:    resp.PoolSaturated,
+		Accelerator:      stringValue(resp.Accelerator),
 		ReturnedCount:    int(resp.Returned),
 		ScopeLabel:       stringValue(resp.ScopeLabel),
 		ScopeSourceCount: intValue(resp.ScopeSourceCount),
@@ -293,6 +308,8 @@ func cliHybridSearchResultFromGenerated(item generated.HybridSearchItem) (CLIHyb
 			ConversationID:  int64Value(item.ConversationID),
 			Subject:         item.Subject,
 			Snippet:         item.Snippet,
+			AttachmentCount: intValue(item.AttachmentCount),
+			AttachmentNames: item.AttachmentNames,
 			FromEmail:       stringValue(item.FromEmail),
 			FromName:        stringValue(item.FromName),
 			FromPhone:       stringValue(item.FromPhone),
@@ -306,6 +323,7 @@ func cliHybridSearchResultFromGenerated(item generated.HybridSearchItem) (CLIHyb
 			DeletedAt:       deletedAt,
 			MessageType:     stringValue(item.MessageType),
 		},
+		AttachmentCount:  item.AttachmentCount,
 		ID:               item.ID,
 		Subject:          item.Subject,
 		FromEmail:        stringValue(item.FromEmail),
@@ -358,6 +376,8 @@ func queryMessageSummaryFromGenerated(msg generated.CLIQueryMessageSummary) quer
 		SourceConversationID: msg.SourceConversationID,
 		Subject:              msg.Subject,
 		Snippet:              msg.Snippet,
+		MatchSnippet:         stringValue(msg.MatchSnippet),
+		AttachmentNames:      msg.AttachmentNames,
 		FromEmail:            msg.FromEmail,
 		FromName:             msg.FromName,
 		FromPhone:            stringValue(msg.FromPhone),
@@ -395,8 +415,10 @@ func cliMessageDetailFromGenerated(resp *generated.GetCLIMessageResponse) *query
 		return &query.MessageDetail{}
 	}
 	return &query.MessageDetail{
+		RelatedMessageID:     resp.RelatedMessageID,
 		ID:                   resp.ID,
 		SourceMessageID:      resp.SourceMessageID,
+		RFC822MessageID:      stringValue(resp.Rfc822MessageID),
 		ConversationID:       resp.ConversationID,
 		SourceConversationID: resp.SourceConversationID,
 		Subject:              resp.Subject,
@@ -446,6 +468,7 @@ func cliMessageAttachmentsFromGenerated(
 			MimeType:    attachment.MimeType,
 			Size:        attachment.Size,
 			ContentHash: attachment.ContentHash,
+			Docbank:     docbankRefsFromGenerated(attachment.Docbank),
 			URL:         stringValue(attachment.URL),
 		}
 	}
@@ -459,7 +482,8 @@ func cliAccountsFromGenerated(resp *generated.ListCLIAccountsResponse) []CLIAcco
 	out := make([]CLIAccount, len(resp.Accounts))
 	for i, account := range resp.Accounts {
 		out[i] = CLIAccount{
-			ID:                 account.ID,
+			ID:         account.ID,
+			Identifier: account.Identifier, Alias: stringValue(account.Alias), HistoryOnly: account.HistoryOnly, ReanchorRequired: account.ReanchorRequired, MergedIntoSourceID: account.MergedIntoSourceID,
 			Email:              account.Email,
 			Type:               account.Type,
 			DisplayName:        account.DisplayName,
@@ -468,6 +492,26 @@ func cliAccountsFromGenerated(resp *generated.ListCLIAccountsResponse) []CLIAcco
 			SourceDeletedCount: account.SourceDeletedCount,
 			LastSync:           account.LastSync,
 			SyncConfig:         stringValue(account.SyncConfig),
+			VirtualAccounts:    virtualAccountsFromGenerated(account.VirtualAccounts),
+		}
+	}
+	return out
+}
+
+func virtualAccountsFromGenerated(accounts []generated.VirtualAccount) []store.VirtualAccount {
+	if len(accounts) == 0 {
+		return nil
+	}
+	out := make([]store.VirtualAccount, len(accounts))
+	for i, account := range accounts {
+		out[i] = store.VirtualAccount{
+			Key:                account.Key,
+			SourceID:           account.SourceID,
+			AccountAddress:     stringValue(account.AccountAddress),
+			Unattributed:       account.Unattributed != nil && *account.Unattributed,
+			MessageCount:       account.MessageCount,
+			SourceDeletedCount: account.SourceDeletedCount,
+			PendingCount:       int64Value(account.PendingCount),
 		}
 	}
 	return out
@@ -879,4 +923,15 @@ func intValue(value *int64) int {
 		return 0
 	}
 	return int(*value)
+}
+
+func docbankRefsFromGenerated(refs []generated.DocbankAttachmentRef) []store.DocbankAttachmentRef {
+	if refs == nil {
+		return nil
+	}
+	result := make([]store.DocbankAttachmentRef, len(refs))
+	for i, ref := range refs {
+		result[i] = store.DocbankAttachmentRef{Endpoint: ref.Endpoint, Folder: ref.Folder, NodeID: ref.NodeID, VersionID: ref.VersionID, BlobHash: ref.BlobHash}
+	}
+	return result
 }

@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -20,11 +21,14 @@ var (
 	embeddingsActivateYes       bool
 )
 
-const embeddingsCommandName = "embeddings"
+const (
+	embeddingsCommandName        = "embeddings"
+	embeddingsOptimizeWorkerName = "__optimize-worker"
+)
 
 var embeddingsCmd = &cobra.Command{
 	Use:   embeddingsCommandName,
-	Short: "Manage vector embeddings",
+	Short: "Manage message vector embeddings",
 }
 
 var embeddingsBuildCmd = newEmbeddingsBuildCmd("build")
@@ -68,7 +72,7 @@ var embedCmd = newEmbeddingsBuildCmd("build-embeddings")
 func newEmbeddingsBuildCmd(use string) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   use,
-		Short: "Build or update the vector embedding index (incremental by default; --full-rebuild for a new generation)",
+		Short: "Build or update the message vector index",
 		Long: `Build or update the vector embedding index for hybrid search.
 Writes vectors to the co-located vectors.db. In the default incremental
 mode, the command embeds any messages still needing embedding for the
@@ -99,6 +103,11 @@ func runEmbeddingsBuild(cmd *cobra.Command, args []string) error {
 }
 
 func runEmbeddingsBuildLocal(cmd *cobra.Command) error {
+	state := invocationFromCommand(cmd)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
 	if !cfg.Vector.Enabled {
 		return errors.New("vector search not enabled; add [vector] enabled=true to config.toml first")
 	}
@@ -117,13 +126,19 @@ func runEmbeddingsBuildHTTP(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("set --yes after confirmation: %w", err)
 		}
 	}
-	return runDaemonCLICommandHTTPFromCobraWithEnv(cmd, args, embeddingsForwardEnv())
+	return runDaemonCLICommandHTTPFromCobraWithEnv(cmd, args, embeddingsForwardEnv(invocationFromCommand(cmd)))
 }
 
 // embeddingsForwardEnv carries the caller's embedding API key into the
 // daemon-spawned subprocess, which otherwise sees only the daemon's
 // environment: a key exported in the user's shell would silently not apply.
-func embeddingsForwardEnv() map[string]string {
+
+func embeddingsForwardEnv(state *invocation) map[string]string {
+	state = invocationState(context.Background(), state)
+	if state == nil || state.cfg == nil {
+		return nil
+	}
+	cfg := state.cfg
 	name := cfg.Vector.Embeddings.APIKeyEnv
 	if name == "" {
 		return nil
@@ -172,6 +187,9 @@ func init() {
 	embeddingsCmd.AddCommand(embeddingsRetireCmd)
 	embeddingsCmd.AddCommand(embeddingsActivateCmd)
 	embeddingsCmd.AddCommand(embeddingsPruneCmd)
+	embeddingsOptimizeCmd.Flags().Bool("drop", false, "Remove the accelerator while keeping exact vectors")
+	embeddingsCmd.AddCommand(embeddingsOptimizeCmd)
+	embeddingsCmd.AddCommand(embeddingsOptimizeWorkerCmd)
 	rootCmd.AddCommand(embeddingsCmd)
 	rootCmd.AddCommand(embedCmd)
 }

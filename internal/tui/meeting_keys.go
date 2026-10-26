@@ -197,7 +197,7 @@ func (m Model) handleMeetingDetailKeys(msg tea.KeyPressMsg) (tea.Model, tea.Cmd)
 		m.meetingState.detailScroll += m.visibleRows()
 	case "left", "h":
 		return m.changeMeetingDetail(-1)
-	case "right", "l":
+	case keyNameRight, "l":
 		return m.changeMeetingDetail(1)
 	case "/":
 		m.meetingState.detailSearchActive = true
@@ -227,7 +227,7 @@ func (m Model) handleMeetingDetailSearchInput(msg tea.KeyPressMsg) (tea.Model, t
 		m.meetingState.detailSearchActive = false
 		m.meetingState.detailSearchInput.Blur()
 		return m, nil
-	case "ctrl+c":
+	case keyNameCtrlC:
 		m.quitting = true
 		return m, tea.Quit
 	default:
@@ -313,6 +313,7 @@ func (m Model) handleMeetingSearchInput(msg tea.KeyPressMsg) (tea.Model, tea.Cmd
 			m.restoreMeetingListPagination()
 			return m, nil
 		}
+		m.submittedQuery = queryString
 		m.invalidateMeetingListForSearch()
 		if !m.meetingState.searchSnapshotInvalid && m.meetingState.preSearch == nil {
 			m.meetingState.preSearch = append([]query.MessageSummary(nil), m.meetingState.messages...)
@@ -327,7 +328,7 @@ func (m Model) handleMeetingSearchInput(msg tea.KeyPressMsg) (tea.Model, tea.Cmd
 		m.meetingState.searchInput.Blur()
 		m.meetingState.searchInput.SetValue(m.meetingState.searchQuery)
 		return m, nil
-	case "ctrl+c":
+	case keyNameCtrlC:
 		m.quitting = true
 		return m, tea.Quit
 	default:

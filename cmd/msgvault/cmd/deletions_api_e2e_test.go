@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"bytes"
-	"context"
 	"database/sql"
 	"encoding/json"
 	"log/slog"
@@ -16,9 +15,12 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
 func TestDeletionStagingEndToEnd(t *testing.T) {
+	cfg := testConfigValue()
+
 	require := require.New(t)
 	assert := assert.New(t)
 
@@ -26,11 +28,10 @@ func TestDeletionStagingEndToEnd(t *testing.T) {
 	savedCfg := cfg
 	t.Cleanup(func() { cfg = savedCfg })
 	cfg = &config.Config{Data: config.DataConfig{DataDir: tmpDir}}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 
-	s, err := store.Open(tmpDir + "/msgvault.db")
-	require.NoError(err, "open store")
-	require.NoError(s.InitSchema(), "init schema")
-	t.Cleanup(func() { _ = s.Close() })
+	s := testutil.NewSQLiteTestStoreAt(t, tmpDir+"/msgvault.db")
 
 	src, err := s.GetOrCreateSource("gmail", "alice@example.com")
 	require.NoError(err, "create source")
@@ -48,8 +49,8 @@ func TestDeletionStagingEndToEnd(t *testing.T) {
 	t.Cleanup(func() { _ = engine.Close() })
 
 	srv := api.NewServerWithOptions(api.ServerOptions{
-		Config: &config.Config{Data: config.DataConfig{DataDir: tmpDir}},
-		Store:  &storeAPIAdapter{store: s},
+		Config: cfg,
+		Store:  &storeAPIAdapter{store: s, config: cfg},
 		Engine: engine,
 		Logger: slog.New(slog.DiscardHandler),
 	})
@@ -74,8 +75,8 @@ func TestDeletionStagingEndToEnd(t *testing.T) {
 
 	// The persisted manifest must carry the account delete-staged
 	// executes against.
-	adapter := &storeAPIAdapter{store: s}
-	persisted, _, err := adapter.GetDeletionManifest(context.Background(), staged.ID)
+	adapter := &storeAPIAdapter{store: s, config: cfg}
+	persisted, _, err := adapter.GetDeletionManifest(testCtx, staged.ID)
 	require.NoError(err, "load persisted manifest")
 	assert.Equal("alice@example.com", persisted.Filters.Account, "manifest account")
 

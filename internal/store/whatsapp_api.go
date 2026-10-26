@@ -1,13 +1,12 @@
 package store
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"strings"
@@ -179,9 +178,7 @@ func DecodeWhatsAppChatCursor(filter WhatsAppChatFilter, value string) (WhatsApp
 		return WhatsAppChatCursor{}, ErrWhatsAppChatCursorInvalid
 	}
 	var wire whatsAppChatCursorWire
-	decoder := json.NewDecoder(bytes.NewReader(decoded))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&wire); err != nil ||
+	if err := json.Unmarshal(decoded, &wire, json.RejectUnknownMembers(true)); err != nil ||
 		wire.Version != whatsAppChatCursorVersion || wire.ID <= 0 ||
 		wire.Filter != whatsAppChatFilterKey(filter) {
 		return WhatsAppChatCursor{}, ErrWhatsAppChatCursorInvalid
@@ -310,7 +307,7 @@ func (s *Store) ListWhatsAppChats(ctx context.Context, filter WhatsAppChatFilter
 // with id > AfterID, in ascending archive ID order.
 func (s *Store) ListWhatsAppMessagesAfter(ctx context.Context, filter WhatsAppMessageFilter) ([]WhatsAppMessageRecord, error) {
 	if filter.ChatJID == "" {
-		return nil, fmt.Errorf("chat_jid is required")
+		return nil, errors.New("chat_jid is required")
 	}
 	limit := filter.Limit
 	if limit <= 0 || limit > MaxWhatsAppMessagePage {

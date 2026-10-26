@@ -7,36 +7,56 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
+	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/oauth"
 )
 
 var setupCmd = &cobra.Command{
 	Use:   "setup",
-	Short: "Interactive setup wizard for first-run configuration",
+	Short: "Run first-time setup; 'setup status' shows enabled features",
 	Long: `Interactive setup wizard to configure msgvault for first use.
 
 This command helps you:
-  1. Locate or configure Google OAuth credentials
-  2. Create the config.toml file
+  1. Optionally configure Google OAuth credentials (Gmail and Google
+     Calendar only; press Enter to skip)
+  2. Choose the IANA timezone used for activity day boundaries
   3. Optionally configure a remote NAS server for token export
+  4. Create the config.toml file
 
-Run this once after installing msgvault to get started quickly.`,
+Run this once after installing msgvault to get started quickly. Then run
+"msgvault setup providers" to turn on search, attachment, and people lanes
+from the API keys you have, and "msgvault setup status" to see what is on.`,
+	Example: `  msgvault setup
+  msgvault setup status --json`,
 	Args: cobra.NoArgs,
 	RunE: runSetup,
 }
 
 func init() {
+	setupCmd.AddCommand(
+		newSetupProvidersCommand(defaultSetupProvidersDeps()),
+		newSetupStatusCommand(defaultSetupStatusDeps()),
+	)
 	rootCmd.AddCommand(setupCmd)
 }
 
 func runSetup(cmd *cobra.Command, args []string) error {
-	reader := bufio.NewReader(os.Stdin)
+	state := invocationFromCommand(cmd)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	reader := bufio.NewReader(cmd.InOrStdin())
 
 	fmt.Println("Welcome to msgvault setup!")
 	fmt.Println()
@@ -47,62 +67,204 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	}
 
 	// Step 1: Find or prompt for OAuth credentials
-	secretsPath, err := setupOAuthSecrets(reader)
+	secretsPath, err := setupOAuthSecrets(reader, cfg)
 	if err != nil {
 		return err
 	}
 
-	// Step 2: Optionally configure remote NAS
-	remoteURL, remoteAPIKey, err := setupRemoteServer(reader, secretsPath)
+	// Step 2: Choose the timezone used for activity day boundaries.
+	activityTimezone, err := setupActivityTimezone(reader, cfg)
 	if err != nil {
 		return err
 	}
 
-	// Step 3: Update config
+	bundleTimezone := cfg.Activity.Timezone
+	if activityTimezone != "" {
+		bundleTimezone = activityTimezone
+	}
+
+	// Step 3: Optionally configure remote NAS
+	remoteURL, remoteAPIKey, err := setupRemoteServer(reader, secretsPath, cfg, bundleTimezone)
+	if err != nil {
+		return err
+	}
+
+	// Step 3: Persist choices made in the wizard, including values that match
+	// environment overrides. Keeping existing settings does not persist them.
+	var edits []config.Edit
 	if secretsPath != "" {
 		cfg.OAuth.ClientSecrets = secretsPath
+		cfg.OAuth.ClientSecretsCommand = nil
+		edits = append(edits, config.Edit{Key: "oauth.client_secrets", Value: secretsPath}, config.Edit{Key: "oauth.client_secrets_command", Remove: true})
 	}
 	if remoteURL != "" {
 		cfg.Remote.URL = remoteURL
-		cfg.Remote.APIKey = remoteAPIKey
-		// Auto-set for HTTP: target is Tailscale/LAN, not public internet.
-		if strings.HasPrefix(remoteURL, "http://") {
-			cfg.Remote.AllowInsecure = true
-		}
+		edits = append(edits,
+			config.Edit{Key: "remote.url", Value: remoteURL},
+			config.Edit{Key: "remote.api_key", Value: remoteAPIKey},
+			config.Edit{Key: "remote.allow_insecure", Value: strings.HasPrefix(remoteURL, "http://")},
+		)
+	}
+	if activityTimezone != "" {
+		cfg.Activity.Timezone = activityTimezone
+		edits = append(edits, config.Edit{Key: "activity.timezone", Value: activityTimezone})
 	}
 
 	// Only save if we configured something
-	if secretsPath != "" || remoteURL != "" {
-		if err := cfg.Save(); err != nil {
+	if len(edits) > 0 {
+		snapshot, err := config.ReadConfigFile(cfg.ConfigFilePath())
+		if err == nil {
+			_, err = config.EditConfigFilePrivate(cfg.ConfigFilePath(), snapshot.ETag, edits)
+		}
+		if err != nil {
 			return fmt.Errorf("save config: %w", err)
 		}
 		fmt.Printf("\nConfiguration saved to %s\n", cfg.ConfigFilePath())
 	}
 
-	// Print next steps
-	fmt.Println()
-	fmt.Println("Setup complete! Next steps:")
-	fmt.Println()
-	fmt.Println("  1. Add a Gmail account:")
-	fmt.Println("     msgvault add-account you@gmail.com")
-	fmt.Println()
-	fmt.Println("  2. Sync your emails:")
-	fmt.Println("     msgvault sync-full you@gmail.com")
-	fmt.Println()
-	if remoteURL != "" {
-		fmt.Println("  3. Export token to your NAS (after add-account):")
-		fmt.Println("     msgvault export-token you@gmail.com")
-		fmt.Println()
-	}
-	fmt.Println("For more help: msgvault --help")
-
+	namedOAuthApp, _ := setupOAuthApp(&cfg.OAuth)
+	printSetupNextSteps(cmd.OutOrStdout(), setupAddAccountCommand(&cfg.OAuth), cfg.Remote.URL != "",
+		cfg.OAuth.ClientSecrets != "" && cfg.OAuth.ServiceAccountKey == "", setupUsesServiceAccount(&cfg.OAuth), namedOAuthApp)
 	return nil
 }
 
-func setupOAuthSecrets(reader *bufio.Reader) (string, error) {
-	fmt.Println("Step 1: OAuth Credentials")
+func setupActivityTimezone(reader *bufio.Reader, cfg *config.Config) (string, error) {
+	fmt.Println()
+	fmt.Println("Step 2: Activity timezone")
 	fmt.Println("--------------------------")
+	fmt.Println("Activity day views use this IANA timezone instead of UTC to group events.")
+	fmt.Println("Restart a running daemon after changing this setting.")
+	fmt.Println("Later projection passes re-date existing activity rows automatically.")
 
+	current := cfg.Activity.Timezone
+	if current == "" {
+		current = "UTC"
+	}
+
+	if detected, err := resolveLocalTimezone(); err == nil {
+		fmt.Printf("Detected host timezone: %s\n", detected)
+		if detected != current && promptYesNo(reader, fmt.Sprintf("Use %s for activity day boundaries?", detected)) {
+			if err := validateSetupActivityTimezone(detected); err != nil {
+				return "", err
+			}
+			return detected, nil
+		}
+	} else {
+		fmt.Println("Could not detect a concrete host timezone.")
+	}
+
+	fmt.Printf("Activity timezone is currently %s.\n", current)
+	fmt.Print("Enter UTC or an IANA timezone name (press Enter to keep current): ")
+	zone, _ := reader.ReadString('\n')
+	zone = strings.TrimSpace(zone)
+	if zone == "" || zone == current {
+		return "", nil
+	}
+	if err := validateSetupActivityTimezone(zone); err != nil {
+		return "", err
+	}
+	return zone, nil
+}
+
+func validateSetupActivityTimezone(zone string) error {
+	if zone == "Local" {
+		return fmt.Errorf("activity timezone %q is host-dependent; use UTC or an IANA zone name", zone)
+	}
+	if _, err := time.LoadLocation(zone); err != nil {
+		return fmt.Errorf("invalid activity timezone %q: %w", zone, err)
+	}
+	return nil
+}
+
+// setupAddAccountCommand returns the add-account invocation that works
+// with the configured Google credentials, or "" when there are none.
+// Without a default credential, add-account needs --oauth-app to pick a
+// named app.
+func setupAddAccountCommand(o *config.OAuthConfig) string {
+	const base = "msgvault add-account you@example.com"
+	app, configured := setupOAuthApp(o)
+	if !configured {
+		return ""
+	}
+	if app == "" {
+		return base
+	}
+	return base + " --oauth-app " + oauth.ShellQuote(app)
+}
+
+func setupOAuthApp(o *config.OAuthConfig) (string, bool) {
+	if o.ClientSecrets != "" || o.ClientSecretsCommand != nil || o.ServiceAccountKey != "" {
+		return "", true
+	}
+	names := slices.Sorted(maps.Keys(o.Apps))
+	for _, name := range names {
+		if app := o.Apps[name]; app.ClientSecrets != "" || app.ClientSecretsCommand != nil || app.ServiceAccountKey != "" {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+func setupUsesServiceAccount(o *config.OAuthConfig) bool {
+	app, configured := setupOAuthApp(o)
+	return configured && o.ServiceAccountKeyFor(app) != ""
+}
+
+// printSetupNextSteps prints the closing steps. bundleHasSecrets reports
+// whether the NAS bundle carries the credential add-account uses. The
+// bundle copies only the default [oauth] client_secrets, and add-account
+// prefers a service account key, which leaves no token to export.
+func printSetupNextSteps(w io.Writer, addAccountCmd string, hasRemote, bundleHasSecrets, serviceAccount bool, namedOAuthApp string) {
+	var b strings.Builder
+	b.WriteString("\nSetup complete! Next steps:\n\n")
+	if addAccountCmd != "" {
+		b.WriteString("  1. Add a Gmail account:\n")
+		b.WriteString("     " + addAccountCmd + "\n\n")
+		b.WriteString("  2. Sync your emails:\n")
+		b.WriteString("     msgvault sync-full you@example.com\n\n")
+		switch {
+		case hasRemote && serviceAccount:
+			b.WriteString("  3. Configure the same service-account key on your NAS.\n")
+			b.WriteString("     Service accounts mint tokens on demand, so there is no token to export.\n\n")
+		case hasRemote && bundleHasSecrets:
+			b.WriteString("  3. Export token to your NAS (after add-account):\n")
+			b.WriteString("     msgvault export-token you@example.com\n\n")
+		case hasRemote:
+			b.WriteString("  3. Configure the same OAuth app and token storage on your NAS.\n")
+			b.WriteString("     The bundle does not carry these client credentials. After add-account:\n")
+			b.WriteString("     msgvault export-token you@example.com\n\n")
+			if namedOAuthApp != "" {
+				b.WriteString("     On the NAS, after token upload, bind the account to this app with:\n")
+				b.WriteString("     " + addAccountCmd + "\n\n")
+			}
+		}
+	} else {
+		b.WriteString("  Add a source, for example:\n")
+		b.WriteString("     msgvault add-imap --host imap.example.com --username you@example.com\n")
+		b.WriteString("     msgvault add-o365 you@example.com\n")
+		// A configured remote would receive this local file path.
+		if !hasRemote {
+			b.WriteString("     msgvault import-mbox you@example.com /path/to/export.mbox\n")
+		}
+		b.WriteString("\n")
+		b.WriteString("  Gmail needs a Google OAuth credential: run msgvault setup again when you have one.\n")
+		b.WriteString("  Setup guide: https://msgvault.io/docs/setup/\n\n")
+	}
+	b.WriteString("For more help: msgvault --help\n")
+	_, _ = io.WriteString(w, b.String())
+}
+
+func setupOAuthSecrets(reader *bufio.Reader, cfg *config.Config) (string, error) {
+	fmt.Println("Step 1: Google OAuth Credentials (Optional)")
+	fmt.Println("--------------------------------------------")
+
+	// A command source stays configured unless the user chooses a replacement.
+	if cfg.OAuth.ClientSecretsCommand != nil {
+		fmt.Println("OAuth client credentials are configured through a command.")
+		if promptYesNo(reader, "Keep existing configuration?") {
+			return "", nil
+		}
+	}
 	// Check if already configured
 	if cfg.OAuth.ClientSecrets != "" {
 		fmt.Printf("OAuth credentials already configured: %s\n", cfg.OAuth.ClientSecrets)
@@ -112,7 +274,8 @@ func setupOAuthSecrets(reader *bufio.Reader) (string, error) {
 	}
 
 	fmt.Println()
-	fmt.Println("You need a Google Cloud OAuth credential (client_secret.json).")
+	fmt.Println("Gmail and Google Calendar need a Google Cloud OAuth credential")
+	fmt.Println("(client_secret.json). Other sources do not. Press Enter to skip.")
 	fmt.Println()
 	fmt.Println("To get one:")
 	fmt.Println("  1. Go to https://console.cloud.google.com/apis/credentials")
@@ -126,7 +289,8 @@ func setupOAuthSecrets(reader *bufio.Reader) (string, error) {
 	path = strings.TrimSpace(path)
 
 	if path == "" {
-		return "", errors.New("OAuth credentials path is required")
+		fmt.Println("Skipping Google OAuth credentials.")
+		return "", nil
 	}
 
 	// Expand ~ in path
@@ -144,9 +308,9 @@ func setupOAuthSecrets(reader *bufio.Reader) (string, error) {
 	return path, nil
 }
 
-func setupRemoteServer(reader *bufio.Reader, oauthSecretsPath string) (string, string, error) {
+func setupRemoteServer(reader *bufio.Reader, oauthSecretsPath string, cfg *config.Config, activityTimezone string) (string, string, error) {
 	fmt.Println()
-	fmt.Println("Step 2: Remote NAS Server (Optional)")
+	fmt.Println("Step 3: Remote NAS Server (Optional)")
 	fmt.Println("-------------------------------------")
 	fmt.Println("Configure a remote msgvault server to export tokens for headless deployment.")
 	fmt.Println()
@@ -155,7 +319,7 @@ func setupRemoteServer(reader *bufio.Reader, oauthSecretsPath string) (string, s
 	if cfg.Remote.URL != "" {
 		fmt.Printf("Remote server already configured: %s\n", cfg.Remote.URL)
 		if promptYesNo(reader, "Keep existing configuration?") {
-			return cfg.Remote.URL, cfg.Remote.APIKey, nil
+			return "", "", nil
 		}
 	}
 
@@ -209,8 +373,11 @@ func setupRemoteServer(reader *bufio.Reader, oauthSecretsPath string) (string, s
 	if effectiveSecrets == "" {
 		effectiveSecrets = cfg.OAuth.ClientSecrets
 	}
+	if cfg.OAuth.ClientSecretsCommand != nil || cfg.OAuth.Tokens.Enabled() {
+		fmt.Println("Configure the credential commands and secret store separately on the NAS; the bundle does not contain command-backed credentials.")
+	}
 	bundleDir := filepath.Join(cfg.HomeDir, "nas-bundle")
-	if err := createNASBundle(bundleDir, apiKey, effectiveSecrets, port); err != nil {
+	if err := createNASBundle(bundleDir, apiKey, effectiveSecrets, port, activityTimezone); err != nil {
 		fmt.Printf("Warning: Could not create NAS bundle: %v\n", err)
 	} else {
 		fmt.Printf("\nNAS deployment files created in: %s\n", bundleDir)
@@ -237,43 +404,50 @@ func generateAPIKey() (string, error) {
 	return hex.EncodeToString(bytes), nil
 }
 
-func createNASBundle(bundleDir, apiKey, oauthSecretsPath string, port int) error {
+func createNASBundle(bundleDir, apiKey, oauthSecretsPath string, port int, activityTimezone string) error {
 	// Create bundle directory
 	if err := os.MkdirAll(bundleDir, 0700); err != nil {
 		return fmt.Errorf("create bundle dir: %w", err)
 	}
 
 	// Create NAS config.toml
+	oauthBlock := ""
+	if oauthSecretsPath != "" {
+		oauthBlock = "[oauth]\nclient_secrets = \"/data/client_secret.json\"\n\n"
+	}
+	activityConfig := config.ActivityConfig{Timezone: activityTimezone}
+	activityConfig.ApplyDefaults()
+	activityBlock := fmt.Sprintf("[activity]\ntimezone = %q\n\n", activityConfig.Timezone)
 	nasConfig := fmt.Sprintf(`[server]
 bind_addr = "0.0.0.0"
 api_port = 8080
 api_key = %q
 
-[oauth]
-client_secrets = "/data/client_secret.json"
-
-[sync]
+%s%s[sync]
 rate_limit_qps = 5
 
 # Accounts will be added automatically when you export tokens.
 # You can also add them manually:
 # [[accounts]]
-# email = "you@gmail.com"
+# email = "you@example.com"
 # schedule = "0 2 * * *"
 # enabled = true
-`, apiKey)
+`, apiKey, oauthBlock, activityBlock)
 
 	configPath := filepath.Join(bundleDir, "config.toml")
 	if err := os.WriteFile(configPath, []byte(nasConfig), 0600); err != nil {
 		return fmt.Errorf("write config.toml: %w", err)
 	}
 
-	// Copy client_secret.json if available
+	// Copy client_secret.json if available. Otherwise remove a copy left
+	// by an earlier run, so the bundle ships no credential it does not use.
+	destPath := filepath.Join(bundleDir, "client_secret.json")
 	if oauthSecretsPath != "" {
-		destPath := filepath.Join(bundleDir, "client_secret.json")
 		if err := copyFile(oauthSecretsPath, destPath); err != nil {
 			return fmt.Errorf("copy client_secret.json: %w", err)
 		}
+	} else if err := os.Remove(destPath); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove stale client_secret.json: %w", err)
 	}
 
 	// Create docker-compose.yml

@@ -1,7 +1,7 @@
 package beeper
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
@@ -29,34 +29,14 @@ func SaveToken(tokensDir, token string) error {
 	if err := fileutil.SecureMkdirAll(tokensDir, 0700); err != nil {
 		return fmt.Errorf("create tokens dir: %w", err)
 	}
-	data, err := json.Marshal(tokenFile{AccessToken: token}) //nolint:gosec // serialized to a 0600 file on the user's own machine
+	data, err := json.Marshal(tokenFile{AccessToken: token}, json.Deterministic(true)) // serialized to a 0600 file on the user's own machine
 	if err != nil {
 		return err
 	}
 	path := tokenPath(tokensDir)
 
-	tmpFile, err := os.CreateTemp(tokensDir, ".beeper-token-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp token file: %w", err)
-	}
-	tmpPath := tmpFile.Name()
-
-	if _, err := tmpFile.Write(data); err != nil {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("write temp token file: %w", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("close temp token file: %w", err)
-	}
-	if err := fileutil.SecureChmod(tmpPath, 0600); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("chmod temp token file: %w", err)
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("rename temp token file: %w", err)
+	if err := fileutil.SecureReplaceFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("write token file: %w", err)
 	}
 	return nil
 }

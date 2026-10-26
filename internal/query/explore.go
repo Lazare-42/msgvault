@@ -3,12 +3,13 @@ package query
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"strings"
 
 	"go.kenn.io/msgvault/internal/identityindex"
+	"go.kenn.io/msgvault/internal/search"
 )
 
 var ErrInvalidExploreRequest = errors.New("invalid exploration request")
@@ -28,6 +29,9 @@ func (e *DuckDBEngine) Explore(ctx context.Context, request ExploreRequest) (*Ex
 	}
 	defer release()
 
+	if err := search.ValidateAccountScopes(request.Context.AccountScopes); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidExploreRequest, err)
+	}
 	if request.Page.Offset < 0 || request.Page.Limit < 0 || request.Page.Limit > maxExploreLimit {
 		return nil, fmt.Errorf("%w: page is outside the supported range", ErrInvalidExploreRequest)
 	}
@@ -73,10 +77,19 @@ func (e *DuckDBEngine) Explore(ctx context.Context, request ExploreRequest) (*Ex
 	var queryText string
 	fastPath := !e.exploreFastPathDisabled && !exploreConditionsTouchParticipantLists(request)
 	if fastPath {
+		shareFilteredPopulation := len(request.Context.Domains) > 0
+		for _, group := range request.Context.AdditionalDomainGroups {
+			if len(group) > 0 {
+				shareFilteredPopulation = true
+				break
+			}
+		}
 		queryText = buildExploreFastListingSQL(conditions, candidateRankExpression,
-			e.parquetPath(datasetParticipantClusters), e.parquetPath(datasetOwnerParticipants))
-		args = append(args, conditionArgs...) // membership rescan
-		args = append(args, conditionArgs...) // total-count scan
+			e.parquetPath(datasetParticipantClusters), e.parquetPath(datasetOwnerParticipants), shareFilteredPopulation)
+		if !shareFilteredPopulation {
+			args = append(args, conditionArgs...) // membership rescan
+			args = append(args, conditionArgs...) // total-count scan
+		}
 	} else {
 		queryText = buildExploreSQL(conditions, candidateRankExpression,
 			e.parquetPath(datasetParticipantClusters), e.parquetPath(datasetOwnerParticipants))
@@ -313,6 +326,10 @@ func buildExploreConditions(request ExploreRequest) (string, []any) {
 		conditions = append(conditions, "("+strings.Join(parts, " OR ")+")")
 	}
 	appendIntAnyOf(request.Context.SourceIDs, "source_id = ?")
+	if scopeConditions, scopeArgs := search.AccountScopeConditions(request.Context.AccountScopes, "account_m"); len(scopeConditions) > 0 {
+		conditions = append(conditions, "message_id IN (SELECT account_m.id FROM messages account_m WHERE "+strings.Join(scopeConditions, " AND ")+")")
+		args = append(args, scopeArgs...)
+	}
 	if identityCondition, identityArgs := buildIdentityPredicateCondition(request.Context.Identity, ""); identityCondition != "" {
 		conditions = append(conditions, identityCondition)
 		args = append(args, identityArgs...)
@@ -327,16 +344,40 @@ func buildExploreConditions(request ExploreRequest) (string, []any) {
 			args = append(args, value, value, value)
 		}
 	}
-	if len(request.Context.Domains) > 0 {
-		parts := make([]string, len(request.Context.Domains))
-		for i := range parts {
-			parts[i] = "(lower(sender_domain) = lower(?) OR list_contains(participant_domains, lower(?)) OR list_contains(conversation_participant_domains, lower(?)))"
+	appendDomainGroup := func(values []string) {
+		if len(values) == 0 {
+			return
 		}
-		conditions = append(conditions, "("+strings.Join(parts, " OR ")+")")
-		for _, value := range request.Context.Domains {
+		parts := make([]string, len(values))
+		for i, value := range values {
+			// Test the same sender, recipient, and roster membership as the
+			// list columns without aggregating lists for the whole archive.
+			parts[i] = `(lower(sender_domain) = lower(?) OR message_id IN (
+				SELECT domain_recipient.message_id FROM message_recipients domain_recipient
+				JOIN participants domain_person ON domain_person.id = domain_recipient.participant_id
+				WHERE COALESCE(domain_person.domain, '') = lower(?)
+			) OR conversation_id IN (
+				SELECT domain_member.conversation_id FROM conversation_participants domain_member
+				JOIN participants domain_person ON domain_person.id = domain_member.participant_id
+				WHERE COALESCE(domain_person.domain, '') = lower(?)
+			))`
 			args = append(args, value, value, value)
 		}
+		conditions = append(conditions, "("+strings.Join(parts, " OR ")+")")
 	}
+	appendDomainGroup(request.Context.Domains)
+	appendMailingListGroup := func(values []string) {
+		if len(values) == 0 {
+			return
+		}
+		parts := make([]string, len(values))
+		for i, value := range values {
+			parts[i] = "LOWER(list_id) = LOWER(?)"
+			args = append(args, value)
+		}
+		conditions = append(conditions, "("+strings.Join(parts, " OR ")+")")
+	}
+	appendMailingListGroup(request.Context.MailingLists)
 	// AdditionalParticipantGroups/AdditionalDomainGroups implement a
 	// drill-down conjunction (A∩B): each group is its own parenthesized OR
 	// using the same predicate shape as the primary group above, and every
@@ -355,17 +396,10 @@ func buildExploreConditions(request ExploreRequest) (string, []any) {
 		}
 	}
 	for _, group := range request.Context.AdditionalDomainGroups {
-		if len(group) == 0 {
-			continue
-		}
-		parts := make([]string, len(group))
-		for i := range parts {
-			parts[i] = "(lower(sender_domain) = lower(?) OR list_contains(participant_domains, lower(?)) OR list_contains(conversation_participant_domains, lower(?)))"
-		}
-		conditions = append(conditions, "("+strings.Join(parts, " OR ")+")")
-		for _, value := range group {
-			args = append(args, value, value, value)
-		}
+		appendDomainGroup(group)
+	}
+	for _, group := range request.Context.AdditionalMailingListGroups {
+		appendMailingListGroup(group)
 	}
 	// duckDBMessageTypeCondition treats "email" as also matching NULL/empty
 	// message_type: legacy rows imported before message_type existed are email.
@@ -444,10 +478,14 @@ func buildIdentityPredicateCondition(identity *IdentityPredicate, prefix string)
 	}
 	// recipientRowMatch renders the identity comparison for one
 	// message_recipients row. For an email-shaped identity the envelope
-	// snapshot (message_recipients.email_address, written at email ingest)
-	// is authoritative: it is immutable under participant merges, so
-	// comparing it keeps one alias's filter from selecting mail sent
-	// through another alias that the merge survivor now also carries.
+	// snapshot (message_recipients.envelope_address, the header address
+	// written at email ingest) is authoritative: it is immutable under
+	// participant merges, so comparing it keeps one alias's filter from
+	// selecting mail sent through another alias that the merge survivor now
+	// also carries. The sibling email_address column must not be used here:
+	// it is the resolved address, falling back to the participant's current
+	// address, so it moves under merges and would defeat alias-precise
+	// matching.
 	// Rows without a snapshot (legacy ingests, non-email writers) fall
 	// back to the resolved participant IDs, and non-email identifier
 	// types (phone, matrix, handles) have no envelope column at all, so
@@ -467,11 +505,11 @@ func buildIdentityPredicateCondition(identity *IdentityPredicate, prefix string)
 			return participantMatch(alias + ".participant_id")
 		}
 		args = append(args, identity.EmailIdentifier)
-		envelope := "(COALESCE(" + alias + ".email_address, '') <> '' AND LOWER(" + alias + ".email_address) = LOWER(?))"
+		envelope := "(COALESCE(" + alias + ".envelope_address, '') <> '' AND LOWER(" + alias + ".envelope_address) = LOWER(?))"
 		if len(identity.ParticipantIDs) == 0 {
 			return envelope
 		}
-		return "(" + envelope + " OR (COALESCE(" + alias + ".email_address, '') = '' AND " +
+		return "(" + envelope + " OR (COALESCE(" + alias + ".envelope_address, '') = '' AND " +
 			participantMatch(alias+".participant_id") + fallbackGuard + "))"
 	}
 	senderCondition := func() string {
@@ -479,7 +517,7 @@ func buildIdentityPredicateCondition(identity *IdentityPredicate, prefix string)
 			SELECT 1 FROM message_recipients identity_mr_sender_envelope
 			WHERE identity_mr_sender_envelope.message_id = ` + outerPrefix + `message_id
 			  AND identity_mr_sender_envelope.recipient_type = 'from'
-			  AND COALESCE(identity_mr_sender_envelope.email_address, '') <> ''
+			  AND COALESCE(identity_mr_sender_envelope.envelope_address, '') <> ''
 		)`
 		explicitFrom := `EXISTS (
 			SELECT 1 FROM message_recipients identity_mr_sender
@@ -610,8 +648,8 @@ SELECT COUNT(*) FROM logical_entries`
 // path (which rescans the filtered population) would pay that cost twice; such
 // requests keep the single-pass legacy query.
 func exploreConditionsTouchParticipantLists(request ExploreRequest) bool {
-	return len(request.Context.ParticipantIDs) > 0 || len(request.Context.Domains) > 0 ||
-		len(request.Context.AdditionalParticipantGroups) > 0 || len(request.Context.AdditionalDomainGroups) > 0
+	return len(request.Context.ParticipantIDs) > 0 ||
+		len(request.Context.AdditionalParticipantGroups) > 0
 }
 
 // buildExploreFastListingSQL builds the two-phase entry-row page query used
@@ -626,8 +664,8 @@ func exploreConditionsTouchParticipantLists(request ExploreRequest) bool {
 //     participant list is its recipients plus its sender
 //     (message_participant_links in sqlAnalyticalEntries);
 //   - a conversation entry aggregates the message-level lists of the chat
-//     messages that pass the same filter conditions ("membership" re-applies
-//     them), plus the conversation's own participant rows. Per-message
+//     messages that pass the same filter conditions ("membership"), plus the
+//     conversation's own participant rows. Per-message
 //     conversation-level lists are constant across a group, so the flattened
 //     concat in the legacy chat arm reduces to this union.
 //
@@ -637,11 +675,21 @@ func exploreConditionsTouchParticipantLists(request ExploreRequest) bool {
 // materialize the doubly-referenced CTE with its string columns (both
 // measured slower). Bind order: condition args (filtered), candidate-rank
 // args (classified), limit, offset (page), condition args again (membership),
-// condition args again (total).
+// condition args again (total). Domain-filtered listings instead share the
+// filtered population across all three consumers: repeated recipient and roster
+// membership joins can exhaust the same memory budget. Their condition args
+// are bound once. Listings without domain filters keep scalar rescans to avoid
+// materializing the archive's message strings.
 //
 // Output columns, ordering, and pagination are identical to buildExploreSQL;
 // TestExploreListingFastPathMatchesLegacy pins the equivalence.
-func buildExploreFastListingSQL(conditions, candidateRankExpression, clustersGlob, ownersGlob string) string {
+func buildExploreFastListingSQL(conditions, candidateRankExpression, clustersGlob, ownersGlob string, shareFilteredPopulation bool) string {
+	population := "entry_core AS analytical_entries"
+	populationConditions := conditions
+	if shareFilteredPopulation {
+		population = "filtered"
+		populationConditions = "TRUE"
+	}
 	return buildExploreNarrowFilteredClassifiedCTE(conditions, candidateRankExpression) +
 		exploreLogicalEntriesCTE(false) + fmt.Sprintf(`
 ), page AS (
@@ -650,7 +698,7 @@ func buildExploreFastListingSQL(conditions, candidateRankExpression, clustersGlo
     LIMIT ? OFFSET ?
 ), membership AS (
     SELECT source_id, conversation_id, message_id
-    FROM entry_core AS analytical_entries
+    FROM %s
     WHERE (%s) AND (%s)
 ), page_messages AS (
     SELECT p.entry_key, p.anchor_message_id AS message_id
@@ -684,7 +732,7 @@ func buildExploreFastListingSQL(conditions, candidateRankExpression, clustersGlo
     FROM (
         SELECT source_id, conversation_id,
             %s AS is_chat
-        FROM entry_core AS analytical_entries
+        FROM %s
         WHERE %s
     )
 ), clusters AS (
@@ -741,9 +789,9 @@ FROM page p
 LEFT JOIN page_participant_facts f ON f.entry_key = p.entry_key
 LEFT JOIN message_owner_canon message_owner ON message_owner.message_id = p.anchor_message_id
 ORDER BY p.occurred_at DESC, p.source_id ASC, p.entry_key ASC`,
-		conditions, sqlIsChatPredicate("message_type", "conversation_type"),
+		population, populationConditions, sqlIsChatPredicate("message_type", "conversation_type"),
 		sqlAnalyticalEntriesParticipantLabel("pt"),
-		sqlIsChatPredicate("message_type", "conversation_type"), conditions,
+		sqlIsChatPredicate("message_type", "conversation_type"), population, populationConditions,
 		clustersGlob, ownersGlob)
 }
 
@@ -752,12 +800,10 @@ func buildExploreLogicalSQL(conditions string) string {
 }
 
 // buildExploreLogicalSQLNoLists renders logical_entries without the
-// participant list columns. Queries that resolve participants or domains
-// through relationship_activity edge joins (person/domain grouping, the
-// filtered people search) must use this variant: projecting the list columns
-// forces analytical_entries to aggregate per-message participant lists for
-// the whole archive before any filter applies, which exceeds the interactive
-// engine's memory budget on production archives.
+// participant list columns. It retains the wide analytical_entries view for
+// filters that need those lists. Queries whose filters need only scalar
+// columns can use buildExploreNarrowFilteredClassifiedCTE to avoid building
+// the lists at all, including when DuckDB materializes a shared CTE.
 func buildExploreLogicalSQLNoLists(conditions string) string {
 	return buildExploreFilteredClassifiedCTE(conditions, "NULL::BIGINT") +
 		exploreLogicalEntriesCTE(false)
@@ -795,8 +841,9 @@ WITH filtered AS (
 )`
 }
 
-// buildExploreNarrowFilteredClassifiedCTE is the listing-only counterpart to
-// buildExploreFilteredClassifiedCTE. It shadows the wide convenience-view name
+// buildExploreNarrowFilteredClassifiedCTE is the scalar-only counterpart to
+// buildExploreFilteredClassifiedCTE, used by listings and indexed grouping.
+// It shadows the wide convenience-view name
 // while evaluating conditions so identity predicates keep their established
 // qualification without forcing participant-list aggregation.
 func buildExploreNarrowFilteredClassifiedCTE(conditions, candidateRankExpression string) string {
@@ -824,6 +871,11 @@ func buildExploreLogicalSQLWithCandidateRank(conditions, candidateRankExpression
 // Explore fast path omits them here and rebuilds them for the ≤limit page
 // rows only (see buildExploreFastListingSQL).
 func exploreLogicalEntriesCTE(withParticipantLists bool) string {
+	// These importers include attachment bytes in their message estimates.
+	// Known attachment bytes still bound an incomplete estimate from below.
+	estimatedBytes := `CASE WHEN lower(source_type) IN ('beeper', 'slack', 'teams')
+		THEN GREATEST(size_estimate, attachment_size)
+		ELSE size_estimate + attachment_size END`
 	messageLists := ""
 	conversationLists := ""
 	if withParticipantLists {
@@ -847,13 +899,14 @@ func exploreLogicalEntriesCTE(withParticipantLists bool) string {
         source_type,
         source_identifier,
         message_type,
+		list_id,
         conversation_type,
         COALESCE(NULLIF(subject, ''), NULLIF(conversation_title, ''), snippet, '') AS title,
         snippet AS preview,` + messageLists + `
 		CASE WHEN candidate_rank IS NOT NULL THEN message_id ELSE NULL END AS strongest_matched_message_id,
 		1::BIGINT AS message_count,
-		(size_estimate + attachment_size)::BIGINT AS estimated_bytes,
-		(entry_kind = 'email' AND lower(source_type) = 'gmail' AND NOT deleted_from_source
+		(` + estimatedBytes + `)::BIGINT AS estimated_bytes,
+		(entry_kind = 'email' AND lower(source_type) IN ` + deletableSourceTypesSQL + ` AND NOT internally_deleted AND NOT deleted_from_source AND NOT archive_only
 			AND COALESCE(source_message_id, '') <> '') AS deletable,
 		has_attachments,
 		is_from_me,
@@ -875,13 +928,14 @@ func exploreLogicalEntriesCTE(withParticipantLists bool) string {
         arg_max(source_type, struct_pack(occurred_at := occurred_at, message_id := message_id)) AS source_type,
         arg_max(source_identifier, struct_pack(occurred_at := occurred_at, message_id := message_id)) AS source_identifier,
         arg_max(message_type, struct_pack(occurred_at := occurred_at, message_id := message_id)) AS message_type,
+		arg_max(list_id, struct_pack(occurred_at := occurred_at, message_id := message_id)) AS list_id,
         arg_max(conversation_type, struct_pack(occurred_at := occurred_at, message_id := message_id)) AS conversation_type,
         COALESCE(NULLIF(MAX(conversation_title), ''), 'Conversation') AS title,
         arg_max(snippet, struct_pack(occurred_at := occurred_at, message_id := message_id)) AS preview,` + conversationLists + `
 		arg_min(message_id, struct_pack(candidate_rank := candidate_rank, message_id := message_id))
 			FILTER (WHERE candidate_rank IS NOT NULL) AS strongest_matched_message_id,
 		COUNT(*)::BIGINT AS message_count,
-		SUM(size_estimate + attachment_size)::BIGINT AS estimated_bytes,
+		SUM(` + estimatedBytes + `)::BIGINT AS estimated_bytes,
 		false AS deletable,
 		bool_or(has_attachments) AS has_attachments,
 		arg_max(is_from_me, struct_pack(occurred_at := occurred_at, message_id := message_id)) AS is_from_me,

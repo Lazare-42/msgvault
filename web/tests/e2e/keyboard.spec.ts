@@ -1,5 +1,7 @@
 import { expect, test, type Page } from '@playwright/test';
 import { loadMixedArchive } from './fixtures/mixed-archive';
+import { installOperations } from './fixtures/operations';
+import { exploreHistoryState } from '../explore-state';
 
 async function tabTo(page: Page, accessibleName: string, limit = 120, key: 'Tab' | 'Shift+Tab' = 'Tab') {
   const seen = new Set<string>();
@@ -16,6 +18,32 @@ async function tabTo(page: Page, accessibleName: string, limit = 120, key: 'Tab'
   }
   throw new Error(`Keyboard focus did not reach ${accessibleName}; saw ${[...seen].join(' | ')}`);
 }
+
+test('operations filters, selection, advertised action, and close work without a pointer', async ({ page }) => {
+  const fixture = await installOperations(page);
+  await page.goto(`/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'operations' }))}`);
+
+  await tabTo(page, 'Lane:');
+  await page.keyboard.press('Enter');
+  for (let index = 0; index < 4; index += 1) await page.keyboard.press('ArrowDown');
+  await page.keyboard.press('Enter');
+  await expect.poll(() => fixture.listQueries.at(-1)?.get('lane')).toBe('documents');
+
+  await tabTo(page, 'Lane:', 120, 'Shift+Tab');
+  await page.keyboard.press('Enter');
+  for (let index = 0; index < 4; index += 1) await page.keyboard.press('ArrowUp');
+  await page.keyboard.press('Enter');
+  await expect.poll(() => fixture.listQueries.at(-1)?.get('lane')).toBeNull();
+
+  await tabTo(page, 'Open CardDAV sync run');
+  await page.keyboard.press('Enter');
+  await expect(page.getByRole('region', { name: 'Operation run detail' })).toBeVisible();
+  await tabTo(page, 'Start CardDAV sync');
+  await page.keyboard.press('Enter');
+  await expect.poll(() => fixture.actionRequests).toEqual(['carddav_sync']);
+  await page.keyboard.press('Escape');
+  await expect(page.getByRole('button', { name: 'Open CardDAV sync run' })).toBeFocused();
+});
 
 test('pointer-free archive journey preserves focus, announcements, and history', async ({ page }) => {
   const fixture = await loadMixedArchive();
@@ -51,7 +79,7 @@ test('pointer-free archive journey preserves focus, announcements, and history',
     cache_revision: 'keyboard-100k', search_provenance: {}
   } }));
   await page.route('**/api/v1/explore/preflight', (route) => route.fulfill({ json: {
-    count: 1, estimated_bytes: 20, cache_revision: 'keyboard-100k', search_provenance: {},
+    count: 1, deletable_count: 1, estimated_bytes: 20, cache_revision: 'keyboard-100k', search_provenance: {},
     unavailable_actions: [], action_targets: [], operation_token: 'keyboard-operation',
     expires_at: '2026-01-03T12:05:00Z'
   } }));
@@ -115,9 +143,7 @@ test('pointer-free archive journey preserves focus, announcements, and history',
   await expect(relationshipTimeline).toBeFocused();
   await page.keyboard.press('Escape');
   await expect(relationshipList).toBeFocused();
-  await expect.poll(() =>
-    JSON.parse(new URL(page.url()).searchParams.get('explore') ?? '{}').relationshipTarget
-  ).toBeNull();
+  await expect.poll(async () => (await exploreHistoryState(page)).relationshipTarget).toBeNull();
   await expect(page.getByRole('heading', { name: 'Beta Person' })).toBeHidden();
 
   await tabTo(page, 'Everything');
@@ -153,10 +179,7 @@ test('pointer-free archive journey preserves focus, announcements, and history',
   await expect(renderedActiveRow).toBeVisible();
   await expect(grid).toHaveAttribute('aria-activedescendant', await renderedActiveRow.getAttribute('id') ?? '');
   await page.keyboard.press('End');
-  await expect.poll(() => {
-    const encoded = new URL(page.url()).searchParams.get('explore');
-    return JSON.parse(encoded ?? '{}').activeRow;
-  }).toBe(terminalServedRow.key);
+  await expect.poll(async () => (await exploreHistoryState(page)).activeRow).toBe(terminalServedRow.key);
   await expect(grid.locator(`[data-row-key="${terminalServedRow.key}"]`)).toBeVisible();
   await page.keyboard.press('Enter');
   const everythingReading = page.getByRole('complementary', { name: /Reading pane/ });

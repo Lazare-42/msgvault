@@ -3,9 +3,10 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 	"unicode/utf8"
 
@@ -32,7 +33,10 @@ type DocumentExtractionClaimInput struct {
 	LeaseUntil             time.Time
 	LocalBytes             int64
 	SourceSequence         int64
-	RequireNoHead          bool
+	// RequireNoHead rejects the claim while a head produced through the same
+	// upload route already serves the owner. A head through another route is
+	// stale evidence and may be replaced.
+	RequireNoHead bool
 }
 
 type DocumentExtractionClaim struct {
@@ -79,6 +83,24 @@ type DocumentPublishedChunk struct {
 	Spans              []DocumentPublishedSpan
 }
 
+type DocumentExtractionConversionSpan struct {
+	Page   int `json:"page"`
+	Record int `json:"record"`
+	Cell   int `json:"cell"`
+}
+
+type DocumentExtractionConversion struct {
+	SourceSHA256      string
+	SourceBytes       int64
+	ProviderMediaType string
+	PDFSHA256         string
+	PDFBytes          int64
+	Pages             int
+	PolicyFingerprint string
+	ConverterVersion  string
+	Spans             []DocumentExtractionConversionSpan
+}
+
 type DocumentExtractionPublication struct {
 	ExtractionID           string
 	ProfileID              string
@@ -89,6 +111,7 @@ type DocumentExtractionPublication struct {
 	OccurrenceAttachmentID int64
 	OccurrenceMIMEType     string
 	OccurrenceMessageType  string
+	SourceBytes            int64
 	ReturnedModel          string
 	ProviderBytes          *int64
 	UnitsProcessed         int
@@ -100,6 +123,7 @@ type DocumentExtractionPublication struct {
 	DocumentFamily         string
 	UnitKind               string
 	NormalizedTruncated    bool
+	Conversion             *DocumentExtractionConversion
 	Units                  []DocumentPublishedUnit
 	Chunks                 []DocumentPublishedChunk
 }
@@ -111,6 +135,7 @@ func (s *Store) ClaimDocumentExtraction(
 	ctx context.Context,
 	input DocumentExtractionClaimInput,
 ) (DocumentExtractionClaim, error) {
+	input.LeaseUntil = input.LeaseUntil.UTC()
 	if err := validateDocumentClaimInput(input); err != nil {
 		return DocumentExtractionClaim{}, err
 	}
@@ -137,10 +162,12 @@ func (s *Store) ClaimDocumentExtraction(
 				SELECT 1 FROM document_occurrences o
 				JOIN attachments a ON a.id = o.attachment_id
 				JOIN messages m ON m.id = o.message_id
+				JOIN document_extraction_profiles p ON p.id = ?
 				WHERE o.attachment_id = ? AND o.canonical_blob_hash = ?
-				  AND o.attachment_role = 'standalone'
+				  AND `+documentRoleScopeSQL("o", "p.include_inline")+`
 				  AND `+authoritativeDocumentRoleSourceSQL("o")+`
-				  AND a.attachment_role = 'standalone'
+				  AND a.attachment_role = o.attachment_role
+				  AND `+documentRoleScopeSQL("a", "p.include_inline")+`
 				  AND `+authoritativeDocumentRoleSourceSQL("a")+`
 				  AND (COALESCE(a.content_hash, '') = ? OR
 				       (COALESCE(a.content_hash, '') = '' AND a.storage_path = ?))
@@ -148,7 +175,7 @@ func (s *Store) ClaimDocumentExtraction(
 				  AND COALESCE(a.mime_type, '') = ?
 				  AND COALESCE(m.message_type, '') = ?
 				  AND `+LiveMessagesWhere("m", true)+`
-			)`, input.OccurrenceAttachmentID, input.CanonicalBlobHash,
+			)`, input.ProfileID, input.OccurrenceAttachmentID, input.CanonicalBlobHash,
 			input.CanonicalBlobHash, canonicalCASPath(input.CanonicalBlobHash), input.OccurrenceMIMEType,
 			input.OccurrenceMIMEType, input.OccurrenceMessageType).Scan(&eligible); err != nil {
 			return fmt.Errorf("check document extraction occurrence: %w", err)
@@ -174,24 +201,31 @@ func (s *Store) ClaimDocumentExtraction(
 		if input.RequireNoHead {
 			if err := q.QueryRow(`
 				SELECT NOT EXISTS (
-					SELECT 1 FROM document_extraction_heads
-					WHERE profile_id = ? AND canonical_blob_hash = ?
-					  AND extraction_input_key = ?
-				)`, input.ProfileID, input.CanonicalBlobHash, input.ExtractionInputKey).Scan(&eligible); err != nil {
+					SELECT 1 FROM document_extraction_heads h
+					JOIN document_extractions he ON he.id = h.extraction_id
+					WHERE h.profile_id = ? AND h.canonical_blob_hash = ?
+					  AND h.extraction_input_key = ?
+					  AND (he.source_media_type IS NULL OR he.source_media_type = ?)
+				)`, input.ProfileID, input.CanonicalBlobHash, input.ExtractionInputKey,
+				input.OccurrenceMIMEType).Scan(&eligible); err != nil {
 				return fmt.Errorf("check current document extraction head: %w", err)
 			}
 			if !eligible {
 				return ErrDocumentExtractionCurrent
 			}
 		}
+		createdAt, err := documentAttemptCreatedAt(q, input)
+		if err != nil {
+			return err
+		}
 		if _, err := q.Exec(`
 			INSERT INTO document_extractions
 				(id, profile_id, rebuild_id, canonical_blob_hash, extraction_input_key,
-				 state, lease_owner, lease_until, local_bytes, source_sequence)
-			VALUES (?, ?, ?, ?, ?, 'staging', ?, ?, ?, ?)`,
+				 source_media_type, state, lease_owner, lease_until, local_bytes, source_sequence, created_at)
+			VALUES (?, ?, ?, ?, ?, ?, 'staging', ?, ?, ?, ?, ?)`,
 			input.ExtractionID, input.ProfileID, nullIfEmpty(input.RebuildID), input.CanonicalBlobHash,
-			input.ExtractionInputKey, input.LeaseOwner, input.LeaseUntil,
-			input.LocalBytes, input.SourceSequence,
+			input.ExtractionInputKey, input.OccurrenceMIMEType, input.LeaseOwner, input.LeaseUntil,
+			input.LocalBytes, input.SourceSequence, createdAt,
 		); err != nil {
 			return fmt.Errorf("create staging document extraction: %w", err)
 		}
@@ -253,14 +287,16 @@ func (s *Store) ClaimDocumentExtraction(
 type DocumentExtractionFailure struct {
 	Claim             DocumentExtractionClaim
 	ReasonCode        string
+	Detail            string
 	Terminal          bool
 	RetryAt           time.Time
 	RequestCount      int
 	RetryCount        int
 	ProviderLatencyMS int64
+	Conversion        *DocumentExtractionConversion
 }
 
-// FailDocumentExtraction records only a bounded reason code, releases the
+// FailDocumentExtraction records a reason and bounded safe diagnostic, releases the
 // exact fenced claim, and either suppresses the owner for this immutable
 // profile or schedules a later retry. Provider bodies and extracted content
 // are never stored on failure.
@@ -270,6 +306,9 @@ func (s *Store) FailDocumentExtraction(ctx context.Context, failure DocumentExtr
 	}
 	return s.withTxContext(ctx, func(tx *loggedTx) error {
 		q := boundQuerier{ctx: ctx, q: tx}
+		if err := persistDocumentExtractionConversion(q, s.dialect, failure.Claim.ExtractionID, failure.Claim.CanonicalBlobHash, failure.Claim.LocalBytes, failure.Claim.OccurrenceMIMEType, failure.Conversion); err != nil {
+			return err
+		}
 		state := "tombstoned"
 		var terminalReason any
 		var nextRetry any = failure.RetryAt
@@ -291,13 +330,13 @@ func (s *Store) FailDocumentExtraction(ctx context.Context, failure DocumentExtr
 			UPDATE document_extractions
 			SET state = ?, attempt_count = attempt_count + 1,
 			    request_count = ?, retry_count = ?, provider_latency_ms = ?,
-			    next_retry_at = ?, terminal_reason = ?, lease_owner = NULL,
+			    next_retry_at = ?, terminal_reason = ?, failure_reason = ?, failure_detail = ?, lease_owner = NULL,
 			    lease_until = NULL, updated_at = `+s.dialect.Now()+`
 			WHERE id = ? AND profile_id = ? AND canonical_blob_hash = ?
 			  AND extraction_input_key = ? AND state = 'staging'
 			  AND lease_owner = ? AND lease_fence = ?`,
 			state, failure.RequestCount, failure.RetryCount, failure.ProviderLatencyMS,
-			nextRetry, terminalReason, failure.Claim.ExtractionID,
+			nextRetry, terminalReason, failure.ReasonCode, CleanDocumentFailureDetail(failure.Detail), failure.Claim.ExtractionID,
 			failure.Claim.ProfileID, failure.Claim.CanonicalBlobHash,
 			failure.Claim.ExtractionInputKey, failure.Claim.LeaseOwner,
 			failure.Claim.LeaseFence,
@@ -432,16 +471,29 @@ func (s *Store) PublishDocumentExtraction(
 		if !current {
 			return ErrDocumentExtractionFenceLost
 		}
+		if publication.OccurrenceMIMEType == "text/csv" && publication.Conversion == nil {
+			var provider string
+			if err := q.QueryRow(`SELECT provider FROM document_extraction_profiles WHERE id = ?`, publication.ProfileID).Scan(&provider); err != nil {
+				return fmt.Errorf("read CSV document extraction provider: %w", err)
+			}
+			// Docling uploads the original CSV. Hosted Mistral still
+			// requires the authenticated local CSV-to-PDF lineage.
+			if provider != "docling" {
+				return errors.New("CSV document extraction publication requires conversion receipt")
+			}
+		}
 		var sourceSequence int64
 		if err := q.QueryRow(`
 			SELECT COALESCE(MAX(o.source_sequence), -1)
 			FROM document_occurrences o
 			JOIN attachments a ON a.id = o.attachment_id
 			JOIN messages m ON m.id = o.message_id
+			JOIN document_extraction_profiles p ON p.id = ?
 			WHERE o.attachment_id = ? AND o.canonical_blob_hash = ?
-			  AND o.attachment_role = 'standalone'
+			  AND `+documentRoleScopeSQL("o", "p.include_inline")+`
 			  AND `+authoritativeDocumentRoleSourceSQL("o")+`
-			  AND a.attachment_role = 'standalone'
+			  AND a.attachment_role = o.attachment_role
+			  AND `+documentRoleScopeSQL("a", "p.include_inline")+`
 			  AND `+authoritativeDocumentRoleSourceSQL("a")+`
 			  AND (COALESCE(a.content_hash, '') = ? OR
 			       (COALESCE(a.content_hash, '') = '' AND a.storage_path = ?))
@@ -449,7 +501,7 @@ func (s *Store) PublishDocumentExtraction(
 			  AND COALESCE(a.mime_type, '') = ?
 			  AND COALESCE(m.message_type, '') = ?
 			  AND `+LiveMessagesWhere("m", true),
-			publication.OccurrenceAttachmentID, publication.CanonicalBlobHash,
+			publication.ProfileID, publication.OccurrenceAttachmentID, publication.CanonicalBlobHash,
 			publication.CanonicalBlobHash, canonicalCASPath(publication.CanonicalBlobHash), publication.OccurrenceMIMEType,
 			publication.OccurrenceMIMEType, publication.OccurrenceMessageType,
 		).Scan(&sourceSequence); err != nil {
@@ -462,7 +514,7 @@ func (s *Store) PublishDocumentExtraction(
 			return fmt.Errorf("clear staged document units: %w", err)
 		}
 		for _, unit := range publication.Units {
-			headingMarks, err := json.Marshal(unit.HeadingMarks)
+			headingMarks, err := json.Marshal(unit.HeadingMarks, json.Deterministic(true))
 			if err != nil {
 				return fmt.Errorf("encode document unit heading marks: %w", err)
 			}
@@ -480,7 +532,7 @@ func (s *Store) PublishDocumentExtraction(
 			}
 		}
 		for _, chunk := range publication.Chunks {
-			headingPath, err := json.Marshal(chunk.HeadingPath)
+			headingPath, err := json.Marshal(chunk.HeadingPath, json.Deterministic(true))
 			if err != nil {
 				return fmt.Errorf("encode document chunk heading path: %w", err)
 			}
@@ -509,6 +561,9 @@ func (s *Store) PublishDocumentExtraction(
 					return fmt.Errorf("publish document chunk %d span %d: %w", chunk.Ordinal, spanOrdinal, err)
 				}
 			}
+		}
+		if err := persistDocumentExtractionConversion(q, s.dialect, publication.ExtractionID, publication.CanonicalBlobHash, publication.SourceBytes, publication.OccurrenceMIMEType, publication.Conversion); err != nil {
+			return err
 		}
 		providerBytes := any(nil)
 		if publication.ProviderBytes != nil {
@@ -588,6 +643,32 @@ func canonicalCASPath(contentHash string) string {
 	return contentHash[:2] + "/" + contentHash
 }
 
+// documentAttemptCreatedAt orders a new attempt after every earlier attempt
+// for the same owner. Failure diagnostics pick the newest attempt by
+// created_at and break ties by caller-chosen ID, so a clock that repeats a
+// value (Windows wall time is coarse) or steps backward must not tie or invert
+// the order. Times use microseconds, PostgreSQL's timestamp precision, so a
+// value later by less than a microsecond cannot be stored equal to latest.
+func documentAttemptCreatedAt(q boundQuerier, input DocumentExtractionClaimInput) (time.Time, error) {
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	var latest time.Time
+	err := q.QueryRow(`
+		SELECT created_at FROM document_extractions
+		WHERE profile_id = ? AND canonical_blob_hash = ? AND extraction_input_key = ?
+		ORDER BY created_at DESC LIMIT 1`,
+		input.ProfileID, input.CanonicalBlobHash, input.ExtractionInputKey).Scan(&latest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return now, nil
+	}
+	if err != nil {
+		return time.Time{}, fmt.Errorf("read latest document extraction attempt: %w", err)
+	}
+	if now.After(latest) {
+		return now, nil
+	}
+	return latest.UTC().Truncate(time.Microsecond).Add(time.Microsecond), nil
+}
+
 func validateDocumentClaimInput(input DocumentExtractionClaimInput) error {
 	now := time.Now().UTC()
 	if input.ExtractionID == "" || input.ProfileID == "" ||
@@ -620,6 +701,12 @@ func validateDocumentPublication(publication DocumentExtractionPublication) erro
 		publication.NormalizationVersion, publication.DocumentFamily, publication.UnitKind,
 	); err != nil {
 		return fmt.Errorf("document extraction publication has invalid normalized identity: %w", err)
+	}
+	if publication.OccurrenceMIMEType == "text/csv" && publication.SourceBytes <= 0 {
+		return errors.New("CSV document extraction publication requires positive source bytes")
+	}
+	if err := validateDocumentExtractionConversion(publication.CanonicalBlobHash, publication.OccurrenceMIMEType, publication.SourceBytes, publication.Conversion); err != nil {
+		return err
 	}
 	for index, unit := range publication.Units {
 		if unit.Index != index || unit.Kind == "" || !utf8.ValidString(unit.Text) ||
@@ -669,6 +756,85 @@ func validateDocumentFailure(failure DocumentExtractionFailure) error {
 		}
 	} else if !failure.RetryAt.After(time.Now().UTC()) || failure.RetryAt.After(time.Now().UTC().Add(7*24*time.Hour)) {
 		return errors.New("retryable document extraction failure has invalid retry deadline")
+	}
+	if err := validateDocumentExtractionConversion(claim.CanonicalBlobHash, claim.OccurrenceMIMEType, claim.LocalBytes, failure.Conversion); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateDocumentExtractionConversion(sourceHash, sourceMIME string, sourceBytes int64, conversion *DocumentExtractionConversion) error {
+	if conversion == nil {
+		return nil
+	}
+	if sourceMIME != "text/csv" || conversion.SourceSHA256 != sourceHash ||
+		(sourceBytes > 0 && conversion.SourceBytes != sourceBytes) || conversion.SourceBytes <= 0 ||
+		conversion.ProviderMediaType != "application/pdf" || !validLowerSHA256(conversion.PDFSHA256) ||
+		conversion.PDFBytes <= 0 || conversion.Pages <= 0 || !validLowerSHA256(conversion.PolicyFingerprint) ||
+		conversion.ConverterVersion == "" || len(conversion.Spans) == 0 {
+		return errors.New("document extraction conversion receipt is incomplete or mismatched")
+	}
+	for _, span := range conversion.Spans {
+		if span.Page <= 0 || span.Page > conversion.Pages || span.Record <= 0 || span.Cell <= 0 {
+			return errors.New("document extraction conversion receipt has invalid provenance span")
+		}
+	}
+	return nil
+}
+
+func persistDocumentExtractionConversion(
+	q boundQuerier, dialect Dialect, extractionID, sourceHash string, sourceBytes int64, sourceMIME string,
+	conversion *DocumentExtractionConversion,
+) error {
+	if conversion == nil {
+		return nil
+	}
+	if err := validateDocumentExtractionConversion(sourceHash, sourceMIME, sourceBytes, conversion); err != nil {
+		return err
+	}
+	spans, err := json.Marshal(conversion.Spans, json.Deterministic(true))
+	if err != nil {
+		return fmt.Errorf("encode document extraction conversion spans: %w", err)
+	}
+	result, err := q.Exec(`
+		INSERT INTO document_extraction_conversions
+			(extraction_id, provider_media_type, pdf_sha256, pdf_bytes, pages,
+			 policy_fingerprint, converter_version, spans)
+		VALUES (?, ?, ?, ?, ?, ?, ?, `+dialect.JSONBindExpr()+`)
+		ON CONFLICT (extraction_id) DO NOTHING`,
+		extractionID, conversion.ProviderMediaType, conversion.PDFSHA256, conversion.PDFBytes,
+		conversion.Pages, conversion.PolicyFingerprint, conversion.ConverterVersion, string(spans),
+	)
+	if err != nil {
+		return fmt.Errorf("persist document extraction conversion: %w", err)
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read document extraction conversion result: %w", err)
+	}
+	if inserted == 1 {
+		return nil
+	}
+	var existing DocumentExtractionConversion
+	var existingSpans []byte
+	if err := q.QueryRow(`
+		SELECT provider_media_type, pdf_sha256, pdf_bytes, pages,
+			policy_fingerprint, converter_version, spans
+		FROM document_extraction_conversions
+		WHERE extraction_id = ?`, extractionID).Scan(
+		&existing.ProviderMediaType, &existing.PDFSHA256, &existing.PDFBytes, &existing.Pages,
+		&existing.PolicyFingerprint, &existing.ConverterVersion, &existingSpans,
+	); err != nil {
+		return fmt.Errorf("read existing document extraction conversion: %w", err)
+	}
+	if err := json.Unmarshal(existingSpans, &existing.Spans); err != nil {
+		return fmt.Errorf("decode existing document extraction conversion spans: %w", err)
+	}
+	if existing.ProviderMediaType != conversion.ProviderMediaType ||
+		existing.PDFSHA256 != conversion.PDFSHA256 || existing.PDFBytes != conversion.PDFBytes ||
+		existing.Pages != conversion.Pages || existing.PolicyFingerprint != conversion.PolicyFingerprint ||
+		existing.ConverterVersion != conversion.ConverterVersion || !reflect.DeepEqual(existing.Spans, conversion.Spans) {
+		return errors.New("document extraction conversion receipt conflicts with existing evidence")
 	}
 	return nil
 }

@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,13 +25,18 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/api"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/discord"
 	imaplib "go.kenn.io/msgvault/internal/imap"
+	"go.kenn.io/msgvault/internal/jobctx"
 	"go.kenn.io/msgvault/internal/oauth"
 	"go.kenn.io/msgvault/internal/personenrichment"
+	"go.kenn.io/msgvault/internal/provideridentity"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/telemetry"
+	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
 
@@ -74,7 +81,7 @@ func TestStoreAPIAdapterDeletePersonSuppressesCurrentIdentifiers(t *testing.T) {
 		DueAt:   now,
 	}))
 	lease, err := f.Store.ClaimWork(t.Context(), personenrichment.ClaimOptions{
-		RunID: run.ID, Owner: "disabled-deletion-worker", ProviderName: profile.Name,
+		RunID: run.ID, Owner: "disabled-deletion-worker", ProviderName: profile.Name, ProfileFingerprint: profile.Fingerprint,
 		Now: now, LeaseDuration: time.Minute,
 	})
 	require.NoError(err)
@@ -213,7 +220,7 @@ func TestStoreAPIAdapterDeletePersonRejectsRecordedAttemptKeyMismatch(t *testing
 		DueAt:   now,
 	}))
 	lease, err := f.Store.ClaimWork(t.Context(), personenrichment.ClaimOptions{
-		RunID: run.ID, Owner: "attempt-key-worker", ProviderName: profile.Name,
+		RunID: run.ID, Owner: "attempt-key-worker", ProviderName: profile.Name, ProfileFingerprint: profile.Fingerprint,
 		Now: now, LeaseDuration: time.Minute,
 	})
 	require.NoError(err)
@@ -254,103 +261,6 @@ func TestStoreAPIAdapterDeletePersonRejectsRecordedAttemptKeyMismatch(t *testing
 // minutes to execute schema.sql under filesystem load.
 const serveLifecycleTestTimeout = 180 * time.Second
 
-func TestServeConfigParsing(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	// Create temp config with scheduled accounts
-	tmpDir := t.TempDir()
-	configContent := `
-[oauth]
-client_secrets = "/path/to/secrets.json"
-
-[server]
-api_port = 9090
-api_key = "test-key"
-
-[[accounts]]
-email = "user1@gmail.com"
-schedule = "0 2 * * *"
-enabled = true
-
-[[accounts]]
-email = "user2@gmail.com"
-schedule = "0 3 * * *"
-enabled = true
-
-[[accounts]]
-email = "disabled@gmail.com"
-schedule = "0 4 * * *"
-enabled = false
-`
-	configPath := filepath.Join(tmpDir, "config.toml")
-	require.NoError(os.WriteFile(configPath, []byte(configContent), 0644), "write config")
-
-	cfg, err := config.Load(configPath, "")
-	require.NoError(err, "Load")
-
-	// Verify server config
-	assert.Equal(9090, cfg.Server.APIPort, "APIPort")
-	assert.Equal("test-key", cfg.Server.APIKey, "APIKey")
-
-	// Verify scheduled accounts
-	scheduled := cfg.ScheduledAccounts()
-	assert.Len(scheduled, 2, "len(ScheduledAccounts())")
-
-	// Verify specific accounts
-	acc := cfg.GetAccountSchedule("user1@gmail.com")
-	require.NotNil(acc, "GetAccountSchedule(user1)")
-	assert.Equal("0 2 * * *", acc.Schedule, "user1 schedule")
-
-	// Disabled account should still be retrievable but not in scheduled list
-	disabled := cfg.GetAccountSchedule("disabled@gmail.com")
-	assert.NotNil(disabled, "GetAccountSchedule(disabled)")
-}
-
-func TestSchedulerWithConfig(t *testing.T) {
-	cfg := &config.Config{
-		Accounts: []config.AccountSchedule{
-			{Email: "test1@gmail.com", Schedule: "0 2 * * *", Enabled: true},
-			{Email: "test2@gmail.com", Schedule: "0 3 * * *", Enabled: true},
-			{Email: "test3@gmail.com", Schedule: "invalid", Enabled: true},
-		},
-	}
-
-	var syncCalls []string
-	sched := scheduler.New(func(ctx context.Context, email string) error {
-		syncCalls = append(syncCalls, email)
-		return nil
-	})
-
-	count, errs := sched.AddAccountsFromConfig(cfg)
-
-	// Should schedule 2 valid accounts
-	assert.Equal(t, 2, count, "scheduled count")
-
-	// Should have 1 error for invalid cron
-	assert.Len(t, errs, 1, "len(errs)")
-
-	// Verify status
-	statuses := sched.Status()
-	assert.Len(t, statuses, 2, "len(Status())")
-}
-
-func TestServeCmdNoAccounts(t *testing.T) {
-	// Create temp config without accounts
-	tmpDir := t.TempDir()
-	configContent := `
-[oauth]
-client_secrets = "/path/to/secrets.json"
-`
-	configPath := filepath.Join(tmpDir, "config.toml")
-	require.NoError(t, os.WriteFile(configPath, []byte(configContent), 0644), "write config")
-
-	cfg, err := config.Load(configPath, "")
-	require.NoError(t, err, "Load")
-
-	scheduled := cfg.ScheduledAccounts()
-	assert.Empty(t, scheduled, "expected no scheduled accounts")
-}
-
 func TestServeOAuthValidationAllowsMicrosoftOnly(t *testing.T) {
 	assert.True(t, hasServeOAuthConfig(&config.Config{
 		Microsoft: config.MicrosoftConfig{ClientID: "azure-client-id"},
@@ -362,6 +272,8 @@ func TestServeOAuthValidationReportsNoProviders(t *testing.T) {
 }
 
 func TestRunServeStartsReadOnlyWithoutOAuthConfig(t *testing.T) {
+	cfg := testConfigValue()
+
 	oldCfg := cfg
 	dataDir := t.TempDir()
 	cfg = lifecycleTestConfig(dataDir)
@@ -371,7 +283,7 @@ func TestRunServeStartsReadOnlyWithoutOAuthConfig(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cmd := &cobra.Command{Use: serveCmd.Use}
-	cmd.SetContext(ctx)
+	cmd.SetContext(testInvocationContext(ctx, cfg, invocationOptions{}))
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- runServe(cmd, nil)
@@ -388,7 +300,55 @@ func TestRunServeStartsReadOnlyWithoutOAuthConfig(t *testing.T) {
 	}
 }
 
+func TestRunServeFailsPendingImportFromPreviousDaemon(t *testing.T) {
+	cfg := testConfigValue()
+
+	require := require.New(t)
+	assert := assert.New(t)
+	oldCfg := cfg
+	dataDir := t.TempDir()
+	c := lifecycleTestConfig(dataDir)
+	c.Server.APIPort = freeTCPPort(t)
+	c.Analytics.Engine = config.AnalyticsEngineSQL
+	c.Vector.Enabled = false
+	cfg = c
+	t.Cleanup(func() { cfg = oldCfg })
+
+	st := testutil.NewSQLiteTestStoreAt(t, c.DatabaseDSN())
+	source, err := st.GetOrCreateSource("gmail", "orphaned-import@example.com")
+	require.NoError(err)
+	_, err = st.CreateSyncOperation(source.ID, "orphaned-operation")
+	require.NoError(err)
+	require.NoError(st.Close())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	cmd := &cobra.Command{Use: serveCmd.Use}
+	cmd.SetContext(testInvocationContext(ctx, cfg, invocationOptions{}))
+	errCh := make(chan error, 1)
+	go func() { errCh <- runServe(cmd, nil) }()
+	waitForServeHealth(t, c.Server.APIPort, errCh)
+
+	observer, err := store.Open(c.DatabaseDSN())
+	require.NoError(err)
+	t.Cleanup(func() { require.NoError(observer.Close()) })
+	op, err := observer.GetSyncOperation("orphaned-operation")
+	require.NoError(err)
+	assert.Equal("failed", op.Status)
+	assert.True(op.FinishedAt.Valid)
+
+	cancel()
+	select {
+	case err := <-errCh:
+		require.NoError(err, "runServe")
+	case <-time.After(5 * time.Second):
+		require.FailNow("runServe did not stop after context cancellation")
+	}
+}
+
 func TestRunServeImmediateCancellationWaitsForAPIStart(t *testing.T) {
+	cfg := testConfigValue()
+
 	require := require.New(t)
 	oldCfg := cfg
 	dataDir := t.TempDir()
@@ -419,7 +379,7 @@ func TestRunServeImmediateCancellationWaitsForAPIStart(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	cmd := &cobra.Command{Use: "serve"}
-	cmd.SetContext(ctx)
+	cmd.SetContext(testInvocationContext(ctx, cfg, invocationOptions{}))
 	errCh := make(chan error, 1)
 	go func() { errCh <- runServe(cmd, nil) }()
 
@@ -432,7 +392,7 @@ func TestRunServeImmediateCancellationWaitsForAPIStart(t *testing.T) {
 	select {
 	case err := <-errCh:
 		require.FailNow("runServe returned before listener-start barrier", "error: %v", err)
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(50 * time.Millisecond): //nolint:kennlint // absence check: the listener-start barrier keeps runServe from returning
 	}
 
 	close(release)
@@ -445,6 +405,8 @@ func TestRunServeImmediateCancellationWaitsForAPIStart(t *testing.T) {
 }
 
 func TestRunServeAutoSelectsAPIPortWhenUnconfigured(t *testing.T) {
+	cfg := testConfigValue()
+
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -457,7 +419,7 @@ func TestRunServeAutoSelectsAPIPortWhenUnconfigured(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	cmd := &cobra.Command{Use: serveCmd.Use}
-	cmd.SetContext(ctx)
+	cmd.SetContext(testInvocationContext(ctx, cfg, invocationOptions{}))
 	errCh := make(chan error, 1)
 	serveDone := make(chan struct{})
 	go func() {
@@ -499,6 +461,8 @@ func TestRunServeAutoSelectsAPIPortWhenUnconfigured(t *testing.T) {
 }
 
 func TestRunServeServesHealthWhileAnalyticsBuildBlocked(t *testing.T) {
+	cfg := testConfigValue()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	oldCfg := cfg
@@ -522,7 +486,7 @@ func TestRunServeServesHealthWhileAnalyticsBuildBlocked(t *testing.T) {
 	defer cancel()
 	t.Cleanup(cancel)
 	cmd := &cobra.Command{Use: "serve"}
-	cmd.SetContext(ctx)
+	cmd.SetContext(testInvocationContext(ctx, cfg, invocationOptions{}))
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- runServe(cmd, nil)
@@ -568,6 +532,8 @@ func TestRunServeServesHealthWhileAnalyticsBuildBlocked(t *testing.T) {
 }
 
 func TestRunServeDuckDBReportsInitializingWithoutSQLFallback(t *testing.T) {
+	cfg := testConfigValue()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	oldCfg := cfg
@@ -591,7 +557,7 @@ func TestRunServeDuckDBReportsInitializingWithoutSQLFallback(t *testing.T) {
 	defer cancel()
 	t.Cleanup(cancel)
 	cmd := &cobra.Command{Use: serveCmd.Use}
-	cmd.SetContext(ctx)
+	cmd.SetContext(testInvocationContext(ctx, cfg, invocationOptions{}))
 	errCh := make(chan error, 1)
 	go func() { errCh <- runServe(cmd, nil) }()
 
@@ -642,7 +608,7 @@ func TestRunServeDuckDBReportsInitializingWithoutSQLFallback(t *testing.T) {
 	)
 	require.NoError(err, "POST SQL query")
 	assert.Equal(http.StatusServiceUnavailable, resp.StatusCode,
-		"initializing DuckDB must report SQL engine unavailable")
+		"startup already owns cache recovery")
 	_ = resp.Body.Close()
 
 	cancel()
@@ -655,6 +621,8 @@ func TestRunServeDuckDBReportsInitializingWithoutSQLFallback(t *testing.T) {
 }
 
 func TestRunServeAutoSwitchesToDuckDBAfterBackgroundBuild(t *testing.T) {
+	cfg := testConfigValue()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	oldCfg := cfg
@@ -684,7 +652,7 @@ func TestRunServeAutoSwitchesToDuckDBAfterBackgroundBuild(t *testing.T) {
 	})
 
 	cmd := &cobra.Command{Use: serveCmd.Use}
-	cmd.SetContext(ctx)
+	cmd.SetContext(testInvocationContext(ctx, cfg, invocationOptions{}))
 	errCh := make(chan error, 1)
 	go func() { errCh <- runServe(cmd, nil) }()
 
@@ -713,9 +681,10 @@ func TestRunServeAutoSwitchesToDuckDBAfterBackgroundBuild(t *testing.T) {
 	assert.Equal(api.AnalyticsModeSQLFallback, readAnalyticsMode())
 
 	close(releaseBuild)
+	// This wait includes the real cache build and opening DuckDB on busy CI runners.
 	assert.Eventually(func() bool {
 		return readAnalyticsMode() == api.AnalyticsModeDuckDB
-	}, 10*time.Second, 25*time.Millisecond, "auto mode should switch to DuckDB after cache build")
+	}, serveLifecycleTestTimeout, 25*time.Millisecond, "auto mode should switch to DuckDB after cache build")
 
 	cancel()
 	select {
@@ -743,6 +712,8 @@ func TestListenServeAPIHonorsAvailableExplicitPort(t *testing.T) {
 }
 
 func TestRunServeFailsBeforeArchiveWorkWhenAPIPortInUse(t *testing.T) {
+	cfg := testConfigValue()
+
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -759,7 +730,7 @@ func TestRunServeFailsBeforeArchiveWorkWhenAPIPortInUse(t *testing.T) {
 	t.Cleanup(func() { cfg = oldCfg })
 
 	cmd := &cobra.Command{Use: "serve"}
-	cmd.SetContext(context.Background())
+	cmd.SetContext(testInvocationContext(context.Background(), cfg, invocationOptions{}))
 	err = runServe(cmd, nil)
 
 	require.Error(err, "runServe")
@@ -850,7 +821,7 @@ func waitForServeHealth(t *testing.T, port int, errCh <-chan error) {
 				return
 			}
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond) //nolint:kennlint // polls runServe's real TCP listener
 	}
 	require.FailNow(t, "serve health endpoint did not become ready")
 }
@@ -874,40 +845,444 @@ func waitForServeHealthBounded(t *testing.T, port int, errCh <-chan error) {
 				return
 			}
 		}
-		time.Sleep(20 * time.Millisecond)
+		time.Sleep(20 * time.Millisecond) //nolint:kennlint // polls runServe's real TCP listener
 	}
 	require.FailNow(t, "serve health endpoint did not become ready")
 }
 
-func TestRunDaemonSQLQueryRebuildsStaleCacheOutOfProcess(t *testing.T) {
+func TestRebuildCacheAfterManualSyncDefersUsableStaleCache(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
-	dataDir := t.TempDir()
-	c := lifecycleTestConfig(dataDir)
-	s, err := store.Open(c.DatabaseDSN())
-	require.NoError(err, "open store")
-	defer func() { _ = s.Close() }()
-	require.NoError(s.InitSchema(), "init schema")
+	c, s := openTestDaemonAnalyticsStore(t)
+	c.Analytics.AutoBuildCache = true
+	c.Analytics.MinRebuildInterval = 6 * time.Hour
+	state := &invocation{cfg: c}
+	_, err := s.DB().Exec(`
+		INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'user@example.com');
+		INSERT INTO conversations (id, source_id, source_conversation_id, conversation_type)
+			VALUES (1, 1, 'thread-1', 'email_thread');
+		INSERT INTO messages (id, source_id, source_message_id, conversation_id, message_type, sent_at)
+			VALUES (1, 1, 'message-1', 1, 'email', '2024-01-01 00:00:00');
+	`)
+	require.NoError(err)
+	_, err = buildCache(c.DatabaseDSN(), c.AnalyticsDir(), true)
+	require.NoError(err)
+	_, err = s.DB().Exec(`
+		INSERT INTO messages (id, source_id, source_message_id, conversation_id, message_type, sent_at)
+			VALUES (2, 1, 'message-2', 1, 'email', '2024-01-02 00:00:00')
+	`)
+	require.NoError(err)
+	require.True(cacheNeedsBuild(c.DatabaseDSN(), c.AnalyticsDir()).NeedsBuild)
+	buildCacheBeforeMessagesExportHook = func() error { return errors.New("unexpected cache build") }
+	t.Cleanup(func() { buildCacheBeforeMessagesExportHook = nil })
+	builderLock, err := cacheBuilderFileLock(c.AnalyticsDir())
+	require.NoError(err)
+	locked, err := builderLock.TryLock()
+	require.NoError(err)
+	require.True(locked)
+	t.Cleanup(func() { require.NoError(builderLock.Unlock()) })
+	done := make(chan error, 1)
+	go func() { done <- rebuildCacheAfterManualSync(c.DatabaseDSN(), state) }()
+	select {
+	case err := <-done:
+		require.NoError(err, "manual sync must finish while the builder lock is held")
+	case <-time.After(serveLifecycleTestTimeout):
+		require.FailNow("manual sync waited for the active cache builder")
+	}
+	staleness, err := cacheNeedsBuildForQuery(t.Context(), c.DatabaseDSN(), c.AnalyticsDir())
+	require.NoError(err)
+	assert.True(staleness.NeedsBuild)
+}
+
+func TestRunDaemonSQLQueryWithJobsServesStaleAndCoalescesFresh(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	c, s := openTestDaemonAnalyticsStore(t)
+	c.Analytics.MinRebuildInterval = 0
+	_, err := s.DB().Exec(`
+		INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'user@example.com');
+		INSERT INTO conversations (id, source_id, source_conversation_id, conversation_type)
+			VALUES (1, 1, 'thread-1', 'email_thread');
+		INSERT INTO messages (id, source_id, source_message_id, conversation_id, message_type, sent_at)
+			VALUES (1, 1, 'message-1', 1, 'email', '2024-01-01 00:00:00');
+	`)
+	require.NoError(err)
+	_, err = buildCache(c.DatabaseDSN(), c.AnalyticsDir(), true)
+	require.NoError(err)
+	engine, err := openDaemonDuckDBEngine(c, s)
+	require.NoError(err)
+	t.Cleanup(func() { _ = engine.Close() })
+	_, err = s.DB().Exec(`
+		INSERT INTO messages (id, source_id, source_message_id, conversation_id, message_type, sent_at)
+			VALUES (2, 1, 'message-2', 1, 'email', '2024-01-02 00:00:00')
+	`)
+	require.NoError(err)
+	ctx, cancel := context.WithTimeout(t.Context(), serveLifecycleTestTimeout)
+	defer cancel()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseBuild := func() { releaseOnce.Do(func() { close(release) }) }
+	firstBuild := true
+	buildCacheBeforeMessagesExportHook = func() error {
+		if !firstBuild {
+			return nil
+		}
+		firstBuild = false
+		// The first export has already pinned its SQLite snapshot here.
+		close(started)
+		select {
+		case <-release:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	jobs := newCacheBuildJobs(ctx, nil, func(context.Context, buildCacheMode) error {
+		_, err := buildCache(c.DatabaseDSN(), c.AnalyticsDir(), true)
+		return err
+	})
+	t.Cleanup(func() {
+		releaseBuild()
+		cancel()
+		drainCtx, drainCancel := context.WithTimeout(context.Background(), serveLifecycleTestTimeout)
+		defer drainCancel()
+		require.True(jobs.waitContext(drainCtx))
+		buildCacheBeforeMessagesExportHook = nil
+	})
+	active, err := jobs.accept(buildCacheModeAuto)
+	require.NoError(err)
+	select {
+	case <-started:
+	case <-ctx.Done():
+		require.FailNow("cache job did not reach its export snapshot")
+	}
+	result, accepted, err := runDaemonSQLQueryWithJobs(ctx, c, s, engine, "SELECT COUNT(*) FROM messages", daemonSQLQueryOptions{}, jobs)
+	require.NoError(err, "published rows must remain readable while the builder is held")
+	assert.Nil(accepted)
+	require.NotNil(result.Cache)
+	assert.True(result.Cache.Building)
+	assert.EqualValues(1, result.Rows[0][0])
+	_, err = s.DB().Exec(`
+		INSERT INTO messages (id, source_id, source_message_id, conversation_id, message_type, sent_at)
+			VALUES (3, 1, 'message-3', 1, 'email', '2024-01-03 00:00:00')
+	`)
+	require.NoError(err)
+	_, first, err := runDaemonSQLQueryWithJobs(ctx, c, s, engine, "SELECT 1", daemonSQLQueryOptions{fresh: true}, jobs)
+	require.NoError(err)
+	require.NotNil(first)
+	assert.NotEqual(active.JobID, first.JobID)
+	assert.Equal(api.CacheBuildQueued, first.Status)
+	_, second, err := runDaemonSQLQueryWithJobs(ctx, c, s, engine, "SELECT 1", daemonSQLQueryOptions{fresh: true}, jobs)
+	require.NoError(err)
+	require.NotNil(second)
+	assert.Equal(first.JobID, second.JobID)
+	releaseBuild()
+	require.Eventually(func() bool {
+		job, ok := jobs.status(first.JobID)
+		return ok && (job.Status == api.CacheBuildPublished || job.Status == api.CacheBuildFailed)
+	}, serveLifecycleTestTimeout, 10*time.Millisecond)
+	job, ok := jobs.status(first.JobID)
+	require.True(ok)
+	require.Equal(api.CacheBuildPublished, job.Status, job.Error)
+	result, accepted, err = runDaemonSQLQueryWithJobs(ctx, c, s, engine, "SELECT COUNT(*) FROM messages", daemonSQLQueryOptions{}, jobs)
+	require.NoError(err)
+	assert.Nil(accepted)
+	assert.EqualValues(3, result.Rows[0][0], "fresh must include the write after the first builder's snapshot")
+}
+
+func TestQueryWithAutomaticCacheBuildsDisabledServesStaleWithoutStartingJob(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	c, s := openTestDaemonAnalyticsStore(t)
+	c.Analytics.AutoBuildCache = false
+	c.Analytics.MinRebuildInterval = 0
+	_, err := s.DB().Exec(`
+		INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'user@example.com');
+		INSERT INTO conversations (id, source_id, source_conversation_id, conversation_type)
+			VALUES (1, 1, 'thread-1', 'email_thread');
+		INSERT INTO messages (id, source_id, source_message_id, conversation_id, message_type, sent_at)
+			VALUES (1, 1, 'message-1', 1, 'email', '2024-01-01 00:00:00');
+	`)
+	require.NoError(err)
+	_, err = buildCache(c.DatabaseDSN(), c.AnalyticsDir(), true)
+	require.NoError(err)
+	engine, err := openDaemonDuckDBEngine(c, s)
+	require.NoError(err)
+	t.Cleanup(func() { _ = engine.Close() })
+	_, err = s.DB().Exec(`
+		INSERT INTO messages (id, source_id, source_message_id, conversation_id, message_type, sent_at)
+			VALUES (2, 1, 'message-2', 1, 'email', '2024-01-02 00:00:00')
+	`)
+	require.NoError(err)
+	started := make(chan struct{}, 1)
+	jobs := newCacheBuildJobs(t.Context(), nil, func(context.Context, buildCacheMode) error {
+		started <- struct{}{}
+		return nil
+	})
+	result, accepted, err := runDaemonSQLQueryWithJobs(t.Context(), c, s, engine, "SELECT COUNT(*) FROM messages", daemonSQLQueryOptions{}, jobs)
+	require.NoError(err)
+	assert.Nil(accepted)
+	require.NotNil(result.Cache)
+	assert.NotEmpty(result.Cache.StaleReason)
+	assert.False(jobs.active())
+	select {
+	case <-started:
+		assert.Fail("automatic cache build started despite auto_build_cache=false")
+	default:
+	}
+	_, forced, err := runDaemonSQLQueryWithJobs(t.Context(), c, s, engine, "SELECT 1", daemonSQLQueryOptions{fresh: true}, jobs)
+	require.NoError(err)
+	require.NotNil(forced)
+	assert.NotEmpty(forced.JobID)
+}
+
+func TestFreshQueryVerifiesCleanPublicationInBackground(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	c, s := openTestDaemonAnalyticsStore(t)
+	c.Analytics.MinRebuildInterval = 6 * time.Hour
+	_, err := s.DB().Exec(`
+		INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'user@example.com');
+		INSERT INTO conversations (id, source_id, source_conversation_id, conversation_type)
+			VALUES (1, 1, 'thread-1', 'email_thread');
+		INSERT INTO messages (id, source_id, source_message_id, conversation_id, message_type, sent_at)
+			VALUES (1, 1, 'message-1', 1, 'email', '2024-01-01 00:00:00');
+	`)
+	require.NoError(err)
+	_, err = buildCache(c.DatabaseDSN(), c.AnalyticsDir(), true)
+	require.NoError(err)
+	engine, err := openDaemonDuckDBEngine(c, s)
+	require.NoError(err)
+	t.Cleanup(func() { _ = engine.Close() })
+	started := make(chan buildCacheMode, 1)
+	jobs := newCacheBuildJobs(t.Context(), nil, func(_ context.Context, mode buildCacheMode) error {
+		started <- mode
+		return nil
+	})
+	result, accepted, err := runDaemonSQLQueryWithJobs(t.Context(), c, s, engine, "SELECT 1", daemonSQLQueryOptions{fresh: true}, jobs)
+	require.NoError(err)
+	assert.Nil(result)
+	require.NotNil(accepted)
+	assert.NotEmpty(accepted.JobID)
+	select {
+	case mode := <-started:
+		assert.Equal(buildCacheModeAuto, mode)
+	case <-time.After(time.Second):
+		require.FailNow("fresh query did not start cache verification")
+	}
+}
+
+func TestSQLAnalyticsModeQueryQueuesMissingCache(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	c, s := openTestDaemonAnalyticsStore(t)
+	c.Analytics.Engine = config.AnalyticsEngineSQL
+	engine := query.NewEngine(s.DB(), false)
+	t.Cleanup(func() { _ = engine.Close() })
+	started := make(chan buildCacheMode, 1)
+	jobs := newCacheBuildJobs(t.Context(), nil, func(_ context.Context, mode buildCacheMode) error {
+		started <- mode
+		return nil
+	})
+	result, accepted, err := runDaemonSQLQueryWithJobs(t.Context(), c, s, engine, "SELECT 1", daemonSQLQueryOptions{}, jobs)
+	require.NoError(err)
+	assert.Nil(result)
+	require.NotNil(accepted)
+	assert.NotEmpty(accepted.JobID)
+	select {
+	case mode := <-started:
+		assert.Equal(buildCacheModeAuto, mode)
+	case <-time.After(time.Second):
+		require.FailNow("missing cache did not queue recovery")
+	}
+}
+
+func TestQueryUsesPublishedParquetWhenDaemonEngineIsSQLite(t *testing.T) {
+	c, s := openPublishedQueryTestStore(t)
+	sqliteEngine := query.NewEngine(s.DB(), false)
+	t.Cleanup(func() { _ = sqliteEngine.Close() })
+	// Model a SQL-capable fallback without changing the real SQLite engine.
+	// Cache queries must still go to DuckDB when a publication exists.
+	engine := &sqlCapableSQLiteFallback{Engine: sqliteEngine}
+	jobs := newCacheBuildJobs(t.Context(), nil, func(context.Context, buildCacheMode) error { return nil })
+
+	for _, mode := range []string{config.AnalyticsEngineAuto, config.AnalyticsEngineSQL} {
+		t.Run(mode, func(t *testing.T) {
+			requirements := require.New(t)
+			assertions := assert.New(t)
+			c.Analytics.Engine = mode
+			result, accepted, err := runDaemonSQLQueryWithJobs(t.Context(), c, s, engine,
+				"SELECT COUNT(*) FROM v_senders", daemonSQLQueryOptions{}, jobs)
+			requirements.NoError(err)
+			assertions.Nil(accepted)
+			requirements.NotNil(result)
+			requirements.NotNil(result.Cache)
+			assertions.EqualValues(0, result.Rows[0][0])
+		})
+	}
+}
+
+type sqlCapableSQLiteFallback struct{ query.Engine }
+
+func (*sqlCapableSQLiteFallback) QuerySQL(context.Context, string) (*query.QueryResult, error) {
+	return nil, errors.New("cache query reached SQLite fallback")
+}
+
+func TestQueryQueuesRepairWhenPublishedShardDisappears(t *testing.T) {
+	for _, fresh := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fresh-%t", fresh), func(t *testing.T) {
+			requirements := require.New(t)
+			assertions := assert.New(t)
+			c, s := openPublishedQueryTestStore(t)
+			c.Analytics.AutoBuildCache = true
+			engine, err := openDaemonDuckDBEngine(c, s)
+			requirements.NoError(err)
+			t.Cleanup(func() { _ = engine.Close() })
+			shards, err := filepath.Glob(filepath.Join(c.AnalyticsDir(), "messages", "*", "*.parquet"))
+			requirements.NoError(err)
+			requirements.NotEmpty(shards)
+			requirements.NoError(os.Remove(shards[0]))
+			started := make(chan buildCacheMode, 1)
+			jobs := newCacheBuildJobs(t.Context(), nil, func(_ context.Context, mode buildCacheMode) error {
+				started <- mode
+				return nil
+			})
+
+			result, accepted, err := runDaemonSQLQueryWithJobs(t.Context(), c, s, engine,
+				"SELECT COUNT(*) FROM v_senders", daemonSQLQueryOptions{fresh: fresh}, jobs)
+			requirements.NoError(err)
+			assertions.Nil(result)
+			requirements.NotNil(accepted)
+			assertions.NotEmpty(accepted.JobID)
+			assertions.Nil(accepted.Cache, "damaged publication must not be advertised as queryable")
+			select {
+			case mode := <-started:
+				assertions.Equal(buildCacheModeAuto, mode)
+			case <-time.After(time.Second):
+				requirements.FailNow("cache repair did not start")
+			}
+		})
+	}
+}
+
+func openPublishedQueryTestStore(t *testing.T) (*config.Config, *store.Store) {
+	t.Helper()
+	requirements := require.New(t)
+	c, s := openTestDaemonAnalyticsStore(t)
+	_, err := s.DB().Exec(`
+		INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'user@example.com');
+		INSERT INTO conversations (id, source_id, source_conversation_id, conversation_type)
+			VALUES (1, 1, 'thread-1', 'email_thread');
+		INSERT INTO messages (id, source_id, source_message_id, conversation_id, message_type, sent_at)
+			VALUES (1, 1, 'message-1', 1, 'email', '2024-01-01 00:00:00');
+	`)
+	requirements.NoError(err)
+	_, err = buildCache(c.DatabaseDSN(), c.AnalyticsDir(), true)
+	requirements.NoError(err)
+	return c, s
+}
+
+func TestManualSyncRefreshQueuesVerificationInsideInterval(t *testing.T) {
+	requirements := require.New(t)
+	c, s := openTestDaemonAnalyticsStore(t)
+	c.Analytics.AutoBuildCache = true
+	c.Analytics.MinRebuildInterval = 6 * time.Hour
+	_, err := s.DB().Exec(`
+		INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'user@example.com');
+		INSERT INTO conversations (id, source_id, source_conversation_id, conversation_type)
+			VALUES (1, 1, 'thread-1', 'email_thread');
+		INSERT INTO messages (id, source_id, source_message_id, conversation_id, message_type, sent_at)
+			VALUES (1, 1, 'message-1', 1, 'email', '2024-01-01 00:00:00');
+	`)
+	requirements.NoError(err)
+	_, err = buildCache(c.DatabaseDSN(), c.AnalyticsDir(), true)
+	requirements.NoError(err)
+	_, err = s.DB().Exec(`
+		INSERT INTO messages (id, source_id, source_message_id, conversation_id, message_type, sent_at)
+			VALUES (2, 1, 'message-2', 1, 'email', '2024-01-02 00:00:00')
+	`)
+	requirements.NoError(err)
+	for _, test := range []struct {
+		name       string
+		args       []string
+		interval   time.Duration
+		shutdown   bool
+		wantQueued bool
+		wantMode   buildCacheMode
+	}{
+		{name: "default inside interval", args: []string{"sync-slack"}, interval: 6 * time.Hour, wantQueued: true, wantMode: buildCacheModeScheduledAuto},
+		{name: "forced inside interval", args: []string{"sync-teams", "--build-cache"}, interval: 6 * time.Hour, wantQueued: true, wantMode: buildCacheModeAuto},
+		{name: "default when due", args: []string{"sync-calendar"}, wantQueued: true, wantMode: buildCacheModeScheduledAuto},
+		{name: "skip when due", args: []string{"sync-slack", "--no-build-cache"}},
+		{name: "shutdown skips forced refresh", args: []string{"sync-teams", "--build-cache=true"}, interval: 6 * time.Hour, shutdown: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			c.Analytics.MinRebuildInterval = test.interval
+			daemonCtx, cancel := context.WithCancel(t.Context())
+			started := make(chan buildCacheMode, 1)
+			jobs := newCacheBuildJobs(daemonCtx, nil, func(ctx context.Context, mode buildCacheMode) error {
+				started <- mode
+				<-ctx.Done()
+				return ctx.Err()
+			})
+			t.Cleanup(func() {
+				cancel()
+				cleanupCtx, stop := context.WithTimeout(context.Background(), 10*time.Second)
+				defer stop()
+				require.True(jobs.waitContext(cleanupCtx), "cache worker stopped")
+			})
+			adapter := &storeAPIAdapter{store: s, config: c, cacheJobs: jobs}
+			runnerCalled := false
+			err := adapter.runCLICommandWithRunner(t.Context(), api.CLIRunRequest{Args: test.args}, nil,
+				func(_ context.Context, args []string, _ map[string]string, _ string, _ func(string, string) error) error {
+					runnerCalled = true
+					assert.Equal(test.args, args)
+					assert.False(jobs.active(), "cache work starts after the sync child returns")
+					if test.shutdown {
+						cancel()
+					}
+					return nil
+				})
+			require.NoError(err)
+			assert.True(runnerCalled)
+			assert.Equal(test.wantQueued, jobs.active())
+			if test.wantQueued {
+				select {
+				case mode := <-started:
+					assert.Equal(test.wantMode, mode)
+				case <-time.After(10 * time.Second):
+					require.FailNow("cache job did not start")
+				}
+			}
+		})
+	}
+}
+
+func TestRunDaemonSQLQueryReturnsCancellationWhenCachePublicationIsLocked(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	c, s := openTestDaemonAnalyticsStore(t)
 	engine := query.NewEngine(s.DB(), false)
 	defer func() { _ = engine.Close() }()
 
-	sentinel := errors.New("subprocess sentinel")
-	var called bool
-	var gotFullRebuild bool
-	old := buildCacheSubprocessForRun
-	buildCacheSubprocessForRun = func(_ context.Context, fullRebuild bool) error {
-		called = true
-		gotFullRebuild = fullRebuild
-		return sentinel
-	}
-	t.Cleanup(func() { buildCacheSubprocessForRun = old })
+	publicationLock, err := cacheBuildFileLock(c.AnalyticsDir())
+	require.NoError(err)
+	require.NoError(publicationLock.Lock())
+	t.Cleanup(func() { _ = publicationLock.Unlock() })
 
-	_, err = runDaemonSQLQuery(context.Background(), c, s, engine, "select 1")
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	jobs := newCacheBuildJobs(t.Context(), nil, func(context.Context, buildCacheMode) error {
+		return errors.New("canceled query must not start a rebuild")
+	})
+	_, accepted, err := runDaemonSQLQueryWithJobs(ctx, c, s, engine, "select 1", daemonSQLQueryOptions{}, jobs)
 
-	require.Error(err, "query should fail with subprocess sentinel")
-	require.ErrorIs(err, sentinel, "error")
-	assert.True(called, "subprocess rebuild should be called")
-	assert.True(gotFullRebuild, "missing cache should request full rebuild")
+	require.ErrorIs(err, context.Canceled)
+	assert.Nil(accepted)
+	assert.False(jobs.active(), "a canceled query must stop before starting a cache rebuild")
 }
 
 func TestOpenDaemonAnalyticsEngineForceSQLSkipsCacheBuild(t *testing.T) {
@@ -954,6 +1329,31 @@ func TestOpenDaemonAnalyticsEngineSkipsCacheBuildWhenDisabled(t *testing.T) {
 	assert.Equal(startupCacheBuildOutcomeNone, outcome, "no explicit intent has no outcome")
 }
 
+func TestOpenDaemonAnalyticsEngineReturnsCancellationWhenCacheBuilderIsLocked(t *testing.T) {
+	require := require.New(t)
+	c, s := openTestDaemonAnalyticsStore(t)
+	c.Analytics.Engine = config.AnalyticsEngineAuto
+	c.Analytics.AutoBuildCache = false
+
+	buildLock, err := cacheBuilderFileLock(c.AnalyticsDir())
+	require.NoError(err)
+	require.NoError(buildLock.Lock())
+	t.Cleanup(func() { _ = buildLock.Unlock() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	engine, _, _, err := openDaemonAnalyticsEngine(
+		ctx, c, s, startupCacheBuildIntentNone,
+	)
+	if engine != nil {
+		_ = engine.Close()
+	}
+
+	require.ErrorIs(err, context.Canceled)
+	require.Nil(engine, "canceled startup must not open an analytics engine")
+}
+
 func TestOpenDaemonAnalyticsEngineWarnsWhenDuckDBRefreshDisabled(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -965,12 +1365,14 @@ func TestOpenDaemonAnalyticsEngineWarnsWhenDuckDBRefreshDisabled(t *testing.T) {
 	staleness := cacheNeedsBuild(c.DatabaseDSN(), c.AnalyticsDir())
 	require.False(staleness.NeedsBuild, "test cache must be ready: %+v", staleness)
 	var logs bytes.Buffer
-	oldLogger := logger
-	logger = slog.New(slog.NewTextHandler(&logs, nil))
-	t.Cleanup(func() { logger = oldLogger })
+	analyticsCtx := testInvocationContext(context.Background(), c, invocationOptions{})
+	inv := invocationFromContext(analyticsCtx)
+	oldLogger := inv.logger
+	inv.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	t.Cleanup(func() { inv.logger = oldLogger })
 
 	engine, mode, outcome, err := openDaemonAnalyticsEngine(
-		context.Background(), c, s, startupCacheBuildIntentNone,
+		analyticsCtx, c, s, startupCacheBuildIntentNone,
 	)
 	require.NoError(err, "openDaemonAnalyticsEngine")
 	defer func() { _ = engine.Close() }()
@@ -1068,15 +1470,17 @@ func TestOpenDaemonAnalyticsEngineAutoFallsBackWhenStartupBuildFails(t *testing.
 	c.Analytics.Engine = config.AnalyticsEngineAuto
 	c.Analytics.AutoBuildCache = true
 	var logs bytes.Buffer
-	oldLogger := logger
-	logger = slog.New(slog.NewTextHandler(&logs, nil))
-	t.Cleanup(func() { logger = oldLogger })
+	analyticsCtx := testInvocationContext(context.Background(), c, invocationOptions{})
+	inv := invocationFromContext(analyticsCtx)
+	oldLogger := inv.logger
+	inv.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	t.Cleanup(func() { inv.logger = oldLogger })
 	stubBuildCacheSubprocess(t, func(context.Context, bool) error {
 		return errors.New("simulated build failure")
 	})
 
 	engine, mode, outcome, err := openDaemonAnalyticsEngine(
-		context.Background(), c, s, startupCacheBuildIntentNone,
+		analyticsCtx, c, s, startupCacheBuildIntentNone,
 	)
 	require.NoError(err, "a failed auto-mode build must not fail daemon startup")
 	defer func() { _ = engine.Close() }()
@@ -1087,6 +1491,158 @@ func TestOpenDaemonAnalyticsEngineAutoFallsBackWhenStartupBuildFails(t *testing.
 	assert.Equal(startupCacheBuildOutcomeNone, outcome, "automatic failures have no explicit outcome")
 	assert.Contains(logs.String(), `msg="daemon startup step failed"`)
 	assert.Contains(logs.String(), "step=build_analytics_cache")
+}
+
+// publishStaleTestCache builds a cache for the fixture archive, then adds a
+// message so the publication is usable but stale.
+func publishStaleTestCache(t *testing.T, c *config.Config, s *store.Store) {
+	t.Helper()
+	_, err := s.DB().Exec(`
+		INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'user@example.com');
+		INSERT INTO conversations (id, source_id, source_conversation_id, conversation_type, title)
+			VALUES (1, 1, 'thread1', 'email_thread', 'Hello');
+		INSERT INTO messages (id, conversation_id, source_id, source_message_id, message_type, sent_at, subject, snippet)
+			VALUES (1, 1, 1, 'msg1', 'email', '2024-01-15 10:00:00', 'Hello', 'Preview');
+	`)
+	require.NoError(t, err, "insert published data")
+	_, err = buildCache(c.DatabaseDSN(), c.AnalyticsDir(), true)
+	require.NoError(t, err, "publish cache")
+	_, err = s.DB().Exec(`
+		INSERT INTO messages (id, conversation_id, source_id, source_message_id, message_type, sent_at, subject, snippet)
+			VALUES (2, 1, 1, 'msg2', 'email', '2024-01-16 10:00:00', 'Later', 'Arrived after publication');
+	`)
+	require.NoError(t, err, "insert unpublished message")
+}
+
+func TestOpenDaemonAnalyticsEngineDefersThrottledStartupBuild(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	c, s := openTestDaemonAnalyticsStore(t)
+	c.Analytics.Engine = config.AnalyticsEngineAuto
+	c.Analytics.AutoBuildCache = true
+	c.Analytics.MinRebuildInterval = 6 * time.Hour
+	publishStaleTestCache(t, c, s)
+	var logs bytes.Buffer
+	state := testInvocationWithConfig(c)
+	state.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	testCtx := withInvocation(t.Context(), state)
+	builds := 0
+	stubBuildCacheSubprocess(t, func(context.Context, bool) error {
+		builds++
+		return errors.New("startup must not build within the rebuild interval")
+	})
+
+	engine, mode, _, err := openDaemonAnalyticsEngine(
+		testCtx, c, s, startupCacheBuildIntentNone,
+	)
+	require.NoError(err)
+	defer func() { _ = engine.Close() }()
+
+	assert.Zero(builds, "a recent usable publication defers the startup build")
+	assert.Equal(api.AnalyticsModeDuckDB, mode, "the existing publication is served")
+	assert.Contains(logs.String(), "rebuild deferred by min_rebuild_interval")
+}
+
+func TestOpenDaemonAnalyticsEngineServesPartialPublication(t *testing.T) {
+	for _, mode := range []string{config.AnalyticsEngineAuto, config.AnalyticsEngineDuckDB} {
+		for _, interval := range []time.Duration{0, 6 * time.Hour} {
+			t.Run(fmt.Sprintf("%s/%s", mode, interval), func(t *testing.T) {
+				require := require.New(t)
+				assert := assert.New(t)
+				c, s := openTestDaemonAnalyticsStore(t)
+				c.Analytics.Engine = mode
+				c.Analytics.AutoBuildCache = true
+				c.Analytics.MinRebuildInterval = interval
+				publishStaleTestCache(t, c, s)
+				state, err := query.ReadCacheSyncState(c.AnalyticsDir())
+				require.NoError(err)
+				state.FullRebuildRequired = true
+				stateData, err := json.Marshal(state)
+				require.NoError(err)
+				require.NoError(os.WriteFile(query.CacheStatePath(c.AnalyticsDir()), stateData, 0o600))
+
+				builds := 0
+				stubBuildCacheSubprocess(t, func(_ context.Context, full bool) error {
+					builds++
+					assert.True(full, "the next build repairs the partial snapshot in full")
+					return errors.New("simulated repair failure")
+				})
+				engine, gotMode, _, err := openDaemonAnalyticsEngine(
+					context.Background(), c, s, startupCacheBuildIntentNone,
+				)
+				require.NoError(err, "a usable partial publication keeps startup available")
+				defer func() { _ = engine.Close() }()
+				assert.Equal(api.AnalyticsModeDuckDB, gotMode)
+				stats, err := engine.GetTotalStats(context.Background(), query.StatsOptions{})
+				require.NoError(err)
+				assert.Equal(int64(1), stats.MessageCount, "analytics still query the published snapshot")
+				if interval > 0 {
+					assert.Zero(builds, "a recent partial publication honors the rebuild interval")
+				} else {
+					assert.Equal(1, builds, "a due publication still attempts its full repair")
+				}
+			})
+		}
+	}
+}
+
+func TestOpenDaemonAnalyticsEngineServesUsablePublicationWhenStartupBuildFails(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	c, s := openTestDaemonAnalyticsStore(t)
+	c.Analytics.Engine = config.AnalyticsEngineAuto
+	c.Analytics.AutoBuildCache = true
+	publishStaleTestCache(t, c, s)
+	builds := 0
+	stubBuildCacheSubprocess(t, func(context.Context, bool) error {
+		builds++
+		return errors.New("simulated build failure")
+	})
+
+	engine, mode, _, err := openDaemonAnalyticsEngine(
+		context.Background(), c, s, startupCacheBuildIntentNone,
+	)
+	require.NoError(err)
+	defer func() { _ = engine.Close() }()
+
+	assert.Equal(1, builds, "without a rebuild interval the startup build runs")
+	assert.Equal(api.AnalyticsModeDuckDB, mode,
+		"a failed build keeps serving the last usable publication, not live SQL")
+}
+
+func TestOpenDaemonAnalyticsEngineDuckDBServesUsablePublicationWhenStartupBuildFails(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	c, s := openTestDaemonAnalyticsStore(t)
+	c.Analytics.Engine = config.AnalyticsEngineDuckDB
+	c.Analytics.AutoBuildCache = true
+	publishStaleTestCache(t, c, s)
+	stubBuildCacheSubprocess(t, func(context.Context, bool) error {
+		return errors.New("simulated build failure")
+	})
+
+	engine, mode, _, err := openDaemonAnalyticsEngine(
+		context.Background(), c, s, startupCacheBuildIntentNone,
+	)
+	require.NoError(err, "a usable publication keeps engine=duckdb startable after a failed build")
+	defer func() { _ = engine.Close() }()
+	assert.Equal(api.AnalyticsModeDuckDB, mode)
+}
+
+func TestOpenDaemonAnalyticsEngineDuckDBServesStalePublicationWithoutAutoBuild(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	c, s := openTestDaemonAnalyticsStore(t)
+	c.Analytics.Engine = config.AnalyticsEngineDuckDB
+	c.Analytics.AutoBuildCache = false
+	publishStaleTestCache(t, c, s)
+
+	engine, mode, _, err := openDaemonAnalyticsEngine(
+		context.Background(), c, s, startupCacheBuildIntentNone,
+	)
+	require.NoError(err, "engine=duckdb serves a usable publication even when stale")
+	defer func() { _ = engine.Close() }()
+	assert.Equal(api.AnalyticsModeDuckDB, mode)
 }
 
 func TestOpenDaemonAnalyticsEngineDuckDBRequiresCacheBuild(t *testing.T) {
@@ -1298,10 +1854,7 @@ func TestOpenDaemonAnalyticsEngineExplicitDuckDBFailureIsFatal(t *testing.T) {
 func openTestDaemonAnalyticsStore(t *testing.T) (*config.Config, *store.Store) {
 	t.Helper()
 	c := lifecycleTestConfig(t.TempDir())
-	s, err := store.Open(c.DatabaseDSN())
-	require.NoError(t, err, "open store")
-	t.Cleanup(func() { _ = s.Close() })
-	require.NoError(t, s.InitSchema(), "init schema")
+	s := testutil.NewSQLiteTestStoreAt(t, c.DatabaseDSN())
 	return c, s
 }
 
@@ -1330,10 +1883,7 @@ func TestStoreAPIAdapterServesSourceStatus(t *testing.T) {
 	assert := assert.New(t)
 	tmpDir := t.TempDir()
 
-	s, err := store.Open(filepath.Join(tmpDir, "msgvault.db"))
-	require.NoError(err, "open store")
-	defer func() { _ = s.Close() }()
-	require.NoError(s.InitSchema(), "init schema")
+	s := testutil.NewSQLiteTestStoreAt(t, filepath.Join(tmpDir, "msgvault.db"))
 
 	source, err := s.GetOrCreateSource("gmail", "alice@example.com")
 	require.NoError(err, "create source")
@@ -1379,8 +1929,6 @@ func TestStoreAPIAdapterServesSourceStatus(t *testing.T) {
 	require.NotNil(got.LastSuccessfulSync, "LastSuccessfulSync")
 	assert.Equal(completedID, got.LastSuccessfulSync.ID, "LastSuccessfulSync.ID")
 	assert.Equal(store.SyncStatusCompleted, got.LastSuccessfulSync.Status, "LastSuccessfulSync.Status")
-	require.NotNil(got.LastSuccessfulSync.CursorAfter, "LastSuccessfulSync.CursorAfter")
-	assert.Equal("history-2", *got.LastSuccessfulSync.CursorAfter, "LastSuccessfulSync.CursorAfter")
 }
 
 func TestStoreAPIAdapterRunCLISyncPacksOnlyAfterSubprocessSuccess(t *testing.T) {
@@ -1465,9 +2013,158 @@ func TestCLISyncSubprocessArgsIncludesExactSourceID(t *testing.T) {
 		cliSyncSubprocessArgs(api.CLISyncRequest{SourceID: 42, SourceIDSet: true}),
 	)
 	assert.Equal(t,
-		[]string{"sync-full", "--source-id", "42"},
-		cliSyncSubprocessArgs(api.CLISyncRequest{Full: true, SourceID: 42, SourceIDSet: true}),
+		[]string{"sync-full", "--source-id", "42", "--sync-operation-id", "operation-1"},
+		cliSyncSubprocessArgs(api.CLISyncRequest{
+			Full: true, SourceID: 42, SourceIDSet: true, OperationID: "operation-1",
+		}),
 	)
+}
+
+func testDaemonCLIRunCannotUseServerRemoteDeleteConfigOrEnvironment(t *testing.T, binaryPath string) {
+	t.Helper()
+	cfg := testConfigValue()
+	cfgFile := ""
+	homeDir := ""
+	useLocal := false
+
+	require := require.New(t)
+	assert := assert.New(t)
+
+	savedResolver := daemonCLIExecutableResolver
+	daemonCLIExecutableResolver = func() (string, error) { return binaryPath, nil }
+	t.Cleanup(func() { daemonCLIExecutableResolver = savedResolver })
+
+	dataDir := t.TempDir()
+	configPath := filepath.Join(dataDir, "config.toml")
+	configContents := fmt.Sprintf(`[data]
+data_dir = %q
+
+[server]
+api_key = %q
+
+[deletion]
+remote_enabled = true
+`, dataDir, "boundary-secret")
+	require.NoError(os.WriteFile(configPath, []byte(configContents), 0o600))
+	serverCfg, err := config.Load(configPath, "")
+	require.NoError(err)
+
+	savedCfg, savedCfgFile, savedHomeDir, savedUseLocal := cfg, cfgFile, homeDir, useLocal
+	cfg, cfgFile, homeDir, useLocal = serverCfg, configPath, "", false
+	t.Cleanup(func() {
+		cfg, cfgFile, homeDir, useLocal = savedCfg, savedCfgFile, savedHomeDir, savedUseLocal
+	})
+	t.Setenv(remoteDeleteEnvVar, "1")
+
+	st := testutil.NewSQLiteTestStoreAt(t, serverCfg.DatabaseDSN())
+	source, err := st.GetOrCreateSource("gmail", "boundary@example.invalid")
+	require.NoError(err)
+
+	manager, err := deletion.NewManager(filepath.Join(dataDir, "deletions"))
+	require.NoError(err)
+	manifest := deletion.NewManifestForSource("daemon consent boundary", []string{"remote-1"}, deletion.SourceReference{
+		ID: source.ID, Type: source.SourceType, Identifier: source.Identifier,
+	})
+	require.NoError(manager.SaveManifest(manifest))
+
+	daemon := api.NewServerWithOptions(api.ServerOptions{
+		Config: serverCfg,
+		Store:  &storeAPIAdapter{store: st, config: serverCfg, options: invocationOptions{cfgFile: configPath}},
+		Logger: slog.New(slog.DiscardHandler),
+	})
+	body, err := json.Marshal(api.CLIRunRequest{
+		Args: []string{"delete-staged", "--yes", manifest.ID},
+	})
+	require.NoError(err)
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/cli/run", bytes.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-Api-Key", "boundary-secret")
+	response := httptest.NewRecorder()
+
+	daemon.Router().ServeHTTP(response, request)
+
+	require.Equal(http.StatusOK, response.Code, response.Body.String())
+	var events []api.CLIRunEvent
+	decoder := json.NewDecoder(response.Body)
+	for decoder.More() {
+		var event api.CLIRunEvent
+		require.NoError(decoder.Decode(&event))
+		events = append(events, event)
+	}
+	require.Len(events, 3, response.Body.String())
+	blocked := "remote deletion is gated; set [deletion] remote_enabled = true in the invoking CLI's config.toml for durable consent; one-command alternative: " +
+		remoteDeleteEnvVar + "=1"
+	var stdout, stderr, subprocessError string
+	for _, event := range events {
+		switch event.Type {
+		case "stdout":
+			stdout += event.Data
+		case "stderr":
+			stderr += event.Data
+		case "error":
+			subprocessError = event.Error
+		}
+	}
+	assert.Contains(stdout, "Deletion Summary:\n")
+	assert.Equal("Error: "+blocked+"\n", stderr)
+	assert.Equal(cliSubprocessExitSentinel, subprocessError)
+	assert.FileExists(filepath.Join(manager.PendingDir(), manifest.ID+".json"))
+	assert.NoFileExists(filepath.Join(manager.InProgressDir(), manifest.ID+".json"))
+}
+
+func TestStoreAPIAdapterCanceledSyncOperationIsFailed(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := storetest.New(t)
+	_, err := f.Store.CreateSyncOperation(f.Source.ID, "operation-1")
+	require.NoError(err)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	adapter := &storeAPIAdapter{store: f.Store}
+
+	err = adapter.runCLISyncOperationWithRunner(
+		ctx,
+		api.CLISyncRequest{Full: true, OperationID: "operation-1"},
+		nil,
+		func(context.Context, []string, func(string, string) error) error { return nil },
+	)
+
+	require.ErrorIs(err, context.Canceled)
+	op, err := f.Store.GetSyncOperation("operation-1")
+	require.NoError(err)
+	assert.Equal("failed", op.Status)
+	assert.False(op.StartedAt.Valid)
+	assert.True(op.FinishedAt.Valid)
+	assert.Empty(op.Runs)
+}
+
+func TestStoreAPIAdapterFinalizesSyncOperationAfterRunnerReturns(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := storetest.New(t)
+	_, err := f.Store.CreateSyncOperation(f.Source.ID, "operation-1")
+	require.NoError(err)
+	adapter := &storeAPIAdapter{store: f.Store}
+
+	err = adapter.runCLISyncOperationWithRunner(
+		t.Context(),
+		api.CLISyncRequest{Full: true, OperationID: "operation-1"},
+		nil,
+		func(context.Context, []string, func(string, string) error) error {
+			runID, err := f.Store.StartSyncOperation(f.Source.ID, "operation-1")
+			require.NoError(err)
+			require.NoError(f.Store.CompleteSync(runID, "cursor"))
+			op, err := f.Store.GetSyncOperation("operation-1")
+			require.NoError(err)
+			assert.Equal("running", op.Status)
+			return nil
+		},
+	)
+
+	require.NoError(err)
+	op, err := f.Store.GetSyncOperation("operation-1")
+	require.NoError(err)
+	assert.Equal("done", op.Status)
 }
 
 func TestStoreAPIAdapterRunCLICommandPacksOnlyAllowlistedSuccess(t *testing.T) {
@@ -1542,6 +2239,60 @@ func TestStoreAPIAdapterRunCLICommandPacksOnlyAllowlistedSuccess(t *testing.T) {
 	}
 }
 
+func TestStoreAPIAdapterRunCLIRepairMessageUsesDedicatedLocalArgv(t *testing.T) {
+	tests := []struct {
+		name string
+		req  api.CLIRepairMessageRequest
+		want []string
+	}{
+		{
+			name: "repair",
+			req:  api.CLIRepairMessageRequest{Reference: "gmail-42", SourceID: 7},
+			want: []string{"repair-message", "--local", "--source-id", "7", "--", "gmail-42"},
+		},
+		{
+			name: "hyphen-prefixed reference stays positional",
+			req:  api.CLIRepairMessageRequest{Reference: "--audit"},
+			want: []string{"repair-message", "--local", "--", "--audit"},
+		},
+		{
+			name: "whole archive audit json",
+			req:  api.CLIRepairMessageRequest{Audit: true, JSON: true},
+			want: []string{"repair-message", "--local", "--audit", "--json"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var gotArgs []string
+			var events []api.CLIRepairMessageEvent
+			adapter := &storeAPIAdapter{}
+			err := adapter.runCLIRepairMessageWithRunner(t.Context(), test.req, func(event api.CLIRepairMessageEvent) error {
+				events = append(events, event)
+				return nil
+			}, func(_ context.Context, args []string, emit func(string, string) error) error {
+				gotArgs = append([]string(nil), args...)
+				return emit("stdout", "line\n")
+			})
+
+			require.NoError(t, err)
+			assert.Equal(t, test.want, gotArgs)
+			assert.Equal(t, []api.CLIRepairMessageEvent{{Type: "stdout", Data: "line\n"}}, events)
+		})
+	}
+}
+
+func TestStoreAPIAdapterRunCLIRepairMessagePropagatesCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	adapter := &storeAPIAdapter{}
+	err := adapter.runCLIRepairMessageWithRunner(ctx, api.CLIRepairMessageRequest{Audit: true}, nil,
+		func(ctx context.Context, _ []string, _ func(string, string) error) error {
+			cancel()
+			<-ctx.Done()
+			return ctx.Err()
+		})
+	require.ErrorIs(t, err, context.Canceled)
+}
+
 func TestStoreAPIAdapterAppendsServerOwnedGrantDecision(t *testing.T) {
 	adapter := &storeAPIAdapter{}
 	req := api.CLIRunRequest{
@@ -1593,7 +2344,7 @@ func TestStoreAPIAdapterInterceptsExplicitRepackInDaemonParent(t *testing.T) {
 	)
 
 	require.NoError(err)
-	has, err := f.store.HasPackRecord(oldPackID)
+	has, err := f.store.HasPackRecordContext(t.Context(), oldPackID)
 	require.NoError(err)
 	assert.False(has)
 	require.Len(events, 1)
@@ -1638,7 +2389,7 @@ func TestStoreAPIAdapterExplicitRepackAcceptsLoggingPassthroughFlags(t *testing.
 	)
 
 	require.NoError(err)
-	has, err := f.store.HasPackRecord(oldPackID)
+	has, err := f.store.HasPackRecordContext(t.Context(), oldPackID)
 	require.NoError(err)
 	assert.False(has)
 }
@@ -1674,6 +2425,7 @@ func TestStoreAPIAdapterRepackAfterSuccessfulRemovalOnly(t *testing.T) {
 		{name: "successful account removal", args: []string{"remove-account", "alice@example.com", "--yes"}, wantRemoved: true},
 		{name: "failed account removal", args: []string{"remove-account", "alice@example.com", "--yes"}, predecessorErr: errors.New("remove failed")},
 		{name: "successful excluded media purge", args: []string{"purge-excluded-media", "--yes"}, wantRemoved: true},
+		{name: "successful garbage collection", args: []string{"gc", "--yes"}, wantRemoved: true},
 		{name: "dry run is not a removal", args: []string{"purge-excluded-media", "--dry-run"}},
 		{name: "unconfirmed purge is not a removal", args: []string{"purge-excluded-media"}},
 		{name: "failed excluded media purge", args: []string{"purge-excluded-media", "--yes"}, predecessorErr: errors.New("purge failed")},
@@ -1702,7 +2454,7 @@ func TestStoreAPIAdapterRepackAfterSuccessfulRemovalOnly(t *testing.T) {
 				require.NoError(err)
 			}
 			assert.Equal(1, runnerCalls)
-			has, hasErr := f.store.HasPackRecord(oldPackID)
+			has, hasErr := f.store.HasPackRecordContext(t.Context(), oldPackID)
 			require.NoError(hasErr)
 			assert.Equal(!tt.wantRemoved, has)
 		})
@@ -1756,7 +2508,7 @@ func TestStoreAPIAdapterPostRemovalRepackCancellationPreservesSuccess(t *testing
 
 	require.NoError(err, "maintenance cancellation cannot erase committed removal success")
 	assert.Empty(events, "cancellation is informational, not a streamed warning")
-	has, err := f.store.HasPackRecord(oldPackID)
+	has, err := f.store.HasPackRecordContext(t.Context(), oldPackID)
 	require.NoError(err)
 	assert.True(has, "canceled cleanup remains inventoried for retry")
 	assert.Contains(f.logs.String(), "automatic attachment repack canceled")
@@ -1780,7 +2532,7 @@ func TestStoreAPIAdapterExplicitRepackCancellationFailsFast(t *testing.T) {
 	)
 
 	require.ErrorIs(err, context.Canceled)
-	has, getErr := f.store.HasPackRecord(oldPackID)
+	has, getErr := f.store.HasPackRecordContext(t.Context(), oldPackID)
 	require.NoError(getErr)
 	assert.True(has, "fail-fast cancellation leaves physical inventory untouched")
 }
@@ -1836,10 +2588,7 @@ func TestStoreAPIAdapterServesCLIInitDB(t *testing.T) {
 	assert := assert.New(t)
 	tmpDir := t.TempDir()
 
-	s, err := store.Open(filepath.Join(tmpDir, "msgvault.db"))
-	require.NoError(err, "open store")
-	defer func() { _ = s.Close() }()
-	require.NoError(s.InitSchema(), "init schema")
+	s := testutil.NewSQLiteTestStoreAt(t, filepath.Join(tmpDir, "msgvault.db"))
 
 	adapter := &storeAPIAdapter{store: s}
 	srv := api.NewServer(
@@ -1941,14 +2690,167 @@ func TestStoreAPIAdapterServesCLIDeleteDeduped(t *testing.T) {
 // cfg.Vector.Enabled is false, setupVectorFeatures returns (nil, nil)
 // regardless of build tag. Runs under both tagged and untagged builds.
 func TestSetupVectorFeatures_Disabled(t *testing.T) {
+	cfg := testConfigValue()
+
 	savedCfg := cfg
 	defer func() { cfg = savedCfg }()
 	cfg = &config.Config{}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	cfg.Vector.Enabled = false
 
-	vf, err := setupVectorFeatures(context.Background(), nil, "", false)
+	vf, err := setupVectorFeatures(testCtx, nil, "", false)
 	require.NoError(t, err, "setupVectorFeatures")
 	assert.Nil(t, vf, "setupVectorFeatures should be nil when disabled")
+}
+
+func TestRunScheduledGmailSync_ReauthGuidance(t *testing.T) {
+	cfg := testConfigValue()
+	logger := testLoggerValue()
+
+	for _, tc := range []struct {
+		name, scope, flags string
+	}{
+		{"default", oauth.ScopeGmailModify, ""},
+		{"readonly", oauth.ScopeGmailReadonly, " --readonly"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			// An expired token without a refresh token fails locally, without
+			// contacting Google or opening an authorization flow.
+			tokenPath, restore := seedTokenEnv(t, fmt.Sprintf(`{"access_token":"expired","expiry":"2000-01-01T00:00:00Z","scopes":[%q]}`, tc.scope))
+			defer restore()
+			cfg = testConfigValue()
+			cfg.OAuth.ClientSecrets = filepath.Join(filepath.Dir(filepath.Dir(tokenPath)), "client_secret.json")
+			mgr, err := oauth.NewManagerWithCredentials(t.Context(), config.OAuthApp{ClientSecrets: cfg.OAuth.ClientSecrets}, cfg.TokensDir(), config.OAuthTokenCommands{}, logger, oauth.Scopes)
+			require.NoError(err)
+			scheduledCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+			_, err = runScheduledGmailSync(scheduledCtx, scopeEscalationAccount, nil, nil,
+				func(ctx context.Context, _ string) (*oauth.Manager, error) { return mgr, nil }, invocationFromContext(scheduledCtx))
+			require.Error(err)
+			assert.Contains(err.Error(), "msgvault add-account user@example.com"+tc.flags+" --force")
+			assert.Contains(err.Error(), "msgvault add-account user@example.com"+tc.flags+" --headless")
+		})
+	}
+}
+
+func TestDaemonGmailClientUsesSourceCredentialsWithoutScopeUpgrade(t *testing.T) {
+	// Credential fixtures set process environment; keep these cases sequential.
+	t.Run("named OAuth app", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		tokenPath, restore := seedTokenEnv(t, fmt.Sprintf(`{"access_token":"synthetic-access","expiry":"2099-01-01T00:00:00Z","scopes":[%q]}`, oauth.ScopeGmailReadonly))
+		defer restore()
+		cfg := testConfigValue()
+		logger := testLoggerValue()
+		cfg.OAuth.ClientSecrets = filepath.Join(filepath.Dir(filepath.Dir(tokenPath)), "client_secret.json")
+		ctx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+		before, err := os.ReadFile(tokenPath)
+		require.NoError(err)
+		cfg.OAuth.Apps = map[string]config.OAuthApp{"archive": {ClientSecrets: cfg.OAuth.ClientSecrets}}
+		source := &store.Source{SourceType: "gmail", Identifier: scopeEscalationAccount, OAuthApp: sql.NullString{String: "archive", Valid: true}}
+		var selected string
+		client, _, err := newDaemonGmailClient(ctx, source.Identifier, source, func(ctx context.Context, app string) (*oauth.Manager, error) {
+			selected = app
+			return oauth.NewManagerWithCredentials(t.Context(), config.OAuthApp{ClientSecrets: cfg.OAuth.Apps[app].ClientSecrets}, cfg.TokensDir(), config.OAuthTokenCommands{}, logger, oauth.Scopes)
+		}, invocationFromContext(ctx), oauth.Scopes)
+		require.NoError(err)
+		t.Cleanup(func() { _ = client.Close() })
+		assert.Equal("archive", selected)
+		after, err := os.ReadFile(tokenPath)
+		require.NoError(err)
+		assert.Equal(before, after, "reading a profile must not upgrade the stored grant")
+	})
+	t.Run("named service account", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		cfg := testConfigValue()
+		ctx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+		// A missing source-bound key fails locally. It must never fall back to
+		// the otherwise configured interactive OAuth app or open authorization.
+		cfg.OAuth.Apps = map[string]config.OAuthApp{"delegated": {ServiceAccountKey: filepath.Join(t.TempDir(), "missing-key.json")}}
+		source := &store.Source{SourceType: "gmail", Identifier: scopeEscalationAccount, OAuthApp: sql.NullString{String: "delegated", Valid: true}}
+		called := false
+		client, _, err := newDaemonGmailClient(ctx, source.Identifier, source, func(ctx context.Context, _ string) (*oauth.Manager, error) {
+			called = true
+			return nil, errors.New("unexpected OAuth fallback")
+		}, invocationFromContext(ctx), oauth.Scopes)
+		require.ErrorContains(err, "service account")
+		credentialErr, ok := errors.AsType[*provideridentity.GmailCredentialError](err)
+		require.True(ok)
+		assert.Contains(credentialErr.Remediation(), "service_account_key")
+		assert.Nil(client)
+		assert.False(called)
+	})
+}
+
+func TestDaemonGmailClientCredentialFailures(t *testing.T) {
+	// Token fixtures set process environment; keep these cases sequential.
+	for _, tc := range []struct {
+		name, providerCode, remediation, tokenJSON string
+		removeToken                                bool
+	}{
+		{"missing token", "", "msgvault add-account", "", true},
+		{"revoked token", "invalid_grant", "expired or been revoked", "", false},
+		{"expired without refresh token", "", "expired or been revoked", `{"access_token":"expired","expiry":"2000-01-01T00:00:00Z"}`, false},
+		{"malformed file token", "", "expired or been revoked", "{", false},
+		{"unexpected provider error", "server_error", "", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			tokenJSON := tc.tokenJSON
+			if tokenJSON == "" {
+				tokenJSON = `{"access_token":"expired","refresh_token":"synthetic-refresh","expiry":"2000-01-01T00:00:00Z"}`
+			}
+			tokenPath, restore := seedTokenEnv(t, tokenJSON)
+			defer restore()
+			cfg := testConfigValue()
+			cfg.OAuth.ClientSecrets = filepath.Join(filepath.Dir(filepath.Dir(tokenPath)), "client_secret.json")
+			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = fmt.Fprintf(w, `{"error":%q,"error_description":"synthetic-secret-token"}`, tc.providerCode)
+			}))
+			t.Cleanup(provider.Close)
+			var secrets map[string]map[string]any
+			require.NoError(json.Unmarshal([]byte(fakeClientSecrets), &secrets))
+			secrets["installed"]["token_uri"] = provider.URL
+			encoded, err := json.Marshal(secrets)
+			require.NoError(err)
+			require.NoError(os.WriteFile(cfg.OAuth.ClientSecrets, encoded, 0600))
+			if tc.removeToken {
+				require.NoError(os.Remove(tokenPath))
+			}
+			ctx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+			source := &store.Source{SourceType: "gmail", Identifier: scopeEscalationAccount}
+			client, _, err := newDaemonGmailClient(ctx, source.Identifier, source, oauthManagerCache(invocationFromContext(ctx)), invocationFromContext(ctx), oauth.Scopes)
+			require.Error(err)
+			assert.Nil(client)
+			credentialErr, ok := errors.AsType[*provideridentity.GmailCredentialError](err)
+			if tc.remediation == "" {
+				assert.False(ok, "unexpected provider errors must remain internal")
+				return
+			}
+			require.True(ok)
+			assert.Contains(credentialErr.Remediation(), tc.remediation)
+			assert.NotContains(credentialErr.Remediation(), "synthetic-secret-token")
+		})
+	}
+	t.Run("missing OAuth configuration", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		cfg := &config.Config{}
+		ctx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+		source := &store.Source{SourceType: "gmail", Identifier: "owner@example.test"}
+		client, _, err := newDaemonGmailClient(ctx, source.Identifier, source, oauthManagerCache(invocationFromContext(ctx)), invocationFromContext(ctx), oauth.Scopes)
+		require.Error(err)
+		assert.Nil(client)
+		credentialErr, ok := errors.AsType[*provideridentity.GmailCredentialError](err)
+		require.True(ok)
+		assert.Contains(credentialErr.Remediation(), "OAuth app and client-secrets file")
+	})
 }
 
 // TestRunScheduledIMAPSync_NoCredentials verifies that the IMAP path
@@ -1957,32 +2859,33 @@ func TestSetupVectorFeatures_Disabled(t *testing.T) {
 // rather than the misleading "oauth2: token expired and refresh token
 // is not set" message reported in #329.
 func TestRunScheduledIMAPSync_NoCredentials(t *testing.T) {
+	cfg := testConfigValue()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	savedCfg := cfg
 	defer func() { cfg = savedCfg }()
 	cfg = &config.Config{}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	cfg.Data.DataDir = t.TempDir()
 
-	s, err := store.Open(filepath.Join(cfg.Data.DataDir, "msgvault.db"))
-	require.NoError(err, "open store")
-	defer func() { _ = s.Close() }()
-	require.NoError(s.InitSchema(), "init schema")
+	s := testutil.NewSQLiteTestStoreAt(t, filepath.Join(cfg.Data.DataDir, "msgvault.db"))
 
 	const imapID = "imaps://user@example.com@imap.example.com:993"
-	_, err = s.GetOrCreateSource("imap", imapID)
+	_, err := s.GetOrCreateSource("imap", imapID)
 	require.NoError(err, "create imap source")
 
 	// getOAuthMgr is only invoked on the Gmail path; fail loudly so
 	// any wrong-path dispatch is obvious.
-	getOAuthMgr := func(app string) (*oauth.Manager, error) {
+	getOAuthMgr := func(ctx context.Context, app string) (*oauth.Manager, error) {
 		assert.Fail("Gmail OAuth manager unexpectedly requested for IMAP source", "app=%q", app)
 		// Unreachable: the assert.Fail above already failed the test; the
 		// return only satisfies the signature.
 		return nil, nil //nolint:nilnil // unreachable guard, see comment above
 	}
 
-	err = runScheduledSync(context.Background(), imapID, s, getOAuthMgr)
+	err = runScheduledSync(testCtx, imapID, s, getOAuthMgr, invocationFromContext(testCtx))
 	require.Error(err, "runScheduledSync(imap, no creds) want credentials error")
 	msg := err.Error()
 	assert.False(strings.Contains(msg, "refresh token") || strings.Contains(msg, "token may be expired"),
@@ -1998,17 +2901,18 @@ func TestRunScheduledIMAPSync_NoCredentials(t *testing.T) {
 // matched against identifier, so config-driven scheduled syncs fell
 // through to the Gmail OAuth path (#329).
 func TestRunScheduledIMAPSync_DispatchByDisplayName(t *testing.T) {
+	cfg := testConfigValue()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	savedCfg := cfg
 	defer func() { cfg = savedCfg }()
 	cfg = &config.Config{}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	cfg.Data.DataDir = t.TempDir()
 
-	s, err := store.Open(filepath.Join(cfg.Data.DataDir, "msgvault.db"))
-	require.NoError(err, "open store")
-	defer func() { _ = s.Close() }()
-	require.NoError(s.InitSchema(), "init schema")
+	s := testutil.NewSQLiteTestStoreAt(t, filepath.Join(cfg.Data.DataDir, "msgvault.db"))
 
 	const (
 		imapID    = "imaps://user@example.com@imap.example.com:993"
@@ -2018,7 +2922,7 @@ func TestRunScheduledIMAPSync_DispatchByDisplayName(t *testing.T) {
 	require.NoError(err, "create imap source")
 	require.NoError(s.UpdateSourceDisplayName(src.ID, imapEmail), "set display_name")
 
-	getOAuthMgr := func(app string) (*oauth.Manager, error) {
+	getOAuthMgr := func(ctx context.Context, app string) (*oauth.Manager, error) {
 		assert.Fail("Gmail OAuth manager unexpectedly requested for IMAP source", "app=%q", app)
 		// Unreachable: the assert.Fail above already failed the test; the
 		// return only satisfies the signature.
@@ -2028,7 +2932,7 @@ func TestRunScheduledIMAPSync_DispatchByDisplayName(t *testing.T) {
 	// Pass the email (as config.toml `email = "..."` would supply it),
 	// not the imaps:// identifier. Dispatch must still land on the
 	// IMAP path; absence of credentials produces an IMAP-shaped error.
-	err = runScheduledSync(context.Background(), imapEmail, s, getOAuthMgr)
+	err = runScheduledSync(testCtx, imapEmail, s, getOAuthMgr, invocationFromContext(testCtx))
 	require.Error(err, "runScheduledSync(email, no creds) want IMAP credentials error")
 	msg := err.Error()
 	assert.False(strings.Contains(msg, "refresh token") || strings.Contains(msg, "token may be expired"),
@@ -2043,17 +2947,18 @@ func TestRunScheduledIMAPSync_DispatchByDisplayName(t *testing.T) {
 // would inject e.g. "imaps://user@host:993" into account_identities
 // when the user had cleared their identities.
 func TestRunScheduledIMAPSync_DefaultIdentityIsDisplayName(t *testing.T) {
+	cfg := testConfigValue()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	savedCfg := cfg
 	defer func() { cfg = savedCfg }()
 	cfg = &config.Config{}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	cfg.Data.DataDir = t.TempDir()
 
-	s, err := store.Open(filepath.Join(cfg.Data.DataDir, "msgvault.db"))
-	require.NoError(err, "open store")
-	defer func() { _ = s.Close() }()
-	require.NoError(s.InitSchema(), "init schema")
+	s := testutil.NewSQLiteTestStoreAt(t, filepath.Join(cfg.Data.DataDir, "msgvault.db"))
 
 	// Use a closed port on loopback so buildAPIClient succeeds (the
 	// client doesn't dial in its constructor) and confirmDefaultIdentity
@@ -2070,7 +2975,7 @@ func TestRunScheduledIMAPSync_DefaultIdentityIsDisplayName(t *testing.T) {
 	), "set sync_config")
 	require.NoError(imaplib.SaveCredentials(cfg.TokensDir(), imapID, "unused"), "save credentials")
 
-	getOAuthMgr := func(app string) (*oauth.Manager, error) {
+	getOAuthMgr := func(ctx context.Context, app string) (*oauth.Manager, error) {
 		assert.Fail("Gmail OAuth manager unexpectedly requested", "app=%q", app)
 		// Unreachable: the assert.Fail above already failed the test; the
 		// return only satisfies the signature.
@@ -2079,7 +2984,7 @@ func TestRunScheduledIMAPSync_DefaultIdentityIsDisplayName(t *testing.T) {
 
 	// Expected to fail at the IMAP connection; what matters is that
 	// confirmDefaultIdentity ran first with the display_name.
-	_ = runScheduledSync(context.Background(), imapID, s, getOAuthMgr)
+	_ = runScheduledSync(testCtx, imapID, s, getOAuthMgr, invocationFromContext(testCtx))
 
 	identities, err := s.ListAccountIdentities(src.ID)
 	require.NoError(err, "ListAccountIdentities")
@@ -2110,14 +3015,11 @@ func TestFindScheduledSyncSources(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	tmpDir := t.TempDir()
-	s, err := store.Open(filepath.Join(tmpDir, "msgvault.db"))
-	require.NoError(err, "open store")
-	defer func() { _ = s.Close() }()
-	require.NoError(s.InitSchema(), "init schema")
+	s := testutil.NewSQLiteTestStoreAt(t, filepath.Join(tmpDir, "msgvault.db"))
 
 	// Unknown identifier returns empty slice (not nil), enabling the
 	// Gmail token-first fallback in runScheduledSync.
-	got, err := findScheduledSyncSources(s, "missing@example.com")
+	got, _, err := findScheduledSyncSources(s, "missing@example.com")
 	require.NoError(err, "findScheduledSyncSources(missing)")
 	assert.Empty(got, "findScheduledSyncSources(missing) should be empty")
 
@@ -2134,7 +3036,7 @@ func TestFindScheduledSyncSources(t *testing.T) {
 	teamsSrc, err := s.GetOrCreateSource("teams", sharedEmail)
 	require.NoError(err, "create teams source")
 
-	got, err = findScheduledSyncSources(s, sharedEmail)
+	got, _, err = findScheduledSyncSources(s, sharedEmail)
 	require.NoError(err, "findScheduledSyncSources(imap+teams)")
 	require.Len(got, 2, "findScheduledSyncSources(imap+teams) should return 2 sources")
 	assert.Equal("imap", got[0].SourceType, "first source should be imap")
@@ -2147,7 +3049,7 @@ func TestFindScheduledSyncSources(t *testing.T) {
 	gmailSrc, err := s.GetOrCreateSource("gmail", gmailAddr)
 	require.NoError(err, "create gmail source")
 
-	got, err = findScheduledSyncSources(s, gmailAddr)
+	got, _, err = findScheduledSyncSources(s, gmailAddr)
 	require.NoError(err, "findScheduledSyncSources(gmail)")
 	require.Len(got, 1, "findScheduledSyncSources(gmail) should return 1 source")
 	assert.Equal("gmail", got[0].SourceType, "source should be gmail")
@@ -2158,7 +3060,7 @@ func TestFindScheduledSyncSources(t *testing.T) {
 	_, err = s.GetOrCreateSource("mbox", mboxAddr)
 	require.NoError(err, "create mbox source")
 
-	got, err = findScheduledSyncSources(s, mboxAddr)
+	got, _, err = findScheduledSyncSources(s, mboxAddr)
 	require.NoError(err, "findScheduledSyncSources(mbox-only)")
 	assert.Empty(got, "findScheduledSyncSources(mbox-only) should be empty")
 
@@ -2171,17 +3073,75 @@ func TestFindScheduledSyncSources(t *testing.T) {
 	require.NoError(err, "create second Discord source")
 	require.NoError(s.UpdateSourceDisplayName(discordB.ID, "Shared Guild"), "name second Discord source")
 
-	got, err = findScheduledSyncSources(s, discordB.Identifier)
+	got, _, err = findScheduledSyncSources(s, discordB.Identifier)
 	require.NoError(err, "find Discord source by guild ID")
 	require.Len(got, 1, "exact guild ID selects one Discord source")
 	assert.Equal(discordB.ID, got[0].ID)
 
-	got, err = findScheduledSyncSources(s, "Shared Guild")
+	got, _, err = findScheduledSyncSources(s, "Shared Guild")
 	require.NoError(err, "do not resolve Discord source by display name")
 	assert.Empty(got, "duplicate guild display names must not select an arbitrary source")
 }
 
+func TestScheduledSyncSkipsRetiredSourcesWithoutGmailFallback(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := storetest.New(t)
+	retired, err := f.Store.GetOrCreateSource(sourceTypeGmail, "history@example.test")
+	require.NoError(err)
+	destination, err := f.Store.GetOrCreateSource(sourceTypeGmail, "current@example.test")
+	require.NoError(err)
+	_, err = f.Store.MergeSourcesContext(t.Context(), store.MergeSourcesRequest{
+		FromSourceID: retired.ID, IntoSourceID: destination.ID,
+	})
+	require.NoError(err)
+
+	sources, retiredMatch, err := findScheduledSyncSources(f.Store, retired.Identifier)
+	require.NoError(err)
+	assert.Empty(sources)
+	assert.True(retiredMatch)
+
+	state := &invocation{cfg: &config.Config{}, logger: slog.New(slog.DiscardHandler)}
+	ctx := withInvocation(t.Context(), state)
+	err = runScheduledSync(ctx, retired.Identifier, f.Store, func(context.Context, string) (*oauth.Manager, error) {
+		return nil, errors.New("retired source incorrectly reached Gmail fallback")
+	}, state)
+	assert.Same(scheduler.ErrDeferUntilNextTrigger, err, "retired source defers without entering the Gmail fallback")
+}
+
+func TestScheduledSyncSkipsRetiredLegacyGmailSourceWithoutFallback(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := storetest.New(t)
+	retired, err := f.Store.GetOrCreateSource(sourceTypeGmail, "legacy-history@example.test")
+	require.NoError(err)
+	destination, err := f.Store.GetOrCreateSource(sourceTypeGmail, "legacy-current@example.test")
+	require.NoError(err)
+	_, err = f.Store.MergeSourcesContext(t.Context(), store.MergeSourcesRequest{
+		FromSourceID: retired.ID, IntoSourceID: destination.ID,
+	})
+	require.NoError(err)
+	_, err = f.Store.DB().Exec(
+		f.Store.Rebind(`UPDATE sources SET source_type = '' WHERE id = ?`), retired.ID,
+	)
+	require.NoError(err)
+
+	sources, retiredMatch, err := findScheduledSyncSources(f.Store, retired.Identifier)
+	require.NoError(err)
+	assert.Empty(sources)
+	assert.True(retiredMatch, "legacy source type still marks the account as retired")
+
+	state := &invocation{cfg: &config.Config{}, logger: slog.New(slog.DiscardHandler)}
+	ctx := withInvocation(t.Context(), state)
+	err = runScheduledSync(ctx, retired.Identifier, f.Store, func(context.Context, string) (*oauth.Manager, error) {
+		return nil, errors.New("retired legacy source incorrectly reached Gmail fallback")
+	}, state)
+	assert.Same(scheduler.ErrDeferUntilNextTrigger, err, "retired legacy source defers without entering the Gmail fallback")
+}
+
 func TestScheduledTeamsImportOptionsApplyMediaPolicy(t *testing.T) {
+	cfg := testConfigValue()
+
 	oldConfig := cfg
 	t.Cleanup(func() { cfg = oldConfig })
 	enabled := true
@@ -2194,14 +3154,82 @@ func TestScheduledTeamsImportOptionsApplyMediaPolicy(t *testing.T) {
 			},
 		},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 
-	opts := scheduledTeamsImportOptions("user@example.com")
+	opts := scheduledTeamsImportOptions("user@example.com", cfg)
 	assert.Equal(t, cfg.Teams.MediaPolicy("user@example.com"), opts.MediaPolicy)
 	assert.Equal(t, cfg.AttachmentsDir(), opts.AttachmentsDir)
 	assert.True(t, opts.IncludeChannels)
 }
 
 func TestRunScheduledSyncUsesSharedDiscordImporterAndRebuildsOnce(t *testing.T) {
+	importErr := errors.New("synthetic Discord import failure")
+	cacheErr := errors.New("synthetic cache failure")
+	for _, tc := range []struct {
+		name       string
+		importErr  error
+		rebuildErr error
+		wantErr    error
+	}{
+		{"import failure", importErr, nil, importErr},
+		{"cache failure", nil, cacheErr, cacheErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			cfg := config.NewDefaultConfig()
+			testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+			state := invocationFromContext(testCtx)
+			events := 0
+			state.syncFailures = &telemetry.SyncFailures{Capture: func(string, map[string]any) error { events++; return nil }}
+			st := storetest.New(t)
+			source, err := st.Store.GetOrCreateSource(sourceTypeDiscord, "113456789012345678")
+			require.NoError(err)
+
+			originalImport := importDiscordSourceForScheduledRun
+			originalRebuild := rebuildCacheAfterScheduledSourceRun
+			t.Cleanup(func() {
+				importDiscordSourceForScheduledRun = originalImport
+				rebuildCacheAfterScheduledSourceRun = originalRebuild
+			})
+
+			var imported []int64
+			importDiscordSourceForScheduledRun = func(
+				_ context.Context, gotStore *store.Store, gotSource *store.Source,
+				deps discordCommandDeps, full bool, after time.Time, progress func(string),
+			) (*discord.ImportSummary, error) {
+				assert.Same(st.Store, gotStore)
+				assert.False(full)
+				assert.True(after.IsZero())
+				assert.Nil(progress)
+				assert.NotNil(deps.tokenManager)
+				imported = append(imported, gotSource.ID)
+				return &discord.ImportSummary{}, tc.importErr
+			}
+			rebuilds := 0
+			rebuildCacheAfterScheduledSourceRun = func(context.Context, string) error {
+				rebuilds++
+				return tc.rebuildErr
+			}
+
+			err = runScheduledSync(testCtx, source.Identifier, st.Store, func(ctx context.Context, _ string) (*oauth.Manager, error) {
+				require.FailNow("Discord scheduled sync must not resolve Gmail OAuth")
+				return nil, errors.New("unreachable Gmail OAuth resolution")
+			}, state)
+			require.ErrorIs(err, tc.wantErr)
+			assert.Equal([]int64{source.ID}, imported)
+			assert.Equal(1, rebuilds)
+			if tc.importErr == nil {
+				assert.Zero(events)
+			} else {
+				assert.Equal(1, events)
+			}
+		})
+	}
+}
+
+func TestRunScheduledSyncStopsAfterYield(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	st := storetest.New(t)
@@ -2215,48 +3243,112 @@ func TestRunScheduledSyncUsesSharedDiscordImporterAndRebuildsOnce(t *testing.T) 
 		rebuildCacheAfterScheduledSourceRun = originalRebuild
 	})
 
-	var imported []int64
-	importDiscordSourceForScheduledRun = func(
-		_ context.Context, gotStore *store.Store, gotSource *store.Source,
-		deps discordCommandDeps, full bool, after time.Time, progress func(string),
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(scheduler.ErrYieldedToWaiter)
+	imports, rebuilds := 0, 0
+	importDiscordSourceForScheduledRun = func(ctx context.Context, _ *store.Store, _ *store.Source,
+		_ discordCommandDeps, _ bool, _ time.Time, _ func(string),
 	) (*discord.ImportSummary, error) {
-		assert.Same(st.Store, gotStore)
-		assert.False(full)
-		assert.True(after.IsZero())
-		assert.Nil(progress)
-		assert.NotNil(deps.tokenManager)
-		imported = append(imported, gotSource.ID)
-		return nil, errors.New("synthetic Discord import failure")
+		imports++
+		return nil, ctx.Err()
 	}
-	rebuilds := 0
 	rebuildCacheAfterScheduledSourceRun = func(context.Context, string) error {
 		rebuilds++
 		return nil
 	}
 
-	err = runScheduledSync(context.Background(), source.Identifier, st.Store, func(string) (*oauth.Manager, error) {
-		require.FailNow("Discord scheduled sync must not resolve Gmail OAuth")
-		return nil, errors.New("unreachable Gmail OAuth resolution")
-	})
-	require.ErrorContains(err, "synthetic Discord import failure")
-	assert.Equal([]int64{source.ID}, imported)
-	assert.Equal(1, rebuilds)
+	err = runScheduledSync(ctx, source.Identifier, st.Store, func(ctx context.Context, _ string) (*oauth.Manager, error) {
+		return nil, errors.New("unexpected Gmail OAuth resolution")
+	}, testInvocationWithConfig(testConfigValue()))
+	require.ErrorIs(err, scheduler.ErrYieldedToWaiter)
+	assert.Equal(1, imports)
+	assert.Zero(rebuilds, "a yielded run releases the gate before cache rebuilding")
+}
+
+func TestScheduledSyncYieldResultPreservesCollectedErrors(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	cancel(scheduler.ErrYieldedToWaiter)
+
+	sourceErr := errors.New("synthetic earlier source failure")
+	err := scheduledSyncYieldResult(ctx, sourceErr)
+
+	require.ErrorIs(t, err, sourceErr)
+	require.ErrorIs(t, err, scheduler.ErrYieldedToWaiter)
+}
+
+func TestRunScheduledSyncCooperativePreemptionPreservesSourceResult(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		sourceErr error
+	}{
+		{name: "successful source"},
+		{name: "source error", sourceErr: errors.New("synthetic Discord import failure")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			st := storetest.New(t)
+			source, err := st.Store.GetOrCreateSource(sourceTypeDiscord, "113456789012345678")
+			require.NoError(err)
+
+			originalImport := importDiscordSourceForScheduledRun
+			originalRebuild := rebuildCacheAfterScheduledSourceRun
+			t.Cleanup(func() {
+				importDiscordSourceForScheduledRun = originalImport
+				rebuildCacheAfterScheduledSourceRun = originalRebuild
+			})
+			importDiscordSourceForScheduledRun = func(
+				context.Context, *store.Store, *store.Source,
+				discordCommandDeps, bool, time.Time, func(string),
+			) (*discord.ImportSummary, error) {
+				return &discord.ImportSummary{}, tt.sourceErr
+			}
+			rebuilds := 0
+			rebuildCacheAfterScheduledSourceRun = func(context.Context, string) error {
+				rebuilds++
+				return nil
+			}
+
+			ctx, requestPreemption := jobctx.WithPreemption(context.Background())
+			requestPreemption()
+			err = runScheduledSync(ctx, source.Identifier, st.Store, func(ctx context.Context, _ string) (*oauth.Manager, error) {
+				require.FailNow("Discord scheduled sync must not resolve Gmail OAuth")
+				return nil, errors.New("unreachable Gmail OAuth resolution")
+			}, testInvocationWithConfig(testConfigValue()))
+
+			if tt.sourceErr == nil {
+				require.NoError(err, "successful cooperative yield is not a callback error")
+			} else {
+				require.ErrorIs(err, tt.sourceErr, "cooperative yield preserves the source error")
+			}
+			assert.Zero(rebuilds, "a cooperative yield releases the gate before cache rebuilding")
+		})
+	}
+}
+
+func TestScheduledSyncYieldedForCooperativePreemption(t *testing.T) {
+	ctx, requestPreemption := jobctx.WithPreemption(context.Background())
+	requestPreemption()
+	require.True(t, scheduledSyncYielded(ctx))
 }
 
 func TestRunScheduledSyncLogsDiscordImportIssues(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
+	cfg := config.NewDefaultConfig()
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	inv := invocationFromContext(testCtx)
 	st := storetest.New(t)
 	source, err := st.Store.GetOrCreateSource(sourceTypeDiscord, "113456789012345678")
 	require.NoError(err)
 
 	originalImport := importDiscordSourceForScheduledRun
 	originalRebuild := rebuildCacheAfterScheduledSourceRun
-	originalLogger := logger
+	originalLogger := inv.logger
 	t.Cleanup(func() {
 		importDiscordSourceForScheduledRun = originalImport
 		rebuildCacheAfterScheduledSourceRun = originalRebuild
-		logger = originalLogger
+		inv.logger = originalLogger
 	})
 	importDiscordSourceForScheduledRun = func(
 		context.Context, *store.Store, *store.Source,
@@ -2277,14 +3369,15 @@ func TestRunScheduledSyncLogsDiscordImportIssues(t *testing.T) {
 	}
 	rebuildCacheAfterScheduledSourceRun = func(context.Context, string) error { return nil }
 	var logs bytes.Buffer
-	logger = slog.New(slog.NewTextHandler(&logs, nil))
+	inv.logger = slog.New(slog.NewTextHandler(&logs, nil))
 
 	require.NoError(runScheduledSync(
-		context.Background(), source.Identifier, st.Store,
-		func(string) (*oauth.Manager, error) {
+		testCtx, source.Identifier, st.Store,
+		func(ctx context.Context, _ string) (*oauth.Manager, error) {
 			require.FailNow("Discord scheduled sync must not resolve Gmail OAuth")
 			return nil, errors.New("unreachable")
 		},
+		inv,
 	))
 	output := logs.String()
 	assert.Contains(output, "discord catalog issue")
@@ -2299,9 +3392,24 @@ func TestRunScheduledSyncLogsDiscordImportIssues(t *testing.T) {
 	assert.NotContains(output, "private-response-secret")
 }
 
+func TestScheduledSyncPreemptibleRequiresResumableSources(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := storetest.New(t)
+	gmail, err := st.Store.GetOrCreateSource(sourceTypeGmail, "reader@example.test")
+	require.NoError(err)
+	imap, err := st.Store.GetOrCreateSource(sourceTypeIMAP, "imaps://reader@example.test:993")
+	require.NoError(err)
+
+	assert.True(scheduledSyncPreemptible(st.Store, gmail.Identifier, testDiscardLogger()))
+	assert.False(scheduledSyncPreemptible(st.Store, imap.Identifier, testDiscardLogger()), "IMAP uses a full pass with non-resumable offsets")
+	assert.True(scheduledSyncPreemptible(st.Store, "new-reader@example.test", testDiscardLogger()), "missing source rows use the resumable Gmail fallback")
+}
+
 func TestScheduledDiscordGuildFailureDoesNotBlockLaterGuild(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
+	cfg := config.NewDefaultConfig()
 	st := storetest.New(t)
 	first, err := st.Store.GetOrCreateSource(sourceTypeDiscord, "113456789012345678")
 	require.NoError(err)
@@ -2334,9 +3442,10 @@ func TestScheduledDiscordGuildFailureDoesNotBlockLaterGuild(t *testing.T) {
 
 	completed := make(chan string, 2)
 	sched := scheduler.New(func(ctx context.Context, identifier string) error {
-		err := runScheduledSync(ctx, identifier, st.Store, func(string) (*oauth.Manager, error) {
+		scheduledCtx := testInvocationContext(ctx, cfg, invocationOptions{})
+		err := runScheduledSync(scheduledCtx, identifier, st.Store, func(ctx context.Context, _ string) (*oauth.Manager, error) {
 			return nil, errors.New("unreachable Gmail OAuth resolution")
-		})
+		}, invocationFromContext(scheduledCtx))
 		completed <- identifier
 		return err
 	})
@@ -2355,40 +3464,12 @@ func TestScheduledDiscordGuildFailureDoesNotBlockLaterGuild(t *testing.T) {
 		}
 	}
 
-	require.NoError(sched.TriggerSync(first.Identifier))
+	require.NoError(sched.TriggerSync(first.Identifier, false))
 	assert.Equal(first.Identifier, awaitCompletion())
-	require.NoError(sched.TriggerSync(second.Identifier))
+	require.NoError(sched.TriggerSync(second.Identifier, false))
 	assert.Equal(second.Identifier, awaitCompletion())
 
 	assert.Equal([]int64{first.ID, second.ID}, imported)
 	assert.Equal([]string{first.Identifier, second.Identifier}, rebuilt,
 		"each scheduled guild invocation rebuilds its cache exactly once")
-}
-
-func TestCronExpressionValidation(t *testing.T) {
-	tests := []struct {
-		name    string
-		expr    string
-		wantErr bool
-	}{
-		{"daily at 2am", "0 2 * * *", false},
-		{"every 15 min", "*/15 * * * *", false},
-		{"weekly sunday", "0 0 * * 0", false},
-		{"monthly first", "0 0 1 * *", false},
-		{"twice daily", "0 8,18 * * *", false},
-		{"invalid", "not a cron", true},
-		{"empty", "", true},
-		{"too many fields", "* * * * * *", true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := scheduler.ValidateCronExpr(tt.expr)
-			if tt.wantErr {
-				assert.Error(t, err, "ValidateCronExpr(%q)", tt.expr)
-			} else {
-				assert.NoError(t, err, "ValidateCronExpr(%q)", tt.expr)
-			}
-		})
-	}
 }

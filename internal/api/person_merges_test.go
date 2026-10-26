@@ -54,6 +54,7 @@ func (s *corruptPersonMergeSnapshotStore) GetPersonMergeSnapshotContext(
 }
 
 func TestPersonMergeHTTPMergeInspectDecideAndSplit(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	ctx := t.Context()
@@ -169,6 +170,7 @@ func TestPersonMergeHTTPMergeInspectDecideAndSplit(t *testing.T) {
 }
 
 func TestPersonMergeHTTPCandidateDecisionUsesAtomicRevision(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	wrapped := &atomicCandidateDecisionStore{
@@ -197,6 +199,7 @@ func TestPersonMergeHTTPCandidateDecisionUsesAtomicRevision(t *testing.T) {
 }
 
 func TestPersonMergeHTTPPreconditionsAndTypedErrors(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	srv, st := newIdentityLinkTestServer(t)
@@ -269,6 +272,7 @@ func TestPersonMergeHTTPPreconditionsAndTypedErrors(t *testing.T) {
 }
 
 func TestPersonMergeOpenAPIContract(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	document := OpenAPIDocument()
@@ -345,11 +349,12 @@ func TestPersonMergeOpenAPIContract(t *testing.T) {
 }
 
 func TestPersonMergeRequiredOpenAPIContract(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	document := OpenAPIDocument()
 	operations := []*huma.Operation{
 		document.Paths["/api/v1/identity/links"].Post,
-		document.Paths["/api/v1/identity/match-candidates/{id}/accept"].Post,
+		document.Paths["/api/v1/identity/match-candidates/{id}/review/accept"].Post,
 	}
 	for _, operation := range operations {
 		require.NotNil(operation)
@@ -365,6 +370,7 @@ func TestPersonMergeRequiredOpenAPIContract(t *testing.T) {
 }
 
 func TestPersonMergeHTTPErrorMapping(t *testing.T) {
+	t.Parallel()
 	srv, _ := newIdentityLinkTestServer(t)
 	tests := []struct {
 		name       string
@@ -413,6 +419,7 @@ func TestPersonMergeHTTPErrorMapping(t *testing.T) {
 }
 
 func TestPersonMergeHTTPSnapshotRejectsHashMismatch(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	base := &stubIdentityCacheStore{Store: testutil.NewTestStore(t)}

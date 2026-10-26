@@ -254,6 +254,56 @@ func TestPeopleBrowserCompleteUsesPrivateBodyAndMapsTypedRows(t *testing.T) {
 	assert.Equal("whatsapp", page.Rows[1].Source)
 }
 
+func TestPeopleBrowserGetContactPreservesIdentityContext(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	engine := newPeopleBrowserTestEngine(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(http.MethodGet, r.Method)
+		assert.Equal("/api/v1/participants/11", r.URL.Path)
+		writePeopleBrowserJSON(t, w, http.StatusOK, `{
+			"id":11,"display_label":"Alice Example","partial_label":false,
+			"identifiers":[{
+				"type":"beeper","value":"beeper:example-id","is_primary":true,"provenance":"archive","participant_id":14,
+				"service_slug":"whatsapp","service_label":"WhatsApp","scope_kind":"account",
+				"scope_value":"local-whatsapp_example","participant_display_name":"Alice Chat"
+			}],
+			"activity_count":9,"file_count":4,"source_counts":[],"cache_revision":"cache-7",
+			"cluster":{
+				"canonical_id":11,"member_ids":[11,14],
+				"members":[
+					{"participant_id":11,"display_name":"Alice Example","email":"alice@example.com"},
+					{"participant_id":14,"display_name":"Alice Chat","phone":"+12025550100"}
+				],
+				"edges":[{"participant_a":11,"participant_b":14,"link_origin":{
+					"kind":"candidate","source":"archive_observation","basis":"stable_provider_id"
+				}}]
+			}
+		}`)
+	}))
+
+	contact, err := engine.GetContact(t.Context(), 11)
+	require.NoError(err)
+	require.NotNil(contact)
+	assert.Equal([]query.PersonIdentifier{{
+		Type: "beeper", Value: "beeper:example-id", IsPrimary: true, Provenance: "archive", ParticipantID: 14,
+		ServiceSlug: "whatsapp", ServiceLabel: "WhatsApp", ScopeKind: "account",
+		ScopeValue: "local-whatsapp_example", ParticipantDisplayName: "Alice Chat",
+	}}, contact.Identifiers)
+	assert.Equal(&query.PersonCluster{
+		CanonicalID: 11, MemberIDs: []int64{11, 14},
+		Members: []query.PersonClusterMember{
+			{ParticipantID: 11, DisplayName: "Alice Example", Email: "alice@example.com"},
+			{ParticipantID: 14, DisplayName: "Alice Chat", Phone: "+12025550100"},
+		},
+		Edges: []query.PersonClusterEdge{{
+			ParticipantA: 11, ParticipantB: 14,
+			LinkOrigin: &query.PersonClusterLinkOrigin{
+				Kind: "candidate", Source: "archive_observation", Basis: "stable_provider_id",
+			},
+		}},
+	}, contact.Cluster)
+}
+
 func TestPeopleBrowserProfileAttributesAndInboxMappings(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -602,6 +652,7 @@ func TestPeopleBrowserTextRevisionMappingAndParticipantIDs(t *testing.T) {
 	require.NoError(err)
 	require.Len(messages.Rows, 1)
 	assert.Equal(int64(91), messages.Rows[0].ID)
+	assert.Equal(engine.engine.store.baseURL+"/messages/91", messages.Rows[0].WebURL)
 	assert.Zero(messages.NextOffset)
 	assert.True(messages.Complete)
 	assert.Equal("text-messages-7", messages.CacheRevision)
@@ -695,6 +746,7 @@ func TestPeopleBrowserMeetingsUseParticipantTimelineCursorAndMapRows(t *testing.
 	assert.Equal("meeting-next", page.NextCursor)
 	assert.Equal("cache-8", page.CacheRevision)
 	assert.Equal(int64(88), page.Rows[0].ID)
+	assert.Equal(engine.engine.store.baseURL+"/messages/88", page.Rows[0].WebURL)
 	assert.Equal(int64(44), page.Rows[0].ConversationID)
 	assert.Equal("Weekly sync", page.Rows[0].Subject)
 	assert.Equal("Discussed plans", page.Rows[0].Snippet)
@@ -762,14 +814,4 @@ func TestPeopleBrowserFilesAndActivityForwardCursorsAndMapRows(t *testing.T) {
 	assert.Equal([]int64{11}, activity.Rows[0].ParticipantIDs)
 	assert.Equal("activity-next", activity.NextCursor)
 	assert.Equal(2, requests)
-}
-
-func TestDaemonPeopleBrowserImplementsBackend(t *testing.T) {
-	var backend peoplebrowser.Backend = (*PeopleBrowser)(nil)
-	assert.Nil(t, backend)
-}
-
-func TestPeopleBrowserStaleValueErrorMatchesSentinel(t *testing.T) {
-	err := peoplebrowser.StaleValueError{CurrentValueID: 72}
-	assert.ErrorIs(t, err, peoplebrowser.ErrStaleValue)
 }

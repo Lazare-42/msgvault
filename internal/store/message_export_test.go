@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/personscope"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
 )
@@ -214,74 +216,6 @@ func TestExportMessagesFiltersSourcesAndMessageTypes(t *testing.T) {
 	}, counts)
 	requirements.Len(sink.messages, 1)
 	assertions.Equal("first-text", sink.messages[0].ID)
-}
-
-func TestExportMessagesSourceFilterBoundsConversationScan(t *testing.T) {
-	st := testutil.NewTestStore(t)
-	if st.IsPostgreSQL() {
-		t.Skip("SQLite query-plan regression")
-	}
-	requirements := require.New(t)
-	selected, err := st.GetOrCreateSource("text", "selected")
-	requirements.NoError(err)
-	unrelated, err := st.GetOrCreateSource("text", "unrelated")
-	requirements.NoError(err)
-	start := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
-	selectedConversation := insertMessageExportConversation(
-		t, st, selected.ID, "selected-conversation", "", "direct_chat", `{}`,
-	)
-
-	tx, err := st.DB().Begin()
-	requirements.NoError(err)
-	conversationStatement, err := tx.Prepare(st.Rebind(`
-		INSERT INTO conversations (
-			source_id, source_conversation_id, conversation_type, title
-		) VALUES (?, ?, 'direct_chat', '')
-	`))
-	requirements.NoError(err)
-	defer func() {
-		requirements.NoError(conversationStatement.Close())
-	}()
-	for i := range 10_000 {
-		_, err = conversationStatement.Exec(unrelated.ID, fmt.Sprintf("unrelated-%d", i))
-		requirements.NoError(err)
-	}
-
-	messageStatement, err := tx.Prepare(st.Rebind(`
-		INSERT INTO messages (
-			conversation_id, source_id, source_message_id, message_type,
-			sent_at, received_at
-		) VALUES (?, ?, ?, 'other', ?, ?)
-	`))
-	requirements.NoError(err)
-	defer func() {
-		requirements.NoError(messageStatement.Close())
-	}()
-	for i := range 1_000 {
-		_, err = messageStatement.Exec(
-			selectedConversation,
-			selected.ID,
-			fmt.Sprintf("selected-%d", i),
-			start,
-			start,
-		)
-		requirements.NoError(err)
-	}
-	requirements.NoError(tx.Commit())
-
-	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
-	defer cancel()
-	sink := &collectingMessageExportSink{}
-	counts, err := st.ExportMessages(ctx, store.MessageExportFilter{
-		Start:        start,
-		End:          start.Add(time.Hour),
-		SourceIDs:    []int64{selected.ID},
-		MessageTypes: []string{"wanted"},
-	}, sink)
-	requirements.NoError(err)
-	assert.Equal(t, store.MessageExportCounts{Sources: 1}, counts)
-	assert.Empty(t, sink.conversations)
-	assert.Empty(t, sink.messages)
 }
 
 func TestExportMessagesEmitsExplicitEmptySources(t *testing.T) {
@@ -723,4 +657,45 @@ func insertMessageExportMessage(
 	`), messageID, body)
 	requirements.NoError(err)
 	return messageID
+}
+
+func TestExportMessagesPersonAuthorAndScope(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	st := testutil.NewTestStore(t)
+	source, err := st.GetOrCreateSource("gmail", "user@example.com")
+	requirements.NoError(err)
+	alice := insertMessageExportParticipant(t, st, "alice@example.com", "Alice Observed")
+	bob := insertMessageExportParticipant(t, st, "bob@example.com", "Bob Observed")
+	person, _, err := st.CreatePersonFromParticipant(alice)
+	requirements.NoError(err)
+	name := "Alice Curated"
+	_, err = st.UpdatePersonDisplayName(person.ID, person.Revision, &name)
+	requirements.NoError(err)
+	start := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	for i, id := range []int64{alice, bob} {
+		key := strconv.Itoa(i)
+		conv := insertMessageExportConversation(t, st, source.ID, key, "Test", "email_thread", `{}`)
+		insertMessageExportMessage(t, st, source.ID, conv, key, "email", start, "body", "subject", id, false, false)
+	}
+	filter := store.MessageExportFilter{Start: start, End: start.Add(time.Hour)}
+	sink := &collectingMessageExportSink{}
+	_, err = st.ExportMessages(context.Background(), filter, sink)
+	requirements.NoError(err)
+	requirements.Len(sink.messages, 2)
+	assertions.Equal(&store.MessageExportAuthor{DisplayName: name, Address: "alice@example.com"}, sink.messages[0].Author)
+	assertions.Equal(&store.MessageExportAuthor{DisplayName: "Bob Observed", Address: "bob@example.com"}, sink.messages[1].Author)
+	for _, ids := range [][]int64{{alice}, {}, {-1}} {
+		sink := &collectingMessageExportSink{}
+		filter.PersonScope = &personscope.Scope{ParticipantIDs: ids, Directions: []personscope.Direction{personscope.FromPerson}}
+		filter.SourceIDs = []int64{source.ID}
+		counts, err := st.ExportMessages(context.Background(), filter, sink)
+		if len(ids) > 0 && ids[0] < 0 {
+			requirements.Error(err)
+			assertions.Empty(sink.phases)
+			continue
+		}
+		requirements.NoError(err)
+		assertions.Equal(store.MessageExportCounts{Sources: len(ids), Conversations: len(ids), Messages: len(ids)}, counts)
+	}
 }

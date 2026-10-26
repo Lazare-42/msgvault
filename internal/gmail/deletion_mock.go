@@ -298,21 +298,21 @@ func (m *DeletionMockAPI) Close() error {
 	return nil
 }
 
-// Draft stubs — DeletionMockAPI is only for deletion testing.
+// ComposedDraft stubs — DeletionMockAPI is only for deletion testing.
 
-func (m *DeletionMockAPI) ListDrafts(ctx context.Context, query string, maxResults int) ([]*Draft, error) {
+func (m *DeletionMockAPI) ListDrafts(ctx context.Context, query string, maxResults int) ([]*ComposedDraft, error) {
 	panic("DeletionMockAPI.ListDrafts not implemented")
 }
 
-func (m *DeletionMockAPI) GetDraft(ctx context.Context, draftID string) (*Draft, error) {
+func (m *DeletionMockAPI) GetDraft(ctx context.Context, draftID string) (*ComposedDraft, error) {
 	panic("DeletionMockAPI.GetDraft not implemented")
 }
 
-func (m *DeletionMockAPI) CreateDraft(ctx context.Context, draft *DraftCompose) (*Draft, error) {
+func (m *DeletionMockAPI) CreateDraft(ctx context.Context, draft *DraftCompose) (*ComposedDraft, error) {
 	panic("DeletionMockAPI.CreateDraft not implemented")
 }
 
-func (m *DeletionMockAPI) UpdateDraft(ctx context.Context, draftID string, draft *DraftCompose) (*Draft, error) {
+func (m *DeletionMockAPI) UpdateDraft(ctx context.Context, draftID string, draft *DraftCompose) (*ComposedDraft, error) {
 	panic("DeletionMockAPI.UpdateDraft not implemented")
 }
 

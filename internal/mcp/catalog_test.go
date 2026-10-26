@@ -108,6 +108,51 @@ func rawCallTool(t *testing.T, opts ServeOptions, name string, arguments map[str
 	return response.Result
 }
 
+func confirmedCallTool(t *testing.T, opts ServeOptions, name string, arguments map[string]any, confirmed bool, inspectPrompt ...func(string)) map[string]any {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	clientTransport, serverTransport := sdkmcp.NewInMemoryTransports()
+	serverSession, err := newMCPServer(opts, true).Connect(ctx, serverTransport, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, serverSession.Close()) })
+	client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "msgvault-confirmation-test", Version: "1.0"}, &sdkmcp.ClientOptions{
+		MultiRoundTrip: &sdkmcp.MultiRoundTripOptions{Disabled: true},
+	})
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, clientSession.Close()) })
+	result, err := clientSession.CallTool(ctx, &sdkmcp.CallToolParams{Name: name, Arguments: arguments})
+	require.NoError(t, err)
+	if result.NeedsInput() {
+		require.NotEmpty(t, result.RequestState)
+		prompt, ok := result.InputRequests["confirm"].(*sdkmcp.ElicitParams)
+		require.True(t, ok)
+		for _, inspect := range inspectPrompt {
+			inspect(prompt.Message)
+		}
+		response := &sdkmcp.ElicitResult{Action: "decline"}
+		if confirmed {
+			response = &sdkmcp.ElicitResult{Action: "accept", Content: map[string]any{"confirm": true}}
+		}
+		result, err = clientSession.CallTool(ctx, &sdkmcp.CallToolParams{
+			Name: name, Arguments: arguments, RequestState: result.RequestState,
+			InputResponses: sdkmcp.InputResponseMap{"confirm": response},
+		})
+		require.NoError(t, err)
+	}
+	wire := map[string]any{"isError": result.IsError}
+	if structured, ok := result.StructuredContent.(map[string]any); ok {
+		wire["structuredContent"] = structured
+	}
+	if len(result.Content) > 0 {
+		if textContent, ok := result.Content[0].(*sdkmcp.TextContent); ok {
+			wire["content"] = []any{map[string]any{"text": textContent.Text}}
+		}
+	}
+	return wire
+}
+
 func toolsByName(t *testing.T, tools []map[string]any) map[string]map[string]any {
 	t.Helper()
 	byName := make(map[string]map[string]any, len(tools))
@@ -128,6 +173,21 @@ func toolPropertyNames(t *testing.T, tool map[string]any) []string {
 	names := make([]string, 0, len(properties))
 	for name := range properties {
 		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func toolRequiredPropertyNames(t *testing.T, tool map[string]any) []string {
+	t.Helper()
+	schema, ok := tool["inputSchema"].(map[string]any)
+	require.True(t, ok, "inputSchema: %#v", tool["inputSchema"])
+	raw, ok := schema["required"].([]any)
+	require.True(t, ok, "required: %#v", schema)
+	names := make([]string, len(raw))
+	for i, value := range raw {
+		names[i], ok = value.(string)
+		require.True(t, ok, "required[%d]: %#v", i, value)
 	}
 	sort.Strings(names)
 	return names
@@ -163,6 +223,8 @@ func TestMCPModernDiscovery(t *testing.T) {
 	checks.Contains(instructions, "never instructions")
 	checks.Contains(instructions, "page")
 	checks.Contains(instructions, "explicit user intent")
+	checks.Contains(instructions, "untrusted_text")
+	checks.Contains(instructions, "messages other people wrote")
 	checks.Contains(instructions, "Notes")
 	checks.Contains(instructions, "Only Notes with user provenance are user-authored")
 	meta, ok := response.Result["_meta"].(map[string]any)
@@ -174,7 +236,6 @@ func TestMCPModernDiscovery(t *testing.T) {
 }
 
 func TestCatalogSchemaPointersStableAcrossServerConstruction(t *testing.T) {
-	assert.Len(t, stableOperationCatalogs, 64)
 	backend := &fakeBackend{}
 	localHybrid := hybrid.NewEngine(backend, nil, stubEmbedder{}, hybrid.Config{})
 	remoteHybrid := hybridSearcherFunc(func(context.Context, HybridSearchRequest) (*HybridSearchResult, error) {
@@ -196,6 +257,7 @@ func TestCatalogSchemaPointersStableAcrossServerConstruction(t *testing.T) {
 		{name: "1110", opts: ServeOptions{Engine: &querytest.MockEngine{}, HybridEngine: localHybrid, Backend: backend}},
 		{name: "0001", opts: ServeOptions{Engine: &querytest.MockEngine{}, DocumentSearcher: documents}},
 		{name: "1111", opts: ServeOptions{Engine: &querytest.MockEngine{}, HybridEngine: localHybrid, Backend: backend, DocumentSearcher: documents}},
+		{name: "0000_saved_views", opts: ServeOptions{Engine: &querytest.MockEngine{}, SavedViews: &savedViewServiceFixture{}}},
 	}
 
 	for _, shape := range shapes {
@@ -222,6 +284,26 @@ func TestCatalogSchemaPointersStableAcrossServerConstruction(t *testing.T) {
 	}
 }
 
+func TestOperationCatalogCacheBuildsOnlyRequestedCapabilities(t *testing.T) {
+	checks := assert.New(t)
+	must := require.New(t)
+	var cache operationCatalogCache
+	firstCapabilities := catalogCapabilities{identityReview: true}
+	first := cache.get(firstCapabilities)
+	again := cache.get(firstCapabilities)
+	second := cache.get(catalogCapabilities{personCardDAV: true})
+
+	must.NotEmpty(first)
+	must.NotEmpty(second)
+	checks.Same(first[0].inputSchema, again[0].inputSchema)
+	count := 0
+	cache.catalogs.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	checks.Equal(2, count)
+}
+
 func TestCatalogSchemas(t *testing.T) {
 	backend := &fakeBackend{}
 	localHybrid := hybrid.NewEngine(backend, nil, stubEmbedder{}, hybrid.Config{})
@@ -232,6 +314,7 @@ func TestCatalogSchemas(t *testing.T) {
 		return &SimilarSearchResult{}, nil
 	})
 	documents := &recordingDocumentSearcher{}
+	savedViews := &savedViewServiceFixture{}
 
 	shapes := []struct {
 		name            string
@@ -240,14 +323,20 @@ func TestCatalogSchemas(t *testing.T) {
 		vectorInMessage bool
 		similar         bool
 		document        bool
+		savedViews      bool
+		directory       bool
+		sqlQuery        bool
 	}{
 		{name: "0000", opts: ServeOptions{Engine: &querytest.MockEngine{}}},
+		{name: "sql_query", opts: ServeOptions{Engine: &querytest.MockEngine{}, ArchiveSQLQuerier: &sqlToolEngine{}}, sqlQuery: true},
 		{name: "1000", opts: ServeOptions{Engine: &querytest.MockEngine{}, HybridSearcher: remoteHybrid}, semantic: true},
 		{name: "0010", opts: ServeOptions{Engine: &querytest.MockEngine{}, SimilarSearcher: remoteSimilar}, similar: true},
 		{name: "1010", opts: ServeOptions{Engine: &querytest.MockEngine{}, HybridSearcher: remoteHybrid, SimilarSearcher: remoteSimilar}, semantic: true, similar: true},
 		{name: "1110", opts: ServeOptions{Engine: &querytest.MockEngine{}, HybridEngine: localHybrid, Backend: backend}, semantic: true, vectorInMessage: true, similar: true},
 		{name: "0001", opts: ServeOptions{Engine: &querytest.MockEngine{}, DocumentSearcher: documents}, document: true},
-		{name: "1111", opts: ServeOptions{Engine: &querytest.MockEngine{}, HybridEngine: localHybrid, Backend: backend, DocumentSearcher: documents}, semantic: true, vectorInMessage: true, similar: true, document: true},
+		{name: "0000_saved_views", opts: ServeOptions{Engine: &querytest.MockEngine{}, SavedViews: savedViews}, savedViews: true},
+		{name: "directory_and_saved_views", opts: ServeOptions{Engine: &querytest.MockEngine{}, DirectoryBackend: &directoryPeopleBackend{}, SavedViews: savedViews}, directory: true, savedViews: true},
+		{name: "1111_saved_views", opts: ServeOptions{Engine: &querytest.MockEngine{}, HybridEngine: localHybrid, Backend: backend, DocumentSearcher: documents, SavedViews: savedViews}, semantic: true, vectorInMessage: true, similar: true, document: true, savedViews: true},
 	}
 
 	for _, shape := range shapes {
@@ -266,10 +355,12 @@ func TestCatalogSchemas(t *testing.T) {
 				}
 				expectedNames := []string{
 					"aggregate",
+					ToolExportEML,
 					"get_attachment",
 					"get_message",
 					"get_stats",
 					"list_messages",
+					ToolListThread,
 					"search_by_domains",
 					"search_in_message",
 					"search_message_bodies",
@@ -284,8 +375,20 @@ func TestCatalogSchemas(t *testing.T) {
 				if shape.document {
 					expectedNames = append(expectedNames, ToolSearchDocuments)
 				}
+				if shape.savedViews {
+					expectedNames = append(expectedNames, ToolListSavedViews, ToolGetSavedView, ToolRunSavedView)
+				}
+				if shape.sqlQuery {
+					expectedNames = append(expectedNames, ToolQuerySQL)
+				}
+				if shape.directory {
+					expectedNames = append(expectedNames, ToolListDirectoryPeople)
+				}
 				if allowWrites {
 					expectedNames = append(expectedNames, "export_attachment", "stage_deletion")
+				}
+				if allowWrites && shape.savedViews {
+					expectedNames = append(expectedNames, ToolCreateSavedView, ToolUpdateSavedView, ToolDeleteSavedView)
 				}
 				sort.Strings(expectedNames)
 				checks.Equal(expectedNames, names)
@@ -334,10 +437,19 @@ func TestCatalogSchemas(t *testing.T) {
 					must.True(ok, "%s outputSchema", tool["name"])
 					checks.Equal("https://json-schema.org/draft/2020-12/schema", outputSchema["$schema"], "%s output dialect", tool["name"])
 					checks.Equal("object", outputSchema["type"], "%s output type", tool["name"])
+					if properties, ok := outputSchema["properties"].(map[string]any); ok {
+						for propertyName, propertySchema := range properties {
+							_, ok := propertySchema.(map[string]any)
+							must.True(ok, "%s outputSchema.properties.%s", tool["name"], propertyName)
+						}
+					}
 
-					readOnly := tool["name"] != ToolExportAttachment && tool["name"] != ToolStageDeletion
+					readOnly := tool["name"] != ToolCreateSavedView && tool["name"] != ToolDeleteSavedView &&
+						tool["name"] != ToolExportAttachment && tool["name"] != ToolStageDeletion &&
+						tool["name"] != ToolUpdateSavedView
+					destructive := tool["name"] == ToolDeleteSavedView
 					checks.Equal(map[string]any{
-						"destructiveHint": false,
+						"destructiveHint": destructive,
 						"idempotentHint":  false,
 						"openWorldHint":   false,
 						"readOnlyHint":    readOnly,
@@ -354,6 +466,10 @@ func TestCatalogSchemas(t *testing.T) {
 		name string
 	}{
 		{ToolGetMessage, "id"},
+		{ToolGetSavedView, "id"},
+		{ToolRunSavedView, "id"},
+		{ToolDeleteSavedView, "id"},
+		{ToolUpdateSavedView, "id"},
 		{ToolGetAttachment, "attachment_id"},
 		{ToolExportAttachment, "attachment_id"},
 		{ToolFindSimilarMessages, "message_id"},
@@ -367,6 +483,23 @@ func TestCatalogSchemas(t *testing.T) {
 		checks.InDelta(1, property["minimum"], 0, "%s.%s minimum", field.tool, field.name)
 		checks.InDelta(jsonSafeIntegerMax, property["maximum"], 0, "%s.%s maximum", field.tool, field.name)
 	}
+	checks.Equal(
+		[]string{"canonical_state", "description", "name", "schema_version"},
+		toolPropertyNames(t, tools[ToolCreateSavedView]),
+	)
+	checks.Equal(
+		[]string{"canonical_state", "name", "schema_version"},
+		toolRequiredPropertyNames(t, tools[ToolCreateSavedView]),
+	)
+	checks.Equal(
+		[]string{"canonical_state", "description", "id", "name", "revision", "schema_version"},
+		toolPropertyNames(t, tools[ToolUpdateSavedView]),
+	)
+	checks.Equal([]string{"id", "revision"}, toolRequiredPropertyNames(t, tools[ToolUpdateSavedView]))
+	checks.Equal([]string{"id", "revision"}, toolPropertyNames(t, tools[ToolDeleteSavedView]))
+	checks.Equal([]string{"id", "revision"}, toolRequiredPropertyNames(t, tools[ToolDeleteSavedView]))
+	checks.Equal([]string{"id"}, toolRequiredPropertyNames(t, tools[ToolGetSavedView]))
+	checks.Equal([]string{"id"}, toolRequiredPropertyNames(t, tools[ToolRunSavedView]))
 
 	for _, toolName := range []string{
 		ToolSearchMessages,
@@ -374,6 +507,7 @@ func TestCatalogSchemas(t *testing.T) {
 		ToolSearchMessageBodies,
 		ToolSemanticSearchMessages,
 		ToolListMessages,
+		ToolRunSavedView,
 	} {
 		limit := toolInputProperty(t, tools[toolName], "limit")
 		checks.Equal("integer", limit["type"], "%s.limit type", toolName)
@@ -439,7 +573,7 @@ func TestCatalogSchemas(t *testing.T) {
 	checks.Equal([]any{"vector", "hybrid"}, toolInputProperty(t, tools[ToolSemanticSearchMessages], "mode")["enum"])
 	checks.Equal([]any{"keyword", "vector"}, toolInputProperty(t, tools[ToolSearchInMessage], "mode")["enum"])
 	checks.Equal([]any{"auto", "text", "html"}, toolInputProperty(t, tools[ToolGetMessage], "body_format")["enum"])
-	checks.Equal([]any{"sender", "recipient", "domain", "label", "time"}, toolInputProperty(t, tools[ToolAggregate], "group_by")["enum"])
+	checks.Equal([]any{"sender", "recipient", "domain", "label", "list", "time"}, toolInputProperty(t, tools[ToolAggregate], "group_by")["enum"])
 
 	t.Run("invalid arguments do not invoke handlers", func(t *testing.T) {
 		var calls atomic.Int64
@@ -513,15 +647,17 @@ func newNumericCaptureEngine() *numericCaptureEngine {
 	}}
 }
 
-func (e *numericCaptureEngine) SearchFast(
+func (e *numericCaptureEngine) SearchFastWithStats(
 	_ context.Context,
 	_ *search.Query,
+	_ string,
 	_ query.MessageFilter,
+	_ query.ViewType,
 	limit int,
 	offset int,
-) ([]query.MessageSummary, error) {
-	e.limit, e.offset = limit, offset
-	return []query.MessageSummary{}, nil
+) (*query.SearchFastResult, error) {
+	e.limit, e.offset = limit-1, offset // The handler requests one extra row for has_more.
+	return &query.SearchFastResult{Messages: []query.MessageSummary{}}, nil
 }
 
 func (e *numericCaptureEngine) SearchMessageBodies(
@@ -529,9 +665,9 @@ func (e *numericCaptureEngine) SearchMessageBodies(
 	_ *search.Query,
 	limit int,
 	offset int,
-) ([]query.MessageSummary, error) {
+) (*query.SearchFastResult, error) {
 	e.limit, e.offset = limit-1, offset // The handler requests one extra row for has_more.
-	return []query.MessageSummary{}, nil
+	return &query.SearchFastResult{Messages: []query.MessageSummary{}}, nil
 }
 
 func (e *numericCaptureEngine) ListMessages(
@@ -557,9 +693,10 @@ func (e *numericCaptureEngine) SearchByDomains(
 	_, _ *time.Time,
 	limit int,
 	offset int,
-) ([]query.MessageSummary, error) {
+	_ []int64,
+) (query.DomainSearchResult, error) {
 	e.limit, e.offset = limit, offset
-	return []query.MessageSummary{}, nil
+	return query.DomainSearchResult{}, nil
 }
 
 func testNumericCompatibility(t *testing.T) {
@@ -595,7 +732,7 @@ func testNumericCompatibility(t *testing.T) {
 	}{
 		{name: "omitted", arguments: map[string]any{}, wantLimit: 20},
 		{name: "zero", arguments: map[string]any{"limit": 0}, wantLimit: 20},
-		{name: "clamped", arguments: map[string]any{"limit": 5000, "offset": 5000}, wantLimit: 50, wantOffset: 1000},
+		{name: "clamped", arguments: map[string]any{"limit": 5000, "offset": 5000}, wantLimit: 50, wantOffset: 5000},
 	}
 	for _, toolName := range searchTools {
 		for _, variant := range variants {
@@ -654,7 +791,7 @@ func testNumericCompatibility(t *testing.T) {
 		{name: "omitted", arguments: map[string]any{}, wantReturn: 10},
 		{name: "zero", arguments: map[string]any{"limit": 0}, wantReturn: 0},
 		{name: "clamped", arguments: map[string]any{"limit": 5000}, wantReturn: 1000},
-		{name: "offset clamped", arguments: map[string]any{"offset": 5000}, wantReturn: 10, wantOffset: 1000},
+		{name: "past matches", arguments: map[string]any{"offset": 5000}, wantReturn: 0, wantOffset: 5000},
 	} {
 		t.Run(ToolSearchInMessage+"/"+test.name, func(t *testing.T) {
 			args := map[string]any{"id": 1, "query": "match"}
@@ -677,8 +814,7 @@ func testNumericCompatibility(t *testing.T) {
 		{name: "aggregate zero", tool: ToolAggregate, args: map[string]any{"group_by": "sender", "limit": 0}, want: 0},
 		{name: "aggregate clamped", tool: ToolAggregate, args: map[string]any{"group_by": "sender", "limit": 5000}, want: 1000},
 		{name: "domains omitted", tool: ToolSearchByDomains, args: map[string]any{"domains": "example.com"}, want: 100},
-		{name: "domains zero", tool: ToolSearchByDomains, args: map[string]any{"domains": "example.com", "limit": 0}, want: 0},
-		{name: "domains clamped", tool: ToolSearchByDomains, args: map[string]any{"domains": "example.com", "limit": 5000}, want: 1000},
+		{name: "domains zero", tool: ToolSearchByDomains, args: map[string]any{"domains": "example.com", "limit": 0}, want: 100},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			engine.limit = -1
@@ -687,6 +823,12 @@ func testNumericCompatibility(t *testing.T) {
 			assert.Equal(t, test.want, engine.limit)
 		})
 	}
+	t.Run(ToolSearchByDomains+"/offset past 1000", func(t *testing.T) {
+		engine.offset = -1
+		result := rawCallTool(t, opts, ToolSearchByDomains, map[string]any{"domains": "example.com", "offset": 5000})
+		assert.NotEqual(t, true, result["isError"], "result: %#v", result)
+		assert.Equal(t, 5000, engine.offset)
+	})
 
 	for _, test := range []struct {
 		name       string
@@ -880,15 +1022,18 @@ func TestArrayToolEmptyResultsUseEmptyDataArray(t *testing.T) {
 		name string
 		tool string
 		args map[string]any
+		want map[string]any
 	}{
-		{name: "aggregate", tool: ToolAggregate, args: map[string]any{"group_by": "domain"}},
-		{name: "search by domains", tool: ToolSearchByDomains, args: map[string]any{"domains": "example.com"}},
+		{name: "aggregate", tool: ToolAggregate, args: map[string]any{"group_by": "domain"}, want: map[string]any{"data": []any{}}},
+		{name: "search by domains", tool: ToolSearchByDomains, args: map[string]any{"domains": "example.com"}, want: map[string]any{
+			"data": []any{}, "total": float64(-1), "returned": float64(0), "offset": float64(0), "has_more": false,
+		}},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			result := rawCallTool(t, opts, test.tool, test.args)
-			assert.Equal(t, map[string]any{"data": []any{}}, result["structuredContent"])
+			assert.Equal(t, test.want, result["structuredContent"])
 		})
 	}
 }
@@ -957,7 +1102,7 @@ func TestCreateDraftAndUpdateDraftSchemasIncludeNewAttachments(t *testing.T) {
 	require := require.New(t)
 	opts := ServeOptions{
 		Engine: &querytest.MockEngine{},
-		GmailFactory: func(context.Context, string) (gmail.API, error) {
+		GmailFactory: func(context.Context, string) (gmail.LiveAPI, error) {
 			return nil, errors.New("not used in this schema-only test")
 		},
 	}

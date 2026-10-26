@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"go.kenn.io/msgvault/internal/search"
 )
 
 // GenerationID identifies one index generation.
@@ -192,13 +194,21 @@ type Chunk struct {
 //     internal/store/api.go so the vector and SQLite paths agree.
 //   - SubjectSubstrings each add one `m.subject LIKE ? ESCAPE '\'`
 //     condition, ANDed together (all substrings must match).
+//   - ListIDSubstrings each add one case-insensitive `m.list_id LIKE ?`
+//     condition, ANDed together (all substrings must match).
+//   - ListIDExactGroups are AND-of-OR case-insensitive exact membership groups.
+//   - ListID restricts m.list_id by case-insensitive equality.
 //   - MessageTypes restricts m.message_type by exact value.
 //   - After/Before are half-open against m.sent_at:
 //     `>= After` and `< Before`.
 //   - LargerThan/SmallerThan compare against m.size_estimate.
 type Filter struct {
+	// AccountScopes intersect; each matches its addresses or unattributed rows.
+	AccountScopes []search.AccountScope
+
 	MessageIDs         []int64   // exact bounded candidate population; empty = unrestricted
 	SourceIDs          []int64   // from [server/sources].identifier; empty = no source filter
+	ConversationIDs    []int64   // exact messages.conversation_id values; empty = unrestricted
 	SenderGroups       [][]int64 // one inner slice per `from:` token; AND across, OR within
 	SenderExactGroups  [][]int64 // exact structured sender; from rows OR messages.sender_id
 	RecipientAnyGroups [][]int64 // exact structured recipient; to/cc/bcc rows are OR'd
@@ -211,14 +221,20 @@ type Filter struct {
 	LargerThan         *int64   // `larger:` — strictly greater than
 	SmallerThan        *int64   // `smaller:` — strictly less than
 	SubjectSubstrings  []string // one per `subject:` term (ANDed)
+	FilenameSubstrings []string // ANDed literal attachment-name substrings
+	ListIDSubstrings   []string // one per `list:` term (ANDed, literal substring)
+	ListID             string   // exact structured List-Id; empty = unrestricted
 	MessageTypes       []string // exact m.message_type values; empty = unrestricted
+
+	ListIDExactGroups [][]string // exact structured groups (AND across, OR within)
 }
 
 // IsEmpty reports whether the filter has no restrictions. A zero-value
 // Filter is empty and backends should skip filter resolution entirely.
 func (f Filter) IsEmpty() bool {
-	return len(f.MessageIDs) == 0 &&
+	return len(f.AccountScopes) == 0 && len(f.MessageIDs) == 0 &&
 		len(f.SourceIDs) == 0 &&
+		len(f.ConversationIDs) == 0 &&
 		len(f.SenderGroups) == 0 &&
 		len(f.SenderExactGroups) == 0 &&
 		len(f.RecipientAnyGroups) == 0 &&
@@ -232,6 +248,10 @@ func (f Filter) IsEmpty() bool {
 		f.LargerThan == nil &&
 		f.SmallerThan == nil &&
 		len(f.SubjectSubstrings) == 0 &&
+		len(f.FilenameSubstrings) == 0 &&
+		len(f.ListIDSubstrings) == 0 &&
+		len(f.ListIDExactGroups) == 0 &&
+		f.ListID == "" &&
 		len(f.MessageTypes) == 0
 }
 
@@ -240,6 +260,9 @@ const MaxFilterMessageIDs = 2_000
 var ErrFilterTooLarge = errors.New("vector message ID filter exceeds 2000 IDs")
 
 func ValidateFilter(filter Filter) error {
+	if err := search.ValidateAccountScopes(filter.AccountScopes); err != nil {
+		return err
+	}
 	if len(filter.MessageIDs) > MaxFilterMessageIDs {
 		return ErrFilterTooLarge
 	}
@@ -382,11 +405,56 @@ type Backend interface {
 	Close() error
 }
 
+// SearchMetadata reports bounded-search behavior that cannot be inferred from
+// result length. Exact backends may omit this optional capability.
+type SearchMetadata struct {
+	PoolSaturated bool
+	// Accelerator identifies the SQLite retrieval path: vec1_ivf_opq,
+	// exact-filter, exact, or exact-fallback. Other backends leave it empty.
+	Accelerator string
+}
+
+// MetadataSearchingBackend is an optional search capability for backends with
+// explicit candidate work ceilings.
+type MetadataSearchingBackend interface {
+	SearchWithMetadata(
+		ctx context.Context,
+		gen GenerationID,
+		queryVec []float32,
+		k int,
+		filter Filter,
+	) ([]Hit, SearchMetadata, error)
+}
+
 // FilteredCoverageBackend is the optional exact-coverage capability used by
-// analytical search. The caller resolves the canonical filtered population in
-// DuckDB; the vector backend intersects that population with one generation.
+// callers that resolve a canonical message-ID population in another database.
+// The vector backend intersects that population with one generation.
 type FilteredCoverageBackend interface {
 	EmbeddedMessageCountForIDs(ctx context.Context, gen GenerationID, messageIDs []int64) (int64, error)
+}
+
+// CoverageSnapshotBackend intersects a generation with live, stamped message
+// IDs captured from one main-database read snapshot. Implementations count only
+// the supplied population and do not re-read mutable message lifecycle state.
+// Callers page at FilteredCoverageBatchSize.
+type CoverageSnapshotBackend interface {
+	EmbeddedMessageCountForSnapshot(ctx context.Context, gen GenerationID, stampedMessageIDs []int64) (int64, error)
+}
+
+// EmbeddingCoverage partitions the in-scope live messages for one generation:
+// Stamped messages carry the generation's embed_gen, and Embedded counts the
+// stamped messages that also have at least one vector.
+type EmbeddingCoverage struct {
+	Live     int64
+	Stamped  int64
+	Embedded int64
+}
+
+// CoverageCountingBackend is implemented by backends whose vectors share the
+// main database. It reads every coverage count from one statement, so the
+// counts describe one snapshot without moving message IDs to the client.
+type CoverageCountingBackend interface {
+	EmbeddingCoverage(ctx context.Context, gen GenerationID, scope BuildScope) (EmbeddingCoverage, error)
 }
 
 // OrphanEmbeddingPruner removes message embeddings whose authoritative
@@ -404,21 +472,22 @@ type OrphanEmbeddingPruner interface {
 const FilteredCoverageBatchSize = 256
 
 // FusingBackend is an optional capability implemented by backends that
-// can fuse FTS5 + ANN in a single SQL query. The hybrid engine checks
+// can fuse FTS + vector results. The hybrid engine checks
 // for this via type assertion.
 //
-// FusedSearch returns the RRF-ordered hits, a saturation flag, and
-// any error. saturated is true when either the BM25 or the ANN
+// FusedSearch returns the RRF-ordered hits, search metadata, and
+// any error. PoolSaturated is true when either the BM25 or the ANN
 // per-signal pool produced MORE THAN KPerSignal candidates — each pool
 // is over-fetched by one probe row (cap KPerSignal+1) and that probe
 // slot filled, so the final result set may have truncated
 // potentially-relevant hits. (The over-fetch/probe is the implementation's
-// chosen way to detect the cap; both concrete backends use it.) Callers
-// surface this to clients as pool_saturated so the user can raise
+// chosen way to detect the cap; both concrete backends use it.) Bounded
+// ANN search also sets it when its work ceiling leaves the pool underfilled.
+// Callers surface this to clients as pool_saturated so the user can raise
 // KPerSignal or narrow the query.
 type FusingBackend interface {
 	Backend
-	FusedSearch(ctx context.Context, req FusedRequest) (hits []FusedHit, saturated bool, err error)
+	FusedSearch(ctx context.Context, req FusedRequest) (hits []FusedHit, metadata SearchMetadata, err error)
 }
 
 // FusedRequest is the parameter bundle for a single-query fused hybrid search.

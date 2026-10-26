@@ -112,7 +112,7 @@ func hasAnyLabel(labels, wants []string) bool {
 // has seen only one full working day and is not yet stale.
 func CutoffWorkdays(now time.Time, n int) time.Time {
 	day := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
-	for i := 0; i < n; i++ {
+	for range n {
 		day = day.AddDate(0, 0, -1)
 		for day.Weekday() == time.Saturday || day.Weekday() == time.Sunday {
 			day = day.AddDate(0, 0, -1)
@@ -123,13 +123,13 @@ func CutoffWorkdays(now time.Time, n int) time.Time {
 
 // TruncateText returns s truncated to at most max runes. Truncation is
 // rune-safe so multi-byte characters are never split.
-func TruncateText(s string, max int) string {
-	if max <= 0 {
+func TruncateText(s string, limit int) string {
+	if limit <= 0 {
 		return ""
 	}
 	runes := []rune(s)
-	if len(runes) <= max {
+	if len(runes) <= limit {
 		return s
 	}
-	return string(runes[:max])
+	return string(runes[:limit])
 }

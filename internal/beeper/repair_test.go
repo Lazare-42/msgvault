@@ -2,14 +2,120 @@ package beeper
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/attachmentpolicy"
+	"go.kenn.io/msgvault/internal/documentindex"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil"
 )
+
+func TestRepairAfterMergePreservesCopiedAttachmentClassification(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	const (
+		liveAccount     = "signal-live"
+		historyAccount  = "signal-history"
+		liveMediaRef    = "mxc://beeper.local/live-photo"
+		historyMediaRef = "mxc://beeper.local/history-photo"
+	)
+	mediaBytes := []byte("same synthetic media bytes")
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	chat := func(accountID, mediaRef string) *fakeChat {
+		return &fakeChat{
+			ID: "!merge-repair:beeper.local", AccountID: accountID, Network: "Signal",
+			Title: "Merge repair", Type: "single", LastActivity: base,
+			Participants: []map[string]any{
+				{"id": "@self:beeper.local", "fullName": "Example Owner", "isSelf": true},
+				{"id": "@sender:beeper.local", "fullName": "Example Sender", "email": "sender@example.test"},
+			},
+			Msgs: []fakeMsg{{
+				ID: "message-1", SortKey: 1, Timestamp: base, Text: "same synthetic message",
+				SenderID: "@sender:beeper.local", SenderName: "Example Sender",
+				Attachments: []map[string]any{{
+					"id": mediaRef, "type": "img", "mimeType": "image/png",
+					"fileName": "photo.png", "fileSize": len(mediaBytes),
+				}},
+			}},
+		}
+	}
+
+	f := newFakeBeeper(t)
+	ch := chat(liveAccount, liveMediaRef)
+	f.addChat(ch)
+	f.setAsset(liveMediaRef, mediaBytes)
+	f.setAsset(historyMediaRef, mediaBytes)
+	imp, st, done := newTestImporter(t, f)
+	defer done()
+	attachmentsDir := t.TempDir()
+
+	_, err := imp.Import(t.Context(), ImportOptions{AccountID: liveAccount, AttachmentsDir: attachmentsDir})
+	require.NoError(err)
+	ch.AccountID = historyAccount
+	ch.Msgs[0].Attachments[0]["id"] = historyMediaRef
+	ch.Msgs[0].Attachments[0]["fileName"] = "historical-photo.png"
+	_, err = imp.Import(t.Context(), ImportOptions{AccountID: historyAccount, AttachmentsDir: attachmentsDir})
+	require.NoError(err)
+
+	liveSource, err := st.GetOrCreateSource("beeper", liveAccount)
+	require.NoError(err)
+	historySource, err := st.GetOrCreateSource("beeper", historyAccount)
+	require.NoError(err)
+	merge, err := st.MergeSourcesContext(t.Context(), store.MergeSourcesRequest{
+		FromSourceID: historySource.ID, IntoSourceID: liveSource.ID,
+	})
+	require.NoError(err)
+	assert.Equal(int64(1), merge.DuplicatesHidden)
+	assert.Equal(int64(1), merge.AttachmentsCopied)
+
+	var liveMessageID, liveAttachmentID, preservedAttachmentID int64
+	require.NoError(st.DB().QueryRow(st.Rebind(`
+			SELECT id FROM messages WHERE source_id = ? AND source_message_id = ?`),
+		liveSource.ID, "message-1").Scan(&liveMessageID))
+	require.NoError(st.DB().QueryRow(st.Rebind(`
+			SELECT id FROM attachments WHERE message_id = ? AND source_attachment_id = ?`),
+		liveMessageID, beeperAttachmentID(liveMediaRef)).Scan(&liveAttachmentID))
+	require.NoError(st.DB().QueryRow(st.Rebind(`
+			SELECT a.id FROM attachments a
+			JOIN source_merge_preserved_attachments spa ON spa.attachment_id = a.id
+			WHERE a.message_id = ?`), liveMessageID).Scan(&preservedAttachmentID))
+	var preservedSourceAttachmentID, preservedRoleBefore, preservedRoleSourceBefore string
+	require.NoError(st.DB().QueryRow(st.Rebind(`
+			SELECT source_attachment_id, attachment_role, role_source
+			FROM attachments WHERE id = ?`), preservedAttachmentID).
+		Scan(&preservedSourceAttachmentID, &preservedRoleBefore, &preservedRoleSourceBefore))
+	assert.Equal(beeperAttachmentID(historyMediaRef), preservedSourceAttachmentID)
+	assert.Equal("standalone", preservedRoleBefore)
+	assert.Equal("importer_semantics", preservedRoleSourceBefore)
+	_, err = st.DB().Exec(st.Rebind(`
+		UPDATE attachments SET attachment_role = 'unknown', role_source = 'unknown'
+		WHERE id = ?`), liveAttachmentID)
+	require.NoError(err)
+
+	sum, err := imp.RepairSource(t.Context(), liveSource.ID, nil)
+	require.NoError(err)
+	assert.Positive(sum.MessagesScanned)
+	assert.Positive(sum.AttachmentsTagged)
+	assert.Zero(sum.Errors)
+
+	var preservedRole, preservedRoleSource string
+	require.NoError(st.DB().QueryRow(st.Rebind(`
+			SELECT attachment_role, role_source FROM attachments WHERE id = ?`),
+		preservedAttachmentID).Scan(&preservedRole, &preservedRoleSource))
+	assert.Equal("standalone", preservedRole)
+	assert.Equal("importer_semantics", preservedRoleSource)
+
+	var liveRole string
+	require.NoError(st.DB().QueryRow(st.Rebind(`
+			SELECT attachment_role FROM attachments WHERE message_id = ? AND source_attachment_id = ?`),
+		liveMessageID, beeperAttachmentID(liveMediaRef)).Scan(&liveRole))
+	assert.Equal("standalone", liveRole)
+}
 
 // TestRepairArchiveRewritesStaleDerivedRows covers repairing an archive
 // written before HTML was converted and before shares were classified: the
@@ -24,16 +130,48 @@ func TestRepairArchiveRewritesStaleDerivedRows(t *testing.T) {
 	f.addChat(ch)
 	f.setAsset("mxc://x/share1", []byte("share-preview-bytes"))
 	f.setAsset("mxc://x/photo1", []byte("photo-bytes"))
+	f.setAsset("mxc://x/sticker1", []byte("sticker-bytes"))
+	ch.Msgs[0].Attachments = []map[string]any{{
+		"id": "mxc://x/sticker1", "type": beeperAttachmentTypeImage, "isSticker": true,
+		"mimeType": "image/webp", "fileName": "sticker.webp", "fileSize": 13,
+	}}
+	voice := mediaTranscriptChat().Msgs[0].Attachments[0]
+	ch.Msgs[0].Attachments = append(ch.Msgs[0].Attachments, voice)
+	f.setAsset("mxc://beeper.local/voice1", []byte("voice-bytes"))
 
 	imp, st, done := newTestImporter(t, f)
 	defer done()
 
 	_, err := imp.Import(context.Background(), ImportOptions{AccountID: "signal", AttachmentsDir: t.TempDir()})
 	require.NoError(err)
+	var htmlMessageID int64
+	require.NoError(st.DB().QueryRow(`
+		SELECT id FROM messages WHERE source_message_id = 'html1'`).Scan(&htmlMessageID))
+	require.NoError(st.UpsertAttachmentRecord(t.Context(), htmlMessageID, store.AttachmentWrite{
+		Filename: "stale.ogg", MIMEType: "audio/ogg", StoragePath: "stale/path",
+		ContentHash: strings.Repeat("a", 64), Size: 12, SourceAttachmentID: "beeper:stale",
+		MediaType: "audio", State: attachmentpolicy.StateStored,
+		Role: store.AttachmentRoleStandalone, RoleSource: store.AttachmentRoleSourceImporterSemantics,
+	}))
+	_, err = st.DB().Exec(st.Rebind(`UPDATE attachments SET attachment_metadata = ? WHERE source_attachment_id = ?`),
+		`{"source_transcript":{"provider":"beeper","text":"stale"}}`, "beeper:stale")
+	require.NoError(err)
+	reconciler, err := documentindex.NewReconciler(st, documentindex.ReconcilerConfig{
+		AttachmentPageSize: 10, ChangePageSize: 10,
+	})
+	require.NoError(err)
+	_, err = reconciler.Reconcile(t.Context())
+	require.NoError(err)
+	var staleOccurrenceKey string
+	require.NoError(st.DB().QueryRow(st.Rebind(`
+		SELECT o.occurrence_key
+		FROM document_occurrences o
+		JOIN attachments a ON a.id = o.attachment_id
+		WHERE a.source_attachment_id = ?`), "beeper:stale").Scan(&staleOccurrenceKey))
 
 	// Simulate rows written by an older build: raw HTML in the body and no
 	// share classification on the attachments.
-	_, err = st.DB().Exec(st.Rebind(`UPDATE message_bodies SET body_text = ?
+	_, err = st.DB().Exec(st.Rebind(`UPDATE message_bodies SET body_text = ?, body_html = NULL
 		WHERE message_id = (SELECT id FROM messages WHERE source_message_id = 'html1')`),
 		`<p>hello <a href="https://example.com" rel="noopener noreferrer">there</a></p>`)
 	require.NoError(err)
@@ -41,7 +179,8 @@ func TestRepairArchiveRewritesStaleDerivedRows(t *testing.T) {
 		UPDATE attachments
 		SET attachment_metadata = NULL,
 		    attachment_role = 'standalone',
-		    role_source = 'importer_semantics'`)
+		    role_source = 'importer_semantics'
+		WHERE source_attachment_id <> 'beeper:stale'`)
 	require.NoError(err)
 
 	sum, err := imp.RepairSource(context.Background(), beeperSourceID(t, st), nil)
@@ -50,12 +189,13 @@ func TestRepairArchiveRewritesStaleDerivedRows(t *testing.T) {
 	assert.Zero(sum.Undecodable)
 	assert.Equal(int64(1), sum.BodiesRewritten, "only the stale body needs rewriting")
 
-	var body, snippet string
-	require.NoError(st.DB().QueryRow(`SELECT b.body_text, COALESCE(m.snippet, '')
+	var body, snippet, html string
+	require.NoError(st.DB().QueryRow(`SELECT b.body_text, COALESCE(m.snippet, ''), b.body_html
 		FROM messages m JOIN message_bodies b ON b.message_id = m.id
-		WHERE m.source_message_id = 'html1'`).Scan(&body, &snippet))
-	assert.Equal("hello there", body, "HTML must be converted to plain text")
-	assert.Equal("hello there", snippet)
+		WHERE m.source_message_id = 'html1'`).Scan(&body, &snippet, &html))
+	assert.Equal(`<p>hello <a href="https://example.com" rel="noopener noreferrer">there</a></p><br>🎤 transcript: source words`, html)
+	assert.Equal("hello there\n🎤 transcript: source words", body)
+	assert.Equal(body, snippet)
 
 	// The forwarded link keeps its share URL and is excluded from standalone
 	// processing; the composed photo remains standalone.
@@ -72,6 +212,26 @@ func TestRepairArchiveRewritesStaleDerivedRows(t *testing.T) {
 	assert.Equal("preview", shareRole)
 	assert.Empty(photoMeta, "media the sender composed is not a share")
 	assert.Equal("standalone", photoRole)
+	var staleMeta, staleRole, staleRoleSource string
+	require.NoError(st.DB().QueryRow(st.Rebind(`
+		SELECT COALESCE(CAST(attachment_metadata AS TEXT), ''), attachment_role, role_source
+		FROM attachments WHERE source_attachment_id = ?`), "beeper:stale").Scan(&staleMeta, &staleRole, &staleRoleSource))
+	assert.Empty(staleMeta, "repair clears classifications for attachments removed from the archived payload")
+	assert.Equal("unknown", staleRole)
+	assert.Equal("unknown", staleRoleSource)
+	var stickerRole, stickerSource string
+	require.NoError(st.DB().QueryRow(st.Rebind(`
+		SELECT attachment_role, role_source
+		FROM attachments WHERE source_attachment_id = ?`), "beeper:mxc://x/sticker1").Scan(&stickerRole, &stickerSource))
+	assert.Equal("sticker", stickerRole)
+	assert.Equal("provider_explicit", stickerSource)
+	result, err := reconciler.Reconcile(t.Context())
+	require.NoError(err)
+	assert.Positive(result.ChangesConsumed)
+	var occurrenceCount int
+	require.NoError(st.DB().QueryRow(st.Rebind(`
+		SELECT COUNT(*) FROM document_occurrences WHERE occurrence_key = ?`), staleOccurrenceKey).Scan(&occurrenceCount))
+	assert.Zero(occurrenceCount, "the existing reconciler removes the now-ineligible occurrence")
 
 	// Re-running must be a no-op: nothing left differing from the archive.
 	again, err := imp.RepairSource(context.Background(), beeperSourceID(t, st), nil)
@@ -125,6 +285,64 @@ func TestRepairArchiveRollsBackDerivedTextTogether(t *testing.T) {
 		JOIN message_bodies b ON b.message_id = m.id
 		WHERE m.source_message_id = 'html1'`).Scan(&body))
 	assert.Equal("hello there", body)
+}
+
+func TestRepairSourceResumesFromLastSuccessfulRowAfterFailure(t *testing.T) {
+	testutil.SkipIfPostgres(t, "SQLite trigger injects a row-level repair failure")
+	require := require.New(t)
+	assert := assert.New(t)
+
+	f := newFakeBeeper(t)
+	f.addChat(shareAndHTMLChat())
+	imp, st, done := newTestImporter(t, f)
+	defer done()
+	_, err := imp.Import(t.Context(), ImportOptions{AccountID: "signal"})
+	require.NoError(err)
+	sourceID := beeperSourceID(t, st)
+	require.NoError(st.AddAccountIdentity(sourceID, "owner@example.test", "manual"))
+	_, err = st.RemoveAccountIdentity(sourceID, "owner@example.test")
+	require.NoError(err)
+
+	rows, err := st.DB().Query(st.Rebind(
+		`SELECT id FROM messages WHERE source_id = ? ORDER BY id`), sourceID)
+	require.NoError(err)
+	defer func() { require.NoError(rows.Close()) }()
+	var messageIDs []int64
+	for rows.Next() {
+		var id int64
+		require.NoError(rows.Scan(&id))
+		messageIDs = append(messageIDs, id)
+	}
+	require.NoError(rows.Err())
+	require.NoError(rows.Close())
+	require.Len(messageIDs, 3)
+	failID := messageIDs[1]
+	_, err = st.DB().Exec(fmt.Sprintf(`CREATE TRIGGER fail_middle_repair
+		BEFORE UPDATE OF snippet ON messages
+		WHEN OLD.id = %d
+		BEGIN SELECT RAISE(ABORT, 'injected row failure'); END`, failID))
+	require.NoError(err)
+
+	sum, err := imp.RepairSource(t.Context(), sourceID, nil)
+	require.NoError(err, "a row failure is reported in the summary so the sync can continue")
+	assert.Equal(int64(2), sum.MessagesScanned, "repair stops at the first failed row")
+	assert.Equal(int64(1), sum.Errors)
+	source, err := st.GetSourceByID(sourceID)
+	require.NoError(err)
+	assert.JSONEq(fmt.Sprintf(`{"repair_version":"%s","repair_after_id":%d,"no_default_identity":true}`,
+		rederiveVersion, messageIDs[0]), source.SyncConfig.String,
+		"checkpoint stays on the last row whose repair committed")
+
+	_, err = st.DB().Exec(`DROP TRIGGER fail_middle_repair`)
+	require.NoError(err)
+	sum, err = imp.RepairSource(t.Context(), sourceID, nil)
+	require.NoError(err)
+	assert.Equal(int64(2), sum.MessagesScanned, "the successful prefix is not rescanned")
+	assert.Zero(sum.Errors)
+	source, err = st.GetSourceByID(sourceID)
+	require.NoError(err)
+	assert.JSONEq(`{"no_default_identity":true}`, source.SyncConfig.String,
+		"completed repair clears only its checkpoint and preserves the ownership opt-out")
 }
 
 func TestRepairArchiveRefreshesSnippetAndFTSWhenBodyIsCurrent(t *testing.T) {
@@ -368,4 +586,27 @@ func beeperSourceID(t *testing.T, st *store.Store) int64 {
 	require.NoError(t, st.DB().QueryRow(
 		`SELECT id FROM sources WHERE source_type = 'beeper'`).Scan(&id))
 	return id
+}
+
+func TestRepairSourceResumesAfterCanceledBatch(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newFakeBeeper(t)
+	f.addChat(budgetTestChat("!repair:beeper.local", repairBatchSize+1, time.Now().Add(-72*time.Hour)))
+	imp, st, done := newTestImporter(t, f)
+	defer done()
+	_, err := imp.Import(t.Context(), ImportOptions{AccountID: "signal"})
+	require.NoError(err)
+	_, err = st.DB().Exec(`UPDATE message_bodies SET body_text = 'stale'`)
+	require.NoError(err)
+	sourceID := beeperSourceID(t, st)
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	sum, err := imp.RepairSource(ctx, sourceID, func(string) { cancel() })
+	require.ErrorIs(err, context.Canceled)
+	assert.EqualValues(repairBatchSize, sum.BodiesRewritten)
+	sum, err = imp.RepairSource(t.Context(), sourceID, nil)
+	require.NoError(err)
+	assert.EqualValues(1, sum.MessagesScanned, "resume starts after the committed batch")
+	assert.EqualValues(1, sum.BodiesRewritten, "the final row gets repaired")
 }

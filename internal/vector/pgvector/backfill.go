@@ -11,10 +11,7 @@ import (
 	"go.kenn.io/msgvault/internal/vector"
 )
 
-// embedGenBackfillMigration is the applied_migrations ledger key that
-// guards the one-time embed_gen upgrade backfill. Stable string — never
-// change it, or the backfill would re-run on every Open.
-const embedGenBackfillMigration = "embed_gen_backfill_active_v1"
+const embedGenBackfillMigration = vector.EmbedGenBackfillMigration
 
 // BackfillEmbedGenForUpgrade performs the ONE-TIME upgrade backfill
 // (Package A): when an active generation exists, it stamps embed_gen=active
@@ -313,6 +310,21 @@ func (b *Backend) resetOrphanedEmbedGen(ctx context.Context) error {
 		  WHERE embed_gen IS NOT NULL
 		    AND embed_gen NOT IN (SELECT id FROM index_generations)`); err != nil {
 		return fmt.Errorf("reset orphaned embed_gen: clear orphaned stamps: %w", err)
+	}
+	// Batch diagnostics are keyed by generation too; a reused id must not
+	// show an earlier generation's timings. The table can be absent before
+	// store.InitSchema runs.
+	var hasDiagnostics bool
+	if err := tx.QueryRowContext(ctx,
+		`SELECT to_regclass('embedding_diagnostics') IS NOT NULL`).Scan(&hasDiagnostics); err != nil {
+		return fmt.Errorf("reset orphaned embed_gen: probe diagnostics table: %w", err)
+	}
+	if hasDiagnostics {
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM embedding_diagnostics
+			  WHERE generation_id NOT IN (SELECT id FROM index_generations)`); err != nil {
+			return fmt.Errorf("reset orphaned embed_gen: clear orphaned diagnostics: %w", err)
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("reset orphaned embed_gen: commit tx: %w", err)

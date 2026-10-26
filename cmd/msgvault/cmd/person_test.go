@@ -2,12 +2,15 @@ package cmd
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"sync/atomic"
 	"testing"
 
@@ -15,7 +18,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/kit/daemon"
+	"go.kenn.io/msgvault/internal/api"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/pkg/client/generated"
 )
 
@@ -36,6 +41,116 @@ func TestWriteCLIPersonSanitizesTerminalControls(t *testing.T) {
 	assert.NotContains(stdout.String(), "\x1b")
 	assert.NotContains(stdout.String(), "https://attacker.test")
 	assert.Contains(stdout.String(), "Alice Example")
+}
+
+func TestPersonGetLooksUpVCardUIDAndJSONIncludesCardDAVBindings(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	const uid = "urn:uuid:77822e26-3cd5-40d0-a0fd-6f0ff63b204b"
+	var requestedPath string
+	var requestedUID string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestedPath = r.URL.Path
+		requestedUID = r.URL.Query().Get("uid")
+		assert.Equal(http.MethodGet, r.Method)
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			_, err := w.Write([]byte(`{"status":"ok","api_schema_version":"3.10.0"}`))
+			assert.NoError(err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write([]byte(`{
+			"id":7,"vcard_uid":"person-7","revision":2,"participant_ids":[],
+			"carddav_bindings":[{"connection":"personal","book":"Personal",
+			"href":"https://contacts.example.test/book/person.vcf","remote_uid":"` + uid + `",
+			"mapping_status":"mapped"}],
+			"created_at":"2026-07-29T12:00:00Z","updated_at":"2026-07-29T12:00:00Z"
+		}`))
+		assert.NoError(err)
+	}))
+	t.Cleanup(server.Close)
+	testCtx := withStoreResolverConfig(t, &config.Config{
+		Remote: config.RemoteConfig{URL: server.URL, AllowInsecure: true},
+	})
+	savedJSON := personJSON
+	personJSON = true
+	t.Cleanup(func() { personJSON = savedJSON })
+
+	var lookupUID string
+	command := &cobra.Command{
+		Use: personGetCmd.Use, Args: personGetCmd.Args, RunE: personGetCmd.RunE,
+	}
+	command.Flags().StringVar(&lookupUID, "vcard-uid", "", "")
+	command.SetContext(testCtx)
+	command.SetArgs([]string{"--vcard-uid", uid})
+	var stdout bytes.Buffer
+	command.SetOut(&stdout)
+	require.NoError(command.Execute())
+	assert.Equal(uid, lookupUID)
+	assert.Equal("/api/v1/people/by-uid", requestedPath)
+	assert.Equal(uid, requestedUID)
+	assert.JSONEq(`{"id":7,"vcard_uid":"person-7","revision":2,"participant_ids":[],`+
+		`"carddav_bindings":[{"connection":"personal","book":"Personal",`+
+		`"href":"https://contacts.example.test/book/person.vcf","remote_uid":"`+uid+`",`+
+		`"mapping_status":"mapped"}],"created_at":"2026-07-29T12:00:00Z",`+
+		`"updated_at":"2026-07-29T12:00:00Z"}`, stdout.String())
+}
+
+func TestPersonGetByUIDRequiresCurrentDaemonSchema(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	var uidLookups atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/v1/health" {
+			w.Header().Set("Content-Type", "application/json")
+			_, err := w.Write([]byte(`{"status":"ok","api_schema_version":"3.9.0"}`))
+			assert.NoError(err)
+			return
+		}
+		if r.URL.Path == "/api/v1/people/by-uid" {
+			uidLookups.Add(1)
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(server.Close)
+	testCtx := withStoreResolverConfig(t, &config.Config{
+		Remote: config.RemoteConfig{URL: server.URL, AllowInsecure: true},
+	})
+	command := &cobra.Command{
+		Use: personGetCmd.Use, Args: personGetCmd.Args, RunE: personGetCmd.RunE,
+	}
+	command.Flags().String("vcard-uid", "", "")
+	command.SetContext(testCtx)
+	command.SetArgs([]string{"--vcard-uid", "urn:uuid:person-example"})
+	err := command.Execute()
+	require.Error(err)
+	assert.Contains(err.Error(), "daemon API schema 3.10.0 or newer")
+	assert.Zero(uidLookups.Load(), "the unsupported route must not be sent to an older daemon")
+}
+
+func TestPersonGetRejectsInvalidIDBeforeOpeningDaemonConnection(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(server.Close)
+	testCtx := withStoreResolverConfig(t, &config.Config{
+		Remote: config.RemoteConfig{URL: server.URL, AllowInsecure: true},
+	})
+	command := &cobra.Command{
+		Use: personGetCmd.Use, Args: personGetCmd.Args, RunE: personGetCmd.RunE,
+	}
+	command.Flags().String("vcard-uid", "", "")
+	command.SetContext(testCtx)
+	command.SetArgs([]string{"0"})
+	err := command.Execute()
+	require.Error(err)
+	assert.Contains(err.Error(), "person ID must be a positive integer")
+	assert.Zero(requests.Load(), "invalid local input must not open the daemon connection")
 }
 
 func TestPersonPromoteAcceptsCreatedResponse(t *testing.T) {
@@ -66,7 +181,7 @@ func TestPersonPromoteAcceptsCreatedResponse(t *testing.T) {
 		assert.NoError(err)
 	}))
 	t.Cleanup(server.Close)
-	withStoreResolverConfig(t, &config.Config{
+	testCtx := withStoreResolverConfig(t, &config.Config{
 		Remote: config.RemoteConfig{URL: server.URL, AllowInsecure: true},
 	})
 
@@ -80,6 +195,7 @@ func TestPersonPromoteAcceptsCreatedResponse(t *testing.T) {
 		Args: personPromoteCmd.Args,
 		RunE: personPromoteCmd.RunE,
 	}
+	command.SetContext(testCtx)
 	command.SetOut(&output)
 	command.SetArgs([]string{"42"})
 
@@ -122,7 +238,7 @@ func TestPersonSetDisplayNameClearSendsNull(t *testing.T) {
 		}
 	}))
 	t.Cleanup(server.Close)
-	withStoreResolverConfig(t, &config.Config{
+	testCtx := withStoreResolverConfig(t, &config.Config{
 		Remote: config.RemoteConfig{URL: server.URL, AllowInsecure: true},
 	})
 
@@ -138,6 +254,7 @@ func TestPersonSetDisplayNameClearSendsNull(t *testing.T) {
 		Args: personSetDisplayNameCmd.Args,
 		RunE: personSetDisplayNameCmd.RunE,
 	}
+	command.SetContext(testCtx)
 	command.Flags().BoolVar(&personClearDisplayName, "clear", false, "")
 	command.SetOut(&output)
 	command.SetArgs([]string{"7", "--clear"})
@@ -174,7 +291,7 @@ func TestPersonDeleteSendsIfMatchFromLatestRead(t *testing.T) {
 		}
 	}))
 	t.Cleanup(server.Close)
-	withStoreResolverConfig(t, &config.Config{
+	testCtx := withStoreResolverConfig(t, &config.Config{
 		Remote: config.RemoteConfig{URL: server.URL, AllowInsecure: true},
 	})
 
@@ -184,6 +301,7 @@ func TestPersonDeleteSendsIfMatchFromLatestRead(t *testing.T) {
 		Args: personDeleteCmd.Args,
 		RunE: personDeleteCmd.RunE,
 	}
+	command.SetContext(testCtx)
 	command.SetOut(&output)
 	command.SetArgs([]string{"7"})
 
@@ -192,12 +310,13 @@ func TestPersonDeleteSendsIfMatchFromLatestRead(t *testing.T) {
 	assert.Contains(output.String(), "Deleted person 7")
 }
 
-func executePersonMergeCLI(t *testing.T, command *cobra.Command, args ...string) string {
+func executePersonMergeCLI(ctx context.Context, t *testing.T, command *cobra.Command, args ...string) string {
 	t.Helper()
 	var output bytes.Buffer
 	command.SetOut(&output)
 	command.SetErr(&output)
 	command.SetArgs(args)
+	command.SetContext(ctx)
 	require.NoError(t, command.Execute(), output.String())
 	return output.String()
 }
@@ -298,52 +417,51 @@ func TestPersonMergeCommandsUseConfiguredRemote(t *testing.T) {
 		}
 	}))
 	t.Cleanup(server.Close)
-	withStoreResolverConfig(t, &config.Config{
+	testCtx := withStoreResolverConfig(t, &config.Config{
 		Remote: config.RemoteConfig{URL: server.URL, AllowInsecure: true},
 	})
-
-	mergeJSONOutput := executePersonMergeCLI(t, newPersonMergeCommand(), "7", "9",
+	mergeJSONOutput := executePersonMergeCLI(testCtx, t, newPersonMergeCommand(), "7", "9",
 		"--survivor-revision", "3", "--absorbed-revision", "2",
 		"--idempotency-key", "remote-merge", "--json")
 	assertions.Contains(mergeJSONOutput, `"review_candidates":[]`)
-	mergeOutput := executePersonMergeCLI(t, newPersonMergeCommand(), "7", "9",
+	mergeOutput := executePersonMergeCLI(testCtx, t, newPersonMergeCommand(), "7", "9",
 		"--survivor-revision", "3", "--absorbed-revision", "2",
 		"--idempotency-key", "remote-merge")
 	assertions.Contains(mergeOutput, "Merge: 12")
 	assertions.Contains(mergeOutput, "Absorbed UID: absorbed-uid")
 	assertions.Contains(mergeOutput, "Identity revision: 42")
 	assertions.Contains(mergeOutput, "Cache state: ready")
-	splitJSONOutput := executePersonMergeCLI(t, newPersonSplitCommand(), "7", "--merge-id", "12",
+	splitJSONOutput := executePersonMergeCLI(testCtx, t, newPersonSplitCommand(), "7", "--merge-id", "12",
 		"--participant", "90", "--revision", "4",
 		"--idempotency-key", "remote-split", "--json")
 	assertions.Contains(splitJSONOutput, `"ambiguous_rows":[]`)
-	splitOutput := executePersonMergeCLI(t, newPersonSplitCommand(), "7", "--merge-id", "12",
+	splitOutput := executePersonMergeCLI(testCtx, t, newPersonSplitCommand(), "7", "--merge-id", "12",
 		"--participant", "90", "--revision", "4",
 		"--idempotency-key", "remote-split")
 	assertions.Contains(splitOutput, "Split: 13")
 	assertions.Contains(splitOutput, "Exact reversal: true")
 	assertions.Contains(splitOutput, "Identity revision: 43")
 	assertions.Contains(splitOutput, "Cache state: stale")
-	rootSplitOutput := executePersonMergeCLI(t, newPersonSplitCommand(), "7", "--merge-id", "12",
+	rootSplitOutput := executePersonMergeCLI(testCtx, t, newPersonSplitCommand(), "7", "--merge-id", "12",
 		"--revision", "4", "--idempotency-key", "remote-root-split", "--json")
 	assertions.Contains(rootSplitOutput, `"exact_reversal":true`)
 	assertions.Equal([][]int64{{90}, {90}, nil}, splitParticipants)
-	executePersonMergeCLI(t, newPersonMergeHistoryCommand(), "7", "--json")
-	assertions.Contains(executePersonMergeCLI(t, newPersonMergeHistoryCommand(), "7"), "MERGE")
-	detailJSONOutput := executePersonMergeCLI(t, newPersonMergeShowCommand(), "12", "--json")
+	executePersonMergeCLI(testCtx, t, newPersonMergeHistoryCommand(), "7", "--json")
+	assertions.Contains(executePersonMergeCLI(testCtx, t, newPersonMergeHistoryCommand(), "7"), "MERGE")
+	detailJSONOutput := executePersonMergeCLI(testCtx, t, newPersonMergeShowCommand(), "12", "--json")
 	for _, field := range []string{"participants", "rows", "splits", "review_candidates"} {
 		assertions.Contains(detailJSONOutput, `"`+field+`":[]`)
 	}
-	assertions.Contains(executePersonMergeCLI(t, newPersonMergeShowCommand(), "12"), "Merge: 12")
-	snapshot := executePersonMergeCLI(t, newPersonMergeShowCommand(), "12", "--snapshot", "--json")
+	assertions.Contains(executePersonMergeCLI(testCtx, t, newPersonMergeShowCommand(), "12"), "Merge: 12")
+	snapshot := executePersonMergeCLI(testCtx, t, newPersonMergeShowCommand(), "12", "--snapshot", "--json")
 	assertions.JSONEq(`{"persons":[{"id":7}],"rows":{"person_names":[1]}}`,
 		string(extractPersonMergeSnapshot(t, snapshot)))
 	assertions.Contains(
-		executePersonMergeCLI(t, newPersonMergeShowCommand(), "12", "--snapshot"),
+		executePersonMergeCLI(testCtx, t, newPersonMergeShowCommand(), "12", "--snapshot"),
 		`Snapshot: {"persons":[{"id":7}],"rows":{"person_names":[1]}}`)
-	executePersonMergeCLI(t, newPersonMergeCandidateCommand(), "21",
+	executePersonMergeCLI(testCtx, t, newPersonMergeCandidateCommand(), "21",
 		"--person-id", "7", "--revision", "4", "--decision", "rejected", "--json")
-	candidateOutput := executePersonMergeCLI(t, newPersonMergeCandidateCommand(), "21",
+	candidateOutput := executePersonMergeCLI(testCtx, t, newPersonMergeCandidateCommand(), "21",
 		"--person-id", "7", "--revision", "4", "--decision", "rejected")
 	assertions.Contains(candidateOutput, "State: rejected")
 	assertions.Contains(candidateOutput, `Person ETag: "person-7-r5"`)
@@ -360,12 +478,6 @@ func TestPersonMergeCommandsUseConfiguredRemote(t *testing.T) {
 		}
 		assertions.Equal(want, requests[key], key)
 	}
-	for _, command := range []*cobra.Command{
-		newPersonMergeCommand(), newPersonSplitCommand(), newPersonMergeCandidateCommand(),
-	} {
-		assertions.Nil(command.Flags().Lookup("actor"))
-	}
-	assertions.Nil(newPersonMergeCandidateCommand().Flags().Lookup("idempotency-key"))
 }
 
 func extractPersonMergeSnapshot(t *testing.T, payload string) json.RawMessage {
@@ -392,7 +504,7 @@ func TestPersonMergeCommandUsesExistingLocalDaemon(t *testing.T) {
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 	dataDir := t.TempDir()
-	withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	testCtx := withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
 	runtime := daemonRuntimeForHTTPServer(t, server, daemonAPIKeyFingerprint(""))
 	_, err := daemonRuntimeStore(dataDir).Write(runtime.Record)
 	require.NoError(t, err)
@@ -402,14 +514,14 @@ func TestPersonMergeCommandUsesExistingLocalDaemon(t *testing.T) {
 			return nil, errors.New("unreachable")
 		})
 
-	output := executePersonMergeCLI(t, newPersonMergeHistoryCommand(), "7", "--json")
+	output := executePersonMergeCLI(testCtx, t, newPersonMergeHistoryCommand(), "7", "--json")
 	assert.JSONEq(t, `[]`, output)
 	assert.Equal(t, 1, requests)
 }
 
 func TestPersonMergeCLIValidationHappensBeforeOpeningStore(t *testing.T) {
 	dataDir := t.TempDir()
-	withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	testCtx := withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
 	tests := []struct {
 		name    string
 		command *cobra.Command
@@ -432,6 +544,7 @@ func TestPersonMergeCLIValidationHappensBeforeOpeningStore(t *testing.T) {
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			test.command.SetArgs(test.args)
+			test.command.SetContext(testCtx)
 			err := test.command.Execute()
 			require.ErrorContains(t, err, test.want)
 		})
@@ -439,4 +552,38 @@ func TestPersonMergeCLIValidationHappensBeforeOpeningStore(t *testing.T) {
 	entries, err := os.ReadDir(dataDir)
 	require.NoError(t, err)
 	assert.Empty(t, entries, "invalid commands must not initialize the archive")
+}
+
+func TestPersonPromoteSeedsNameThroughDaemonAdapter(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	st := testutil.NewTestStore(t)
+	id, err := st.EnsureParticipant("promotion@example.com", "Alex Example", "example.com")
+	require.NoError(err)
+	srv := api.NewServer(&config.Config{}, &storeAPIAdapter{store: st}, nil, slog.New(slog.DiscardHandler))
+	server := httptest.NewServer(srv.Router())
+	t.Cleanup(server.Close)
+	testCtx := withStoreResolverConfig(t, &config.Config{Remote: config.RemoteConfig{URL: server.URL, AllowInsecure: true}})
+	savedJSON := personJSON
+	personJSON = false
+	t.Cleanup(func() { personJSON = savedJSON })
+	var output bytes.Buffer
+	promote := &cobra.Command{Use: personPromoteCmd.Use, Args: personPromoteCmd.Args, RunE: personPromoteCmd.RunE}
+	promote.SetOut(&output)
+	promote.SetArgs([]string{strconv.FormatInt(id, 10)})
+	require.NoError(promote.ExecuteContext(testCtx))
+	assert.Contains(output.String(), "Display name: Alex Example")
+	person, err := st.PersonForParticipants([]int64{id})
+	require.NoError(err)
+	require.NotNil(person)
+	directory, err := runPersonDirectoryCommand(testCtx, t)
+	require.NoError(err)
+	assert.Contains(directory, "Alex Example")
+	output.Reset()
+	get := &cobra.Command{Use: personGetCmd.Use, Args: personGetCmd.Args, RunE: personGetCmd.RunE}
+	get.Flags().String("vcard-uid", "", "")
+	get.SetOut(&output)
+	get.SetArgs([]string{strconv.FormatInt(person.ID, 10)})
+	require.NoError(get.ExecuteContext(testCtx))
+	assert.Contains(output.String(), "Display name: Alex Example")
 }

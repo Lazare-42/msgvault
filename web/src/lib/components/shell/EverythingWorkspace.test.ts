@@ -1,11 +1,28 @@
+import { recordingMessage, recordingTranscript, recordingSearchReport } from '../../archive/recording-fixtures.test-support';
 import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
 import { appShortcuts } from '@kenn-io/kit-ui';
-import { describe, expect, it, vi } from 'vitest';
+import { tick } from 'svelte';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { createAPIClient } from '../../api/client';
+import { meetingFixtureResponse } from '../../meetings/fixtures.test-support';
+import { createCaptureClient } from '../../telemetry/capture.test-support';
+import { IntegrationReadiness } from '../../kata/kata-ready.svelte';
+import { mediaReadinessKey } from '../../search/media-ready.svelte';
 import { LOAD_THROUGH_END_MAX_PAGES } from '../../explore/paging';
 import { ExploreState, parseExploreURLState } from '../../explore/state.svelte';
 import AppShell from './AppShell.svelte';
+
+vi.mock('../../telemetry/screen-views', () => ({ startScreenViewReporting: () => () => {} }));
+
+const telemetryEvents: Array<{ event: string; properties: { kind: string } }> = [];
+beforeEach(() => { telemetryEvents.length = 0; });
+const createAPIClient = (fetchFn: typeof fetch) => createCaptureClient(fetchFn, telemetryEvents);
+
+function renderRecordingShell(client: ReturnType<typeof createAPIClient>, state: ExploreState, probe: (signal: AbortSignal) => Promise<boolean | undefined> = async () => true) {
+  const readiness = new IntegrationReadiness(probe);
+  const view = render(AppShell, { props: { client, state }, context: new Map([[mediaReadinessKey, readiness]]) });
+  return { ...view, unmount: () => { view.unmount(); readiness.dispose(); } };
+}
 
 function exploreResponse(overrides: Record<string, unknown> = {}) {
   return {
@@ -18,6 +35,147 @@ function exploreResponse(overrides: Record<string, unknown> = {}) {
 }
 
 describe('EverythingWorkspace', () => {
+  it('hides unconfigured recording search and preserves the layout across navigation', async () => {
+    window.history.replaceState(null, '', '/');
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json(exploreResponse()));
+    const probe = vi.fn(async () => false);
+    const state = new ExploreState(window);
+    state.replaceTransient({ workspace: 'everything', query: 'quarterly', searchMode: 'full_text' });
+    const view = renderRecordingShell(createAPIClient(fetchFn), state, probe);
+    try {
+      await screen.findByText('0 items');
+      vi.useFakeTimers();
+      state.commitSearch('different', 'full_text');
+      await tick();
+      await vi.advanceTimersByTimeAsync(300);
+      state.commitNavigation({ workspace: 'files' });
+      await tick();
+      state.commitNavigation({ workspace: 'everything' });
+      await tick();
+      await vi.advanceTimersByTimeAsync(300);
+      expect(probe).toHaveBeenCalledOnce();
+      expect(screen.queryByRole('region', { name: 'Recordings' })).toBeNull();
+      expect(screen.queryByRole('heading', { name: /^Results/ })).toBeNull();
+      expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
+      expect(document.querySelector('.results-primary--recordings')).toBeNull();
+      expect(fetchFn.mock.calls.some(([input]) => new URL((input as Request).url).pathname.endsWith('/media/search'))).toBe(false);
+    } finally {
+      view.unmount();
+      state.destroy();
+      vi.useRealTimers();
+    }
+  });
+
+  it('retries recording details and distinguishes missing messages', async () => {
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything', query: 'quarterly', searchMode: 'full_text', selectedRow: 'recording:9' }))}`);
+    const message = recordingMessage;
+    let messageStatus = 500;
+    const exploreBodies: Array<{ cursor?: string }> = [];
+    const fetchFn = vi.fn<typeof fetch>(async input => {
+      const request = input as Request;
+      const path = new URL(request.url).pathname;
+      if (path.endsWith('/explore')) exploreBodies.push(await request.clone().json());
+      if (path.endsWith('/media/search')) return Response.json(recordingSearchReport());
+      if (path.endsWith('/messages/9/recordings')) return Response.json(recordingTranscript);
+      if (path.endsWith('/messages/9')) return messageStatus === 200 ? Response.json(message) : Response.json({ error: 'unavailable' }, { status: messageStatus });
+      if (path.endsWith('/conversations/2')) return Response.json({ id: 2, messages: [message], anchor_id: 9, has_before: false, has_after: false, total: 1 });
+      return Response.json(exploreResponse({ next_cursor: 'more' }));
+    });
+    const state = new ExploreState(window);
+    const view = renderRecordingShell(createAPIClient(fetchFn), state);
+    try {
+      const link = await screen.findByRole('link', { name: 'Team chat' });
+      await screen.findByText('Could not load this recording message.');
+      await waitFor(() => expect(telemetryEvents.filter(e => e.event === 'error_shown')).toEqual([{ event: 'error_shown', properties: { surface: 'web', kind: 'message' } }]));
+      messageStatus = 200;
+      await fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+      const pane = await screen.findByRole('complementary', { name: 'Reading pane: Team chat' });
+      expect(await within(pane).findByText('Source recording')).toBeTruthy();
+      expect(await within(pane).findByText('Quarterly numbers in the source transcript')).toBeTruthy();
+      expect(screen.getByRole('heading', { name: 'Results 0 items' })).toBeTruthy();
+      expect(link.getAttribute('aria-current')).toBe('true');
+      expect(exploreBodies.length).toBeGreaterThan(0);
+      expect(exploreBodies.filter(body => body.cursor)).toHaveLength(0);
+      await fireEvent.click(screen.getByRole('button', { name: 'Close reading pane' }));
+      messageStatus = 404;
+      await fireEvent.click(await screen.findByRole('link', { name: 'Team chat' }));
+      await screen.findByText('This recording message is no longer available.');
+      await waitFor(() => expect(telemetryEvents.filter(e => e.event === 'error_shown')).toEqual([
+        { event: 'error_shown', properties: { surface: 'web', kind: 'message' } },
+        { event: 'error_shown', properties: { surface: 'web', kind: 'message' } },
+      ]));
+      expect(screen.queryByRole('link', { name: 'Team chat' })).toBeNull();
+      expect(screen.queryByText('Quarterly numbers')).toBeNull();
+      await fireEvent.click(screen.getByRole('button', { name: 'Close reading pane' }));
+      expect(screen.queryByText('Quarterly numbers')).toBeNull();
+      expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
+    } finally {
+      view.unmount();
+      state.destroy();
+    }
+  });
+
+  it('uses the single Person filter for recording search', async () => {
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything', query: 'quarterly', searchMode: 'full_text', filters: [{ dimension: 'participant', values: ['7'] }] }))}`);
+    const fetchFn = vi.fn<typeof fetch>(async input => {
+      const url = new URL((input as Request).url);
+      return Response.json(url.pathname.endsWith('/media/search') ? recordingSearchReport() : exploreResponse());
+    });
+    const state = new ExploreState(window);
+    const view = renderRecordingShell(createAPIClient(fetchFn), state);
+    try {
+      await screen.findByText('Quarterly numbers');
+      const request = fetchFn.mock.calls.find(([input]) => new URL((input as Request).url).pathname.endsWith('/media/search'))![0] as Request;
+      expect(new URL(request.url).searchParams.get('participant_id')).toBe('7');
+    } finally {
+      view.unmount();
+      state.destroy();
+    }
+  });
+
+  it.each([
+    { searchMode: 'semantic' }, { filters: [{ dimension: 'source', values: ['1'] }] },
+    { groupingChain: ['kind'] },
+    { filters: [{ dimension: 'participant', values: ['1', '2'] }] },
+    { filters: [{ dimension: 'participant', values: ['1'] }, { dimension: 'participant', values: ['2'] }] },
+    ...['1e3', '0x7', '7.0'].map(value => ({ filters: [{ dimension: 'participant', values: [value] }] })),
+  ])('shows recording search hints for configured unsupported queries %j', async patch => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything', query: 'quarterly', searchMode: 'full_text', ...patch }))}`);
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json(exploreResponse()));
+    const state = new ExploreState(window);
+    const view = renderRecordingShell(createAPIClient(fetchFn), state);
+    try {
+      await screen.findByText('groupingChain' in patch ? '0 groups' : '0 items');
+      expect(await screen.findByRole('region', { name: 'Recordings' })).toBeTruthy();
+      expect(screen.getByRole('heading', { name: /^Results/ })).toBeTruthy();
+      expect(document.querySelector('.results-primary--recordings')).toBeTruthy();
+      await vi.advanceTimersByTimeAsync(300);
+      expect(fetchFn.mock.calls.some(([input]) => new URL((input as Request).url).pathname.endsWith('/media/search'))).toBe(false);
+    } finally {
+      view.unmount();
+      state.destroy();
+      vi.useRealTimers();
+    }
+  });
+
+  it.each(['everything', 'files'] as const)('keeps non-filterable groups in %s visible without opening an unavailable inspector', async (workspace) => {
+    window.history.replaceState(null, '', '/');
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json({
+      rows: [{ key: 'message', label: 'Messages', count: 12, estimated_bytes: 42, latest_at: '2026-07-18T12:00:00Z' }],
+      total_count: 1, cache_revision: 'cache-1', search_provenance: {}
+    }));
+    const state = new ExploreState(window);
+    state.replaceTransient({ workspace, groupingChain: ['kind'] });
+    const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
+    const row = (await screen.findByText('Messages')).closest('[role="row"]')!;
+    await fireEvent.pointerDown(row);
+    expect(state.current.selectedRow).toBeNull();
+    expect(screen.queryByText('The selected group is not available in this context.')).toBeNull();
+    rendered.unmount();
+    state.destroy();
+  });
+
   function entry(index: number) {
     return {
       key: `message:${index}`,
@@ -40,6 +198,18 @@ describe('EverythingWorkspace', () => {
       match: {}
     };
   }
+
+  it('leaves searching to the global search box', () => {
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
+    const state = new ExploreState(window);
+    render(AppShell, { client: createAPIClient(vi.fn<typeof fetch>(async () => Response.json(exploreResponse()))), state, enabled: false });
+    const main = screen.getByRole('main', { name: 'Everything' });
+    expect(within(main).queryByRole('search')).toBeNull();
+    expect(screen.getAllByRole('search')).toHaveLength(1);
+    expect(screen.queryByRole('contentinfo', { name: 'Keyboard shortcuts' })).toBeNull();
+    expect(within(main).queryByText('Keyboard shortcuts')).toBeNull();
+    state.destroy();
+  });
 
   it('explains how to refine a semantic search when the candidate pool is capped', async () => {
     window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
@@ -96,7 +266,6 @@ describe('EverythingWorkspace', () => {
     rendered.unmount();
     state.destroy();
   });
-
 
   it('polls initializing semantic coverage until it reaches a terminal state', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
@@ -162,7 +331,6 @@ describe('EverythingWorkspace', () => {
       vi.useRealTimers();
     }
   });
-
 
   it('backs off exponentially while semantic coverage stays initializing', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
@@ -369,7 +537,7 @@ describe('EverythingWorkspace', () => {
       if (new URL(request.url).pathname.endsWith('/explore/preflight')) {
         preflightRequests.push(request);
         return Response.json({
-          count: 1, estimated_bytes: 10, cache_revision: 'cache-1', search_provenance: {},
+          count: 1, deletable_count: 1, estimated_bytes: 10, cache_revision: 'cache-1', search_provenance: {},
           unavailable_actions: [
             { action: 'export', reason: 'selection_contains_items_without_exportable_files' },
             { action: 'open_in_source', reason: 'trusted_source_link_unavailable' }
@@ -387,8 +555,9 @@ describe('EverythingWorkspace', () => {
     grid.focus();
     await fireEvent.keyDown(grid, { key: ' ' });
 
-    expect(await screen.findByText('Export: selection_contains_items_without_exportable_files')).toBeDefined();
-    expect(screen.getByText('Open in source: trusted_source_link_unavailable')).toBeDefined();
+    expect(await screen.findByText('Export unavailable: Selection contains items without exportable files.')).toBeDefined();
+    await fireEvent.click(screen.getByRole('button', { name: 'More selection actions' }));
+    expect(screen.getByText('Your sources don’t provide links to open these items.')).toBeDefined();
     expect(screen.queryByRole('button', { name: 'Export selection' })).toBeNull();
     const body = await preflightRequests[0]!.clone().json();
     expect(body.selection).toMatchObject({
@@ -411,7 +580,7 @@ describe('EverythingWorkspace', () => {
       requests.push(request);
       const path = new URL(request.url).pathname;
       if (path.endsWith('/explore/preflight')) return Response.json({
-        count: 1, estimated_bytes: 10, cache_revision: 'cache-1', search_provenance: {},
+        count: 1, deletable_count: 1, estimated_bytes: 10, cache_revision: 'cache-1', search_provenance: {},
         unavailable_actions: [{ action: 'open_in_source', reason: 'trusted_source_link_unavailable' }],
         action_targets: [{ action: 'export', message_id: 1, filename: 'message-1.eml' }],
         operation_token: 'operation-1', expires_at: '2026-07-19T10:05:00Z'
@@ -437,6 +606,197 @@ describe('EverythingWorkspace', () => {
     await waitFor(() => expect(createObjectURL).toHaveBeenCalledOnce());
     expect(anchorClick).toHaveBeenCalledOnce();
     expect(revokeObjectURL).toHaveBeenCalledWith('blob:raw-message');
+    rendered.unmount();
+    state.destroy();
+  });
+
+
+  it('offers meeting export only when every selected row is a meeting', async () => {
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      const path = new URL(request.url).pathname;
+      if (path.endsWith('/explore/preflight')) {
+        return Response.json({
+          count: 1, deletable_count: 1, estimated_bytes: 10, cache_revision: 'cache-1', search_provenance: {},
+          unavailable_actions: [], action_targets: [],
+          operation_token: 'operation-1', expires_at: '2026-09-12T17:00:00Z',
+        });
+      }
+      return Response.json(exploreResponse({
+        rows: [
+          { ...entry(1), message_type: 'email', anchor_message_id: 101 },
+          { ...entry(2), message_type: 'meeting_transcript', anchor_message_id: 102 },
+        ],
+        total_count: 2,
+      }));
+    });
+    const state = new ExploreState(window);
+    const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
+    const grid = await screen.findByRole('grid', { name: 'Everything results' });
+    await screen.findByText('Synthetic subject 2');
+    grid.focus();
+    await fireEvent.keyDown(grid, { key: ' ' });
+    await waitFor(() => expect(selectionStatus().textContent).toBe('1 selected'));
+    expect(screen.queryByRole('button', { name: 'Meeting context…' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Export meeting context' })).toBeNull();
+
+    await fireEvent.keyDown(grid, { key: 'j' });
+    await fireEvent.keyDown(grid, { key: ' ' });
+    await waitFor(() => expect(selectionStatus().textContent).toBe('2 selected'));
+    expect(screen.queryByRole('button', { name: 'Meeting context…' })).toBeNull();
+
+    await fireEvent.keyDown(grid, { key: 'k' });
+    await fireEvent.keyDown(grid, { key: ' ' });
+    await waitFor(() => expect(selectionStatus().textContent).toBe('1 selected'));
+    await fireEvent.click(screen.getByRole('button', { name: 'Meeting context…' }));
+    expect(screen.getByRole('button', { name: 'Export meeting context' })).toBeDefined();
+    rendered.unmount();
+    state.destroy();
+  });
+
+  it('exports exact explicit meeting row keys retained while later pages load', async () => {
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
+    const contextRequests: Request[] = [];
+    let resolveNext!: (response: Response) => void;
+    let pageRequests = 0;
+    vi.spyOn(URL, 'createObjectURL').mockReturnValue('blob:meeting-context');
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => undefined);
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      const path = new URL(request.url).pathname;
+      if (path.endsWith('/explore/preflight')) {
+        return Response.json({
+          count: 2, deletable_count: 2, estimated_bytes: 20, cache_revision: 'cache-7', search_provenance: {},
+          unavailable_actions: [{ action: 'export', reason: 'raw_export_unavailable' }], action_targets: [],
+          operation_token: 'operation-1', expires_at: '2026-09-12T17:00:00Z',
+        });
+      }
+      if (path.endsWith('/meetings/context')) {
+        contextRequests.push(request);
+        return Response.json({
+          schema_version: 1, format: 'json', content: '{"meetings":[]}', content_bytes: 15,
+          truncated: false, omitted_message_ids: [],
+        });
+      }
+      if (path.endsWith('/explore')) {
+        pageRequests += 1;
+        if (pageRequests === 1) {
+          return Response.json(exploreResponse({
+            rows: [{
+              ...entry(7), message_type: 'meeting_transcript', source_type: 'zoom',
+              source_identifier: 'synthetic-zoom', anchor_message_id: 107,
+            }],
+            total_count: 2, cache_revision: 'cache-7', search_provenance: {}, next_cursor: 'page-2',
+          }));
+        }
+        return new Promise<Response>((resolve) => {
+          resolveNext = resolve;
+        });
+      }
+      return Response.json({}, { status: 404 });
+    });
+    const state = new ExploreState(window);
+    const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
+    const grid = await screen.findByRole('grid', { name: 'Everything results' });
+    await screen.findByText('Synthetic subject 7');
+    grid.focus();
+    await fireEvent.keyDown(grid, { key: ' ' });
+    await waitFor(() => expect(selectionStatus().textContent).toBe('1 selected'));
+    const end = fireEvent.keyDown(grid, { key: 'End' });
+    await waitFor(() => expect(resolveNext).toBeTypeOf('function'));
+
+    resolveNext(Response.json(exploreResponse({
+      rows: [{
+        ...entry(91), message_type: 'meeting_transcript', source_type: 'teams',
+        source_identifier: 'synthetic-teams', anchor_message_id: 191,
+      }],
+      total_count: 2, cache_revision: 'cache-7', search_provenance: {},
+    })));
+    await end;
+    const secondRow = (await screen.findByText('Synthetic subject 91')).closest('[role="row"]')!;
+    await fireEvent.pointerDown(secondRow);
+    await fireEvent.keyDown(grid, { key: ' ' });
+    await waitFor(() => expect(selectionStatus().textContent).toBe('2 selected'));
+    await fireEvent.click(screen.getByRole('button', { name: 'Meeting context…' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Export meeting context' }));
+
+    await waitFor(() => expect(contextRequests).toHaveLength(1));
+    const body = await contextRequests[0]!.clone().json();
+    expect(body.selection).toMatchObject({
+      mode: 'explicit',
+      row_keys: ['message:7', 'message:91'],
+      cache_revision: 'cache-7',
+      search_provenance: {},
+    });
+    expect(body).toMatchObject({ format: 'json', include_transcript: false });
+    rendered.unmount();
+    state.destroy();
+  });
+
+  it('passes all-matching exclusions and full search authority to meeting context unchanged', async () => {
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
+    const preflightSelections: unknown[] = [];
+    let contextSelection: unknown;
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      const path = new URL(request.url).pathname;
+      if (path.endsWith('/explore/preflight')) {
+        const body = await request.clone().json();
+        preflightSelections.push(body.selection);
+        return Response.json({
+          count: 4, deletable_count: 4, estimated_bytes: 40, cache_revision: 'cache-search',
+          search_provenance: { lexical_index_revision: 'fts-9', vector_generation: 9 },
+          unavailable_actions: [], action_targets: [],
+          operation_token: 'operation-2', expires_at: '2026-09-12T17:00:00Z',
+        });
+      }
+      if (path.endsWith('/meetings/context')) {
+        const body = await request.clone().json();
+        contextSelection = body.selection;
+        return Response.json(
+          { error: 'selection_not_all_meetings', message: 'Meeting context selections may contain only meetings' },
+          { status: 400 },
+        );
+      }
+      const meetingResponse = meetingFixtureResponse(path);
+      if (meetingResponse) return meetingResponse;
+      return Response.json(exploreResponse({
+        rows: [
+          { ...entry(7), message_type: 'meeting_transcript', anchor_message_id: 107 },
+          { ...entry(8), message_type: 'email', anchor_message_id: 108 },
+        ],
+        total_count: 5,
+        cache_revision: 'cache-search',
+        search_provenance: { lexical_index_revision: 'fts-9', vector_generation: 9 },
+        candidate_snapshot_id: 'snapshot-5',
+      }));
+    });
+    const state = new ExploreState(window);
+    state.replaceTransient({
+      query: 'planning', searchMode: 'hybrid',
+      filters: [{ dimension: 'message_type', values: ['meeting_transcript'] }]
+    });
+    const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
+    const grid = await screen.findByRole('grid', { name: 'Everything results' });
+    await screen.findByText('Synthetic subject 8');
+    grid.focus();
+    await fireEvent.keyDown(grid, { key: 'A' });
+    await fireEvent.click(screen.getByRole('button', { name: 'Select all 5 matching items' }));
+    await fireEvent.keyDown(grid, { key: ' ' });
+    await fireEvent.click(screen.getByRole('button', { name: 'Meeting context…' }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Export meeting context' }));
+
+    expect((await screen.findByRole('alert')).textContent).toContain('Select meetings only');
+    expect(contextSelection).toMatchObject({
+      mode: 'all_matching',
+      exclusions: ['message:7'],
+      cache_revision: 'cache-search',
+      search_provenance: { lexical_index_revision: 'fts-9', vector_generation: 9 },
+      candidate_snapshot_id: 'snapshot-5',
+    });
+    expect(preflightSelections).toContainEqual(contextSelection);
     rendered.unmount();
     state.destroy();
   });
@@ -710,32 +1070,19 @@ describe('EverythingWorkspace', () => {
   });
 
 
-  it('uses one analytical context for grouped, timeline, and files presentations', async () => {
+  it('uses one analytical context for grouped and timeline presentations', async () => {
     window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
     const requests: Request[] = [];
     const fetchFn = vi.fn<typeof fetch>(async (input) => {
       const request = input instanceof Request ? input : new Request(input);
-      requests.push(request);
       const path = new URL(request.url).pathname;
-      if (path.endsWith('/files/7')) return Response.json({
-        id: 7, message_id: 1, conversation_id: 11, filename: 'analysis.pdf',
-        mime_type: 'application/pdf', size_bytes: 2048,
-        content_state: 'missing_blob', content_available: false
-      });
-      if (path.endsWith('/explore/files')) return Response.json({
-        files: [{
-          id: 7, key: 'message:1:file:7', entry_key: 'message:1', message_id: 1, conversation_id: 11,
-          occurred_at: '2026-07-18T12:00:00Z', source_id: 1,
-          source_identifier: 'archive@example.com', title: 'Synthetic subject 1',
-          filename: 'analysis.pdf', mime_type: 'application/pdf', size: 2048
-        }],
-        total_count: 1, cache_revision: 'cache-1', search_provenance: {}
-      });
+      if (!path.endsWith('/telemetry/events')) requests.push(request);
       return Response.json(exploreResponse({ rows: [entry(1)], total_count: 1 }));
     });
     const state = new ExploreState(window);
     state.commitNavigation({ groupingChain: ['source'] });
-    const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
+    state.commitSearch('quarterly', 'full_text');
+    const rendered = renderRecordingShell(createAPIClient(fetchFn), state);
 
     await waitFor(() => expect(requests).toHaveLength(1));
     expect(new URL(requests[0]!.url).pathname).toBe('/api/v1/explore/groups');
@@ -743,44 +1090,16 @@ describe('EverythingWorkspace', () => {
     state.commitNavigation({ groupingChain: [], presentation: 'timeline' });
     expect(await screen.findByRole('region', { name: 'Canonical activity timeline' })).toBeDefined();
     expect(await screen.findByText('Synthetic subject 1')).toBeDefined();
+    expect(screen.queryByRole('region', { name: 'Recordings' })).toBeNull();
+    expect(screen.queryByRole('heading', { name: /^Results/ })).toBeNull();
+    expect(document.querySelector('.results-primary--recordings')).toBeNull();
     expect(new URL(requests.at(-1)!.url).pathname).toBe('/api/v1/explore');
 
     state.commitNavigation({ presentation: 'files' });
-    expect(await screen.findByRole('grid', { name: 'Files in current context' })).toBeDefined();
-    expect(await screen.findByText('analysis.pdf')).toBeDefined();
-    const filesRequest = requests.at(-1)!;
-    expect(new URL(filesRequest.url).pathname).toBe('/api/v1/explore/files');
-    await expect(filesRequest.clone().json()).resolves.toMatchObject({
-      predicate: { presentation: 'files' }
-    });
-    state.replaceTransient({
-      activeRow: 'message:1:file:7',
-      scrollAnchor: { key: 'message:1:file:7', offset: 4 }
-    });
-    const filesGrid = screen.getByRole('grid', { name: 'Files in current context' });
-    filesGrid.focus();
-    await fireEvent.keyDown(filesGrid, { key: 'Enter' });
-    await waitFor(() => expect(state.current.selectedRow).toBe('attachment:7'));
-    expect(await screen.findByRole('dialog', { name: 'View analysis.pdf' })).toBeDefined();
-    expect(state.current.selectedRow).toBe('attachment:7');
-    expect(parseExploreURLState(window.location.search).selectedRow).toBe('attachment:7');
-    await fireEvent.click(screen.getByRole('button', { name: 'Close file viewer' }));
-    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'View analysis.pdf' })).toBeNull());
-    expect(state.current.selectedRow).toBeNull();
-    expect(document.activeElement).toBe(filesGrid);
-
-    await screen.findByText('analysis.pdf');
-    const restoredFilesGrid = screen.getByRole('grid', { name: 'Files in current context' });
-    await waitFor(() => expect(restoredFilesGrid.getAttribute('aria-activedescendant')).toContain('message-3a-1'));
-    restoredFilesGrid.focus();
-    await fireEvent.keyDown(restoredFilesGrid, { key: 'Enter' });
-    await waitFor(() => expect(state.current.selectedRow).toBe('attachment:7'));
-    expect(await screen.findByRole('dialog', { name: 'View analysis.pdf' })).toBeDefined();
-    await fireEvent.click(screen.getByRole('button', { name: 'Open containing item' }));
-    expect(state.current.presentation).toBe('table');
-    expect(state.current.selectedRow).toBe('message:1');
-    expect(state.current.activeRow).toBeNull();
-    expect(state.current.scrollAnchor).toBeNull();
+    expect(state.current).toMatchObject({ workspace: 'files', presentation: 'files' });
+    expect(await screen.findByRole('main', { name: 'Files' })).toBeDefined();
+    expect(screen.queryByRole('grid', { name: 'Files in current context' })).toBeNull();
+    expect(screen.queryByRole('region', { name: 'Recordings' })).toBeNull();
     rendered.unmount();
     state.destroy();
   });
@@ -837,6 +1156,8 @@ describe('EverythingWorkspace', () => {
     const requests: Request[] = [];
     const fetchFn = vi.fn<typeof fetch>(async (input) => {
       const request = input instanceof Request ? input : new Request(input);
+      const meetingResponse = meetingFixtureResponse(new URL(request.url).pathname);
+      if (meetingResponse) return meetingResponse;
       requests.push(request);
       const path = new URL(request.url).pathname;
       if (path.endsWith('/coverage')) return Response.json({
@@ -917,6 +1238,7 @@ describe('EverythingWorkspace', () => {
     const signals: AbortSignal[] = [];
     const fetchFn = vi.fn<typeof fetch>((input) => {
       const request = input instanceof Request ? input : new Request(input);
+      if (new URL(request.url).pathname.endsWith('/media/search')) return Promise.resolve(Response.json({}, { status: 503 }));
       signals.push(request.signal);
       return new Promise<Response>(() => undefined);
     });
@@ -1149,6 +1471,8 @@ describe('EverythingWorkspace', () => {
     const groupRequests: Request[] = [];
     const fetchFn = vi.fn<typeof fetch>(async (input) => {
       const request = input instanceof Request ? input : new Request(input);
+      const meetingResponse = meetingFixtureResponse(new URL(request.url).pathname);
+      if (meetingResponse) return meetingResponse;
       if (new URL(request.url).pathname.endsWith('/groups')) {
         groupRequests.push(request);
         return Response.json({
@@ -1243,6 +1567,8 @@ describe('EverythingWorkspace', () => {
     const groupRequests: Request[] = [];
     const fetchFn = vi.fn<typeof fetch>(async (input) => {
       const request = input instanceof Request ? input : new Request(input);
+      const meetingResponse = meetingFixtureResponse(new URL(request.url).pathname);
+      if (meetingResponse) return meetingResponse;
       if (new URL(request.url).pathname.endsWith('/groups')) {
         groupRequests.push(request);
         const body = await request.clone().json();
@@ -1377,6 +1703,8 @@ describe('EverythingWorkspace', () => {
     }> = [];
     const fetchFn = vi.fn<typeof fetch>((input) => {
       const request = input instanceof Request ? input : new Request(input);
+      const meetingResponse = meetingFixtureResponse(new URL(request.url).pathname);
+      if (meetingResponse) return Promise.resolve(meetingResponse);
       const path = new URL(request.url).pathname;
       if (path.endsWith('/groups')) {
         return new Promise<Response>((resolve) => pending.push({ request, resolve }));
@@ -1779,6 +2107,7 @@ describe('EverythingWorkspace', () => {
     await screen.findByText('Synthetic subject 1');
     await fireEvent.scroll(grid);
     await waitFor(() => expect(requests).toHaveLength(2));
+    await waitFor(() => expect(resolveSecond).toBeTypeOf('function'));
 
     grid.focus();
     const end = fireEvent.keyDown(grid, { key: 'End' });
@@ -2300,7 +2629,7 @@ describe('EverythingWorkspace', () => {
     state.destroy();
   });
 
-  it('discloses the active-only semantic deletion scope for list and grouped results', async () => {
+  it.each(['semantic', 'hybrid'] as const)('discloses active-only scope for %s entry and group results', async (searchMode) => {
     window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
     const fetchFn = vi.fn<typeof fetch>(async (input) => {
       const request = input instanceof Request ? input : new Request(input);
@@ -2323,7 +2652,7 @@ describe('EverythingWorkspace', () => {
       }));
     });
     const state = new ExploreState(window);
-    state.replaceSearchDraft('alpha', 'semantic');
+    state.replaceSearchDraft('alpha', searchMode);
     const rendered = render(AppShell, { client: createAPIClient(fetchFn), state });
 
     await screen.findByText('Synthetic subject 1');
@@ -2360,3 +2689,7 @@ describe('EverythingWorkspace', () => {
     state.destroy();
   });
 });
+
+function selectionStatus(): HTMLElement {
+  return screen.getByRole('status', { name: 'Selection status' });
+}

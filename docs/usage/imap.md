@@ -1,17 +1,43 @@
 ---
-title: IMAP Folder Sync
-description: List IMAP folders and choose which folders msgvault scans during a sync.
+last_edited: "2026-10-04"
+title: IMAP Sync and Repair
+description: Archive IMAP mail efficiently, choose folders, and repair stored labels.
 ---
 
-# IMAP Folder Sync
+Archive mail from an IMAP account, then keep it current without downloading
+unchanged messages again. Start with [IMAP account setup](../setup.md#add-an-imap-account)
+if you have not connected the account yet.
 
-By default, msgvault scans every selectable folder in an IMAP account. You can
-limit a sync to the folders you need or skip folders that are large or
-unimportant. This is useful when you want to try msgvault with a small part of
-an account before starting a complete archive.
+```bash
+msgvault sync-full you@example.com
+msgvault sync you@example.com
+```
 
-Folder filters work with both `sync-full` and `sync`. They affect IMAP accounts
-only.
+Sync reads the provider. It preserves messages already in your local archive
+when their server copies disappear. Remote deletion is a separate
+[staged workflow](/docs/usage/deletion/).
+
+## How later syncs find changes
+
+msgvault chooses the sync method from the server's capabilities:
+
+| Server behavior | What msgvault does |
+|---|---|
+| Supports QRESYNC, the IMAP change-tracking extension | Uses saved mailbox state to fetch changes and track messages removed from folders |
+| Does not support QRESYNC | Compares mailbox counts and saved message-number boundaries; skips unchanged folders and fetches new messages where possible |
+| State is missing, inconsistent, or no longer valid | Enumerates the affected folders again to establish current membership |
+
+A failed QRESYNC attempt reconnects and falls back to full enumeration. An
+incomplete server response is not accepted as a complete mailbox snapshot.
+Temporary connection failures receive bounded retries; a persistent failure
+still ends the run with an error. Rerun the command after correcting the
+connection problem.
+
+## Choose folders
+
+By default, msgvault scans every selectable folder. Folder filters let you
+start with a small part of an account or leave out folders you do not need.
+They work with both `sync-full` and `sync` and affect IMAP sources only.
 
 ## Find the Folder Names
 
@@ -118,6 +144,312 @@ without folder flags scans the complete account again.
 Folder filtering works the same whether the CLI uses a local daemon or a
 configured remote msgvault server.
 
+## Edit keyword tags
+
+Use [`message-tags`](../cli-reference.md#message-tags) to read, add, or remove
+custom keywords on a message's recorded server copy:
+
+```bash
+msgvault message-tags 42 --mailbox INBOX --json
+msgvault message-tags 42 --mailbox INBOX --add Next --remove Old
+```
+
+Keywords are separate from the folder labels shown in the archive. The daemon
+preserves system flags and other keywords, verifies the requested changes by
+readback, and saves the observed flags on that exact membership. Each folder
+copy has its own flags. Without `--mailbox`, msgvault uses the current original
+copy or the sole current membership. If the original is absent and multiple
+copies survive, specify `--mailbox`. Keywords allow at most 255 ASCII bytes
+and compare without case. Sync first if the stored UID or UIDVALIDITY is missing
+or stale. The server must allow persistent keywords: its `PERMANENTFLAGS` must
+list `\*` or the keyword, or be absent, which IMAP treats as all flags
+permanent.
+
+This path applies to every IMAP account, including Microsoft 365, Outlook.com,
+Fastmail, and accounts at other providers. It does not depend on the host or
+authentication method. Fastmail's custom keywords are
+[shared with JMAP](https://www.rfc-editor.org/rfc/rfc8621.html#section-4.1.1); its
+optional JMAP address-discovery token does not change how mail is archived.
+Microsoft Outlook categories are separate from IMAP keywords and use the
+[Microsoft Graph tag backend](../cli-reference.md#message-tags). A server that
+does not allow persistent keywords cannot accept an IMAP tag edit.
+
+A dry run can check keyword syntax, identity, and advertised support. It cannot
+prove mailbox write access; the server's STORE response and readback decide
+whether a later edit succeeded. After a partial or uncertain write, read the
+current tags before retrying.
+
+## Repair stored labels
+
+Use `repair-labels` when an archived message still shows a folder label that
+no longer belongs to it. The command rebuilds labels from the folder
+memberships already stored in msgvault. It does not contact the provider.
+
+1. Preview the repair for one source:
+
+    ```bash
+    msgvault repair-labels you@example.com
+    ```
+
+2. Review the `scanned` and `changed` counts, then apply it:
+
+    ```bash
+    msgvault repair-labels you@example.com --apply
+    ```
+
+Omit the identifier to check or repair every IMAP source. Applying a repair
+also refreshes the analytical cache.
+
+A sync with incomplete folder information only adds labels; it does not
+remove labels it cannot disprove. If the stored memberships later become
+complete but never change again, an old label can remain until this repair.
+
+If the stored memberships themselves need refreshing, enumerate the server
+again first:
+
+```bash
+msgvault sync-full you@example.com --noresume
+```
+
+Leave out folder filters for a complete account scan. `repair-labels` cannot
+recover memberships that the archive has never observed.
+
+## Drafts
+
+Create a fresh message or a reply in your IMAP Drafts folder, then review and
+send it from your usual mail application. Msgvault never sends email. Draft
+creation is disabled until an operator grants it for one exact IMAP source on
+the daemon host.
+
+1. Run `msgvault list-accounts` to find the source ID. Confirm the Drafts
+    folder's exact name with `msgvault list-folders <account>`.
+
+1. Add the grant to the daemon host's `config.toml`, using that source ID and
+    folder name:
+
+    ```toml
+    [[imap.drafts]]
+    source_id = 42
+    enabled = true
+    mailbox = "Drafts"
+    ```
+
+1. Restart the daemon. The host policy applies per source. Owner callers
+    using an API key, browser session, or keyless loopback can create drafts
+    on a granted source. Delegated callers also need that source in their
+    [agent token grant](../cli-reference.md#agent-token). Client configuration,
+    request fields, and environment variables cannot grant access or choose a
+    different folder.
+
+1. Check the source's confirmed sender identities:
+
+    ```bash
+    msgvault identity list --source-id 42
+    ```
+
+    If your address is missing, confirm it with
+    `msgvault identity add --source-id 42 you@example.com`.
+
+1. Find the parent email's local message ID with search, then create a reply:
+
+    ```bash
+    msgvault draft-reply 123 --all --from you@example.com \
+      --body 'Thanks for the update. I will review it tomorrow.' --json
+    ```
+
+    Omit `--all` for a direct reply. Use `--account <account>` or
+    `--source-id <id>` to select a different live IMAP destination. An offline
+    parent requires one of those selectors.
+
+1. Create a new message by selecting its live source and repeating recipient
+    flags as needed:
+
+    ```bash
+    msgvault draft-compose --source-id 42 --from you@example.com \
+      --to recipient@example.com --cc copy@example.com \
+      --bcc private@example.com --subject 'Project update' --body 'Draft text'
+    ```
+
+The parent must have its original email stored in the archive. Reply-all uses
+Reply-To or From, then visible To and Cc recipients. It removes confirmed
+identities for the selected destination and never reads a parent's Bcc as a
+reply recipient. The IMAP server must support UIDPLUS, which returns a receipt
+that identifies the stored draft.
+
+Msgvault picks the draft's From address in this order:
+
+1. An explicit `--from`. It must be a confirmed identity for the destination.
+2. For replies, the confirmed identity the parent was addressed to. Msgvault
+    checks the parent's archived To, Cc, and Bcc recipients and every To and
+    Cc header in the original email. If several identities match, an agent's
+    grant must allow exactly one of them; otherwise pass `--from`. A sole
+    match outside the agent's grant returns an authorization error.
+3. The destination's only eligible confirmed identity. Compose and forward
+    start here.
+
+For delegated callers, the token freezes the allowed sender identities when an
+owner issues it. A draft From header is a local choice and does not prove
+provider send-as permission.
+
+A successful result reports `status: "created"`, the archived `message_id`, and
+the remote mailbox receipt. The draft is marked `\Draft` and stored locally with
+its original email content. Later syncs advance the mailbox cursor and reconcile
+any mailbox identifier changes.
+
+### If draft creation does not finish
+
+The command does not retry the remote write automatically. Use the reported
+outcome to decide what to do next:
+
+| Result                                      | Next step                                                                                                                                            |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sync_active`                               | Wait for this source's sync to finish, then retry.                                                                                                   |
+| `uidplus_required`                          | Use a server that advertises UIDPLUS; no draft was appended.                                                                                         |
+| `append_rejected`                           | Check that the configured folder exists and permits writes.                                                                                          |
+| `remote_unknown` or `accepted_unidentified` | Inspect the Drafts folder before retrying; the draft may already exist.                                                                              |
+| `remote_accepted_local_failed`              | The server accepted the draft, but the local save failed. Use the reported `operation_ref` and mailbox receipt to inspect it before another request. |
+
+## Manage a created draft
+
+The creation result includes an opaque `draft_id` and revision `1`. Read the
+archived draft and its current revision through the daemon:
+
+```bash
+msgvault draft-get <draft-id> --json
+```
+
+`draft-get` never connects to IMAP or changes pending operations. It also reads
+discarded drafts and works when the source's draft mutation grant is disabled
+or its provider configuration is unavailable.
+
+### Edit or delete the provider draft
+
+Use the current revision from `draft-get` or the last successful operation:
+
+```bash
+msgvault draft-edit <draft-id> --revision 1 --body 'Updated text' --json
+msgvault draft-delete <draft-id> --revision 2 --json
+msgvault draft-recover <draft-id> --revision 1 --json
+```
+
+Edit and delete require the same daemon-host `[[imap.drafts]]` grant and provider
+configuration as draft creation. Policy changes take effect after a daemon
+restart. Recovery uses the same policy after it checks the delegated action
+grant. None of these commands sends mail.
+
+Editing supports plain-text drafts without attachments. `--body=` sets an empty
+body. The edit preserves the From, To, Cc, Bcc, Reply-To, Subject, In-Reply-To, and
+References headers. Msgvault appends one replacement, records the new revision,
+removes the exact old UID, and confirms that it is absent.
+
+Delete removes the exact provider draft and marks the managed draft
+`discarded` after confirming its absence. The local archived content remains
+readable with `draft-get`; ordinary archive garbage collection retains it.
+A discarded draft cannot be edited. Repeating delete with its current revision
+returns `already_discarded`.
+
+### Provider checks before a change
+
+Msgvault refuses stale revisions, UIDVALIDITY changes, external moves, a missing
+`\Draft` flag, an existing `\Deleted` flag, or missing UIDPLUS before writing.
+Edits also reject multipart drafts. An active source sync returns `sync_active`;
+retry after it finishes.
+
+When the mailbox supplies CONDSTORE metadata, msgvault uses the exact UID's
+positive MODSEQ to guard its singleton `UID STORE`, then verifies that UID's
+flags. If the server does not advertise CONDSTORE, msgvault runs a fresh `SELECT`
+and exact-UID `FETCH` immediately before the nonconditional `UID STORE`.
+When CONDSTORE is advertised, missing or zero mailbox or message MODSEQ metadata
+refuses the change before writing with `modseq_unusable`. This also applies to
+`NOMODSEQ` mailboxes: the current IMAP parser cannot distinguish that response
+from missing metadata.
+
+Every removal path checks the mailbox generation and requires both `\Draft` and
+`\Deleted` again before `UID EXPUNGE`, then confirms exact-UID absence.
+`UID EXPUNGE` itself is not conditional, so another client can still change flags
+after the last check.
+
+### Recover an interrupted edit or delete
+
+Recovery uses only the original receipt and a replacement receipt already saved
+on the managed draft row. It checks the requested revision, source type and
+identifier, mailbox UIDVALIDITY, exact UID, and current draft flags before it
+publishes or removes anything. A pending edit without a known replacement
+returns `unknown_replacement` without opening an IMAP connection.
+
+```bash
+msgvault draft-recover <draft-id> --revision 1 --json
+```
+
+If another client already removed the exact original UID, recovery records that
+absence and finishes the Store transition locally. A known unpublished
+replacement is published from its saved bytes, then the original is removed
+with the existing conditional `UID STORE` and `UID EXPUNGE` sequence. Recovery
+never searches a mailbox, adopts a moved copy, calls APPEND, or rolls back a
+publication. Once a replacement is published locally, cleanup of the original
+can finish even if another client has since sent or deleted the replacement.
+Only an unpublished replacement must still be a live draft.
+
+`draft.edit` authorizes active and pending edits. `draft.delete` authorizes
+discarded and pending deletes. A delegated token must also name the exact source
+type and identifier. Wrong actions, sources, or revisions return before draft
+content, policy errors, locks, or provider work are disclosed.
+
+If the original already has `\Deleted`, recovery returns `already_deleted`
+without a provider write. This includes removal interrupted after `UID STORE`
+succeeded. Repeating recovery cannot clear that state: use an IMAP client to
+expunge the exact original UID in the recorded mailbox and UIDVALIDITY, then run
+`draft-recover` with the revision from the recovery output or `draft-get`.
+Recovery may have published a replacement locally and advanced the revision
+before cleanup was refused. For a published edit, remove the original
+copy, not the replacement. Check the receipt before expunging; do not purge all
+deleted messages in the mailbox. Saved cancellation evidence does not establish
+who set the flag, so automatic removal of an already-deleted UID is outside this
+command's scope.
+
+If cleanup fails after publication, the new revision and pending evidence stay
+saved. Recovery can retry when the original is still an undeleted draft or is
+confirmed absent; an already-deleted original needs the manual step above.
+A generation or SELECT refusal before `UID STORE` leaves the pending code,
+receipts, timestamp, and revision unchanged. Output keeps the saved
+`pending_code`. Refused results use `refusal_code`; pending cleanup results use
+`observation.code` for the current provider result.
+
+### If an edit or delete does not finish
+
+- A delete failure before any remote write clears the pending claim. After
+  resolving the reported problem, retry with the same revision.
+- An uncertain APPEND or removal returns a nonzero result with the saved
+  candidate and available receipt evidence. The operation stays pending and
+  blocks further changes. Inspect the provider state before any manual
+  reconciliation; general recovery for uncertain writes is not available.
+- If `draft-get <draft-id> --json` reports `pending_code: "removed"`, removal was
+  confirmed and saved, but local completion is still pending. `draft-recover` is
+  the preferred local completion route. Run it with the revision from that
+  read; it finishes locally without another remote write. You can also repeat
+  the matching `draft-edit` or `draft-delete` command with that revision. The
+  source policy still applies. For an edit, `--body` must match the already
+  published replacement after MIME normalization. A `removed` observation in
+  an error response alone is not enough;
+  `draft-get` must report the saved pending code.
+
+## Keep edited outgoing mail current
+
+After you edit or send a draft in your mail application, IMAP sync can update
+its archived body, recipients, attachments, and search text while retaining the
+local message ID. A newer Sent copy takes precedence over a stale Drafts copy.
+
+This replacement is limited to trusted outgoing folders. Msgvault trusts
+unambiguous server-advertised `\Sent` and `\Drafts` roles. If your server does
+not advertise Sent correctly, configure the exact account and folder under
+[`sync.trusted_imap_sent_mailboxes`](../configuration.md#sync). Only name
+folders used for sent mail; never include folders that receive incoming mail
+through filters or filing rules. Ordinary received-mail and All Mail copies
+preserve the archived content instead of replacing it.
+
+These rules apply during later syncs. They do not automatically repair older
+archive rows that already lost the location information needed to identify the
+outgoing copy.
 ## Flag-Derived Labels
 
 Besides folder names, msgvault stores each message's IMAP flags as searchable

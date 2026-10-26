@@ -3,10 +3,12 @@ package cmd
 import (
 	"context"
 	"crypto/subtle"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"html/template"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -59,9 +61,7 @@ var whatsappStatusCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(status)
+		return json.MarshalWrite(os.Stdout, status, jsontext.WithIndent("  "))
 	},
 }
 
@@ -69,12 +69,17 @@ var whatsappLiveMCPCmd = &cobra.Command{
 	Use:   "whatsapp-live-mcp",
 	Short: "Run writable live WhatsApp MCP server",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		addr, err := normalizeMCPHTTPAddr(whatsappLiveMCPAddr, false, cfg.Server.APIKey != "")
+		state := invocationFromCommand(cmd)
+		if state == nil || state.cfg == nil || isAgentMode(state) {
+			return errors.New("owner configuration is required")
+		}
+		cfg, logger := state.cfg, state.logger
+		addr, err := normalizeMCPHTTPAddr(whatsappLiveMCPAddr, false, cfg.Server.AuthenticationKey() != "")
 		if err != nil {
 			return usageErr(cmd, err)
 		}
 
-		st, cleanup, err := openWritableStoreAndInit()
+		st, cleanup, err := openWritableStoreAndInitForInvocation(state)
 		if err != nil {
 			return err
 		}
@@ -181,6 +186,11 @@ func whatsAppLiveMCPOptions(
 }
 
 func openWhatsAppTransport(ctx context.Context) (*whatsapplive.WhatsmeowTransport, error) {
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil {
+		return nil, errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
 	sessionPath := filepath.Join(cfg.Data.DataDir, "whatsapp-session.db")
 	return whatsapplive.NewWhatsmeowTransport(ctx, whatsapplive.WhatsmeowOptions{
 		SessionPath: sessionPath,
@@ -200,7 +210,9 @@ func init() {
 }
 
 func serveWhatsAppLiveHTTP(ctx context.Context, addr string, st *store.Store, service *whatsapplive.Service, transport *whatsapplive.WhatsmeowTransport, opts mcpserver.ServeOptions, pairingToken string, basePath string, apiToken string) error {
-	mcpHandler := mcpserver.NewStreamableHTTPHandler(opts, true)
+	mcpHTTP := mcpserver.NewHTTPServer(opts, mcpserver.HTTPOptions{APIKey: apiToken, AllowWrites: true})
+	defer func() { _ = mcpHTTP.Shutdown(context.Background()) }()
+	mcpHandler := mcpHTTP.Handler
 	pairing := &whatsappPairingHandler{
 		ctx:          ctx,
 		service:      service,
@@ -227,7 +239,7 @@ func serveWhatsAppLiveHTTP(ctx context.Context, addr string, st *store.Store, se
 
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("Starting WhatsApp live MCP server", "addr", addr)
+		slog.Info("Starting WhatsApp live MCP server", "addr", addr)
 		if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 			return
@@ -295,7 +307,7 @@ func (h *whatsappPairingHandler) qrPage(w http.ResponseWriter, r *http.Request) 
 	if status.Paired && !status.Connected {
 		status, err = h.reconnect(r.Context(), status)
 		if err != nil {
-			logger.Warn("WhatsApp reconnect from QR page failed", "err", err)
+			slog.Warn("WhatsApp reconnect from QR page failed", "err", err)
 		}
 	}
 	if !status.Paired {
@@ -380,13 +392,15 @@ func (h *whatsappPairingHandler) statusJSON(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(struct {
+	if err := json.MarshalWrite(w, struct {
 		Status  whatsapplive.Status         `json:"status"`
 		Pairing whatsapplive.QRPairingState `json:"pairing"`
 	}{
 		Status:  status,
 		Pairing: pairing,
-	})
+	}); err != nil {
+		slog.Warn("encode whatsapp pairing response", "err", err)
+	}
 }
 
 func (h *whatsappPairingHandler) authorized(r *http.Request) bool {
@@ -405,8 +419,8 @@ func (h *whatsappPairingHandler) requestToken(r *http.Request) string {
 		return token
 	}
 	auth := r.Header.Get("Authorization")
-	if strings.HasPrefix(auth, "Bearer ") {
-		return strings.TrimSpace(strings.TrimPrefix(auth, "Bearer "))
+	if after, ok := strings.CutPrefix(auth, "Bearer "); ok {
+		return strings.TrimSpace(after)
 	}
 	return ""
 }
@@ -424,10 +438,10 @@ func normalizeHTTPBasePath(raw string) (string, error) {
 		return "", nil
 	}
 	if !strings.HasPrefix(raw, "/") {
-		return "", fmt.Errorf("http base path must start with /")
+		return "", errors.New("http base path must start with /")
 	}
 	if strings.ContainsAny(raw, "?#") {
-		return "", fmt.Errorf("http base path must not contain query or fragment")
+		return "", errors.New("http base path must not contain query or fragment")
 	}
 	raw = strings.TrimRight(raw, "/")
 	if raw == "" {
@@ -443,16 +457,16 @@ func normalizeHTTPPublicBaseURL(raw string) (string, error) {
 	}
 	parsed, err := url.Parse(raw)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("parse pairing URL: %w", err)
 	}
 	if parsed.Scheme != "http" && parsed.Scheme != "https" {
-		return "", fmt.Errorf("public base URL must start with http:// or https://")
+		return "", errors.New("public base URL must start with http:// or https://")
 	}
 	if parsed.Host == "" {
-		return "", fmt.Errorf("public base URL must include a host")
+		return "", errors.New("public base URL must include a host")
 	}
 	if parsed.RawQuery != "" || parsed.Fragment != "" {
-		return "", fmt.Errorf("public base URL must not contain query or fragment")
+		return "", errors.New("public base URL must not contain query or fragment")
 	}
 	return strings.TrimRight(parsed.String(), "/"), nil
 }

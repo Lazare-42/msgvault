@@ -7,16 +7,18 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/beeper"
 	"go.kenn.io/msgvault/internal/circleback"
 	"go.kenn.io/msgvault/internal/discord"
 	imaplib "go.kenn.io/msgvault/internal/imap"
+	matrixsource "go.kenn.io/msgvault/internal/matrix"
 	"go.kenn.io/msgvault/internal/microsoft"
 	"go.kenn.io/msgvault/internal/oauth"
+	"go.kenn.io/msgvault/internal/plaud"
 	"go.kenn.io/msgvault/internal/slack"
 	"go.kenn.io/msgvault/internal/sourceops"
 	"go.kenn.io/msgvault/internal/store"
@@ -62,6 +64,7 @@ Examples:
 		RunE: runRemoveAccount,
 	}
 	cmd.Flags().BoolP("yes", "y", false, "Skip confirmation prompt")
+	cmd.Flags().Bool("dry-run", false, "Check removal eligibility without deleting data")
 	cmd.Flags().Bool(removeAccountConfirmedFlag, false, "Internal: confirmation was already accepted by the frontend CLI")
 	if err := cmd.Flags().MarkHidden(removeAccountConfirmedFlag); err != nil {
 		panic(err)
@@ -89,7 +92,25 @@ func runRemoveAccountHTTP(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("read --yes flag: %w", err)
 	}
+	dryRun, err := cmd.Flags().GetBool("dry-run")
+	if err != nil {
+		return fmt.Errorf("read --dry-run flag: %w", err)
+	}
+	if dryRun {
+		return runDaemonCLICommandHTTPFromCobra(cmd, args)
+	}
 	if !yes {
+		dryRunFlag := cmd.Flags().Lookup("dry-run")
+		changed := dryRunFlag.Changed
+		if err := cmd.Flags().Set("dry-run", "true"); err != nil {
+			return fmt.Errorf("prepare removal preflight: %w", err)
+		}
+		preflightErr := runDaemonCLICommandHTTPFromCobra(cmd, args)
+		resetErr := cmd.Flags().Set("dry-run", "false")
+		dryRunFlag.Changed = changed
+		if err := errors.Join(preflightErr, resetErr); err != nil {
+			return err
+		}
 		ok, err := confirmRemoveAccount(cmd.InOrStdin(), cmd.OutOrStdout())
 		if err != nil {
 			return err
@@ -122,6 +143,16 @@ func confirmRemoveAccount(r io.Reader, w io.Writer) (bool, error) {
 }
 
 func runRemoveAccountLocal(cmd *cobra.Command, args []string) error {
+	return runRemoveAccountLocalWithMatrixLock(cmd, args, false)
+}
+
+func runRemoveAccountLocalWithMatrixLock(cmd *cobra.Command, args []string, matrixLockHeld bool) (retErr error) {
+	state := invocationFromCommand(cmd)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	logger := state.logger
 	yes, err := cmd.Flags().GetBool("yes")
 	if err != nil {
 		return fmt.Errorf("read --yes flag: %w", err)
@@ -135,16 +166,43 @@ func runRemoveAccountLocal(cmd *cobra.Command, args []string) error {
 		return usageErr(cmd, err)
 	}
 
-	s, cleanup, err := openWritableStoreAndInit()
+	s, cleanup, err := openWritableStoreAndInitForInvocation(state)
 	if err != nil {
 		return err
 	}
-	defer cleanup()
 
 	source, err := sourceops.ResolveExactOne(s, selector)
 	if err != nil {
+		cleanup()
 		return err
 	}
+	if err := s.CheckSourceRemovalAllowedContext(cmd.Context(), source.ID); err != nil {
+		cleanup()
+		return err
+	}
+	dryRun, err := cmd.Flags().GetBool("dry-run")
+	if err != nil {
+		cleanup()
+		return fmt.Errorf("read --dry-run flag: %w", err)
+	}
+	if dryRun {
+		defer cleanup()
+		active, err := s.GetActiveSync(source.ID)
+		if err != nil && !errors.Is(err, store.ErrSyncRunNotFound) {
+			return err
+		}
+		if active != nil && !yes {
+			return fmt.Errorf("account %s has an active sync in progress; use --yes to force removal", source.Identifier)
+		}
+		return nil
+	}
+	if source.SourceType == sourceTypeMatrix && !matrixLockHeld {
+		cleanup()
+		return matrixsource.WithCredentialLifecycleLock(cfg.TokensDir(), func() error {
+			return runRemoveAccountLocalWithMatrixLock(cmd, args, true)
+		})
+	}
+	defer cleanup()
 	email := source.Identifier
 
 	activeSync, err := s.GetActiveSync(source.ID)
@@ -179,6 +237,25 @@ func runRemoveAccountLocal(cmd *cobra.Command, args []string) error {
 		if !isYesAnswer(answer) {
 			fmt.Println("Aborted.")
 			return nil
+		}
+	}
+
+	// Keep the source row until the dedicated Matrix device is revoked. A
+	// transient homeserver failure must leave both the source and credentials
+	// available so remove-account can be retried. If a previous attempt revoked
+	// the device but failed later in the local cascade, the missing credential
+	// is treated as an already-completed revocation.
+	if source.SourceType == sourceTypeMatrix {
+		// The credential lifecycle lock has already waited for Matrix sync.
+		// Keep execution ownership until the cascade commits so a merge cannot
+		// make this source ineligible while the remote logout is in flight.
+		release, err := s.AcquireSourceRemovalLockContext(cmd.Context(), source.ID)
+		if err != nil {
+			return fmt.Errorf("prepare Matrix account removal: %w", err)
+		}
+		defer func() { retErr = errors.Join(retErr, release()) }()
+		if err := revokeMatrixCredentials(cmd.Context(), cfg.TokensDir(), source.Identifier); err != nil {
+			return fmt.Errorf("revoke Matrix device (account was not removed): %w", err)
 		}
 	}
 
@@ -294,9 +371,10 @@ func runRemoveAccountLocal(cmd *cobra.Command, args []string) error {
 		for _, remainingSource := range remaining {
 			remainingEmails = append(remainingEmails, remainingSource.Identifier)
 		}
-		grantInUse := listErr != nil || oauth.EquivalentStoredGrantInUse(
-			cfg.TokensDir(), source.Identifier, remainingEmails,
-		)
+		tokenManager := oauth.NewStoredTokenManager(cfg.TokensDir(), cfg.OAuth.Tokens)
+		grantInUse, grantErr := tokenManager.EquivalentGrantInUse(cmd.Context(), source.Identifier, remainingEmails)
+		listErr = errors.Join(listErr, grantErr)
+		grantInUse = grantInUse || listErr != nil
 		if listErr != nil {
 			fmt.Fprintf(os.Stderr,
 				"Warning: could not check remaining Gmail accounts; Google grant was not revoked: %v\n",
@@ -310,9 +388,7 @@ func runRemoveAccountLocal(cmd *cobra.Command, args []string) error {
 		// credential may already be dead, and removal must still complete.
 		// Keep a shared grant while an equivalent Gmail source still uses it.
 		if !grantInUse {
-			if err := oauth.RevokeStoredCredential(
-				cmd.Context(), cfg.TokensDir(), source.Identifier,
-			); err != nil &&
+			if err := tokenManager.RevokeToken(cmd.Context(), source.Identifier); err != nil &&
 				!errors.Is(err, os.ErrNotExist) &&
 				!errors.Is(err, oauth.ErrRevokeCredentialInvalid) {
 				fmt.Fprintf(os.Stderr,
@@ -322,14 +398,8 @@ func runRemoveAccountLocal(cmd *cobra.Command, args []string) error {
 				)
 			}
 		}
-		tokenPath := oauth.TokenFilePath(
-			cfg.TokensDir(), source.Identifier,
-		)
-		if err := os.Remove(tokenPath); err != nil && !os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr,
-				"Warning: could not remove token file %s: %v\n",
-				tokenPath, err,
-			)
+		if err := tokenManager.DeleteToken(cmd.Context(), source.Identifier); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not remove Google token: %v\n", err)
 		}
 	case sourceTypeTeams:
 		graphMgr := microsoft.NewGraphManager(
@@ -342,6 +412,12 @@ func runRemoveAccountLocal(cmd *cobra.Command, args []string) error {
 		if err := graphMgr.DeleteToken(source.Identifier); err != nil {
 			fmt.Fprintf(os.Stderr,
 				"Warning: could not remove Microsoft Graph token: %v\n", err,
+			)
+		}
+	case sourceTypeMSMail:
+		if err := newGraphMailManager(state).DeleteToken(source.Identifier); err != nil {
+			fmt.Fprintf(os.Stderr,
+				"Warning: could not remove Microsoft Graph mail token: %v\n", err,
 			)
 		}
 	case sourceTypeDiscord:
@@ -363,6 +439,9 @@ func runRemoveAccountLocal(cmd *cobra.Command, args []string) error {
 				)
 			}
 		}
+	case sourceTypeMatrix:
+		// The dedicated device and local credential were revoked before the
+		// source cascade so a remote failure could abort removal safely.
 	case sourceTypeSlack:
 		if teamID, userID, ok := splitSlackIdentifier(source.Identifier); ok {
 			if err := slack.DeleteToken(cfg.TokensDir(), teamID, userID); err != nil {
@@ -370,6 +449,11 @@ func runRemoveAccountLocal(cmd *cobra.Command, args []string) error {
 					"Warning: could not remove Slack token: %v\n", err,
 				)
 			}
+		}
+	case sourceTypePlaud:
+		mgr := plaud.NewManager("", cfg.TokensDir(), logger)
+		if err := mgr.DeleteToken(source.Identifier); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not remove Plaud token: %v\n", err)
 		}
 	case sourceTypeCircleback:
 		circlebackMgr := circleback.NewManager("", cfg.TokensDir(), logger)
@@ -493,18 +577,50 @@ func removeDiscordCredentialAfterCascade(
 	}
 }
 
-// deleteOrphanedAttachmentFiles removes files in paths that are no longer
-// referenced by any attachment row. Returns the count of files actually
-// deleted and the count preserved because a concurrent reference appeared
-// after the candidate list was collected.
-//
-// The work runs under an exclusive DB write lock so that no new sync can
-// insert an attachment row (and place a file on disk) between the
-// IsAttachmentPathReferenced check and os.Remove. The inside-lock
-// HasAnyActiveSync recheck catches any sync on a different source that
-// started between RemoveSourceSerialized releasing its lock and this
-// helper acquiring its own; the per-file reference check handles the
-// narrower race where a sync inserts a row for one of our candidate hashes.
+func revokeMatrixCredentials(ctx context.Context, tokensDir, userID string) error {
+	// An unfinished add-matrix renewal holds a second live device.
+	pending, hasPending, err := matrixsource.LoadPendingCredentials(tokensDir, userID)
+	if err != nil {
+		return err
+	}
+	if hasPending {
+		if err := logoutMatrixDevice(ctx, pending); err != nil {
+			return err
+		}
+		if err := matrixsource.DeletePendingCredentials(tokensDir, userID); err != nil {
+			return fmt.Errorf("remove pending Matrix credentials: %w", err)
+		}
+	}
+	exists, err := matrixsource.CredentialsExist(tokensDir, userID)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	creds, err := matrixsource.LoadCredentials(tokensDir, userID)
+	if err != nil {
+		return fmt.Errorf("load Matrix credentials: %w", err)
+	}
+	if err := logoutMatrixDevice(ctx, creds); err != nil {
+		return err
+	}
+	if err := matrixsource.DeleteCredentials(tokensDir, userID); err != nil {
+		return fmt.Errorf("remove Matrix credentials: %w", err)
+	}
+	return nil
+}
+
+func logoutMatrixDevice(ctx context.Context, creds matrixsource.Credentials) error {
+	logoutCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if err := matrixsource.Logout(logoutCtx, creds); err != nil && !matrixsource.IsUnknownToken(err) {
+		return fmt.Errorf("log out Matrix device %s: %w", creds.DeviceID, err)
+	}
+	return nil
+}
+
+// Account cleanup holds the write lock so a sync cannot reference a candidate during removal.
 func deleteOrphanedAttachmentFiles(
 	ctx context.Context,
 	s *store.Store,
@@ -515,18 +631,8 @@ func deleteOrphanedAttachmentFiles(
 		return 0, 0
 	}
 
-	cleanDir, err := filepath.Abs(attachmentsDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr,
-			"Warning: could not resolve attachments dir; "+
-				"skipping file deletion: %v\n"+
-				"Orphaned files may remain in %s\n",
-			err, attachmentsDir,
-		)
-		return 0, 0
-	}
-
 	lockErr := s.WithExclusiveLock(ctx, func() error {
+		// Catch a sync started after source deletion released its lock.
 		running, err := s.HasAnyActiveSync()
 		if err != nil {
 			fmt.Fprintf(os.Stderr,
@@ -547,22 +653,15 @@ func deleteOrphanedAttachmentFiles(
 			return nil
 		}
 
-		var failed int
-		for _, relPath := range paths {
-			d, p, ok := deleteOneAttachmentFile(s, cleanDir, relPath)
-			if !ok {
-				failed++
-				continue
-			}
-			deleted += d
-			preserved += p
+		candidates := make([]attachmentFileCandidate, 0, len(paths))
+		for _, path := range paths {
+			candidates = append(candidates, attachmentFileCandidate{path: path})
 		}
-		if failed > 0 {
-			fmt.Fprintf(os.Stderr,
-				"Warning: could not remove %d attachment file(s) "+
-					"from disk.\n",
-				failed,
-			)
+		counts, cleanupErr := sweepAttachmentCandidates(context.WithoutCancel(ctx), s, attachmentsDir, candidates, os.Remove)
+		deleted, preserved = counts.removed+counts.missing, counts.preserved
+		if cleanupErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: could not remove %d attachment file(s) from disk: %v\n",
+				len(paths)-deleted-preserved, cleanupErr)
 		}
 		return nil
 	})
@@ -575,41 +674,6 @@ func deleteOrphanedAttachmentFiles(
 		)
 	}
 	return deleted, preserved
-}
-
-// deleteOneAttachmentFile checks that relPath is safe to delete and either
-// removes it, preserves it (still referenced), or reports a failure via ok=false.
-func deleteOneAttachmentFile(
-	s *store.Store, cleanDir, relPath string,
-) (deleted, preserved int, ok bool) {
-	absPath := filepath.Join(cleanDir, relPath)
-
-	rel, err := filepath.Rel(cleanDir, absPath)
-	if err != nil || rel == ".." ||
-		strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		fmt.Fprintf(os.Stderr,
-			"Warning: attachment path %q escapes attachments "+
-				"directory, skipping\n",
-			relPath,
-		)
-		return 0, 0, false
-	}
-
-	referenced, err := s.IsAttachmentPathReferenced(relPath)
-	if err != nil {
-		fmt.Fprintf(os.Stderr,
-			"Warning: could not verify attachment %s is unreferenced: %v\n",
-			relPath, err,
-		)
-		return 0, 0, false
-	}
-	if referenced {
-		return 0, 1, true
-	}
-	if err := os.Remove(absPath); err != nil && !os.IsNotExist(err) {
-		return 0, 0, false
-	}
-	return 1, 0, true
 }
 
 // resolveSource finds the unique source for the given identifier.

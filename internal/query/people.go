@@ -3,7 +3,7 @@ package query
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"slices"
@@ -25,20 +25,39 @@ const (
 // this is the only field that tells the caller which chip belongs to which
 // member (see PersonSummary.Cluster).
 type PersonIdentifier struct {
-	Type          string `json:"type"`
-	Value         string `json:"value"`
-	DisplayValue  string `json:"display_value,omitempty"`
-	IsPrimary     bool   `json:"is_primary"`
-	Provenance    string `json:"provenance"`
-	ParticipantID int64  `json:"participant_id"`
+	Type                   string `json:"type"`
+	Value                  string `json:"value"`
+	DisplayValue           string `json:"display_value,omitempty"`
+	IsPrimary              bool   `json:"is_primary"`
+	Provenance             string `json:"provenance"`
+	ParticipantID          int64  `json:"participant_id"`
+	ServiceSlug            string `json:"service_slug,omitempty"`
+	ServiceLabel           string `json:"service_label,omitempty"`
+	ScopeKind              string `json:"scope_kind,omitempty"`
+	ScopeValue             string `json:"scope_value,omitempty"`
+	ParticipantDisplayName string `json:"participant_display_name,omitempty"`
 }
 
 // PersonClusterEdge is one participant_links edge within a person's cluster,
 // as recorded by the store (the query layer has no edge data of its own —
 // see internal/store/participant_links.go's LinkEdge).
 type PersonClusterEdge struct {
-	ParticipantA int64 `json:"participant_a"`
-	ParticipantB int64 `json:"participant_b"`
+	ParticipantA int64                    `json:"participant_a"`
+	ParticipantB int64                    `json:"participant_b"`
+	LinkOrigin   *PersonClusterLinkOrigin `json:"link_origin,omitempty"`
+}
+
+type PersonClusterLinkOrigin struct {
+	Kind   string `json:"kind"`
+	Source string `json:"source,omitempty"`
+	Basis  string `json:"basis,omitempty"`
+}
+
+type PersonClusterMember struct {
+	ParticipantID int64  `json:"participant_id"`
+	DisplayName   string `json:"display_name,omitempty"`
+	Email         string `json:"email,omitempty"`
+	Phone         string `json:"phone,omitempty"`
 }
 
 // PersonCluster describes the identity-link cluster a person detail belongs
@@ -48,20 +67,21 @@ type PersonClusterEdge struct {
 // participant is linked to at least one other participant; a nil Cluster on
 // PersonSummary means the participant is unlinked.
 type PersonCluster struct {
-	CanonicalID int64               `json:"canonical_id"`
-	MemberIDs   []int64             `json:"member_ids"`
-	Edges       []PersonClusterEdge `json:"edges"`
+	CanonicalID int64                 `json:"canonical_id"`
+	MemberIDs   []int64               `json:"member_ids"`
+	Edges       []PersonClusterEdge   `json:"edges"`
+	Members     []PersonClusterMember `json:"members,omitempty"`
 }
 
 // PersonProfile references the durable curated person (see /api/v1/people)
 // covering this detail's identity cluster, when one has been promoted.
 // Revision is the person's optimistic-concurrency counter, so clients can
 // PATCH or DELETE the profile straight from a detail view. Populated at the
-// HTTP layer from the store, like PersonSummary.Cluster; the query layer
-// itself never reads curated person data.
+// HTTP layer from the live store, like PersonSummary.Cluster. The cache
+// carries curated labels only, never profile revisions.
 type PersonProfile struct {
 	ID          int64   `json:"id"`
-	DisplayName *string `json:"display_name,omitempty"`
+	DisplayName *string `json:"display_name,omitzero" nullable:"false"`
 	Revision    int64   `json:"revision"`
 }
 
@@ -93,8 +113,8 @@ type PersonSummary struct {
 	FirstAt                        time.Time          `json:"first_at"`
 	LastAt                         time.Time          `json:"last_at"`
 	CacheRevision                  string             `json:"cache_revision"`
-	Cluster                        *PersonCluster     `json:"cluster,omitempty"`
-	Profile                        *PersonProfile     `json:"profile,omitempty"`
+	Cluster                        *PersonCluster     `json:"cluster,omitzero" nullable:"false"`
+	Profile                        *PersonProfile     `json:"profile,omitzero" nullable:"false"`
 }
 
 type PersonSearchResponse struct {
@@ -324,7 +344,7 @@ func (e *DuckDBEngine) searchPeopleLegacy(
 	}
 	conditions, args := buildExploreConditions(request.Explore)
 	entriesCTE, entryArgs := personEntriesCTE(exactID, clusterMemberIDs, conditions,
-		e.parquetPath(datasetParticipantClusters), e.identityActivityPath())
+		e.parquetPath(datasetParticipantClusters))
 	args = append(args, entryArgs...)
 	// bestNameExpr is the shared cluster label policy (see person_label.go).
 	// Listing/search rows are canonical identities, so the label evaluates
@@ -334,6 +354,7 @@ func (e *DuckDBEngine) searchPeopleLegacy(
 	// members bind as placeholders here, before the personWhere and
 	// identifier args, matching their position inside person_population;
 	// otherwise the row participant's own name applies.
+	// Curated-name member args follow observed-name args in person_population.
 	bestNameExpr := "NULLIF(TRIM(p.display_name), '')"
 	switch {
 	case exactID == nil:
@@ -345,6 +366,18 @@ func (e *DuckDBEngine) searchPeopleLegacy(
 			args = append(args, memberID)
 		}
 	}
+	personDisplayNamesGlob := quoteIdentitySQLPath(e.parquetPath(datasetPersonDisplayNames))
+	overrideFilter := "pnv.participant_id = p.id"
+	switch {
+	case exactID == nil:
+		overrideFilter = "pnv.participant_id IN (SELECT cno.participant_id FROM canon cno WHERE cno.canonical_id = p.id)"
+	case len(clusterMemberIDs) > 1:
+		overrideFilter = "pnv.participant_id IN (" + strings.TrimSuffix(strings.Repeat("?,", len(clusterMemberIDs)), ",") + ")"
+		for _, memberID := range clusterMemberIDs {
+			args = append(args, memberID)
+		}
+	}
+	overrideExpr := sqlPersonNameOverrideExpr(e.parquetPath(datasetPersonDisplayNames), overrideFilter)
 	personWhere := []string{"true"}
 	if exactID != nil {
 		personWhere = append(personWhere, "person_id = ?")
@@ -371,8 +404,13 @@ func (e *DuckDBEngine) searchPeopleLegacy(
 				WHERE pi.participant_id = person_id AND (contains(lower(pi.identifier_value), lower(?))
 					OR contains(lower(pi.display_value), lower(?)))))`
 		}
+		curatedMatch := "contains(lower(COALESCE(person_display_name, '')), lower(?))"
+		if exactID == nil {
+			curatedMatch = "EXISTS (SELECT 1 FROM read_parquet('" + personDisplayNamesGlob + "') pnq JOIN canon cq2 ON cq2.participant_id = pnq.participant_id WHERE cq2.canonical_id = person_population.person_id AND contains(lower(pnq.display_name), lower(?)))"
+		}
+		matchExpr = "(" + matchExpr + " OR " + curatedMatch + ")"
 		personWhere = append(personWhere, matchExpr)
-		args = append(args, searchText, searchText, searchText, searchText, searchText)
+		args = append(args, searchText, searchText, searchText, searchText, searchText, searchText)
 	}
 	// identifierFilter scopes the per-row identifiers subquery below. For
 	// listing/search rows the canonical identity's identifiers span its whole
@@ -411,6 +449,7 @@ func (e *DuckDBEngine) searchPeopleLegacy(
 	SELECT p.id AS person_id, COALESCE(p.display_name, '') AS display_name,
 		COALESCE(p.email_address, '') AS email_address, COALESCE(p.phone_number, '') AS phone_number,
 		` + bestNameExpr + ` AS best_display_name,
+		` + overrideExpr + ` AS person_display_name,
 		` + sqlPersonIdentifierFallbackExpr("p") + ` AS fallback_label,
 		COUNT(*)::BIGINT AS activity_count,
 		COUNT(*) FILTER (WHERE pe.message_type = 'meeting_transcript')::BIGINT AS meeting_count,
@@ -419,8 +458,8 @@ func (e *DuckDBEngine) searchPeopleLegacy(
 	FROM person_entries pe JOIN participants p ON p.id = pe.person_id
 	GROUP BY p.id, p.display_name, p.email_address, p.phone_number
 ), filtered_people AS (
-	SELECT *, COALESCE(best_display_name, fallback_label) AS display_label,
-		(best_display_name IS NULL) AS partial_label
+	SELECT *, COALESCE(person_display_name, best_display_name, fallback_label) AS display_label,
+		(person_display_name IS NULL AND best_display_name IS NULL) AS partial_label
 	FROM person_population WHERE ` + strings.Join(personWhere, " AND ") + `
 ), counted AS (
 	SELECT *, COUNT(*) OVER () AS total_count FROM filtered_people
@@ -517,7 +556,7 @@ FROM counted ORDER BY ` + order + ` LIMIT ? OFFSET ?`
 //     cluster (e.g. cc'ing a contact's work and personal addresses) is never
 //     double-counted. The clusters/canon CTEs remain only for the caller's
 //     label, search-match, and identifier subqueries.
-func personEntriesCTE(exactID *int64, memberIDs []int64, conditions, clustersGlob, activityGlob string) (string, []any) {
+func personEntriesCTE(exactID *int64, memberIDs []int64, conditions, clustersGlob string) (string, []any) {
 	if exactID == nil {
 		return fmt.Sprintf(`
 ), clusters AS (
@@ -526,7 +565,7 @@ func personEntriesCTE(exactID *int64, memberIDs []int64, conditions, clustersGlo
 	SELECT p.id AS participant_id, COALESCE(c.canonical_id, p.id) AS canonical_id
 	FROM participants p LEFT JOIN clusters c ON c.participant_id = p.id
 ), person_entries AS (`, clustersGlob) +
-			sqlActivityEntryEdges(activityGlob,
+			sqlActivityEntryEdges(
 				"a.canonical_id AS person_id, le.occurred_at, le.message_type, le.attachment_count, le.source_type",
 				"a.is_direct", "(a.is_direct OR a.is_conversation_member)"), nil
 	}
@@ -556,7 +595,7 @@ func personEntriesCTE(exactID *int64, memberIDs []int64, conditions, clustersGlo
 	FROM logical_entries
 	WHERE entry_key IN (
 		SELECT edge.entry_key FROM (` +
-			sqlActivityEntryEdges(activityGlob, "a.canonical_id AS person_id",
+			sqlActivityEntryEdges("a.canonical_id AS person_id",
 				"a.is_direct AND a.canonical_id IN "+memberList,
 				"(a.is_direct OR a.is_conversation_member) AND a.canonical_id IN "+memberList) + `
 		) AS edge
@@ -677,7 +716,7 @@ func (e *DuckDBEngine) searchDomainsLegacy(ctx context.Context, request DomainSe
 	// as the index's domain entries do.
 	queryText := buildExploreLogicalSQLNoLists(conditions) + `
 ), domain_edges AS (` +
-		sqlActivityEntryEdges(e.identityActivityPath(),
+		sqlActivityEntryEdges(
 			"a.participant_domain AS domain, a.canonical_id AS person_id, "+
 				"a.is_direct AS is_direct, "+
 				"(le.entry_kind = 'conversation') AS is_chat_entry, "+

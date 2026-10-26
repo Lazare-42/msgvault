@@ -16,6 +16,14 @@ import (
 
 const daemonCLISubprocessEnv = "MSGVAULT_DAEMON_CLI_PARENT_PID"
 
+// ErrSyncPaused signals a sync that paused until a later run.
+var ErrSyncPaused = errors.New("sync paused")
+
+// ExitCodeSyncPaused carries a paused outcome from the CLI child to the daemon.
+const ExitCodeSyncPaused = 75
+
+var daemonCLIExecutableResolver = os.Executable
+
 func isDaemonCLISubprocess() bool {
 	return os.Getenv(daemonCLISubprocessEnv) == strconv.Itoa(os.Getppid())
 }
@@ -82,7 +90,7 @@ func runDaemonCLISubprocessStreamWithEnv(
 	if secondStreamErr != nil {
 		return secondStreamErr
 	}
-	return classifyDaemonCLIWaitErr(waitErr, args)
+	return classifyDaemonCLIWaitErr(waitErr, args, emitLocked)
 }
 
 // cliSubprocessExitSentinel marks a daemon CLI subprocess that ran and exited
@@ -92,17 +100,23 @@ func runDaemonCLISubprocessStreamWithEnv(
 const cliSubprocessExitSentinel = "msgvault: cli subprocess exited non-zero"
 
 // classifyDaemonCLIWaitErr maps a subprocess Wait() error to what the proxy
-// should report. A non-zero exit (the command ran and failed) becomes the
+// should report. A paused exit emits its outcome and succeeds. Other non-zero exits become the
 // sentinel: its real error was already streamed to the caller's stderr, so the
 // client must not print a second, redundant "CLI subprocess ...: exit status
 // 1" wrapper. Any other failure (couldn't start, signal, etc.) is wrapped with
 // context because nothing else surfaced it.
-func classifyDaemonCLIWaitErr(waitErr error, args []string) error {
+func classifyDaemonCLIWaitErr(waitErr error, args []string, emit func(string, string) error) error {
 	if waitErr == nil {
 		return nil
 	}
 	var exitErr *exec.ExitError
 	if errors.As(waitErr, &exitErr) && exitErr.Exited() {
+		if exitErr.ExitCode() == ExitCodeSyncPaused {
+			if emit != nil {
+				return emit("outcome", "paused")
+			}
+			return nil
+		}
 		// A normal non-zero exit: the command ran and streamed its own error,
 		// so collapse to the silent sentinel. A signal-terminated process
 		// (Exited() is false, ExitCode() == -1) streamed nothing, so keep it
@@ -113,11 +127,11 @@ func classifyDaemonCLIWaitErr(waitErr error, args []string) error {
 }
 
 func newDaemonCLISubprocessCommand(ctx context.Context, commandArgs []string, env map[string]string, cwd string) (*exec.Cmd, error) {
-	exe, err := os.Executable()
+	exe, err := daemonCLIExecutableResolver()
 	if err != nil {
 		return nil, fmt.Errorf("locate msgvault executable: %w", err)
 	}
-	args := globalConfigFlagArgs()
+	args := globalConfigFlagArgs(optionsFromContext(ctx))
 	args = append(args, "--no-log-file")
 	args = append(args, commandArgs...)
 
@@ -125,7 +139,7 @@ func newDaemonCLISubprocessCommand(ctx context.Context, commandArgs []string, en
 	if cwd != "" {
 		cmd.Dir = cwd
 	}
-	cmd.Env = daemonCLIChildEnv(os.Environ(), os.Getpid(), env)
+	cmd.Env = daemonRuntimeChildEnv(ctx, daemonCLIChildEnv(os.Environ(), os.Getpid(), env))
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return os.ErrProcessDone
@@ -151,6 +165,9 @@ func daemonCLIChildEnv(base []string, parentPID int, extra map[string]string) []
 			continue
 		}
 		if key, ok := splitEnvEntry(entry); ok {
+			if strings.EqualFold(key, remoteDeleteEnvVar) {
+				continue
+			}
 			if extraValue, exists := extra[key]; exists {
 				if !extraReplaced[key] {
 					out = append(out, key+"="+extraValue)
@@ -165,6 +182,12 @@ func daemonCLIChildEnv(base []string, parentPID int, extra map[string]string) []
 		out = append(out, value)
 	}
 	for _, key := range sortedEnvKeys(extra) {
+		if strings.EqualFold(key, remoteDeleteEnvVar) {
+			if key == remoteDeleteEnvVar {
+				out = append(out, remoteDeleteEnvVar+"="+extra[key])
+			}
+			continue
+		}
 		if !extraReplaced[key] {
 			out = append(out, key+"="+extra[key])
 		}

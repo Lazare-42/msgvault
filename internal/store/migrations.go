@@ -5,7 +5,8 @@ import (
 	"compress/zlib"
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -17,9 +18,11 @@ import (
 // last_modified backfill alone is a full messages-table scan — seconds of
 // startup on a large archive).
 const (
-	migrationAttachmentsContentHashUnique = "attachments_content_hash_unique_index"
-	migrationAttachmentOccurrenceUnique   = "attachment_occurrence_unique_indexes_v1"
-	migrationMessagesLastModifiedBackfill = "messages_last_modified_backfill"
+	migrationMeetingProjectionV1            = "meeting_projection_v1"
+	migrationAttachmentsContentHashUnique   = "attachments_content_hash_unique_index"
+	migrationAttachmentOccurrenceUnique     = "attachment_occurrence_unique_indexes_v1"
+	migrationMessagesLastModifiedBackfill   = "messages_last_modified_backfill"
+	migrationMessagesLastModifiedNullRepair = "messages_last_modified_null_repair"
 	// v3: messageIdentityAttributionMatch became envelope-authoritative and
 	// gated email identifier matches on the sender lacking a primary email.
 	// Archives that ran v2 reconciled under the old predicate, so the rename
@@ -45,7 +48,13 @@ const (
 	// v9: the scope-entry seed revives a tombstoned publication back to
 	// stale (a scope exit tombstones it; DO NOTHING left re-entry
 	// unindexable until a full rebuild).
-	migrationMessageWatermarkTriggers       = "message_and_attachment_triggers_v9"
+	// v10: List-ID became a message content column. Archives that recorded v9
+	// retain a trigger definition without list_id until this migration replaces
+	// it, leaving consumers on stale mailing-list routing data.
+	// v11: attachment media interpretation changes when a live message moves to
+	// another source or conversation, even when its attachment row is unchanged.
+	// v12: journal attachment_state changes so the Docbank mirror replays them.
+	migrationMessageWatermarkTriggers       = "message_and_attachment_triggers_v12"
 	migrationEmbeddingChangeJournalTriggers = "embedding_change_journal_triggers_v7"
 	// v2: message updates share the content-column/value guard, participant
 	// scope mirrors personscope, and metadata-only edge edits are not identity
@@ -58,19 +67,96 @@ const (
 	// must reinstall both backend trigger sets so document evidence lifecycle
 	// changes can match the canonical document lane instead of only the owning
 	// conversation_text or meeting_text row.
-	migrationPersonSweepChangeTriggers   = "person_sweep_change_triggers_v5"
-	migrationIdentityMatchSourceSupport  = "identity_match_source_support_v1"
-	migrationVCardSourceResourceIdentity = "vcard_source_resource_identity_v1"
-	migrationOrganizationDomainIDNA      = "organization_domain_idna_v1"
-	migrationGmailChatClassification     = "gmail_chat_classification_v1"
+	migrationPersonSweepChangeTriggers     = "person_sweep_change_triggers_v5"
+	migrationIdentityMatchSourceSupport    = "identity_match_source_support_v1"
+	migrationCardDAVDisplayNameOwnership   = "carddav_display_name_ownership_v1"
+	migrationCardDAVLocalPublicationOrigin = "carddav_local_publication_origin_v1"
+	migrationVCardSourceResourceIdentity   = "vcard_source_resource_identity_v1"
+	migrationOrganizationDomainIDNA        = "organization_domain_idna_v1"
+	migrationGmailChatClassification       = "gmail_chat_classification_v1"
+	migrationSyncRunResumeMetadata         = "sync_run_resume_metadata_v1"
 	// v3: the SQLite conversation trigger narrowed from a blanket
 	// AFTER UPDATE to conversation_type changes only; archives that
 	// installed the blanket trigger need the repair to re-run.
 	// v4: the messages trigger narrowed on both backends to
 	// MessagesActivityColumns with a value-change guard, so embedding and
 	// FTS bookkeeping sweeps no longer requeue the archive.
-	migrationActivityProjectionTriggers = "activity_projection_triggers_v4"
+	// v5: is_sent joined MessagesActivityColumns, and messages projected while
+	// unsent are requeued so the projector retracts them.
+	migrationActivityProjectionTriggers = "activity_projection_triggers_v5"
+	migrationPersonInferenceProviderV2  = "person_inference_provider_v2"
+	migrationPersonSweepCallsV2         = "person_sweep_calls_v2"
+	migrationProviderConsentsV1         = "provider_consents_v1"
+	// The partial unique index on account_identities(source_id, address_key)
+	// is DDL that runs once per archive; the key backfill itself is not
+	// ledgered because previous-release writers can reintroduce unkeyed rows
+	// at any time (see ensureAccountIdentityAddressKeys).
+	migrationAccountIdentityAddressKeyIndex = "account_identities_address_key_index_v1"
+	// v2: the provider call journal accepts the person brief purposes
+	// alongside the extraction pair.
+	migrationPersonSweepBatchPurposeV2 = "person_sweep_batch_purpose_v2"
+	// The fact ledger records a claim the person brief proposed with its own
+	// origin, and an attempt records why a brief call produced no version.
+	migrationPersonFactClaimOriginBrief     = "person_fact_claim_origin_brief_v1"
+	migrationPersonSweepAttemptBriefFailure = "person_sweep_attempt_brief_failure_v1"
+	migrationCardDAVMultipleAccounts        = "carddav_multiple_accounts_v1"
+	migrationCardDAVInferenceExportState    = "carddav_inference_export_state_v1"
+	migrationChatMembers                    = "chat_members_v1"
 )
+
+func (s *Store) backfillSyncRunResumeMetadata(
+	ctx context.Context, tx *loggedTx,
+) error {
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE sync_runs
+		SET sync_type = CASE (
+			SELECT source_type FROM sources WHERE sources.id = sync_runs.source_id
+		)
+			WHEN 'mbox' THEN 'import-mbox'
+			WHEN 'apple-mail' THEN 'import-emlx'
+			WHEN 'pst' THEN 'import-pst'
+			WHEN 'gcal' THEN 'full'
+			ELSE 'full'
+		END
+		WHERE sync_type = ''
+		  AND (
+			source_id IN (
+				SELECT id FROM sources WHERE source_type IN ('mbox', 'apple-mail', 'pst')
+			)
+			OR (
+				cursor_before LIKE '{"kind":"gcal_full_v1","page_token":%'
+				AND source_id IN (
+					SELECT id FROM sources WHERE source_type = 'gcal'
+				)
+			)
+			OR (
+				status IN ('running', 'failed')
+				AND cursor_before IS NOT NULL AND cursor_before != ''
+				AND cursor_after IS NOT NULL AND cursor_after != ''
+				AND source_id IN (
+					SELECT id FROM sources WHERE source_type IN ('', 'gmail')
+				)
+			)
+		  )
+	`); err != nil {
+		return fmt.Errorf("backfill sync run types: %w", err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		UPDATE sync_runs
+		SET request_fingerprint = ?
+		WHERE request_fingerprint IS NULL
+		  AND sync_type = 'full'
+		  AND status IN ('running', 'failed')
+		  AND cursor_after IS NOT NULL
+		  AND cursor_after != ''
+		  AND source_id IN (
+			SELECT id FROM sources WHERE source_type IN ('', 'gmail')
+		  )
+	`, GmailHistoryRecoveryRequestFingerprint); err != nil {
+		return fmt.Errorf("backfill Gmail history recovery request fingerprints: %w", err)
+	}
+	return nil
+}
 
 func (s *Store) classifyLegacyGmailChats(ctx context.Context, tx *loggedTx) error {
 	if _, err := tx.ExecContext(ctx, `
@@ -397,7 +483,7 @@ func backfillLegacyMessageAttributionProvenance(
 	}
 
 	for _, sourceID := range sourceIDs {
-		if err := refreshSourceMessageAttributionContext(ctx, tx, sourceID, ""); err != nil {
+		if err := refreshSourceMessageAttributionContext(ctx, tx, sourceID); err != nil {
 			return fmt.Errorf("reconcile source %d attribution: %w", sourceID, err)
 		}
 	}
@@ -505,17 +591,55 @@ func legacyCalendarOrganizerSelf(
 	return event.Organizer.Self, true
 }
 
-// IsMigrationApplied reports whether the named one-time data migration
-// has already run.
-func (s *Store) IsMigrationApplied(name string) (bool, error) {
-	return s.IsMigrationAppliedContext(context.Background(), name)
+// ensureMigrationLedgerVersionColumn adds the ledger version column before
+// InitSchemaContext issues its first version-aware ledger query.
+func (s *Store) ensureMigrationLedgerVersionColumn(ctx context.Context) error {
+	statement := `ALTER TABLE applied_migrations ADD COLUMN version INTEGER NOT NULL DEFAULT 1`
+	if s.IsPostgreSQL() {
+		statement = `ALTER TABLE applied_migrations ADD COLUMN IF NOT EXISTS version INTEGER NOT NULL DEFAULT 1`
+	}
+	if _, err := s.db.ExecContext(ctx, statement); err != nil &&
+		!s.dialect.IsDuplicateColumnError(err) {
+		return fmt.Errorf("add migration ledger version: %w", err)
+	}
+	return nil
 }
 
-// IsMigrationAppliedContext is the request-aware form of IsMigrationApplied.
-func (s *Store) IsMigrationAppliedContext(ctx context.Context, name string) (bool, error) {
+const markMigrationAppliedSQL = `
+	INSERT INTO applied_migrations (name, version) VALUES (?, ?)
+	ON CONFLICT (name) DO UPDATE SET
+		version = excluded.version,
+		applied_at = CURRENT_TIMESTAMP
+	WHERE applied_migrations.version < excluded.version`
+
+func (s *Store) markMigrationAppliedContext(
+	ctx context.Context, q contextStatementQuerier, name string, version int,
+) error {
+	_, err := q.ExecContext(ctx, markMigrationAppliedSQL, name, version)
+	if err != nil {
+		return fmt.Errorf("mark migration %q applied: %w", name, err)
+	}
+	return nil
+}
+
+// IsMigrationApplied reports whether the named one-time data migration has
+// reached version 1.
+func (s *Store) IsMigrationApplied(name string) (bool, error) {
+	return s.IsMigrationAppliedContext(context.Background(), name, 1)
+}
+
+// IsMigrationAppliedContext reports whether the named migration has reached
+// the requested positive minimum implementation version.
+func (s *Store) IsMigrationAppliedContext(
+	ctx context.Context, name string, minimumVersion int,
+) (bool, error) {
+	if minimumVersion < 1 {
+		return false, fmt.Errorf("migration version must be positive, got %d", minimumVersion)
+	}
 	var count int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM applied_migrations WHERE name = ?`, name,
+		`SELECT COUNT(*) FROM applied_migrations WHERE name = ? AND version >= ?`,
+		name, minimumVersion,
 	).Scan(&count)
 	if err != nil {
 		return false, fmt.Errorf("check migration %q: %w", name, err)
@@ -523,20 +647,66 @@ func (s *Store) IsMigrationAppliedContext(ctx context.Context, name string) (boo
 	return count > 0, nil
 }
 
-// MarkMigrationApplied records that a migration has run. Idempotent.
+// MarkMigrationApplied records that version 1 of a migration has run without
+// replacing a higher recorded version.
 func (s *Store) MarkMigrationApplied(name string) error {
-	return s.MarkMigrationAppliedContext(context.Background(), name)
+	return s.MarkMigrationAppliedContext(context.Background(), name, 1)
 }
 
-// MarkMigrationAppliedContext is the request-aware form of
-// MarkMigrationApplied.
-func (s *Store) MarkMigrationAppliedContext(ctx context.Context, name string) error {
-	_, err := s.db.ExecContext(ctx,
-		s.dialect.InsertOrIgnore(`INSERT OR IGNORE INTO applied_migrations (name) VALUES (?)`),
-		name,
-	)
+// MarkMigrationAppliedContext records a successfully applied positive migration
+// version. It preserves the highest recorded version and only updates the
+// timestamp when the version increases.
+func (s *Store) MarkMigrationAppliedContext(
+	ctx context.Context, name string, version int,
+) error {
+	if version < 1 {
+		return fmt.Errorf("migration version must be positive, got %d", version)
+	}
+	return s.markMigrationAppliedContext(ctx, s.db, name, version)
+}
+
+// colonFreeSuffixSQL matches names that extend a prefix with a remainder free
+// of colons, the same guard source merges use for rederive ledger keys.
+const colonFreeSuffixSQL = `SUBSTR(name, 1, LENGTH(?)) = ? AND SUBSTR(name, LENGTH(?) + 1) NOT LIKE '%:%'`
+
+// NextMigrationKeyContext returns the first ledger name after `after` that
+// extends prefix with a colon-free remainder, or "" when none remains.
+func (s *Store) NextMigrationKeyContext(ctx context.Context, prefix, after string) (string, error) {
+	var name string
+	err := s.db.QueryRowContext(ctx, `SELECT name FROM applied_migrations
+		WHERE `+colonFreeSuffixSQL+` AND name > ? ORDER BY name LIMIT 1`, prefix, prefix, prefix, after).Scan(&name)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
 	if err != nil {
-		return fmt.Errorf("mark migration %q applied: %w", name, err)
+		return "", fmt.Errorf("next migration after %q: %w", after, err)
+	}
+	return name, nil
+}
+
+// ReplaceMigrationContext atomically deletes ledger name old and records
+// version 1 of name replacement. Either name may be empty to skip that step.
+func (s *Store) ReplaceMigrationContext(ctx context.Context, old, replacement string) error {
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
+		if old != "" {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM applied_migrations WHERE name = ?`, old); err != nil {
+				return fmt.Errorf("forget migration %q: %w", old, err)
+			}
+		}
+		if replacement == "" {
+			return nil
+		}
+		return s.markMigrationAppliedContext(ctx, tx, replacement, 1)
+	})
+}
+
+// ForgetMigrationsContext deletes ledger name and every name extending
+// name+"#" with a colon-free remainder in one statement.
+func (s *Store) ForgetMigrationsContext(ctx context.Context, name string) error {
+	prefix := name + "#"
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM applied_migrations
+		WHERE name = ? OR (`+colonFreeSuffixSQL+`)`, name, prefix, prefix, prefix); err != nil {
+		return fmt.Errorf("forget migration %q: %w", name, err)
 	}
 	return nil
 }

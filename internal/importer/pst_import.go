@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +16,8 @@ import (
 
 	pstlib "github.com/mooijtech/go-pst/v6/pkg"
 	pstreader "go.kenn.io/msgvault/internal/pst"
+	"go.kenn.io/msgvault/internal/rederive"
+	"go.kenn.io/msgvault/internal/remoteimage"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -41,6 +43,8 @@ type PstImportOptions struct {
 	// AttachmentsDir controls where attachment files are written.
 	// Empty string disables disk storage (messages still imported).
 	AttachmentsDir string
+	// RemoteImages is nil unless remote image archiving was explicitly enabled.
+	RemoteImages *remoteimage.Fetcher
 
 	// MaxMessageBytes limits the total byte size (body + attachments) read
 	// per message. Defaults to 128 MiB.
@@ -97,7 +101,15 @@ const defaultMaxPstMessageBytes int64 = 128 << 20 // 128 MiB
 // Folder structure is preserved as labels. Non-email items (calendar, contacts,
 // tasks) are skipped automatically. The import is resumable: if interrupted,
 // rerunning with the same arguments continues from where it left off.
-func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImportOptions) (*PstImportSummary, error) {
+func ImportPst(
+	ctx context.Context, st *store.Store, pstPath string, opts PstImportOptions,
+) (retSummary *PstImportSummary, retErr error) {
+	return importPstWithBatchSize(ctx, st, pstPath, opts, 200)
+}
+
+func importPstWithBatchSize(
+	ctx context.Context, st *store.Store, pstPath string, opts PstImportOptions, batchSize int,
+) (retSummary *PstImportSummary, retErr error) {
 	if opts.SourceType == "" {
 		opts.SourceType = "pst"
 	}
@@ -113,7 +125,7 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 
 	ingestFn := opts.IngestFunc
 	if ingestFn == nil {
-		ingestFn = IngestRawMessage
+		ingestFn = pstMessageIngester(opts.RemoteImages)
 	}
 
 	log := opts.Logger
@@ -155,6 +167,15 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 		return nil, fmt.Errorf("get/create source: %w", err)
 	}
 	summary.SourceID = src.ID
+	ownershipCtx := context.WithoutCancel(ctx)
+	execution, err := st.AcquireSyncExecutionContext(ownershipCtx, src.ID)
+	if err != nil {
+		return nil, fmt.Errorf("acquire sync execution: %w", err)
+	}
+	defer func() {
+		retErr = errors.Join(retErr, execution.Release())
+	}()
+	rederive.Heal(ctx, slog.Default(), st, src)
 
 	// Set display name to the PST filename so it appears in list-accounts / get_stats.
 	pstBase := filepath.Base(absPath)
@@ -175,12 +196,11 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 	)
 
 	if !opts.NoResume {
-		active, err := st.GetActiveSync(src.ID)
+		active, err := st.GetLatestCheckpointedSyncByType(src.ID, "import-pst")
 		if err != nil && !errors.Is(err, store.ErrSyncRunNotFound) {
-			return nil, fmt.Errorf("check active sync: %w", err)
+			return nil, fmt.Errorf("check resumable sync: %w", err)
 		}
 		if active != nil {
-			syncID = active.ID
 			cp.MessagesProcessed = active.MessagesProcessed
 			cp.MessagesAdded = active.MessagesAdded
 			cp.MessagesUpdated = active.MessagesUpdated
@@ -190,7 +210,7 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 				if err := json.Unmarshal([]byte(active.CursorBefore.String), &saved); err == nil {
 					sameFile := saved.File == absPath || saved.File == cpFile
 					if !sameFile && saved.File != "" {
-						if curInfo, err := os.Stat(absPath); err == nil {
+						if curInfo, err := os.Stat(absPath); err == nil { // #nosec G703 -- The local CLI caller selects the PST file to import.
 							if cpInfo, err := os.Stat(saved.File); err == nil && os.SameFile(curInfo, cpInfo) {
 								sameFile = true
 							}
@@ -231,11 +251,9 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 		}
 	}
 
-	if syncID == 0 {
-		syncID, err = st.StartSync(src.ID, "import-pst")
-		if err != nil {
-			return nil, fmt.Errorf("start sync: %w", err)
-		}
+	syncID, err = execution.StartSyncContext(ownershipCtx, "import-pst", "")
+	if err != nil {
+		return nil, fmt.Errorf("start sync: %w", err)
 	}
 	st = st.ScopedToSync(src.ID, syncID)
 
@@ -306,10 +324,7 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 	}
 
 	// Batching constants (same as MBOX/EMLX importers).
-	const (
-		batchSize  = 200
-		batchBytes = 32 << 20 // 32 MiB
-	)
+	const batchBytes = 32 << 20 // 32 MiB
 
 	type pendingPstMessage struct {
 		Raw          []byte
@@ -331,6 +346,9 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 	)
 
 	saveCp := func(fi int, fp string, mi int64) {
+		if checkpointBlocked {
+			return
+		}
 		if err := savePstCheckpoint(st, syncID, cpFile, archiveID, fi, fp, mi, &cp); err != nil {
 			cp.ErrorsCount++
 			summary.Errors++
@@ -362,9 +380,12 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 			log.Warn("existence check (any) failed", "error", errAny)
 		}
 
-		for _, p := range pending {
+		for i, p := range pending {
 			if ctx.Err() != nil {
-				saveCp(p.FolderIndex, p.FolderPath, p.MsgIndex)
+				if i > 0 {
+					lastProcessed := pending[i-1]
+					saveCp(lastProcessed.FolderIndex, lastProcessed.FolderPath, lastProcessed.MsgIndex)
+				}
 				summary.Duration = time.Since(start)
 				return true
 			}
@@ -372,32 +393,33 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 			cp.MessagesProcessed++
 			summary.MessagesProcessed++
 
-			// Deduplicate: if exists with raw, just ensure labels are applied.
-			if errWithRaw == nil {
-				if msgID, exists := existingWithRaw[p.SourceMsgID]; exists {
-					summary.MessagesSkipped++
-					if p.LabelID != 0 {
-						if err := st.AddMessageLabels(msgID, []int64{p.LabelID}); err != nil {
-							log.Warn("add labels to existing message", "error", err)
-						}
-					}
-					if !checkpointBlocked && cp.MessagesProcessed%int64(opts.CheckpointInterval) == 0 {
-						saveCp(p.FolderIndex, p.FolderPath, p.MsgIndex)
-					}
-					continue
-				}
-			} else {
-				// Fall back to individual check.
+			// Re-import repairs header facts while preserving archived content.
+			existingID, exists := existingWithRaw[p.SourceMsgID]
+			if errWithRaw != nil {
 				one, err := st.MessageExistsWithRawBatch(src.ID, []string{p.SourceMsgID})
 				if err == nil {
-					if msgID, exists := one[p.SourceMsgID]; exists {
-						summary.MessagesSkipped++
-						if p.LabelID != 0 {
-							_ = st.AddMessageLabels(msgID, []int64{p.LabelID})
-						}
-						continue
+					existingID, exists = one[p.SourceMsgID]
+				}
+			}
+			if exists {
+				if err := recordPstMessageHeadersByID(ctx, st, src.ID, existingID, p.Raw); err != nil {
+					cp.ErrorsCount++
+					summary.Errors++
+					checkpointBlocked = true
+					hardErrors = true
+					log.Warn("repair PST message headers", "error", err)
+					continue
+				}
+				summary.MessagesSkipped++
+				if p.LabelID != 0 {
+					if err := st.AddMessageLabels(existingID, []int64{p.LabelID}); err != nil {
+						log.Warn("add labels to existing message", "error", err)
 					}
 				}
+				if cp.MessagesProcessed%int64(opts.CheckpointInterval) == 0 {
+					saveCp(p.FolderIndex, p.FolderPath, p.MsgIndex)
+				}
+				continue
 			}
 
 			alreadyExists := false
@@ -429,7 +451,7 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 				summary.MessagesAdded++
 			}
 
-			if !checkpointBlocked && cp.MessagesProcessed%int64(opts.CheckpointInterval) == 0 {
+			if cp.MessagesProcessed%int64(opts.CheckpointInterval) == 0 {
 				saveCp(p.FolderIndex, p.FolderPath, p.MsgIndex)
 			}
 		}
@@ -437,10 +459,8 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 		clear(pending)
 		pending = pending[:0]
 		pendingBytes = 0
-		// Reset checkpoint blocking so future successful batches can checkpoint.
-		// checkpointBlocked is set when an ingest error occurs within a batch;
-		// once the batch completes, we allow checkpointing again.
-		checkpointBlocked = false
+		// Keep checkpoint blocking across batches. A message that failed repair or
+		// ingestion remains unprocessed, so later checkpoints must not move past it.
 		return false
 	}
 
@@ -589,6 +609,11 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 	summary.Duration = time.Since(start)
 	summary.HardErrors = hardErrors
 
+	// An interrupted import leaves its sync running so the next run resumes
+	// from the last checkpoint, matching an interruption inside a batch.
+	if ctx.Err() != nil {
+		return summary, nil
+	}
 	finalMsg := fmt.Sprintf("folders:%d messages:%d", summary.FoldersImported, summary.MessagesProcessed)
 	if hardErrors {
 		if err := st.FailSync(syncID, fmt.Sprintf("completed with %d errors", cp.ErrorsCount)); err != nil {
@@ -597,11 +622,34 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 		return summary, nil
 	}
 
-	if err := st.CompleteSync(syncID, finalMsg); err != nil {
+	if err := finishPstThreads(ctx, st, src.ID); err != nil {
+		if ctx.Err() != nil {
+			return summary, nil
+		}
+		failSync(err.Error())
+		return summary, err
+	}
+	if err := st.CompleteSyncContext(ctx, syncID, finalMsg); err != nil {
+		if ctx.Err() != nil {
+			return summary, nil
+		}
 		return summary, fmt.Errorf("complete sync: %w", err)
 	}
 
 	return summary, nil
+}
+
+// finishPstThreads links replies to archived parents and joins split
+// conversations after every folder is imported, so replies that appear before
+// their parents in the file still thread.
+func finishPstThreads(ctx context.Context, st *store.Store, sourceID int64) error {
+	if err := st.ResolveEmailReplyParentsContext(ctx, sourceID, 0, nil); err != nil {
+		return fmt.Errorf("resolve PST email replies: %w", err)
+	}
+	if err := st.ReconcilePstEmailThreadsContext(ctx, sourceID); err != nil {
+		return fmt.Errorf("reconcile PST email threads: %w", err)
+	}
+	return nil
 }
 
 // pstArchiveFingerprint returns a short stable identifier for a PST file,
@@ -611,7 +659,7 @@ func ImportPst(ctx context.Context, st *store.Store, pstPath string, opts PstImp
 // distinguishes archives. Re-importing the same bytes yields the same
 // fingerprint regardless of path, preserving idempotence.
 func pstArchiveFingerprint(path string) (string, error) {
-	f, err := os.Open(path)
+	f, err := os.Open(path) // #nosec G703 -- The local CLI caller selects the PST file to fingerprint.
 	if err != nil {
 		return "", err
 	}
@@ -634,7 +682,7 @@ func savePstCheckpoint(st *store.Store, syncID int64, file, archiveID string, fo
 		FolderIndex: folderIndex,
 		FolderPath:  folderPath,
 		MsgIndex:    msgIndex,
-	})
+	}, json.Deterministic(true))
 	if err != nil {
 		return fmt.Errorf("marshal checkpoint: %w", err)
 	}

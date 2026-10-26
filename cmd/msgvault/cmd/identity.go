@@ -1,7 +1,8 @@
 package cmd
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -156,9 +157,9 @@ func writeIdentityJSON(w io.Writer, rows []identityRow) error {
 			ConfirmedAt: r.ConfirmedAt,
 		})
 	}
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	return enc.Encode(out)
+	enc := jsontext.NewEncoder(w, jsontext.WithIndentPrefix(""), jsontext.WithIndent("  "))
+
+	return json.MarshalEncode(enc, out, json.Deterministic(true))
 }
 
 var identityShowCmd = &cobra.Command{
@@ -378,9 +379,9 @@ func runIdentityImport(cmd *cobra.Command, args []string) error {
 
 func renderIdentityImport(w io.Writer, result identityops.ImportResult, jsonOutput bool) error {
 	if jsonOutput {
-		encoder := json.NewEncoder(w)
-		encoder.SetIndent("", "  ")
-		return encoder.Encode(result)
+		encoder := jsontext.NewEncoder(w, jsontext.WithIndentPrefix(""), jsontext.WithIndent("  "))
+
+		return json.MarshalEncode(encoder, result, json.Deterministic(true))
 	}
 	if _, err := fmt.Fprintf(
 		w,
@@ -473,9 +474,9 @@ func renderIdentityDiscoverProgress(w io.Writer, progress identityops.DiscoverPr
 
 func renderIdentityDiscover(w io.Writer, result identityops.DiscoverResult, jsonOutput bool) error {
 	if jsonOutput {
-		encoder := json.NewEncoder(w)
-		encoder.SetIndent("", "  ")
-		return encoder.Encode(result)
+		encoder := jsontext.NewEncoder(w, jsontext.WithIndentPrefix(""), jsontext.WithIndent("  "))
+
+		return json.MarshalEncode(encoder, result, json.Deterministic(true))
 	}
 
 	if _, err := fmt.Fprintf(
@@ -597,7 +598,8 @@ func renderIdentityRemoveResult(w io.Writer, result daemonclient.CLIIdentityRemo
 func renderIdentityNoIdentityWarning(w io.Writer, account string) {
 	_, _ = fmt.Fprintf(w, "Warning: %s now has no confirmed identity. "+
 		"Dedup sent-copy detection for this account will rely on is_from_me "+
-		"and SENT label signals only.\n", account)
+		"and SENT label signals only. Future syncs will not restore a default; "+
+		"use the source's add command with --no-default-identity=false to re-enable it.\n", account)
 }
 
 func identityShowArgs(cmd *cobra.Command, args []string) error {
@@ -675,6 +677,7 @@ func init() {
 	identityCmd.AddCommand(identityRemoveCmd)
 	identityCmd.AddCommand(identityDiscoverCmd)
 	identityCmd.AddCommand(identityImportCmd)
+	identityCmd.AddCommand(newIdentityMatchesCommand())
 
 	identityListCmd.Flags().StringVar(&identityListAccount,
 		"account", "", "Restrict to a single account")
@@ -702,7 +705,7 @@ func init() {
 	identityDiscoverCmd.Flags().BoolVar(&identityDiscoverApply,
 		"apply", false, "Confirm strong identity evidence after the preview scan completes")
 	identityDiscoverCmd.Flags().BoolVar(&identityDiscoverProvider,
-		"provider", false, "Include configured provider alias inventory")
+		"provider", false, "Include authenticated Gmail profile or configured provider alias inventory")
 	identityDiscoverCmd.Flags().StringArrayVar(&identityDiscoverConfirm,
 		"confirm", nil, "Explicitly confirm a weak candidate (repeatable; requires --apply)")
 	identityDiscoverCmd.Flags().BoolVar(&identityDiscoverJSON,

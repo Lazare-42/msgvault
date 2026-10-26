@@ -2,7 +2,7 @@ package api
 
 import (
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"net/http"
 	"strings"
@@ -85,7 +85,7 @@ func (s *Server) handleRequestOCR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.scheduler != nil && s.scheduler.IsJobScheduled("attachment-ocr") {
-		_ = s.scheduler.StartJob("attachment-ocr")
+		_, _ = s.scheduler.StartJob("attachment-ocr", false)
 	}
 	writeJSON(w, http.StatusAccepted, result)
 }
@@ -96,7 +96,7 @@ func (s *Server) handleSearchOCR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req ocrSearchRequest
-	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10)).Decode(&req); err != nil {
+	if err := json.UnmarshalRead(http.MaxBytesReader(w, r.Body, 64<<10), &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}

@@ -5,7 +5,8 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"sort"
@@ -155,6 +156,9 @@ func (s *Store) applyPreparedPersonFactGenerationDetailedTx(
 			return nil, personFactApplyMetadata{}, err
 		}
 	}
+	if err := s.lockAttributeDefinitionCatalogTx(ctx, tx, false); err != nil {
+		return nil, personFactApplyMetadata{}, err
+	}
 	organizationRefs, employmentTouched, err := s.personFactGenerationEmploymentOrganizationReferencesTx(
 		ctx, tx, input.PersonID, touched, claims)
 	if err != nil {
@@ -173,6 +177,14 @@ func (s *Store) applyPreparedPersonFactGenerationDetailedTx(
 			}
 			break
 		}
+	}
+
+	if err := s.lockEmploymentPeopleTx(ctx, tx, input.PersonID); err != nil {
+		return nil, personFactApplyMetadata{}, err
+	}
+	inferenceProjectionBefore, err := s.loadPersonInferenceExportProjectionTx(ctx, tx, input.PersonID)
+	if err != nil {
+		return nil, personFactApplyMetadata{}, fmt.Errorf("load inference export projection before fact generation: %w", err)
 	}
 
 	generation, replay, err := s.insertPersonFactGenerationTx(ctx, tx, prepared)
@@ -249,6 +261,7 @@ func (s *Store) applyPreparedPersonFactGenerationDetailedTx(
 	}
 
 	transactionTime := time.Now().UTC()
+	systemRetirements := make(map[personfacts.ProjectionRef]struct{})
 	projectionChanged := false
 	for _, touchedTarget := range touched {
 		descriptor, eligibility, loadErr := s.loadPersonFactTargetDescriptorTx(
@@ -259,7 +272,7 @@ func (s *Store) applyPreparedPersonFactGenerationDetailedTx(
 		}
 		changed, resolveErr := s.resolvePersonFactTargetWithOrganizationLocksTx(
 			ctx, tx, generation, descriptor, eligibility, input.Policy,
-			preparedFailures, organizationLocks, transactionTime)
+			preparedFailures, organizationLocks, transactionTime, systemRetirements)
 		if resolveErr != nil {
 			return nil, personFactApplyMetadata{}, resolveErr
 		}
@@ -267,6 +280,9 @@ func (s *Store) applyPreparedPersonFactGenerationDetailedTx(
 	}
 	if projectionChanged {
 		if err := s.bumpPersonVCardProjectionsTx(ctx, tx, input.PersonID); err != nil {
+			return nil, personFactApplyMetadata{}, err
+		}
+		if err := s.invalidateResolverInferenceExportTx(ctx, tx, input.PersonID, inferenceProjectionBefore, systemRetirements); err != nil {
 			return nil, personFactApplyMetadata{}, err
 		}
 	}
@@ -584,10 +600,11 @@ func (s *Store) resolvePersonFactTargetTx(
 	descriptor personfacts.TargetDescriptor, eligibility personFactTargetEligibility,
 	policyContext personfacts.PolicyContext,
 	preparedFailures map[string]*personfacts.ValidationFailure, transactionTime time.Time,
+	systemRetirements map[personfacts.ProjectionRef]struct{},
 ) (bool, error) {
 	return s.resolvePersonFactTargetWithOrganizationLocksTx(
 		ctx, tx, generation, descriptor, eligibility, policyContext,
-		preparedFailures, nil, transactionTime)
+		preparedFailures, nil, transactionTime, systemRetirements)
 }
 
 func (s *Store) resolvePersonFactTargetWithOrganizationLocksTx(
@@ -596,6 +613,7 @@ func (s *Store) resolvePersonFactTargetWithOrganizationLocksTx(
 	policyContext personfacts.PolicyContext,
 	preparedFailures map[string]*personfacts.ValidationFailure,
 	organizationLocks *personFactOrganizationLockSet, transactionTime time.Time,
+	systemRetirements map[personfacts.ProjectionRef]struct{},
 ) (bool, error) {
 	resolvedClaims, chronology, err := s.loadPersonFactResolvedClaimsTx(
 		ctx, tx, generation.PersonID, descriptor, preparedFailures)
@@ -721,6 +739,13 @@ func (s *Store) resolvePersonFactTargetWithOrganizationLocksTx(
 		}
 		if ref != nil {
 			resolution.Decisions[index].Projection = ref
+		}
+		// Only a successfully applied, supported system retirement is
+		// deterministic removal. retireUnsupported/retireExpired below
+		// remain attributable to the old inferred contributor.
+		if planChanged && plan.Operation == personfacts.ProjectionRetire &&
+			claim.Claim.Origin == personfacts.OriginSystem && plan.CurrentRef != nil {
+			systemRetirements[*plan.CurrentRef] = struct{}{}
 		}
 		changed = changed || planChanged
 	}
@@ -874,7 +899,7 @@ func (s *Store) loadPersonFactResolvedClaimsTx(
 			ClaimKey: claim.ClaimKey,
 			Claim: personfacts.ProposedClaim{
 				Target: proposedTarget, Relation: claim.Relation,
-				SubmittedValue: append(json.RawMessage(nil), claim.SubmittedValue...),
+				SubmittedValue: append(jsontext.Value(nil), claim.SubmittedValue...),
 				ValidFrom:      personFactPortableTimePointer(claim.ValidFrom),
 				ValidUntil:     personFactPortableTimePointer(claim.ValidUntil),
 				Origin:         claim.Origin, Confidence: claim.Confidence,
@@ -1347,7 +1372,7 @@ func (p *personFactEmploymentProjector) projectionContext(
 		})
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].ClaimKey < entries[j].ClaimKey })
-	encoded, err := json.Marshal(entries)
+	encoded, err := json.Marshal(entries, json.Deterministic(true))
 	if err != nil {
 		return "", fmt.Errorf("encode employment projection context: %w", err)
 	}
@@ -1752,7 +1777,7 @@ func personFactEmploymentNormalizedStableIdentity(
 		return "", false, fmt.Errorf("normalize employment claim %q organization for chronology: %w",
 			claimKey, err)
 	}
-	organization, err := json.Marshal(keys)
+	organization, err := json.Marshal(keys, json.Deterministic(true))
 	if err != nil {
 		return "", false, fmt.Errorf("encode employment claim %q organization identity: %w",
 			claimKey, err)
@@ -2168,8 +2193,8 @@ func canonicalPersonFactOrganizationReference(organization Organization) personf
 	return ref
 }
 
-func mustMarshalPersonFactEmployment(value personfacts.EmploymentValue) json.RawMessage {
-	encoded, err := json.Marshal(value)
+func mustMarshalPersonFactEmployment(value personfacts.EmploymentValue) jsontext.Value {
+	encoded, err := json.Marshal(value, json.Deterministic(true))
 	if err != nil {
 		panic(err)
 	}
@@ -2220,7 +2245,7 @@ func personFactEmploymentActiveFrom(employment Employment) time.Time {
 
 func personFactEmploymentProvenance(origin personfacts.ClaimOrigin) (Provenance, error) {
 	switch origin {
-	case personfacts.OriginExtraction:
+	case personfacts.OriginExtraction, personfacts.OriginBrief:
 		return ProvenanceExtraction, nil
 	case personfacts.OriginEnrichment:
 		return ProvenanceEnrichment, nil
@@ -2598,7 +2623,7 @@ func normalizedPersonFactAttributeValue(
 	return normalized, nil
 }
 
-func personFactAttributeValueJSON(value AttributeValue) (json.RawMessage, error) {
+func personFactAttributeValueJSON(value AttributeValue) (jsontext.Value, error) {
 	var scalar any
 	switch value.Type {
 	case AttributeValueText:
@@ -2618,7 +2643,7 @@ func personFactAttributeValueJSON(value AttributeValue) (json.RawMessage, error)
 	default:
 		return nil, fmt.Errorf("attribute value type %q is not a generic person fact", value.Type)
 	}
-	encoded, err := json.Marshal(scalar)
+	encoded, err := json.Marshal(scalar, json.Deterministic(true))
 	if err != nil {
 		return nil, fmt.Errorf("encode stored person fact attribute: %w", err)
 	}
@@ -2704,7 +2729,7 @@ func copyPersonFactNormalized(value *personfacts.NormalizedValue) *personfacts.N
 		return nil
 	}
 	copyValue := *value
-	copyValue.JSON = append(json.RawMessage(nil), value.JSON...)
+	copyValue.JSON = append(jsontext.Value(nil), value.JSON...)
 	return &copyValue
 }
 

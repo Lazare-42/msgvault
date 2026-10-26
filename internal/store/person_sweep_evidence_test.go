@@ -1,18 +1,24 @@
 package store_test
 
 import (
+	"database/sql"
+	"encoding/csv"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/imazingcsv"
 	"go.kenn.io/msgvault/internal/peoplesweep"
 	"go.kenn.io/msgvault/internal/personfacts"
 	"go.kenn.io/msgvault/internal/personscope"
 	"go.kenn.io/msgvault/internal/personscope/resolver"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/testutil/storetest"
 )
 
@@ -108,6 +114,78 @@ func TestListPersonSweepHistoricalCandidatesFiltersBeforeLimit(t *testing.T) {
 			SourceSince:   "2025-01-01", SourceUntil: "2026-01-01", Limit: 1})
 	require.NoError(t, err)
 	assert.Equal(t, []int64{eligible}, got)
+}
+
+// TestListPersonSweepHistoricalCandidatesAuthoredByPersonSkipsOwnerMessages
+// pins the listing filter the brief window relies on: with AuthoredByPerson
+// the newest-first listing counts only messages the person sent on a source
+// that authenticates its sender, so an owner-heavy conversation cannot fill
+// the limit ahead of the person's own older messages, and the rows it returns
+// are exactly the ones hydration marks with the person as its own subject.
+func TestListPersonSweepHistoricalCandidatesAuthoredByPersonSkipsOwnerMessages(t *testing.T) {
+	requirements := require.New(t)
+	checks := assert.New(t)
+	f := newPersonSweepJournalFixture(t, true, false)
+	// The owner's messages reach the person through the direct chat's roster.
+	_, err := f.store.DB().ExecContext(t.Context(), f.store.Rebind(`
+		INSERT INTO conversation_participants (conversation_id, participant_id, role)
+		VALUES (?, ?, 'member')`), f.conversationID, f.aliceID)
+	requirements.NoError(err)
+	older := f.insertMessage(t, "alice-older", "slack_message", f.aliceID,
+		time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC))
+	newer := f.insertMessage(t, "alice-newer", "slack_message", f.aliceID,
+		time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC))
+	for day := 3; day <= 10; day++ {
+		f.insertMessage(t, fmt.Sprintf("bob-%d", day), "slack_message", f.bobID,
+			time.Date(2026, 5, day, 12, 0, 0, 0, time.UTC))
+	}
+	addSweepBody(t, f, older, "Alice's older text")
+	addSweepBody(t, f, newer, "Alice's newer text")
+
+	unfiltered, err := f.store.ListPersonSweepHistoricalCandidates(t.Context(),
+		peoplesweep.HistoricalCandidateRequest{PersonID: f.alicePersonID, Limit: 4})
+	requirements.NoError(err)
+	requirements.Len(unfiltered, 4)
+	checks.NotContains(unfiltered, older,
+		"without the filter the owner's newer messages exhaust the limit first")
+
+	authored, err := f.store.ListPersonSweepHistoricalCandidates(t.Context(),
+		peoplesweep.HistoricalCandidateRequest{PersonID: f.alicePersonID, Limit: 4,
+			AuthoredByPerson: true})
+	requirements.NoError(err)
+	checks.Equal([]int64{newer, older}, authored,
+		"the filtered listing is newest-first over the person's own messages only")
+
+	hydrated, err := f.store.HydratePersonSweepMessages(t.Context(), f.alicePersonID, authored, 0)
+	requirements.NoError(err)
+	requirements.Len(hydrated, 2)
+	for _, item := range hydrated {
+		requirements.NotNil(item.SubjectPersonID)
+		checks.Equal(f.alicePersonID, *item.SubjectPersonID,
+			"every listed candidate is evidence the person is the subject of")
+	}
+
+	// An email source does not authenticate its sender, so a message the
+	// person sent there is never their own subject and must not be listed.
+	mailSource, err := f.store.GetOrCreateSource("gmail", "alice-mail")
+	requirements.NoError(err)
+	mailConversation, err := f.store.EnsureConversationWithType(
+		mailSource.ID, "alice-mail-thread", "", "Synthetic thread")
+	requirements.NoError(err)
+	mailID, err := f.store.UpsertMessage(&store.Message{
+		SourceID: mailSource.ID, SourceMessageID: "alice-mail-1",
+		ConversationID: mailConversation, MessageType: "email",
+		SenderID: sql.NullInt64{Int64: f.aliceID, Valid: true},
+		SentAt:   sql.NullTime{Time: time.Date(2026, 5, 11, 12, 0, 0, 0, time.UTC), Valid: true},
+		Subject:  sql.NullString{String: "Synthetic mail", Valid: true},
+	})
+	requirements.NoError(err)
+	withMail, err := f.store.ListPersonSweepHistoricalCandidates(t.Context(),
+		peoplesweep.HistoricalCandidateRequest{PersonID: f.alicePersonID, Limit: 4,
+			AuthoredByPerson: true})
+	requirements.NoError(err)
+	checks.Equal([]int64{newer, older}, withMail)
+	checks.NotContains(withMail, mailID)
 }
 
 func TestLoadPersonSweepWindowPreservesFromToAndGroupProvenance(t *testing.T) {
@@ -333,15 +411,71 @@ func TestSearchPersonSweepMessagesPreservesNewestFirstCandidateRanking(t *testin
 }
 
 func TestPersonSweepAuthenticatedChatSenderCanBeDirectSelf(t *testing.T) {
-	f := newPersonSweepJournalFixture(t, true, false)
-	_, err := f.store.DB().ExecContext(t.Context(), f.store.Rebind(
-		`UPDATE sources SET source_type = 'slack' WHERE id = ?`), f.sourceID)
-	require.NoError(t, err)
-	id := f.insertMessage(t, "authored chat", "chat", f.aliceID, time.Now().UTC())
-	addSweepBody(t, f, id, "I work in product.")
-	item := sweepItem(t, loadSweepWindow(t, f, peoplesweep.SourceConversationText, 0).Seeds, id)
-	require.NotNil(t, item.SubjectPersonID)
-	assert.Equal(t, personfacts.DirectSelf, item.Directness)
+	for _, sourceType := range []string{"matrix", "slack", "slackdump"} {
+		t.Run(sourceType, func(t *testing.T) {
+			f := newPersonSweepJournalFixture(t, true, false)
+			_, err := f.store.DB().ExecContext(t.Context(), f.store.Rebind(
+				`UPDATE sources SET source_type = ? WHERE id = ?`), sourceType, f.sourceID)
+			require.NoError(t, err)
+			id := f.insertMessage(t, "authored chat", "chat", f.aliceID, time.Now().UTC())
+			addSweepBody(t, f, id, "I work in product.")
+			item := sweepItem(t, loadSweepWindow(t, f, peoplesweep.SourceConversationText, 0).Seeds, id)
+			require.NotNil(t, item.SubjectPersonID)
+			assert.Equal(t, personfacts.DirectSelf, item.Directness)
+		})
+	}
+}
+
+func TestPersonSweepAttributesImazingCSVOutgoingMessagesToPerson(t *testing.T) {
+	checks := assert.New(t)
+	requirements := require.New(t)
+	st := testutil.NewTestStore(t)
+	// Import a real iMazing CSV export whose outgoing row was sent by the
+	// archive owner, then track the owner as a person.
+	exportRoot := t.TempDir()
+	csvDir := filepath.Join(exportRoot, "csv")
+	requirements.NoError(os.Mkdir(csvDir, 0o700))
+	csvFile, err := os.Create(filepath.Join(csvDir, "messages.csv"))
+	requirements.NoError(err)
+	writer := csv.NewWriter(csvFile)
+	requirements.NoError(writer.Write([]string{
+		"Chat Session", "Message Date", "Delivered Date", "Read Date", "Service", "Type",
+		"Sender ID", "Sender Name", "Status", "Replying to", "Subject", "Text", "Attachment", "Attachment type",
+	}))
+	requirements.NoError(writer.Write([]string{
+		"Alice", "2024-06-01 12:00:00", "", "", "iMessage", "Outgoing", "", "", "", "", "", "I prefer chat", "", "",
+	}))
+	writer.Flush()
+	requirements.NoError(writer.Error())
+	requirements.NoError(csvFile.Close())
+	_, err = imazingcsv.NewImporter(st, imazingcsv.Options{Owner: "+15550000001", Timezone: "UTC"}).
+		ImportPath(t.Context(), exportRoot)
+	requirements.NoError(err)
+	source, err := st.GetSourceByTypeAndIdentifier(imazingcsv.SourceType, "+15550000001")
+	requirements.NoError(err)
+	var ownerParticipantID, messageID int64
+	requirements.NoError(st.DB().QueryRow(`
+		SELECT id FROM participants WHERE phone_number = '+15550000001'`).Scan(&ownerParticipantID))
+	requirements.NoError(st.DB().QueryRow(st.Rebind(`
+		SELECT id FROM messages WHERE source_id = ?`), source.ID).Scan(&messageID))
+	person, _, err := st.CreatePersonFromParticipant(ownerParticipantID)
+	requirements.NoError(err)
+	_, err = st.SetPersonTrackingContext(t.Context(), person.ID, true)
+	requirements.NoError(err)
+
+	items, err := st.HydratePersonSweepMessages(t.Context(), person.ID, []int64{messageID}, 0)
+	requirements.NoError(err)
+	requirements.Len(items, 1)
+	requirements.NotNil(items[0].SubjectPersonID)
+	checks.Equal(person.ID, *items[0].SubjectPersonID)
+	checks.Equal(personfacts.DirectSelf, items[0].Directness)
+
+	candidates, err := st.ListPersonSweepHistoricalCandidates(t.Context(), peoplesweep.HistoricalCandidateRequest{
+		PersonID: person.ID, AuthoredByPerson: true, Limit: 10,
+	})
+	requirements.NoError(err)
+	checks.Equal([]int64{messageID}, candidates,
+		"outgoing imazing_csv messages must count as person authorship")
 }
 
 func TestPersonSweepEvidenceStatusChangesCoalesceToTerminalEffect(t *testing.T) {
@@ -692,6 +826,93 @@ func TestSearchPersonSweepDocumentsPreservesCoordinates(t *testing.T) {
 	checks.False(got[0].EventTime.IsZero())
 }
 
+func TestPersonSweepDocumentsRejectOutOfScopeEvidence(t *testing.T) {
+	for _, scopeChange := range []string{"attachment role before reconciliation", "inline target narrowed"} {
+		t.Run(scopeChange, func(t *testing.T) {
+			checks := assert.New(t)
+			requirements := require.New(t)
+			f, personID := newPersonSweepDocumentFixture(t)
+			var attachmentID int64
+			var hash string
+			requirements.NoError(f.Store.DB().QueryRowContext(t.Context(),
+				`SELECT attachment_id, canonical_blob_hash FROM document_occurrences`).Scan(&attachmentID, &hash))
+			var original store.DocumentProviderConsent
+			if scopeChange == "inline target narrowed" {
+				requirements.NoError(f.Store.DB().QueryRowContext(t.Context(), `
+					SELECT profile_id, profile_fingerprint, retention_posture, training_posture
+					FROM document_provider_consents`).Scan(&original.ProfileID, &original.ProfileFingerprint,
+					&original.RetentionPosture, &original.TrainingPosture))
+				inline := store.DocumentExtractionProfile{
+					ID: "person-sweep-inline", Fingerprint: strings.Repeat("f", 64),
+					Provider: "mistral", Endpoint: "https://api.mistral.ai/v1/ocr",
+					Region: "eu", Model: "mistral-ocr-4-0", IncludeInline: true,
+					RetentionPosture: "standard", TrainingPosture: "opted-out",
+					AllowedMediaTypes: []string{"application/pdf"}, PolicyJSON: []byte(`{"include_inline":true}`),
+				}
+				_, err := f.Store.EnsureDocumentExtractionProfile(t.Context(), inline)
+				requirements.NoError(err)
+				requirements.NoError(f.Store.RecordDocumentProviderConsent(t.Context(), store.DocumentProviderConsent{
+					ProfileID: inline.ID, ProfileFingerprint: inline.Fingerprint,
+					RetentionPosture: inline.RetentionPosture, TrainingPosture: inline.TrainingPosture,
+				}))
+				_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
+					`UPDATE attachments SET attachment_role = 'inline' WHERE id = ?`), attachmentID)
+				requirements.NoError(err)
+				_, eligible, err := f.Store.ReconcileDocumentOccurrence(t.Context(), attachmentID, 2)
+				requirements.NoError(err)
+				requirements.True(eligible)
+				claim, err := f.Store.ClaimDocumentExtraction(t.Context(), store.DocumentExtractionClaimInput{
+					ExtractionID: "person-sweep-inline", ProfileID: inline.ID,
+					CanonicalBlobHash: hash, ExtractionInputKey: "original", OccurrenceAttachmentID: attachmentID,
+					OccurrenceMIMEType: "application/pdf", OccurrenceMessageType: "email",
+					LeaseOwner: "inline-worker", LeaseUntil: time.Now().Add(time.Hour), LocalBytes: 128, SourceSequence: 2,
+				})
+				requirements.NoError(err)
+				requirements.NoError(f.Store.PublishDocumentExtraction(t.Context(), publicationFor(t,
+					claim, "alpha synthetic role evidence", strings.Repeat("d", 64))))
+				_, err = f.Store.GarbageCollectDocumentDerivatives(t.Context(), time.Now().Add(time.Hour), 10)
+				requirements.NoError(err)
+			}
+
+			search := peoplesweep.DocumentContextRequest{PersonID: personID, Query: "synthetic", Limit: 10}
+			items, err := f.Store.SearchPersonSweepDocuments(t.Context(), search)
+			requirements.NoError(err)
+			requirements.Len(items, 1)
+			input := sweepEvidenceInput(t, items[0])
+			aligner := store.PersonSweepEvidenceAligner{Store: f.Store}
+			aligned, err := aligner.Align(t.Context(), input)
+			requirements.NoError(err)
+			requirements.True(aligned.Accepted)
+			history := peoplesweep.HistoricalCandidateRequest{
+				PersonID: personID, SourceClasses: []peoplesweep.SourceClass{peoplesweep.SourceDocumentText}, Limit: 10,
+			}
+			candidates, err := f.Store.ListPersonSweepHistoricalCandidates(t.Context(), history)
+			requirements.NoError(err)
+			requirements.Equal([]int64{items[0].Ref.MessageID}, candidates)
+
+			if scopeChange == "inline target narrowed" {
+				requirements.NoError(f.Store.RecordDocumentProviderConsent(t.Context(), original))
+			} else {
+				// Readers must reject the changed role before the occurrence is reconciled.
+				_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(
+					`UPDATE attachments SET attachment_role = 'inline' WHERE id = ?`), attachmentID)
+				requirements.NoError(err)
+			}
+			items, err = f.Store.SearchPersonSweepDocuments(t.Context(), search)
+			requirements.NoError(err)
+			checks.Empty(items)
+			candidates, err = f.Store.ListPersonSweepHistoricalCandidates(t.Context(), history)
+			requirements.NoError(err)
+			checks.Empty(candidates)
+			aligned, err = aligner.Align(t.Context(), input)
+			requirements.NoError(err)
+			checks.False(aligned.Accepted)
+			requirements.NotNil(aligned.Failure)
+			checks.Equal(personfacts.ReasonUnalignedEvidence, aligned.Failure.Reason)
+		})
+	}
+}
+
 func TestPersonSweepEvidenceNonTextAttachmentsFailClosed(t *testing.T) {
 	f := newPersonSweepJournalFixture(t, true, false)
 	ref, err := peoplesweep.EncodePersonSweepEvidenceRef(peoplesweep.EvidenceRef{
@@ -803,4 +1024,82 @@ func countSweepMessage(items []peoplesweep.EvidenceItem, id int64) int {
 		}
 	}
 	return count
+}
+
+// TestPersonSweepRetrievalHonorsTheJournalSequenceBound pins the contract a
+// brief boundary relies on: retrieval bounded by a journal sequence returns
+// exactly the messages the journal had committed for the person at that
+// sequence. A message journaled later is out on every path, a message whose
+// last journal row is the bound itself is in, and a message the journal never
+// saw, here one archived before the person was tracked, is in as well, because
+// it can never trigger a regeneration and hiding it would lose old history.
+func TestPersonSweepRetrievalHonorsTheJournalSequenceBound(t *testing.T) {
+	checks := assert.New(t)
+	requirements := require.New(t)
+	f := newPersonSweepJournalFixture(t, false, false)
+	unjournaled := f.insertMessage(t, "before-tracking", "email", f.aliceID,
+		time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC))
+	addSweepBody(t, f, unjournaled, "archived before the person was tracked")
+	_, err := f.store.SetPersonTrackingContext(t.Context(), f.alicePersonID, true)
+	requirements.NoError(err)
+	requirements.Empty(personSweepChangesAfter(t, f.store, f.alicePersonID, 0),
+		"tracking a person journals nothing for the messages already archived")
+
+	atBound := f.insertMessage(t, "at-bound", "email", f.aliceID,
+		time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC))
+	addSweepBody(t, f, atBound, "committed at the bound")
+	through := latestPersonSweepSequence(t, f.store)
+	bounded := personSweepChangesAfter(t, f.store, f.alicePersonID, 0)
+	requirements.NotEmpty(bounded)
+	checks.Equal(atBound, bounded[len(bounded)-1].MessageID)
+	checks.Equal(through, bounded[len(bounded)-1].Sequence,
+		"the bound is this message's own last journal row")
+
+	late := f.insertMessage(t, "after-planning", "meeting_transcript", f.aliceID,
+		time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC))
+	addSweepBody(t, f, late, "committed after the bound was captured")
+	checks.Greater(latestPersonSweepSequence(t, f.store), through)
+
+	unbounded, err := f.store.ListPersonSweepHistoricalCandidates(t.Context(),
+		peoplesweep.HistoricalCandidateRequest{PersonID: f.alicePersonID, Limit: 10})
+	requirements.NoError(err)
+	checks.Equal([]int64{late, atBound, unjournaled}, unbounded,
+		"a zero sequence leaves the listing unbounded")
+
+	candidates, err := f.store.ListPersonSweepHistoricalCandidates(t.Context(),
+		peoplesweep.HistoricalCandidateRequest{PersonID: f.alicePersonID, Limit: 10,
+			ThroughSequence: through})
+	requirements.NoError(err)
+	checks.Equal([]int64{atBound, unjournaled}, candidates)
+
+	retrieved, err := f.store.SearchPersonSweepMessages(t.Context(), peoplesweep.ContextRequest{
+		PersonID: f.alicePersonID, CandidateMessageIDs: []int64{late, atBound, unjournaled},
+		SourceClasses: []peoplesweep.SourceClass{
+			peoplesweep.SourceConversationText, peoplesweep.SourceMeetingText},
+		Limit: 10, ThroughSequence: through,
+	})
+	requirements.NoError(err)
+	checks.Equal([]int64{atBound, unjournaled}, sweepMessageIDs(retrieved),
+		"hydration drops a candidate the journal saw after the bound even when named directly")
+
+	listed, err := f.store.SearchPersonSweepMessages(t.Context(), peoplesweep.ContextRequest{
+		PersonID: f.alicePersonID, Limit: 10, ThroughSequence: through,
+	})
+	requirements.NoError(err)
+	checks.Equal([]int64{atBound, unjournaled}, sweepMessageIDs(listed),
+		"a search that lists its own candidates carries the bound into the listing")
+
+	hydrated, err := f.store.HydratePersonSweepMessages(t.Context(), f.alicePersonID,
+		[]int64{atBound, unjournaled}, through)
+	requirements.NoError(err)
+	checks.Equal([]int64{atBound, unjournaled}, sweepMessageIDs(hydrated))
+
+	_, err = f.store.HydratePersonSweepMessages(t.Context(), f.alicePersonID, []int64{late}, through)
+	requirements.ErrorIs(err, peoplesweep.ErrPersonSweepMessageUnavailable,
+		"the last-contact read refuses a message past the bound with the typed unavailable error")
+
+	hydratedLate, err := f.store.HydratePersonSweepMessages(t.Context(), f.alicePersonID,
+		[]int64{late}, 0)
+	requirements.NoError(err)
+	checks.Equal([]int64{late}, sweepMessageIDs(hydratedLate))
 }

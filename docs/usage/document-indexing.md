@@ -1,20 +1,53 @@
 ---
-last_edited: "2026-08-17"
+last_edited: "2026-10-18"
 title: Document Attachment Indexing
-description: Safely extract, index, search, rebuild, and remove standalone document attachments.
+description: Find words and topics inside archived documents, with explicit control over provider uploads.
 ---
 
-Msgvault can extract text from standalone document attachments with Mistral
-OCR, store deterministic normalized chunks locally, and expose them through
-full-text search. The feature is opt-in and fail-closed: configuration alone
-cannot upload a document.
+Document indexing lets you search inside archived attachments and return to
+the message that contained them. Msgvault sends eligible files to your selected
+extraction provider, stores their text locally, and builds a keyword index.
+Mistral OCR is the hosted option. On `main` after v0.21.0, a self-hosted
+Docling service is also supported.
+Optional document embeddings add search by meaning.
 
-The provider receives the complete original document bytes and media type.
-Message provenance, normalized text, chunks, indexes, orchestration, consent, and
-backups remain owned by Msgvault. Raw provider JSON and full provider Markdown
-are transient.
+What works today:
 
-## Safety gates
+- Keyword search over extracted text, with headings and containing-message
+  details in each result.
+- Semantic and hybrid search after separate document-vector setup and consent.
+- Filters for a person, source, message, attachment, message type, and date.
+- Optional local CSV-to-PDF conversion so CSV tables can enter the extraction
+  pipeline.
+- Native PowerPoint `.pptx` uploads. Mistral requires a capability manifest
+  with a passing local slide count; each slide becomes a source unit.
+
+Limits:
+
+- Mistral uploads require an authenticated capability manifest. Docling uses
+  the configured native formats and returned-unit limits described below.
+- Extraction uploads require an explicit `documents build` or `documents
+  resume` command. Enabling the feature does not upload attachments.
+
+For a combined provider setup, start with
+[Recommended Configuration](/docs/usage/recommended-configuration/). The steps
+below explain each provider’s consent and build workflow.
+
+## What leaves your archive
+
+The provider receives complete original bytes for each directly authorized format.
+Msgvault keeps the containing-message links, normalized text, text chunks,
+indexes, consent records, and backups locally. It does not retain the full raw
+provider JSON or Markdown response.
+
+For Mistral, eligible CSV attachments use a local conversion step when enabled.
+Msgvault retains the CSV source hash and `text/csv` occurrence identity, then sends only
+the generated `application/pdf` bytes to Mistral. The conversion receipt stores
+the generated PDF hash, byte count, page count, converter version, policy
+fingerprint, and one based page, record, and cell spans. The generated PDF never
+becomes an attachment.
+
+## Mistral safety gates {#safety-gates}
 
 Three independent gates must pass before production extraction:
 
@@ -26,15 +59,29 @@ Three independent gates must pass before production extraction:
    posture, processing limits, normalization policy, and capability evidence.
 
 A changed policy or manifest produces a different profile identity and requires
-new consent. Credentials are read only for the explicit probe and extraction
-commands. Local fixture validation, status, search, retirement, and purging do
-not contact Mistral.
+new consent. OCR credentials are read only for the explicit probe and extraction
+commands. Local fixture validation, status, keyword search, retirement, and
+purging make no OCR request. Semantic and hybrid search have separate consent
+to send queries to the embedding provider.
 
 !!! note
 
-    The first capability contract authorizes at most PDF for production upload.
-    Other formats are still probed for extraction support, but remain blocked
-    until Msgvault can enforce their provider-unit limits before upload.
+    The authenticated capability manifest determines the directly authorized
+    formats and their upload bounds. Raw CSV has no enforceable Mistral unit bound,
+    so the resolver excludes it while conversion is disabled. Enabling CSV
+    conversion adds a source route that sends generated PDF bytes after local
+    conversion.
+
+    PPTX is authorized only when the manifest's PPTX row passed with
+    `unit_bound_method` set to `local_exact`. Docbank counts the deck's slides,
+    hidden slides included, before upload. Decks above `max_pages_per_document`
+    fail locally. A provider slide count that differs from the local count
+    records `provider_capability_changed` without publishing.
+
+    A manifest from an earlier Docbank version that marked PPTX as passing
+    without a slide bound no longer validates. Run a fresh probe before PDF,
+    CSV, or PPTX extraction. Adding PPTX changes the profile fingerprint and
+    requires `documents consent-mistral` again.
 
 Provider uploads are manual-only. `msgvault serve` performs weekly local
 reconciliation and derivative cleanup when document indexing is enabled, but it
@@ -42,7 +89,7 @@ never starts extraction on its own. Start every upload batch explicitly with
 `documents build` or `documents resume`; when the daemon owns the archive, it
 runs that requested batch so the command does not contend for the writer lock.
 
-## Configure the policy
+## Configure Mistral {#configure-the-policy}
 
 Add an `[attachments.documents]` section and explicitly state the provider
 privacy posture you have verified. The example below uses zero data retention
@@ -70,11 +117,28 @@ max_estimated_cost_usd_per_run = 50
 
 [attachments.documents.scope]
 message_types = ["email"]
+include_inline = false
 
 [attachments.documents.index]
 lexical = true
 store_chunk_text = true
+
+[attachments.documents.conversion.csv]
+enabled = true
 ```
+
+Document extraction includes standalone attachments by default. In v0.21.0, set
+`include_inline = true` when your mail client marks ordinary attached documents
+as inline. Only configured, authorized document formats with authoritative role
+provenance become eligible. Avatar, preview, sticker, and unknown roles stay out
+of scope. The setting also applies to local CSV conversion.
+
+Changing inline scope changes the profile fingerprint. Record consent again
+before building. Consent rescans historical attachments, including archives whose
+original reconciliation skipped inline documents. Local reconciliation retains
+inline occurrences only while an active, consented profile permits inline scope.
+Returning to standalone-only scope stops inline results from serving under older
+profiles too.
 
 Set the key in the named environment variable only when running an
 authenticated operation:
@@ -83,10 +147,110 @@ authenticated operation:
 export MISTRAL_API_KEY="..."
 ```
 
-See the [configuration reference](/configuration/#attachmentsdocuments) for
-all policy and run limits.
+Direct formats authorized by the capability manifest retain their original bytes
+and media type for upload. CSV conversion uses Docbank's defaults,
+tightened by `max_file_bytes`, `max_response_bytes`, and `max_pages_per_document`.
+Docbank accepts UTF-8 CSV
+cells containing Latin, Greek, Cyrillic, and common Unicode characters that its
+embedded monospaced font supports. Control characters, combining marks,
+formatting characters, unsupported scripts, and characters absent from that
+font fail locally as `invalid_local_source`. Enabling CSV or changing an
+effective bound changes the exact profile fingerprint and requires fresh consent.
 
-## Build and validate the synthetic fixtures
+See the [configuration reference](/docs/configuration/#attachmentsdocuments) for
+the complete policy and run limits.
+
+## Use a self-hosted Docling service
+
+Docling support is available on `main` after v0.21.0. Run Docling Serve on
+hardware and a network you control. Msgvault uses its asynchronous conversion
+API; deploy a compatible service with `/v1/convert/file/async`,
+`/v1/status/poll/<id>`, and `/v1/result/<id>`.
+
+```toml
+[attachments.documents]
+enabled = true
+provider = "docling"
+endpoint = "http://127.0.0.1:5001"
+request_timeout = "30s"
+total_timeout = "10m"
+poll_interval = "1s"
+max_poll_attempts = 300
+```
+
+The endpoint must be an exact HTTP(S) origin, including any port, with no
+trailing slash, path, user information, query, or fragment. Plain HTTP works
+only for `localhost` and loopback IP addresses, where document bytes stay on
+the same machine. A Docling server on another machine, including one on your
+LAN or tailnet, needs HTTPS so document bytes and any API key are encrypted in
+transit. Msgvault sends private document bytes only to that origin, disables
+ambient HTTP proxies, and does not follow redirects. It never switches to a
+hosted extractor.
+
+The configured formats are PDF, DOCX, PPTX, XLSX, UTF-8 text, Markdown, CSV,
+and HTML. Each uploads its original bytes under a synthetic filename. Docling
+uses native CSV; leave CSV-to-PDF conversion disabled. Source preparation
+checks size, hash, and format in bounded memory. It does not use Mistral’s
+private disk spool. The service’s own memory, disk, and job retention need
+operator controls.
+
+When omitted, the model is `docling.serve-v1`, the region is `operator_network`,
+and retention and training postures are `operator-controlled`. These describe
+who is responsible; they do not guarantee privacy behavior. You control service
+credentials, model downloads, network egress, resource limits, retention, and
+training behavior. No API key is required by default. If your service requires
+one, set `api_key_env` to its environment variable name; Msgvault sends that
+value as `X-Api-Key`. It does not inherit `MISTRAL_API_KEY`, even when a
+config file saved by msgvault still lists Mistral's defaults; Docling replaces
+Mistral's default key variable, model, region, and postures with its own.
+If the configured variable is missing or blank, build and resume fail before
+claiming any documents. Set the credential and rerun the command.
+
+Review the disclosure, then record consent and build:
+
+```bash
+msgvault documents consent-docling
+msgvault documents consent-docling --yes
+msgvault documents build --limit 100 --yes
+msgvault documents status
+```
+
+Docling needs no capability manifest. Its commands can run through a
+configured remote daemon, which owns the attachment bytes and extraction.
+Endpoint, credential binding, formats, processing limits, adapter version,
+normalization, and scope form the exact consent identity. Changing them
+requires new consent. Extraction remains manual-only.
+
+Complete PDF evidence retains page locators. When structured evidence omits
+tables or other content, Msgvault uses whole-document Markdown with a
+`document` locator instead of claiming page provenance. This preserves
+searchable text without inventing page numbers. The returned-unit cap applies
+before this fallback; `max_pages_per_run` counts provider units.
+
+Interrupted jobs retry the same way as other providers: after a server restart,
+a canceled build, or a lost submission response, the next `build` or `resume`
+uploads the document again once its retry delay or lease has passed. That can
+run a document twice on your server.
+
+A job that is still running when `total_timeout` or `max_poll_attempts` runs
+out fails with `provider_timeout` and does not retry on its own. Docling Serve
+keeps working on a job after msgvault stops waiting, so automatic resubmission
+would stack duplicate work on your server. Raise the limit if the document
+needs more time, record consent for the changed policy, and reset it. Partial
+results and other permanent failures use the same explicit reset:
+
+```bash
+msgvault documents retry --hash <sha256>
+msgvault documents resume --yes
+```
+
+Use `build --full-rebuild --yes` to replace existing extractions and `resume
+--yes` to continue the same rebuild. Existing searchable text remains available
+until its replacement publishes successfully. Search, retirement, and removal
+use the shared commands below. Document embeddings remain independent and may
+use a separately configured local embedding endpoint.
+
+## Build and validate Mistral fixtures {#build-and-validate-the-synthetic-fixtures}
 
 The repository fixture builder creates 21 formats deterministically. Five
 legacy native containers need private seed files named `doc`, `ppt`, `xls`,
@@ -106,7 +270,7 @@ msgvault documents probe-mistral \
 Fixture creation is all-or-nothing. The output directory and files are private,
 and local validation makes no provider request.
 
-## Produce the capability manifest
+## Produce the Mistral capability manifest {#produce-the-capability-manifest}
 
 Run the authenticated probe and redirect its JSON output to a private file:
 
@@ -122,7 +286,7 @@ unit-bound evidence. It contains no credentials or fixture contents, but it is
 upload authority for the exact policy it supports and should be controlled as
 deployment configuration.
 
-## Record consent and build
+## Record Mistral consent and build {#record-consent-and-build}
 
 First run the consent command without `--yes` to read the exact disclosure,
 then repeat it after review:
@@ -152,7 +316,7 @@ msgvault documents build \
 The command claims a candidate before local inspection, so an oversized or
 invalid attachment reaches a durable terminal state without starving later
 documents. Transient provider and staging-capacity failures remain retryable.
-Every retry reopens and verifies the private staged copy.
+Mistral retries reopen and verify the private staged copy.
 
 Use `--full-rebuild` to begin a replacement generation. If the bounded run does
 not finish it, continue with `documents resume` and the same manifest:
@@ -172,6 +336,7 @@ msgvault documents resume \
 ```bash
 msgvault documents search "shipping damage"
 msgvault documents search "shipping damage" --message-type email --limit 50
+msgvault documents search "shipping damage" --person 123 --direction from_person
 msgvault documents status \
   --capabilities /private/msgvault/mistral-capabilities.json
 ```
@@ -181,9 +346,72 @@ heading path, normalized text, checksum, score, and an opaque stable cursor.
 The same search is available at `GET /api/v1/documents/search`; status is at
 `GET /api/v1/documents/status`.
 
+Use `--source-id`, `--message-id`, or `--attachment-id` for exact archive
+objects. `--person` selects a durable person; `--participant` selects an
+observed participant and uses their durable person when one is bound. They
+are mutually exclusive. With either person filter, `--direction` accepts
+`from_person`, `to_person`, or `group`. `--after` includes its boundary and
+`--before` excludes it; both accept `YYYY-MM-DD` or RFC3339 timestamps.
+
+Add `--json` for scores and structured provenance. To fetch the next page,
+repeat the same query and filters with `--cursor <next-cursor>`. If the index
+changes and the cursor becomes stale, start again without the cursor.
+
+### Semantic and hybrid document search
+
+Keyword search is local and is the default (`--mode lexical`; `auto` also
+means lexical). `--mode semantic` finds related meaning in document chunks.
+`--mode hybrid` combines keyword and semantic rankings. Both explicitly send
+the query text to the configured embedding provider.
+
+First configure [message embeddings](/docs/usage/vector-search/#enable) and
+enable document vectors:
+
+```toml
+[attachments.documents.index.embeddings]
+enabled = true
+```
+
+Document vectors use the configured text embedding provider and a separate
+document generation. Extraction consent does not authorize that provider to
+receive document text or search queries. Review each disclosure without
+`--yes`, then record both consents:
+
+```bash
+msgvault documents vectors consent --yes
+msgvault documents vectors consent --purpose queries --yes
+msgvault daemon restart
+msgvault documents vectors build
+msgvault documents vectors status
+```
+
+`build` processes a bounded batch of extracted chunks. Read the generation ID
+from its output or `status`, then use `documents vectors resume
+--generation-id <id>` to continue. Restarting after consent enables semantic
+document queries and scheduled document-vector work. The schedule comes from
+`[vector.embed.schedule]` and embeds already-extracted text; OCR uploads still
+require an explicit extraction command.
+
+```bash
+msgvault documents search "evidence of transit damage" --mode semantic
+msgvault documents search "shipping damage" --mode hybrid --person 123 --json
+```
+
+Semantic and hybrid search require a matching index and query consent. They
+report an error when those prerequisites are missing; they do not silently
+fall back to keyword search. The default candidate limit is 100, with a
+maximum of 1,000 via `--candidate-limit`; lexical search allows up to 10,000.
+Pagination stays within that candidate set.
+
+In MCP, use `search_document_attachments` for document text search, including
+semantic/hybrid mode and optional `person_id` scope. `search_person_files`
+searches attachment metadata only. The CLI `person files --lane all` provides
+the broader combined search. See [MCP](/docs/usage/chat/).
+
 ## Recovery and removal
 
-Retry one terminal document by its canonical attachment SHA-256:
+Retry one terminal document by its canonical attachment SHA-256. The examples
+below include Mistral’s manifest flag; omit it for Docling:
 
 ```bash
 msgvault documents retry \
@@ -202,3 +430,43 @@ msgvault documents purge-derived --hash <sha256> --yes
 
 Document derivatives participate in full backups. Rebuilds are deterministic
 under the same source bytes and profile policy.
+
+For document vectors, use `documents vectors status --json` to inspect
+generations, consent, usage, and failures. These operations are separate from
+rebuilding or retiring the OCR extraction profile:
+
+| Task | Command |
+|---|---|
+| Reset failed chunks for another attempt | `msgvault documents vectors retry --generation-id <id>` |
+| Continue a build or retired-generation cleanup | `msgvault documents vectors resume --generation-id <id>` |
+| Replace an active generation while retaining it during the build | `msgvault documents vectors rebuild --generation-id <active-id> --yes` |
+| Retire a generation | `msgvault documents vectors retire --generation-id <id> --yes` |
+
+Once a generation is active, use `rebuild` to replace it for coverage changes;
+`build` reports that it is already active. Retirement keeps the backend
+ledger; later vector operations finish the cleanup.
+
+## Diagnose extraction failures
+
+In v0.21.0, a failed build reports each document hash, reason code,
+and available local cause. For example, `invalid_local_source` can include
+`PDF structure is malformed`. Newer msgvault builds report
+`PDF structure could not be validated`. Size mismatches and spool capacity
+failures have separate details. `documents status --capabilities <manifest>`
+shows those diagnostics later (omit `--capabilities` for Docling). `--json`
+includes `status.failures` and `status.failures_exhausted` (false when more than 20 failures remain).
+
+Status lists up to 20 current failed documents in deterministic order. It keeps
+failed replacements visible during an active full rebuild even while an older
+extraction still serves. Those documents still count as ready in coverage totals.
+A successful replacement removes its failure from the list. Details are
+single-line and capped at 1024 UTF-8 bytes. Parser diagnostics
+that can contain document content and I/O paths are filtered; raw provider
+response bodies and extracted text are never retained as failure details.
+
+Older failures have only a reason code. Retry one to record a fresh cause:
+
+```bash
+msgvault documents retry --capabilities <manifest> --hash <sha256>
+msgvault documents build --capabilities <manifest> --yes
+```

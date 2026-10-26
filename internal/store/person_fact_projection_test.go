@@ -615,7 +615,7 @@ func TestApplyPersonFactGenerationPersistsOverLimitTextClaimAlongsideValidSiblin
 	assert := assert.New(t)
 	require := require.New(t)
 	st, personID, targets := newPersonFactProjectionStore(t)
-	overLimit := strings.Repeat("🙂", 121)
+	overLimit := strings.Repeat("🙂", 281)
 	submitted, err := json.Marshal(overLimit)
 	require.NoError(err)
 	input := personFactProjectionInput(personID, "over-limit-text",
@@ -643,7 +643,7 @@ func TestApplyPersonFactGenerationPersistsOverLimitTextClaimAlongsideValidSiblin
 		require.NotNil(claim.Failure)
 		assert.Equal(personfacts.DecisionInvalid, claim.Failure.Action)
 		assert.Equal(personfacts.ReasonMalformedValue, claim.Failure.Reason)
-		assert.Contains(claim.Failure.Detail, "max_length 120")
+		assert.Contains(claim.Failure.Detail, "max_length 280")
 	}
 	values, err := st.ListPersonAttributeValuesContext(t.Context(), personID,
 		PersonAttributeQuery{DefinitionSlug: AttributeSlugPrimaryChannel})
@@ -658,7 +658,7 @@ func TestApplyPersonFactGenerationPersistsTamperedTargetDescriptorAlongsideValid
 	st, personID, targets := newPersonFactProjectionStore(t)
 	tampered := targets[AttributeSlugAskMeAbout]
 	tampered.MaxLength = 0
-	overLimit := strings.Repeat("🙂", 121)
+	overLimit := strings.Repeat("🙂", 281)
 	submitted, err := json.Marshal(overLimit)
 	require.NoError(err)
 	input := personFactProjectionInput(personID, "tampered-target-descriptor",
@@ -997,7 +997,7 @@ func TestPersonTrackingUntrackWaitsForInFlightFactGeneration(t *testing.T) {
 	select {
 	case outcome := <-untrackDone:
 		early = &outcome
-	case <-time.After(150 * time.Millisecond):
+	case <-time.After(150 * time.Millisecond): //nolint:kennlint // absence check: the held commit gate keeps untracking waiting
 	}
 	release()
 
@@ -1115,7 +1115,7 @@ func TestApplyPreparedPersonFactGenerationDoesNotEndCallerTransaction(t *testing
 	require.ErrorIs(err, injected)
 	person, err := st.GetPersonContext(t.Context(), personID)
 	require.NoError(err)
-	assert.Nil(person.DisplayName)
+	assert.Equal(new("Alice"), person.DisplayName)
 	assert.Equal(int64(0), personFactProjectionRowCount(t, st, "person_fact_generations"))
 }
 
@@ -1615,6 +1615,7 @@ func newPersonFactProjectionStore(t *testing.T) (*Store, int64, map[string]perso
 	return st, personID, map[string]personfacts.TargetDescriptor{
 		AttributeSlugPrimaryChannel: projectionTargetBySlug(t, st, AttributeSlugPrimaryChannel),
 		AttributeSlugAskMeAbout:     projectionTargetBySlug(t, st, AttributeSlugAskMeAbout),
+		AttributeSlugNotes:          projectionTargetBySlug(t, st, AttributeSlugNotes),
 	}
 }
 

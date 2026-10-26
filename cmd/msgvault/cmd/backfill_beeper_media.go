@@ -29,11 +29,15 @@ Examples:
   msgvault backfill-beeper-media --account signal`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			state := invocationFromCommand(cmd)
+			if state == nil || state.cfg == nil {
+				return errors.New("configuration is unavailable")
+			}
 			if !isDaemonCLISubprocess() {
 				return runDaemonCLICommandHTTPFromCobra(cmd, args)
 			}
 
-			imp, accountIDs, dbPath, cleanup, err := openBeeperImporter(backfillBeeperMediaAccounts)
+			imp, s, accountIDs, dbPath, cleanup, err := openBeeperImporter(backfillBeeperMediaAccounts, state, true)
 			if err != nil {
 				return err
 			}
@@ -42,26 +46,24 @@ Examples:
 			defer stop()
 
 			for _, accountID := range accountIDs {
-				opts := beeperImportOptions(accountID)
+				opts := beeperImportOptions(accountID, state.cfg)
 				opts.Progress = func(s string) { _, _ = fmt.Fprintln(cmd.OutOrStdout(), "  "+s) }
 				sum, err := imp.BackfillMedia(ctx, opts)
 				if ctx.Err() != nil {
 					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "\nInterrupted — re-run backfill-beeper-media to resume (idempotent).")
-					return rebuildCacheAfterWrite(dbPath)
+					return rebuildCacheAfterWrite(dbPath, state)
 				}
 				if err != nil {
 					return errors.Join(
 						fmt.Errorf("beeper media backfill failed for %s: %w", accountID, err),
-						rebuildCacheAfterWrite(dbPath),
+						rebuildCacheAfterWrite(dbPath, state),
 					)
 				}
 				writeBeeperMediaBackfillSummary(cmd.OutOrStdout(), accountID, sum)
-				if sum.Errors > 0 {
-					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  %d errors — see sync run items; re-run to retry\n", sum.Errors)
-				}
+				writeBeeperRunFailures(ctx, cmd.OutOrStdout(), s, sum, accountID, "backfill-beeper-media")
 			}
 
-			return rebuildCacheAfterWrite(dbPath)
+			return rebuildCacheAfterWrite(dbPath, state)
 		},
 	}
 	cmd.Flags().StringArrayVar(&backfillBeeperMediaAccounts, "account", nil, "Beeper accountID to backfill (repeatable; default: all registered accounts)")

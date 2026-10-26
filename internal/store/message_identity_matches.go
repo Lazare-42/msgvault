@@ -21,6 +21,8 @@ type MessageIdentityMatch struct {
 	SourceID   int64
 	Sender     []string
 	Recipients []string
+	// Visible holds the confirmed To/Cc matches, without Bcc.
+	Visible []string
 }
 
 // ResolvedAccountIdentity is one confirmed source identity and every
@@ -61,58 +63,11 @@ func (s *Store) ResolveAccountIdentityContext(
 			"source %d identity %q: %w", sourceID, identifier, ErrAccountIdentityNotFound)
 	}
 
-	// Mirrors messageIdentityAttributionMatch (messages.go) exactly: the
-	// email column compares case-insensitively and only when non-blank,
-	// participant_identifiers rows compare per their own identifier_type
-	// (case-insensitive only when type = 'email', and email identifiers are
-	// consulted only when the participant carries no primary email — the
-	// attribution fallback's primary-email guard), and
-	// participants.phone_number is never consulted —
-	// EnsureParticipantByPhone always backs a phone identity with a
-	// participant_identifiers row, so that row is the parity-correct match
-	// surface. Do not reintroduce identifierMatch/EqualIdentifier here: their
-	// global, shape-based case rule is what this query replaces.
-	const query = `
-		SELECT p.id FROM participants p
-		WHERE p.email_address IS NOT NULL
-		  AND TRIM(p.email_address) <> ''
-		  AND LOWER(p.email_address) = LOWER(?)
-		UNION
-		SELECT pi.participant_id FROM participant_identifiers pi
-		WHERE (pi.identifier_type = 'email'
-		       AND NOT EXISTS (
-		         SELECT 1 FROM participants pp
-		         WHERE pp.id = pi.participant_id
-		           AND pp.email_address IS NOT NULL
-		           AND TRIM(pp.email_address) <> ''
-		       )
-		       AND LOWER(pi.identifier_value) = LOWER(?))
-		   OR (pi.identifier_type <> 'email' AND pi.identifier_value = ?)
-		ORDER BY 1
-	`
-	rows, err := s.db.QueryContext(
-		ctx,
-		query,
-		storedIdentifier,
-		storedIdentifier,
-		storedIdentifier,
-	)
+	participantIDs, err := participantIDsForAddressesContext(ctx, s.db, []string{storedIdentifier})
 	if err != nil {
 		return ResolvedAccountIdentity{}, fmt.Errorf("resolve account identity participants: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
-
-	participantIDs := make([]int64, 0)
-	for rows.Next() {
-		var participantID int64
-		if err := rows.Scan(&participantID); err != nil {
-			return ResolvedAccountIdentity{}, fmt.Errorf("scan account identity participant: %w", err)
-		}
-		participantIDs = append(participantIDs, participantID)
-	}
-	if err := rows.Err(); err != nil {
-		return ResolvedAccountIdentity{}, fmt.Errorf("iterate account identity participants: %w", err)
-	}
+	slices.Sort(participantIDs)
 
 	return ResolvedAccountIdentity{
 		SourceID:          sourceID,
@@ -134,6 +89,7 @@ type messageIdentityCandidates struct {
 	senderFallback    *identityCandidateSet
 	senderHasEnvelope bool
 	recipients        *identityCandidateSet
+	visible           *identityCandidateSet
 }
 
 // identityCandidateSet keeps one key set per comparison rule so the
@@ -163,10 +119,20 @@ func (s *Store) MatchMessageIdentitiesContext(
 	ctx context.Context,
 	messageIDs []int64,
 ) (map[int64]MessageIdentityMatch, error) {
+	return matchMessageIdentitiesWith(ctx, s.db, messageIDs)
+}
+
+// matchMessageIdentitiesWith is MatchMessageIdentitiesContext on any querier,
+// so account attribution can read it inside its transaction.
+func matchMessageIdentitiesWith(
+	ctx context.Context,
+	q chunkQuerier,
+	messageIDs []int64,
+) (map[int64]MessageIdentityMatch, error) {
 	candidatesByMessage := make(map[int64]*messageIdentityCandidates, len(messageIDs))
 	sourceSet := make(map[int64]struct{})
 
-	err := queryInChunksContext(ctx, s.db, messageIDs, nil, `
+	err := queryInChunksContext(ctx, q, messageIDs, nil, `
 		WITH requested_messages AS (
 			SELECT m.id, m.source_id, m.sender_id
 			FROM messages m
@@ -237,6 +203,7 @@ func (s *Store) MatchMessageIdentitiesContext(
 				sender:         newIdentityCandidateSet(),
 				senderFallback: newIdentityCandidateSet(),
 				recipients:     newIdentityCandidateSet(),
+				visible:        newIdentityCandidateSet(),
 			}
 			candidatesByMessage[messageID] = candidates
 			sourceSet[sourceID] = struct{}{}
@@ -251,7 +218,10 @@ func (s *Store) MatchMessageIdentitiesContext(
 			} else {
 				target = candidates.senderFallback
 			}
-		case "to", "cc", "bcc":
+		case "to", "cc":
+			candidates.visible.addRow(envelopeAddress, emailAddress, identifierType, identifierValue)
+			target = candidates.recipients
+		case "bcc":
 			target = candidates.recipients
 		default:
 			return nil
@@ -270,7 +240,7 @@ func (s *Store) MatchMessageIdentitiesContext(
 	slices.Sort(sourceIDs)
 
 	identitiesBySource := make(map[int64]*storedIdentityIndex, len(sourceIDs))
-	err = queryInChunksContext(ctx, s.db, sourceIDs, nil, `
+	err = queryInChunksContext(ctx, q, sourceIDs, nil, `
 		SELECT source_id, address
 		FROM account_identities
 		WHERE source_id IN (%s)
@@ -305,6 +275,7 @@ func (s *Store) MatchMessageIdentitiesContext(
 			SourceID:   candidates.sourceID,
 			Sender:     intersectStoredIdentities(sender, identities),
 			Recipients: intersectStoredIdentities(candidates.recipients, identities),
+			Visible:    intersectStoredIdentities(candidates.visible, identities),
 		}
 	}
 	return matches, nil

@@ -12,6 +12,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/require"
 
+	"go.kenn.io/msgvault/internal/sqliteutil"
 	"go.kenn.io/msgvault/internal/vector"
 )
 
@@ -79,20 +80,19 @@ func openFusedMainDB(t *testing.T) (*sql.DB, string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "main.db")
-	db, err := sql.Open("sqlite3", path)
+	db, err := sql.Open(sqliteutil.DriverName(), path)
 	require.NoError(t, err, "open main")
 	t.Cleanup(func() { _ = db.Close() })
 
-	// sent_at is DATETIME (text in canonical "2006-01-02 15:04:05"
-	// format) to match the production messages schema. The fused query
-	// compares it as a string; using INTEGER here would let bugs in
-	// boundary semantics slip past the fused tests.
+	// Text DATETIME values match the production schema and expose date comparison bugs.
 	schema := `
 CREATE TABLE messages (
     id INTEGER PRIMARY KEY,
     subject TEXT,
+	list_id TEXT,
     message_type TEXT NOT NULL DEFAULT 'email',
     source_id INTEGER,
+    conversation_id INTEGER,
     sender_id INTEGER,
     has_attachments INTEGER DEFAULT 0,
     size_estimate INTEGER,

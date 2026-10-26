@@ -21,6 +21,9 @@ var (
 	importContacts                  string
 	importLimit                     int
 	importDisplayName               string
+	importFull                      bool
+	importWhatsAppAfter             string
+	importWhatsAppBefore            string
 	noDefaultIdentityImportWhatsApp bool
 )
 
@@ -36,7 +39,12 @@ Examples:
   msgvault import-whatsapp --phone "+447700900000" /path/to/msgstore.db
   msgvault import-whatsapp --phone "+447700900000" "$HOME/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite"
   msgvault import-whatsapp --phone "+447700900000" --contacts ~/contacts.vcf /path/to/msgstore.db
-  msgvault import-whatsapp --phone "+447700900000" --media-dir /path/to/Media /path/to/msgstore.db`,
+  msgvault import-whatsapp --phone "+447700900000" --media-dir /path/to/Media /path/to/msgstore.db
+  msgvault import-whatsapp --phone "+447700900000" --after 2026-01-01 "$HOME/Library/Group Containers/group.net.whatsapp.WhatsApp.shared/ChatStorage.sqlite"
+
+--after and --before (YYYY-MM-DD, local time; after is inclusive, before is
+exclusive) limit an Apple import to that window. A later unfiltered run
+imports the rest. Android msgstore.db imports reject both flags.`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		if !isDaemonCLISubprocess() {
@@ -47,6 +55,11 @@ Examples:
 }
 
 func runWhatsAppImport(cmd *cobra.Command, sourcePath string) error {
+	state := invocationFromCommand(cmd)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
 	// Validate source file exists.
 	if _, err := os.Stat(sourcePath); err != nil {
 		return fmt.Errorf("source file not found: %w", err)
@@ -60,6 +73,11 @@ func runWhatsAppImport(cmd *cobra.Command, sourcePath string) error {
 		return usageErr(cmd, fmt.Errorf("phone number must be in E.164 format (starting with +), got %q", importPhone))
 	}
 
+	after, before, err := parseWhatsAppDateWindow(importWhatsAppAfter, importWhatsAppBefore)
+	if err != nil {
+		return usageErr(cmd, err)
+	}
+
 	// Validate media dir if provided.
 	if importMediaDir != "" {
 		if info, err := os.Stat(importMediaDir); err != nil || !info.IsDir() {
@@ -67,7 +85,7 @@ func runWhatsAppImport(cmd *cobra.Command, sourcePath string) error {
 		}
 	}
 
-	s, cleanup, err := openWritableStoreAndInitForIngest()
+	s, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
 	if err != nil {
 		return err
 	}
@@ -94,6 +112,9 @@ func runWhatsAppImport(cmd *cobra.Command, sourcePath string) error {
 	opts.MediaDir = importMediaDir
 	opts.AttachmentsDir = cfg.AttachmentsDir()
 	opts.Limit = importLimit
+	opts.Full = importFull
+	opts.After = after
+	opts.Before = before
 
 	// Create importer with CLI progress.
 	progress := &ImportCLIProgress{}
@@ -107,25 +128,31 @@ func runWhatsAppImport(cmd *cobra.Command, sourcePath string) error {
 	if importLimit > 0 {
 		fmt.Printf("Limit: %d messages\n", importLimit)
 	}
+	if importWhatsAppAfter != "" {
+		fmt.Printf("After: %s\n", importWhatsAppAfter)
+	}
+	if importWhatsAppBefore != "" {
+		fmt.Printf("Before: %s\n", importWhatsAppBefore)
+	}
 	fmt.Println()
 
 	summary, err := importer.Import(ctx, sourcePath, opts)
 	if err != nil {
 		if ctx.Err() != nil {
 			fmt.Println("\nImport interrupted. Run again to continue.")
-			return rebuildCacheAfterWrite(dbPath)
+			return rebuildCacheAfterWrite(dbPath, state)
 		}
 		return fmt.Errorf("import failed: %w", err)
 	}
 
 	// Auto-default-identity must run BEFORE the legacy migration
 	// retry — see comment in account_identity.go.
-	if !noDefaultIdentityImportWhatsApp && summary.Errors == 0 && summary.SourceID != 0 {
-		confirmDefaultIdentity(cmd.OutOrStdout(), s, summary.SourceID, importPhone, importPhone, "phone-e164")
+	if !noDefaultIdentityImportWhatsApp && summary.SourceID != 0 {
+		confirmDefaultIdentity(cmd.OutOrStdout(), s, summary.SourceID, importPhone, importPhone, "phone-e164", state.logger)
 	}
 
 	if summary.SourceID != 0 {
-		if err := runPostSourceCreateMigrations(s); err != nil {
+		if err := runPostSourceCreateMigrationsForInvocation(s, state); err != nil {
 			return fmt.Errorf("post-source-create migrations: %w", err)
 		}
 	}
@@ -163,7 +190,28 @@ func runWhatsAppImport(cmd *cobra.Command, sourcePath string) error {
 		fmt.Printf("  Rate:           %.0f messages/sec\n", rate)
 	}
 
-	return rebuildCacheAfterWrite(dbPath)
+	return rebuildCacheAfterWrite(dbPath, state)
+}
+
+// parseWhatsAppDateWindow parses --after/--before like import-imessage does:
+// YYYY-MM-DD at local midnight.
+func parseWhatsAppDateWindow(afterFlag, beforeFlag string) (after, before time.Time, err error) {
+	if afterFlag != "" {
+		after, err = time.ParseInLocation("2006-01-02", afterFlag, time.Local)
+		if err != nil {
+			return after, before, fmt.Errorf("invalid --after date: %w (use YYYY-MM-DD format)", err)
+		}
+	}
+	if beforeFlag != "" {
+		before, err = time.ParseInLocation("2006-01-02", beforeFlag, time.Local)
+		if err != nil {
+			return after, before, fmt.Errorf("invalid --before date: %w (use YYYY-MM-DD format)", err)
+		}
+	}
+	if !after.IsZero() && !before.IsZero() && !after.Before(before) {
+		return after, before, fmt.Errorf("--after %s must be earlier than --before %s", afterFlag, beforeFlag)
+	}
+	return after, before, nil
 }
 
 // ImportCLIProgress implements whatsapp.ImportProgress for terminal output.
@@ -258,6 +306,9 @@ func init() {
 	importWhatsappCmd.Flags().StringVar(&importContacts, "contacts", "", "path to contacts .vcf file for name resolution (optional)")
 	importWhatsappCmd.Flags().IntVar(&importLimit, "limit", 0, "limit number of messages (for testing)")
 	importWhatsappCmd.Flags().StringVar(&importDisplayName, "display-name", "", "display name for the phone owner")
+	importWhatsappCmd.Flags().BoolVar(&importFull, "full", false, "Apple only: compare every message, including chats unchanged since the last import")
+	importWhatsappCmd.Flags().StringVar(&importWhatsAppAfter, "after", "", "only Apple messages on or after this date (YYYY-MM-DD)")
+	importWhatsappCmd.Flags().StringVar(&importWhatsAppBefore, "before", "", "only Apple messages before this date (YYYY-MM-DD)")
 	importWhatsappCmd.Flags().BoolVar(&noDefaultIdentityImportWhatsApp, "no-default-identity", false, noDefaultIdentityHelp)
 	_ = importWhatsappCmd.MarkFlagRequired("phone")
 	rootCmd.AddCommand(importWhatsappCmd)

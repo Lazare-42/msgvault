@@ -3,19 +3,133 @@ package beeper
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"math"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/attachmentpolicy"
 	"go.kenn.io/msgvault/internal/store"
 )
+
+func TestAttachmentMetadataPreservesSharedURLAndBoundsSourceTranscript(t *testing.T) {
+	assert := assert.New(t)
+	longTranscript := strings.Repeat("あ", 11_000) + "x"
+	m := &Message{
+		Type: typeImage, Text: "https://example.com/shared", Attachments: []Attachment{{
+			IsVoiceNote: true, Transcription: &Transcription{Transcription: longTranscript},
+		}},
+	}
+	var metadata struct {
+		SharedURL        string `json:"shared_url"`
+		SourceTranscript struct {
+			Provider  string `json:"provider"`
+			Text      string `json:"text"`
+			Truncated bool   `json:"truncated"`
+		} `json:"source_transcript"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(attachmentMetadataJSON(m, &m.Attachments[0])), &metadata))
+	assert.Equal("https://example.com/shared", metadata.SharedURL)
+	assert.Equal(sourceTypeBeeper, metadata.SourceTranscript.Provider)
+	assert.True(metadata.SourceTranscript.Truncated)
+	assert.LessOrEqual(len(metadata.SourceTranscript.Text), maxSourceTranscriptMetadataBytes)
+	assert.True(utf8.ValidString(metadata.SourceTranscript.Text))
+	assert.Equal(0, len([]byte(metadata.SourceTranscript.Text))%3)
+	assert.Contains(bodyText(m), longTranscript)
+
+	exact := &Attachment{Transcription: &Transcription{Transcription: strings.Repeat("é", 16_384)}}
+	var exactMetadata struct {
+		SourceTranscript struct {
+			Text      string `json:"text"`
+			Truncated bool   `json:"truncated"`
+		} `json:"source_transcript"`
+	}
+	exactMetadataJSON := attachmentMetadataJSON(&Message{Attachments: []Attachment{{}}}, exact)
+	require.NoError(t, json.Unmarshal([]byte(exactMetadataJSON), &exactMetadata))
+	assert.Len([]byte(exactMetadata.SourceTranscript.Text), maxSourceTranscriptMetadataBytes)
+	assert.False(exactMetadata.SourceTranscript.Truncated)
+	assert.NotContains(exactMetadataJSON, `"truncated":false`)
+	t.Logf("metadata boundary bytes: %d", len([]byte(exactMetadata.SourceTranscript.Text)))
+}
+
+func TestAttachmentMetadataEmptyAndTranscriptAbsentStayNull(t *testing.T) {
+	assert.Empty(t, attachmentMetadataJSON(&Message{Type: typeImage, Attachments: []Attachment{{}}}, &Attachment{}))
+	assert.JSONEq(t, `{"shared_url":"https://example.com"}`, attachmentMetadataJSON(
+		&Message{Text: "https://example.com", Attachments: []Attachment{{}}}, &Attachment{}))
+}
+
+func TestImportAndRepairPreserveAttachmentTranscriptMetadata(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	f := newFakeBeeper(t)
+	ch := mediaTranscriptChat()
+	f.addChat(ch)
+	f.setAsset("mxc://beeper.local/voice1", []byte("voice bytes"))
+	imp, st, done := newTestImporter(t, f)
+	defer done()
+
+	opts := mediaImportOptions(t)
+	_, err := imp.Import(context.Background(), opts)
+	require.NoError(err)
+
+	var body, metadata string
+	var messageID int64
+	require.NoError(st.DB().QueryRow(st.Rebind(`
+		SELECT m.id, b.body_text, COALESCE(CAST(a.attachment_metadata AS TEXT), '')
+		FROM messages m
+		JOIN message_bodies b ON b.message_id = m.id
+		JOIN attachments a ON a.message_id = m.id
+		WHERE m.source_message_id = ? AND a.source_attachment_id = ?`),
+		"voice1", "beeper:mxc://beeper.local/voice1").Scan(&messageID, &body, &metadata))
+	assert.Equal("https://example.com\n🎤 transcript: source words", body)
+	assert.JSONEq(`{"shared_url":"https://example.com","source_transcript":{"provider":"beeper","text":"source words"}}`, metadata)
+
+	require.NoError(st.UpsertAttachmentRecord(t.Context(), messageID, store.AttachmentWrite{
+		Filename: "stale.ogg", MIMEType: "audio/ogg", StoragePath: "stale/path",
+		ContentHash: strings.Repeat("b", 64), Size: 12, SourceAttachmentID: "beeper:stale",
+		MediaType: "audio", State: attachmentpolicy.StateStored,
+		Role: store.AttachmentRoleStandalone, RoleSource: store.AttachmentRoleSourceImporterSemantics,
+	}))
+	_, err = st.DB().Exec(st.Rebind(`UPDATE attachments SET attachment_metadata = ? WHERE source_attachment_id = ?`),
+		`{"source_transcript":{"provider":"beeper","text":"stale"}}`, "beeper:stale")
+	require.NoError(err)
+
+	_, err = st.DB().Exec(st.Rebind(`UPDATE attachments SET attachment_metadata = NULL WHERE source_attachment_id = ?`), "beeper:mxc://beeper.local/voice1")
+	require.NoError(err)
+	_, err = imp.RepairSource(context.Background(), beeperSourceID(t, st), nil)
+	require.NoError(err)
+	require.NoError(st.DB().QueryRow(st.Rebind(`
+		SELECT COALESCE(CAST(a.attachment_metadata AS TEXT), '')
+		FROM attachments a WHERE a.source_attachment_id = ?`), "beeper:mxc://beeper.local/voice1").Scan(&metadata))
+	assert.JSONEq(`{"shared_url":"https://example.com","source_transcript":{"provider":"beeper","text":"source words"}}`, metadata)
+	require.NoError(st.DB().QueryRow(st.Rebind(`
+		SELECT COALESCE(CAST(a.attachment_metadata AS TEXT), '')
+		FROM attachments a WHERE a.source_attachment_id = ?`), "beeper:stale").Scan(&metadata))
+	assert.Empty(metadata)
+}
+
+func mediaTranscriptChat() *fakeChat {
+	ch := mediaChat()
+	ch.ID = "!transcript:beeper.local"
+	ch.Msgs[0].ID = "voice1"
+	ch.Msgs[0].Type = "VOICE"
+	ch.Msgs[0].Text = "https://example.com"
+	ch.Msgs[0].Attachments = []map[string]any{{
+		"id": "mxc://beeper.local/voice1", "type": "audio", "isVoiceNote": true,
+		"mimeType": "audio/ogg", "fileName": "voice.ogg", "fileSize": 11,
+		"transcription": map[string]any{"transcription": "source words"},
+	}}
+	return ch
+}
 
 // mediaChat builds a chat with one image message whose asset may or may not
 // be present on the fake server.
@@ -64,7 +178,9 @@ func TestImportDownloadsAttachment(t *testing.T) {
 	assert := assert.New(t)
 
 	f := newFakeBeeper(t)
-	f.addChat(mediaChat())
+	ch := mediaChat()
+	ch.Msgs[0].Attachments[0]["transcription"] = map[string]any{"transcription": "stored words"}
+	f.addChat(ch)
 	f.setAsset("mxc://beeper.local/photo1", []byte("hello bytes"))
 	imp, st, done := newTestImporter(t, f)
 	defer done()
@@ -112,11 +228,13 @@ func TestImportDownloadsAttachment(t *testing.T) {
 	}
 
 	// Metadata folded into the attachment row survives the re-persist.
-	var keptMediaType string
+	var keptMediaType, keptMetadata string
 	require.NoError(st.DB().QueryRow(st.Rebind(`
-		SELECT a.media_type FROM attachments a JOIN messages m ON m.id = a.message_id
-		WHERE m.source_message_id = ?`), "p0").Scan(&keptMediaType))
+		SELECT a.media_type, COALESCE(CAST(a.attachment_metadata AS TEXT), '')
+		FROM attachments a JOIN messages m ON m.id = a.message_id
+		WHERE m.source_message_id = ?`), "p0").Scan(&keptMediaType, &keptMetadata))
 	assert.Equal("image", keptMediaType)
+	assert.JSONEq(`{"source_transcript":{"provider":"beeper","text":"stored words"}}`, keptMetadata)
 }
 
 func TestSetBeeperAttachmentRoleUsesSourceSemantics(t *testing.T) {
@@ -154,6 +272,57 @@ func TestSetBeeperAttachmentRoleUsesSourceSemantics(t *testing.T) {
 	}
 }
 
+func TestPersistAttachmentsPreservesReusedMediaFields(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newFakeBeeper(t)
+	f.addChat(mediaChat())
+	f.setAsset("mxc://beeper.local/photo1", []byte("photo bytes"))
+	imp, st, done := newTestImporter(t, f)
+	defer done()
+
+	opts := mediaImportOptions(t)
+	_, err := imp.Import(context.Background(), opts)
+	require.NoError(err)
+	var messageID int64
+	require.NoError(st.DB().QueryRow(st.Rebind(
+		`SELECT id FROM messages WHERE source_message_id = ?`), "p0").Scan(&messageID))
+	_, err = st.DB().Exec(st.Rebind(`
+		UPDATE attachments
+		SET filename = 'old.jpg', mime_type = 'image/jpeg', width = 32, height = 24,
+			duration_ms = 400, media_type = 'sticker', attachment_metadata = ?,
+			attachment_role = 'sticker', role_source = 'provider_explicit'
+		WHERE source_attachment_id = ?`),
+		`{"source_transcript":{"provider":"beeper","text":"old words"}}`, "beeper:mxc://beeper.local/photo1")
+	// The projection refreshes metadata while preserving optional fields that
+	// the current payload does not authoritatively replace.
+	require.NoError(err)
+
+	imp.persistAttachments(context.Background(), 0, messageID, "chat", &Message{
+		Attachments: []Attachment{{
+			ID: "mxc://beeper.local/photo1", Type: "audio", MimeType: "audio/ogg",
+			FileName: "voice.ogg", FileSize: 11,
+			Transcription: &Transcription{Transcription: "new words"},
+		}},
+	}, opts, &ImportSummary{})
+	var filename, mimeType, mediaType, role, roleSource, metadata string
+	var width, height, durationMS int64
+	require.NoError(st.DB().QueryRow(st.Rebind(`
+		SELECT filename, mime_type, width, height, duration_ms, media_type, attachment_role, role_source,
+			COALESCE(CAST(attachment_metadata AS TEXT), '')
+		FROM attachments WHERE source_attachment_id = ?`), "beeper:mxc://beeper.local/photo1").Scan(
+		&filename, &mimeType, &width, &height, &durationMS, &mediaType, &role, &roleSource, &metadata))
+	assert.Equal("old.jpg", filename)
+	assert.Equal("image/jpeg", mimeType)
+	assert.EqualValues(32, width)
+	assert.EqualValues(24, height)
+	assert.EqualValues(400, durationMS)
+	assert.Equal("sticker", mediaType)
+	assert.Equal("standalone", role)
+	assert.Equal("importer_semantics", roleSource)
+	assert.JSONEq(`{"source_transcript":{"provider":"beeper","text":"new words"}}`, metadata)
+}
+
 func TestImportMediaPolicySkipsWithoutFetching(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -188,7 +357,9 @@ func TestImportMediaFailureLeavesMarkerAndBackfillRepairs(t *testing.T) {
 	assert := assert.New(t)
 
 	f := newFakeBeeper(t)
-	f.addChat(mediaChat())
+	ch := mediaChat()
+	ch.Msgs[0].Attachments[0]["transcription"] = map[string]any{"transcription": "pending words"}
+	f.addChat(ch)
 	// Asset intentionally missing: download fails, message still archives.
 	imp, st, done := newTestImporter(t, f)
 	defer done()
@@ -199,6 +370,13 @@ func TestImportMediaFailureLeavesMarkerAndBackfillRepairs(t *testing.T) {
 	assert.EqualValues(0, sum.AttachmentsDownloaded)
 	assert.EqualValues(1, sum.AttachmentsPending)
 	assert.EqualValues(0, sum.AttachmentsSkipped)
+	require.Len(sum.FailedChats, 1)
+	cf := sum.FailedChats[ch.ID]
+	require.NotNil(cf)
+	assert.EqualValues(1, cf.MediaErrors)
+	assert.Zero(cf.FetchErrors)
+	assert.NotEmpty(cf.LastError)
+	assert.EqualValues(1, sum.Errors)
 
 	var msgCount int
 	require.NoError(st.DB().QueryRow(st.Rebind(
@@ -213,12 +391,29 @@ func TestImportMediaFailureLeavesMarkerAndBackfillRepairs(t *testing.T) {
 		WHERE m.source_message_id = ?`), "p0").Scan(&storagePath, &sourceAttID))
 	assert.Equal("mxc://beeper.local/photo1", storagePath)
 	assert.Equal("beeper:mxc://beeper.local/photo1", sourceAttID)
+	var markerMetadata string
+	require.NoError(st.DB().QueryRow(st.Rebind(`
+		SELECT COALESCE(CAST(a.attachment_metadata AS TEXT), '')
+		FROM attachments a WHERE a.source_attachment_id = ?`), sourceAttID).Scan(&markerMetadata))
+	assert.JSONEq(`{"source_transcript":{"provider":"beeper","text":"pending words"}}`, markerMetadata)
+	beforeRevision, err := st.DerivedDataRevision()
+	require.NoError(err)
+	_, err = st.DB().Exec(st.Rebind(`UPDATE attachments SET attachment_metadata = ? WHERE source_attachment_id = ?`),
+		`{"source_transcript":{"provider":"beeper","text":"stale"}}`, sourceAttID)
+	require.NoError(err)
 
 	// Error recorded per item.
 	var itemCount int
 	require.NoError(st.DB().QueryRow(
 		`SELECT COUNT(*) FROM sync_run_items WHERE error_kind = 'beeper_media_error'`).Scan(&itemCount))
 	assert.Equal(1, itemCount)
+
+	// History-only accounts can finish downloading already archived media.
+	historyOnly := true
+	source, err := st.GetSourceByTypeAndIdentifier("beeper", "signal")
+	require.NoError(err)
+	_, err = st.UpdateSourceSettingsContext(t.Context(), source.ID, store.SourceSettingsUpdate{HistoryOnly: &historyOnly})
+	require.NoError(err)
 
 	// The asset becomes available; backfill repairs the marker.
 	f.setAsset("mxc://beeper.local/photo1", []byte("late bytes"))
@@ -237,6 +432,13 @@ func TestImportMediaFailureLeavesMarkerAndBackfillRepairs(t *testing.T) {
 		WHERE m.source_message_id = ?`), "p0").Scan(&attCount, &contentHash))
 	assert.Equal(1, attCount, "marker replaced, not duplicated")
 	assert.NotEmpty(contentHash)
+	require.NoError(st.DB().QueryRow(st.Rebind(`
+		SELECT COALESCE(CAST(a.attachment_metadata AS TEXT), '')
+		FROM attachments a WHERE a.source_attachment_id = ?`), sourceAttID).Scan(&markerMetadata))
+	assert.JSONEq(`{"source_transcript":{"provider":"beeper","text":"pending words"}}`, markerMetadata)
+	afterRevision, err := st.DerivedDataRevision()
+	require.NoError(err)
+	assert.Equal(beforeRevision+1, afterRevision, "backfill metadata refresh invalidates the analytics cache")
 
 	// Nothing pending anymore: a second backfill visits no messages.
 	bsum, err = imp.BackfillMedia(context.Background(), ImportOptions{
@@ -565,6 +767,13 @@ func TestBackfillMediaTransientFetchErrorKeepsMarker(t *testing.T) {
 	})
 	require.NoError(err)
 	assert.Positive(bsum.Errors, "transient fetch failures must be reported")
+	require.Len(bsum.FailedChats, 1)
+	cf := bsum.FailedChats[ch.ID]
+	require.NotNil(cf)
+	assert.EqualValues(1, cf.MediaErrors)
+	assert.Zero(cf.FetchErrors)
+	assert.NotEmpty(cf.LastError)
+	assert.EqualValues(1, bsum.Errors)
 	assert.EqualValues(0, bsum.AttachmentsDownloaded)
 
 	src, err := st.GetOrCreateSource("beeper", "signal")
@@ -970,6 +1179,135 @@ func TestBackfillMediaGoneMessageKeepsDownloadedRows(t *testing.T) {
 	assert.EqualValues(0, bsum.MessagesProcessed)
 }
 
+func TestImportMediaUnavailableIsTerminal(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	f := newFakeBeeper(t)
+	f.addChat(mediaChat())
+	f.setAssetError("mxc://beeper.local/photo1", http.StatusInternalServerError, expiredAssetBody)
+	imp, st, done := newTestImporter(t, f)
+	defer done()
+
+	opts := mediaImportOptions(t)
+	sum, err := imp.Import(context.Background(), opts)
+	require.NoError(err)
+	assert.EqualValues(1, sum.AttachmentsUnavailable)
+	assert.EqualValues(0, sum.AttachmentsPending)
+	assert.EqualValues(0, sum.AttachmentsSkipped)
+	assert.EqualValues(0, sum.Errors)
+	assert.Len(assetRequests(f), 1, "an expired asset costs one request")
+
+	var state, reason, itemStatus string
+	require.NoError(st.DB().QueryRow(st.Rebind(`
+		SELECT a.attachment_state, a.attachment_skip_reason
+		FROM attachments a JOIN messages m ON m.id = a.message_id
+		WHERE m.source_message_id = ?`), "p0").Scan(&state, &reason))
+	assert.Equal(string(attachmentpolicy.StateUnavailable), state)
+	assert.Equal(string(attachmentpolicy.SkipSourceUnavailable), reason)
+	require.NoError(st.DB().QueryRow(
+		`SELECT status FROM sync_run_items WHERE error_kind = 'beeper_media_unavailable'`).Scan(&itemStatus))
+	assert.Equal(store.SyncRunItemStatusSkipped, itemStatus)
+
+	// Neither a backfill nor a full re-import asks for it again.
+	f.resetRequests()
+	bsum, err := imp.BackfillMedia(context.Background(), ImportOptions{
+		AccountID: "signal", AttachmentsDir: opts.AttachmentsDir,
+	})
+	require.NoError(err)
+	assert.EqualValues(0, bsum.MessagesProcessed)
+	_, err = imp.Import(context.Background(), ImportOptions{
+		AccountID: "signal", AttachmentsDir: opts.AttachmentsDir, Full: true,
+	})
+	require.NoError(err)
+	assert.Empty(assetRequests(f), "unavailable media must never be re-requested")
+	require.NoError(st.DB().QueryRow(st.Rebind(`
+		SELECT a.attachment_state FROM attachments a JOIN messages m ON m.id = a.message_id
+		WHERE m.source_message_id = ?`), "p0").Scan(&state))
+	assert.Equal(string(attachmentpolicy.StateUnavailable), state, "re-import keeps the terminal marker")
+}
+
+func TestImportBoundsRepeatedAssetAttemptsAcrossIncrementalAndReconcile(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	f := newFakeBeeper(t)
+	ch := mediaChat()
+	f.addChat(ch)
+	imp, _, done := newTestImporter(t, f)
+	defer done()
+
+	opts := mediaImportOptions(t)
+	opts.NoMedia = true
+	_, err := imp.Import(context.Background(), opts)
+	require.NoError(err)
+
+	newAsset := "mxc://beeper.local/repeated"
+	ch = f.chat("!media:beeper.local")
+	ch.Msgs = append(ch.Msgs, fakeMsg{
+		ID: "p1", SortKey: 1, Timestamp: time.Now().Add(-time.Minute).UTC(),
+		Type: "IMAGE", SenderID: "@signal_ann:beeper.local", SenderName: "Ann",
+		Attachments: []map[string]any{{
+			"id": newAsset, "type": "img", "mimeType": "image/png", "fileName": "repeated.png", "fileSize": 11,
+		}},
+	})
+	ch.LastActivity = ch.Msgs[len(ch.Msgs)-1].Timestamp
+	f.setAssetError(newAsset, http.StatusInternalServerError, `{"message":"temporary failure"}`)
+	opts.NoMedia = false
+
+	sum, err := imp.Import(context.Background(), opts)
+	require.NoError(err)
+	assert.EqualValues(1, sum.AttachmentsPending)
+	assert.EqualValues(1, sum.Errors)
+	assert.Len(assetRequests(f), 3, "the incremental and reconcile passes share one retry budget")
+}
+
+func TestBackfillMediaDefinitiveLossKeepsUnavailableRow(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	f := newFakeBeeper(t)
+	ch := mediaChat()
+	// A recent message: definitive loss is terminal on the first miss,
+	// with no age or repeat requirement.
+	ch.Msgs[0].Timestamp = time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Second)
+	ch.Msgs[0].Attachments = append(ch.Msgs[0].Attachments, map[string]any{
+		"id": "mxc://beeper.local/photo2", "type": "img", "mimeType": "image/png", "fileName": "later.png",
+	})
+	addFillerMessages(ch, 5)
+	f.addChat(ch)
+	f.setAssetError("mxc://beeper.local/photo1", http.StatusInternalServerError, expiredAssetBody)
+	imp, st, done := newTestImporter(t, f)
+	defer done()
+
+	opts := mediaImportOptions(t)
+	sum, err := imp.Import(context.Background(), opts)
+	require.NoError(err)
+	require.EqualValues(1, sum.AttachmentsUnavailable)
+	require.EqualValues(1, sum.AttachmentsPending)
+
+	chat := f.chat("!media:beeper.local")
+	chat.Msgs = chat.Msgs[1:]
+	_, err = imp.BackfillMedia(context.Background(), ImportOptions{
+		AccountID: "signal", AttachmentsDir: opts.AttachmentsDir,
+	})
+	require.NoError(err)
+
+	rows, err := st.DB().Query(`SELECT source_attachment_id, COALESCE(attachment_state, '') FROM attachments`)
+	require.NoError(err)
+	defer func() { _ = rows.Close() }()
+	got := map[string]string{}
+	for rows.Next() {
+		var id, state string
+		require.NoError(rows.Scan(&id, &state))
+		got[id] = state
+	}
+	require.NoError(rows.Err())
+	assert.Equal(map[string]string{
+		"beeper:mxc://beeper.local/photo1": string(attachmentpolicy.StateUnavailable),
+	}, got, "the retryable marker is cleared; the terminal record stays")
+}
+
 func TestBackfillMediaRearmsLostAnchor(t *testing.T) {
 	require := require.New(t)
 
@@ -1033,4 +1371,202 @@ func TestMediaTypeOf(t *testing.T) {
 	assert.Equal("mxc://x/1", assetRef(&Attachment{ID: "mxc://x/1", SrcURL: "http://y"}))
 	assert.Equal("http://y", assetRef(&Attachment{SrcURL: "http://y"}), "srcURL is the fallback when the asset ID is empty")
 	assert.Empty(assetRef(&Attachment{}))
+}
+
+// TestAssetNotFoundBecomesTerminalOnlyOnConfirmedRepeat runs the not-found
+// policy against a real store: a not-found costs one request and leaves a
+// retryable marker, and it becomes terminal only for an old message whose
+// not-found repeats on a separate, later run.
+func TestAssetNotFoundBecomesTerminalOnlyOnConfirmedRepeat(t *testing.T) {
+	const assetURL = "mxc://beeper.local/photo1"
+	oldTimestamp := func() time.Time { return time.Now().Add(-assetNotFoundMaxAge - time.Hour).UTC() }
+
+	t.Run("old message: first miss retryable, confirming repeat on a separate call goes terminal", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		f := newFakeBeeper(t)
+		ch := mediaChat()
+		ch.Msgs[0].Timestamp = oldTimestamp()
+		ch.LastActivity = ch.Msgs[0].Timestamp
+		f.addChat(ch)
+		f.setAssetError(assetURL, http.StatusBadGateway, "Media not found")
+		imp, st, done := newTestImporter(t, f)
+		defer done()
+		opts := mediaImportOptions(t)
+
+		sum, err := imp.Import(t.Context(), opts)
+		require.NoError(err)
+		assert.Len(assetRequests(f), 1, "a not-found costs one request, not maxAssetAttempts")
+		var state, reason string
+		require.NoError(st.DB().QueryRow(`SELECT attachment_state, attachment_skip_reason FROM attachments`).Scan(&state, &reason))
+		assert.Equal(string(attachmentpolicy.StateFailed), state)
+		assert.Equal(string(attachmentpolicy.SkipSourceUnavailable), reason)
+		assert.Zero(sum.AttachmentsUnavailable, "a first miss is not yet terminal")
+		assert.EqualValues(1, sum.AttachmentsPending)
+
+		f.resetRequests()
+		opts.Full = true
+		sum, err = imp.Import(t.Context(), opts)
+		require.NoError(err)
+		assert.Len(assetRequests(f), 1, "the confirming repeat still costs only one request")
+		require.NoError(st.DB().QueryRow(`SELECT attachment_state, attachment_skip_reason FROM attachments`).Scan(&state, &reason))
+		assert.Equal(string(attachmentpolicy.StateUnavailable), state, "a repeat on a separate, later run goes terminal")
+		assert.Equal(string(attachmentpolicy.SkipSourceUnavailable), reason)
+		assert.EqualValues(1, sum.AttachmentsUnavailable)
+	})
+
+	t.Run("a single miss recovers if the asset becomes available on the next run", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		f := newFakeBeeper(t)
+		ch := mediaChat()
+		ch.Msgs[0].Timestamp = oldTimestamp()
+		ch.LastActivity = ch.Msgs[0].Timestamp
+		f.addChat(ch)
+		f.setAssetError(assetURL, http.StatusBadGateway, "Media not found")
+		imp, st, done := newTestImporter(t, f)
+		defer done()
+		opts := mediaImportOptions(t)
+
+		sum, err := imp.Import(t.Context(), opts)
+		require.NoError(err)
+		assert.Zero(sum.AttachmentsUnavailable)
+
+		f.setAsset(assetURL, []byte("recovered bytes"))
+		f.resetRequests()
+		bsum, err := imp.BackfillMedia(t.Context(), opts)
+		require.NoError(err)
+		assert.EqualValues(1, bsum.AttachmentsDownloaded)
+		assert.Zero(bsum.AttachmentsUnavailable)
+		var state string
+		require.NoError(st.DB().QueryRow(`SELECT attachment_state FROM attachments`).Scan(&state))
+		assert.Equal(string(attachmentpolicy.StateStored), state)
+	})
+
+	t.Run("a different error between two not-founds resets the repeat", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		f := newFakeBeeper(t)
+		ch := mediaChat()
+		ch.Msgs[0].Timestamp = oldTimestamp()
+		ch.LastActivity = ch.Msgs[0].Timestamp
+		f.addChat(ch)
+		f.setAssetError(assetURL, http.StatusBadGateway, "Media not found")
+		imp, st, done := newTestImporter(t, f)
+		defer done()
+		imp.client.retryAfterMax = time.Millisecond
+		opts := mediaImportOptions(t)
+
+		_, err := imp.Import(t.Context(), opts)
+		require.NoError(err)
+
+		f.setAssetError(assetURL, http.StatusBadGateway, "upstream timeout")
+		f.resetRequests()
+		opts.Full = true
+		sum, err := imp.Import(t.Context(), opts)
+		require.NoError(err)
+		assert.Zero(sum.AttachmentsUnavailable)
+		var reason string
+		require.NoError(st.DB().QueryRow(`SELECT attachment_skip_reason FROM attachments`).Scan(&reason))
+		assert.Equal(string(attachmentpolicy.SkipFetchFailure), reason, "the generic failure replaces the provisional not-found marker")
+
+		f.setAssetError(assetURL, http.StatusBadGateway, "Media not found")
+		f.resetRequests()
+		sum, err = imp.Import(t.Context(), opts)
+		require.NoError(err)
+		assert.Zero(sum.AttachmentsUnavailable, "the intervening generic failure means this not-found is a first sighting again")
+		var state string
+		require.NoError(st.DB().QueryRow(`SELECT attachment_state, attachment_skip_reason FROM attachments`).Scan(&state, &reason))
+		assert.Equal(string(attachmentpolicy.StateFailed), state)
+		assert.Equal(string(attachmentpolicy.SkipSourceUnavailable), reason)
+	})
+
+	t.Run("a --no-media deferral between the two misses does not reset the marker", func(t *testing.T) {
+		require := require.New(t)
+		assert := assert.New(t)
+		f := newFakeBeeper(t)
+		ch := mediaChat()
+		ch.Msgs[0].Timestamp = oldTimestamp()
+		ch.LastActivity = ch.Msgs[0].Timestamp
+		f.addChat(ch)
+		f.setAssetError(assetURL, http.StatusBadGateway, "Media not found")
+		imp, st, done := newTestImporter(t, f)
+		defer done()
+		opts := mediaImportOptions(t)
+
+		_, err := imp.Import(t.Context(), opts)
+		require.NoError(err)
+		var state, reason string
+		require.NoError(st.DB().QueryRow(`SELECT attachment_state, attachment_skip_reason FROM attachments`).Scan(&state, &reason))
+		require.Equal(string(attachmentpolicy.StateFailed), state)
+		require.Equal(string(attachmentpolicy.SkipSourceUnavailable), reason)
+
+		noMediaOpts := opts
+		noMediaOpts.Full = true
+		noMediaOpts.NoMedia = true
+		f.resetRequests()
+		_, err = imp.Import(t.Context(), noMediaOpts)
+		require.NoError(err)
+		assert.Empty(assetRequests(f), "a --no-media run never fetches")
+		require.NoError(st.DB().QueryRow(`SELECT attachment_state, attachment_skip_reason FROM attachments`).Scan(&state, &reason))
+		assert.Equal(string(attachmentpolicy.StateFailed), state, "the deferral must not reset the provisional marker to bare pending")
+		assert.Equal(string(attachmentpolicy.SkipSourceUnavailable), reason)
+
+		opts.Full = true
+		sum, err := imp.Import(t.Context(), opts)
+		require.NoError(err)
+		assert.EqualValues(1, sum.AttachmentsUnavailable, "the marker the deferral preserved still confirms on the next real run")
+	})
+}
+
+// TestIsConfirmedAssetNotFound covers the previous-marker and age checks.
+func TestIsConfirmedAssetNotFound(t *testing.T) {
+	now := time.Now()
+	old := now.Add(-assetNotFoundMaxAge - time.Hour)
+	young := now.Add(-assetNotFoundMaxAge + time.Hour)
+	provisional := store.AttachmentRef{State: attachmentpolicy.StateFailed, SkipReason: attachmentpolicy.SkipSourceUnavailable}
+
+	tests := []struct {
+		name      string
+		previous  store.AttachmentRef
+		timestamp time.Time
+		want      bool
+	}{
+		{
+			name:      "no previous marker at all",
+			previous:  store.AttachmentRef{},
+			timestamp: old,
+		},
+		{
+			name:      "previous was never confirmed-eligible: still pending",
+			previous:  store.AttachmentRef{State: attachmentpolicy.StatePending},
+			timestamp: old,
+		},
+		{
+			name:      "previous failed for an unrelated reason",
+			previous:  store.AttachmentRef{State: attachmentpolicy.StateFailed, SkipReason: attachmentpolicy.SkipFetchFailure},
+			timestamp: old,
+		},
+		{
+			name:      "message timestamp is missing",
+			previous:  provisional,
+			timestamp: time.Time{},
+		},
+		{
+			name:      "message is younger than the age cutoff",
+			previous:  provisional,
+			timestamp: young,
+		},
+		{
+			name:      "old message, provisional previous miss: confirmed",
+			previous:  provisional,
+			timestamp: old,
+			want:      true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isConfirmedAssetNotFound(tt.previous, tt.timestamp, now))
+		})
+	}
 }

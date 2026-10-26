@@ -15,7 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/circleback"
 	"go.kenn.io/msgvault/internal/granola"
-	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
 type cacheRefreshCirclebackSource struct {
@@ -46,10 +46,7 @@ func TestCacheNeedsBuild_CirclebackRefresh(t *testing.T) {
 	dbPath := filepath.Join(tmp, "msgvault.db")
 	analyticsDir := filepath.Join(tmp, "analytics")
 
-	st, err := store.Open(dbPath)
-	require.NoError(err)
-	require.NoError(st.InitSchema())
-	t.Cleanup(func() { _ = st.Close() })
+	st := testutil.NewSQLiteTestStoreAt(t, dbPath)
 
 	organizer := circleback.Attendee{Name: "Alice", Email: "alice@example.com"}
 	source := &cacheRefreshCirclebackSource{meeting: circleback.Meeting{
@@ -133,17 +130,14 @@ func TestCacheNeedsBuild_CirclebackRefresh(t *testing.T) {
 	assert.Equal("Refreshed Meeting", cachedSubject)
 }
 
-func TestCacheNeedsBuild_SupersededCirclebackRunWithoutCheckpoint(t *testing.T) {
+func TestCacheNeedsBuild_FailedCirclebackRunWithoutCheckpoint(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	tmp := t.TempDir()
 	dbPath := filepath.Join(tmp, "msgvault.db")
 	analyticsDir := filepath.Join(tmp, "analytics")
 
-	st, err := store.Open(dbPath)
-	require.NoError(err)
-	require.NoError(st.InitSchema())
-	t.Cleanup(func() { _ = st.Close() })
+	st := testutil.NewSQLiteTestStoreAt(t, dbPath)
 
 	organizer := circleback.Attendee{Name: "Alice", Email: "alice@example.com"}
 	source := &cacheRefreshCirclebackSource{meeting: circleback.Meeting{
@@ -169,8 +163,7 @@ func TestCacheNeedsBuild_SupersededCirclebackRunWithoutCheckpoint(t *testing.T) 
 		WHERE source_message_id = 'meeting:failed-refresh-1'
 	`)
 	require.NoError(err)
-	_, err = st.StartSync(first.SourceID, circleback.SourceType)
-	require.NoError(err, "starting the replacement run supersedes the abandoned run")
+	require.NoError(st.FailSync(abandonedRunID, "worker stopped"))
 
 	var status string
 	var additions, updates int64
@@ -185,7 +178,7 @@ func TestCacheNeedsBuild_SupersededCirclebackRunWithoutCheckpoint(t *testing.T) 
 	staleness := cacheNeedsBuild(dbPath, analyticsDir)
 	require.True(staleness.NeedsBuild, "zero-counter failed run must invalidate cache: %+v", staleness)
 	require.True(staleness.FullRebuild, "failed-run progress requires a full rebuild: %+v", staleness)
-	require.Contains(staleness.Reason, "failed sync")
+	require.Contains(staleness.Reason, "interrupted sync")
 
 	rebuilt, err := buildCache(dbPath, analyticsDir, false)
 	require.NoError(err)
@@ -267,10 +260,7 @@ func TestCacheNeedsBuild_GranolaRefresh(t *testing.T) {
 	server := httptest.NewServer(api)
 	t.Cleanup(server.Close)
 
-	st, err := store.Open(dbPath)
-	require.NoError(err)
-	require.NoError(st.InitSchema())
-	t.Cleanup(func() { _ = st.Close() })
+	st := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	imp := granola.NewImporter(st, granola.NewClient(server.URL, "grn_testkey"))
 	first, err := imp.Import(context.Background(), granola.ImportOptions{Identifier: "alice@example.com"})
 	require.NoError(err)

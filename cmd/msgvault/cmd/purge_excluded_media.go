@@ -14,8 +14,10 @@ import (
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/attachmentpolicy"
+	"go.kenn.io/msgvault/internal/chatwoot"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/twilio"
 )
 
 const (
@@ -25,15 +27,34 @@ const (
 )
 
 type purgeExcludedMediaDeps struct {
+	bind       func(context.Context) purgeExcludedMediaDeps
 	openStore  func() (*store.Store, func(), error)
 	config     func() *config.Config
 	removeFile func(string) error
 }
 
-func defaultPurgeExcludedMediaDeps() purgeExcludedMediaDeps {
+func defaultPurgeExcludedMediaDeps(contexts ...context.Context) purgeExcludedMediaDeps {
+	if len(contexts) > 0 {
+		deps := defaultPurgeExcludedMediaDeps()
+		if deps.bind != nil {
+			return deps.bind(contexts[0])
+		}
+	}
 	return purgeExcludedMediaDeps{
-		openStore:  openWritableStoreAndInitForIngest,
-		config:     func() *config.Config { return cfg },
+		bind: func(ctx context.Context) purgeExcludedMediaDeps {
+			deps := defaultPurgeExcludedMediaDeps()
+			if state := invocationFromContext(ctx); state != nil && state.cfg != nil {
+				deps.config = func() *config.Config { return state.cfg }
+				deps.openStore = func() (*store.Store, func(), error) {
+					return openWritableStoreAndInitForIngestInvocation(state)
+				}
+			}
+			return deps
+		},
+		openStore: func() (*store.Store, func(), error) {
+			return nil, nil, errors.New("configuration is unavailable")
+		},
+		config:     func() *config.Config { return nil },
 		removeFile: os.Remove,
 	}
 }
@@ -84,6 +105,9 @@ Applying the purge requires an interactive confirmation or --yes. This command
 never deletes media from a provider.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if invocationFromContext(cmd.Context()) != nil && deps.bind != nil {
+				deps = deps.bind(cmd.Context())
+			}
 			dryRun, err := cmd.Flags().GetBool("dry-run")
 			if err != nil {
 				return fmt.Errorf("read --dry-run flag: %w", err)
@@ -191,7 +215,7 @@ func mediaPolicyForSource(cfg *config.Config, sourceType, identifier string) (at
 	switch sourceType {
 	case sourceTypeBeeper:
 		return cfg.Beeper.MediaPolicy(identifier), true
-	case sourceTypeSlack:
+	case sourceTypeSlack, sourceTypeSlackdump:
 		teamID, _, ok := splitSlackIdentifier(identifier)
 		if !ok {
 			return attachmentpolicy.Policy{}, false
@@ -201,6 +225,23 @@ func mediaPolicyForSource(cfg *config.Config, sourceType, identifier string) (at
 		return cfg.Discord.MediaPolicy(identifier), true
 	case sourceTypeTeams:
 		return cfg.Teams.MediaPolicy(identifier), true
+	case chatwoot.SourceType:
+		baseURL, accountID, _, ok := chatwoot.ParseSourceIdentifier(identifier)
+		if ok {
+			for _, source := range cfg.Chatwoot {
+				canonical, err := chatwoot.CanonicalURL(source.URL)
+				if err == nil && canonical == baseURL && source.AccountID == accountID {
+					return source.MediaPolicy(), true
+				}
+			}
+		}
+		return attachmentpolicy.Policy{}, false
+	case twilio.SourceType:
+		source := cfg.GetTwilioSource(identifier)
+		if source == nil {
+			return attachmentpolicy.Policy{}, false
+		}
+		return source.MediaPolicy(), true
 	default:
 		return attachmentpolicy.Policy{}, false
 	}
@@ -277,6 +318,52 @@ func writeExcludedMediaPlan(out io.Writer, plan excludedMediaPlan, dryRun bool) 
 	}
 }
 
+type attachmentFileCandidate struct {
+	path string
+	hash string
+}
+
+type attachmentSweepCounts struct {
+	removed, missing, preserved int
+}
+
+func sweepAttachmentCandidates(ctx context.Context, st *store.Store, attachmentsDir string, candidates []attachmentFileCandidate, removeFile func(string) error) (counts attachmentSweepCounts, err error) {
+	cleanDir, err := filepath.Abs(attachmentsDir)
+	if err != nil {
+		return counts, fmt.Errorf("resolve attachments directory: %w", err)
+	}
+	var cleanupErrors []error
+	for _, candidate := range candidates {
+		if err := ctx.Err(); err != nil {
+			return counts, errors.Join(append(cleanupErrors, err)...)
+		}
+		absPath := filepath.Join(cleanDir, candidate.path)
+		rel, err := filepath.Rel(cleanDir, absPath)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("attachment path %q escapes attachments directory", candidate.path))
+			continue
+		}
+		referenced, err := st.AttachmentBlobReferenced(ctx, candidate.hash, candidate.path)
+		if err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("check attachment %s: %w", candidate.path, err))
+			continue
+		}
+		if referenced {
+			counts.preserved++
+			continue
+		}
+		switch err := removeFile(absPath); {
+		case err == nil:
+			counts.removed++
+		case errors.Is(err, os.ErrNotExist):
+			counts.missing++
+		default:
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("remove unreferenced attachment %s: %w", candidate.path, err))
+		}
+	}
+	return counts, errors.Join(cleanupErrors...)
+}
+
 func sweepUnreferencedLooseMedia(
 	ctx context.Context, st *store.Store, attachmentsDir string, removeFile func(string) error,
 ) (int, error) {
@@ -303,31 +390,22 @@ func sweepUnreferencedLooseMedia(
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("scan attachment directory %s: %w", prefix, err))
 			continue
 		}
+		var candidates []attachmentFileCandidate
 		for _, blobEntry := range blobEntries {
-			if err := ctx.Err(); err != nil {
-				return removed, errors.Join(append(cleanupErrors, err)...)
-			}
 			hash := blobEntry.Name()
 			storagePath := prefix + "/" + hash
 			if !blobEntry.Type().IsRegular() || !isCanonicalAttachmentPath(storagePath, hash) {
 				continue
 			}
-			referenced, err := st.AttachmentBlobReferenced(ctx, hash, storagePath)
-			if err != nil {
-				cleanupErrors = append(cleanupErrors, fmt.Errorf("check attachment %s: %w", storagePath, err))
-				continue
-			}
-			if referenced {
-				continue
-			}
-			err = removeFile(filepath.Join(dirPath, hash))
-			if err != nil && !errors.Is(err, os.ErrNotExist) {
-				cleanupErrors = append(cleanupErrors, fmt.Errorf("remove unreferenced attachment %s: %w", storagePath, err))
-				continue
-			}
-			if err == nil {
-				removed++
-			}
+			candidates = append(candidates, attachmentFileCandidate{path: storagePath, hash: hash})
+		}
+		counts, err := sweepAttachmentCandidates(ctx, st, attachmentsDir, candidates, removeFile)
+		removed += counts.removed
+		if err != nil {
+			cleanupErrors = append(cleanupErrors, err)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil && errors.Is(err, ctxErr) {
+			return removed, errors.Join(cleanupErrors...)
 		}
 	}
 	return removed, errors.Join(cleanupErrors...)

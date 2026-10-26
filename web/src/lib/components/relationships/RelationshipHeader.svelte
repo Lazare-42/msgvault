@@ -1,11 +1,18 @@
 <script lang="ts">
+  import { untrack } from 'svelte';
+  import CopyIcon from '@lucide/svelte/icons/copy';
   import XIcon from '@lucide/svelte/icons/x';
-  import { Button, IconButton } from '@kenn-io/kit-ui';
+  import { Button, IconButton, SegmentedControl, copyToClipboard } from '@kenn-io/kit-ui';
 
   import type { APIClient } from '../../api/client';
+  import type { PersonAttributeGroup } from '../../api/generated/models';
   import type { DomainSummary, PersonSummary } from '../../explore/models';
-  import type { LinkOutcome } from '../../relationships/controller.svelte';
+  import type { LinkOutcome, RelationshipsMergeContext } from '../../relationships/controller.svelte';
+  import { identityChipText } from '../../relationships/identity-chip';
+  import type { PersonMergeSuccess, ValidatedPersonMergeRequired } from '../../directory/person-merge';
   import IdentityAvatar from '../common/IdentityAvatar.svelte';
+  import AttributeSummary from '../directory/AttributeSummary.svelte';
+  import PersonBindingConflictModal from '../directory/PersonBindingConflictModal.svelte';
   import LinkIdentityDialog from './LinkIdentityDialog.svelte';
 
   const STALE_CACHE_MESSAGE =
@@ -19,6 +26,12 @@
     client: APIClient;
     onLinkParticipants: (a: number, b: number) => Promise<LinkOutcome>;
     onUnlinkParticipants: (a: number, b: number) => Promise<LinkOutcome>;
+    onOpenDirectory?: (participantID: number) => void;
+    capturePersonMergeContext?: () => RelationshipsMergeContext;
+    onReconcilePersonMerge?: (context: RelationshipsMergeContext) => Promise<void>;
+    onOpenDirectoryPerson?: (personID: number) => void;
+    loadAttributes?: (personID: number) => Promise<PersonAttributeGroup[]>;
+    onAnnounce?: (message: string) => void;
   }
 
   let {
@@ -28,18 +41,29 @@
     onFilesToggle,
     client,
     onLinkParticipants,
-    onUnlinkParticipants
+    onUnlinkParticipants,
+    onOpenDirectory = undefined,
+    capturePersonMergeContext = undefined,
+    onReconcilePersonMerge = undefined,
+    onOpenDirectoryPerson = undefined,
+    loadAttributes = undefined,
+    onAnnounce = undefined
   }: Props = $props();
 
   type LinkMutation = { kind: 'link' | 'unlink'; a: number; b: number };
 
-  let dialogOpen = $state(false);
+  type ActiveDialog =
+    | { kind: 'link'; context?: RelationshipsMergeContext }
+    | { kind: 'merge'; context?: RelationshipsMergeContext; conflict: ValidatedPersonMergeRequired };
+  let activeDialog = $state<ActiveDialog>();
   let staleBanner = $state<'identity_cache_stale' | null>(null);
   let lastMutation = $state<LinkMutation | null>(null);
   let retrying = $state(false);
   let confirmingParticipantID = $state<number | null>(null);
   let unlinking = $state(false);
   let unlinkError = $state<string | null>(null);
+  let identitiesOpen = $state(false);
+  let attributeGroups = $state<PersonAttributeGroup[]>([]);
 
   function isPersonDetail(value: PersonSummary | DomainSummary): value is PersonSummary {
     return 'identifiers' in value;
@@ -61,7 +85,8 @@
 
   function formatDate(value: string): string {
     const date = new Date(value);
-    return Number.isNaN(date.valueOf()) ? value : date.toLocaleDateString();
+    if (Number.isNaN(date.valueOf())) return value;
+    return date.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
   }
 
   /** Cluster members (from PersonCluster.member_ids) with no row in
@@ -74,6 +99,19 @@
     const known = new Set((detail.identifiers ?? []).map((identifier) => identifier.participant_id));
     return (detail.cluster.member_ids ?? []).filter((id) => id !== detail.id && !known.has(id));
   });
+  const identityCount = $derived(
+    detail && isPersonDetail(detail) ? (detail.identifiers ?? []).length + unrepresentedMembers.length : 0
+  );
+  const forceIdentitiesOpen = $derived(confirmingParticipantID !== null || unlinkError !== null);
+
+  function handleIdentitiesToggle(event: Event): void {
+    const disclosure = event.currentTarget as HTMLDetailsElement;
+    if (forceIdentitiesOpen) {
+      disclosure.open = true;
+      return;
+    }
+    identitiesOpen = disclosure.open;
+  }
 
   /** A single identity with nothing linked has nothing to explain — the
    * identities section only appears once there are at least two identities,
@@ -98,19 +136,54 @@
     return parts.join(' · ');
   }
 
+  function memberFor(participantID: number) {
+    return detail && isPersonDetail(detail)
+      ? detail.cluster?.members?.find((member) => member.participant_id === participantID) : undefined;
+  }
+
+  function edgesFor(participantID: number) {
+    return detail && isPersonDetail(detail)
+      ? (detail.cluster?.edges ?? []).filter((edge) => edge.participant_a === participantID || edge.participant_b === participantID)
+      : [];
+  }
+
+  async function copyIdentifier(value: string): Promise<void> {
+    const copied = await copyToClipboard(value);
+    onAnnounce?.(copied ? 'Identity copied' : 'Could not copy identity');
+  }
+
   // Navigating to a different person must not leave behind a stale banner
   // (or its Retry) bound to the previous cluster's IDs, and must not leave
   // a pending unlink confirm open on a chip that no longer belongs to the
   // now-open detail.
   let lastPersonID: number | null = null;
+  let profileID = $state<number>();
   $effect(() => {
-    const currentID = detail && isPersonDetail(detail) ? detail.id : null;
+    // Reloads briefly clear detail; keep the current person's UI state.
+    if (!detail) return;
+    profileID = isPersonDetail(detail) ? detail.profile?.id : undefined;
+    const currentID = isPersonDetail(detail) ? detail.id : null;
     if (currentID === lastPersonID) return;
     lastPersonID = currentID;
     staleBanner = null;
     lastMutation = null;
     confirmingParticipantID = null;
     unlinkError = null;
+    activeDialog = undefined;
+    identitiesOpen = false;
+  });
+
+  $effect(() => {
+    const id = profileID;
+    attributeGroups = [];
+    if (!id) return;
+    let cancelled = false;
+    void untrack(() => loadAttributes?.(id))
+      ?.then((groups) => { if (!cancelled) attributeGroups = groups; })
+      .catch(() => {
+        // This summary is best-effort; failed requests leave it empty.
+      });
+    return () => { cancelled = true; };
   });
 
   // ok/ready clears any earlier stale banner; ok/stale (re)raises it and
@@ -136,6 +209,25 @@
     // for whoever is showing now with a result that was never about them.
     if (currentPersonID() === id) applyOutcome(outcome, 'link', id, participantID);
     return outcome;
+  }
+
+  function openLinkDialog(): void {
+    activeDialog = { kind: 'link', context: capturePersonMergeContext?.() };
+  }
+
+  function resolveMerge(conflict: ValidatedPersonMergeRequired): void {
+    if (activeDialog?.kind !== 'link') return;
+    activeDialog = { kind: 'merge', context: activeDialog.context, conflict };
+  }
+
+  function completeMerge(success: PersonMergeSuccess): void {
+    if (activeDialog?.kind !== 'merge') return;
+    const context = activeDialog.context;
+    activeDialog = undefined;
+    const name = success.survivor.display_name?.trim() || `Person ${success.survivor.id}`;
+    onAnnounce?.(`People merged into ${name}. Identity cache ${success.result.cache_state}.`);
+    if (context && onReconcilePersonMerge) void onReconcilePersonMerge(context);
+    onOpenDirectoryPerson?.(success.survivor.id);
   }
 
   async function retryRefresh(): Promise<void> {
@@ -222,24 +314,25 @@
         size={36}
       />
       <h2>{displayLabel(detail)}</h2>
-      <div class="actions">
-        <Button
-          label={`Files ${detail.file_count}`}
-          ariaLabel={`Files ${detail.file_count}`}
-          surface={filesOpen ? 'solid' : 'outline'}
-          tone={filesOpen ? 'info' : 'neutral'}
-          ariaExpanded={filesOpen}
-          onclick={() => onFilesToggle(!filesOpen)}
-        />
-        {#if isPersonDetail(detail)}
+      {#if isPersonDetail(detail)}
+        <div class="actions" role="group" aria-label="Person actions">
+          {#if onOpenDirectory || (detail.profile?.id && onOpenDirectoryPerson)}
+            <Button
+              label="Open in Directory"
+              surface="outline"
+              onclick={() => detail.profile?.id && onOpenDirectoryPerson
+                ? onOpenDirectoryPerson(detail.profile.id)
+                : onOpenDirectory?.(detail.id)}
+            />
+          {/if}
           <Button
             label="Same person…"
             ariaLabel="Same person…"
             surface="outline"
-            onclick={() => (dialogOpen = true)}
+            onclick={openLinkDialog}
           />
-        {/if}
-      </div>
+        </div>
+      {/if}
     </div>
     {#if staleBanner === 'identity_cache_stale'}
       <section class="named-state" role="alert">
@@ -247,27 +340,73 @@
         <Button label="Retry" surface="outline" size="sm" disabled={retrying} onclick={() => void retryRefresh()} />
       </section>
     {/if}
-    <p class="counts" data-mono>
-      {detail.activity_count.toLocaleString()} items · {detail.file_count.toLocaleString()} files ·
+    <div class="view-row">
+      <SegmentedControl
+        ariaLabel="Relationship view"
+        value={filesOpen ? 'files' : 'messages'}
+        options={[
+          { value: 'messages', label: 'Messages' },
+          { value: 'files', label: `Files ${detail.file_count.toLocaleString()}` }
+        ]}
+        onchange={(value) => onFilesToggle(value === 'files')}
+      />
+    </div>
+    <p class="counts">
+      {detail.activity_count.toLocaleString()} items ·
       {formatDate(detail.first_at)} – {formatDate(detail.last_at)}
       {#if !isPersonDetail(detail)}
         · {detail.person_count.toLocaleString()} people
       {/if}
     </p>
+    {#if isPersonDetail(detail) && detail.profile?.id}
+      <AttributeSummary
+        groups={attributeGroups}
+        onEdit={onOpenDirectoryPerson ? () => onOpenDirectoryPerson(detail.profile!.id) : undefined}
+      />
+    {/if}
     {#if isPersonDetail(detail) && showIdentities}
-      <span class="identity-label" data-section-label>Identities</span>
-      <div class="identifiers" aria-label="Linked identities">
+      {#key detail.id}
+      <details class="identities" open={identitiesOpen || forceIdentitiesOpen} ontoggle={handleIdentitiesToggle}>
+        <summary data-section-label>Identities ({identityCount})</summary>
+        <div class="identifiers" aria-label="Linked identities">
         {#each detail.identifiers ?? [] as identifier (`${identifier.participant_id}:${identifier.type}:${identifier.value}`)}
           {@const isOtherMember = !!detail.cluster && identifier.participant_id !== detail.id}
-          {@const chipName = identifier.display_value?.trim() || identifier.value}
-          <span class="chip" aria-label={`Identity ${chipName}`} title={identifierTooltip(identifier)}>
-            {#if identifier.display_value?.trim() && identifier.display_value.trim() !== identifier.value}
+          {@const opaque = identifier.type !== 'email' && identifier.type !== 'phone'}
+          {@const edges = isOtherMember ? edgesFor(identifier.participant_id) : []}
+          {@const member = memberFor(identifier.participant_id)}
+          {@const text = identityChipText(identifier, member, edges)}
+          {@const memberName = identifier.participant_display_name || member?.display_name}
+          {@const chipName = opaque
+            ? `${text.title} identifier for ${memberName ? `${memberName} (profile ${identifier.participant_id})` : `profile ${identifier.participant_id}`}`
+            : identifier.display_value?.trim() || identifier.value}
+          {@const relation = isOtherMember ? (edges.some((edge) => edge.link_origin) ? '' : 'linked') : 'this profile'}
+          <span class="chip" class:two-actions={isOtherMember && confirmingParticipantID !== identifier.participant_id} aria-label={`Identity ${chipName}`} title={opaque ? `${text.detail} · ${identifierTooltip(identifier)}` : identifierTooltip(identifier)}>
+            {#if !opaque && identifier.display_value?.trim() && identifier.display_value.trim() !== identifier.value}
               <span class="chip-display">{identifier.display_value}</span>
             {/if}
-            <strong data-mono>{identifier.value}</strong>
-            <small>{isOtherMember ? 'linked' : 'this profile'}</small>
-            {#if isOtherMember}
-              {#if confirmingParticipantID === identifier.participant_id}
+            <strong>{text.title}</strong>
+            <small>{[text.subtitle, relation].filter(Boolean).join(' · ')}</small>
+            <span class="chip-actions">
+              <IconButton
+                size="sm"
+                ariaLabel={opaque ? `Copy ${chipName}` : `Copy ${identifier.value}`}
+                onclick={() => void copyIdentifier(identifier.value)}
+              >
+                <CopyIcon size="12" aria-hidden="true" />
+              </IconButton>
+              {#if isOtherMember && confirmingParticipantID !== identifier.participant_id}
+                <IconButton
+                  class="chip-unlink"
+                  size="sm"
+                  tone="danger"
+                  ariaLabel={`Unlink ${chipName}`}
+                  onclick={() => startUnlink(identifier.participant_id)}
+                >
+                  <XIcon size="12" aria-hidden="true" />
+                </IconButton>
+              {/if}
+            </span>
+            {#if isOtherMember && confirmingParticipantID === identifier.participant_id}
                 <span class="chip-confirm" role="group" aria-label={`Confirm unlinking ${chipName}`}>
                   <span>Not the same person?</span>
                   <Button
@@ -280,26 +419,18 @@
                   />
                   <Button label="Cancel" surface="soft" size="sm" disabled={unlinking} onclick={cancelUnlink} />
                 </span>
-              {:else}
-                <IconButton
-                  class="chip-unlink"
-                  size="sm"
-                  tone="danger"
-                  ariaLabel={`Unlink ${chipName}`}
-                  onclick={() => startUnlink(identifier.participant_id)}
-                >
-                  <XIcon size="12" aria-hidden="true" />
-                </IconButton>
-              {/if}
             {/if}
           </span>
         {/each}
         {#each unrepresentedMembers as memberID (memberID)}
-          <span class="chip" aria-label={`Linked profile ${memberID}`}>
-            <strong>Linked profile</strong>
-            <small>linked · no stored address</small>
+          {@const member = memberFor(memberID)}
+          {@const text = identityChipText(undefined, member, edgesFor(memberID))}
+          {@const chipName = `profile ${member?.display_name ? `${text.title} (${memberID})` : member?.email || member?.phone || memberID}`}
+          <span class="chip" aria-label={`Linked ${chipName}`}>
+            <strong>{text.title}</strong>
+            <small>{text.subtitle}</small>
             {#if confirmingParticipantID === memberID}
-              <span class="chip-confirm" role="group" aria-label={`Confirm unlinking profile ${memberID}`}>
+              <span class="chip-confirm" role="group" aria-label={`Confirm unlinking ${chipName}`}>
                 <span>Not the same person?</span>
                 <Button
                   label="Unlink"
@@ -316,7 +447,7 @@
                 class="chip-unlink"
                 size="sm"
                 tone="danger"
-                ariaLabel={`Unlink profile ${memberID}`}
+                ariaLabel={`Unlink ${chipName}`}
                 onclick={() => startUnlink(memberID)}
               >
                 <XIcon size="12" aria-hidden="true" />
@@ -324,18 +455,29 @@
             {/if}
           </span>
         {/each}
-      </div>
-      {#if unlinkError}
-        <p class="unlink-error" role="alert">{unlinkError}</p>
-      {/if}
+        </div>
+        {#if unlinkError}
+          <p class="unlink-error" role="alert">{unlinkError}</p>
+        {/if}
+      </details>
+      {/key}
     {/if}
-    {#if dialogOpen && isPersonDetail(detail)}
+    {#if activeDialog?.kind === 'link' && isPersonDetail(detail)}
       <LinkIdentityDialog
         {client}
         excludeID={detail.id}
         personLabel={detail.display_label}
         onConfirm={confirmLink}
-        onClose={() => (dialogOpen = false)}
+        onMergeRequired={resolveMerge}
+        onClose={() => (activeDialog = undefined)}
+      />
+    {:else if activeDialog?.kind === 'merge'}
+      <PersonBindingConflictModal
+        {client}
+        conflict={activeDialog.conflict}
+        onOpenProfile={(personID) => onOpenDirectoryPerson?.(personID)}
+        onSuccess={completeMerge}
+        onClose={() => (activeDialog = undefined)}
       />
     {/if}
   {/if}
@@ -355,7 +497,15 @@
     border-bottom: 1px solid var(--border-muted);
   }
 
-  .identity-label {
+  .identities {
+    margin-top: var(--space-2);
+  }
+
+  .identities summary {
+    cursor: pointer;
+  }
+
+  .identities .identifiers {
     margin-top: var(--space-2);
   }
 
@@ -367,12 +517,14 @@
 
   .title-row {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: var(--space-4);
+    gap: var(--space-2) var(--space-4);
   }
 
   .title-row h2 {
-    flex: 1;
+    flex: 1 1 12rem;
+    min-width: 0;
   }
 
   h2 {
@@ -389,6 +541,10 @@
     display: flex;
     flex: none;
     gap: var(--space-2);
+  }
+
+  .view-row {
+    display: flex;
   }
 
   .counts {
@@ -426,7 +582,11 @@
     border: 1px solid var(--border-muted);
     border-radius: var(--radius-sm);
     background: var(--bg-subtle);
-    padding: var(--space-2) var(--space-6) var(--space-2) var(--space-3);
+    padding: var(--space-2) 2.5rem var(--space-2) var(--space-3);
+  }
+
+  .chip.two-actions {
+    padding-right: 4.5rem;
   }
 
   .chip-display {
@@ -439,10 +599,12 @@
     font-size: var(--font-size-2xs);
   }
 
-  :global(.chip-unlink) {
+  .chip-actions {
     position: absolute;
     top: var(--space-1);
     right: var(--space-1);
+    display: flex;
+    gap: var(--space-1);
   }
 
   .chip-confirm {

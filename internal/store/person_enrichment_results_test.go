@@ -81,7 +81,7 @@ func newEnrichmentResultFixture(t *testing.T) *enrichmentResultFixture {
 		DueAt:   now,
 	}))
 	lease, err := st.ClaimWork(t.Context(), personenrichment.ClaimOptions{
-		RunID: run.ID, Owner: "result-worker", ProviderName: profile.Name,
+		RunID: run.ID, Owner: "result-worker", ProviderName: profile.Name, ProfileFingerprint: profile.Fingerprint,
 		Now: now, LeaseDuration: 5 * time.Minute,
 	})
 	require.NoError(t, err)
@@ -153,6 +153,85 @@ func newEnrichmentResultFixture(t *testing.T) *enrichmentResultFixture {
 	}
 }
 
+func TestPersonEnrichmentCatchUpDoesNotConsumeProducingAttempt(t *testing.T) {
+	require := require.New(t)
+	f := newEnrichmentResultFixture(t)
+	f.result.Claims[0].ValidUntil = new(f.now.Add(-time.Minute))
+	f.reseal(t)
+	outcome, err := f.store.CommitEnrichmentClaims(t.Context(), f.commit)
+	require.NoError(err)
+	require.Equal(personenrichment.ClaimApplied, outcome.Status)
+	count, err := f.store.EnqueueDuePersonEnrichmentContext(t.Context(), f.now, 200, []string{f.profile.Fingerprint})
+	require.NoError(err)
+	assert.Equal(t, 1, count, "a result already expired on arrival still needs an expiry lookup")
+}
+
+func TestPersonEnrichmentProfileCleanupPreservesRefresh(t *testing.T) {
+	for _, laterFailure := range []bool{false, true} {
+		t.Run("later_failure="+strconv.FormatBool(laterFailure), func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			f := newEnrichmentResultFixture(t)
+			outcome, err := f.store.CommitEnrichmentClaims(t.Context(), f.commit)
+			require.NoError(err)
+			require.Equal(personenrichment.ClaimApplied, outcome.Status)
+			refreshAt := f.now.Add(f.profile.RefreshInterval)
+			now := f.now.Add(time.Hour)
+			SetPersonEnrichmentClockForTest(f.store, func() time.Time { return now })
+			if laterFailure {
+				now = refreshAt
+				lease, err := f.store.ClaimWork(t.Context(), personenrichment.ClaimOptions{
+					RunID: f.attempt.RunID, Owner: "refresh-worker", ProviderName: f.profile.Name, ProfileFingerprint: f.profile.Fingerprint,
+					Now: now, LeaseDuration: time.Minute,
+				})
+				require.NoError(err)
+				require.NotNil(lease)
+				person, err := f.store.GetPersonContext(t.Context(), f.person.ID)
+				require.NoError(err)
+				attempt, _, err := f.store.BeginAttempt(t.Context(), lease.Token, personenrichment.AttemptStart{
+					RunID: lease.RunID, PersonID: f.person.ID, ProfileFingerprint: f.profile.Fingerprint,
+					PersonRevision: person.Revision, Trigger: lease.Trigger,
+					PayloadHash: strings.Repeat("3", 64), RequestHash: strings.Repeat("4", 64),
+				})
+				require.NoError(err)
+				require.NoError(f.store.MarkTerminal(t.Context(), attempt.Token, personenrichment.SafeFailure{
+					Class: personenrichment.FailureInvalidOutput, Message: "invalid provider output",
+				}))
+			}
+			require.NoError(f.store.CancelPersonEnrichmentWorkOutsideProfilesContext(t.Context(), nil))
+			_, err = f.store.EnsurePersonEnrichmentProfile(t.Context(), f.profile)
+			require.NoError(err)
+			require.NoError(f.store.CancelPersonEnrichmentWorkOutsideProfilesContext(t.Context(), []string{f.profile.Fingerprint}))
+			count, err := f.store.EnqueueDuePersonEnrichmentContext(t.Context(), now, 200, []string{f.profile.Fingerprint})
+			require.NoError(err)
+			work, err := f.store.ListPersonEnrichmentWorkContext(t.Context(), PersonEnrichmentWorkFilter{
+				PersonID: f.person.ID, ProfileFingerprint: f.profile.Fingerprint, Limit: 10,
+			})
+			require.NoError(err)
+			if laterFailure {
+				assert.Zero(count)
+				assert.Empty(work, "re-enabling must not replay a failed refresh")
+				return
+			}
+			require.Zero(count)
+			require.Len(work, 1)
+			assert.Equal(int64(8), work[0].TriggerMask)
+			assert.Equal("refresh:"+outcome.Generation.GenerationKey, work[0].TriggerGeneration)
+			assert.True(refreshAt.Equal(work[0].DueAt), "keep the original refresh due time")
+			count, err = f.store.EnqueueDuePersonEnrichmentContext(t.Context(), refreshAt, 200, []string{f.profile.Fingerprint})
+			require.NoError(err)
+			assert.Zero(count, "repeated catch-up must not republish the refresh")
+			lease, err := f.store.ClaimWork(t.Context(), personenrichment.ClaimOptions{
+				RunID: f.attempt.RunID, Owner: "reenabled-worker", ProviderName: f.profile.Name, ProfileFingerprint: f.profile.Fingerprint,
+				Now: refreshAt, LeaseDuration: time.Minute,
+			})
+			require.NoError(err)
+			require.NotNil(lease)
+			assert.Equal(personenrichment.TriggerRefresh, lease.Trigger.Kind)
+		})
+	}
+}
+
 func TestPersonEnrichmentSynchronousResultCommitsFromStartingAttempt(t *testing.T) {
 	requirements := require.New(t)
 	checks := assert.New(t)
@@ -209,7 +288,7 @@ func (f *enrichmentResultFixture) reseal(t *testing.T) {
 	f.commit, err = personenrichment.NewClaimCommit(personenrichment.ClaimCommitInput{
 		AttemptID: f.attempt.ID, RunID: f.attempt.RunID, PersonID: f.person.ID,
 		LeaseFence: f.attempt.Token.Fence, ProfileFingerprint: f.profile.Fingerprint,
-		ProviderNamespace: f.profile.ProviderNamespace, RequestHash: strings.Repeat("2", 64),
+		ProviderNamespace: f.profile.ProviderNamespace, RequestHash: f.attempt.RequestHash,
 		IdentityAssessment: f.commit.IdentityAssessment,
 	}, f.result, hasher)
 	require.NoError(t, err)
@@ -614,6 +693,101 @@ func TestPersonEnrichmentResultDeduplicatesMetadataAndPreservesOpaqueIDs(t *test
 	identities, err := f.store.LoadProviderPersonIDs(t.Context(), f.person.ID, f.profile.ProviderNamespace)
 	requirements.NoError(err)
 	checks.Equal([]string{"Opaque ID/Not-A-URL:MiXeD?x=1#fragment"}, identities)
+}
+
+func TestCommitEnrichmentClaimsReusesCitationAcrossAttempts(t *testing.T) {
+	checks := assert.New(t)
+	requirements := require.New(t)
+	f := newEnrichmentResultFixture(t)
+	firstAttemptID := f.attempt.ID
+	firstRetrievedAt := f.result.Citations[0].RetrievedAt
+	_, err := f.store.CommitEnrichmentClaims(t.Context(), f.commit)
+	requirements.NoError(err)
+	firstCitations, err := f.store.ListPersonEnrichmentAttemptCitationsContext(t.Context(), firstAttemptID)
+	requirements.NoError(err)
+	requirements.Len(firstCitations, 1)
+
+	now := f.now.Add(f.profile.RefreshInterval)
+	SetPersonEnrichmentClockForTest(f.store, func() time.Time { return now })
+	run, _, err := f.store.StartRun(t.Context(), personenrichment.RunStart{
+		Kind: "scheduled", RequestedBy: "citation-refresh", RequestedAt: now,
+	})
+	requirements.NoError(err)
+	lease, err := f.store.ClaimWork(t.Context(), personenrichment.ClaimOptions{
+		RunID: run.ID, Owner: "result-worker", ProviderName: f.profile.Name, ProfileFingerprint: f.profile.Fingerprint,
+		Now: now, LeaseDuration: 5 * time.Minute,
+	})
+	requirements.NoError(err)
+	requirements.NotNil(lease)
+	person, err := f.store.GetPersonContext(t.Context(), f.person.ID)
+	requirements.NoError(err)
+	f.attempt, _, err = f.store.BeginAttempt(t.Context(), lease.Token, personenrichment.AttemptStart{
+		RunID: run.ID, PersonID: person.ID, ProfileFingerprint: f.profile.Fingerprint,
+		PayloadHash: strings.Repeat("1", 64), RequestHash: strings.Repeat("3", 64),
+		PersonRevision: person.Revision, Trigger: lease.Trigger,
+	})
+	requirements.NoError(err)
+	requirements.NoError(f.store.AuthorizeAttemptDispatch(t.Context(), f.attempt.Token))
+	f.result.RequestID = "refresh-request"
+	f.result.JobID = "refresh-job"
+	f.result.Citations[0].RetrievedAt = now
+	f.result.SourceAttempts[0].ObservedAt = now
+	f.reseal(t)
+
+	outcome, err := f.store.CommitEnrichmentClaims(t.Context(), f.commit)
+	requirements.NoError(err)
+	checks.Equal(personenrichment.ClaimApplied, outcome.Status)
+	attempt, err := f.store.GetPersonEnrichmentAttemptContext(t.Context(), f.attempt.ID)
+	requirements.NoError(err)
+	checks.Equal("succeeded", attempt.State)
+	checks.Nil(attempt.LeaseUntil)
+	secondCitations, err := f.store.ListPersonEnrichmentAttemptCitationsContext(t.Context(), f.attempt.ID)
+	requirements.NoError(err)
+	checks.Equal(firstCitations, secondCitations, "reuse the citation and preserve its first retrieval time")
+	checks.Equal(int64(1), enrichmentTableCount(t, f.store, "person_enrichment_citations"))
+	checks.Equal(int64(2), enrichmentTableCount(t, f.store, "person_enrichment_attempt_citations"))
+
+	evidence, err := f.store.ListPersonFactEvidenceContext(t.Context(), person.ID, personfacts.EvidenceFilter{})
+	requirements.NoError(err)
+	recordedTimes := make([]time.Time, 0, len(evidence))
+	for _, item := range evidence {
+		recordedTimes = append(recordedTimes, item.Input.RecordedTime)
+	}
+	checks.ElementsMatch([]time.Time{firstRetrievedAt, now}, recordedTimes)
+}
+
+func TestCommitEnrichmentClaimsRejectsChangedCitationMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(*personenrichment.Citation)
+	}{
+		{"URL", func(c *personenrichment.Citation) { c.URL = "https://sources.example.test/other" }},
+		{"title", func(c *personenrichment.Citation) { c.Title = "Different title" }},
+		{"publisher", func(c *personenrichment.Citation) { c.Publisher = "Different publisher" }},
+		{"excerpt", func(c *personenrichment.Citation) { c.Excerpt = "Different excerpt" }},
+		{"published time", func(c *personenrichment.Citation) { c.PublishedAt = c.PublishedAt.Add(time.Hour) }},
+		{"missing published time", func(c *personenrichment.Citation) { c.PublishedAt = time.Time{} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			checks := assert.New(t)
+			requirements := require.New(t)
+			f := newEnrichmentResultFixture(t)
+			citation := f.result.Citations[0]
+			_, err := f.store.db.ExecContext(t.Context(), `INSERT INTO person_enrichment_citations
+				(person_id, citation_key, canonical_url, title, publisher, excerpt, published_at, retrieved_at)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, f.person.ID, citation.Key, citation.URL,
+				citation.Title, citation.Publisher, citation.Excerpt, citation.PublishedAt, citation.RetrievedAt)
+			requirements.NoError(err)
+			tc.change(&f.result.Citations[0])
+			f.reseal(t)
+
+			_, err = f.store.CommitEnrichmentClaims(t.Context(), f.commit)
+			requirements.ErrorContains(err, "citation key has different immutable metadata")
+			citations, err := f.store.ListPersonEnrichmentAttemptCitationsContext(t.Context(), f.attempt.ID)
+			requirements.NoError(err)
+			checks.Empty(citations)
+		})
+	}
 }
 
 func TestCommitEnrichmentClaimsRanksUnsupportedAggregatorEvidenceBelowThreshold(t *testing.T) {
@@ -1178,7 +1352,7 @@ func TestPersonEnrichmentResultCommitAndLeaseRenewalDoNotDeadlock(t *testing.T) 
 	select {
 	case err := <-renewDone:
 		requirements.FailNowf("lease renewal did not wait for the held commit", "%v", err)
-	case <-time.After(300 * time.Millisecond):
+	case <-time.After(300 * time.Millisecond): //nolint:kennlint // absence check: the held commit keeps the renewal waiting
 	}
 	close(releaseResult)
 

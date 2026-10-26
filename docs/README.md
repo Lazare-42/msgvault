@@ -1,15 +1,114 @@
-# msgvault Docs
+# Documentation contributor guide
 
-This directory contains the Zensical documentation project for msgvault.
+Help readers choose a workflow, complete it, and understand its limits. The
+public site has three levels; keep their responsibilities distinct.
 
-Generated and curated media are not committed on the main source branch. Use
-the docs asset scripts to hydrate `docs/assets/static/` and
-`docs/assets/generated/` from their orphan asset branches before building.
+| Source | Reader question | Owns |
+|---|---|---|
+| `website/index.html` and `website/index.md` | Why use msgvault? | Product purpose and capabilities |
+| `website/guide/index.html` and `website/guide.md` | How does an archive fit together? | The capture-to-ownership lifecycle |
+| `docs/index.md` and `docs/zensical.toml` | Where do I go next? | Task routing and navigation |
+| `docs/guides/` and `docs/usage/` | How do I do this? | Procedures, choices, and task-specific limits |
+| CLI, configuration, and API references | What is the exact contract? | Flags, fields, defaults, authorization, and errors |
+| `docs/architecture/` | How does the current system work? | Responsibilities, data flow, invariants, and backend limits |
+| `docs/changelog.md` | What changed in a release? | Release history and upgrade implications |
+| `docs/internal/` | Why was this decision made? | Engineering records, proposals, and historical plans |
 
-Common commands from the repository root:
+## Write and maintain a page
+
+- Start with the reader's outcome. Explain the smallest amount of context needed
+  to take the next step, then put detailed contracts below it or link to them.
+- Separate what works today, its limitations, and future work. A merged change
+  is not necessarily in the latest release. The [changelog](changelog.md) owns
+  release changes and upgrade notes; keep unreleased work separate from dated
+  releases. Task guides own current usage, not a second release catalog.
+- Update the owning section. Do not append a running implementation diary or
+  copy whole command catalogs into README and indexes.
+- Preserve command spelling, defaults, authorization checks, failure behavior,
+  and any active exceptions. Check changes against current commands, tests,
+  configuration types, and `api/openapi.yaml` rather than an old plan alone.
+- Keep the product and lifecycle HTML pages and their Markdown companions
+  consistent. Update `website/llms.txt` when adding a useful reader route.
+- Keep useful existing anchors when reorganizing pages, or update all incoming
+  links. Prefer relative `.md` links between docs; use `/docs/.../` in website
+  HTML and `/docs/assets/static/` or `/docs/assets/generated/` for docs media.
+
+## Living architecture and historical records
+
+Architecture pages describe the system now. Use sections for purpose, current
+capabilities, responsibilities, data flow, rules and failure behavior, and open
+decisions only when the topic needs them. A diagram can explain a relationship;
+a package inventory does not replace an explanation of who owns the data.
+
+Keep proposals and approved but unbuilt work explicitly labeled. When a design
+is implemented or superseded, link its current owning guide and mark the old
+document as a historical record. Preserve rationale, recorded approvals, and
+active exceptions, including the conditions for removing them. Do not infer
+completion or approval from a plan's existence or checkboxes.
+
+`docs/internal/` is excluded from the public site and normal user navigation.
+Its [index](internal/README.md) routes maintainers to historical material; it
+must not become a second implementation-status catalog. New work does not need
+a mandatory template or a design document unless the problem warrants one.
+
+## Build and inspect
+
+From the repository root:
 
 ```bash
 make docs-install
 make docs-build
 make docs-check
 ```
+
+The Zensical project lives here. The build puts documentation under `/docs/`
+and copies the static marketing site to `/`. `make docs-check` runs source
+validation, builds that actual layout, and checks the output and redirects.
+Use `make docs-serve` to inspect it at `http://127.0.0.1:8000`.
+
+Documentation artwork is fetched from the upstream asset branches so this fork
+can build new upstream pages without copying binary assets into main. Set
+`MSGVAULT_DOCS_ASSETS_REMOTE` to a Git remote name or URL to use custom asset
+branches instead.
+
+Every public page has a Markdown companion. The build copies documentation
+sources to matching paths such as `/docs/setup.md` and `/docs/usage/searching.md`;
+the documentation index is `/docs/index.md`. HTML pages link to their Markdown
+companions with `rel="alternate"`. Keep `website/llms.txt` linked to every public
+Markdown page. `make docs-check` verifies this coverage against the built site.
+
+Deploy with `make docs-deploy-staging` for a Vercel preview or
+`make docs-deploy` for production. Both targets pull the matching Vercel
+environment, build locally with access to `docs/` and `website/`, and upload
+the built site. Running `vercel` directly from `docs/` uploads only that
+directory, so the remote build cannot find the sibling `website/` sources.
+
+Check a representative rendered page after changing structure, navigation,
+tables, diagrams, or HTML. Inspect links, headings, and mobile line wrapping.
+For prose changes, run the existing docs checks; do not add tests that search
+for the words you just wrote.
+
+## Media
+
+Curated and generated docs media live on the `docs-assets` and
+`docs-generated-assets` orphan branches. Builds hydrate ignored
+`docs/assets/static/` and `docs/assets/generated/` directories from those
+branches. Do not commit hydrated files on the source branch.
+
+Follow the [diagram guide](diagrams/README.md) and the scripts in
+`docs/screenshots/` when changing media. The public Enron screenshot fixture
+has a narrow provenance and privacy-review exception in [AGENTS.md](../AGENTS.md);
+it does not authorize reuse in ordinary tests.
+
+Refresh the Web UI images with `make docs-web-screenshots`. The script imports
+the pinned fixture into a temporary archive, builds and starts its own daemon,
+and captures Everything and Relationships at 1920 × 1080. It keeps the normal
+build toolchain and caches. Set `MSGVAULT_DOCS_SCREENSHOT_OUTPUT_DIR` to retain
+captures outside the hydrated asset directory while reviewing them.
+
+The Web UI PNGs belong on `docs-assets`; the TUI SVGs and concept images belong
+on `docs-generated-assets`. Inspect every changed image before updating its
+branch. Capture `*-linux.png` with a Linux browser and `*-darwin.png` with a
+macOS browser. `MSGVAULT_DOCS_SCREENSHOT_PLATFORM` chooses the filenames only;
+it does not change the browser platform. Keep the fixture's provenance and
+review record on `docs-fixtures` unchanged unless the fixture itself changes.

@@ -1,0 +1,88 @@
+package cmd
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/carddav"
+	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/testutil"
+)
+
+func TestAuthorizeGoogleCardDAVValidatesEmailAndExplainsMissingSecrets(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{
+		HomeDir: dir,
+		Data:    config.DataConfig{DataDir: dir},
+		OAuth:   config.OAuthConfig{ClientSecrets: filepath.Join(dir, "missing.json")},
+	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	for _, tc := range []struct{ email, wantError string }{
+		{"person name@example.com", "invalid email address"},
+		{"Person <person@example.com>", "invalid email address"},
+		{" person@EXAMPLE.com ", "OAuth client secrets file not accessible"},
+	} {
+		t.Run(tc.email, func(t *testing.T) {
+			cmd := newAuthorizeGoogleCardDAVCmd()
+			cmd.SetContext(testCtx)
+			err := cmd.RunE(cmd, []string{tc.email})
+			require.ErrorContains(t, err, tc.wantError)
+		})
+	}
+}
+
+func TestAuthorizeGoogleCardDAVAllowsClientRotation(t *testing.T) {
+	required := require.New(t)
+	dir := t.TempDir()
+	secrets := filepath.Join(dir, "client.json")
+	required.NoError(os.WriteFile(secrets, []byte(`{"installed":{"client_id":"selected-client","client_secret":"synthetic-secret","auth_uri":"https://accounts.example/authorize","token_uri":"https://accounts.example/token","redirect_uris":["http://localhost"]}}`), 0600))
+	cfg := &config.Config{
+		HomeDir: dir,
+		Data:    config.DataConfig{DataDir: dir},
+		OAuth:   config.OAuthConfig{ClientSecrets: secrets},
+	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	mgr, err := carddav.NewGoogleOAuthManagerWithCredentials(t.Context(), config.OAuthApp{ClientSecrets: secrets}, cfg.TokensDir(), config.OAuthTokenCommands{}, "", "person@example.com", nil)
+	required.NoError(err)
+	required.NoError(os.MkdirAll(filepath.Dir(mgr.TokenPath("person@example.com")), 0700))
+	oldToken := []byte(`{"access_token":"synthetic-old-access","client_id":"previous-client","scopes":["https://www.googleapis.com/auth/carddav"]}`)
+	required.NoError(os.WriteFile(mgr.TokenPath("person@example.com"), oldToken, 0600))
+	for _, manual := range []string{"false", "true"} {
+		t.Run("manual="+manual, func(t *testing.T) {
+			required := require.New(t)
+			cmd := newAuthorizeGoogleCardDAVCmd()
+			required.NoError(cmd.Flags().Set("no-browser", manual))
+			ctx, cancel := context.WithCancel(testCtx)
+			cancel()
+			cmd.SetContext(ctx)
+			required.ErrorIs(cmd.RunE(cmd, []string{"person@example.com"}), context.Canceled)
+			unchanged, err := os.ReadFile(mgr.TokenPath("person@example.com"))
+			required.NoError(err)
+			assert.Equal(t, oldToken, unchanged)
+		})
+	}
+}
+
+func TestAuthorizeGoogleCardDAVReportsTokenStoreReadFailure(t *testing.T) {
+	required := require.New(t)
+	dir := t.TempDir()
+	secrets := filepath.Join(dir, "client.json")
+	required.NoError(os.WriteFile(secrets, []byte(`{"web":{"client_id":"synthetic-client","client_secret":"synthetic-secret","auth_uri":"https://accounts.example/authorize","token_uri":"https://accounts.example/token","redirect_uris":["http://localhost"]}}`), 0600))
+	commands := config.OAuthTokenCommands(testutil.SecretStoreFixture(t))
+	commands.ReadCommand = testutil.SecretCommand(t, "fail")
+	cfg := &config.Config{
+		HomeDir: dir,
+		Data:    config.DataConfig{DataDir: dir},
+		OAuth:   config.OAuthConfig{ClientSecrets: secrets, Tokens: commands},
+	}
+	cmd := newAuthorizeGoogleCardDAVCmd()
+	cmd.SetContext(testInvocationContext(t.Context(), cfg, invocationOptions{}))
+
+	err := cmd.RunE(cmd, []string{"person@example.com"})
+	required.ErrorContains(err, "inspect dedicated Google Contacts token")
+	required.NotContains(err.Error(), "OAuth client secrets file not accessible")
+}

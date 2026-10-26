@@ -1,8 +1,13 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -10,14 +15,51 @@ import (
 	"go.kenn.io/msgvault/internal/api"
 	"go.kenn.io/msgvault/internal/carddav"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/oauth"
 	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
-type scheduledCardDAVFixture struct{ syncs int }
+type scheduledCardDAVFixture struct {
+	syncs   int
+	options []carddav.SyncOptions
+}
 
-func (f *scheduledCardDAVFixture) Sync(context.Context, carddav.SyncOptions) (carddav.SyncResult, error) {
+func TestRecoverCardDAVSyncRunsAtStartupTerminalizesOrphansAndLogsOnlyCount(t *testing.T) {
+	require := require.New(t)
+	assertions := assert.New(t)
+	st := testutil.NewTestStore(t)
+	_, err := st.StartCardDAVSyncRunContext(t.Context(), store.CardDAVSyncRunStart{
+		AccountID: store.DefaultCardDAVAccountID,
+		Trigger:   store.CardDAVSyncTriggerScheduled,
+	})
+	require.NoError(err)
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+	require.NoError(recoverCardDAVSyncRunsAtStartup(t.Context(), st, logger))
+	runs, err := st.ListCardDAVSyncRunsContext(t.Context(), 10, nil, store.AllCardDAVAccounts)
+	require.NoError(err)
+	require.Len(runs, 1)
+	assertions.Equal(store.CardDAVSyncRunFailed, runs[0].State)
+	assertions.Equal("daemon_restarted", runs[0].ErrorCode)
+	assertions.Contains(logs.String(), "count=1")
+	assertions.NotContains(strings.ToLower(logs.String()), "error_message")
+}
+
+func TestRecoverCardDAVSyncRunsAtStartupReturnsFailure(t *testing.T) {
+	st := testutil.NewTestStore(t)
+	_, err := st.DB().Exec(`DROP TABLE carddav_sync_runs`)
+	require.NoError(t, err)
+
+	err = recoverCardDAVSyncRunsAtStartup(t.Context(), st, slog.New(slog.DiscardHandler))
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "recover CardDAV sync runs")
+}
+
+func (f *scheduledCardDAVFixture) Sync(_ context.Context, options carddav.SyncOptions) (carddav.SyncResult, error) {
 	f.syncs++
+	f.options = append(f.options, options)
 	return carddav.SyncResult{}, nil
 }
 func (f *scheduledCardDAVFixture) ListBooks(context.Context) ([]store.CardDAVAddressBook, error) {
@@ -26,15 +68,21 @@ func (f *scheduledCardDAVFixture) ListBooks(context.Context) ([]store.CardDAVAdd
 func (f *scheduledCardDAVFixture) SetBookRoles(context.Context, int64, carddav.BookRoles) error {
 	return nil
 }
-func (f *scheduledCardDAVFixture) Publication(context.Context, int64) (*store.CardDAVPublication, error) {
-	return &store.CardDAVPublication{}, nil
+func (f *scheduledCardDAVFixture) PublicationView(context.Context, int64) (*carddav.PublicationView, error) {
+	return &carddav.PublicationView{}, nil
 }
-func (f *scheduledCardDAVFixture) PublishPerson(context.Context, int64) error   { return nil }
+func (f *scheduledCardDAVFixture) PublishPerson(context.Context, int64) error { return nil }
+func (f *scheduledCardDAVFixture) PreviewPublication(context.Context, int64) (*carddav.PublicationPreview, error) {
+	return nil, nil //nolint:nilnil // scheduler fixture never previews
+}
+func (f *scheduledCardDAVFixture) PublishReviewedPerson(context.Context, int64, string) error {
+	return nil
+}
 func (f *scheduledCardDAVFixture) UnpublishPerson(context.Context, int64) error { return nil }
-func (f *scheduledCardDAVFixture) ListConflicts(context.Context) ([]store.CardDAVConflict, error) {
+func (f *scheduledCardDAVFixture) ListConflictViews(context.Context) ([]carddav.ConflictListItem, error) {
 	return nil, nil
 }
-func (f *scheduledCardDAVFixture) GetConflict(context.Context, int64) (*store.CardDAVConflict, error) {
+func (f *scheduledCardDAVFixture) GetConflictView(context.Context, int64) (*carddav.ConflictDetail, error) {
 	return nil, store.ErrCardDAVConflictNotFound
 }
 func (f *scheduledCardDAVFixture) ResolveConflict(context.Context, int64, carddav.ResolutionChoice) error {
@@ -53,22 +101,22 @@ func TestRegisterCardDAVSchedulerJobRequiresEnabledSchedule(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert := assert.New(t)
+			assertions := assert.New(t)
 			require := require.New(t)
 
 			sched := scheduler.New(nil)
 			t.Cleanup(func() { sched.Stop() })
 			service := &scheduledCardDAVFixture{}
 			logger := slog.New(slog.DiscardHandler)
-			require.NoError(reconcileCardDAVSchedulerJob(sched, tt.config, service, logger))
+			require.NoError(reconcileCardDAVSchedulerJob(sched, tt.config, service, logger, config.DefaultCardDAVConnection, nil))
 			status := sched.JobStatus()
 			if len(tt.wantStatus) == 0 {
-				assert.Empty(status)
+				assertions.Empty(status)
 				return
 			}
 			require.Len(status, 1)
-			assert.Equal(tt.wantStatus[0].Name, status[0].Name)
-			assert.Equal(tt.wantStatus[0].Schedule, status[0].Schedule)
+			assertions.Equal(tt.wantStatus[0].Name, status[0].Name)
+			assertions.Equal(tt.wantStatus[0].Schedule, status[0].Schedule)
 		})
 	}
 }
@@ -79,12 +127,73 @@ func TestRegisterCardDAVSchedulerJobSkipsUnavailableService(t *testing.T) {
 
 	require.NoError(t, reconcileCardDAVSchedulerJob(sched,
 		config.CardDAVConfig{Enabled: true, Schedule: "0 */6 * * *"}, nil,
-		slog.New(slog.DiscardHandler)))
+		slog.New(slog.DiscardHandler), config.DefaultCardDAVConnection, nil))
 	assert.False(t, sched.IsJobScheduled(api.CardDAVJobName))
 }
 
+func TestGoogleCardDAVSchedulerWaitsForAuthorization(t *testing.T) {
+	assertions := assert.New(t)
+	required := require.New(t)
+	dir := t.TempDir()
+	secrets := filepath.Join(dir, "client.json")
+	required.NoError(os.WriteFile(secrets, []byte(`{"web":{"client_id":"synthetic-client","client_secret":"synthetic-secret","redirect_uris":["https://archive.example/"]}}`), 0600))
+	cfg := config.NewDefaultConfig()
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
+	cfg.HomeDir, cfg.Data.DataDir = dir, dir
+	cfg.OAuth.ClientSecrets = secrets
+	cfg.CardDAV = config.CardDAVConfig{Provider: "google", BaseURL: carddav.GoogleDiscoveryURL, Username: "person@example.com", Enabled: true, Schedule: "0 1 * * *"}
+	required.NoError(cfg.Save())
+	st := testutil.NewTestStore(t)
+	_, _, err := st.ReplaceCardDAVDiscoveryContext(testCtx, store.CardDAVDiscoveryInput{
+		BaseURL: cfg.CardDAV.BaseURL, Username: cfg.CardDAV.Username,
+		PrincipalURL: "https://www.googleapis.com/principal/", HomeURL: "https://www.googleapis.com/contacts/",
+	})
+	required.NoError(err)
+	required.NoError(carddav.SaveCredential(cfg.TokensDir(), carddav.Credential{
+		Google: true, BaseURL: cfg.CardDAV.BaseURL, Username: cfg.CardDAV.Username, ConnectionGeneration: 1,
+	}))
+	logger := slog.New(slog.DiscardHandler)
+	controller, err := api.NewCardDAVController(cfg, st, logger)
+	required.NoError(err)
+	required.NotNil(controller.Current(), "manual operations retain a runtime that can load new credentials")
+	sched := scheduler.New(nil)
+	t.Cleanup(func() { sched.Stop() })
+	controller.SetScheduleReconciler(func(settings config.CardDAVConfig, service api.CardDAVOperations) error {
+		return reconcileCardDAVSchedulerJob(sched, settings, service, logger, config.DefaultCardDAVConnection, nil)
+	})
+	required.NoError(controller.ReconcileSchedule(t.Context()))
+	status, err := controller.Status(testCtx, "")
+	required.NoError(err)
+	assertions.Equal("google_authorization_required", status.RepairReason)
+	assertions.False(sched.IsJobScheduled(api.CardDAVJobName), "startup must skip an unauthorized Google account")
+
+	request := api.CardDAVAccountRequest{Provider: "google", Username: cfg.CardDAV.Username, Enabled: new(true), Schedule: "0 2 * * *"}
+	_, err = controller.Save(testCtx, request)
+	required.NoError(err)
+	assertions.False(sched.IsJobScheduled(api.CardDAVJobName), "schedule-only saves must also skip missing authorization")
+
+	// A CLI authorization is picked up when the account is saved again.
+	tokenPath := filepath.Join(cfg.TokensDir(), cfg.CardDAV.Username+".json")
+	token := fmt.Sprintf(`{"access_token":"synthetic-access","refresh_token":"synthetic-refresh","client_id":"synthetic-client","scopes":[%q]}`, oauth.ScopeCardDAV)
+	required.NoError(os.WriteFile(tokenPath, []byte(token), 0600))
+	request.Schedule = "0 3 * * *"
+	_, err = controller.Save(testCtx, request)
+	required.NoError(err)
+	assertions.True(sched.IsJobScheduled(api.CardDAVJobName))
+	jobs := sched.JobStatus()
+	required.Len(jobs, 1)
+	assertions.Equal(request.Schedule, jobs[0].Schedule)
+
+	required.NoError(os.Remove(tokenPath))
+	request.Schedule = "0 4 * * *"
+	_, err = controller.Save(testCtx, request)
+	required.NoError(err)
+	assertions.False(sched.IsJobScheduled(api.CardDAVJobName), "saving after credentials are removed must unschedule the account")
+}
+
 func TestReconcileCardDAVSchedulerJobUpdatesRunsAndRemovesStableJob(t *testing.T) {
-	assert := assert.New(t)
+	assertions := assert.New(t)
 	require := require.New(t)
 
 	tracker := &fakeDaemonWorkTracker{allow: true}
@@ -93,20 +202,58 @@ func TestReconcileCardDAVSchedulerJobUpdatesRunsAndRemovesStableJob(t *testing.T
 	service := &scheduledCardDAVFixture{}
 	logger := slog.New(slog.DiscardHandler)
 
-	require.NoError(reconcileCardDAVSchedulerJob(sched, config.CardDAVConfig{Enabled: true, Schedule: "0 1 * * *"}, service, logger))
+	require.NoError(reconcileCardDAVSchedulerJob(sched, config.CardDAVConfig{Enabled: true, Schedule: "0 1 * * *"}, service, logger, config.DefaultCardDAVConnection, nil))
 	require.NoError(sched.TriggerJob(api.CardDAVJobName))
-	assert.Equal(1, service.syncs)
+	assertions.Equal(1, service.syncs)
+	require.Len(service.options, 1)
+	assertions.Equal(store.CardDAVSyncTriggerScheduled, service.options[0].Trigger)
 	begin, done := tracker.counts()
-	assert.Equal(1, begin)
-	assert.Equal(1, done)
+	assertions.Equal(1, begin)
+	assertions.Equal(1, done)
 
-	require.NoError(reconcileCardDAVSchedulerJob(sched, config.CardDAVConfig{Enabled: true, Schedule: "0 2 * * *"}, service, logger))
+	require.NoError(reconcileCardDAVSchedulerJob(sched, config.CardDAVConfig{Enabled: true, Schedule: "0 2 * * *"}, service, logger, config.DefaultCardDAVConnection, nil))
 	status := sched.JobStatus()
 	require.Len(status, 1)
-	assert.Equal("0 2 * * *", status[0].Schedule)
+	assertions.Equal("0 2 * * *", status[0].Schedule)
 	require.NoError(sched.TriggerJob(api.CardDAVJobName))
-	assert.Equal(2, service.syncs)
+	assertions.Equal(2, service.syncs)
 
-	require.NoError(reconcileCardDAVSchedulerJob(sched, config.CardDAVConfig{Enabled: false, Schedule: "0 2 * * *"}, service, logger))
-	assert.False(sched.IsJobScheduled(api.CardDAVJobName))
+	require.NoError(reconcileCardDAVSchedulerJob(sched, config.CardDAVConfig{Enabled: false, Schedule: "0 2 * * *"}, service, logger, config.DefaultCardDAVConnection, nil))
+	assertions.False(sched.IsJobScheduled(api.CardDAVJobName))
+}
+
+func TestCardDAVNamedSchedulerJobsRemainIndependent(t *testing.T) {
+	assertions := assert.New(t)
+	require := require.New(t)
+
+	sched := scheduler.New(nil)
+	t.Cleanup(func() { sched.Stop() })
+	logger := slog.New(slog.DiscardHandler)
+	primary, work := &scheduledCardDAVFixture{}, &scheduledCardDAVFixture{}
+	settings := config.CardDAVConfig{Enabled: true, Schedule: "0 1 * * *"}
+	require.NoError(reconcileCardDAVSchedulerJob(sched, settings, primary, logger, config.DefaultCardDAVConnection, nil))
+	require.NoError(reconcileCardDAVSchedulerJob(sched, settings, work, logger, "work", nil))
+	require.Len(sched.JobStatus(), 2)
+	require.NoError(sched.TriggerJob("carddav:work"))
+	assertions.Equal(0, primary.syncs)
+	assertions.Equal(1, work.syncs)
+	require.Len(work.options, 1)
+	assertions.Equal(store.CardDAVSyncTriggerScheduled, work.options[0].Trigger)
+	settings.Schedule = "0 2 * * *"
+	require.NoError(reconcileCardDAVSchedulerJob(sched, settings, work, logger, "work", nil))
+	require.Len(sched.JobStatus(), 2)
+	require.NoError(sched.TriggerJob(api.CardDAVJobName))
+	assertions.Equal(1, primary.syncs)
+	for _, job := range sched.JobStatus() {
+		if job.Name == api.CardDAVJobName {
+			assertions.Equal("0 1 * * *", job.Schedule)
+		} else {
+			assertions.Equal("0 2 * * *", job.Schedule)
+		}
+	}
+	for _, settings := range []config.CardDAVConfig{{Enabled: false, Schedule: "0 2 * * *"}, {Enabled: true, Schedule: "0 2 * * *"}} {
+		require.NoError(reconcileCardDAVSchedulerJob(sched, settings, nil, logger, "work", nil))
+		assertions.False(sched.IsJobScheduled("carddav:work"))
+		assertions.True(sched.IsJobScheduled(api.CardDAVJobName))
+	}
 }

@@ -4,19 +4,25 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"go.kenn.io/msgvault/internal/api"
+	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/gmail"
 	"go.kenn.io/msgvault/internal/googledocs"
 	"go.kenn.io/msgvault/internal/mailclient"
 	mcpserver "go.kenn.io/msgvault/internal/mcp"
-	"go.kenn.io/msgvault/internal/oauth"
+	"go.kenn.io/msgvault/internal/providercredentials"
+	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/vector/visual"
 	"go.kenn.io/msgvault/pkg/client/generated"
 	"google.golang.org/api/docs/v1"
@@ -30,6 +36,14 @@ var mcpHTTPAddr string
 var mcpHTTPAllowInsecure bool
 var mcpHTTPAllowWrites bool
 var mcpAllowProfileWrites bool
+var mcpAllowIdentityDecisions bool
+var mcpAllowIdentityScoring bool
+var mcpAllowPersonMerges bool
+var mcpAllowCardDAVWrites bool
+var mcpAllowKataWrites bool
+var mcpAllowCalendarWrites bool
+var serveMCPStdioWithOptions = mcpserver.ServeWithOptions
+var mcpAllowSourceWrites bool
 var serveMCPHTTPWithOptions = mcpserver.ServeHTTPWithOptions
 
 var mcpCmd = &cobra.Command{
@@ -37,13 +51,15 @@ var mcpCmd = &cobra.Command{
 	Short: "Run MCP server for Claude Desktop integration",
 	Long: `Start an MCP (Model Context Protocol) server over stdio.
 
-This allows Claude Desktop (or any MCP client) to query your email archive
-using tools like search_metadata, search_message_bodies, semantic_search_messages,
-get_message, list_messages, get_stats, aggregate, stage_deletion, and draft
-management (list, create, update, send, delete drafts).
 This allows Claude Desktop (or any MCP client) to query your archive
-using tools like search_metadata, search_message_bodies, search_document_attachments, semantic_search_messages, get_message, list_messages, get_stats,
-aggregate, and stage_deletion.
+using tools like search_metadata, search_message_bodies, search_document_attachments, semantic_search_messages, get_message, list_messages, list_thread, export_eml, get_stats,
+aggregate, get_person_agenda, list_saved_views, run_saved_view, stage_deletion,
+draft_reply, draft_compose, draft_forward, draft_get, draft_edit, draft_delete,
+draft_recover, and draft_send_as.
+Draft tools create, read, edit, delete, and recover managed drafts through the
+daemon. Msgvault never sends. With --agent-url and --agent-token-file, stdio
+exposes scoped read, draft and calendar tools and the daemon enforces the
+agent grant.
 
 Add to Claude Desktop config:
   {
@@ -52,14 +68,37 @@ Add to Claude Desktop config:
         "command": "msgvault",
         "args": ["mcp"]
       }
-	    }
-	  }`,
+      }
+    }`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		st, _, err := OpenHTTPStore(cmd.Context())
+		state := invocationFromCommand(cmd)
+		if state == nil || (state.cfg == nil && !isAgentMode(state)) {
+			return errors.New("configuration is unavailable")
+		}
+		if isAgentMode(state) && mcpHTTPAddr != "" {
+			return usageErr(cmd, errors.New("delegated MCP supports stdio only"))
+		}
+		cfg := state.cfg
+		httpAddr, inboundKey, err := prepareMCPHTTP(cmd, cfg)
+		if err != nil {
+			return usageErr(cmd, err)
+		}
+		st, info, err := OpenHTTPStore(cmd.Context())
 		if err != nil {
 			return fmt.Errorf("open daemon: %w", err)
 		}
 		defer func() { _ = st.Close() }()
+		if httpAddr != "" {
+			if !cmd.Flags().Changed("http-token-file") && !cmd.Flags().Changed("http-token-env") {
+				// Local startup may have created the key. OpenHTTPStore refreshes
+				// it after discovering or starting the daemon that owns the archive.
+				inboundKey = cfg.Server.AuthenticationKey()
+			}
+			httpAddr, err = normalizeMCPHTTPAddr(httpAddr, mcpHTTPAllowInsecure, inboundKey != "")
+			if err != nil {
+				return usageErr(cmd, err)
+			}
+		}
 
 		// Derive from cmd.Context() so signal handling installed by
 		// the cobra root command (SIGINT/SIGTERM → ctx.Done()) reaches
@@ -68,79 +107,294 @@ Add to Claude Desktop config:
 		ctx, cancel := context.WithCancel(cmd.Context())
 		defer cancel()
 
-		opts, err := daemonMCPServeOptions(ctx, st)
-		if err != nil {
-			return err
+		var opts mcpserver.ServeOptions
+		if isAgentMode(state) {
+			if opts, err = delegatedMCPServeOptions(ctx, st); err != nil {
+				return err
+			}
+		} else {
+			opts = daemonMCPServeOptions(ctx, st, state)
+		}
+		opts.AllowProfileWrites = mcpAllowProfileWrites
+		opts.AllowIdentityDecisions = mcpAllowIdentityDecisions
+		opts.AllowIdentityScoring = mcpAllowIdentityScoring
+		opts.AllowPersonMerges = mcpAllowPersonMerges
+		opts.AllowCardDAVWrites = mcpAllowCardDAVWrites
+		opts.AllowKataWrites = mcpAllowKataWrites
+		opts.AllowCalendarWrites = mcpAllowCalendarWrites
+		if mcpAllowProfileWrites {
+			opts.OperationWriteFamilies = append(opts.OperationWriteFamilies, mcpserver.OperationFamilyRecords)
+		}
+		if mcpAllowSourceWrites {
+			opts.OperationWriteFamilies = append(opts.OperationWriteFamilies, mcpserver.OperationFamilySources)
 		}
 		// Set up the live mail client factory for draft/label operations.
 		// If neither Gmail OAuth nor an IMAP account is available, the
 		// write tools are simply not exposed.
-		opts.GmailFactory = buildMailFactory(ctx, st)
-		opts.GoogleDocsFactory = buildGoogleDocsFactory()
-		opts.AllowProfileWrites = mcpAllowProfileWrites
+		if !isAgentMode(state) {
+			opts.GmailFactory = buildMailFactory(ctx, st)
+			opts.GoogleDocsFactory = buildGoogleDocsFactory(ctx)
+		}
 
-		if mcpHTTPAddr != "" {
-			normalized, err := normalizeMCPHTTPAddr(
-				mcpHTTPAddr,
-				mcpHTTPAllowInsecure,
-				cfg.Server.APIKey != "",
-			)
-			if err != nil {
-				return usageErr(cmd, err)
-			}
+		if httpAddr != "" {
 			return serveMCPHTTPWithOptions(ctx, opts, mcpserver.HTTPOptions{
-				Addr:        normalized,
-				APIKey:      cfg.Server.APIKey,
-				AllowWrites: mcpHTTPAllowWrites,
+				Addr:               httpAddr,
+				DiscoveryDirectory: filepath.Join(cfg.HomeDir, "mcp"),
+				BackendURL:         info.URL,
+				APIKey:             inboundKey,
+				AllowWrites:        mcpHTTPAllowWrites,
 			})
 		}
-		return mcpserver.ServeWithOptions(ctx, opts)
+		return serveMCPStdioWithOptions(ctx, opts)
 	},
 }
 
-func daemonMCPServeOptions(ctx context.Context, st *daemonclient.Client) (mcpserver.ServeOptions, error) {
+// prepareMCPHTTP validates inbound sources and the address without creating keys.
+// Explicit inbound sources leave the daemon's unused server credential alone.
+func prepareMCPHTTP(cmd *cobra.Command, cfg *config.Config) (string, string, error) {
+	fileSet := cmd.Flags().Changed("http-token-file")
+	envSet := cmd.Flags().Changed("http-token-env")
+	if mcpHTTPAddr == "" {
+		if fileSet || envSet || cmd.Flags().Changed("http") {
+			return "", "", errors.New("HTTP token flags require --http with an address")
+		}
+		return "", "", nil
+	}
+	var key string
+	var err error
+	var deferKeyCheck bool
+	switch {
+	case fileSet:
+		path, _ := cmd.Flags().GetString("http-token-file")
+		if path == "" {
+			return "", "", errors.New("--http-token-file must not be empty")
+		}
+		key, err = providercredentials.ReadSecretFile(path)
+	case envSet:
+		name, _ := cmd.Flags().GetString("http-token-env")
+		if name == "" {
+			return "", "", errors.New("--http-token-env must not be empty")
+		}
+		key, err = providercredentials.ResolveSecret("", "", name)
+	default:
+		err = cfg.ResolveServerKey()
+		key = cfg.Server.AuthenticationKey()
+		// A local daemon may create the default key during startup. Enforce
+		// the inbound key requirement after OpenHTTPStore has resolved it.
+		deferKeyCheck = !isRemoteModeFor(invocationFromCommand(cmd))
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("MCP inbound credential: %w", err)
+	}
+	address, err := normalizeMCPHTTPAddr(mcpHTTPAddr, mcpHTTPAllowInsecure, key != "" || deferKeyCheck)
+	return address, key, err
+}
+
+// savedViewsMinAPISchemaVersion is the first daemon API schema that runs Saved
+// Views through POST /api/v1/saved-views/{id}/run.
+const savedViewsMinAPISchemaVersion = "2.21.0"
+const personCardDAVMinAPISchemaVersion = "2.32.0"
+const identityReviewMinAPISchemaVersion = "3.0.0"
+const identityScoringMinAPISchemaVersion = "3.0.0"
+const draftsMinAPISchemaVersion = "3.0.0"
+
+// delegatedMCPServeOptions offers only the tools an agent grant can use.
+// Draft tools are the floor, so an older daemon fails instead of serving an empty msgvault.
+func delegatedMCPServeOptions(ctx context.Context, st *daemonclient.Client) (mcpserver.ServeOptions, error) {
+	health, err := st.Health(ctx)
+	if err != nil {
+		return mcpserver.ServeOptions{}, fmt.Errorf("check daemon compatibility: %w", err)
+	}
+	var schemaVersion string
+	if health != nil && health.APISchemaVersion != nil {
+		schemaVersion = *health.APISchemaVersion
+	}
+	if !daemonclient.APISchemaVersionAtLeast(schemaVersion, draftsMinAPISchemaVersion) {
+		return mcpserver.ServeOptions{}, fmt.Errorf("MCP draft tools require daemon API schema %s or newer (daemon reports %q); upgrade the daemon", draftsMinAPISchemaVersion, schemaVersion)
+	}
+	opts := mcpserver.ServeOptions{
+		Drafts: daemonMCPDraftRunner{client: st}, DraftCommands: mcpDraftCommands(true), DelegatedOnly: true,
+	}
+	if daemonclient.APISchemaVersionAtLeast(schemaVersion, daemonclient.AgentReadMinAPISchemaVersion) {
+		grant, err := st.AgentTokenSelf(ctx)
+		if err != nil {
+			return mcpserver.ServeOptions{}, fmt.Errorf("read agent grant: %w", err)
+		}
+		opts.Engine = daemonclient.NewEngineAdapter(st)
+		opts.AttachmentReader = st
+		opts.GrantPermissions = grant.Permissions
+	}
+	if daemonclient.APISchemaVersionAtLeast(schemaVersion, calendarControlMinAPISchemaVersion) {
+		opts.Calendar = st
+	}
+	return opts, nil
+}
+
+// messageTagsMinAPISchemaVersion adds native email tag reads and edits.
+const messageTagsMinAPISchemaVersion = "3.15.0"
+
+// personAgendaMinAPISchemaVersion adds live task-backed person agendas.
+const personAgendaMinAPISchemaVersion = "2.30.0"
+
+const contactRoutesMinAPISchemaVersion = "3.20.0"
+
+// archiveSQLMinAPISchemaVersion adds SQL confined to archive analytics files.
+const archiveSQLMinAPISchemaVersion = "2.31.0"
+
+// calendarControlMinAPISchemaVersion adds delegated Calendar tools.
+const calendarControlMinAPISchemaVersion = "3.1.0"
+
+// kataIssuesMinAPISchemaVersion adds Kata issues that quote archive evidence.
+const kataIssuesMinAPISchemaVersion = "3.4.0"
+
+// kataLookupMinAPISchemaVersion adds issue lookup and context reads.
+const kataLookupMinAPISchemaVersion = "3.12.0"
+const kataDocbankMinAPISchemaVersion = "3.13.0"
+
+// Schema 2.28.0 adds independent configured-lane facts to authenticated
+// health. Older health responses cannot distinguish text from visual search.
+const vectorLaneHealthMinAPISchemaVersion = "2.28.0"
+
+// Schema 2.4.0 added the visual attachment search route.
+const visualSearchMinAPISchemaVersion = "2.4.0"
+
+func daemonMCPServeOptions(ctx context.Context, st *daemonclient.Client, state *invocation) mcpserver.ServeOptions {
+	if state == nil {
+		state = invocationFromContext(ctx)
+	}
+	var cfg *config.Config
+	log := slog.New(slog.DiscardHandler)
+	if state != nil {
+		cfg = state.cfg
+		if state.logger != nil {
+			log = state.logger
+		}
+	}
 	engine := daemonclient.NewEngineAdapter(st)
 	opts := mcpserver.ServeOptions{
 		Engine:             engine,
-		AttachmentsDir:     cfg.AttachmentsDir(),
 		AttachmentReader:   st,
 		ManifestSaver:      daemonMCPManifestSaver{client: st},
 		DocumentSearcher:   st,
+		MediaSearcher:      st,
 		PersonFileSearcher: daemonMCPPersonFileSearcher{client: st},
-		OCR:                st,
-		DataDir:            cfg.Data.DataDir,
+		Drafts:             daemonMCPDraftRunner{client: st},
 	}
-	compatible, capabilityErr := st.SupportsAPISchemaVersion(ctx, peopleMinAPISchemaVersion)
+	if cfg != nil {
+		opts.AttachmentsDir = cfg.AttachmentsDir()
+		opts.DataDir = cfg.Data.DataDir
+	}
+	capabilities, discoveryErr := st.MCPCapabilities(ctx)
+	if discoveryErr != nil {
+		log.Warn("operational MCP tools disabled because daemon discovery failed", "error", discoveryErr)
+	} else {
+		backend := newDaemonMCPOperations(st, capabilities)
+		opts.Operations = backend
+		opts.OperationCapabilities = backend.capabilities()
+	}
+	health, capabilityErr := st.Health(ctx)
+	var schemaVersion string
+	if health != nil && health.APISchemaVersion != nil {
+		schemaVersion = *health.APISchemaVersion
+	}
+	if capabilityErr == nil && health != nil && health.Vector != nil &&
+		daemonclient.APISchemaVersionAtLeast(schemaVersion, vectorLaneHealthMinAPISchemaVersion) {
+		if health.Vector.TextEnabled != nil && *health.Vector.TextEnabled {
+			opts.HybridSearcher = daemonMCPHybridSearcher{client: st}
+			opts.SimilarSearcher = daemonMCPSimilarSearcher{client: st}
+		}
+		if health.Vector.VisualEnabled != nil && *health.Vector.VisualEnabled &&
+			daemonclient.APISchemaVersionAtLeast(schemaVersion, visualSearchMinAPISchemaVersion) {
+			opts.VisualSearcher = daemonMCPVisualSearcher{client: st}
+		}
+	}
+	if capabilityErr == nil && health != nil && health.Vector != nil && daemonclient.APISchemaVersionAtLeast(schemaVersion, embeddingsStatusMinAPISchemaVersion) {
+		opts.EmbeddingStatus = st
+	}
 	if capabilityErr != nil {
-		logger.Warn("people tools disabled because the daemon capability probe failed", "error", capabilityErr)
-	} else if compatible {
-		opts.PeopleBackend = daemonclient.NewPeopleBrowser(engine)
+		log.Warn("people tools disabled because the daemon capability probe failed", "error", capabilityErr)
+	} else if daemonclient.APISchemaVersionAtLeast(schemaVersion, peopleMinAPISchemaVersion) {
+		people := daemonclient.NewPeopleBrowser(engine)
+		if daemonclient.APISchemaVersionAtLeast(schemaVersion, directoryPeopleMinAPISchemaVersion) {
+			opts.DirectoryBackend = people
+		}
+		opts.PeopleBackend = people
+		if supportsNamedPromotion(capabilities) {
+			opts.PeopleBackend = daemonMCPNamedPeopleBrowser{PeopleBrowser: people, client: st}
+		}
+	}
+	if capabilityErr == nil && daemonclient.APISchemaVersionAtLeast(schemaVersion, daemonclient.ChatDiscoveryMinAPISchemaVersion) {
+		opts.ChatDiscoveryBackend = st
+	}
+	// The daemon executes Saved Views itself, so the tools need a daemon that
+	// serves the run endpoint; an older daemon simply omits them.
+	if capabilityErr != nil {
+		log.Warn("Saved View tools disabled because the daemon capability probe failed", "error", capabilityErr)
+	} else if daemonclient.APISchemaVersionAtLeast(schemaVersion, savedViewsMinAPISchemaVersion) {
+		opts.SavedViews = st
+	}
+	if capabilityErr != nil {
+		log.Warn("meeting tools disabled because the daemon capability probe failed", "error", capabilityErr)
+	} else if daemonclient.APISchemaVersionAtLeast(schemaVersion, meetingsMinAPISchemaVersion) {
+		opts.Meetings = st
+	}
+	if capabilityErr == nil && daemonclient.APISchemaVersionAtLeast(schemaVersion, calendarControlMinAPISchemaVersion) {
+		opts.Calendar = st
+	}
+	if capabilityErr == nil && daemonclient.APISchemaVersionAtLeast(schemaVersion, contactRoutesMinAPISchemaVersion) {
+		opts.ContactRoutesBackend = st
+	}
+	if capabilityErr == nil && daemonclient.APISchemaVersionAtLeast(schemaVersion, personAgendaMinAPISchemaVersion) {
+		opts.PersonAgendaBackend = st
+	}
+	if capabilityErr == nil && daemonclient.APISchemaVersionAtLeast(schemaVersion, kataIssuesMinAPISchemaVersion) {
+		opts.Kata = st
+		opts.KataLookup = daemonclient.APISchemaVersionAtLeast(schemaVersion, kataLookupMinAPISchemaVersion)
+		if daemonclient.APISchemaVersionAtLeast(schemaVersion, kataDocbankMinAPISchemaVersion) {
+			opts.KataDocbank = probeKataDocbank(ctx, st, log)
+		}
+	}
+	if capabilityErr == nil && daemonclient.APISchemaVersionAtLeast(schemaVersion, archiveSQLMinAPISchemaVersion) &&
+		(health.AnalyticsEngine == nil || *health.AnalyticsEngine != api.AnalyticsModePostgres) {
+		opts.ArchiveSQLQuerier = engine
+	}
+	if capabilityErr == nil && daemonclient.APISchemaVersionAtLeast(schemaVersion, identityReviewMinAPISchemaVersion) {
+		opts.IdentityReview = st
+	}
+	if capabilityErr == nil && daemonclient.APISchemaVersionAtLeast(schemaVersion, personCardDAVMinAPISchemaVersion) {
+		opts.PersonCardDAV = st
+	}
+	if capabilityErr == nil && daemonclient.APISchemaVersionAtLeast(schemaVersion, messageTagsMinAPISchemaVersion) {
+		opts.MessageTags = st
+	}
+	if capabilityErr == nil && daemonclient.APISchemaVersionAtLeast(schemaVersion, identityScoringMinAPISchemaVersion) {
+		opts.IdentityScoring = st
+	}
+	if capabilityErr == nil && daemonclient.APISchemaVersionAtLeast(schemaVersion, draftsMinAPISchemaVersion) {
+		opts.DraftCommands = mcpDraftCommands(false)
 	}
 
-	vectorAvailable, err := st.VectorSearchAvailable(ctx)
+	return opts
+}
+
+// probeKataDocbank reports whether the daemon can cite Docbank transcripts.
+// A failed probe leaves transcript citations out of the tool description.
+func probeKataDocbank(ctx context.Context, st *daemonclient.Client, log *slog.Logger) bool {
+	client, err := st.GeneratedClient()
 	if err != nil {
-		return mcpserver.ServeOptions{}, fmt.Errorf("check daemon vector search: %w", err)
+		log.Warn("Kata transcript citations hidden because the daemon client failed", "error", err)
+		return false
 	}
-	if vectorAvailable {
-		opts.HybridSearcher = daemonMCPHybridSearcher{client: st}
-		opts.SimilarSearcher = daemonMCPSimilarSearcher{client: st}
+	status, err := client.GetMediaSearchStatusWithResponse(ctx)
+	if err != nil {
+		log.Warn("Kata transcript citations hidden because the Docbank status probe failed", "error", err)
+		return false
 	}
-	// The daemon owns the multimodal lane; a remote-only MCP client's local
-	// config says nothing about it, so availability is probed, not assumed.
-	// The stats lane field distinguishes configured (including still
-	// initializing) from disabled, so a transient 503 during asynchronous
-	// vector init cannot permanently omit the tool — per-request errors
-	// report readiness instead. Older daemons lack the field; fall back to
-	// the visual status endpoint answering at all.
-	visualAvailable, laneReported, visualErr := st.VisualSearchAvailable(ctx)
-	if visualErr == nil && !laneReported {
-		_, statusErr := st.VisualStatus(ctx)
-		visualAvailable = statusErr == nil
+	if status.JSON200 == nil {
+		log.Warn("Kata transcript citations hidden because the Docbank status probe failed", "status", status.StatusCode)
+		return false
 	}
-	if visualErr == nil && visualAvailable {
-		opts.VisualSearcher = daemonMCPVisualSearcher{client: st}
-	}
-	return opts, nil
+	return status.JSON200.Configured
 }
 
 type daemonMCPPersonFileSearcher struct{ client *daemonclient.Client }
@@ -187,6 +441,7 @@ func (s daemonMCPHybridSearcher) SearchHybrid(
 	resp, err := s.client.GetCLIHybridSearch(ctx, daemonclient.CLIHybridSearchRequest{
 		Query:          req.Query,
 		Account:        req.Account,
+		Filter:         query.MessageFilter{AccountScopes: search.CloneAccountScopes(req.AccountScopes)},
 		Mode:           req.Mode,
 		Limit:          req.Limit,
 		Offset:         req.Offset,
@@ -226,7 +481,14 @@ func (s daemonMCPHybridSearcher) SearchHybrid(
 	return &mcpserver.HybridSearchResult{
 		Hits:          hits,
 		PoolSaturated: resp.PoolSaturated,
+		Accelerator:   resp.Accelerator,
 		HasMore:       resp.HasMore,
+		TookMS:        resp.TookMS,
+		Timings: mcpserver.HybridSearchTimings{
+			QueryEmbeddingMS: resp.Timings.QueryEmbeddingMS,
+			RetrievalMS:      resp.Timings.RetrievalMS,
+			HydrationMS:      resp.Timings.HydrationMS,
+		},
 		Generation: mcpserver.HybridGeneration{
 			ID:          resp.Generation.ID,
 			Model:       resp.Generation.Model,
@@ -246,6 +508,7 @@ func (s daemonMCPSimilarSearcher) FindSimilar(
 	req mcpserver.SimilarSearchRequest,
 ) (*mcpserver.SimilarSearchResult, error) {
 	resp, err := s.client.FindSimilarMessages(ctx, daemonclient.SimilarSearchRequest{
+		AccountScopes: search.CloneAccountScopes(req.AccountScopes),
 		MessageID:     req.MessageID,
 		Limit:         req.Limit,
 		Account:       req.Account,
@@ -286,11 +549,15 @@ func (s daemonMCPSimilarSearcher) FindSimilar(
 // (OAuth tokens, IMAP passwords, Microsoft refresh tokens or certificates)
 // live locally (cfg.TokensDir() or configured paths) and are read directly.
 func buildMailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.MailClientFactory {
-	secretsPath, secretsErr := cfg.OAuth.ClientSecretsFor("")
-	oauthConfigured := secretsErr == nil
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil {
+		return nil
+	}
+	cfg, logger := state.cfg, state.logger
+	oauthConfigured := cfg.OAuth.HasAnyConfig()
 
 	hasIMAP := false
-	if accounts, err := st.GetCLIAccounts(ctx); err == nil {
+	if accounts, _, err := st.GetCLIAccounts(ctx); err == nil {
 		for _, a := range accounts {
 			if a.Type == sourceTypeIMAP {
 				hasIMAP = true
@@ -307,7 +574,7 @@ func buildMailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.Ma
 		return nil
 	}
 
-	return func(ctx context.Context, email string) (client gmail.API, err error) {
+	return func(ctx context.Context, email string) (client gmail.LiveAPI, err error) {
 		defer func() {
 			if err != nil || client == nil {
 				return
@@ -318,8 +585,9 @@ func buildMailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.Ma
 				_ = backend.Close()
 			}
 		}()
+		ctx = withInvocation(ctx, state)
 		// Look up the account's source type and OAuth app binding via the daemon.
-		accounts, err := st.GetCLIAccounts(ctx)
+		accounts, _, err := st.GetCLIAccounts(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("lookup account %s: %w", email, err)
 		}
@@ -339,20 +607,7 @@ func buildMailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.Ma
 			return buildIMAPAPIClient(ctx, account.Email, account.SyncConfig)
 
 		case sourceTypeGmail, "":
-			if !oauthConfigured {
-				return nil, fmt.Errorf("Gmail OAuth not configured for %s: %v", email, secretsErr)
-			}
-
-			// Resolve the correct OAuth app for this account
-			appSecrets := secretsPath
-			if account.OAuthApp != "" {
-				appSecrets, err = cfg.OAuth.ClientSecretsFor(account.OAuthApp)
-				if err != nil {
-					return nil, fmt.Errorf("OAuth app %q: %w", account.OAuthApp, err)
-				}
-			}
-
-			oauthMgr, err := oauth.NewManager(appSecrets, cfg.TokensDir(), logger)
+			oauthMgr, err := loadOAuthManager(ctx, state, account.OAuthApp)
 			if err != nil {
 				return nil, fmt.Errorf("create OAuth manager: %w", err)
 			}
@@ -363,12 +618,12 @@ func buildMailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.Ma
 			}
 
 			rateLimiter := gmail.NewRateLimiter(float64(cfg.Sync.RateLimitQPS))
-			client = gmail.NewClient(tokenSource,
+			gmailClient := gmail.NewClient(tokenSource,
 				gmail.WithLogger(logger),
 				gmail.WithRateLimiter(rateLimiter),
 			)
 
-			return client, nil
+			return gmail.NewLiveClient(gmailClient), nil
 
 		default:
 			return nil, fmt.Errorf("account %s has source type %q, which does not support draft/label operations", email, account.Type)
@@ -378,27 +633,33 @@ func buildMailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.Ma
 
 // buildGoogleDocsFactory returns a GoogleDocsClientFactory for configured
 // Drive folder sources. It returns nil when no Google Docs sources are enabled.
-func buildGoogleDocsFactory() mcpserver.GoogleDocsClientFactory {
+func buildGoogleDocsFactory(ctx context.Context) mcpserver.GoogleDocsClientFactory {
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil {
+		return nil
+	}
+	cfg := state.cfg
 	sources := cfg.EnabledGoogleDocsSources()
 	if len(sources) == 0 {
 		return nil
 	}
 
 	return func(ctx context.Context) (googledocs.Client, error) {
+		ctx = withInvocation(ctx, state)
 		services := make([]googledocs.SourceServices, 0, len(sources))
 		for _, src := range sources {
 			if err := googledocs.ValidateSource(src); err != nil {
 				return nil, err
 			}
-			clientSecrets, err := cfg.OAuth.ClientSecretsFor(src.OAuthApp)
+			clientSecrets, err := cfg.OAuth.CredentialsFor(src.OAuthApp)
 			if err != nil {
 				return nil, fmt.Errorf("OAuth for google-docs source %q: %w", src.Name, err)
 			}
-			mgr, err := newGoogleDocsDriveOAuthManager(clientSecrets)
+			mgr, err := newGoogleDocsDriveOAuthManager(ctx, clientSecrets)
 			if err != nil {
 				return nil, fmt.Errorf("create OAuth manager for google-docs source %q: %w", src.Name, err)
 			}
-			if !googleDocsDriveTokenReady(mgr, src.GoogleAccount) {
+			if !googleDocsDriveTokenReady(ctx, mgr, src.GoogleAccount) {
 				return nil, fmt.Errorf("no Google Docs OAuth token with Drive/Docs scopes for %s; run 'msgvault add-google-docs-drive %s --folder-id %s --google-account %s' on a machine with browser auth first",
 					src.GoogleAccount, src.Name, src.FolderID, src.GoogleAccount)
 			}
@@ -425,27 +686,45 @@ func buildGoogleDocsFactory() mcpserver.GoogleDocsClientFactory {
 }
 
 func init() {
+	mcpCmd.AddCommand(newMCPStatusCommand())
 	rootCmd.AddCommand(mcpCmd)
 	mcpCmd.Flags().BoolVar(&mcpForceSQL, "force-sql", false, "Deprecated in 0.17.0: set [analytics].engine = \"sql\" in config.toml")
 	mcpCmd.Flags().BoolVar(&mcpNoSQLiteScanner, "no-sqlite-scanner", false, "Deprecated in 0.17.0: cache engine selection is daemon-managed")
 	mcpCmd.Flags().StringVar(&mcpHTTPAddr, "http", "",
 		"Serve over StreamableHTTP on this address (e.g. 127.0.0.1:8080) "+
 			"instead of stdio. Bare port forms (':8080', '8080') bind to "+
-			"loopback only; non-loopback hosts require [server].api_key or "+
+			"loopback only; non-loopback hosts require an inbound key or "+
 			"--http-allow-insecure.")
+	mcpCmd.Flags().String("http-token-file", "", "Read an independent inbound bearer key from an owner-only file (requires --http)")
+	mcpCmd.Flags().String("http-token-env", "", "Name the environment variable holding an inbound bearer key (requires --http; file takes priority)")
 	mcpCmd.Flags().BoolVar(&mcpHTTPAllowInsecure, "http-allow-insecure", false,
-		"Allow --http to bind a non-loopback address without [server].api_key. "+
+		"Allow --http to bind a non-loopback address without an inbound key. "+
 			"Any configured key still requires bearer authentication. Without a "+
 			"key, any reachable client can read your archive; only set this behind "+
 			"a trusted network boundary or authenticating reverse proxy.")
 	mcpCmd.Flags().BoolVar(&mcpHTTPAllowWrites, "http-allow-writes", false,
 		"Expose write-class MCP tools over HTTP. This permits attachment exports, "+
-			"deletion manifests, and profile writes separately enabled with "+
-			"--allow-profile-writes; enable it only for trusted, authenticated clients.")
+			"deletion manifests, Saved View management, managed draft writes, and profile writes separately enabled with "+
+			"--allow-profile-writes, identity decisions, identity scoring, person merges, CardDAV writes, calendar writes, source writes, and Kata issue writes enabled "+
+			"with their separate opt-ins; enable it only for trusted, authenticated clients.")
 	mcpCmd.Flags().BoolVar(&mcpAllowProfileWrites, "allow-profile-writes", false,
-		"Expose person promotion and private Notes writes. Model tool calls "+
+		"Expose person promotion, display-name editing, and private Notes writes. Model tool calls "+
 			"can persist profile data, so enable this only for sessions where the user "+
 			"has explicitly authorized profile writes.")
+	mcpCmd.Flags().BoolVar(&mcpAllowIdentityDecisions, "allow-identity-decisions", false,
+		"Expose identity match accept/reject tools. Each call requires MCP client confirmation; the client must obtain user approval.")
+	mcpCmd.Flags().BoolVar(&mcpAllowIdentityScoring, "allow-identity-scoring", false,
+		"Expose manual identity scoring that sends evidence to the fixed Jev provider. Each call requires MCP client confirmation; the client must obtain user approval.")
+	mcpCmd.Flags().BoolVar(&mcpAllowPersonMerges, "allow-person-merges", false,
+		"Expose local person merge tools. Each call requires MCP client confirmation; the client must obtain user approval.")
+	mcpCmd.Flags().BoolVar(&mcpAllowKataWrites, "allow-kata-writes", false,
+		"Expose Kata issue creation and evidence linking tools. Archive text is untrusted input; enable only when the user explicitly authorizes Kata issue writes.")
+	mcpCmd.Flags().BoolVar(&mcpAllowCardDAVWrites, "allow-carddav-writes", false,
+		"Expose CardDAV publication and sync tools. Each call requires MCP client confirmation; the client must obtain user approval.")
+	mcpCmd.Flags().BoolVar(&mcpAllowCalendarWrites, "allow-calendar-writes", false,
+		"Expose calendar event mutation tools. Calendar event text is untrusted input; enable only when the user explicitly authorizes calendar writes.")
+	mcpCmd.Flags().BoolVar(&mcpAllowSourceWrites, "allow-source-writes", false,
+		"Expose source synchronization and source policy writes. Each operation requires client confirmation; HTTP also requires --http-allow-writes.")
 	_ = mcpCmd.Flags().MarkDeprecated("force-sql", "deprecated in 0.17.0; set [analytics].engine = \"sql\" in config.toml")
 	_ = mcpCmd.Flags().MarkDeprecated("no-sqlite-scanner", "deprecated in 0.17.0; cache engine selection is daemon-managed; use [analytics].engine = \"sql\" for live SQL")
 	_ = mcpCmd.Flags().MarkHidden("force-sql")
@@ -493,7 +772,7 @@ func normalizeMCPHTTPAddr(addr string, allowInsecure, authenticated bool) (strin
 	if !authenticated && !allowInsecure {
 		return "", fmt.Errorf(
 			"--http %q: refusing to bind a non-loopback address without "+
-				"[server].api_key or --http-allow-insecure (configure an API key "+
+				"an inbound key or --http-allow-insecure (configure an API key "+
 				"for bearer authentication, or only opt into unauthenticated "+
 				"access behind a trusted network boundary)", trimmed)
 	}

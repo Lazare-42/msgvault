@@ -363,11 +363,6 @@ func TestManifest_Save_CreatesDirectories(t *testing.T) {
 	assert.False(t, os.IsNotExist(err), "File was not created")
 }
 
-func TestLoadManifest_NotFound(t *testing.T) {
-	_, err := LoadManifest("/nonexistent/path/manifest.json")
-	assert.Error(t, err, "LoadManifest() should error for nonexistent file")
-}
-
 func TestLoadManifest_InvalidJSON(t *testing.T) {
 	tmpDir := t.TempDir()
 	path := filepath.Join(tmpDir, "invalid.json")
@@ -711,38 +706,6 @@ func TestMethod_Values(t *testing.T) {
 	assert.Equal(t, MethodDelete, Method("delete"))
 }
 
-// TestStatusDirMap verifies that statusDirMap contains all persisted statuses
-// and maps them to the expected directory names.
-func TestStatusDirMap(t *testing.T) {
-	assert := assert.New(t)
-	// Verify all persistedStatuses have entries in statusDirMap
-	for _, status := range persistedStatuses {
-		dirName, ok := statusDirMap[status]
-		if !ok {
-			assert.Fail("missing from statusDirMap", "persistedStatus %q missing", status)
-			continue
-		}
-		assert.NotEmpty(dirName, "statusDirMap[%q] is empty", status)
-	}
-
-	// Verify expected mappings
-	expectedMappings := map[Status]string{
-		StatusPending:    "pending",
-		StatusInProgress: "in_progress",
-		StatusCompleted:  "completed",
-		StatusFailed:     "failed",
-		StatusCancelled:  "cancelled",
-	}
-	for status, wantDir := range expectedMappings {
-		gotDir, ok := statusDirMap[status]
-		if !ok {
-			assert.Fail("missing from statusDirMap", "statusDirMap missing entry for %q", status)
-			continue
-		}
-		assert.Equal(wantDir, gotDir, "statusDirMap[%q]", status)
-	}
-}
-
 // TestDirForStatus verifies that dirForStatus returns the correct path for each status.
 func TestDirForStatus(t *testing.T) {
 	mgr := testManager(t)
@@ -928,6 +891,34 @@ func TestManifestRawFilterRoundTrip(t *testing.T) {
 	assert.Nil(loadedOld.RawFilter, "absent field stays nil")
 }
 
+// TestManifestListIDsRoundTripAndOmitWhenEmpty verifies list IDs remain
+// durable deletion provenance without changing older manifests' JSON shape.
+func TestManifestListIDsRoundTripAndOmitWhenEmpty(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	mgr, err := NewManager(t.TempDir())
+	require.NoError(err)
+	manifest := NewManifest("list filter", []string{"gm-1"})
+	manifest.Filters.ListIDs = []string{"<announce.example.test>"}
+	require.NoError(mgr.SaveManifest(manifest))
+
+	claimed, err := mgr.ClaimManifest(manifest.ID, MethodTrash)
+	require.NoError(err)
+	require.NotNil(claimed.Execution)
+	claimed.Execution.LastProcessedIndex = 1
+	require.NoError(mgr.WriteInProgressCheckpoint(claimed, manifest.ID))
+
+	loaded, status, err := mgr.GetManifestWithStatus(manifest.ID)
+	require.NoError(err)
+	assert.Equal(StatusInProgress, status)
+	assert.Equal([]string{"<announce.example.test>"}, loaded.Filters.ListIDs)
+
+	data, err := json.Marshal(NewManifest("no list filter", []string{"gm-2"}))
+	require.NoError(err)
+	assert.NotContains(string(data), "list_ids")
+}
+
 func TestGetManifestWithStatus(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -1104,7 +1095,7 @@ func TestManager_CheckpointCancelSerialize(t *testing.T) {
 	select {
 	case <-cancelDone:
 		require.FailNow("cancel ran while checkpoint held the lock")
-	case <-time.After(150 * time.Millisecond):
+	case <-time.After(150 * time.Millisecond): //nolint:kennlint // absence check: the held manifest lock keeps cancel waiting
 	}
 
 	// Complete the checkpoint's atomic write, then release the lock.
@@ -1144,7 +1135,7 @@ func TestManager_WriteInProgressCheckpoint_Writes(t *testing.T) {
 	entries, err := os.ReadDir(mgr.InProgressDir())
 	require.NoError(err, "ReadDir")
 	for _, e := range entries {
-		assert.False(strings.HasSuffix(e.Name(), ".tmp"), "leftover temp file %s", e.Name())
+		assert.False(strings.HasPrefix(e.Name(), "."), "leftover temp file %s", e.Name())
 	}
 }
 

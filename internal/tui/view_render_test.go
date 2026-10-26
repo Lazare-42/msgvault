@@ -558,6 +558,30 @@ func TestViewFitsTerminalHeightWithBadData(t *testing.T) {
 	}
 }
 
+func TestListIDRenderingSanitizesTerminalControls(t *testing.T) {
+	assert := assert.New(t)
+	rawListID := "<a\x1b[2J@b.test>\nX\u009b"
+	wantListID := "<a@b.test> X"
+
+	model := NewBuilder().
+		WithRows(query.AggregateRow{Key: rawListID, Count: 1}).
+		WithViewType(query.ViewLists).
+		Build()
+
+	table := model.aggregateTableView()
+	assert.NotContains(table, "\x1b[2J")
+	assert.NotContains(table, "\u009b")
+	assert.Contains(stripANSI(table), wantListID)
+	assert.Equal(rawListID, model.rows[0].Key, "rendering must preserve the raw drill key")
+
+	model.level = levelDrillDown
+	model.drillViewType = query.ViewLists
+	model.drillFilter = query.MessageFilter{ListID: rawListID}
+	breadcrumb := model.buildBreadcrumb()
+	assert.Equal("LI: "+wantListID+" (by List ID)", breadcrumb)
+	assert.Equal(rawListID, model.drillFilter.ListID, "breadcrumb rendering must preserve the raw filter")
+}
+
 // TestViewFitsVariousTerminalSizes tests that View fits for common terminal sizes.
 func TestViewFitsVariousTerminalSizes(t *testing.T) {
 	sizes := []struct {
@@ -702,34 +726,19 @@ func TestFooterShowsLoadedCountWhenNoTotalUnique(t *testing.T) {
 	assert.Contains(t, footer, "1/2", "Footer when TotalUnique is not set")
 }
 
-// TestViewTypePrefixFallback verifies viewTypePrefix handles all ViewType values.
-func TestViewTypePrefixFallback(t *testing.T) {
-	// Test known view types return expected prefixes
-	tests := []struct {
-		vt       query.ViewType
-		expected string
-	}{
-		{query.ViewSenders, "S"},
-		{query.ViewRecipients, "R"},
-		{query.ViewRecipientNames, "RN"},
-		{query.ViewDomains, "D"},
-		{query.ViewLabels, "L"},
-		{query.ViewTime, "T"},
-	}
+// TestListsViewRendersDistinctHeaderAndBreadcrumb verifies that mailing-list
+// aggregation cannot be confused with Gmail Labels in the visible UI.
+func TestListsViewRendersDistinctHeaderAndBreadcrumb(t *testing.T) {
+	model := NewBuilder().
+		WithRows(query.AggregateRow{Key: "<announce.example.test>", Count: 1}).
+		WithSize(100, 20).
+		WithViewType(query.ViewLists).
+		Build()
 
-	for _, tc := range tests {
-		got := viewTypePrefix(tc.vt)
-		assert.Equal(t, tc.expected, got, "viewTypePrefix(%v)", tc.vt)
-	}
+	view := stripANSI(model.renderView())
 
-	// Test unknown view type - should return first char of String()
-	// Note: ViewType(999).String() returns "ViewType(999)" so we get "V"
-	// The "?" fallback in viewTypePrefix is defensive code for the edge case
-	// where String() returns empty, which doesn't happen with Go's stringer.
-	unknown := query.ViewType(999)
-	got := viewTypePrefix(unknown)
-	expectedFirstChar := string(unknown.String()[0]) // "V" from "ViewType(999)"
-	assert.Equal(t, expectedFirstChar, got, "viewTypePrefix(%v) first char of String()", unknown)
+	assert.Contains(t, view, "List ID")
+	assert.Equal(t, "LI", viewTypePrefix(query.ViewLists))
 }
 
 // TestDetailNavigationPrevNext verifies left/right arrow navigation in message detail view.

@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
 	"go.kenn.io/msgvault/internal/api"
+	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/operations"
 	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
@@ -68,14 +71,14 @@ func (h *vectorInitHandle) WaitTimeout(d time.Duration) bool {
 
 // CloseFeatures closes the vector backend if the init goroutine opened one.
 // Only call after WaitTimeout reports the goroutine finished.
-func (h *vectorInitHandle) CloseFeatures() {
+func (h *vectorInitHandle) CloseFeatures(logger *slog.Logger) {
 	h.mu.Lock()
 	vf := h.vf
 	h.vf = nil
 	h.mu.Unlock()
 	if vf != nil && vf.Close != nil {
 		if err := vf.Close(); err != nil {
-			logger.Warn("closing vectors.db failed", "error", err)
+			repairLogger(logger).Warn("closing vectors.db failed", "error", err)
 		}
 	}
 }
@@ -98,6 +101,13 @@ func startVectorInit(
 	openers ...visual.StreamOpener,
 ) *vectorInitHandle {
 	h := &vectorInitHandle{done: make(chan struct{})}
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil || state.logger == nil {
+		close(h.done)
+		return h
+	}
+	cfg := state.cfg
+	logger := state.logger
 	if !cfg.Vector.AnyLaneEnabled() {
 		close(h.done)
 		return h
@@ -138,6 +148,8 @@ func startVectorInit(
 		h.vf = vf
 		h.mu.Unlock()
 		if cfg.Vector.Enabled {
+			status := embeddingStatusSource{st: s, backend: vf.Backend, cfg: vf.Cfg, coverage: newEmbeddingCoverageCache(ctx, nil)}
+			apiServer.SetEmbeddingStatus(status.read, vf.Cfg.Embeddings.ETAWindow)
 			apiServer.SetVectorFeatures(
 				vf.HybridEngine, vf.PersonSearchEngine, vf.Backend, vf.Cfg,
 			)
@@ -147,9 +159,10 @@ func startVectorInit(
 			// even on daemons whose embed job never runs (empty cron,
 			// run_after_sync=false). The embed job's own per-run check remains
 			// the detection path for scheduled embeds.
-			apiServer.SetVectorScopeCheck(embedScopeDriftCheck(s, vf.Cfg.Embed.Scope.BuildScope()))
-			checkVectorIndexFreshness(ctx, apiServer, vf)
-			if err := registerEmbedJob(sched, vf, s, apiServer); err != nil {
+			apiServer.SetVectorScopeCheck(embedScopeDriftCheck(s, vf.Cfg.Embed.Scope.BuildScope(), state))
+			apiServer.SetVectorRestartFingerprint(restartVectorFingerprint(s, state))
+			checkVectorIndexFreshness(ctx, apiServer, vf, logger)
+			if err := registerEmbedJob(sched, vf, s, apiServer, cfg, logger); err != nil {
 				// Cron was validated in precheckVectorFeatures, so this is an
 				// invariant violation, not user error; vector search still works.
 				logger.Error("register embed job failed", "error", err)
@@ -167,34 +180,41 @@ func startVectorInit(
 			} else {
 				apiServer.SetVisualSearch(searchService)
 			}
-			build := func(runCtx context.Context) error {
-				if err := vf.Visual.Archive.ConsentVisualGeneration(
-					runCtx, vf.Visual.Generation.ID, vf.Visual.PolicyFingerprint); err != nil {
-					return err
-				}
-				return runVisualOnce(runCtx, vf.Visual)
-			}
-			resume := func(runCtx context.Context) error {
-				if err := requireVisualConsent(runCtx, vf.Visual); err != nil {
-					return err
-				}
-				return runVisualOnce(runCtx, vf.Visual)
-			}
-			apiServer.SetVisualOperations(build, resume, func(runCtx context.Context, messageID int64, hash string) error {
-				if err := requireVisualConsent(runCtx, vf.Visual); err != nil {
-					return err
-				}
-				if vf.Visual.ScopeCheck != nil {
-					if err := vf.Visual.ScopeCheck(runCtx); err != nil {
-						return err
+			build := func(runCtx context.Context, scope operations.PassScope) error {
+				return runVisualOperation(runCtx, vf.Visual, scope, func(ctx context.Context) (visual.WorkerResult, error) {
+					if err := vf.Visual.Archive.ConsentVisualGeneration(
+						ctx, vf.Visual.Generation.ID, vf.Visual.PolicyFingerprint); err != nil {
+						return visual.WorkerResult{}, err
 					}
-				}
-				result, err := vf.Visual.Reconciler.RetryOwner(runCtx, messageID, hash)
-				if err != nil || len(result.Work) == 0 {
-					return err
-				}
-				_, err = vf.Visual.Worker.Run(runCtx, result.Work)
-				return err
+					return runVisualOnce(ctx, vf.Visual)
+				})
+			}
+			resume := func(runCtx context.Context, scope operations.PassScope) error {
+				return runVisualOperation(runCtx, vf.Visual, scope, func(ctx context.Context) (visual.WorkerResult, error) {
+					if err := requireVisualConsent(ctx, vf.Visual); err != nil {
+						return visual.WorkerResult{}, err
+					}
+					return runVisualOnce(ctx, vf.Visual)
+				})
+			}
+			apiServer.SetVisualOperations(build, resume, func(
+				runCtx context.Context, scope operations.PassScope, messageID int64, hash string,
+			) error {
+				return runVisualOperation(runCtx, vf.Visual, scope, func(ctx context.Context) (visual.WorkerResult, error) {
+					if err := requireVisualConsent(ctx, vf.Visual); err != nil {
+						return visual.WorkerResult{}, err
+					}
+					if vf.Visual.ScopeCheck != nil {
+						if err := vf.Visual.ScopeCheck(ctx); err != nil {
+							return visual.WorkerResult{}, err
+						}
+					}
+					result, err := vf.Visual.Reconciler.RetryOwner(ctx, messageID, hash)
+					if err != nil || len(result.Work) == 0 {
+						return visual.WorkerResult{}, err
+					}
+					return vf.Visual.Worker.Run(ctx, result.Work)
+				})
 			}, func(statusCtx context.Context, includeCoverage bool) (visual.Status, error) {
 				return vf.Visual.Reconciler.Status(statusCtx, visual.ProviderUsage{}, false, includeCoverage)
 			}, func(retireCtx context.Context) error {
@@ -214,11 +234,11 @@ func startVectorInit(
 				}
 				return vf.Visual.Backend.DeleteTokens(retireCtx, visualTokens)
 			})
-			if err := registerVisualJob(sched, vf.Visual); err != nil {
+			if err := registerVisualJob(sched, vf.Visual, cfg); err != nil {
 				logger.Error("register multimodal job failed", "error", err)
 			}
 		}
-		if err := registerDocumentVectorJob(sched, vf, s); err != nil {
+		if err := registerDocumentVectorJob(sched, vf, s, state); err != nil {
 			logger.Error("register document vector job failed", "error", err)
 		}
 		logger.Info("daemon startup step complete", "step", "init_vector_backend")
@@ -249,42 +269,79 @@ func requireVisualConsent(ctx context.Context, vf *visualFeatures) error {
 	return nil
 }
 
-func runVisualOnce(ctx context.Context, vf *visualFeatures) error {
-	passErr := runVisualPass(ctx, vf)
+func runVisualOperation(
+	ctx context.Context,
+	vf *visualFeatures,
+	scope operations.PassScope,
+	execute func(context.Context) (visual.WorkerResult, error),
+) (runErr error) {
+	pass, terminal, err := beginCommandOperationPass(
+		ctx, vf.Archive, operations.KindVisualEmbedding, scope,
+	)
+	if err != nil {
+		return err
+	}
+	if terminal != nil {
+		return operations.TerminalReplayOutcome(terminal)
+	}
+	var result visual.WorkerResult
+	defer func() {
+		counters := visualEmbeddingCounters(result)
+		pass.checkpoint(ctx, counters)
+		pass.finish(ctx, counters, runErr)
+	}()
+	result, runErr = execute(ctx)
+	return runErr
+}
+
+func visualEmbeddingCounters(result visual.WorkerResult) operations.InvocationCounters {
+	return operations.InvocationCounters{
+		Attempted: result.Attempted, Succeeded: result.Succeeded,
+		Failed: result.Failed, Skipped: result.Skipped,
+	}
+}
+
+func runVisualPass(ctx context.Context, vf *visualFeatures, scope operations.PassScope) error {
+	return runVisualOperation(ctx, vf, scope, func(ctx context.Context) (visual.WorkerResult, error) {
+		return runVisualOnce(ctx, vf)
+	})
+}
+
+func runVisualOnce(ctx context.Context, vf *visualFeatures) (visual.WorkerResult, error) {
+	result, passErr := executeVisualPass(ctx, vf)
 	// The pass's own worker mutations (commit replacements, drift discards)
 	// park obsolete tokens after the opening sweep already ran; drain them
 	// now so an unscheduled installation's final pass does not leave
 	// unreachable backend vectors behind. Best-effort on a failed pass.
 	if cleanupErr := cleanupObsoleteVisualVectors(ctx, vf); cleanupErr != nil && passErr == nil {
-		return cleanupErr
+		return result, cleanupErr
 	}
-	return passErr
+	return result, passErr
 }
 
-func runVisualPass(ctx context.Context, vf *visualFeatures) error {
+func executeVisualPass(ctx context.Context, vf *visualFeatures) (visual.WorkerResult, error) {
 	if vf.ScopeCheck != nil {
 		if err := vf.ScopeCheck(ctx); err != nil {
-			return err
+			return visual.WorkerResult{}, err
 		}
 	}
 	if err := cleanupObsoleteVisualVectors(ctx, vf); err != nil {
-		return err
+		return visual.WorkerResult{}, err
 	}
 	if err := cleanupRetiredVisualGenerations(ctx, vf); err != nil {
-		return err
+		return visual.WorkerResult{}, err
 	}
 	needsFull, err := vf.Reconciler.NeedsFullReconcile(ctx)
 	if err != nil {
-		return err
+		return visual.WorkerResult{}, err
 	}
 	if needsFull {
 		result, reconcileErr := vf.Reconciler.FullReconcile(ctx)
 		if reconcileErr != nil {
-			return reconcileErr
+			return visual.WorkerResult{}, reconcileErr
 		}
 		if len(result.Work) > 0 {
-			_, err = vf.Worker.Run(ctx, result.Work)
-			return err
+			return vf.Worker.Run(ctx, result.Work)
 		}
 		// A page-bounded pass can find no work without reaching the end of
 		// the archive. Replay rejects consumers whose baseline is still
@@ -292,32 +349,31 @@ func runVisualPass(ctx context.Context, vf *visualFeatures) error {
 		// pass continue the scan.
 		stillNeedsFull, err := vf.Reconciler.NeedsFullReconcile(ctx)
 		if err != nil {
-			return err
+			return visual.WorkerResult{}, err
 		}
 		if stillNeedsFull {
-			return nil
+			return visual.WorkerResult{}, nil
 		}
 	}
 	result, err := vf.Reconciler.Replay(ctx)
 	if err != nil {
-		return err
+		return visual.WorkerResult{}, err
 	}
 	if len(result.Work) > 0 {
-		_, err = vf.Worker.Run(ctx, result.Work)
-		return err
+		return vf.Worker.Run(ctx, result.Work)
 	}
 	status, err := vf.Reconciler.Status(ctx, visual.ProviderUsage{}, false, false)
 	if err != nil {
-		return err
+		return visual.WorkerResult{}, err
 	}
 	if status.ReconciliationComplete && status.JournalLag == 0 && status.ActiveLeases == 0 &&
 		status.Stale == 0 && status.Retryable == 0 && status.Converged == status.ConvergenceTotal {
 		if _, err := vf.Reconciler.Activate(ctx); err != nil {
-			return err
+			return visual.WorkerResult{}, err
 		}
-		return cleanupRetiredVisualGenerations(ctx, vf)
+		return visual.WorkerResult{}, cleanupRetiredVisualGenerations(ctx, vf)
 	}
-	return nil
+	return visual.WorkerResult{}, nil
 }
 
 // cleanupRetiredVisualGenerations deletes retired generations' backend
@@ -386,7 +442,10 @@ func cleanupObsoleteVisualVectors(ctx context.Context, vf *visualFeatures) error
 	}
 }
 
-func registerVisualJob(sched *scheduler.Scheduler, vf *visualFeatures) error {
+func registerVisualJob(sched *scheduler.Scheduler, vf *visualFeatures, cfg *config.Config) error {
+	if cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
 	runScheduled := func(ctx context.Context) error {
 		generation, err := vf.Archive.GetVisualGeneration(ctx, vf.Generation.ID)
 		if err != nil ||
@@ -398,7 +457,8 @@ func registerVisualJob(sched *scheduler.Scheduler, vf *visualFeatures) error {
 		if consentErr := requireVisualConsent(ctx, vf); consentErr != nil {
 			return nil //nolint:nilerr // missing consent is an expected idle state, not a job failure
 		}
-		return runVisualOnce(ctx, vf)
+		return runVisualPass(ctx, vf,
+			newOperationPassScope("scheduled:visual", operations.TriggerScheduled))
 	}
 	if cfg.Vector.Multimodal.Schedule.RunAfterSync {
 		sched.SetVisualPostSyncJob(runScheduled)
@@ -421,15 +481,37 @@ func registerVisualJob(sched *scheduler.Scheduler, vf *visualFeatures) error {
 // backend errors leave the freshly-installed "ready" status untouched, since
 // those are not the "index does not match the configured embedding settings" failure this
 // status exists to expose.
-func checkVectorIndexFreshness(ctx context.Context, apiServer *api.Server, vf *vectorFeatures) {
+func checkVectorIndexFreshness(ctx context.Context, apiServer *api.Server, vf *vectorFeatures, logger *slog.Logger) {
 	_, err := resolveActiveGeneration(ctx, vf.Backend, vf.Cfg.GenerationFingerprint())
 	if !errors.Is(err, vector.ErrIndexStale) {
 		return
 	}
-	detail := err.Error() + "; if this is a one-off account-scoped generation, set matching [vector.embed.scope] accounts and restart the daemon; otherwise run `msgvault embeddings build --full-rebuild` to rebuild"
-	logger.Warn("vector index does not match configured embedding settings; vector search unavailable",
-		"detail", detail)
-	apiServer.SetVectorStale(detail)
+	detail := apiServer.MarkVectorIndexStale(ctx, err)
+	repairLogger(logger).Warn("vector index does not match configured embedding settings; vector search unavailable",
+		"error", err, "detail", detail)
+}
+
+// restartVectorFingerprint computes the text index fingerprint after a restart.
+func restartVectorFingerprint(s *store.Store, state *invocation) func(context.Context) (string, error) {
+	return func(ctx context.Context) (string, error) {
+		cfg := state.cfg
+		snapshot, err := config.ReadConfigFile(cfg.ConfigFilePath())
+		if err != nil {
+			return "", err
+		}
+		loaded, err := cfg.ReloadConfigFile(snapshot)
+		if err != nil {
+			return "", err
+		}
+		if !loaded.Vector.Enabled {
+			return "", vector.ErrNotEnabled
+		}
+		resolved, err := resolvedVectorConfig(ctx, s, loaded.Vector)
+		if err != nil {
+			return "", err
+		}
+		return resolved.GenerationFingerprint(), nil
+	}
 }
 
 // embedScopeDriftDetail is the operator-facing explanation for a latched
@@ -446,9 +528,9 @@ func embedScopeDriftDetail(resolved, initialized vector.BuildScope) string {
 // deterministically unresolvable (a configured account removed or
 // ambiguous). Transient resolution failures (a busy database) pass through
 // as errors so the preflight logs and retries them instead of latching.
-func embedScopeDriftCheck(s *store.Store, initialized vector.BuildScope) func(context.Context) (string, error) {
-	return func(context.Context) (string, error) {
-		resolved, err := configuredEmbedBuildScope(s)
+func embedScopeDriftCheck(s *store.Store, initialized vector.BuildScope, state *invocation) func(context.Context) (string, error) {
+	return func(ctx context.Context) (string, error) {
+		resolved, err := configuredEmbedBuildScope(s, state)
 		if errors.Is(err, vector.ErrScopeUnresolvable) {
 			return err.Error() + "; fix [vector.embed.scope] accounts and restart the daemon", nil
 		}
@@ -473,8 +555,12 @@ type documentVectorJobRegistrar interface {
 	SetDocumentVectorJob(job func(context.Context) error, schedule string, runAfterSync bool) error
 }
 
-func registerDocumentVectorJob(sched documentVectorJobRegistrar, vf *vectorFeatures, st *store.Store) error {
-	if cfg == nil || !cfg.Attachments.Documents.Index.Embeddings.Enabled || vf == nil || vf.DocumentBackend == nil {
+func registerDocumentVectorJob(sched documentVectorJobRegistrar, vf *vectorFeatures, st *store.Store, state *invocation) error {
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	if !cfg.Attachments.Documents.Index.Embeddings.Enabled || vf == nil || vf.DocumentBackend == nil {
 		return nil
 	}
 	limit := vf.Cfg.Embeddings.BatchSize
@@ -484,21 +570,25 @@ func registerDocumentVectorJob(sched documentVectorJobRegistrar, vf *vectorFeatu
 	if limit > 1000 {
 		limit = 1000
 	}
-	job := func(ctx context.Context) error {
+	job := invocationBoundJobRun(state, func(ctx context.Context) error {
 		return runScheduledDocumentVectorGeneration(ctx, st, vf, limit)
-	}
+	})
 	if err := sched.SetDocumentVectorJob(job, cfg.Vector.Embed.Schedule.Cron, cfg.Vector.Embed.Schedule.RunAfterSync); err != nil {
 		return fmt.Errorf("register document vector job: %w", err)
 	}
-	logger.Info("document vectors scheduled", "cron", cfg.Vector.Embed.Schedule.Cron,
+	repairLogger(state.logger).Info("document vectors scheduled", "cron", cfg.Vector.Embed.Schedule.Cron,
 		"run_after_sync", cfg.Vector.Embed.Schedule.RunAfterSync)
 	return nil
 }
 
-func registerEmbedJob(sched embedJobRegistrar, vf *vectorFeatures, s *store.Store, apiServer *api.Server) error {
-	embedJob := newSchedulerEmbedJob(vf, s)
+func registerEmbedJob(sched embedJobRegistrar, vf *vectorFeatures, s *store.Store, apiServer *api.Server, cfg *config.Config, logger *slog.Logger) error {
+	if cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	embedJob := newSchedulerEmbedJob(vf, s, logger)
+	scopeState := &invocation{cfg: cfg}
 	embedJob.ResolveBuildScope = func() (vector.BuildScope, error) {
-		return configuredEmbedBuildScope(s)
+		return configuredEmbedBuildScope(s, scopeState)
 	}
 	// Scope drift also has to reach searchers, not just the log: the
 	// installed components still match the active generation's
@@ -512,14 +602,14 @@ func registerEmbedJob(sched embedJobRegistrar, vf *vectorFeatures, s *store.Stor
 	if err := sched.SetEmbedJob(embedJob, schedule, cfg.Vector.Embed.Schedule.RunAfterSync); err != nil {
 		return fmt.Errorf("register embed job: %w", err)
 	}
-	logger.Info("embed scheduled",
+	repairLogger(logger).Info("embed scheduled",
 		"cron", schedule,
 		"run_after_sync", cfg.Vector.Embed.Schedule.RunAfterSync,
 	)
 	return nil
 }
 
-func newSchedulerEmbedJob(vf *vectorFeatures, s *store.Store) *scheduler.EmbedJob {
+func newSchedulerEmbedJob(vf *vectorFeatures, s *store.Store, logger *slog.Logger) *scheduler.EmbedJob {
 	return &scheduler.EmbedJob{
 		Worker:      vf.Runner,
 		Backend:     vf.Backend,
@@ -530,6 +620,6 @@ func newSchedulerEmbedJob(vf *vectorFeatures, s *store.Store) *scheduler.EmbedJo
 		Fingerprint:      vf.Cfg.GenerationFingerprint(),
 		BackstopInterval: vf.Cfg.Embed.BackstopInterval,
 		BuildScope:       vf.Cfg.Embed.Scope.BuildScope(),
-		Log:              logger,
+		Log:              repairLogger(logger),
 	}
 }

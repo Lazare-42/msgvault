@@ -13,6 +13,12 @@ export interface AppearanceDefaults {
   density: DensityPreference;
 }
 
+export interface SavedAppearance {
+  theme?: string;
+  density?: string;
+  defaultSearchMode?: string;
+}
+
 export interface AppearanceSnapshot extends AppearanceDefaults {
   overridden: boolean;
 }
@@ -138,6 +144,13 @@ export class AppearancePreferences {
 
 export function createAppearancePreferences(defaults: AppearanceDefaults): AppearancePreferences {
   return new AppearancePreferences(defaults);
+}
+
+export function mergeSavedAppearance(current: AppearanceDefaults, saved: SavedAppearance): AppearanceDefaults {
+  return {
+    theme: saved.theme !== undefined && isTheme(saved.theme) ? saved.theme : current.theme,
+    density: saved.density !== undefined && isDensity(saved.density) ? saved.density : current.density
+  };
 }
 
 export function rebaseVirtualScroll(scrollTop: number, previousHeight: number, nextHeight: number): number {

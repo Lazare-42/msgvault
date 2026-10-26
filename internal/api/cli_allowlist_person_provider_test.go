@@ -3,13 +3,35 @@ package api
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/peoplesweep"
 	"go.kenn.io/msgvault/internal/personenrichment"
 )
 
+func configureAPIProvider(cfg *config.Config, provider peoplesweep.ProviderConfig) {
+	cfg.People.Sweep.Provider = peoplesweep.ProviderSelection{Name: "default"}
+	cfg.People.Sweep.Providers = map[string]peoplesweep.ProviderConfig{"default": provider}
+}
+
+func completeAPIProvider(keyEnv, model string) peoplesweep.ProviderConfig {
+	return peoplesweep.ProviderConfig{
+		Protocol: peoplesweep.ProtocolOpenAIChat, Endpoint: "https://provider.example/v1",
+		Model: model, Auth: peoplesweep.AuthBearer,
+		Credential: peoplesweep.CredentialEnv, CredentialEnv: keyEnv,
+		OutputMode:          peoplesweep.OutputModeNativeJSONSchema,
+		TokenLimitParameter: "max_completion_tokens",
+		RetentionPosture:    "zero_data_retention", TrainingPosture: "no_training",
+		AllowedSources: []peoplesweep.SourceClass{peoplesweep.SourceMeetingText},
+		SourceSince:    "2025-01-01", RequestTimeout: time.Second,
+	}
+}
+
 func TestCLIRunCommandAllowedPermitsExactPersonProviderCommands(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		args []string
@@ -17,9 +39,43 @@ func TestCLIRunCommandAllowedPermitsExactPersonProviderCommands(t *testing.T) {
 	}{
 		{name: "status", args: []string{"person", "provider", "status"}, want: true},
 		{name: "status flags", args: []string{"person", "provider", "status", "--json"}, want: true},
+		{name: "named status", args: []string{"person", "provider", "status", "alpha", "--json"}, want: true},
+		{name: "list", args: []string{"person", "provider", "list", "--json"}, want: true},
 		{name: "consent", args: []string{"person", "provider", "consent", "--yes"}, want: true},
 		{name: "revoke", args: []string{"person", "provider", "revoke"}, want: true},
+		{name: "guarded revoke", args: []string{
+			"person", "provider", "revoke", "alpha", "--if-fingerprint", strings.Repeat("a", 64),
+		}, want: true},
+		{name: "targeted revoke", args: []string{
+			"person", "provider", "revoke", "alpha", "--fingerprint", strings.Repeat("b", 64),
+		}, want: true},
 		{name: "check", args: []string{"person", "provider", "check", "--json"}, want: true},
+		{name: "named check", args: []string{"person", "provider", "check", "alpha", "--json"}, want: true},
+		{name: "named reverify", args: []string{"person", "provider", "reverify", "alpha", "--yes", "--json"}, want: true},
+		{name: "guarded check", args: []string{
+			"person", "provider", "check", "alpha", "--if-fingerprint", strings.Repeat("a", 64),
+		}, want: true},
+		{name: "history", args: []string{"person", "provider", "history", "alpha", "--limit", "20"}, want: true},
+		{name: "add is local", args: []string{"person", "provider", "add", "alpha"}},
+		{name: "use is local", args: []string{"person", "provider", "use", "alpha"}},
+		{name: "remove is local", args: []string{"person", "provider", "remove", "alpha"}},
+		{name: "login is local", args: []string{"person", "provider", "login"}},
+		{name: "models are local", args: []string{"person", "provider", "models"}},
+		{name: "secret flag smuggling", args: []string{"person", "provider", "check", "--api-key=secret-canary"}},
+		{name: "control profile name", args: []string{"person", "provider", "check", "bad\nname"}},
+		{name: "oversize profile name", args: []string{"person", "provider", "history", strings.Repeat("x", 65)}},
+		{name: "invalid guarded revoke fingerprint", args: []string{
+			"person", "provider", "revoke", "alpha", "--if-fingerprint", "not-a-fingerprint",
+		}},
+		{name: "guarded revoke without profile", args: []string{
+			"person", "provider", "revoke", "--if-fingerprint", strings.Repeat("a", 64),
+		}},
+		{name: "extra positional smuggling", args: []string{"person", "provider", "check", "alpha", "beta"}},
+		{name: "active reverify", args: []string{"person", "provider", "reverify", "--yes"}, want: true},
+		{name: "reverify extra positional", args: []string{"person", "provider", "reverify", "alpha", "beta", "--yes"}},
+		{name: "reverify semantic flag", args: []string{"person", "provider", "reverify", "alpha", "--semantic-embeddings", "--yes"}},
+		{name: "reverify credential smuggling", args: []string{"person", "provider", "reverify", "alpha", "--api-key=secret-canary", "--yes"}},
+		{name: "list positional smuggling", args: []string{"person", "provider", "list", "alpha"}},
 		{name: "missing operation", args: []string{"person", "provider"}},
 		{name: "unknown operation", args: []string{"person", "provider", "run"}},
 		{name: "ordinary person mutation", args: []string{"person", "delete", "7"}},
@@ -33,10 +89,13 @@ func TestCLIRunCommandAllowedPermitsExactPersonProviderCommands(t *testing.T) {
 }
 
 func TestCLIRunEnvAllowedPermitsConfiguredPeopleProviderKeyOnly(t *testing.T) {
+	t.Parallel()
 	checks := assert.New(t)
 	srv := &Server{cfg: &config.Config{}}
-	srv.cfg.People.Sweep.Provider.Kind = "openai_compatible"
-	srv.cfg.People.Sweep.Provider.APIKeyEnv = "MSGVAULT_PEOPLE_PROVIDER_KEY"
+	configureAPIProvider(srv.cfg, peoplesweep.ProviderConfig{
+		Protocol: peoplesweep.ProtocolOpenAIChat, Credential: peoplesweep.CredentialEnv,
+		CredentialEnv: "MSGVAULT_PEOPLE_PROVIDER_KEY",
+	})
 
 	checks.True(srv.cliRunEnvAllowed("MSGVAULT_PEOPLE_PROVIDER_KEY"))
 	checks.False(srv.cliRunEnvAllowed("OPENAI_API_KEY"))
@@ -45,12 +104,14 @@ func TestCLIRunEnvAllowedPermitsConfiguredPeopleProviderKeyOnly(t *testing.T) {
 	checks.False(unconfigured.cliRunEnvAllowed("MSGVAULT_PEOPLE_PROVIDER_KEY"))
 
 	codex := &Server{cfg: &config.Config{}}
-	codex.cfg.People.Sweep.Provider.Kind = "codex_app_server"
-	codex.cfg.People.Sweep.Provider.APIKeyEnv = "MSGVAULT_PEOPLE_PROVIDER_KEY"
+	configureAPIProvider(codex.cfg, peoplesweep.ProviderConfig{
+		Protocol: peoplesweep.ProtocolCodexAppServer, Credential: peoplesweep.CredentialNone,
+	})
 	checks.False(codex.cliRunEnvAllowed("MSGVAULT_PEOPLE_PROVIDER_KEY"))
 }
 
 func TestCLIAllowlistPermitsExactPersonSweepCommands(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		args []string
 		want bool
@@ -67,11 +128,39 @@ func TestCLIAllowlistPermitsExactPersonSweepCommands(t *testing.T) {
 	}
 }
 
+func TestCLIAllowlistRejectsProviderCredentialValuesInDaemonRequest(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+	cfg := config.NewDefaultConfig()
+	cfg.HomeDir = t.TempDir()
+	cfg.People.Sweep.Enabled = true
+	cfg.People.Sweep.Provider = peoplesweep.ProviderSelection{Name: "default"}
+	cfg.People.Sweep.Providers = map[string]peoplesweep.ProviderConfig{
+		"default": completeAPIProvider("STALE_ACTIVE_KEY", "active-model"),
+	}
+	require.NoError(cfg.Save())
+
+	latest, err := config.Load(cfg.ConfigFilePath(), "")
+	require.NoError(err)
+	latest.People.Sweep.Providers["named"] = completeAPIProvider("EXACT_NAMED_KEY", "named-model")
+	require.NoError(latest.Save())
+
+	srv := &Server{cfg: cfg}
+	args := []string{"person", "provider", "check", "named", "--json"}
+	assert.False(srv.cliRunEnvAllowedForCommand(args, "EXACT_NAMED_KEY"))
+	assert.False(srv.cliRunEnvAllowedForCommand(args, "STALE_ACTIVE_KEY"))
+	assert.False(srv.cliRunEnvAllowedForCommand(args, "OPENAI_API_KEY"))
+}
+
 func TestCLIAllowlistPersonSweepForwardsExactCredentialOnly(t *testing.T) {
+	t.Parallel()
 	checks := assert.New(t)
 	srv := &Server{cfg: &config.Config{}}
-	srv.cfg.People.Sweep.Provider.Kind = "openai_compatible"
-	srv.cfg.People.Sweep.Provider.APIKeyEnv = "PEOPLE_SWEEP_KEY"
+	configureAPIProvider(srv.cfg, peoplesweep.ProviderConfig{
+		Protocol: peoplesweep.ProtocolOpenAIChat, Credential: peoplesweep.CredentialEnv,
+		CredentialEnv: "PEOPLE_SWEEP_KEY",
+	})
 	srv.cfg.Vector.Embeddings.APIKeyEnv = "EMBEDDINGS_KEY"
 	srv.cfg.Attachments.Documents.APIKeyEnv = "DOCUMENT_KEY"
 
@@ -90,10 +179,11 @@ func TestCLIAllowlistPersonSweepForwardsExactCredentialOnly(t *testing.T) {
 }
 
 func TestCLIAllowlistCodexProviderOperations(t *testing.T) {
+	t.Parallel()
 	checks := assert.New(t)
 	for _, operation := range []string{"login", "models"} {
 		args := []string{"person", "provider", operation}
-		checks.True(cliRunCommandAllowed(args), args)
+		checks.False(cliRunCommandAllowed(args), args)
 	}
 	for _, operation := range []string{"logout", "delete", "exec", "account"} {
 		args := []string{"person", "provider", operation}
@@ -101,8 +191,9 @@ func TestCLIAllowlistCodexProviderOperations(t *testing.T) {
 	}
 
 	srv := &Server{cfg: &config.Config{}}
-	srv.cfg.People.Sweep.Provider.Kind = "codex_app_server"
-	srv.cfg.People.Sweep.Provider.APIKeyEnv = "MUST_NOT_FORWARD"
+	configureAPIProvider(srv.cfg, peoplesweep.ProviderConfig{
+		Protocol: peoplesweep.ProtocolCodexAppServer, Credential: peoplesweep.CredentialNone,
+	})
 	for _, operation := range []string{"login", "models", "status", "check"} {
 		checks.False(srv.cliRunEnvAllowedForCommand(
 			[]string{"person", "provider", operation}, "MUST_NOT_FORWARD"), operation)
@@ -110,6 +201,7 @@ func TestCLIAllowlistCodexProviderOperations(t *testing.T) {
 }
 
 func TestCLIRunCommandAllowedPermitsExactPersonEnrichmentCommandsAndRejectsRawShapes(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		args []string
@@ -143,6 +235,7 @@ func TestCLIRunCommandAllowedPermitsExactPersonEnrichmentCommandsAndRejectsRawSh
 }
 
 func TestCLIRunCommandAllowedRejectsPersonSuppressionMetadataSmuggling(t *testing.T) {
+	t.Parallel()
 	for _, field := range []string{
 		"provider-namespace", "identifier-class", "normalization-version", "key-id", "digest", "actor",
 	} {
@@ -155,6 +248,7 @@ func TestCLIRunCommandAllowedRejectsPersonSuppressionMetadataSmuggling(t *testin
 }
 
 func TestCLIAllowlistPersonEnrichmentForwardsOnlyCommandCredentials(t *testing.T) {
+	t.Parallel()
 	checks := assert.New(t)
 	srv := &Server{cfg: &config.Config{}}
 	srv.cfg.People.Enrichment.SuppressionKeyEnv = "ENRICHMENT_SUPPRESSION_KEY"
@@ -179,4 +273,21 @@ func TestCLIAllowlistPersonEnrichmentForwardsOnlyCommandCredentials(t *testing.T
 		"--digest=" + strings.Repeat("c", 64), "--reason=opt_out", "--actor=cli"}
 	checks.False(srv.cliRunEnvAllowedForCommand(digestSuppression, "ENRICHMENT_SUPPRESSION_KEY"))
 	checks.False(srv.cliRunEnvAllowedForCommand([]string{"person", "enrichment", "status"}, "EXA_PRIMARY_KEY"))
+}
+
+func TestCLIAllowlistPersonSweepForwardsCredentialDespiteInvalidDaemonSetting(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	cfg := config.NewDefaultConfig()
+	cfg.HomeDir = t.TempDir()
+	cfg.People.Sweep.Enabled = true
+	configureAPIProvider(cfg, completeAPIProvider("PEOPLE_SWEEP_KEY", "active-model"))
+	require.NoError(cfg.Save())
+	latest, err := config.Load(cfg.ConfigFilePath(), "")
+	require.NoError(err)
+	latest.Integrations.Kata.Endpoint = "://invalid"
+	require.NoError(latest.Save())
+
+	srv := &Server{cfg: cfg}
+	require.True(srv.cliRunEnvAllowedForCommand([]string{"person", "sweep", "run"}, "PEOPLE_SWEEP_KEY"))
 }

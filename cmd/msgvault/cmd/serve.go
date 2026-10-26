@@ -3,6 +3,7 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -12,26 +13,42 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
+	stdsync "sync"
 	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
+	"go.kenn.io/kit/telemetry/posthog"
 	"go.kenn.io/msgvault/internal/api"
+	"go.kenn.io/msgvault/internal/beeper"
 	"go.kenn.io/msgvault/internal/carddav"
 	"go.kenn.io/msgvault/internal/circleback"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/discord"
+	"go.kenn.io/msgvault/internal/gcal"
 	"go.kenn.io/msgvault/internal/gmail"
 	"go.kenn.io/msgvault/internal/granola"
+	imaplib "go.kenn.io/msgvault/internal/imap"
+	"go.kenn.io/msgvault/internal/jobctx"
+	"go.kenn.io/msgvault/internal/kataevidence"
 	"go.kenn.io/msgvault/internal/meetingimport"
-	"go.kenn.io/msgvault/internal/microsoft"
+	"go.kenn.io/msgvault/internal/msmail"
+	"go.kenn.io/msgvault/internal/muesli"
+	"go.kenn.io/msgvault/internal/notionmeetings"
 	"go.kenn.io/msgvault/internal/oauth"
 	"go.kenn.io/msgvault/internal/ocr"
+	"go.kenn.io/msgvault/internal/operations"
+	"go.kenn.io/msgvault/internal/peoplesweep"
+	"go.kenn.io/msgvault/internal/personagenda"
 	"go.kenn.io/msgvault/internal/personenrichment"
 	"go.kenn.io/msgvault/internal/personfacts"
+	"go.kenn.io/msgvault/internal/personmatch"
+	"go.kenn.io/msgvault/internal/plaud"
+	"go.kenn.io/msgvault/internal/provideridentity"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/search"
@@ -40,12 +57,15 @@ import (
 	"go.kenn.io/msgvault/internal/syncerr"
 	"go.kenn.io/msgvault/internal/synctechsms"
 	"go.kenn.io/msgvault/internal/teams"
+	"go.kenn.io/msgvault/internal/telemetry"
+	"go.kenn.io/msgvault/internal/twilio"
 	"golang.org/x/oauth2"
 )
 
 var serveCmd = &cobra.Command{
-	Use:   "serve",
-	Short: "Run msgvault as a daemon with scheduled sync",
+	Use:         "serve",
+	Annotations: map[string]string{strictConfigAnnotation: "required"},
+	Short:       "Run msgvault as a daemon with scheduled sync",
 	Long: `Run msgvault as a long-running daemon that syncs email accounts on schedule.
 
 The daemon runs in the foreground and performs:
@@ -129,24 +149,66 @@ type serveRuntimeScheduler interface {
 	Stop() context.Context
 }
 
+// serveSchedulers stops every daemon scheduler and reports when all have drained.
+type serveSchedulers []serveRuntimeScheduler
+
+func (s serveSchedulers) Stop() context.Context {
+	stopped := make([]context.Context, 0, len(s))
+	for _, sched := range s {
+		stopped = append(stopped, sched.Stop())
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		for _, done := range stopped {
+			<-done.Done()
+		}
+		cancel()
+	}()
+	return ctx
+}
+
+// newServeSchedulers returns the daemon scheduler, whose jobs hold the
+// operation gate, and one for Beeper media delivery. A media upload can run
+// for minutes, so that job takes the gate only around its Store writes.
+// Media passes do not count as activity; shutdown cancels and drains them.
+func newServeSchedulers(
+	syncFunc scheduler.SyncFunc, logger *slog.Logger, idle scheduler.WorkTracker, gate api.LabeledOperationGate,
+	capture func(string, map[string]any) error,
+) (*scheduler.Scheduler, *scheduler.Scheduler) {
+	sched := scheduler.New(syncFunc).WithLogger(logger).
+		WithWorkTracker(combineWorkTrackers(scheduleIdleWorkTracker(idle), labelWorkTracker(gate, "a scheduled sync")))
+	media := scheduler.New(nil).WithLogger(logger)
+	if capture != nil {
+		for _, target := range []*scheduler.Scheduler{sched, media} {
+			target.WithCompletion(func() { _ = capture(telemetry.EventSyncFinished, map[string]any{"surface": "web"}) })
+		}
+	}
+	return sched, media
+}
+
 type serveRuntimeOperationGate interface {
 	StartDrain()
 	Wait(ctx context.Context) error
 }
 
 func init() {
+	addServeConfigFlags(serveCmd)
 	rootCmd.AddCommand(serveCmd)
 	rootCmd.AddCommand(daemonCmd)
 	addServeLifecycleCommands(serveCmd)
 }
 
 func runServe(cmd *cobra.Command, args []string) error {
-	// Validate security posture before doing any work
-	if err := cfg.Server.ValidateSecure(); err != nil {
-		return err
+	state := invocationFromCommand(cmd)
+	if state == nil || state.cfg == nil || state.logger == nil {
+		return errors.New("configuration is unavailable")
 	}
-	if cfg.Server.APIKey != "" && len(cfg.Server.APIKey) < 16 {
-		logger.Warn("api_key is very short — use a randomly generated key of at least 32 characters")
+	cfg := state.cfg
+	logger := state.logger
+	// Resolve the interface before reserving a listener. Credential creation
+	// waits until this process owns the daemon lock.
+	if _, err := cfg.ResolveServerBindAddress(); err != nil {
+		return err
 	}
 
 	// Missing provider credentials should not prevent the daemon from serving
@@ -170,6 +232,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	logger.Info("Server listener bound", "address", apiListener.Addr().String(), "bind_source", cfg.BindAddressSource())
 	listenerReserved := true
 	defer func() {
 		if listenerReserved {
@@ -189,6 +252,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("claim daemon ownership: %w", err)
 	}
+	if !cfg.Server.HasCredentialSource() && !cfg.Server.AllowInsecure && cfg.Server.AuthenticationKey() != "" {
+		logger.Info("Server API credential is persisted", "path", cfg.ServerKeyFilePath())
+	}
+	if cfg.Server.AuthenticationKey() != "" && len(cfg.Server.AuthenticationKey()) < 16 {
+		logger.Warn("api_key is very short — use a randomly generated key of at least 32 characters")
+	}
 	heartbeatCtx, stopHeartbeat := context.WithCancel(cmd.Context())
 	heartbeatDone := make(chan struct{})
 	go func() {
@@ -200,6 +269,15 @@ func runServe(cmd *cobra.Command, args []string) error {
 		<-heartbeatDone
 		if err := ownership.Close(); err != nil {
 			logger.Warn("release daemon ownership failed", "error", err)
+		}
+	}()
+	telemetryReporter := telemetry.NewReporterOrDisabled(telemetry.Options{
+		DataDir: cfg.Data.DataDir, Version: Version, Commit: Commit,
+		ConfigEnabled: cfg.Telemetry.EnabledOrDefault(),
+	}, logger)
+	defer func() {
+		if err := telemetryReporter.Close(); err != nil {
+			logger.Warn("close telemetry reporter", "error", err)
 		}
 	}()
 	setStartupPhase := func(phase string) {
@@ -221,7 +299,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	resourceCleanupSafe := true
 	defer func() {
 		if !resourceCleanupSafe {
-			logger.Warn("archive database cleanup skipped", "error", "HTTP shutdown did not complete")
+			logger.Warn("archive database cleanup skipped", "error", "daemon shutdown did not complete safely")
 			return
 		}
 		if err := closeDaemonStoreAfterInitializers(s, analyticsInit, vectorInit); err != nil {
@@ -243,7 +321,18 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err := s.InitSchemaContext(cmd.Context()); err != nil {
 		return fmt.Errorf("init schema: %w", err)
 	}
+	failedUnfinishedImports, err := s.FailUnfinishedSyncOperationsContext(cmd.Context())
+	if err != nil {
+		return fmt.Errorf("recover unfinished historical imports: %w", err)
+	}
+	if failedUnfinishedImports > 0 {
+		logger.Warn("marked historical imports abandoned by the previous daemon as failed",
+			"count", failedUnfinishedImports)
+	}
 	logger.Info("daemon startup step complete", "step", "init_archive_schema")
+	if err := recoverNativeOperationRunsAtStartup(cmd.Context(), s, logger); err != nil {
+		return err
+	}
 	// Legacy [identity] migration is deferred to the first scheduled sync's
 	// runPostSourceCreateMigrations call, which fires AFTER that sync's
 	// confirmDefaultIdentity. Calling the migration here would race
@@ -255,7 +344,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// (which may open files and run migrations) respects Ctrl+C.
 	ctx, cancel := context.WithCancel(cmd.Context())
 	defer cancel()
-	idleTracker := newDaemonIdleTracker(cfg, cancel)
+	idleTracker := newDaemonIdleTracker(cfg, cancel, logger)
 	operationGate := api.NewSerialOperationGate()
 	// Closed on shutdown so cached pack readers don't hold attachment pack
 	// files open past the daemon's lifetime (blocks deletion on Windows).
@@ -270,13 +359,36 @@ func runServe(cmd *cobra.Command, args []string) error {
 			_ = attachmentMaint.close()
 		}
 	}()
+	var initialAnalyticsEngine query.Engine
+	analyticsServerStarted := false
+	defer func() {
+		if resourceCleanupSafe && !analyticsServerStarted && initialAnalyticsEngine != nil {
+			_ = initialAnalyticsEngine.Close()
+		}
+	}()
+	// Due analytics cache rebuilds run here, off the scheduled job that asked
+	// for them, so a sync never holds the operation gate for a cache build.
+	cacheRefresher := newBackgroundCacheRefresher(ctx, nil, idleTracker)
+	daemonCacheRefresher = cacheRefresher
+	defer func() { daemonCacheRefresher = nil }()
+	cacheRefresherShutdown := false
+	defer func() {
+		if cacheRefresherShutdown {
+			return
+		}
+		if err := shutdownBackgroundCacheRefresher(cacheRefresher); err != nil {
+			resourceCleanupSafe = false
+			return
+		}
+		cacheRefresherShutdown = true
+	}()
 	blobStore := attachmentMaint.blob
 
 	// Vector misconfiguration still fails startup fast; the expensive
 	// backend open/migrate/backfill runs in the background after the API
 	// server is listening (startVectorInit below), so the TUI and other
 	// clients are not blocked by vector maintenance.
-	if err := precheckVectorFeatures(dbPath); err != nil {
+	if err := precheckVectorFeatures(dbPath, cfg); err != nil {
 		return fmt.Errorf("vector features: %w", err)
 	}
 	if !cfg.Vector.AnyLaneEnabled() {
@@ -306,18 +418,12 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 		return engineErr
 	}
-	initialAnalyticsEngine := engine
-	analyticsServerStarted := false
-	defer func() {
-		if resourceCleanupSafe && !analyticsServerStarted && initialAnalyticsEngine != nil {
-			_ = initialAnalyticsEngine.Close()
-		}
-	}()
+	initialAnalyticsEngine = engine
 	if !analyticsAsync {
 		logger.Info("daemon startup step complete", "step", "init_analytics_engine")
 	}
 
-	getOAuthMgr := oauthManagerCache()
+	getOAuthMgr := oauthManagerCache(invocationFromCommand(cmd))
 
 	// Create sync function for the scheduler. Under scan-and-fill the
 	// Syncer no longer needs an enqueuer — newly-ingested messages get
@@ -325,22 +431,26 @@ func runServe(cmd *cobra.Command, args []string) error {
 	// by the background startVectorInit) discovers them on its next run, so
 	// the sync path no longer threads the vector features.
 	syncFunc := func(ctx context.Context, email string) error {
+		ctx = withInvocation(ctx, state)
 		return runScheduledSource(ctx, attachmentMaint, true, func(ctx context.Context) error {
-			return runScheduledSync(ctx, email, s, getOAuthMgr)
+			return runScheduledSync(ctx, email, s, getOAuthMgr, state)
 		})
 	}
 
 	// Create and configure scheduler
-	sched := scheduler.New(syncFunc).WithLogger(logger).
-		WithWorkTracker(combineWorkTrackers(idleTracker, labelWorkTracker(operationGate, "a scheduled sync")))
-	cardDAVController, err := api.NewCardDAVController(cfg, s)
+	state.syncFailures = &telemetry.SyncFailures{Capture: telemetryReporter.Capture}
+	sched, mediaSched := newServeSchedulers(syncFunc, logger, idleTracker, operationGate, telemetryReporter.Capture)
+	sched.WithAccountPreemptionPolicy(func(identifier string) bool {
+		return scheduledSyncPreemptible(s, identifier, logger)
+	})
+	cardDAVController, err := api.NewCardDAVController(cfg, s, logger)
 	if err != nil {
 		return fmt.Errorf("configure CardDAV: %w", err)
 	}
-	cardDAVController.SetScheduleReconciler(func(cardDAVConfig config.CardDAVConfig, service api.CardDAVOperations) error {
-		return reconcileCardDAVSchedulerJob(sched, cardDAVConfig, service, logger)
+	cardDAVController.SetConnectionScheduleReconciler(func(name string, cardDAVConfig config.CardDAVConfig, service api.CardDAVOperations) error {
+		return reconcileCardDAVSchedulerJob(sched, cardDAVConfig, service, logger, name, state)
 	})
-	if err := reconcileCardDAVSchedulerJob(sched, cfg.CardDAV, cardDAVController.Current(), logger); err != nil {
+	if err := cardDAVController.ReconcileSchedule(ctx); err != nil {
 		return err
 	}
 
@@ -369,11 +479,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if err := sched.AddJob(scheduler.Job{
 			Name:     jobName,
 			Schedule: source.Schedule,
-			Run: func(ctx context.Context) error {
+			Run: invocationBoundJobRun(state, func(ctx context.Context) error {
 				return runScheduledSource(ctx, attachmentMaint, true, func(ctx context.Context) error {
-					return runConfiguredSynctechSMSSourceWithStore(ctx, s, source)
+					return runScheduledSynctechSMSSource(ctx, s, source)
 				})
-			},
+			}),
 		}); err != nil {
 			logger.Error("failed to schedule synctech-sms source", "source", source.Name, "error", err)
 		} else {
@@ -403,11 +513,11 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if err := sched.AddJob(scheduler.Job{
 			Name:     jobName,
 			Schedule: source.Schedule,
-			Run: func(ctx context.Context) error {
+			Run: invocationBoundJobRun(state, func(ctx context.Context) error {
 				return runScheduledSource(ctx, attachmentMaint, false, func(ctx context.Context) error {
 					return runConfiguredGCalSync(ctx, s, source)
 				})
-			},
+			}),
 		}); err != nil {
 			logger.Error("failed to schedule gcal source", "source", source.Name, "error", err)
 		} else {
@@ -417,6 +527,49 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if err := registerAttachmentMaintenanceJob(sched, attachmentMaint); err != nil {
 		return fmt.Errorf("schedule attachment maintenance: %w", err)
 	}
+	if err := registerAttachmentPackJob(sched, attachmentMaint); err != nil {
+		return fmt.Errorf("schedule attachment packing: %w", err)
+	}
+	if err := registerSQLiteMaintenanceJob(sched, s); err != nil {
+		return fmt.Errorf("schedule SQLite maintenance: %w", err)
+	}
+	if err := configureDocumentReconcileJob(
+		ctx, sched, s, cfg.Attachments.Documents.Enabled,
+	); err != nil {
+		return fmt.Errorf("configure document reconciliation: %w", err)
+	}
+	if err := registerFilenameDiscoveryJob(sched, s); err != nil {
+		return fmt.Errorf("schedule filename discovery: %w", err)
+	}
+	if err := configureBeeperMediaJob(ctx, mediaSched, operationGate, s, blobStore,
+		filepath.Join(cfg.Data.DataDir, "tmp", "beeper-media"), cfg.AttachmentsDir(), cfg.Integrations.Docbank, logger); err != nil {
+		logger.Warn("Beeper media submission unavailable", "error", err)
+	}
+	if err := configureRecordingReferenceJob(ctx, mediaSched, operationGate, s, cfg.Integrations.Docbank, logger); err != nil {
+		logger.Warn("Recording reference submission unavailable", "error", err)
+	}
+	if err := registerActivityProjectionJob(
+		sched, s, cfg.Activity, logger); err != nil {
+		return fmt.Errorf("schedule activity projection: %w", err)
+	}
+	if cfg.People.Sweep.Enabled {
+		if err := cfg.People.Sweep.Validate(); err != nil {
+			return fmt.Errorf("validate people sweep: %w", err)
+		}
+	}
+	if err := addPeopleSweepJob(
+		sched, cfg.People.Sweep, newPeopleSweepScheduledRun(cfg, s),
+	); err != nil {
+		return fmt.Errorf("schedule people sweep: %w", err)
+	}
+	if err := registerPersonEnrichmentJob(
+		ctx, sched, s, cfg.People.Enrichment, personEnrichmentRuntimeCredentials{
+			Suppression: personEnrichmentEnvironmentLookup(cfg),
+			Provider:    personEnrichmentProviderCredentialLookup(cfg),
+		}); err != nil {
+		return fmt.Errorf("schedule person enrichment: %w", err)
+	}
+
 	if cfg.OCR.Enabled {
 		ocrClient := ocr.NewClient(cfg.OCR.Socket, cfg.OCR.RequestTimeout)
 		ocrWorker := ocr.NewWorker(s, blobStore, ocrClient, ocr.WorkerConfig{
@@ -438,41 +591,37 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 		logger.Info("scheduled attachment OCR", "schedule", cfg.OCR.Schedule, "socket", cfg.OCR.Socket)
 	}
-	if err := configureDocumentReconcileJob(
-		ctx, sched, s, cfg.Attachments.Documents.Enabled,
-	); err != nil {
-		return fmt.Errorf("configure document reconciliation: %w", err)
-	}
-	if err := registerActivityProjectionJob(
-		sched, s, cfg.Activity, logger); err != nil {
-		return fmt.Errorf("schedule activity projection: %w", err)
-	}
-	if cfg.People.Sweep.Enabled {
-		if err := cfg.People.Sweep.Validate(); err != nil {
-			return fmt.Errorf("validate people sweep: %w", err)
-		}
-	}
-	if err := addPeopleSweepJob(
-		sched, cfg.People.Sweep, newPeopleSweepScheduledRun(cfg.People.Sweep, s),
-	); err != nil {
-		return fmt.Errorf("schedule people sweep: %w", err)
-	}
-	if err := registerPersonEnrichmentJob(
-		ctx, sched, s, cfg.People.Enrichment); err != nil {
-		return fmt.Errorf("schedule person enrichment: %w", err)
-	}
 
 	if cfg.Beeper.Enabled && cfg.Beeper.Schedule == "" {
 		logger.Warn("beeper is enabled but has no schedule — the daemon will not sync it; its freshness will eventually go stale",
 			"hint", `set a cron schedule (e.g. "*/30 * * * *") on the [beeper] entry`)
 	}
 	if cfg.Beeper.Enabled && cfg.Beeper.Schedule != "" {
-		if err := registerScheduledBeeperJob(sched, cfg.Beeper.Schedule, attachmentMaint, func(ctx context.Context) error {
+		if err := registerScheduledBeeperJob(sched, cfg.Beeper.Schedule, attachmentMaint, invocationBoundJobRun(state, func(ctx context.Context) error {
 			return runConfiguredBeeperSync(ctx, s)
-		}); err != nil {
+		})); err != nil {
 			logger.Error("failed to schedule beeper sync", "error", err)
 		} else {
 			logger.Info("scheduled beeper sync", "schedule", cfg.Beeper.Schedule)
+		}
+	}
+
+	if cfg.Matrix.Enabled && cfg.Matrix.Schedule == "" {
+		logger.Warn("matrix is enabled but has no schedule — the daemon will not sync it",
+			"hint", `set a cron schedule (e.g. "*/30 * * * *") on the [matrix] entry`)
+	}
+	if cfg.Matrix.Enabled && cfg.Matrix.Schedule != "" {
+		if err := sched.AddJob(scheduler.Job{
+			Name: api.MatrixJobName, Schedule: cfg.Matrix.Schedule, Preemptible: true,
+			Run: invocationBoundJobRun(state, func(ctx context.Context) error {
+				return runScheduledSource(ctx, attachmentMaint, false, func(ctx context.Context) error {
+					return runConfiguredMatrixSync(ctx, s)
+				})
+			}),
+		}); err != nil {
+			logger.Error("failed to schedule matrix sync", "error", err)
+		} else {
+			logger.Info("scheduled matrix sync", "schedule", cfg.Matrix.Schedule)
 		}
 	}
 
@@ -482,13 +631,14 @@ func runServe(cmd *cobra.Command, args []string) error {
 	}
 	if cfg.Slack.Enabled && cfg.Slack.Schedule != "" {
 		if err := sched.AddJob(scheduler.Job{
-			Name:     api.SlackJobName,
-			Schedule: cfg.Slack.Schedule,
-			Run: func(ctx context.Context) error {
+			Name:        api.SlackJobName,
+			Schedule:    cfg.Slack.Schedule,
+			Preemptible: true,
+			Run: invocationBoundJobRun(state, func(ctx context.Context) error {
 				return runScheduledSource(ctx, attachmentMaint, true, func(ctx context.Context) error {
 					return runConfiguredSlackSync(ctx, s)
 				})
-			},
+			}),
 		}); err != nil {
 			logger.Error("failed to schedule slack sync", "error", err)
 		} else {
@@ -496,8 +646,39 @@ func runServe(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	// Meeting sources (Granola/Circleback) mirror the gcal treatment: warn
+	for _, source := range cfg.Chatwoot {
+		if source.Enabled && source.Schedule == "" {
+			logger.Warn("chatwoot profile is enabled but has no schedule", "profile", source.Identifier,
+				"hint", `set a cron schedule on the [[chatwoot]] profile`)
+		}
+	}
+	for _, source := range cfg.ScheduledChatwootSources() {
+		if err := registerScheduledChatwootJob(sched, source, attachmentMaint, invocationBoundJobRun(state, func(ctx context.Context) error {
+			return runConfiguredChatwootSync(ctx, s, source)
+		})); err != nil {
+			logger.Error("failed to schedule Chatwoot", "profile", source.Identifier, "error", err)
+		} else {
+			logger.Info("scheduled Chatwoot", "profile", source.Identifier, "schedule", source.Schedule)
+		}
+	}
+
+	// Meeting sources mirror the gcal treatment: warn
 	// when enabled but unscheduled, then register the scheduled ones.
+	for _, src := range cfg.Omi {
+		if src.Enabled && src.Schedule == "" {
+			logger.Warn("omi source is enabled but has no schedule — the daemon will not sync it; its freshness will eventually go stale",
+				"source", src.Identifier,
+				"hint", `set a cron schedule (e.g. "0 */6 * * *") on the [[omi]] entry`)
+		}
+	}
+	for _, src := range cfg.ScheduledOmiSources() {
+		source := src
+		if err := registerScheduledOmiJob(sched, state, s, source); err != nil {
+			logger.Error("failed to schedule omi source", "source", source.Identifier, "error", err)
+		} else {
+			logger.Info("scheduled omi source", "source", source.Identifier, "schedule", source.Schedule)
+		}
+	}
 	for _, src := range cfg.Granola {
 		if src.Enabled && src.Schedule == "" {
 			logger.Warn("granola source is enabled but has no schedule — the daemon will not sync it; its freshness will eventually go stale",
@@ -518,9 +699,9 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if err := sched.AddJob(scheduler.Job{
 			Name:     jobName,
 			Schedule: source.Schedule,
-			Run: func(ctx context.Context) error {
+			Run: invocationBoundJobRun(state, func(ctx context.Context) error {
 				return runConfiguredGranolaSync(ctx, s, source)
-			},
+			}),
 		}); err != nil {
 			logger.Error("failed to schedule granola source", "source", source.Identifier, "error", err)
 		} else {
@@ -547,42 +728,195 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if err := sched.AddJob(scheduler.Job{
 			Name:     jobName,
 			Schedule: source.Schedule,
-			Run: func(ctx context.Context) error {
+			Run: invocationBoundJobRun(state, func(ctx context.Context) error {
 				return runConfiguredCirclebackSync(ctx, s, source)
-			},
+			}),
 		}); err != nil {
 			logger.Error("failed to schedule circleback source", "source", source.Identifier, "error", err)
 		} else {
 			logger.Info("scheduled circleback source", "source", source.Identifier, "schedule", source.Schedule)
 		}
 	}
+	for _, src := range cfg.Plaud {
+		if src.Enabled && src.Schedule == "" {
+			logger.Warn("plaud source is enabled but has no schedule — the daemon will not sync it; its freshness will eventually go stale",
+				"source", src.Identifier,
+				"hint", `set a cron schedule (e.g. "30 */6 * * *") on the [[plaud]] entry`)
+		}
+	}
+	for _, src := range cfg.ScheduledPlaudSources() {
+		source := src
+		jobName, ok := api.SchedulerJobNameForSource(plaud.SourceType, source.Identifier)
+		if !ok {
+			logger.Error("no scheduler job mapping for plaud source", "source", source.Identifier)
+			continue
+		}
+		if err := sched.AddJob(scheduler.Job{
+			Name:     jobName,
+			Schedule: source.Schedule,
+			Run: invocationBoundJobRun(state, func(ctx context.Context) error {
+				return runConfiguredPlaudSync(ctx, s, source)
+			}),
+		}); err != nil {
+			logger.Error("failed to schedule plaud source", "source", source.Identifier, "error", err)
+		} else {
+			logger.Info("scheduled plaud source", "source", source.Identifier, "schedule", source.Schedule)
+		}
+	}
+	for _, src := range cfg.NotionMeetings {
+		if src.Enabled && src.Schedule == "" {
+			logger.Warn("notion meeting source is enabled but has no schedule — the daemon will not sync it; its freshness will eventually go stale",
+				"source", src.Identifier,
+				"hint", `set a cron schedule (e.g. "15 */6 * * *") on the [[notion_meetings]] entry`)
+		}
+	}
+	for _, src := range cfg.ScheduledNotionMeetingsSources() {
+		source := src
+		jobName, ok := api.SchedulerJobNameForSource(notionmeetings.SourceType, source.Identifier)
+		if !ok {
+			logger.Error("no scheduler job mapping for notion meeting source", "source", source.Identifier)
+			continue
+		}
+		if err := sched.AddJob(scheduler.Job{
+			Name:     jobName,
+			Schedule: source.Schedule,
+			Run: invocationBoundJobRun(state, func(ctx context.Context) error {
+				return runConfiguredNotionMeetingsSync(ctx, s, source)
+			}),
+		}); err != nil {
+			logger.Error("failed to schedule notion meeting source", "source", source.Identifier, "error", err)
+		} else {
+			logger.Info("scheduled notion meeting source", "source", source.Identifier, "schedule", source.Schedule)
+		}
+	}
+	for _, src := range cfg.Twilio {
+		if src.Enabled && src.Schedule == "" {
+			logger.Warn("twilio source is enabled but has no schedule — the daemon will not sync it; its freshness will eventually go stale",
+				"source", src.Identifier,
+				"hint", `set a cron schedule (e.g. "15 */6 * * *") on the [[twilio]] entry`)
+		}
+	}
+	for _, src := range cfg.ScheduledTwilioSources() {
+		source := src
+		jobName, ok := api.SchedulerJobNameForSource(twilio.SourceType, source.Identifier)
+		if !ok {
+			logger.Error("no scheduler job mapping for twilio source", "source", source.Identifier)
+			continue
+		}
+		if err := sched.AddJob(scheduler.Job{
+			Name:     jobName,
+			Schedule: source.Schedule,
+			Run: invocationBoundJobRun(state, func(ctx context.Context) error {
+				return runScheduledSource(ctx, attachmentMaint, true, func(ctx context.Context) error {
+					return runConfiguredTwilioSync(ctx, s, source)
+				})
+			}),
+		}); err != nil {
+			logger.Error("failed to schedule twilio source", "source", source.Identifier, "error", err)
+		} else {
+			logger.Info("scheduled twilio source", "source", source.Identifier, "schedule", source.Schedule)
+		}
+	}
+	for _, src := range cfg.Muesli {
+		if src.Enabled && src.Schedule == "" {
+			logger.Warn("muesli source is enabled but has no schedule — the daemon will not sync it; its freshness will eventually go stale",
+				"source", src.Identifier,
+				"hint", `set a cron schedule (e.g. "*/30 * * * *") on the [[muesli]] entry`)
+		}
+	}
+	for _, src := range cfg.ScheduledMuesliSources() {
+		source := src
+		jobName, ok := api.SchedulerJobNameForSource(muesli.SourceType, source.Identifier)
+		if !ok {
+			logger.Error("no scheduler job mapping for muesli source", "source", source.Identifier)
+			continue
+		}
+		if err := sched.AddJob(scheduler.Job{
+			Name:     jobName,
+			Schedule: source.Schedule,
+			Run: invocationBoundJobRun(state, func(ctx context.Context) error {
+				return runConfiguredMuesliSync(ctx, s, source, cfg.AttachmentsDir())
+			}),
+		}); err != nil {
+			logger.Error("failed to schedule muesli source", "source", source.Identifier, "error", err)
+		} else {
+			logger.Info("scheduled muesli source", "source", source.Identifier, "schedule", source.Schedule)
+		}
+	}
+
+	for _, src := range cfg.Twenty {
+		if src.Enabled && src.Schedule == "" {
+			logger.Warn("Twenty source is enabled but has no schedule; the daemon will not sync it",
+				"source", src.Identifier, "hint", `set schedule on the [[twenty]] entry`)
+		}
+	}
+	for _, src := range cfg.ScheduledTwentySources() {
+		source := src
+		jobName, ok := api.SchedulerJobNameForSource(sourceTypeTwenty, source.Identifier)
+		if !ok {
+			logger.Error("no scheduler job mapping for Twenty source", "source", source.Identifier)
+			continue
+		}
+		if err := sched.AddJob(scheduler.Job{
+			Name: jobName, Schedule: source.Schedule,
+			Run: invocationBoundJobRun(state, func(ctx context.Context) error {
+				return runConfiguredTwentySync(ctx, s, source)
+			}),
+		}); err != nil {
+			logger.Error("failed to schedule Twenty source", "source", source.Identifier, "error", err)
+		} else {
+			logger.Info("scheduled Twenty source", "source", source.Identifier, "schedule", source.Schedule)
+		}
+	}
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
-	// Start the scheduler
+	// Start the schedulers
 	sched.Start()
+	mediaSched.Start()
 
 	// Create adapters for the API interfaces
+	refreshCacheAfterWrite := func(_ context.Context, label string) error {
+		// The write is already durable. Keep the refresh independent of the
+		// client, but let daemon shutdown stop it before the store closes.
+		return daemonCacheRefreshError(ctx, rebuildCacheAfterScheduledSync(ctx, label))
+	}
 	meetingImporter := meetingimport.NewImporter(s, meetingimport.Hooks{
 		AfterSourceSetup: func() error {
-			return runPostSourceCreateMigrations(s)
+			return runPostSourceCreateMigrationsForInvocation(s, state)
 		},
-		RefreshCache: func(_ context.Context, label string) error {
-			// The import is already durable. Keep the refresh independent of the
-			// client, but let daemon shutdown stop it before the store closes.
-			return daemonCacheRefreshError(ctx, rebuildCacheAfterScheduledSync(ctx, label))
-		},
+		RefreshCache: refreshCacheAfterWrite,
 	}).WithLogger(logger)
+	cacheJobs := newCacheBuildJobs(ctx, idleTracker, nil)
+	cacheJobs.logger = logger
 	storeAdapter := &storeAPIAdapter{
 		store:                  s,
+		operationGate:          operationGate,
+		config:                 cfg,
+		options:                state.options,
+		logger:                 logger,
+		draftPolicy:            snapshotIMAPDraftPolicy(cfg),
+		gmailDraftPolicy:       snapshotGmailDraftPolicy(cfg),
+		beeperDraftPolicy:      snapshotBeeperDraftPolicy(cfg),
+		draftCacheRefresh:      refreshCacheAfterWrite,
 		attachmentMaintenance:  attachmentMaint,
 		meetingImporter:        meetingImporter,
 		analyticsDir:           cfg.AnalyticsDir(),
+		cacheJobs:              cacheJobs,
 		personEnrichmentConfig: cfg.People.Enrichment,
-		lookupEnv:              os.LookupEnv,
+		lookupEnv:              personEnrichmentEnvironmentLookup(cfg),
 	}
-	schedAdapter := &schedulerAdapter{scheduler: sched}
+	schedAdapter := &schedulerAdapter{scheduler: sched, media: mediaSched}
+
+	docbankAttachments, err := newDocbankAttachmentReader(ctx, s, cfg.Integrations.Docbank)
+	if err != nil {
+		logger.Warn("Attachment mirror status unavailable", "error", err)
+	}
+	messageRecordings, err := newMessageRecordingReader(ctx, s, cfg.Integrations.Docbank)
+	if err != nil {
+		logger.Warn("Message transcripts unavailable", "error", err)
+	}
 
 	// Create and start API server
 	var apiServer *api.Server
@@ -591,13 +925,16 @@ func runServe(cmd *cobra.Command, args []string) error {
 		Store:          storeAdapter,
 		SavedViewStore: s,
 		Engine:         engine,
-		SQLQueryRunner: func(ctx context.Context, sql string) (*query.QueryResult, error) {
+		SQLQueryRunner: func(requestCtx context.Context, sql string, fresh bool) (*query.QueryResult, *api.CacheBuildAccepted, error) {
 			if apiServer == nil {
-				return nil, errors.New("daemon API server unavailable")
+				return nil, nil, errors.New("daemon API server unavailable")
 			}
-			return runDaemonSQLQuery(ctx, cfg, s, apiServer.QueryEngineForRequest(ctx), sql)
+			return runDaemonSQLQueryWithJobs(requestCtx, cfg, s, apiServer.QueryEngineForRequest(requestCtx), sql, daemonSQLQueryOptions{fresh: fresh}, cacheJobs)
 		},
-		OCRStore:                      s,
+		ArchiveSQLQueryRunner: func(requestCtx context.Context, sql string, fresh bool) (*query.QueryResult, *api.CacheBuildAccepted, error) {
+			return runDaemonSQLQueryWithJobs(requestCtx, cfg, s, nil, sql, daemonSQLQueryOptions{fresh: fresh, archiveOnly: true}, cacheJobs)
+		},
+		CacheBuildStatusReader:        cacheJobs.status,
 		ShutdownToken:                 ownership.shutdownToken,
 		ShutdownFunc:                  cancel,
 		Scheduler:                     schedAdapter,
@@ -608,13 +945,42 @@ func runServe(cmd *cobra.Command, args []string) error {
 		AnalyticsInitializationActive: analyticsAsync,
 		IdleTracker:                   idleTracker,
 		OperationGate:                 operationGate,
+		OperationHistoryReader:        storeAdapter,
 		BlobStore:                     blobStore,
+		TelemetryCapture:              telemetry.CaptureHandler(telemetryReporter, cfg.Data.DataDir),
+		MessageRecordings:             messageRecordings,
+		DocbankAttachments:            docbankAttachments,
+		OCRStore:                      s,
+	}
+	apiOpts.GmailProfileAddress = func(ctx context.Context, source *store.Source) (string, error) {
+		client, serviceAccount, err := newDaemonGmailClient(
+			ctx, source.Identifier, source, getOAuthMgr, state, oauth.Scopes,
+		)
+		if err != nil {
+			return "", err
+		}
+		defer func() { _ = client.Close() }()
+		profile, err := client.GetProfile(ctx)
+		if err != nil {
+			classified := provideridentity.ClassifyGmailProfileError(err, serviceAccount)
+			return "", fmt.Errorf("read authenticated Gmail profile: %w", classified)
+		}
+		if profile == nil {
+			return "", errors.New("authenticated Gmail profile is missing")
+		}
+		return profile.EmailAddress, nil
 	}
 	applyServerRuntimeConfig(&apiOpts, cfg)
 	if cfg.Vector.AnyLaneEnabled() {
 		apiOpts.VectorStatus = api.VectorStatusInitializing
 	}
 	apiServer = api.NewServerWithOptions(apiOpts)
+	if cfg.People.Sweep.Enabled {
+		// The daemon owns the people sweep worker, so it owns manual brief
+		// generation: POST /api/v1/people/{id}/brief/generate reports
+		// unavailable in every process that does not.
+		apiServer.SetPersonBriefGenerator(newPersonBriefManualRun(cfg, s))
+	}
 
 	// Start API server in goroutine
 	apiAddr := apiListener.Addr().String()
@@ -649,17 +1015,13 @@ func runServe(cmd *cobra.Command, args []string) error {
 		if analyticsAsync {
 			analyticsInit = startDaemonAnalyticsInitializer(
 				ctx, cfg, s, startupCacheIntent, apiServer, ownership,
-				combineWorkTrackers(
-					idleTracker,
-					labelWorkTracker(operationGate, "analytics cache initialization"),
-				),
+				daemonAnalyticsCacheWorkTracker(idleTracker),
 			)
 		} else {
 			analyticsInit = completedDaemonAnalyticsInitHandle()
 		}
-		// Analytics must acquire the serial mutation gate before vector
-		// initialization can compete for it. This keeps an explicit cache
-		// request from waiting behind a long vector migration or backfill.
+		// Wait for the initializer to publish its startup barrier before vector
+		// initialization can compete for shared archive resources.
 		_ = analyticsInit.WaitStarted(ctx)
 		if idleTracker != nil {
 			idleTracker.Touch()
@@ -672,11 +1034,25 @@ func runServe(cmd *cobra.Command, args []string) error {
 			combineWorkTrackers(idleTracker, labelWorkTracker(operationGate, "background embedding work")),
 			apiServer, sched, blobStore,
 		)
+		telemetryHeartbeatDone := make(chan struct{})
+		go func() {
+			defer close(telemetryHeartbeatDone)
+			posthog.RunHeartbeat(ctx, telemetryReporter, logger)
+		}()
+		// Stop the heartbeat before the deferred telemetryReporter.Close.
+		defer func() {
+			cancel()
+			<-telemetryHeartbeatDone
+		}()
 
 		fmt.Printf("msgvault daemon started\n")
 		fmt.Printf("  API server: http://%s\n", apiAddr)
 		fmt.Printf("  Scheduled accounts: %d\n", count)
 		fmt.Printf("  Data directory: %s\n", cfg.Data.DataDir)
+		if telemetryReporter.Enabled() {
+			fmt.Printf("  Anonymous telemetry: on ([telemetry] enabled = false or %s=0 turns it off)\n",
+				telemetry.EnabledEnv)
+		}
 		fmt.Println()
 		fmt.Println("Press Ctrl+C to stop.")
 		fmt.Println()
@@ -714,9 +1090,23 @@ func runServe(cmd *cobra.Command, args []string) error {
 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), serveOperationDrainTimeout)
 	defer shutdownCancel()
-	shutdownErr := shutdownServeRuntime(shutdownCtx, cmd.OutOrStdout(), apiServer, sched, operationGate)
+	shutdownErr := shutdownServeRuntime(shutdownCtx, cmd.OutOrStdout(), apiServer, serveSchedulers{sched, mediaSched}, operationGate)
+	if !cacheJobs.waitContext(shutdownCtx) {
+		logger.Warn("analytics cache build did not stop within the shutdown drain timeout")
+		shutdownErr = errors.Join(shutdownErr, errors.New("analytics cache build did not stop during shutdown"))
+	}
 	if shutdownErr == nil {
 		resourceCleanupSafe = true
+	}
+	if err := cacheRefresher.Shutdown(shutdownCtx); err != nil {
+		logger.Warn("analytics cache refresh did not stop within the shutdown drain timeout", "error", err)
+		if retryErr := shutdownBackgroundCacheRefresher(cacheRefresher); retryErr != nil {
+			resourceCleanupSafe = false
+		} else {
+			cacheRefresherShutdown = true
+		}
+	} else {
+		cacheRefresherShutdown = true
 	}
 	// Wait for the background vector init regardless of the shutdown
 	// outcome: the deferred s.Close() must not run under a still-running
@@ -728,7 +1118,7 @@ func runServe(cmd *cobra.Command, args []string) error {
 	if vectorInit != nil {
 		if vectorInit.WaitContext(shutdownCtx) {
 			if resourceCleanupSafe {
-				vectorInit.CloseFeatures()
+				vectorInit.CloseFeatures(logger)
 			}
 		} else {
 			logger.Warn("vector init did not stop within the shutdown drain timeout; skipping vectors.db close")
@@ -755,29 +1145,97 @@ func runServe(cmd *cobra.Command, args []string) error {
 	return nil
 }
 
-func reconcileCardDAVSchedulerJob(sched *scheduler.Scheduler, cardDAVConfig config.CardDAVConfig, service api.CardDAVOperations, logger *slog.Logger) error {
+func snapshotIMAPDraftPolicy(cfg *config.Config) []config.IMAPDraftSource {
+	if cfg == nil {
+		return nil
+	}
+	return append([]config.IMAPDraftSource(nil), cfg.IMAP.Drafts...)
+}
+
+func snapshotGmailDraftPolicy(cfg *config.Config) []config.GmailDraftSource {
+	if cfg == nil {
+		return nil
+	}
+	return append([]config.GmailDraftSource(nil), cfg.Gmail.Drafts...)
+}
+
+func snapshotBeeperDraftPolicy(cfg *config.Config) []config.GmailDraftSource {
+	if cfg == nil {
+		return nil
+	}
+	return append([]config.GmailDraftSource(nil), cfg.Beeper.Drafts...)
+}
+
+func reconcileCardDAVSchedulerJob(sched *scheduler.Scheduler, cardDAVConfig config.CardDAVConfig, service api.CardDAVOperations, logger *slog.Logger, name string, state *invocation) error {
+	jobName := api.CardDAVJobNameForConnection(name)
 	if !cardDAVConfig.Enabled || cardDAVConfig.Schedule == "" {
-		sched.RemoveJob(api.CardDAVJobName)
+		sched.RemoveJob(jobName)
 		if cardDAVConfig.Enabled && cardDAVConfig.Schedule == "" {
 			logger.Warn("carddav is enabled but has no schedule — the daemon will not sync it",
-				"hint", `set a cron schedule (e.g. "0 */6 * * *") in [carddav]`)
+				"connection", name, "hint", `set a cron schedule (e.g. "0 */6 * * *") in [carddav]`)
 		}
 		return nil
 	}
 	if service == nil {
-		sched.RemoveJob(api.CardDAVJobName)
+		sched.RemoveJob(jobName)
+		hint := "save the CardDAV account with its password to repair the connection"
+		switch cardDAVConfig.Provider {
+		case "google":
+			hint = "connect Google in CardDAV account settings, then test and save the account"
+		case "microsoft":
+			hint = "run msgvault carddav authorize-microsoft with the account email, then test and save the account"
+		}
 		logger.Warn("carddav credentials are unavailable or do not match saved discovery; skipping scheduled sync",
-			"hint", "save the CardDAV account with its password to repair the connection")
+			"connection", name, "hint", hint)
 		return nil
 	}
 	if err := sched.AddJob(scheduler.Job{
-		Name: api.CardDAVJobName, Schedule: cardDAVConfig.Schedule,
-		Run: func(ctx context.Context) error {
-			_, err := service.Sync(ctx, carddav.SyncOptions{})
-			return err
-		},
+		Name: jobName, Schedule: cardDAVConfig.Schedule,
+		Run: invocationBoundJobRun(state, func(ctx context.Context) error {
+			_, err := service.Sync(ctx, carddav.SyncOptions{Trigger: store.CardDAVSyncTriggerScheduled})
+			return recordSyncAttempt(ctx, "carddav", name, err)
+		}),
 	}); err != nil {
-		return fmt.Errorf("schedule CardDAV sync: %w", err)
+		return fmt.Errorf("schedule CardDAV connection %s: %w", name, err)
+	}
+	return nil
+}
+
+func recoverCardDAVSyncRunsAtStartup(ctx context.Context, st *store.Store, logger *slog.Logger) error {
+	recovered, err := st.RecoverCardDAVSyncRunsContext(ctx)
+	if err != nil {
+		return fmt.Errorf("recover CardDAV sync runs at daemon startup: %w", err)
+	}
+	if recovered > 0 {
+		logger.Info("recovered orphaned CardDAV sync runs", "count", recovered)
+	}
+	return nil
+}
+
+func recoverNativeOperationRunsAtStartup(ctx context.Context, st *store.Store, logger *slog.Logger) error {
+	recoveredAt := time.Now().UTC()
+	sourceRuns, err := st.RecoverSyncRunsContext(ctx, recoveredAt)
+	if err != nil {
+		return fmt.Errorf("recover source sync runs at daemon startup: %w", err)
+	}
+	if err := recoverCardDAVSyncRunsAtStartup(ctx, st, logger); err != nil {
+		return err
+	}
+	if err := st.RecoverOperationInvocations(ctx, recoveredAt); err != nil {
+		return fmt.Errorf("recover operation invocations at daemon startup: %w", err)
+	}
+	sweepRuns, err := st.RecoverPersonSweepRunsContext(ctx)
+	if err != nil {
+		return fmt.Errorf("recover person sweep runs at daemon startup: %w", err)
+	}
+	enrichmentRuns, err := st.RecoverPersonEnrichmentRunsContext(ctx, recoveredAt)
+	if err != nil {
+		return fmt.Errorf("recover person enrichment runs at daemon startup: %w", err)
+	}
+	if sourceRuns+sweepRuns+enrichmentRuns > 0 {
+		logger.Info("recovered orphaned operation runs",
+			"source_sync", sourceRuns, "person_sweep", sweepRuns,
+			"person_enrichment", enrichmentRuns)
 	}
 	return nil
 }
@@ -797,6 +1255,11 @@ func applyServerRuntimeConfig(options *api.ServerOptions, cfg *config.Config) {
 }
 
 func listenServeAPI(bindAddr string, port int) (net.Listener, error) {
+	resolved, err := resolveServeBind(bindAddr)
+	if err != nil {
+		return nil, err
+	}
+	bindAddr = resolved
 	if bindAddr == "" {
 		bindAddr = defaultDaemonBindAddr
 	}
@@ -889,51 +1352,155 @@ func shutdownServeRuntime(
 	return nil
 }
 
-func runDaemonSQLQuery(
-	ctx context.Context,
-	c *config.Config,
-	s *store.Store,
-	engine query.Engine,
-	sqlStr string,
-) (*query.QueryResult, error) {
-	if c == nil || s == nil {
-		return nil, errors.New("daemon query unavailable")
+type daemonSQLQueryOptions struct {
+	fresh       bool
+	archiveOnly bool
+}
+
+// runDaemonSQLQueryWithJobs serves committed data while refresh work runs in
+// the daemon's background job registry. The request never waits for a cache
+// builder; a fresh request or unusable publication receives a job ID instead.
+func runDaemonSQLQueryWithJobs(
+	ctx context.Context, c *config.Config, s *store.Store, engine query.Engine,
+	sqlStr string, options daemonSQLQueryOptions, jobs *cacheBuildJobs,
+) (*query.QueryResult, *api.CacheBuildAccepted, error) {
+	if jobs == nil || c == nil || s == nil {
+		return nil, nil, errors.New("daemon cache refresh unavailable")
 	}
-	if engine == nil {
-		return nil, api.ErrSQLQueryEngineUnavailable
+	if err := query.EnsureReadOnly(sqlStr); err != nil {
+		return nil, nil, err
 	}
 	if s.IsPostgreSQL() {
+		if options.archiveOnly {
+			return nil, nil, api.ErrSQLQueryEngineUnavailable
+		}
 		if querier, ok := engine.(query.SQLQuerier); ok {
-			return querier.QuerySQL(ctx, sqlStr)
+			result, err := querier.QuerySQL(ctx, sqlStr)
+			return result, nil, err
 		}
-		return nil, errors.New("SQL query requires DuckDB engine")
+		return nil, nil, api.ErrSQLQueryEngineUnavailable
 	}
-
-	dbPath := c.DatabaseDSN()
-	analyticsDir := c.AnalyticsDir()
-	staleness := cacheNeedsBuild(dbPath, analyticsDir)
-	if !store.IsPostgresURL(dbPath) && !staleness.NeedsBuild {
-		if querier, ok := engine.(query.SQLQuerier); ok {
-			return querier.QuerySQL(ctx, sqlStr)
-		}
-	}
-
-	if staleness.NeedsBuild {
-		if err := buildCacheSubprocessForRun(ctx, staleness.FullRebuild); err != nil {
-			return nil, fmt.Errorf("build cache: %w", err)
-		}
-		logger.Info("rebuilt analytics cache for SQL query",
-			"reason", staleness.Reason,
-			"full_rebuild", staleness.FullRebuild)
-	}
-
-	duckEngine, err := openDaemonDuckDBEngine(c, s)
+	staleness, err := cacheNeedsBuildForServing(ctx, c.DatabaseDSN(), c.AnalyticsDir())
 	if err != nil {
-		return nil, fmt.Errorf("open DuckDB query engine: %w", err)
+		return nil, nil, fmt.Errorf("inspect analytics cache: %w", err)
 	}
-	defer func() { _ = duckEngine.Close() }()
+	if options.fresh {
+		job, err := jobs.acceptAfterWrite(buildCacheModeAuto)
+		if err != nil {
+			return nil, nil, fmt.Errorf("%w: %w", api.ErrCacheBuildUnavailable, err)
+		}
+		return nil, &api.CacheBuildAccepted{
+			Status: job.Status, JobID: job.JobID,
+		}, nil
+	}
+	if staleness.NeedsBuild {
+		if !c.Analytics.AutoBuildCache {
+			if !staleness.HasUsablePublication {
+				return nil, nil, api.ErrSQLQueryEngineUnavailable
+			}
+		} else if !staleness.HasUsablePublication {
+			job, err := jobs.accept(buildCacheModeAuto)
+			if err != nil {
+				return nil, nil, fmt.Errorf("%w: %w", api.ErrCacheBuildUnavailable, err)
+			}
+			return nil, &api.CacheBuildAccepted{
+				Status: job.Status, JobID: job.JobID, Cache: cacheFreshnessFromStaleness(staleness),
+			}, nil
+		}
+		if c.Analytics.AutoBuildCache {
+			if _, deferBuild := scheduledCacheBuildDelay(staleness, c.Analytics.MinRebuildInterval, time.Now()); !deferBuild {
+				if _, err := jobs.accept(buildCacheModeScheduledAuto); err != nil {
+					return nil, nil, fmt.Errorf("%w: %w", api.ErrCacheBuildUnavailable, err)
+				}
+			}
+		}
+	} else if c.Analytics.AutoBuildCache && staleness.HasUsablePublication {
+		if err := jobs.verifyWhenDue(staleness.PublishedAt, c.Analytics.MinRebuildInterval, time.Now()); err != nil {
+			return nil, nil, fmt.Errorf("%w: %w", api.ErrCacheBuildUnavailable, err)
+		}
+	}
+	// Raw SQL over a SQLite archive must use the committed Parquet views,
+	// even if the aggregate engine is a SQL-capable fallback.
+	querier, ok := engine.(*query.DuckDBEngine)
+	if options.archiveOnly {
+		duckOptions, err := daemonDuckDBOptions(c)
+		if err != nil {
+			return nil, nil, err
+		}
+		duckEngine, err := query.NewArchiveDuckDBEngine(ctx, c.AnalyticsDir(), duckOptions)
+		if err != nil {
+			if errors.Is(err, query.ErrCacheUnavailable) {
+				return acceptUnavailableCacheQuery(c, jobs, options.fresh)
+			}
+			return nil, nil, fmt.Errorf("open archive SQL engine: %w", err)
+		}
+		defer func() { _ = duckEngine.Close() }()
+		querier = duckEngine
+	} else if !ok {
+		duckEngine, err := openDaemonDuckDBEngine(c, s)
+		if err != nil {
+			if errors.Is(err, query.ErrCacheUnavailable) {
+				return acceptUnavailableCacheQuery(c, jobs, options.fresh)
+			}
+			return nil, nil, fmt.Errorf("open DuckDB query engine: %w", err)
+		}
+		defer func() { _ = duckEngine.Close() }()
+		querier = duckEngine
+	}
+	result, err := queryCommittedSQL(ctx, querier, sqlStr, staleness)
+	if err != nil {
+		if errors.Is(err, query.ErrCacheUnavailable) {
+			return acceptUnavailableCacheQuery(c, jobs, options.fresh)
+		}
+		return nil, nil, err
+	}
+	if result.Cache != nil {
+		result.Cache.Building = jobs.active()
+	}
+	return result, nil, nil
+}
 
-	return duckEngine.QuerySQL(ctx, sqlStr)
+func acceptUnavailableCacheQuery(
+	c *config.Config, jobs *cacheBuildJobs, fresh bool,
+) (*query.QueryResult, *api.CacheBuildAccepted, error) {
+	if !fresh && !c.Analytics.AutoBuildCache {
+		return nil, nil, api.ErrSQLQueryEngineUnavailable
+	}
+	job, err := jobs.accept(buildCacheModeAuto)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: %w", api.ErrCacheBuildUnavailable, err)
+	}
+	return nil, &api.CacheBuildAccepted{Status: job.Status, JobID: job.JobID}, nil
+}
+
+func cacheFreshnessFromStaleness(staleness cacheStaleness) *query.CacheFreshness {
+	if !staleness.HasUsablePublication {
+		return nil
+	}
+	return &query.CacheFreshness{
+		Generation: staleness.Generation, PublishedAt: staleness.PublishedAt,
+		StaleReason: staleness.Reason, PendingAdditions: staleness.PendingAdditions, Building: true,
+	}
+}
+
+func queryCommittedSQL(
+	ctx context.Context, querier query.SQLQuerier, sqlStr string, staleness cacheStaleness,
+) (*query.QueryResult, error) {
+	result, err := querier.QuerySQL(ctx, sqlStr)
+	if err != nil || result == nil || result.Cache == nil {
+		return result, err
+	}
+	if result.Cache.Generation != staleness.Generation ||
+		!result.Cache.PublishedAt.Equal(staleness.PublishedAt) {
+		// A publication may have landed between the staleness probe and the
+		// engine's read lock. Keep the engine's actual generation metadata.
+		return result, nil
+	}
+	if staleness.NeedsBuild {
+		result.Cache.StaleReason = staleness.Reason
+		result.Cache.PendingAdditions = staleness.PendingAdditions
+	}
+	return result, nil
 }
 
 // openDaemonAnalyticsEngine picks the daemon's analytics engine once at
@@ -950,6 +1517,7 @@ func openDaemonAnalyticsEngine(
 		return nil, "", startupCacheBuildOutcomeNone,
 			errors.New("daemon analytics engine unavailable")
 	}
+	logger := loggerFromContext(ctx)
 	if s.IsPostgreSQL() {
 		outcome := startupCacheBuildOutcomeNone
 		if intent != startupCacheBuildIntentNone {
@@ -974,10 +1542,32 @@ func openDaemonAnalyticsEngine(
 
 	dbPath := c.DatabaseDSN()
 	analyticsDir := c.AnalyticsDir()
-	staleness := cacheNeedsBuild(dbPath, analyticsDir)
+	staleness := cacheNeedsBuildContext(ctx, dbPath, analyticsDir)
+	if err := ctx.Err(); err != nil {
+		return nil, "", startupCacheBuildOutcomeNone, err
+	}
 	outcome := startupCacheBuildOutcomeNone
-	shouldBuild := intent != startupCacheBuildIntentNone ||
-		(staleness.NeedsBuild && c.Analytics.AutoBuildCache)
+	automaticBuild := intent == startupCacheBuildIntentNone &&
+		staleness.NeedsBuild && c.Analytics.AutoBuildCache
+	if automaticBuild {
+		// A restart must not force the full rebuild the post-sync path is
+		// throttling: serve the recent publication and refresh once the
+		// interval has elapsed.
+		if remaining, throttle := scheduledCacheBuildDelay(
+			staleness, c.Analytics.MinRebuildInterval, scheduledCacheBuildNow(),
+		); throttle {
+			logger.Info("serving existing analytics cache; rebuild deferred by min_rebuild_interval",
+				"published_at", staleness.PublishedAt,
+				"remaining", remaining.String(),
+				"reason", staleness.Reason)
+			if refresher := daemonCacheRefresher; refresher != nil {
+				refresher.RequestAfter(remaining, "startup")
+			}
+			automaticBuild = false
+		}
+	}
+	shouldBuild := intent != startupCacheBuildIntentNone || automaticBuild
+	var automaticBuildErr error
 	if shouldBuild {
 		// Build the cache before serving rather than starting on live-SQL
 		// fallback: incremental rebuilds take seconds, and startup progress
@@ -1001,6 +1591,15 @@ func openDaemonAnalyticsEngine(
 		} else {
 			buildErr = buildCacheSubprocessForRun(ctx, staleness.FullRebuild)
 		}
+		if err := ctx.Err(); err != nil {
+			if intent != startupCacheBuildIntentNone {
+				outcome = startupCacheBuildOutcomeFailed
+				if engineMode == config.AnalyticsEngineDuckDB {
+					outcome = startupCacheBuildOutcomeFatal
+				}
+			}
+			return nil, "", outcome, err
+		}
 		if buildErr != nil {
 			if intent != startupCacheBuildIntentNone {
 				outcome = startupCacheBuildOutcomeFailed
@@ -1010,25 +1609,43 @@ func openDaemonAnalyticsEngine(
 				"reason", reason,
 				"full_rebuild", fullBuild,
 				"error", buildErr)
-			if engineMode == config.AnalyticsEngineDuckDB {
-				if intent != startupCacheBuildIntentNone {
-					outcome = startupCacheBuildOutcomeFatal
-				}
-				return nil, "", outcome, fmt.Errorf("build analytics cache: %w", buildErr)
-			}
 			if intent != startupCacheBuildIntentNone {
+				if engineMode == config.AnalyticsEngineDuckDB {
+					outcome = startupCacheBuildOutcomeFatal
+					return nil, "", outcome, fmt.Errorf("build analytics cache: %w", buildErr)
+				}
 				return query.NewEngine(s.DB(), false), api.AnalyticsModeSQLFallback, outcome, nil
 			}
+			// A usable publication can still be served below, including a
+			// partial snapshot awaiting a full repair.
+			automaticBuildErr = buildErr
 		} else {
 			logger.Info("daemon startup step complete",
 				"step", "build_analytics_cache",
 				"reason", reason,
 				"full_rebuild", fullBuild)
 		}
-		staleness = cacheNeedsBuild(dbPath, analyticsDir)
+		staleness = cacheNeedsBuildContext(ctx, dbPath, analyticsDir)
+		if err := ctx.Err(); err != nil {
+			if intent != startupCacheBuildIntentNone {
+				outcome = startupCacheBuildOutcomeFailed
+				if engineMode == config.AnalyticsEngineDuckDB {
+					outcome = startupCacheBuildOutcomeFatal
+				}
+			}
+			return nil, "", outcome, err
+		}
 	}
 
-	if !staleness.NeedsBuild {
+	// A stale but usable publication is still served while automatic refresh
+	// is on (the post-sync path throttles rebuilds the same way at runtime),
+	// and always for engine="duckdb", which never falls back to live SQL.
+	servesStale := staleness.HasUsablePublication &&
+		(c.Analytics.AutoBuildCache || engineMode == config.AnalyticsEngineDuckDB)
+	if !staleness.NeedsBuild || servesStale {
+		if err := ctx.Err(); err != nil {
+			return nil, "", outcome, err
+		}
 		duckEngine, err := openDaemonDuckDBEngineForRun(c, s)
 		if err != nil {
 			if intent != startupCacheBuildIntentNone {
@@ -1057,12 +1674,18 @@ func openDaemonAnalyticsEngine(
 		return duckEngine, api.AnalyticsModeDuckDB, outcome, nil
 	}
 
+	if err := ctx.Err(); err != nil {
+		return nil, "", outcome, err
+	}
 	if intent != startupCacheBuildIntentNone {
 		outcome = startupCacheBuildOutcomeFailed
 	}
 	if engineMode == config.AnalyticsEngineDuckDB {
 		if intent != startupCacheBuildIntentNone {
 			outcome = startupCacheBuildOutcomeFatal
+		}
+		if automaticBuildErr != nil {
+			return nil, "", outcome, fmt.Errorf("build analytics cache: %w", automaticBuildErr)
 		}
 		reason := staleness.Reason
 		if reason == "" {
@@ -1088,35 +1711,34 @@ func openDaemonDuckDBEngine(c *config.Config, s *store.Store) (*query.DuckDBEngi
 	if c == nil || s == nil {
 		return nil, errors.New("daemon DuckDB engine unavailable")
 	}
-	spillParent, err := query.PrepareDaemonSpillDir(c.HomeDir)
+	options, err := daemonDuckDBOptions(c)
 	if err != nil {
 		return nil, err
 	}
-	// Each engine spills into its own subdirectory: the daemon opens both a
-	// long-lived engine and short-lived per-query engines (runDaemonSQLQuery),
-	// and OwnTempDirectory deletes the directory on Close — sharing one
-	// directory would let a temporary engine remove the live engine's spill
-	// files. The pid-owned parent is reaped by PrepareDaemonSpillDir once
-	// this process exits.
+	return query.NewDuckDBEngine(c.AnalyticsDir(), c.DatabaseDSN(), s.DB(), options)
+}
+
+func daemonDuckDBOptions(c *config.Config) (query.DuckDBOptions, error) {
+	spillParent, err := query.PrepareDaemonSpillDir(c.HomeDir)
+	if err != nil {
+		return query.DuckDBOptions{}, err
+	}
+	// Each engine owns its spill directory, so closing a temporary SQL
+	// engine cannot remove the long-lived analytics engine's spill files.
 	tempDirectory, err := os.MkdirTemp(spillParent, "engine-")
 	if err != nil {
-		return nil, fmt.Errorf("create engine spill directory: %w", err)
+		return query.DuckDBOptions{}, fmt.Errorf("create engine spill directory: %w", err)
 	}
-	// DisableSQLiteScanner keeps DuckDB's bundled SQLite library from
-	// ATTACHing the live database for the daemon's lifetime, which can
-	// interfere with the daemon's own go-sqlite3 WAL/lock state. Detail
-	// queries route through the shared go-sqlite3 connection instead;
-	// aggregates still read Parquet.
-	return query.NewDuckDBEngine(
-		c.AnalyticsDir(),
-		c.DatabaseDSN(),
-		s.DB(),
-		query.DuckDBOptions{
-			DisableSQLiteScanner: true,
-			TempDirectory:        tempDirectory,
-			OwnTempDirectory:     true,
-		},
-	)
+	// Keep DuckDB's bundled SQLite library away from the live database;
+	// detail queries use the daemon's shared go-sqlite3 connection.
+	return query.DuckDBOptions{
+		DisableSQLiteScanner: true,
+		TempDirectory:        tempDirectory,
+		OwnTempDirectory:     true,
+		MemoryLimit:          c.Analytics.QueryMemoryLimit,
+		Threads:              c.Analytics.QueryThreads,
+		MaxTempDirectorySize: c.Analytics.QueryTempLimit,
+	}, nil
 }
 
 func hasServeOAuthConfig(c *config.Config) bool {
@@ -1126,10 +1748,11 @@ func hasServeOAuthConfig(c *config.Config) bool {
 	return c.OAuth.HasAnyConfig() || c.Microsoft.ClientID != ""
 }
 
-func newDaemonIdleTracker(c *config.Config, stop context.CancelFunc) *api.IdleTracker {
+func newDaemonIdleTracker(c *config.Config, stop context.CancelFunc, logger *slog.Logger) *api.IdleTracker {
 	if c == nil || os.Getenv(serveBackgroundChildEnv) != "1" {
 		return nil
 	}
+	logger = repairLogger(logger)
 	timeout := c.Server.DaemonIdleTimeout
 	if raw := os.Getenv(daemonIdleTimeoutEnv); raw != "" {
 		parsed, err := time.ParseDuration(raw)
@@ -1155,21 +1778,87 @@ func newDaemonIdleTracker(c *config.Config, stop context.CancelFunc) *api.IdleTr
 // Since api.APIMessage, api.StoreStats, etc. are type aliases for store types,
 // the adapter methods are simple pass-throughs with no conversion needed.
 type storeAPIAdapter struct {
-	store                 *store.Store
+	operationGate             api.OperationGate
+	embeddingsOptimizeMu      stdsync.Mutex
+	store                     *store.Store
+	config                    *config.Config
+	options                   invocationOptions
+	logger                    *slog.Logger
+	draftPolicy               []config.IMAPDraftSource
+	draftClientFactory        func(context.Context, *store.Source) (*imaplib.Client, error)
+	gmailDraftPolicy          []config.GmailDraftSource
+	beeperDraftPolicy         []config.GmailDraftSource
+	gmailDraftClientFactory   func(context.Context, *store.Source) (gmail.DraftAPI, error)
+	calendarClientFactory     func(context.Context, config.GCalSource, bool) (gcal.ControlAPI, error)
+	emailTagClientFactory     func(context.Context, *store.Source) (gmail.API, error)
+	microsoftTagClientFactory func(context.Context, *store.Source, bool) (*msmail.Client, error)
+	// draftCacheRefresh rebuilds the analytics cache after a draft is durable,
+	// the same best-effort hook the meeting importer uses.
+	draftCacheRefresh     func(context.Context, string) error
 	attachmentMaintenance *attachmentMaintenance
 	meetingImporter       *meetingimport.Importer
 	// analyticsDir is the daemon's Parquet analytics cache directory, used
 	// to read the revision committed by the derived-refresh child.
 	analyticsDir           string
+	cacheJobs              *cacheBuildJobs
 	personEnrichmentConfig personenrichment.Config
 	lookupEnv              personenrichment.CredentialLookup
+}
+
+func (a *storeAPIAdapter) invocationContext(ctx context.Context) context.Context {
+	if a == nil {
+		return ctx
+	}
+	state := newInvocation()
+	state.cfg = a.config
+	state.options = a.options
+	if a.logger != nil {
+		state.logger = a.logger
+	}
+	return withInvocation(ctx, state)
+}
+
+func (a *storeAPIAdapter) GrantPersonMatchConsentContext(ctx context.Context, disclosure personmatch.Disclosure, actor string, mutationGate func(context.Context) (func(), error)) (*store.PersonMatchConsent, bool, error) {
+	return a.store.GrantPersonMatchConsentContext(ctx, disclosure, actor, mutationGate)
+}
+
+func (a *storeAPIAdapter) RevokePersonMatchConsentContext(ctx context.Context, fingerprint, actor string, mutationGate func(context.Context) (func(), error)) (bool, error) {
+	return a.store.RevokePersonMatchConsentContext(ctx, fingerprint, actor, mutationGate)
+}
+
+func (a *storeAPIAdapter) HasPersonMatchConsentContext(ctx context.Context, fingerprint string) (bool, error) {
+	return a.store.HasPersonMatchConsentContext(ctx, fingerprint)
+}
+
+func (a *storeAPIAdapter) PersonMatchConsentEgressContext(
+	ctx context.Context, fingerprint string, dispatch func() error,
+) (bool, error) {
+	return a.store.PersonMatchConsentEgressContext(ctx, fingerprint, dispatch)
+}
+
+func (a *storeAPIAdapter) EnsurePersonMatchScoringCandidatesContext(ctx context.Context, limit int) (int, error) {
+	return a.store.EnsurePersonMatchScoringCandidatesContext(ctx, limit)
+}
+
+func (a *storeAPIAdapter) ClaimNextIdentityMatchJudgmentContext(ctx context.Context, owner string, leaseDuration time.Duration, scoringVersion ...string) (*store.IdentityMatchJudgmentLease, error) {
+	return a.store.ClaimNextIdentityMatchJudgmentContext(ctx, owner, leaseDuration, scoringVersion...)
+}
+
+func (a *storeAPIAdapter) RecordIdentityMatchJudgmentContext(ctx context.Context, lease store.IdentityMatchJudgmentLease, input store.IdentityMatchJudgmentInput) (*store.IdentityMatchJudgment, error) {
+	return a.store.RecordIdentityMatchJudgmentContext(ctx, lease, input)
+}
+
+func (a *storeAPIAdapter) ListIdentityMatchJudgmentsContext(ctx context.Context, candidateID int64, limit int, beforeID ...int64) ([]store.IdentityMatchJudgment, error) {
+	return a.store.ListIdentityMatchJudgmentsContext(ctx, candidateID, limit, beforeID...)
 }
 
 var _ api.MessageStore = (*storeAPIAdapter)(nil)
 var _ api.CtxMessageStore = (*storeAPIAdapter)(nil)
 var _ api.MessageIdentityStore = (*storeAPIAdapter)(nil)
 var _ api.PersonFactStore = (*storeAPIAdapter)(nil)
+var _ api.PersonBriefStore = (*storeAPIAdapter)(nil)
 var _ api.MeetingImporter = (*storeAPIAdapter)(nil)
+var _ api.MuesliImporter = (*storeAPIAdapter)(nil)
 var _ api.SourceStatusStore = (*storeAPIAdapter)(nil)
 var _ api.CLIStore = (*storeAPIAdapter)(nil)
 var _ api.ContextCLIStore = (*storeAPIAdapter)(nil)
@@ -1178,6 +1867,7 @@ var _ api.CLICacheBuilder = (*storeAPIAdapter)(nil)
 var _ api.CLISyncRunner = (*storeAPIAdapter)(nil)
 var _ api.CLIVerifyRunner = (*storeAPIAdapter)(nil)
 var _ api.CLIRepairEncodingRunner = (*storeAPIAdapter)(nil)
+var _ api.CLIRepairMessageRunner = (*storeAPIAdapter)(nil)
 var _ api.CLIRunner = (*storeAPIAdapter)(nil)
 var _ api.CLIAddCalendarPlanner = (*storeAPIAdapter)(nil)
 var _ api.CLIDeleteStagedPlanner = (*storeAPIAdapter)(nil)
@@ -1193,6 +1883,7 @@ var _ api.IdentityMatchStore = (*storeAPIAdapter)(nil)
 var _ api.PersonProfileStore = (*storeAPIAdapter)(nil)
 var _ api.PersonCompletionStore = (*storeAPIAdapter)(nil)
 var _ api.PersonTrackingStore = (*storeAPIAdapter)(nil)
+var _ api.PersonNetworkStore = (*storeAPIAdapter)(nil)
 var _ api.PersonProfileValueStore = (*storeAPIAdapter)(nil)
 var _ api.CommunicationServiceStore = (*storeAPIAdapter)(nil)
 var _ api.AttributeDefinitionStore = (*storeAPIAdapter)(nil)
@@ -1205,10 +1896,17 @@ var _ api.ClusterLookupStore = (*storeAPIAdapter)(nil)
 var _ api.ConversationWindowStore = (*storeAPIAdapter)(nil)
 var _ api.ChangedMessageLister = (*storeAPIAdapter)(nil)
 var _ api.ArchiveIdentifier = (*storeAPIAdapter)(nil)
+var _ operations.HistoryReader = (*storeAPIAdapter)(nil)
 var _ api.DocumentSearchStore = (*storeAPIAdapter)(nil)
 var _ api.DocumentStatusStore = (*storeAPIAdapter)(nil)
 var _ api.DocumentVectorStatusStore = (*storeAPIAdapter)(nil)
 var _ api.ActivityStore = (*storeAPIAdapter)(nil)
+var _ api.ParticipantIdentityContextStore = (*storeAPIAdapter)(nil)
+
+// personagenda.IdentityStore backs the live person agenda routes; without the
+// forwarding method below the backend starts nil and every agenda endpoint
+// answers 503 task_integration_unavailable.
+var _ personagenda.IdentityStore = (*storeAPIAdapter)(nil)
 
 func (a *storeAPIAdapter) ContactStateContext(
 	ctx context.Context, personID int64, now time.Time,
@@ -1226,6 +1924,40 @@ func (a *storeAPIAdapter) PersonDayContext(
 	ctx context.Context, request store.PersonDayRequest,
 ) (*store.PersonDayPage, error) {
 	return a.store.PersonDayContext(ctx, request)
+}
+
+// Kata issue evidence reaches the API through the adapter.
+func (a *storeAPIAdapter) LoadKataEvidenceSource(ctx context.Context, selector kataevidence.Selector) (kataevidence.SourceRecord, error) {
+	return a.store.LoadKataEvidenceSource(ctx, selector)
+}
+
+func (a *storeAPIAdapter) ReadKataEvidenceSource(ctx context.Context, ref kataevidence.Reference) (kataevidence.SourceRecord, error) {
+	return a.store.ReadKataEvidenceSource(ctx, ref)
+}
+
+func (a *storeAPIAdapter) KataCitationSource(ctx context.Context, messageID, attachmentID int64) ([]kataevidence.Reference, error) {
+	return a.store.KataCitationSource(ctx, messageID, attachmentID)
+}
+
+func (a *storeAPIAdapter) KataDocbankBinding(ctx context.Context, destination string, attachmentID int64) (kataevidence.DocbankBinding, error) {
+	return a.store.KataDocbankBinding(ctx, destination, attachmentID)
+}
+
+func (a *storeAPIAdapter) MediaRevision(ctx context.Context, attachmentID int64) (string, error) {
+	revision, err := beeper.MediaRevision(ctx, a.store, attachmentID)
+	if beeper.MediaRevisionUnavailable(err) {
+		return "", kataevidence.ErrUnavailable
+	}
+	if beeper.MediaRevisionChanged(err) {
+		return "", kataevidence.ErrChanged
+	}
+	return revision, err
+}
+
+// ListPersonUIDsContext forwards to the store so the daemon's adapter, not a
+// bare *store.Store, satisfies the agenda identity lookup.
+func (a *storeAPIAdapter) ListPersonUIDsContext(ctx context.Context, personID int64) ([]string, error) {
+	return a.store.ListPersonUIDsContext(ctx, personID)
 }
 
 func (a *storeAPIAdapter) DayContext(
@@ -1252,6 +1984,14 @@ func (a *storeAPIAdapter) DeleteDailyNoteEntryContext(ctx context.Context, id in
 
 func (a *storeAPIAdapter) ConversationExistsContext(ctx context.Context, conversationID int64) (bool, error) {
 	return a.store.ConversationExistsContext(ctx, conversationID)
+}
+
+func (a *storeAPIAdapter) RefreshChatMembersContext(ctx context.Context) error {
+	return a.store.RefreshChatMembersContext(ctx)
+}
+
+func (a *storeAPIAdapter) SearchChatsMetadataContext(ctx context.Context, q store.ChatDiscoveryQuery) (*store.ChatDiscoveryPage, error) {
+	return a.store.SearchChatsMetadataContext(ctx, q)
 }
 
 func (a *storeAPIAdapter) GetConversationWindowContext(
@@ -1282,10 +2022,39 @@ func (a *storeAPIAdapter) ArchiveUIDContext(ctx context.Context) (string, error)
 	return a.store.ArchiveUIDContext(ctx)
 }
 
+func (a *storeAPIAdapter) ActiveOperationTokenKey(ctx context.Context) (store.OperationTokenKey, error) {
+	return a.store.ActiveOperationTokenKey(ctx)
+}
+
+func (a *storeAPIAdapter) OperationTokenKey(
+	ctx context.Context, keyID string,
+) (store.OperationTokenKey, error) {
+	return a.store.OperationTokenKey(ctx, keyID)
+}
+
+func (a *storeAPIAdapter) Kinds() []operations.Kind {
+	return a.store.Kinds()
+}
+
+func (a *storeAPIAdapter) ListRuns(ctx context.Context, query operations.Query) (operations.HistorySnapshot, error) {
+	return a.store.ListRuns(ctx, query)
+}
+
+func (a *storeAPIAdapter) GetRun(ctx context.Context, id operations.StableID) (operations.Run, error) {
+	return a.store.GetRun(ctx, id)
+}
+
+func (a *storeAPIAdapter) LaneStatus(
+	ctx context.Context, kind operations.Kind,
+) (operations.LaneHistoryStatus, error) {
+	return a.store.LaneStatus(ctx, kind)
+}
+
 func (a *storeAPIAdapter) SearchDocuments(
 	ctx context.Context,
 	request store.DocumentSearchRequest,
 ) (store.DocumentSearchResponse, error) {
+	ctx = a.invocationContext(ctx)
 	if err := reconcileDocumentOccurrencesForSearch(ctx, a.store); err != nil {
 		return store.DocumentSearchResponse{}, err
 	}
@@ -1293,6 +2062,7 @@ func (a *storeAPIAdapter) SearchDocuments(
 }
 
 func (a *storeAPIAdapter) ReconcileDocumentOccurrences(ctx context.Context) error {
+	ctx = a.invocationContext(ctx)
 	return reconcileDocumentOccurrencesForSearch(ctx, a.store)
 }
 
@@ -1306,6 +2076,12 @@ func (a *storeAPIAdapter) GetDocumentIndexStatusForScope(
 	return a.store.GetDocumentIndexStatusForScope(
 		ctx, profileID, extractionInputKey, allowedMediaTypes, allowedMessageTypes,
 	)
+}
+
+func (a *storeAPIAdapter) GetCurrentDocumentIndexStatusScope(
+	ctx context.Context,
+) (string, []string, error) {
+	return a.store.GetCurrentDocumentIndexStatusScope(ctx)
 }
 
 func (a *storeAPIAdapter) GetActiveDocumentExtractionRebuild(
@@ -1359,14 +2135,54 @@ func (a *storeAPIAdapter) ImportMeeting(
 	return a.meetingImporter.Import(ctx, req)
 }
 
+// ImportMuesliRecording uses the shared attachment writer; Docbank discovers it
+// through ordinary stored audio classification and attachment journal changes.
+func (a *storeAPIAdapter) ImportMuesliRecording(ctx context.Context, upload muesli.RecordingUpload, input io.Reader, maxBytes int64) (bool, error) {
+	if a == nil || a.store == nil || a.config == nil {
+		return false, errors.New("muesli recording import unavailable")
+	}
+	changed, err := muesli.NewImporter(a.store).ImportRecording(ctx, upload, a.config.AttachmentsDir(), input, maxBytes)
+	if changed && !upload.NoBuildCache {
+		refreshCtx := context.WithoutCancel(a.invocationContext(ctx))
+		if refreshErr := rebuildMuesliCacheAfterScheduledSync(refreshCtx, "muesli"); refreshErr != nil && a.logger != nil {
+			a.logger.Warn("Muesli cache refresh deferred", "error_class", "internal")
+		}
+	}
+	return changed, err
+}
+
+// ImportMuesli receives bounded recorder-local evidence under the API gate.
+func (a *storeAPIAdapter) ImportMuesli(ctx context.Context, req muesli.RemoteRequest) (muesli.RemoteResult, error) {
+	if a == nil || a.store == nil {
+		return muesli.RemoteResult{}, errors.New("muesli import unavailable")
+	}
+	result, err := muesli.NewImporter(a.store).ImportRemote(ctx, req)
+	refreshCtx := context.WithoutCancel(a.invocationContext(ctx))
+	if req.Action == "refresh" && err == nil && req.BuildCache {
+		err = a.queueCacheRefreshAfterManualSync(true, req.NoBuildCache)
+	} else if result.Changed && !req.NoBuildCache {
+		// A committed write still needs a refresh when checkpoint/link work fails.
+		if refreshErr := rebuildMuesliCacheAfterScheduledSync(refreshCtx, "muesli"); refreshErr != nil && a.logger != nil {
+			a.logger.Warn("Muesli cache refresh deferred", "error_class", "internal")
+		}
+	}
+	return result, err
+}
+
 func (a *storeAPIAdapter) GetStatsContext(ctx context.Context) (*api.StoreStats, error) {
 	return a.store.GetStatsContext(ctx)
 }
 
+func (a *storeAPIAdapter) BeginReadSnapshotContext(ctx context.Context) (context.Context, func(), error) {
+	return a.store.BeginReadSnapshotContext(ctx)
+}
+func (a *storeAPIAdapter) DB() *sql.DB        { return a.store.DB() }
+func (a *storeAPIAdapter) IsPostgreSQL() bool { return a.store.IsPostgreSQL() }
+
 func (a *storeAPIAdapter) ListMessagesContext(
-	ctx context.Context, offset, limit int,
+	ctx context.Context, offset, limit int, sourceIDs []int64,
 ) ([]api.APIMessage, int64, error) {
-	return a.store.ListMessagesContext(ctx, offset, limit)
+	return a.store.ListMessagesContext(ctx, offset, limit, sourceIDs)
 }
 
 func (a *storeAPIAdapter) GetMessageContext(ctx context.Context, id int64) (*api.APIMessage, error) {
@@ -1413,6 +2229,10 @@ func (a *storeAPIAdapter) GetMessage(id int64) (*api.APIMessage, error) {
 	return a.store.GetMessage(id)
 }
 
+func (a *storeAPIAdapter) MessageRemoteImagesContext(ctx context.Context, id int64) (map[string]store.AttachmentRef, error) {
+	return a.store.MessageRemoteImagesContext(ctx, id)
+}
+
 func (a *storeAPIAdapter) GetMessagesSummariesByIDs(ids []int64) ([]api.APIMessage, error) {
 	return a.store.GetMessagesSummariesByIDs(ids)
 }
@@ -1433,6 +2253,15 @@ func (a *storeAPIAdapter) SearchMessagesQueryContext(ctx context.Context, q *sea
 	return a.store.SearchMessagesQueryContext(ctx, q, offset, limit)
 }
 
+func (a *storeAPIAdapter) SearchMessageIDsQueryContext(
+	ctx context.Context, q *search.Query, limit int,
+) ([]int64, int64, error) {
+	return a.store.SearchMessageIDsQueryContext(ctx, q, limit)
+}
+
+func (a *storeAPIAdapter) NeedsFTSBackfillContext(ctx context.Context) (bool, error) {
+	return a.store.NeedsFTSBackfillContext(ctx)
+}
 func (a *storeAPIAdapter) NeedsFTSBackfill() bool {
 	return a.store.NeedsFTSBackfill()
 }
@@ -1472,6 +2301,7 @@ func (a *storeAPIAdapter) BuildCLICache(
 	fullRebuild bool,
 	emit func(api.CLICacheBuildEvent) error,
 ) error {
+	ctx = a.invocationContext(ctx)
 	return buildCacheSubprocessStream(ctx, fullRebuild, false, emit)
 }
 
@@ -1480,7 +2310,33 @@ func (a *storeAPIAdapter) RunCLISync(
 	req api.CLISyncRequest,
 	emit func(api.CLISyncEvent) error,
 ) error {
-	return a.runCLISyncWithRunner(ctx, req, emit, runDaemonCLISubprocessStream)
+	ctx = a.invocationContext(ctx)
+	return a.runCLISyncOperationWithRunner(ctx, req, emit, runDaemonCLISubprocessStream)
+}
+
+func (a *storeAPIAdapter) runCLISyncOperationWithRunner(
+	ctx context.Context,
+	req api.CLISyncRequest,
+	emit func(api.CLISyncEvent) error,
+	run cliSyncSubprocessRunner,
+) error {
+	err := a.runCLISyncWithRunner(ctx, req, emit, run)
+	if err == nil && ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	if req.OperationID != "" {
+		status := "done"
+		if err != nil {
+			status = "failed"
+		}
+		if finishErr := a.store.FinishSyncOperation(req.OperationID, status); finishErr != nil {
+			return errors.Join(err, fmt.Errorf("finish sync operation: %w", finishErr))
+		}
+	}
+	if queueErr := a.queueCacheRefreshAfterManualSync(req.BuildCache, req.NoBuildCache); queueErr != nil {
+		err = errors.Join(err, queueErr)
+	}
+	return err
 }
 
 type cliSyncSubprocessRunner func(
@@ -1525,8 +2381,17 @@ func emitFolderArgs(args []string, flag string, values []string) []string {
 func cliSyncSubprocessArgs(req api.CLISyncRequest) []string {
 	if req.Full {
 		args := []string{"sync-full"}
+		if req.BuildCache {
+			args = append(args, "--build-cache")
+		}
+		if req.NoBuildCache {
+			args = append(args, "--no-build-cache")
+		}
 		if req.SourceIDSet {
 			args = append(args, "--source-id", strconv.FormatInt(req.SourceID, 10))
+		}
+		if req.OperationID != "" {
+			args = append(args, "--sync-operation-id", req.OperationID)
 		}
 		if req.Query != "" {
 			args = append(args, "--query", req.Query)
@@ -1551,6 +2416,12 @@ func cliSyncSubprocessArgs(req api.CLISyncRequest) []string {
 		return args
 	}
 	args := []string{syncIncrementalCmd.Name()}
+	if req.BuildCache {
+		args = append(args, "--build-cache")
+	}
+	if req.NoBuildCache {
+		args = append(args, "--no-build-cache")
+	}
 	if req.SourceIDSet {
 		args = append(args, "--source-id", strconv.FormatInt(req.SourceID, 10))
 	}
@@ -1567,6 +2438,7 @@ func (a *storeAPIAdapter) RunCLIVerify(
 	req api.CLIVerifyRequest,
 	emit func(api.CLIVerifyEvent) error,
 ) error {
+	ctx = a.invocationContext(ctx)
 	return runDaemonCLISubprocessStream(ctx, cliVerifySubprocessArgs(req), func(stream, data string) error {
 		if emit == nil {
 			return nil
@@ -1594,6 +2466,7 @@ func (a *storeAPIAdapter) RunCLIRepairEncoding(
 	ctx context.Context,
 	emit func(api.CLIRepairEncodingEvent) error,
 ) error {
+	ctx = a.invocationContext(ctx)
 	return runDaemonCLISubprocessStream(ctx, []string{"repair-encoding"}, func(stream, data string) error {
 		if emit == nil {
 			return nil
@@ -1602,11 +2475,67 @@ func (a *storeAPIAdapter) RunCLIRepairEncoding(
 	})
 }
 
+func (a *storeAPIAdapter) RunCLIRepairMessage(
+	ctx context.Context,
+	req api.CLIRepairMessageRequest,
+	emit func(api.CLIRepairMessageEvent) error,
+) error {
+	ctx = a.invocationContext(ctx)
+	return a.runCLIRepairMessageWithRunner(ctx, req, emit, runDaemonCLISubprocessStream)
+}
+
+func (a *storeAPIAdapter) runCLIRepairMessageWithRunner(
+	ctx context.Context,
+	req api.CLIRepairMessageRequest,
+	emit func(api.CLIRepairMessageEvent) error,
+	run cliSyncSubprocessRunner,
+) error {
+	emitSubprocess := func(stream, data string) error {
+		if emit == nil {
+			return nil
+		}
+		return emit(api.CLIRepairMessageEvent{Type: stream, Data: data})
+	}
+	runRepair := func(ctx context.Context) error {
+		return run(ctx, cliRepairMessageSubprocessArgs(req), emitSubprocess)
+	}
+	if req.Audit {
+		return runRepair(ctx)
+	}
+	emitWarning := func(message string) error {
+		if emit == nil {
+			return nil
+		}
+		return emit(api.CLIRepairMessageEvent{Type: "stderr", Data: message})
+	}
+	return runAfterSuccessfulAttachmentIngest(ctx, a.attachmentMaintenance, runRepair, emitWarning)
+}
+
+func cliRepairMessageSubprocessArgs(req api.CLIRepairMessageRequest) []string {
+	args := []string{"repair-message", "--local"}
+	if req.Audit {
+		args = append(args, "--audit")
+	}
+	if req.SourceID > 0 {
+		args = append(args, "--source-id", strconv.FormatInt(req.SourceID, 10))
+	}
+	if req.JSON {
+		args = append(args, "--json")
+	}
+	if req.Reference != "" {
+		// The reference is user data. Terminate flag parsing so a value such
+		// as "--audit" reaches the subprocess as a positional argument.
+		args = append(args, "--", req.Reference)
+	}
+	return args
+}
+
 func (a *storeAPIAdapter) RunCLICommand(
 	ctx context.Context,
 	req api.CLIRunRequest,
 	emit func(api.CLIRunEvent) error,
 ) error {
+	ctx = a.invocationContext(ctx)
 	return a.runCLICommandWithRunner(ctx, req, emit, runDaemonCLISubprocessStreamWithEnv)
 }
 
@@ -1623,12 +2552,36 @@ func (a *storeAPIAdapter) runCLICommandWithRunner(
 	req api.CLIRunRequest,
 	emit func(api.CLIRunEvent) error,
 	run cliCommandSubprocessRunner,
-) error {
+) (runErr error) {
+	if api.IsCLIRunEmbeddingsOptimize(req.Args) {
+		return a.runCLIEmbeddingsOptimize(ctx, req, emit)
+	}
+	if manualSyncCLICommand(req.Args) {
+		defer func() {
+			force, skip := manualSyncCacheFlagValues(req.Args)
+			runErr = errors.Join(runErr, a.queueCacheRefreshAfterManualSync(force, skip))
+		}()
+	}
 	emitSubprocess := func(stream, data string) error {
 		if emit == nil {
 			return nil
 		}
 		return emit(api.CLIRunEvent{Type: stream, Data: data})
+	}
+	if api.IsCLIRunDraftCreate(req.Args) {
+		if api.IsCLIRunDraftForward(req.Args) {
+			return a.runCLIForwardDraft(ctx, req, emit)
+		}
+		if api.IsCLIRunDraftCompose(req.Args) {
+			return a.runCLIComposeDraft(ctx, req, emit)
+		}
+		return a.runCLIReplyDraft(ctx, req, emit)
+	}
+	if api.IsCLIRunDraftSendAs(req.Args) {
+		return a.runCLIDraftSendAs(ctx, req, emit)
+	}
+	if api.IsCLIRunDraftLifecycle(req.Args) {
+		return a.runCLIDraftLifecycle(ctx, req, emit)
 	}
 	runSubprocess := func(ctx context.Context) error {
 		args := req.Args
@@ -1692,6 +2645,9 @@ func attachmentRemovalCommand(args []string) bool {
 	if args[0] == removeAccountCommandName {
 		return true
 	}
+	if args[0] == "gc" {
+		return true
+	}
 	if args[0] != purgeExcludedMediaCommandName {
 		return false
 	}
@@ -1733,6 +2689,7 @@ func (a *storeAPIAdapter) PlanCLIAddCalendar(
 	ctx context.Context,
 	req api.CLIAddCalendarPlanRequest,
 ) (api.CLIAddCalendarPlanResponse, error) {
+	ctx = a.invocationContext(ctx)
 	return planCLIAddCalendar(ctx, a.store, req)
 }
 
@@ -1740,6 +2697,7 @@ func (a *storeAPIAdapter) PlanCLIEmbeddings(
 	ctx context.Context,
 	req api.CLIEmbeddingsPlanRequest,
 ) (api.CLIEmbeddingsPlanResponse, error) {
+	ctx = a.invocationContext(ctx)
 	return planCLIEmbeddings(ctx, req)
 }
 
@@ -1747,11 +2705,15 @@ func (a *storeAPIAdapter) PlanCLIDeleteStaged(
 	ctx context.Context,
 	req api.CLIDeleteStagedPlanRequest,
 ) (api.CLIDeleteStagedPlanResponse, error) {
+	ctx = a.invocationContext(ctx)
 	return planCLIDeleteStaged(ctx, a.store, req)
 }
 
 func (a *storeAPIAdapter) deletionManager() (*deletion.Manager, error) {
-	mgr, err := deletion.NewManager(filepath.Join(cfg.Data.DataDir, "deletions"))
+	if a.config == nil {
+		return nil, errors.New("configuration is unavailable")
+	}
+	mgr, err := deletion.NewManager(filepath.Join(a.config.Data.DataDir, "deletions"))
 	if err != nil {
 		return nil, fmt.Errorf("create deletion manager: %w", err)
 	}
@@ -1805,6 +2767,7 @@ func (a *storeAPIAdapter) PlanCLIDeduplicate(
 	ctx context.Context,
 	req api.CLIDeduplicatePlanRequest,
 ) (api.CLIDeduplicatePlanResponse, error) {
+	ctx = a.invocationContext(ctx)
 	return planCLIDeduplicate(ctx, a.store, req)
 }
 
@@ -1863,6 +2826,12 @@ func (a *storeAPIAdapter) BackupDatabase(dst string) error {
 
 func (a *storeAPIAdapter) BackupDatabaseContext(ctx context.Context, dst string) error {
 	return a.store.BackupDatabaseContext(ctx, dst)
+}
+
+// CountMessagesBySourceContext counts every source's messages in one pass
+// for account listings.
+func (a *storeAPIAdapter) CountMessagesBySourceContext(ctx context.Context) (map[int64]store.SourceMessageCounts, error) {
+	return a.store.CountMessagesBySourceContext(ctx)
 }
 
 func (a *storeAPIAdapter) CountMessagesForSource(sourceID int64) (int64, error) {
@@ -2021,6 +2990,23 @@ func (a *storeAPIAdapter) ListAccountIdentitiesContext(
 	return a.store.ListAccountIdentitiesContext(ctx, sourceID)
 }
 
+func (a *storeAPIAdapter) ListVirtualAccountsContext(ctx context.Context) (map[int64][]store.VirtualAccount, error) {
+	return a.store.ListVirtualAccountsContext(ctx)
+}
+
+// AccountIdentityRevisionContext lets the API tell a catalog read from before
+// an identity change from a current one.
+func (a *storeAPIAdapter) AccountIdentityRevisionContext(ctx context.Context) (int64, error) {
+	return a.store.AccountIdentityRevisionContext(ctx)
+}
+
+// The API serves the account catalog only from a store that also reports
+// the identity revision, so the adapter must keep both.
+var _ interface {
+	ListVirtualAccountsContext(ctx context.Context) (map[int64][]store.VirtualAccount, error)
+	AccountIdentityRevisionContext(ctx context.Context) (int64, error)
+} = (*storeAPIAdapter)(nil)
+
 func (a *storeAPIAdapter) ResolveAccountIdentityContext(
 	ctx context.Context,
 	sourceID int64,
@@ -2117,33 +3103,75 @@ func (a *storeAPIAdapter) ListIdentityMatchCandidatesContext(
 	return a.store.ListIdentityMatchCandidatesContext(ctx, states, limit, offset)
 }
 
+func (a *storeAPIAdapter) ListIdentityMatchReviewsContext(
+	ctx context.Context, states []store.IdentityMatchState, limit, offset int,
+) ([]store.IdentityMatchCandidate, error) {
+	return a.store.ListIdentityMatchReviewsContext(ctx, states, limit, offset)
+}
+
+func (a *storeAPIAdapter) GetIdentityMatchReviewContext(
+	ctx context.Context, candidateID int64,
+) (*store.IdentityMatchCandidate, error) {
+	return a.store.GetIdentityMatchReviewContext(ctx, candidateID)
+}
+
+func (a *storeAPIAdapter) DecideIdentityMatchReviewedContext(
+	ctx context.Context, candidateID int64, token string,
+	decision store.IdentityMatchState, notes *string,
+) (*store.IdentityMatchCandidate, int64, error) {
+	return a.store.DecideIdentityMatchReviewedContext(ctx, candidateID, token, decision, notes)
+}
+
 func (a *storeAPIAdapter) GetIdentityMatchCandidateContext(
 	ctx context.Context, candidateID int64,
 ) (*store.IdentityMatchCandidate, error) {
 	return a.store.GetIdentityMatchCandidateContext(ctx, candidateID)
 }
 
-func (a *storeAPIAdapter) AcceptIdentityMatchCandidateContext(
-	ctx context.Context, candidateID int64, decidedBy string, notes *string,
-) (*store.IdentityMatchCandidate, int64, error) {
-	return a.store.AcceptIdentityMatchCandidateContext(ctx, candidateID, decidedBy, notes)
-}
-
-func (a *storeAPIAdapter) DecideIdentityMatchCandidateContext(
-	ctx context.Context, candidateID int64, state store.IdentityMatchState,
-	decidedBy string, notes *string,
-) (*store.IdentityMatchCandidate, error) {
-	return a.store.DecideIdentityMatchCandidateContext(ctx, candidateID, state, decidedBy, notes)
-}
-
-func (a *storeAPIAdapter) CreatePersonFromParticipantContext(
-	ctx context.Context, participantID int64,
+func (a *storeAPIAdapter) CreatePersonFromParticipantWithDisplayNameContext(
+	ctx context.Context, participantID int64, displayName *string,
 ) (*store.Person, bool, error) {
-	return a.store.CreatePersonFromParticipantContext(ctx, participantID)
+	return a.store.CreatePersonFromParticipantWithDisplayNameContext(ctx, participantID, displayName)
 }
 
 func (a *storeAPIAdapter) GetPersonContext(ctx context.Context, id int64) (*store.Person, error) {
 	return a.store.GetPersonContext(ctx, id)
+}
+
+func (a *storeAPIAdapter) GetPersonByUIDContext(ctx context.Context, uid string) (*store.Person, error) {
+	return a.store.GetPersonByUIDContext(ctx, uid)
+}
+
+func (a *storeAPIAdapter) EnsurePersonInferenceProfile(ctx context.Context, profile peoplesweep.ProviderProfile) (bool, error) {
+	return a.store.EnsurePersonInferenceProfile(ctx, profile)
+}
+
+func (a *storeAPIAdapter) RecordPersonInferenceCheck(ctx context.Context, check store.PersonInferenceCheck) error {
+	return a.store.RecordPersonInferenceCheck(ctx, check)
+}
+
+func (a *storeAPIAdapter) HasSuccessfulPersonInferenceCheck(ctx context.Context, fingerprint string) (bool, error) {
+	return a.store.HasSuccessfulPersonInferenceCheck(ctx, fingerprint)
+}
+
+func (a *storeAPIAdapter) ListPersonInferenceProfiles(ctx context.Context) ([]peoplesweep.ProviderProfile, error) {
+	return a.store.ListPersonInferenceProfiles(ctx)
+}
+
+func (a *storeAPIAdapter) InvalidatePersonInferenceCheck(ctx context.Context, fingerprint string) (bool, error) {
+	return a.store.InvalidatePersonInferenceCheck(ctx, fingerprint)
+}
+
+func (a *storeAPIAdapter) GrantPersonInferenceConsent(ctx context.Context, fingerprint, actor string) (*store.ProviderConsent, bool, error) {
+	return a.store.GrantPersonInferenceConsent(ctx, fingerprint, actor)
+}
+
+func (a *storeAPIAdapter) HasActivePersonInferenceConsent(ctx context.Context, fingerprint string) (bool, error) {
+	return a.store.HasActivePersonInferenceConsent(ctx, fingerprint)
+}
+
+func (a *storeAPIAdapter) RevokePersonInferenceConsent(ctx context.Context, fingerprint, actor string) (bool, error) {
+	return a.store.RevokePersonInferenceConsent(ctx, fingerprint, actor)
 }
 
 func (a *storeAPIAdapter) GetPersonTrackingContext(
@@ -2156,6 +3184,42 @@ func (a *storeAPIAdapter) SetPersonTrackingContext(
 	ctx context.Context, id int64, tracked bool,
 ) (*store.PersonTracking, error) {
 	return a.store.SetPersonTrackingContext(ctx, id, tracked)
+}
+
+func (a *storeAPIAdapter) GetPersonBriefContext(
+	ctx context.Context, personID int64, version int,
+) (*store.PersonBrief, error) {
+	return a.store.GetPersonBriefContext(ctx, personID, version)
+}
+
+func (a *storeAPIAdapter) ListPersonBriefVersionsContext(
+	ctx context.Context, personID int64, limit int,
+) ([]store.PersonBrief, error) {
+	return a.store.ListPersonBriefVersionsContext(ctx, personID, limit)
+}
+
+func (a *storeAPIAdapter) ListPersonBriefEvidenceContext(
+	ctx context.Context, briefID int64,
+) ([]store.PersonBriefEvidencePointer, error) {
+	return a.store.ListPersonBriefEvidenceContext(ctx, briefID)
+}
+
+func (a *storeAPIAdapter) RejectPersonBriefContext(
+	ctx context.Context, personID int64, reason string, at time.Time,
+) (*store.PersonBrief, error) {
+	return a.store.RejectPersonBriefContext(ctx, personID, reason, at)
+}
+
+func (a *storeAPIAdapter) GetPersonBriefEnrollmentContext(
+	ctx context.Context, personID int64,
+) (*store.PersonBriefEnrollment, error) {
+	return a.store.GetPersonBriefEnrollmentContext(ctx, personID)
+}
+
+func (a *storeAPIAdapter) SetPersonBriefEnrollmentContext(
+	ctx context.Context, personID int64, enabled bool, actor string, track bool,
+) (*store.PersonBriefEnrollment, error) {
+	return a.store.SetPersonBriefEnrollmentContext(ctx, personID, enabled, actor, track)
 }
 
 func (a *storeAPIAdapter) BuildPersonFactCatalogContext(
@@ -2203,6 +3267,18 @@ func (a *storeAPIAdapter) SetPersonFactPinContext(
 
 func (a *storeAPIAdapter) ListPersonsContext(ctx context.Context) ([]store.Person, error) {
 	return a.store.ListPersonsContext(ctx)
+}
+
+func (a *storeAPIAdapter) DirectoryPeoplePageContext(
+	ctx context.Context, query store.DirectoryPeopleQuery,
+) (*store.DirectoryPeoplePage, error) {
+	return a.store.DirectoryPeoplePageContext(ctx, query)
+}
+
+func (a *storeAPIAdapter) GetPersonNetworkContext(
+	ctx context.Context, personID int64, opts store.PersonNetworkOptions,
+) (store.PersonNetwork, error) {
+	return a.store.GetPersonNetworkContext(ctx, personID, opts)
 }
 
 func (a *storeAPIAdapter) UpdatePersonDisplayNameContext(
@@ -2730,10 +3806,17 @@ func (a *storeAPIAdapter) ClusterEdges(id int64) ([]store.LinkEdge, error) {
 	return a.store.ClusterEdges(id)
 }
 
+func (a *storeAPIAdapter) GetParticipantIdentityContext(
+	ctx context.Context, participantIDs []int64,
+) (*store.ParticipantIdentityContext, error) {
+	return a.store.GetParticipantIdentityContext(ctx, participantIDs)
+}
+
 // RefreshIdentityDatasets rebuilds identity-derived Parquet in a short-lived,
 // resource-bounded child. The child owns the cache lock and its DuckDB
 // allocator exits with the process; the long-lived daemon does neither.
 func (a *storeAPIAdapter) RefreshIdentityDatasets(ctx context.Context) (int64, error) {
+	ctx = a.invocationContext(ctx)
 	if err := runDerivedCacheSubprocess(ctx, a.analyticsDir); err != nil {
 		return 0, err
 	}
@@ -2744,24 +3827,32 @@ func (a *storeAPIAdapter) RefreshIdentityDatasets(ctx context.Context) (int64, e
 	return state.IdentityRevision, nil
 }
 
-func (a *storeAPIAdapter) GetActiveSync(sourceID int64) (*store.SyncRun, error) {
-	return a.store.GetActiveSync(sourceID)
+func (a *storeAPIAdapter) GetActiveSyncReadOnly(ctx context.Context, sourceID int64) (*store.SyncRun, error) {
+	return a.store.GetActiveSyncReadOnly(ctx, sourceID)
 }
 
-func (a *storeAPIAdapter) GetLatestSync(sourceID int64) (*store.SyncRun, error) {
-	return a.store.GetLatestSync(sourceID)
+func (a *storeAPIAdapter) GetLatestSyncContext(ctx context.Context, sourceID, excludeID int64) (*store.SyncRun, error) {
+	return a.store.GetLatestSyncContext(ctx, sourceID, excludeID)
 }
 
-func (a *storeAPIAdapter) GetLastSuccessfulSync(sourceID int64) (*store.SyncRun, error) {
-	return a.store.GetLastSuccessfulSync(sourceID)
+func (a *storeAPIAdapter) GetSyncOperation(operationID string) (*store.SyncOperation, error) {
+	return a.store.GetSyncOperation(operationID)
 }
 
-func (a *storeAPIAdapter) CountSyncRunItems(syncRunID int64, status string) (int64, error) {
-	return a.store.CountSyncRunItems(syncRunID, status)
+func (a *storeAPIAdapter) CreateSyncOperation(sourceID int64, operationID string) (*store.SyncOperation, error) {
+	return a.store.CreateSyncOperation(sourceID, operationID)
 }
 
-func (a *storeAPIAdapter) ListSyncRunItems(syncRunID int64, status string, limit int) ([]store.SyncRunItem, error) {
-	return a.store.ListSyncRunItems(syncRunID, status, limit)
+func (a *storeAPIAdapter) GetLastSuccessfulSyncContext(ctx context.Context, sourceID int64) (*store.SyncRun, error) {
+	return a.store.GetLastSuccessfulSyncContext(ctx, sourceID)
+}
+
+func (a *storeAPIAdapter) CountSyncRunItemsContext(ctx context.Context, syncRunID int64, status string) (int64, error) {
+	return a.store.CountSyncRunItemsContext(ctx, syncRunID, status)
+}
+
+func (a *storeAPIAdapter) ListSyncRunItemsContext(ctx context.Context, syncRunID int64, status string, limit int) ([]store.SyncRunItem, error) {
+	return a.store.ListSyncRunItemsContext(ctx, syncRunID, status, limit)
 }
 
 const personEnrichmentJob = "person-enrichment"
@@ -2804,6 +3895,27 @@ func (r *personEnrichmentSchedule) Wake(ctx context.Context, occurrence time.Tim
 	for _, run := range runs {
 		if err := r.drainRun(ctx, run.ID); err != nil {
 			return err
+		}
+	}
+	for {
+		queued, err := r.Store.ListQueuedPersonEnrichmentRunsContext(ctx, 200)
+		if err != nil {
+			return fmt.Errorf("list queued person enrichment runs: %w", err)
+		}
+		if len(queued) == 0 {
+			break
+		}
+		for _, queuedRun := range queued {
+			claimed, ok, err := r.Store.ClaimQueuedPersonEnrichmentRunContext(ctx, queuedRun.ID)
+			if err != nil {
+				return fmt.Errorf("claim queued person enrichment run %d: %w", queuedRun.ID, err)
+			}
+			if !ok {
+				continue
+			}
+			if err := r.drainRun(ctx, claimed.ID); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -2857,11 +3969,17 @@ func canonicalPersonEnrichmentOccurrence(occurrence time.Time) string {
 	return occurrence.UTC().Truncate(time.Minute).Format(time.RFC3339)
 }
 
+type personEnrichmentRuntimeCredentials struct {
+	Suppression personenrichment.CredentialLookup
+	Provider    personenrichment.ProviderCredentialLookup
+}
+
 func registerPersonEnrichmentJob(
 	ctx context.Context,
 	sched *scheduler.Scheduler,
 	st *store.Store,
 	enrichmentConfig personenrichment.Config,
+	credentials personEnrichmentRuntimeCredentials,
 ) error {
 	if !enrichmentConfig.Enabled {
 		if st == nil {
@@ -2878,7 +3996,10 @@ func registerPersonEnrichmentJob(
 	if err := enrichmentConfig.Validate(); err != nil {
 		return err
 	}
-	suppressionKey, ok := os.LookupEnv(enrichmentConfig.SuppressionKeyEnv)
+	if credentials.Suppression == nil || credentials.Provider == nil {
+		return errors.New("person enrichment schedule requires suppression and provider credential lookups")
+	}
+	suppressionKey, ok := credentials.Suppression(enrichmentConfig.SuppressionKeyEnv)
 	if !ok || suppressionKey == "" {
 		return fmt.Errorf("person enrichment suppression key environment %q is not set",
 			enrichmentConfig.SuppressionKeyEnv)
@@ -2893,6 +4014,7 @@ func registerPersonEnrichmentJob(
 	}
 	factories := make(map[string]personenrichment.ProviderFactory)
 	providerConfigs := make(map[string]personenrichment.ProviderConfig)
+	providerFingerprints := make(map[string]string)
 	activeFingerprints := make([]string, 0, len(enrichmentConfig.Providers))
 	for _, configured := range enrichmentConfig.Providers {
 		provider := configured
@@ -2908,6 +4030,7 @@ func registerPersonEnrichmentJob(
 		}
 		activeFingerprints = append(activeFingerprints, profile.Fingerprint)
 		providerConfigs[provider.Name] = provider
+		providerFingerprints[provider.Name] = profile.Fingerprint
 		switch provider.Kind {
 		case personenrichment.ProviderExa:
 			factories[provider.Name] = func(config personenrichment.ProviderConfig, credential string) (personenrichment.Provider, error) {
@@ -2927,15 +4050,16 @@ func registerPersonEnrichmentJob(
 	if err := st.CancelPersonEnrichmentWorkOutsideProfilesContext(ctx, activeFingerprints); err != nil {
 		return fmt.Errorf("cancel unavailable person enrichment work: %w", err)
 	}
-	gate, err := personenrichment.NewEgressGate(st, st, hasher, os.LookupEnv)
+	gate, err := personenrichment.NewProviderBoundEgressGate(st, st, hasher, credentials.Provider)
 	if err != nil {
 		return fmt.Errorf("configure person enrichment egress: %w", err)
 	}
 	worker, err := personenrichment.NewWorker(st, st, *gate, factories, personenrichment.WorkerOptions{
 		Owner: "daemon-person-enrichment", LeaseDuration: enrichmentConfig.LeaseDuration,
 		RenewEvery: enrichmentConfig.LeaseDuration / 4, Clock: time.Now,
-		Jitter:          func(delay time.Duration) time.Duration { return delay },
-		ProviderConfigs: providerConfigs,
+		Jitter:               func(delay time.Duration) time.Duration { return delay },
+		ProviderConfigs:      providerConfigs,
+		ProviderFingerprints: providerFingerprints,
 	})
 	if err != nil {
 		return fmt.Errorf("configure person enrichment worker: %w", err)
@@ -2954,17 +4078,26 @@ func registerPersonEnrichmentJob(
 
 // schedulerAdapter adapts scheduler.Scheduler to api.SyncScheduler.
 // Since api.AccountStatus is a type alias for scheduler.AccountStatus,
-// the adapter methods are simple pass-throughs.
+// the adapter methods are simple pass-throughs. Jobs on the media scheduler
+// join the same job status and trigger by name.
 type schedulerAdapter struct {
 	scheduler *scheduler.Scheduler
+	media     *scheduler.Scheduler
+}
+
+func (a *schedulerAdapter) jobScheduler(name string) *scheduler.Scheduler {
+	if a.media != nil && a.media.IsJobScheduled(name) {
+		return a.media
+	}
+	return a.scheduler
 }
 
 func (a *schedulerAdapter) IsScheduled(email string) bool {
 	return a.scheduler.IsScheduled(email)
 }
 
-func (a *schedulerAdapter) TriggerSync(email string) error {
-	return a.scheduler.TriggerSync(email)
+func (a *schedulerAdapter) TriggerSync(email string, manual bool) error {
+	return a.scheduler.TriggerSync(email, manual)
 }
 
 func (a *schedulerAdapter) AddAccount(email, schedule string) error {
@@ -2980,19 +4113,24 @@ func (a *schedulerAdapter) Status() []api.AccountStatus {
 }
 
 func (a *schedulerAdapter) JobStatus() []api.JobStatus {
-	return a.scheduler.JobStatus()
+	jobs := a.scheduler.JobStatus()
+	if a.media != nil {
+		jobs = append(jobs, a.media.JobStatus()...)
+		slices.SortFunc(jobs, func(x, y api.JobStatus) int { return strings.Compare(x.Name, y.Name) })
+	}
+	return jobs
 }
 
 func (a *schedulerAdapter) IsJobScheduled(name string) bool {
-	return a.scheduler.IsJobScheduled(name)
+	return a.jobScheduler(name).IsJobScheduled(name)
 }
 
 func (a *schedulerAdapter) TriggerJob(name string) error {
-	return a.scheduler.TriggerJob(name)
+	return a.jobScheduler(name).TriggerJob(name)
 }
 
-func (a *schedulerAdapter) StartJob(name string) error {
-	return a.scheduler.StartJob(name)
+func (a *schedulerAdapter) StartJob(name string, manual bool) (scheduler.JobDisposition, error) {
+	return a.jobScheduler(name).StartJob(name, manual)
 }
 
 // runScheduledSync performs a sync for a scheduled account. It resolves
@@ -3013,10 +4151,18 @@ func (a *schedulerAdapter) StartJob(name string) error {
 // this is the email address, for IMAP it's the full
 // `imaps://user@host:port` URL recorded by `add-imap`, for Teams it is
 // the UPN/email recorded by `add-o365`.
-func runScheduledSync(ctx context.Context, identifier string, s *store.Store, getOAuthMgr func(string) (*oauth.Manager, error)) error {
+func runScheduledSync(ctx context.Context, identifier string, s *store.Store, getOAuthMgr func(ctx context.Context, _ string) (*oauth.Manager, error), state *invocation) error {
+	if state == nil {
+		state = invocationFromContext(ctx)
+	}
+	if state == nil || state.cfg == nil || state.logger == nil {
+		return errors.New("configuration is unavailable")
+	}
+	logger := state.logger
+	ctx = withInvocation(ctx, state)
 	logger.Info("starting scheduled sync", "identifier", identifier)
 
-	srcs, srcErr := findScheduledSyncSources(s, identifier)
+	srcs, retiredMatch, srcErr := findScheduledSyncSources(s, identifier)
 	if srcErr != nil {
 		return fmt.Errorf("look up sources for %s: %w", identifier, srcErr)
 	}
@@ -3025,8 +4171,16 @@ func runScheduledSync(ctx context.Context, identifier string, s *store.Store, ge
 	// (preserves behaviour for tokens uploaded via API before the source
 	// row exists).
 	if len(srcs) == 0 {
+		if retiredMatch {
+			logger.Info("skipping scheduled sync for retired source", "identifier", identifier)
+			return scheduler.ErrDeferUntilNextTrigger
+		}
 		startTime := time.Now()
-		summary, syncErr := runScheduledGmailSync(ctx, identifier, nil, s, getOAuthMgr)
+		summary, syncErr := runScheduledGmailSync(ctx, identifier, nil, s, getOAuthMgr, state)
+		if scheduledSyncYielded(ctx) {
+			return scheduledSyncYieldResult(ctx, syncErr)
+		}
+		state.syncFailures.Record(ctx, sourceTypeGmail, identifier, syncErr)
 		if syncErr == nil {
 			logger.Info("sync completed",
 				"identifier", identifier,
@@ -3052,20 +4206,29 @@ func runScheduledSync(ctx context.Context, identifier string, s *store.Store, ge
 		)
 		switch sourceType {
 		case sourceTypeGmail:
-			summary, err = runScheduledGmailSync(ctx, identifier, src, s, getOAuthMgr)
+			summary, err = runScheduledGmailSync(ctx, identifier, src, s, getOAuthMgr, state)
 		case sourceTypeIMAP:
-			summary, err = runScheduledIMAPSync(ctx, src, s)
+			summary, err = runScheduledIMAPSync(ctx, src, s, state)
 		case sourceTypeTeams:
-			err = runScheduledTeamsSync(ctx, src, s)
+			err = runScheduledTeamsSync(ctx, src, s, state)
+		case sourceTypeMSMail:
+			err = runScheduledMSMailSync(ctx, src, s, state)
 		case sourceTypeDiscord:
 			var discordSummary *discord.ImportSummary
 			discordSummary, err = importDiscordSourceForScheduledRun(
-				ctx, s, src, defaultDiscordCommandDeps(), false, time.Time{}, nil,
+				ctx, s, src, defaultDiscordCommandDeps().bind(ctx), false, time.Time{}, nil,
 			)
-			logScheduledDiscordIssues(identifier, discordSummary)
+			logScheduledDiscordIssues(identifier, discordSummary, logger)
 		default:
 			err = fmt.Errorf("source %q has type %q which is not supported by the daemon scheduler", identifier, sourceType)
 		}
+		if scheduledSyncYielded(ctx) {
+			if err != nil {
+				errs = append(errs, fmt.Errorf("%s (%s): %w", identifier, sourceType, err))
+			}
+			return scheduledSyncYieldResult(ctx, errs...)
+		}
+		state.syncFailures.Record(ctx, sourceType, src.Identifier, err)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s (%s): %w", identifier, sourceType, err))
 			continue
@@ -3095,7 +4258,19 @@ func runScheduledSync(ctx context.Context, identifier string, s *store.Store, ge
 	return errors.Join(errs...)
 }
 
-func logScheduledDiscordIssues(identifier string, summary *discord.ImportSummary) {
+func scheduledSyncYielded(ctx context.Context) bool {
+	return jobctx.YieldedToWaiter(ctx) || jobctx.PreemptionRequested(ctx)
+}
+
+func scheduledSyncYieldResult(ctx context.Context, errs ...error) error {
+	if jobctx.YieldedToWaiter(ctx) {
+		errs = append(errs, scheduler.ErrYieldedToWaiter)
+	}
+	return errors.Join(errs...)
+}
+
+func logScheduledDiscordIssues(identifier string, summary *discord.ImportSummary, logger *slog.Logger) {
+	logger = repairLogger(logger)
 	if summary == nil {
 		return
 	}
@@ -3123,24 +4298,33 @@ func logScheduledDiscordIssues(identifier string, summary *discord.ImportSummary
 
 // findScheduledSyncSources resolves ALL syncable source rows for a
 // scheduler identifier. Returns at most one row per syncable type
-// (gmail, imap, teams, discord), in that stable order. Non-syncable types
+// (gmail, imap, msmail, teams, discord), in that stable order. Non-syncable types
 // (mbox, apple-mail, etc.) are skipped.
 //
-// Returns an empty slice (not nil) when no syncable source matches —
-// callers should fall back to the Gmail token-first workflow.
+// Returns an empty slice (not nil) when no active syncable source matches.
+// retiredMatch distinguishes a merged source from an identifier with no
+// registered row, which alone is eligible for the Gmail token-first fallback.
 //
 // Matches against both sources.identifier and sources.display_name.
-func findScheduledSyncSources(s *store.Store, identifier string) ([]*store.Source, error) {
+func findScheduledSyncSources(s *store.Store, identifier string) ([]*store.Source, bool, error) {
 	rows, err := s.GetSourcesByIdentifierOrDisplayName(identifier)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	// Collect first occurrence of each syncable type.
 	seen := make(map[string]*store.Source, 4)
+	retiredMatch := false
 	for _, src := range rows {
+		if src.MergedIntoSourceID != 0 {
+			switch src.SourceType {
+			case "", sourceTypeGmail, sourceTypeIMAP, sourceTypeMSMail, sourceTypeTeams, sourceTypeDiscord:
+				retiredMatch = true
+			}
+			continue
+		}
 		switch src.SourceType {
-		case sourceTypeGmail, sourceTypeIMAP, sourceTypeTeams:
+		case sourceTypeGmail, sourceTypeIMAP, sourceTypeMSMail, sourceTypeTeams:
 			if _, dup := seen[src.SourceType]; !dup {
 				seen[src.SourceType] = src
 			}
@@ -3153,22 +4337,52 @@ func findScheduledSyncSources(s *store.Store, identifier string) ([]*store.Sourc
 		}
 	}
 
-	// Return in stable order: gmail, imap, teams, discord.
+	// Return in stable order: gmail, imap, msmail, teams, discord.
 	var result []*store.Source
-	for _, t := range []string{sourceTypeGmail, sourceTypeIMAP, sourceTypeTeams, sourceTypeDiscord} {
+	for _, t := range []string{sourceTypeGmail, sourceTypeIMAP, sourceTypeMSMail, sourceTypeTeams, sourceTypeDiscord} {
 		if src, ok := seen[t]; ok {
 			result = append(result, src)
 		}
 	}
-	return result, nil
+	return result, retiredMatch, nil
 }
 
-// runScheduledGmailSync runs an incremental Gmail sync for the daemon.
-// Token-source lookup uses oauthMgr.TokenSource directly (not
-// getTokenSourceWithReauth) because serve runs as a daemon and cannot
-// open a browser for OAuth — the error path tells the user how to
-// re-authorize from a terminal.
-func runScheduledGmailSync(ctx context.Context, email string, src *store.Source, s *store.Store, getOAuthMgr func(string) (*oauth.Manager, error)) (*gmail.SyncSummary, error) {
+// scheduledSyncPreemptible disables scheduler-job preemption when an account
+// dispatch includes a full IMAP pass, whose offset-based paging cannot resume
+// after the syncer stops. An unavailable source lookup also takes the safe
+// path and lets the current pass finish.
+func scheduledSyncPreemptible(s *store.Store, identifier string, logger *slog.Logger) bool {
+	sources, _, err := findScheduledSyncSources(s, identifier)
+	if err != nil {
+		logger.Warn("could not determine scheduled sync preemption safety; allowing current pass to finish",
+			"identifier", identifier,
+			"error", err,
+		)
+		return false
+	}
+	for _, source := range sources {
+		if source.SourceType == sourceTypeIMAP {
+			return false
+		}
+	}
+	return true
+}
+
+// newDaemonGmailClient reuses source-bound credentials without interactive reauth.
+// serviceAccount reports which credentials the returned client uses.
+func newDaemonGmailClient(
+	ctx context.Context, email string, src *store.Source,
+	getOAuthMgr func(ctx context.Context, _ string) (*oauth.Manager, error), state *invocation,
+	scopes []string,
+) (client gmail.API, serviceAccount bool, err error) {
+	if state == nil {
+		state = invocationFromContext(ctx)
+	}
+	if state == nil || state.cfg == nil || state.logger == nil {
+		return nil, false, errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	logger := state.logger
 	appName := ""
 	if src != nil {
 		appName = sourceOAuthApp(src)
@@ -3177,19 +4391,32 @@ func runScheduledGmailSync(ctx context.Context, email string, src *store.Source,
 	var tokenSource oauth2.TokenSource
 	var tsErr error
 
-	if saKeyPath := cfg.OAuth.ServiceAccountKeyFor(appName); saKeyPath != "" {
-		saMgr, saErr := oauth.NewServiceAccountManager(saKeyPath, oauth.Scopes)
+	saKeyPath := cfg.OAuth.ServiceAccountKeyFor(appName)
+	if saKeyPath != "" {
+		saMgr, saErr := oauth.NewServiceAccountManager(saKeyPath, scopes)
 		if saErr != nil {
-			return nil, fmt.Errorf("service account for %s: %w", email, saErr)
+			return nil, false, provideridentity.NewGmailCredentialError(
+				provideridentity.GmailServiceAccountConfiguration,
+				fmt.Errorf("service account for %s: %w", email, saErr),
+			)
 		}
 		tokenSource, tsErr = saMgr.TokenSource(ctx, email)
 		if tsErr != nil {
-			return nil, fmt.Errorf("service account token for %s: %w", email, tsErr)
+			return nil, false, provideridentity.NewGmailCredentialError(
+				provideridentity.GmailServiceAccountConfiguration,
+				fmt.Errorf("service account token for %s: %w", email, tsErr),
+			)
 		}
 	} else {
-		oauthMgr, oaErr := getOAuthMgr(appName)
+		oauthMgr, oaErr := getOAuthMgr(ctx, appName)
 		if oaErr != nil {
-			return nil, fmt.Errorf("resolve OAuth credentials for %s: %w", email, oaErr)
+			if !errors.Is(oaErr, oauth.ErrClientConfig) {
+				return nil, false, fmt.Errorf("resolve OAuth credentials for %s: %w", email, oaErr)
+			}
+			return nil, false, provideridentity.NewGmailCredentialError(
+				provideridentity.GmailOAuthConfiguration,
+				fmt.Errorf("resolve OAuth credentials for %s: %w", email, oaErr),
+			)
 		}
 		tokenSource, tsErr = oauthMgr.TokenSource(ctx, email)
 		if tsErr != nil {
@@ -3198,28 +4425,55 @@ func runScheduledGmailSync(ctx context.Context, email string, src *store.Source,
 			// auth errors. Suggesting reauth on every network blip sends
 			// the user down the wrong path.
 			if syncerr.IsTransientNetwork(tsErr) {
-				return nil, fmt.Errorf("get token source: %w (transient network error; will retry on next schedule)", tsErr)
+				return nil, false, fmt.Errorf(
+					"get token source: %w (transient network error; will retry on next schedule)", tsErr,
+				)
 			}
-			if oauthMgr.HasToken(email) {
-				return nil, fmt.Errorf("get token source: %w (token may be expired; run 'sync %s' or 'verify %s' from an interactive terminal to re-authorize)", tsErr, email, email)
+			if errors.Is(tsErr, os.ErrNotExist) {
+				return nil, false, provideridentity.NewGmailCredentialError(provideridentity.GmailTokenMissing,
+					fmt.Errorf("get token source: %w (run 'msgvault add-account %s' first)", tsErr, email))
 			}
-			return nil, fmt.Errorf("get token source: %w (run 'add-account %s' first)", tsErr, email)
+			if isAuthInvalidError(tsErr) || errors.Is(tsErr, oauth.ErrTokenUnrefreshable) || errors.Is(tsErr, oauth.ErrInvalidTokenJSON) {
+				return nil, false, provideridentity.NewGmailCredentialError(provideridentity.GmailAuthorizationRevoked, fmt.Errorf("get token source: %w (token may be expired; %s)", tsErr, gmailReauthHint(email, accountIsNarrowed(ctx, oauthMgr, email))))
+			}
+			return nil, false, fmt.Errorf("get token source: %w", tsErr)
 		}
 	}
 
 	rateLimiter := gmail.NewRateLimiter(float64(cfg.Sync.RateLimitQPS))
-	client := gmail.NewClient(tokenSource,
+	return gmail.NewClient(tokenSource,
 		gmail.WithLogger(logger),
 		gmail.WithRateLimiter(rateLimiter),
-	)
+	), saKeyPath != "", nil
+}
+
+// runScheduledGmailSync runs an incremental Gmail sync for the daemon.
+// Token-source lookup uses oauthMgr.TokenSource directly (not
+// getTokenSourceWithReauth) because serve runs as a daemon and cannot
+// open a browser for OAuth — the error path tells the user how to
+// re-authorize from a terminal.
+func runScheduledGmailSync(ctx context.Context, email string, src *store.Source, s *store.Store, getOAuthMgr func(ctx context.Context, _ string) (*oauth.Manager, error), state *invocation) (*gmail.SyncSummary, error) {
+	if state == nil {
+		state = invocationFromContext(ctx)
+	}
+	if state == nil || state.cfg == nil || state.logger == nil {
+		return nil, errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	logger := state.logger
+	accountEmail := scheduledGmailAccountIdentifier(email, src)
+	client, _, err := newDaemonGmailClient(ctx, accountEmail, src, getOAuthMgr, state, oauth.Scopes)
+	if err != nil {
+		return nil, err
+	}
 	defer func() { _ = client.Close() }()
 
 	opts := sync.DefaultOptions()
 	opts.AttachmentsDir = cfg.AttachmentsDir()
 
-	syncer := newMessageSyncer(client, s, opts).WithLogger(logger)
+	syncer := newMessageSyncer(client, s, opts, state).WithLogger(logger)
 
-	source, err := s.GetOrCreateSource(sourceTypeGmail, email)
+	source, err := s.GetOrCreateSource(sourceTypeGmail, accountEmail)
 	if err != nil {
 		return nil, fmt.Errorf("get source: %w", err)
 	}
@@ -3227,8 +4481,8 @@ func runScheduledGmailSync(ctx context.Context, email string, src *store.Source,
 	// — see comment in account_identity.go. serve is a daemon, so the
 	// confirmation message has no terminal; discard it. Helper logs any
 	// failure path through its own logger.Warn.
-	confirmDefaultIdentity(io.Discard, s, source.ID, email, email, "account-identifier")
-	if err := runPostSourceCreateMigrations(s); err != nil {
+	confirmDefaultIdentity(io.Discard, s, source.ID, accountEmail, accountEmail, "account-identifier", logger)
+	if err := runPostSourceCreateMigrationsForInvocation(s, state); err != nil {
 		return nil, fmt.Errorf("post-source-create migrations: %w", err)
 	}
 
@@ -3245,14 +4499,32 @@ func runScheduledGmailSync(ctx context.Context, email string, src *store.Source,
 	return summary, nil
 }
 
+// scheduledGmailAccountIdentifier resolves archive selectors to the provider
+// identifier used for credentials and source creation. With no source, the
+// selector remains the token-first account key.
+func scheduledGmailAccountIdentifier(selector string, src *store.Source) string {
+	if src != nil && src.Identifier != "" {
+		return src.Identifier
+	}
+	return selector
+}
+
 // runScheduledIMAPSync runs a full IMAP sync for the daemon. IMAP has
 // no incremental/history API, so we do a full pass, skipping mailboxes
 // unchanged since the last completed sync (saved UIDVALIDITY/UIDNEXT)
 // and relying on the store to dedupe by message-id. NoResume is forced
 // on because IMAP page tokens are numeric offsets that don't survive
 // across processes (see syncfull.go).
-func runScheduledIMAPSync(ctx context.Context, src *store.Source, s *store.Store) (*gmail.SyncSummary, error) {
-	imapOpts := imapFolderStateOptions(s, src, false)
+func runScheduledIMAPSync(ctx context.Context, src *store.Source, s *store.Store, state *invocation) (*gmail.SyncSummary, error) {
+	if state == nil {
+		state = invocationFromContext(ctx)
+	}
+	if state == nil || state.cfg == nil || state.logger == nil {
+		return nil, errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	logger := state.logger
+	imapOpts := imapFolderStateOptions(s, src, false, cfg, logger)
 	apiClient, err := buildAPIClient(ctx, src, nil, nil, imapOpts...)
 	if err != nil {
 		return nil, fmt.Errorf("build IMAP client: %w", err)
@@ -3264,7 +4536,7 @@ func runScheduledIMAPSync(ctx context.Context, src *store.Source, s *store.Store
 	opts.AttachmentsDir = cfg.AttachmentsDir()
 	opts.NoResume = true
 
-	syncer := newMessageSyncer(apiClient, s, opts).WithLogger(logger)
+	syncer := newMessageSyncer(apiClient, s, opts, state).WithLogger(logger)
 
 	// runPostSourceCreateMigrations is keyed off Gmail-only legacy
 	// state, so it's a no-op for fresh IMAP installs; we still call it
@@ -3279,23 +4551,37 @@ func runScheduledIMAPSync(ctx context.Context, src *store.Source, s *store.Store
 	// row with NULL display_name skips the write rather than re-injecting
 	// the URL.
 	displayName := src.DisplayName.String
-	confirmDefaultIdentity(io.Discard, s, src.ID, displayName, displayName, "account-identifier")
-	if err := runPostSourceCreateMigrations(s); err != nil {
+	confirmDefaultIdentity(io.Discard, s, src.ID, displayName, displayName, "account-identifier", logger)
+	if err := runPostSourceCreateMigrationsForInvocation(s, state); err != nil {
 		return nil, fmt.Errorf("post-source-create migrations: %w", err)
 	}
 
-	summary, err := syncer.Full(ctx, src.Identifier)
+	summary, err := syncer.FullWithFinalizer(
+		ctx,
+		src,
+		func(summary *gmail.SyncSummary) error {
+			if err := saveIMAPFolderStates(ctx, s, src, apiClient, summary, 0); err != nil {
+				return fmt.Errorf("save IMAP incremental state: %w", err)
+			}
+			return nil
+		},
+	)
 	if err != nil {
 		return nil, fmt.Errorf("IMAP sync failed: %w", err)
-	}
-	if err := saveIMAPFolderStates(ctx, s, src, apiClient, summary, 0); err != nil {
-		return nil, fmt.Errorf("save IMAP incremental state: %w", err)
 	}
 	return summary, nil
 }
 
 // runScheduledTeamsSync runs a Teams sync for the daemon.
-func runScheduledTeamsSync(ctx context.Context, src *store.Source, s *store.Store) error {
+func runScheduledTeamsSync(ctx context.Context, src *store.Source, s *store.Store, state *invocation) error {
+	if state == nil {
+		state = invocationFromContext(ctx)
+	}
+	if state == nil || state.cfg == nil || state.logger == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	logger := state.logger
 	email := src.Identifier
 
 	// Seed the default identity and converge legacy migrations before
@@ -3305,31 +4591,29 @@ func runScheduledTeamsSync(ctx context.Context, src *store.Source, s *store.Stor
 	// "me" identity. Auto-default-identity must run BEFORE the legacy
 	// migration retry (see account_identity.go); serve is a daemon, so
 	// the confirmation message has no terminal and is discarded.
-	confirmDefaultIdentity(io.Discard, s, src.ID, email, email, "account-identifier")
-	if err := runPostSourceCreateMigrations(s); err != nil {
+	confirmDefaultIdentity(io.Discard, s, src.ID, email, email, "account-identifier", logger)
+	if err := runPostSourceCreateMigrationsForInvocation(s, state); err != nil {
 		return fmt.Errorf("post-source-create migrations: %w", err)
 	}
 
-	mgr := microsoft.NewGraphManager(cfg.Microsoft.ClientID, cfg.Microsoft.EffectiveTenantID(), cfg.Microsoft.EffectiveRedirectURI(), cfg.TokensDir(), logger)
-	tokenFn, err := mgr.TokenSource(ctx, email)
+	client, err := newTeamsClient(ctx, cfg, logger, email)
 	if err != nil {
 		return err
 	}
-	qps := float64(cfg.Sync.RateLimitQPS)
-	if qps <= 0 {
-		qps = 5
-	}
-	client := teams.NewClient("https://graph.microsoft.com/v1.0", teams.TokenFunc(tokenFn), qps)
-	opts := scheduledTeamsImportOptions(email)
+	opts := scheduledTeamsImportOptions(email, cfg)
 	_, err = teams.NewImporter(s, client).Import(ctx, opts)
 	return err
 }
 
-func scheduledTeamsImportOptions(email string) teams.ImportOptions {
+func scheduledTeamsImportOptions(email string, cfg *config.Config) teams.ImportOptions {
 	return teams.ImportOptions{
 		Email:           email,
 		AttachmentsDir:  cfg.AttachmentsDir(),
 		MediaPolicy:     cfg.Teams.MediaPolicy(email),
 		IncludeChannels: true,
 	}
+}
+
+func (a *storeAPIAdapter) GetSearchMetadata(ctx context.Context, ids []int64, q *search.Query, includeSnippet bool) (map[int64]store.SearchMetadata, error) {
+	return a.store.GetSearchMetadata(ctx, ids, q, includeSnippet)
 }

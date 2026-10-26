@@ -24,19 +24,19 @@ type Employment struct {
 	ID             int64        `json:"id"`
 	PersonID       int64        `json:"person_id"`
 	OrganizationID int64        `json:"organization_id"`
-	Title          *string      `json:"title,omitempty"`
-	Role           *string      `json:"role,omitempty"`
-	Department     *string      `json:"department,omitempty"`
-	Location       *string      `json:"location,omitempty"`
-	AddressID      *int64       `json:"address_id,omitempty"`
-	Description    *string      `json:"description,omitempty"`
+	Title          *string      `json:"title,omitzero" nullable:"false"`
+	Role           *string      `json:"role,omitzero" nullable:"false"`
+	Department     *string      `json:"department,omitzero" nullable:"false"`
+	Location       *string      `json:"location,omitzero" nullable:"false"`
+	AddressID      *int64       `json:"address_id,omitzero" nullable:"false"`
+	Description    *string      `json:"description,omitzero" nullable:"false"`
 	StartDate      *PartialDate `json:"start_date,omitempty"`
 	EndDate        *PartialDate `json:"end_date,omitempty"`
 	IsCurrent      bool         `json:"is_current"`
 	IsPrimary      bool         `json:"is_primary"`
 	Source         Provenance   `json:"source"`
-	SourceRef      *string      `json:"source_ref,omitempty"`
-	Confidence     *float64     `json:"confidence,omitempty"`
+	SourceRef      *string      `json:"source_ref,omitzero" nullable:"false"`
+	Confidence     *float64     `json:"confidence,omitzero" nullable:"false"`
 	Revision       int64        `json:"revision"`
 	CreatedAt      time.Time    `json:"created_at"`
 	UpdatedAt      time.Time    `json:"updated_at"`
@@ -81,6 +81,13 @@ func (s *Store) AddEmploymentContext(ctx context.Context, input EmploymentInput)
 			if err := s.claimEmploymentPeopleTx(ctx, tx, input.PersonID); err != nil {
 				return err
 			}
+			var inferenceProjectionBefore map[int64]personInferenceExportProjection
+			if provenanceIsInferred(input.Source) {
+				inferenceProjectionBefore, err = s.captureInferenceExportPeopleTx(ctx, tx, input.PersonID)
+				if err != nil {
+					return fmt.Errorf("load inference export projection before employment add: %w", err)
+				}
+			}
 			var err error
 			employment, err = s.addEmploymentTx(ctx, tx, input)
 			if err != nil {
@@ -89,6 +96,11 @@ func (s *Store) AddEmploymentContext(ctx context.Context, input EmploymentInput)
 			if input.Source.IsDeclared() {
 				if err := s.appendManualPersonFactEmploymentPinTx(
 					ctx, tx, input.PersonID, string(input.Source)); err != nil {
+					return err
+				}
+			}
+			if provenanceIsInferred(input.Source) {
+				if err := s.invalidateInferenceExportChangesTx(ctx, tx, inferenceProjectionBefore); err != nil {
 					return err
 				}
 			}
@@ -131,6 +143,13 @@ func (s *Store) UpdateEmploymentContext(ctx context.Context, id, expectedRevisio
 				ctx, tx, snapshot.PersonID, input.PersonID); err != nil {
 				return err
 			}
+			var inferenceBefore map[int64]personInferenceExportProjection
+			if provenanceIsInferred(input.Source) {
+				inferenceBefore, err = s.captureInferenceExportPeopleTx(ctx, tx, snapshot.PersonID, input.PersonID)
+				if err != nil {
+					return err
+				}
+			}
 			projection := personfacts.ProjectionRef{Kind: personFactProjectionKindEmployment, RowID: id}
 			ownedBefore, err := ownsPersonFactProjectionTx(
 				ctx, tx, snapshot.PersonID, projection)
@@ -148,6 +167,9 @@ func (s *Store) UpdateEmploymentContext(ctx context.Context, id, expectedRevisio
 						return err
 					}
 				}
+			}
+			if err := s.invalidateInferenceExportChangesTx(ctx, tx, inferenceBefore); err != nil {
+				return err
 			}
 			return s.publishPersonIdentityEnrichmentTx(
 				ctx, tx, snapshot.PersonID, input.PersonID)
@@ -212,6 +234,10 @@ func (s *Store) setPrimaryEmploymentOnce(ctx context.Context, id, expectedRevisi
 		if err := s.claimEmploymentPeopleTx(ctx, tx, snapshot.PersonID); err != nil {
 			return err
 		}
+		inferenceBefore, err := s.captureInferenceExportPeopleTx(ctx, tx, snapshot.PersonID)
+		if err != nil {
+			return err
+		}
 		current, err := getEmploymentForUpdateTx(ctx, tx, s.dialect, id)
 		if err != nil {
 			return err
@@ -234,6 +260,9 @@ func (s *Store) setPrimaryEmploymentOnce(ctx context.Context, id, expectedRevisi
 		}
 		if err := s.appendManualPersonFactEmploymentPinTx(
 			ctx, tx, current.PersonID, string(ProvenanceUser)); err != nil {
+			return err
+		}
+		if err := s.invalidateInferenceExportChangesTx(ctx, tx, inferenceBefore); err != nil {
 			return err
 		}
 		return s.publishPersonIdentityEnrichmentTx(ctx, tx, current.PersonID)
@@ -618,6 +647,13 @@ func (s *Store) claimEmploymentPeopleTx(
 func (s *Store) lockEmploymentPeopleTx(
 	ctx context.Context, tx *loggedTx, personIDs ...int64,
 ) error {
+	lockClause := s.dialect.SelectForUpdate()
+	if s.IsPostgreSQL() {
+		// These mutations do not change person keys. Match enrichment's lock
+		// so nested projection writes do not upgrade it and deadlock with a
+		// participant merge holding a foreign-key KEY SHARE lock.
+		lockClause = " FOR NO KEY UPDATE"
+	}
 	ids := append([]int64(nil), personIDs...)
 	slices.Sort(ids)
 	var previous int64
@@ -628,7 +664,7 @@ func (s *Store) lockEmploymentPeopleTx(
 		var lockedID int64
 		err := tx.QueryRowContext(ctx, fmt.Sprintf(`
 			SELECT id FROM persons WHERE id = ?%s
-		`, s.dialect.SelectForUpdate()), personID).Scan(&lockedID)
+		`, lockClause), personID).Scan(&lockedID)
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrPersonNotFound
 		}

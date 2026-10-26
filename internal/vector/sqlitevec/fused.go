@@ -5,14 +5,19 @@ package sqlitevec
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"math"
 	"sort"
 	"strings"
+	"time"
+
+	"go.kenn.io/kit/search/rrf"
 
 	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/sqliteutil"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 )
@@ -20,7 +25,116 @@ import (
 // Compile-time check that *Backend satisfies vector.FusingBackend.
 var _ vector.FusingBackend = (*Backend)(nil)
 
-// FusedSearch runs the single-query hybrid CTE (spec §5.3) by opening a
+// FusedSearch uses the bounded accelerator path when a ready Vec1 index is
+// available, otherwise it retains the exact fused query.
+func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]vector.FusedHit, vector.SearchMetadata, error) {
+	metadata := vector.SearchMetadata{}
+	if len(req.QueryVec) > 0 {
+		vectorHits, searchMeta, err := b.searchAccelerator(
+			ctx, req.Generation, req.QueryVec, req.KPerSignal+1, req.Filter,
+		)
+		if err != nil {
+			return nil, vector.SearchMetadata{}, err
+		}
+		metadata = searchMeta
+		if metadata.Accelerator == acceleratorKind || metadata.Accelerator == "exact-filter" {
+			return b.fuseSignals(ctx, req, vectorHits, metadata)
+		}
+		if metadata.Accelerator == "" {
+			metadata.Accelerator = "exact"
+		}
+		if req.Filter.IsEmpty() && req.KPerSignal > 0 {
+			// Exact vector search already handles chunk collapse and deleted
+			// messages using bounded hit lookups. Reuse it rather than build
+			// the entire live-message population inside the fused SQL query.
+			vectorHits, err = b.searchExact(ctx, req.Generation, req.QueryVec, req.KPerSignal+1, req.Filter)
+			if err != nil {
+				return nil, vector.SearchMetadata{}, err
+			}
+			return b.fuseSignals(ctx, req, vectorHits, metadata)
+		}
+	}
+	hits, saturated, err := b.fusedSearchExact(ctx, req)
+	metadata.PoolSaturated = saturated
+	return hits, metadata, err
+}
+
+func (b *Backend) fuseSignals(
+	ctx context.Context,
+	req vector.FusedRequest,
+	vectorHits []vector.Hit,
+	metadata vector.SearchMetadata,
+) ([]vector.FusedHit, vector.SearchMetadata, error) {
+	poolLimit := max(req.KPerSignal, 0)
+	vectorSaturated := metadata.PoolSaturated || len(vectorHits) > poolLimit
+	if len(vectorHits) > poolLimit {
+		vectorHits = vectorHits[:poolLimit]
+	}
+
+	var bm25Hits []vector.FusedHit
+	bm25Saturated := false
+	if len(req.FTSTerms) > 0 {
+		bm25Request := req
+		bm25Request.QueryVec = nil
+		bm25Request.Limit = poolLimit
+		bm25Request.SubjectBoost = 1
+		bm25Request.SubjectTerms = nil
+		var err error
+		bm25Hits, bm25Saturated, err = b.fusedSearchExact(ctx, bm25Request)
+		if err != nil {
+			return nil, vector.SearchMetadata{}, err
+		}
+	}
+
+	byMessage := make(map[int64]vector.FusedHit, len(bm25Hits)+len(vectorHits))
+	lexicalKeys := make([]int64, len(bm25Hits))
+	semanticKeys := make([]int64, len(vectorHits))
+	for i, hit := range bm25Hits {
+		lexicalKeys[i] = hit.MessageID
+		hit.VectorScore = math.NaN()
+		byMessage[hit.MessageID] = hit
+	}
+	for i, vectorHit := range vectorHits {
+		semanticKeys[i] = vectorHit.MessageID
+		hit, exists := byMessage[vectorHit.MessageID]
+		if !exists {
+			hit = vector.FusedHit{MessageID: vectorHit.MessageID, BM25Score: math.NaN()}
+		}
+		hit.VectorScore = vectorHit.Score
+		byMessage[vectorHit.MessageID] = hit
+	}
+	// Kit receives only identities. NaN means a missing signal in MsgVault's
+	// result contract, and must not become a shared fusion score or key.
+	fused, err := rrf.Fuse(float64(req.RRFK), []rrf.Leg[int64]{
+		{Name: "lexical", Weight: 1, Keys: lexicalKeys},
+		{Name: "semantic", Weight: 1, Keys: semanticKeys},
+	})
+	if err != nil {
+		return nil, vector.SearchMetadata{}, fmt.Errorf("fuse search signals: %w", err)
+	}
+	hits := make([]vector.FusedHit, len(fused))
+	for i, result := range fused {
+		hit := byMessage[result.Key]
+		hit.RRFScore = result.Score
+		hits[i] = hit
+	}
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].RRFScore != hits[j].RRFScore {
+			return hits[i].RRFScore > hits[j].RRFScore
+		}
+		return hits[i].MessageID < hits[j].MessageID
+	})
+	if req.SubjectBoost > 1 && len(req.SubjectTerms) > 0 {
+		b.applySubjectBoost(ctx, hits, req.SubjectTerms, req.SubjectBoost)
+	}
+	if len(hits) > req.Limit {
+		hits = hits[:req.Limit]
+	}
+	metadata.PoolSaturated = bm25Saturated || vectorSaturated
+	return hits, metadata, nil
+}
+
+// fusedSearchExact runs the single-query hybrid CTE (spec §5.3) by opening a
 // fresh connection to the main msgvault.db with vectors.db ATTACHed.
 // Filters resolve at the Go layer.
 //
@@ -29,7 +143,7 @@ var _ vector.FusingBackend = (*Backend)(nil)
 // (BM25 via LIMIT KPerSignal+1, ANN via k=KPerSignal+1) and trimmed to
 // KPerSignal before fusion. The extra "probe" row exists only so the
 // outer query can report whether the pool was full on either side.
-func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]vector.FusedHit, bool, error) {
+func (b *Backend) fusedSearchExact(ctx context.Context, req vector.FusedRequest) ([]vector.FusedHit, bool, error) {
 	if err := vector.ValidateFilter(req.Filter); err != nil {
 		return nil, false, err
 	}
@@ -61,6 +175,16 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 	if err != nil {
 		return nil, false, err
 	}
+	hasListID := false
+	if len(req.Filter.ListIDSubstrings) > 0 || len(req.Filter.ListIDExactGroups) > 0 || req.Filter.ListID != "" {
+		hasListID, err = sqliteColumnExists(ctx, conn, "messages", "list_id")
+		if err != nil {
+			return nil, false, err
+		}
+		if !hasListID {
+			return nil, false, errors.New(listIDSchemaRequiredErrorText)
+		}
+	}
 
 	messageIDs, err := idsToJSON(req.Filter.MessageIDs)
 	if err != nil {
@@ -69,6 +193,15 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 	sourceIDs, err := idsToJSON(req.Filter.SourceIDs)
 	if err != nil {
 		return nil, false, fmt.Errorf("encode source_ids: %w", err)
+	}
+	var conversationIDs sql.NullString
+	conversationSQL := ""
+	if len(req.Filter.ConversationIDs) > 0 {
+		conversationIDs, err = idsToJSON(req.Filter.ConversationIDs)
+		if err != nil {
+			return nil, false, fmt.Errorf("encode conversation_ids: %w", err)
+		}
+		conversationSQL = `AND m.conversation_id IN (SELECT value FROM json_each(:conversation_ids))`
 	}
 	var exactMessageTypes []string
 	includeLegacyEmail := false
@@ -115,15 +248,12 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 	if req.Filter.HasAttachment != nil {
 		hasAttachment = sql.NullBool{Valid: true, Bool: *req.Filter.HasAttachment}
 	}
-	// Format date bounds with the canonical SQLite datetime layout used
-	// elsewhere in the repo so boundary comparisons on the text sent_at
-	// column agree with the existing SQLite query paths.
 	var after, before sql.NullString
 	if req.Filter.After != nil {
-		after = sql.NullString{Valid: true, String: req.Filter.After.Format(sqliteDatetimeFormat)}
+		after = sql.NullString{Valid: true, String: req.Filter.After.UTC().Format(time.RFC3339Nano)}
 	}
 	if req.Filter.Before != nil {
-		before = sql.NullString{Valid: true, String: req.Filter.Before.Format(sqliteDatetimeFormat)}
+		before = sql.NullString{Valid: true, String: req.Filter.Before.UTC().Format(time.RFC3339Nano)}
 	}
 	var largerThan, smallerThan sql.NullInt64
 	if req.Filter.LargerThan != nil {
@@ -141,11 +271,35 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 		for i, term := range req.Filter.SubjectSubstrings {
 			patterns[i] = "%" + escapeLikeSubject(term) + "%"
 		}
-		buf, err := json.Marshal(patterns)
+		buf, err := json.Marshal(patterns, json.Deterministic(true))
 		if err != nil {
 			return nil, false, fmt.Errorf("encode subject patterns: %w", err)
 		}
 		subjectPatterns = sql.NullString{Valid: true, String: string(buf)}
+	}
+	var listIDPatterns sql.NullString
+	if len(req.Filter.ListIDSubstrings) > 0 {
+		patterns := make([]string, len(req.Filter.ListIDSubstrings))
+		for i, term := range req.Filter.ListIDSubstrings {
+			patterns[i] = "%" + escapeLikeSubject(term) + "%"
+		}
+		buf, err := json.Marshal(patterns, json.Deterministic(true))
+		if err != nil {
+			return nil, false, fmt.Errorf("encode list id patterns: %w", err)
+		}
+		listIDPatterns = sql.NullString{Valid: true, String: string(buf)}
+	}
+	var exactListID sql.NullString
+	if req.Filter.ListID != "" {
+		exactListID = sql.NullString{Valid: true, String: req.Filter.ListID}
+	}
+	var exactListIDGroups sql.NullString
+	if len(req.Filter.ListIDExactGroups) > 0 {
+		buf, err := json.Marshal(req.Filter.ListIDExactGroups, json.Deterministic(true))
+		if err != nil {
+			return nil, false, fmt.Errorf("encode exact list id groups: %w", err)
+		}
+		exactListIDGroups = sql.NullString{Valid: true, String: string(buf)}
 	}
 
 	vecTable := "vec." + VectorTableName(dim)
@@ -182,10 +336,41 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 			OR (:include_legacy_email = 1 AND (m.message_type = 'email' OR m.message_type IS NULL OR m.message_type = ''))
 		)`
 	}
+	listIDSQL := ""
+	if hasListID {
+		listIDSQL = fmt.Sprintf(`AND (:list_id IS NULL OR %s(m.list_id) = %s(:list_id))
+		AND (:list_id_patterns IS NULL OR NOT EXISTS (
+			SELECT 1 FROM json_each(:list_id_patterns) lp
+			 WHERE m.list_id IS NULL OR %s(m.list_id) NOT LIKE %s(lp.value) ESCAPE '\'))
+		AND (:list_id_exact_groups IS NULL OR NOT EXISTS (
+			SELECT 1 FROM json_each(:list_id_exact_groups) lg
+			 WHERE NOT EXISTS (
+				SELECT 1 FROM json_each(lg.value) lv
+				 WHERE %s(m.list_id) = %s(lv.value))))`,
+			sqliteutil.UnicodeLowerFunction, sqliteutil.UnicodeLowerFunction,
+			sqliteutil.UnicodeLowerFunction, sqliteutil.UnicodeLowerFunction,
+			sqliteutil.UnicodeLowerFunction, sqliteutil.UnicodeLowerFunction)
+	}
+
+	filenameSQL := ""
+	var filenamePatterns string
+	if len(req.Filter.FilenameSubstrings) > 0 {
+		patterns := make([]string, len(req.Filter.FilenameSubstrings))
+		for i, term := range req.Filter.FilenameSubstrings {
+			patterns[i] = "%" + escapeLikeSubject(term) + "%"
+		}
+		buf, err := json.Marshal(patterns, json.Deterministic(true))
+		if err != nil {
+			return nil, false, fmt.Errorf("encode filename filters: %w", err)
+		}
+		filenamePatterns = string(buf)
+		filenameSQL = fmt.Sprintf(`AND NOT EXISTS (SELECT 1 FROM json_each(:filename_patterns) fp WHERE NOT EXISTS (SELECT 1 FROM attachments fa WHERE fa.message_id = m.id AND %s(fa.filename) LIKE %s(fp.value) ESCAPE '\'))`, sqliteutil.UnicodeLowerFunction, sqliteutil.UnicodeLowerFunction)
+	}
 
 	filterWhere := fmt.Sprintf(`%s
        AND (:message_ids IS NULL OR m.id IN (SELECT value FROM json_each(:message_ids)))
        AND (:source_ids IS NULL OR m.source_id IN (SELECT value FROM json_each(:source_ids)))
+	   %s
        %s
        %s
        %s
@@ -194,16 +379,25 @@ func (b *Backend) FusedSearch(ctx context.Context, req vector.FusedRequest) ([]v
 	   %s
 	   %s
        AND (:has_attachment IS NULL OR m.has_attachments = :has_attachment)
-       AND (:after IS NULL OR m.sent_at >= :after)
-       AND (:before IS NULL OR m.sent_at < :before)
+       AND (:after IS NULL OR julianday(m.sent_at) >= julianday(:after))
+       AND (:before IS NULL OR julianday(m.sent_at) < julianday(:before))
        AND (:larger_than IS NULL OR m.size_estimate > :larger_than)
        AND (:smaller_than IS NULL OR m.size_estimate < :smaller_than)
        AND (:subject_patterns IS NULL OR NOT EXISTS (
              SELECT 1 FROM json_each(:subject_patterns) sp
               WHERE m.subject IS NULL OR m.subject NOT LIKE sp.value ESCAPE '\'))
-       %s`,
-		store.LiveMessagesWhere("m", true), messageTypeSQL, senderGroupSQL, senderExactGroupSQL,
-		recipientAnyGroupSQL, toGroupSQL, ccGroupSQL, bccGroupSQL, labelGroupSQL)
+	   %s
+	   %s`,
+		store.LiveMessagesWhere("m", true), conversationSQL, messageTypeSQL, senderGroupSQL, senderExactGroupSQL,
+		recipientAnyGroupSQL, toGroupSQL, ccGroupSQL, bccGroupSQL, labelGroupSQL, listIDSQL+"\n"+filenameSQL)
+	var accountArgs []any
+	if clauses := search.AccountScopeConditionsBound(req.Filter.AccountScopes, "m", func(v any) string {
+		name := fmt.Sprintf("account_scope_%d", len(accountArgs))
+		accountArgs = append(accountArgs, sql.Named(name, v))
+		return ":" + name
+	}); len(clauses) > 0 {
+		filterWhere += " AND " + strings.Join(clauses, " AND ")
+	}
 
 	// buildQuery interpolates a fresh query string for a given chunkK,
 	// so the widening loop below can re-issue the fused CTE with a
@@ -311,6 +505,9 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
 		sql.Named("message_ids", messageIDs),
 		sql.Named("source_ids", sourceIDs),
 	}
+	if conversationIDs.Valid {
+		filterArgs = append(filterArgs, sql.Named("conversation_ids", conversationIDs))
+	}
 	if hasMessageType {
 		filterArgs = append(filterArgs, sql.Named("message_types", messageTypes))
 	}
@@ -325,6 +522,17 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
 		sql.Named("subject_patterns", subjectPatterns),
 		sql.Named("gen", int64(req.Generation)),
 	)
+	if hasListID {
+		filterArgs = append(filterArgs,
+			sql.Named("list_id", exactListID),
+			sql.Named("list_id_patterns", listIDPatterns),
+			sql.Named("list_id_exact_groups", exactListIDGroups),
+		)
+	}
+	if filenameSQL != "" {
+		filterArgs = append(filterArgs, sql.Named("filename_patterns", filenamePatterns))
+	}
+
 	filterArgs = append(filterArgs, senderGroupArgs...)
 	filterArgs = append(filterArgs, senderExactGroupArgs...)
 	filterArgs = append(filterArgs, recipientAnyGroupArgs...)
@@ -332,6 +540,7 @@ SELECT message_id, rrf_score, bm25_score, vector_score,
 	filterArgs = append(filterArgs, ccGroupArgs...)
 	filterArgs = append(filterArgs, bccGroupArgs...)
 	filterArgs = append(filterArgs, labelGroupArgs...)
+	filterArgs = append(filterArgs, accountArgs...)
 
 	// Two ceilings bound the widening loop. The generation-wide
 	// chunkCeiling is the hard upper bound on currentChunkK so the
@@ -487,7 +696,11 @@ func (b *Backend) openFusedConn(ctx context.Context) (*sql.DB, error) {
 	if b.mainPath == "" {
 		return nil, errors.New("FusedSearch requires MainPath in Options")
 	}
-	conn, err := sql.Open(DriverName(), b.mainPath)
+	mainDSN, err := normalizeFusedMainDSN(b.mainPath)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := sql.Open(DriverName(), mainDSN)
 	if err != nil {
 		return nil, fmt.Errorf("open main for fused: %w", err)
 	}
@@ -502,6 +715,14 @@ func (b *Backend) openFusedConn(ctx context.Context) (*sql.DB, error) {
 	return conn, nil
 }
 
+func normalizeFusedMainDSN(mainPath string) (string, error) {
+	normalized, _, err := sqliteutil.ResolveDSN(mainPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve main database path for fused search: %w", err)
+	}
+	return normalized, nil
+}
+
 // idsToJSON encodes an int64 slice as a JSON array for the json_each
 // pattern used in the fused CTE. Returns a NULL NullString when the
 // slice is empty, so the SQL can short-circuit with IS NULL.
@@ -509,7 +730,7 @@ func idsToJSON(ids []int64) (sql.NullString, error) {
 	if len(ids) == 0 {
 		return sql.NullString{}, nil
 	}
-	buf, err := json.Marshal(ids)
+	buf, err := json.Marshal(ids, json.Deterministic(true))
 	if err != nil {
 		return sql.NullString{}, fmt.Errorf("marshal ids: %w", err)
 	}
@@ -521,7 +742,7 @@ func stringsToJSON(values []string) (sql.NullString, error) {
 	if len(values) == 0 {
 		return sql.NullString{}, nil
 	}
-	buf, err := json.Marshal(values)
+	buf, err := json.Marshal(values, json.Deterministic(true))
 	if err != nil {
 		return sql.NullString{}, fmt.Errorf("marshal strings: %w", err)
 	}

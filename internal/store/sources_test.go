@@ -47,6 +47,30 @@ func TestStore_GetSourcesByIdentifier_NotFound(t *testing.T) {
 	assert.Empty(t, sources)
 }
 
+func TestStore_GetSourcesByIdentifierOrDisplayNameIgnoresCase(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+
+	source, err := st.GetOrCreateSource("gmail", "Archive@Example.com")
+	require.NoError(err)
+	_, err = st.DB().Exec(
+		st.Rebind(`UPDATE sources SET display_name = ? WHERE id = ?`),
+		"Primary Archive", source.ID,
+	)
+	require.NoError(err)
+
+	byIdentifier, err := st.GetSourcesByIdentifierOrDisplayName("archive@example.com")
+	require.NoError(err)
+	require.Len(byIdentifier, 1)
+	assert.Equal(source.ID, byIdentifier[0].ID)
+
+	byDisplayName, err := st.GetSourcesByIdentifierOrDisplayName("primary archive")
+	require.NoError(err)
+	require.Len(byDisplayName, 1)
+	assert.Equal(source.ID, byDisplayName[0].ID)
+}
+
 func TestStore_RemoveSource(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -871,6 +895,31 @@ func TestStore_RemoveSourceSerialized_NoActiveSync(t *testing.T) {
 	assert.Nil(src, "source should be removed")
 }
 
+func TestStore_RemoveSourceSerialized_PreservesPendingOperation(t *testing.T) {
+	requirements := require.New(t)
+	checks := assert.New(t)
+	fixture := storetest.New(t)
+	const operationID = "pending-operation"
+
+	_, err := fixture.Store.CreateSyncOperation(fixture.Source.ID, operationID)
+	requirements.NoError(err)
+
+	hadActiveSync, removed, err := fixture.Store.RemoveSourceSerialized(
+		t.Context(), fixture.Source.ID,
+	)
+	requirements.ErrorIs(err, store.ErrSyncAlreadyActive)
+	checks.True(hadActiveSync)
+	checks.Zero(removed)
+
+	source, err := fixture.Store.GetSourceByID(fixture.Source.ID)
+	requirements.NoError(err)
+	checks.Equal(fixture.Source.ID, source.ID)
+	operation, err := fixture.Store.GetSyncOperation(operationID)
+	requirements.NoError(err)
+	checks.Equal("pending", operation.Status)
+	requirements.NoError(fixture.Store.FinishSyncOperation(operationID, "failed"))
+}
+
 func TestStore_RemoveSourceSerialized_PackedLogicalGC(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -1042,7 +1091,7 @@ func TestStore_RemoveSourceSerialized_PreservesPackedCaseAliasReferences(t *test
 			require.NotNil(entry)
 			assert.Equal(packID, entry.PackID)
 			for _, requested := range []string{hash, uppercase} {
-				loc, err := f.Store.ResolveAttachmentBlob(requested)
+				loc, err := f.Store.ResolveAttachmentBlobContext(t.Context(), requested)
 				require.NoError(err)
 				assert.True(loc.Referenced)
 				require.NotNil(loc.Pack)
@@ -1143,13 +1192,6 @@ func TestStore_RemoveSourceSerialized_ActiveSyncOtherSource(t *testing.T) {
 	other, err := f.Store.GetSourceByIdentifier("other@example.com")
 	require.NoError(err, "GetSourceByIdentifier other")
 	assert.NotNil(other, "other source should remain")
-}
-
-func TestStore_RemoveSourceSerialized_NotFound(t *testing.T) {
-	st := testutil.NewTestStore(t)
-
-	_, _, err := st.RemoveSourceSerialized(context.Background(), 99999)
-	require.Error(t, err, "RemoveSourceSerialized should error for nonexistent ID")
 }
 
 func TestStore_AttachmentPathsUniqueToSource(t *testing.T) {
@@ -1368,8 +1410,8 @@ func TestInitSchema_AddsDeletedAtToLegacyMessagesTable(t *testing.T) {
 	// deleted_from_source_at, message_type, …) but DOES NOT have the
 	// new dedup-hide columns (`deleted_at`, `delete_batch_id`).
 	// Approximates a legacy DB just before this branch landed.
-	// metadata has been on messages since the first schema and the activity
-	// queue trigger names it, so a legacy table must carry it too.
+	// metadata and is_sent predate this migration and the activity queue
+	// trigger names them, so a legacy table must carry them too.
 	_, err = st.DB().Exec(`
 		CREATE TABLE messages (
 			id INTEGER PRIMARY KEY,
@@ -1385,9 +1427,11 @@ func TestInitSchema_AddsDeletedAtToLegacyMessagesTable(t *testing.T) {
 			size_estimate INTEGER,
 			has_attachments BOOLEAN,
 			is_from_me BOOLEAN,
+			is_sent BOOLEAN DEFAULT TRUE,
 			archived_at DATETIME,
 			rfc822_message_id TEXT,
 			sender_id INTEGER,
+			reply_to_message_id INTEGER REFERENCES messages(id),
 			message_type TEXT NOT NULL DEFAULT 'email',
 			attachment_count INTEGER DEFAULT 0,
 			deleted_from_source_at DATETIME
@@ -1421,4 +1465,10 @@ func TestInitSchema_AddsDeletedAtToLegacyMessagesTable(t *testing.T) {
 		"SELECT COUNT(DISTINCT delete_batch_id) FROM messages",
 	)
 	require.NoError(err, "post-migration delete_batch_id query")
+}
+
+func TestRemoveSourceSerializedReportsMissingSource(t *testing.T) {
+	st := testutil.NewTestStore(t)
+	_, _, err := st.RemoveSourceSerialized(t.Context(), 99999)
+	require.ErrorIs(t, err, store.ErrSourceNotFound)
 }

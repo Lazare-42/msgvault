@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"time"
 )
 
@@ -23,6 +24,26 @@ type FTSDoc struct {
 	FromAddr  string
 	ToAddrs   string
 	CcAddrs   string
+}
+
+type ftsEnvelopeExpressions struct {
+	subject, fromAddr, toAddrs, ccAddrs string
+}
+
+// storedFTSEnvelopeSQL keeps archive comparison, repair, and backfill on the
+// same stored subject, sender fallback, and recipient selection.
+// The enclosing query must alias messages as m.
+func storedFTSEnvelopeSQL(aggregate string) ftsEnvelopeExpressions {
+	recipients := func(kind string) string {
+		return fmt.Sprintf("COALESCE((SELECT %s(p.email_address, ' ') FROM message_recipients mr JOIN participants p ON p.id = mr.participant_id WHERE mr.message_id = m.id AND mr.recipient_type = '%s'), '')", aggregate, kind)
+	}
+	return ftsEnvelopeExpressions{
+		subject: "COALESCE(m.subject, '')",
+		fromAddr: `COALESCE(CASE WHEN m.message_type != 'email' AND m.message_type IS NOT NULL AND m.message_type != ''
+			THEN (SELECT COALESCE(p.phone_number, p.email_address) FROM participants p WHERE p.id = m.sender_id) END, ` + recipients("from") + `)`,
+		toAddrs: recipients("to"),
+		ccAddrs: recipients("cc"),
+	}
 }
 
 // ColumnMigration is a single ALTER TABLE ADD COLUMN statement used by
@@ -89,6 +110,17 @@ type Dialect interface {
 	// Rebind converts a query with ? placeholders to the appropriate format
 	// for the database driver. No-op for SQLite; converts to $1, $2, ... for PostgreSQL.
 	Rebind(query string) string
+
+	// UnicodeLowerExpression returns a Unicode-aware lowercasing SQL expression.
+	// SQLite uses the deterministic scalar registered on every connection;
+	// PostgreSQL uses its collation-aware LOWER implementation.
+	UnicodeLowerExpression(expr string) string
+
+	// BlobPrefixSQL returns an expression that reads at most the bytes bound by
+	// its one placeholder from a BLOB/bytea column expression. The repair
+	// paths use it before scanning raw archive payloads so database/sql never
+	// materializes a whole MIME body merely to inspect its headers.
+	BlobPrefixSQL(column string) string
 
 	// Now returns the SQL expression for the current timestamp.
 	// SQLite: "datetime('now')"  PostgreSQL: "NOW()"
@@ -157,6 +189,10 @@ type Dialect interface {
 	// free to use a column-update on messages.
 	FTSUpsert(q querier, doc FTSDoc) error
 
+	// FTSMatches reports whether the stored search document for
+	// doc.MessageID is exactly what FTSUpsert would write for doc.
+	FTSMatches(q querier, doc FTSDoc) (bool, error)
+
 	// FTSSearchClause returns SQL fragments for full-text search using ?
 	// placeholders. Returns: join clause, where clause, order-by clause,
 	// and the number of times the caller must re-bind the search term to
@@ -164,7 +200,8 @@ type Dialect interface {
 	// "rank" is an implicit FTS5 column; PostgreSQL: 1 for ts_rank).
 	// Callers compose these with their own SQL and must run Rebind on the
 	// final query before execution.
-	FTSSearchClause() (join, where, orderBy string, orderArgCount int)
+	// rowIDs uses a self-contained predicate so MATCH can appear inside OR.
+	FTSSearchClause(rowIDs bool) (join, where, orderBy string, orderArgCount int)
 
 	// FTSDeleteSQL returns the SQL to remove FTS entries for messages belonging to
 	// a given source. Takes one parameter: source_id.
@@ -194,6 +231,7 @@ type Dialect interface {
 
 	// FTSNeedsBackfill reports whether the FTS index needs to be populated.
 	FTSNeedsBackfill(db *sql.DB) bool
+	FTSNeedsBackfillContext(ctx context.Context, db *sql.DB) (bool, error)
 
 	// FTSNeedsBackfillQuick is a cheap approximation of FTSNeedsBackfill for
 	// hot paths: it must never take longer than a few index lookups. True
@@ -308,6 +346,12 @@ type Dialect interface {
 
 	// CheckpointWAL checkpoints the WAL (SQLite) or is a no-op (PostgreSQL).
 	CheckpointWAL(db *sql.DB) error
+	// CheckpointWALContext checkpoints the WAL using ctx to interrupt a busy
+	// SQLite checkpoint, or is a no-op for PostgreSQL.
+	CheckpointWALContext(ctx context.Context, db *sql.DB) error
+	// CheckpointWALPassive checkpoints without waiting on readers or writers
+	// (SQLite) or is a no-op (PostgreSQL). ctx bounds pool acquisition and PRAGMA.
+	CheckpointWALPassive(ctx context.Context, db *sql.DB) error
 
 	// Schema migration
 
@@ -366,6 +410,22 @@ type Dialect interface {
 	// (emit "col = 1"); PostgreSQL has a real BOOLEAN type and rejects
 	// integer comparisons against it, so the bare column name is correct.
 	BoolTrueExpr(col string) string
+
+	// RFC822CanonicalIDExpr returns the SQL expression used to group stored
+	// Message-IDs after removing one structurally valid pair of angle brackets.
+	// SQLite must operate on BLOB bytes because its TEXT length and substring
+	// functions stop at embedded NUL; PostgreSQL TEXT rejects NUL at write time.
+	RFC822CanonicalIDExpr(col string) string
+
+	// RFC822CanonicalIDIndexDefinition returns the backend-specific portion of
+	// a composite canonical Message-ID/source index declaration beginning with
+	// ON messages. Keeping source_id in the index lets the production scope
+	// predicate be evaluated from the index while canonical ID remains first so
+	// GROUP BY can stream in index order. PostgreSQL needs an extra parenthesis
+	// pair around the CASE expression; SQLite does not. The indexed expression
+	// must stay byte-identical to RFC822CanonicalIDExpr("rfc822_message_id") so
+	// the planner can match it to the discovery query.
+	RFC822CanonicalIDIndexDefinition() string
 
 	// BuildFTSArg formats a slice of user-supplied search terms into the
 	// single string argument that FTSSearchClause's WHERE fragment binds

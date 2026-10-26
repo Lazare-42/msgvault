@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/msgvault/internal/config"
-	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/sqlitevec"
 )
@@ -52,6 +52,8 @@ func readEmbedGen(t *testing.T, db *sql.DB, id int64) (val int64, isNull bool) {
 // This FAILS with the old reset-before-open ordering (the message ends stamped
 // =active) and PASSES with the open-before-reset fix.
 func TestRepairResetEmbeddings_OpensBackendBeforeResettingEmbedGen(t *testing.T) {
+	cfg := testConfigValue()
+
 	assert := assert.New(t)
 	require := require.New(t)
 	require.NoError(
@@ -64,18 +66,9 @@ func TestRepairResetEmbeddings_OpensBackendBeforeResettingEmbedGen(t *testing.T)
 	vecPath := filepath.Join(dir, "vectors.db")
 
 	// Real main DB with two live messages, both previously embedded.
-	s, err := store.Open(mainPath)
-	require.NoError(
-		err, "store.Open")
+	s := testutil.NewSQLiteTestStoreAt(t, mainPath)
 
-	// Close the store LAST (registered first → LIFO) so the backend that
-	// borrows s.DB() closes before it, and the open msgvault.db handle does not
-	// block t.TempDir() cleanup on Windows.
-	t.Cleanup(func() { _ = s.Close() })
-	require.NoError(
-		s.InitSchema(), "InitSchema")
-
-	_, err = s.DB().Exec(`
+	_, err := s.DB().Exec(`
 INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'me@example.com');
 INSERT INTO conversations (id, source_id, conversation_type) VALUES (1, 1, 'email_thread');
 INSERT INTO messages (id, conversation_id, source_id, source_message_id, message_type)
@@ -123,13 +116,14 @@ VALUES (1, 1, 1, 'm1', 'email'), (2, 1, 1, 'm2', 'email');
 	savedCfg := cfg
 	t.Cleanup(func() { cfg = savedCfg })
 	cfg = &config.Config{}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
 	cfg.Data.DataDir = dir
 	cfg.Vector.Enabled = true
 	cfg.Vector.DBPath = vecPath
 	cfg.Vector.Embeddings.Dimension = 4
 	require.NoError(
 
-		repairResetEmbeddings(ctx, s, []int64{1}),
+		repairResetEmbeddings(testCtx, s, []int64{1}, cfg),
 		"repairResetEmbeddings")
 
 	// FIX A assertion: the repaired message must end embed_gen IS NULL — the
@@ -151,21 +145,16 @@ VALUES (1, 1, 1, 'm1', 'email'), (2, 1, 1, 'm2', 'email');
 // with vector search disabled, repairResetEmbeddings opens no backend (no
 // backfill) but still clears embed_gen so the column is consistent. No error.
 func TestRepairResetEmbeddings_VectorDisabledStillResets(t *testing.T) {
+	cfg := testConfigValue()
+
 	require := require.New(t)
 
-	ctx := context.Background()
 	dir := t.TempDir()
 	mainPath := filepath.Join(dir, "msgvault.db")
 
-	s, err := store.Open(mainPath)
-	require.NoError(
-		err, "store.Open")
+	s := testutil.NewSQLiteTestStoreAt(t, mainPath)
 
-	t.Cleanup(func() { _ = s.Close() })
-	require.NoError(
-		s.InitSchema(), "InitSchema")
-
-	_, err = s.DB().Exec(`
+	_, err := s.DB().Exec(`
 INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'me@example.com');
 INSERT INTO conversations (id, source_id, conversation_type) VALUES (1, 1, 'email_thread');
 INSERT INTO messages (id, conversation_id, source_id, source_message_id, message_type, embed_gen)
@@ -177,10 +166,11 @@ VALUES (1, 1, 1, 'm1', 'email', 7);
 	savedCfg := cfg
 	t.Cleanup(func() { cfg = savedCfg })
 	cfg = &config.Config{}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
 	cfg.Data.DataDir = dir
 	cfg.Vector.Enabled = false
 	require.NoError(
-		repairResetEmbeddings(ctx, s, []int64{1}),
+		repairResetEmbeddings(testCtx, s, []int64{1}, cfg),
 		"repairResetEmbeddings (vector disabled)")
 
 	_, isNull := readEmbedGen(t, s.DB(), 1)

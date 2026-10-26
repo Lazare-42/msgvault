@@ -2,7 +2,8 @@ package discord
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"time"
 )
 
@@ -59,24 +60,34 @@ type Guild struct {
 // threads. Discord categories are represented here for catalog context but are
 // not made message containers by the importer.
 type Channel struct {
-	ID                   string           `json:"id"`
-	Type                 int              `json:"type"`
-	GuildID              string           `json:"guild_id"`
-	Position             int              `json:"position"`
-	Name                 string           `json:"name"`
-	Topic                string           `json:"topic"`
-	NSFW                 bool             `json:"nsfw"`
-	LastMessageID        string           `json:"last_message_id"`
-	ParentID             string           `json:"parent_id"`
-	OwnerID              string           `json:"owner_id"`
-	RateLimitPerUser     int              `json:"rate_limit_per_user"`
-	MessageCount         int              `json:"message_count"`
-	MemberCount          int              `json:"member_count"`
-	Flags                int              `json:"flags"`
-	AppliedTags          []string         `json:"applied_tags"`
-	AvailableTags        []ForumTag       `json:"available_tags"`
-	DefaultReactionEmoji *DefaultReaction `json:"default_reaction_emoji"`
-	ThreadMetadata       *ThreadMetadata  `json:"thread_metadata"`
+	ID                   string                `json:"id"`
+	Type                 int                   `json:"type"`
+	GuildID              string                `json:"guild_id"`
+	Position             int                   `json:"position"`
+	Name                 string                `json:"name"`
+	Topic                string                `json:"topic"`
+	NSFW                 bool                  `json:"nsfw"`
+	LastMessageID        string                `json:"last_message_id"`
+	ParentID             string                `json:"parent_id"`
+	OwnerID              string                `json:"owner_id"`
+	RateLimitPerUser     int                   `json:"rate_limit_per_user"`
+	MessageCount         int                   `json:"message_count"`
+	MemberCount          int                   `json:"member_count"`
+	Flags                int                   `json:"flags"`
+	AppliedTags          []string              `json:"applied_tags"`
+	AvailableTags        []ForumTag            `json:"available_tags"`
+	DefaultReactionEmoji *DefaultReaction      `json:"default_reaction_emoji"`
+	ThreadMetadata       *ThreadMetadata       `json:"thread_metadata"`
+	PermissionOverwrites []PermissionOverwrite `json:"permission_overwrites"`
+}
+
+// PermissionOverwrite is provider-reported channel access metadata. Its
+// presence does not establish visibility to a host application's readers.
+type PermissionOverwrite struct {
+	ID    string `json:"id"`
+	Type  int    `json:"type"`
+	Allow string `json:"allow"`
+	Deny  string `json:"deny"`
 }
 
 type ForumTag struct {
@@ -152,18 +163,18 @@ type Message struct {
 	Pinned            bool              `json:"pinned"`
 	WebhookID         string            `json:"webhook_id"`
 	Type              int               `json:"type"`
-	Activity          json.RawMessage   `json:"activity"`
-	Application       json.RawMessage   `json:"application"`
+	Activity          jsontext.Value    `json:"activity"`
+	Application       jsontext.Value    `json:"application"`
 	ApplicationID     string            `json:"application_id"`
 	MessageReference  *MessageReference `json:"message_reference"`
 	Flags             int               `json:"flags"`
 	ReferencedMessage *Message          `json:"referenced_message"`
-	Interaction       json.RawMessage   `json:"interaction"`
+	Interaction       jsontext.Value    `json:"interaction"`
 	Thread            *Channel          `json:"thread"`
-	Components        json.RawMessage   `json:"components"`
+	Components        jsontext.Value    `json:"components"`
 	StickerItems      []StickerItem     `json:"sticker_items"`
 	Poll              *Poll             `json:"poll"`
-	Raw               json.RawMessage   `json:"-"`
+	Raw               jsontext.Value    `json:"-"`
 }
 
 // UnmarshalJSON retains the complete API object while decoding the fields the
@@ -176,7 +187,7 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*m = Message(decoded)
-	m.Raw = append(json.RawMessage(nil), data...)
+	m.Raw = append(jsontext.Value(nil), data...)
 	return nil
 }
 

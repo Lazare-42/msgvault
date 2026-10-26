@@ -1,7 +1,8 @@
 package slack
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"strconv"
 	"strings"
 	"time"
@@ -32,17 +33,18 @@ type AuthTestResult struct {
 // Conversation is one channel/group DM/DM from conversations.list or
 // users.conversations.
 type Conversation struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	IsChannel  bool   `json:"is_channel"`
-	IsGroup    bool   `json:"is_group"`
-	IsIM       bool   `json:"is_im"`
-	IsMpim     bool   `json:"is_mpim"`
-	IsPrivate  bool   `json:"is_private"`
-	IsArchived bool   `json:"is_archived"`
-	IsMember   bool   `json:"is_member"`
-	User       string `json:"user"` // IM peer user ID (im only)
-	NumMembers int    `json:"num_members"`
+	ID         string   `json:"id"`
+	Name       string   `json:"name"`
+	IsChannel  bool     `json:"is_channel"`
+	IsGroup    bool     `json:"is_group"`
+	IsIM       bool     `json:"is_im"`
+	IsMpim     bool     `json:"is_mpim"`
+	IsPrivate  bool     `json:"is_private"`
+	IsArchived bool     `json:"is_archived"`
+	IsMember   bool     `json:"is_member"`
+	User       string   `json:"user"` // IM peer user ID (im only)
+	NumMembers int      `json:"num_members"`
+	Members    []string `json:"members"`
 }
 
 // User is one workspace member from users.list.
@@ -170,8 +172,8 @@ type BlockElement struct {
 // UnmarshalJSON decodes a BlockElement tolerantly (see type comment).
 func (e *BlockElement) UnmarshalJSON(b []byte) error {
 	var probe struct {
-		Type string          `json:"type"`
-		Text json.RawMessage `json:"text"`
+		Type string         `json:"type"`
+		Text jsontext.Value `json:"text"`
 	}
 	if err := json.Unmarshal(b, &probe); err != nil {
 		return err
@@ -214,7 +216,7 @@ type Message struct {
 	// Raw holds the exact original JSON for this message, captured during
 	// decode (see UnmarshalJSON) and archived verbatim so no API field is
 	// lost to our partial struct modelling.
-	Raw json.RawMessage `json:"-"`
+	Raw jsontext.Value `json:"-"`
 }
 
 // UnmarshalJSON decodes a Message while retaining the original bytes in Raw.
@@ -225,7 +227,7 @@ func (m *Message) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	*m = Message(a)
-	m.Raw = json.RawMessage(strings.Clone(string(b)))
+	m.Raw = jsontext.Value(strings.Clone(string(b)))
 	return nil
 }
 
@@ -274,11 +276,19 @@ func tsLess(a, b string) bool {
 
 // ImportOptions configures one Import run.
 type ImportOptions struct {
+	// SourceID pins an existing source. Zero keeps standalone source discovery;
+	// a supplied ID must match the authenticated workspace and is never
+	// recreated if removed while a run is waiting to start.
+	SourceID int64
 	// TeamID is the workspace to sync; with UserID it forms the msgvault
 	// source identifier ("<team_id>:<user_id>").
 	TeamID string
 	// UserID is the archiving user (from auth.test at add-slack time).
 	UserID string
+	// RevalidatePrincipal restarts scoped history/reply discovery when the
+	// credential user differs from the checkpoint's principal. Message IDs
+	// remain stable; this is used by archives that can replace a credential.
+	RevalidatePrincipal bool
 	// Limit caps messages processed per conversation this run (0 = no
 	// limit). A limited backfill leaves the conversation resumable.
 	Limit int
@@ -300,10 +310,24 @@ type ImportOptions struct {
 	MaxMediaBytes     int64
 	MediaPolicy       attachmentpolicy.Policy
 	MediaConversation attachmentpolicy.Conversation
-	// IncludeChannels/ExcludeChannels filter by channel name (no "#").
-	// Include empty = all memberships. DMs/group DMs are never filtered.
+	// IncludeChannels/ExcludeChannels filter channels by name (no "#").
+	// Include empty = all channel memberships. Name filters never apply to
+	// DMs or group DMs; ExcludeDMs/ExcludeGroupDMs select those.
 	IncludeChannels []string
 	ExcludeChannels []string
+	// ChannelIDs adds an exact ID selection before all other filters. Nil
+	// retains normal selection; a non-nil empty slice selects nothing. Reply
+	// searches stay within each selected channel (C-prefixed IDs, public or
+	// private) instead of the workspace; selected DMs and group DMs audit
+	// their threads directly.
+	ChannelIDs []string
+	// ExcludePrivateChannels skips private channels without affecting DMs.
+	ExcludePrivateChannels bool
+	// ExcludeDMs skips one-to-one DMs and ExcludeGroupDMs skips group DMs.
+	// A skipped conversation keeps its resume state and thread debt until it
+	// is selected again. The zero value syncs both.
+	ExcludeDMs      bool
+	ExcludeGroupDMs bool
 	// Progress, if non-nil, is called after each conversation with a
 	// human-readable status line.
 	Progress func(msg string) `json:"-"`
@@ -322,6 +346,10 @@ type ImportSummary struct {
 	AttachmentsSkipped     int
 	FetchErrors            int
 	Errors                 int
-	Duration               time.Duration
-	processedMessageIDs    map[string]struct{}
+	// UnavailableChannels lists selected ChannelIDs the credential user's
+	// conversation listing did not return. The run skips them without
+	// failing; their archived history is unchanged.
+	UnavailableChannels []string
+	Duration            time.Duration
+	processedMessageIDs map[string]struct{}
 }

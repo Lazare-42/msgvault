@@ -3,6 +3,7 @@ package daemonclient
 import (
 	"context"
 	"encoding/json"
+	"encoding/json/jsontext"
 	"errors"
 	"fmt"
 	"io"
@@ -14,7 +15,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel/propagation"
@@ -243,7 +243,7 @@ func TestCLIIdentityImportSendsParsedEntriesAndConvertsResult(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assertions.Equal(http.MethodPost, r.Method)
 		assertions.Equal("/api/v1/cli/identities/import", r.URL.Path)
-		var raw map[string]json.RawMessage
+		var raw map[string]jsontext.Value
 		if !assertions.NoError(json.NewDecoder(r.Body).Decode(&raw), "decode import request") {
 			http.Error(w, "bad import request", http.StatusBadRequest)
 			return
@@ -312,16 +312,32 @@ func TestNewRejectsHTTPWithoutAllowInsecure(t *testing.T) {
 	require.Error(t, err, "New should reject http without AllowInsecure")
 }
 
-func TestNewAllowsHTTPWithAllowInsecure(t *testing.T) {
-	c, err := New(Config{URL: "http://nas:8080", APIKey: "key", AllowInsecure: true})
-	require.NoError(t, err, "New")
-	require.NotNil(t, c, "client")
+func TestNewRejectsHTTPAgentTokenWithoutAllowInsecure(t *testing.T) {
+	_, err := New(Config{URL: "http://nas:8080", AgentToken: "mva1_token"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "HTTPS required for agent token", "error must name agent token as the reason")
 }
 
-func TestNewAllowsHTTPS(t *testing.T) {
-	c, err := New(Config{URL: "https://nas:8080", APIKey: "key"})
-	require.NoError(t, err, "New")
-	require.NotNil(t, c, "client")
+func TestNewAgentTokenClientRejectsRedirects(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(target.Close)
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/health", http.StatusFound)
+	}))
+	t.Cleanup(redirector.Close)
+
+	c, err := New(Config{URL: redirector.URL, AgentToken: "mva1_token", AllowInsecure: true})
+	require.NoError(t, err)
+
+	resp, err := c.DoGeneratedRequestWithContext(context.Background(), http.MethodGet, "/health", &generated.RunCLIRequestOptions{})
+	if resp != nil {
+		_ = resp.Body.Close()
+	}
+	require.Error(t, err, "agent token client must not follow redirects")
+	assert.Contains(t, err.Error(), "does not follow redirects")
 }
 
 func TestNewRejectsEmptyURL(t *testing.T) {
@@ -448,10 +464,50 @@ func TestRunSQLQueryPreservesIntegerPrecision(t *testing.T) {
 	assert.Equal(1, got.RowCount, "row count")
 	require.Len(got.Rows, 1, "rows")
 	assert.Equal(
-		[]any{"UNREAD", json.Number("1662130"), json.Number("9007199254740993")},
+		[]any{"UNREAD", jsontext.Value("1662130"), jsontext.Value("9007199254740993")},
 		got.Rows[0],
 		"row cells keep exact integer values",
 	)
+}
+
+func TestRunArchiveSQLQueryPreservesRowsAndAcceptedBuild(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal("/api/v1/query/archive", r.URL.Path)
+		var request struct {
+			SQL   string `json:"sql"`
+			Fresh bool   `json:"fresh"`
+		}
+		if !assert.NoError(json.NewDecoder(r.Body).Decode(&request)) {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		assert.Equal("SELECT id FROM messages", request.SQL)
+		w.Header().Set("Content-Type", "application/json")
+		if request.Fresh {
+			w.WriteHeader(http.StatusAccepted)
+			_, err := w.Write([]byte(`{"status":"queued","job_id":"archive-build"}`))
+			assert.NoError(err)
+			return
+		}
+		_, err := w.Write([]byte(`{"columns":["id"],"rows":[[9007199254740993]],"row_count":1}`))
+		assert.NoError(err)
+	}))
+	t.Cleanup(server.Close)
+	client, err := New(Config{URL: server.URL, APIKey: "synthetic-owner-key", AllowInsecure: true})
+	require.NoError(err)
+	t.Cleanup(func() { require.NoError(client.Close()) })
+	result, accepted, err := client.RunArchiveSQLQueryWithFresh(t.Context(), "SELECT id FROM messages", false)
+	require.NoError(err)
+	assert.Nil(accepted)
+	assert.Equal([][]any{{jsontext.Value("9007199254740993")}}, result.Rows)
+	result, accepted, err = client.RunArchiveSQLQueryWithFresh(t.Context(), "SELECT id FROM messages", true)
+	require.NoError(err)
+	assert.Nil(result)
+	require.NotNil(accepted)
+	assert.Equal("archive-build", accepted.JobID)
+	assert.Equal("queued", accepted.Status)
 }
 
 func TestGeneratedClientUsesConfiguredHTTPClient(t *testing.T) {
@@ -532,10 +588,73 @@ func TestGeneratedCLIResponseErrorReturnsBareServerMessage(t *testing.T) {
 	require.EqualError(t, err, "bad account", "CLI error")
 }
 
-func TestGeneratedResponseDecodeErrorDetection(t *testing.T) {
-	err := &runtime.ResponseDecodeError{Err: errors.New("malformed")}
-	assert.True(t, responseDecodeError(err), "decode error")
-	assert.False(t, responseDecodeError(errors.New("other")), "other error")
+func TestRunCLICommandTypesDaemonReportedFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name             string
+		status           int
+		body, want       string
+		typed, truncated bool
+	}{
+		{name: "daemon refusal", status: 400, body: `{"error":"command_not_allowed","message":"command is not allowed through the daemon CLI runner"}`, want: "command is not allowed through the daemon CLI runner", typed: true},
+		{name: "stream event", status: 200, body: "{\"type\":\"error\",\"error\":\"not_permitted\"}\n", want: "not_permitted", typed: true},
+		{name: "empty stream error", status: 200, body: "{\"type\":\"error\"}\n", want: "run failed", typed: true},
+		{name: "malformed HTML", status: 400, body: "<html>private-body</html>", want: "API error (400): <html>private-body</html>"},
+		{name: "truncated body", status: 400, body: `{"message":"private-body"}`, want: "API error (400): could not read response body: unexpected EOF", truncated: true},
+		{name: "truncated stream", status: 200, body: `{"type":`, want: "decode CLI run stream:"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				if tc.truncated {
+					w.Header().Set("Content-Length", "1000")
+				}
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(server.Close)
+			client, err := New(Config{URL: server.URL, AllowInsecure: true})
+			require.NoError(err)
+			t.Cleanup(func() { _ = client.Close() })
+			err = client.RunCLICommand(t.Context(), CLIRunRequest{Args: []string{"draft-get", "d1"}}, nil)
+			require.Error(err)
+			_, typed := errors.AsType[*CLIRunError](err)
+			assert.Equal(tc.typed, typed)
+			if tc.name == "truncated stream" {
+				assert.Contains(err.Error(), tc.want)
+			} else {
+				assert.EqualError(err, tc.want)
+			}
+		})
+	}
+	t.Run("transport", func(t *testing.T) {
+		assert := assert.New(t)
+		require := require.New(t)
+		server := httptest.NewServer(http.NotFoundHandler())
+		server.Close()
+		client, err := New(Config{URL: server.URL, AllowInsecure: true})
+		require.NoError(err)
+		t.Cleanup(func() { _ = client.Close() })
+		err = client.RunCLICommand(t.Context(), CLIRunRequest{}, nil)
+		require.Error(err)
+		_, typed := errors.AsType[*CLIRunError](err)
+		assert.False(typed)
+	})
+	t.Run("cancellation", func(t *testing.T) {
+		assert := assert.New(t)
+		require := require.New(t)
+		server := httptest.NewServer(http.NotFoundHandler())
+		t.Cleanup(server.Close)
+		client, err := New(Config{URL: server.URL, AllowInsecure: true})
+		require.NoError(err)
+		t.Cleanup(func() { _ = client.Close() })
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		err = client.RunCLICommand(ctx, CLIRunRequest{}, nil)
+		require.ErrorIs(err, context.Canceled)
+		_, typed := errors.AsType[*CLIRunError](err)
+		assert.False(typed)
+	})
 }
 
 func TestRunCLICommandRetriesWhileOperationInProgress(t *testing.T) {
@@ -791,3 +910,101 @@ func TestRunCLICommandStopsRetryingWhenContextCancelled(t *testing.T) {
 		require.FailNow("streaming busy retry did not return after context cancellation")
 	}
 }
+
+// TestRequestEditorDelegatedMode tests proof matrix row 19.
+// In delegated mode the client attaches exactly X-Msgvault-Agent-Token and
+// never X-Api-Key or the daemon runtime token. APIKey and AgentToken are
+// mutually exclusive at construction time.
+func TestRequestEditorDelegatedMode(t *testing.T) {
+	t.Run("agent token without api key is accepted", func(t *testing.T) {
+		c, err := New(Config{URL: "http://daemon:8080", AgentToken: "mva1_token", AllowInsecure: true})
+		require.NoError(t, err)
+		require.NotNil(t, c)
+	})
+
+	t.Run("both agent token and api key is rejected", func(t *testing.T) {
+		_, err := New(Config{URL: "http://daemon:8080", AgentToken: "mva1_token", APIKey: "key", AllowInsecure: true})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "mutually exclusive")
+	})
+
+	t.Run("delegated mode sets agent header not api key", func(t *testing.T) {
+		var gotAgentToken, gotAPIKey string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotAgentToken = r.Header.Get(apiprotocol.AgentTokenHeader)
+			gotAPIKey = r.Header.Get("X-Api-Key")
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"status":"ok"}`))
+		}))
+		t.Cleanup(srv.Close)
+
+		const token = "mva1_delegatedtesttoken"
+		c, err := New(Config{URL: srv.URL, AgentToken: token, AllowInsecure: true})
+		require.NoError(t, err)
+
+		// Make a request via the generated client to trigger requestEditor.
+		resp, _ := c.DoGeneratedRequestWithContext(context.Background(), http.MethodGet, "/health", &generated.RunCLIRequestOptions{})
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+
+		assert.Equal(t, token, gotAgentToken, "agent token header must be set in delegated mode")
+		assert.Empty(t, gotAPIKey, "X-Api-Key must not be set in delegated mode")
+	})
+}
+
+func TestErrorResponseBodiesAreBounded(t *testing.T) {
+	for _, size := range []int{maxErrorBodyBytes - 1, maxErrorBodyBytes, maxErrorBodyBytes + 1} {
+		for _, eofWithData := range []bool{false, true} {
+			t.Run(fmt.Sprintf("size-%d-eof-with-data-%t", size, eofWithData), func(t *testing.T) {
+				must := require.New(t)
+				resp := boundErrorBody(&http.Response{StatusCode: http.StatusBadRequest, Body: &boundaryErrorReader{
+					Reader: strings.NewReader(strings.Repeat("x", size)), eofWithData: eofWithData,
+				}}, maxErrorBodyBytes)
+				t.Cleanup(func() { must.NoError(resp.Body.Close()) })
+				body := resp.Body
+				p := make([]byte, maxErrorBodyBytes+1)
+				n, err := body.Read(p)
+				assert.Equal(t, size, n)
+				if size > maxErrorBodyBytes {
+					must.ErrorContains(err, "exceeds 64 KiB")
+				} else {
+					if eofWithData {
+						must.ErrorIs(err, io.EOF)
+					} else {
+						must.NoError(err)
+					}
+					_, err = body.Read(p)
+					must.ErrorIs(err, io.EOF)
+				}
+			})
+		}
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, strings.Repeat("x", 80<<10))
+	}))
+	t.Cleanup(srv.Close)
+	client, err := New(Config{URL: srv.URL, AllowInsecure: true})
+	require.NoError(t, err)
+
+	_, _, err = client.GetCLIAccounts(t.Context())
+	require.ErrorContains(t, err, "exceeds 64 KiB")
+}
+
+type boundaryErrorReader struct {
+	*strings.Reader
+
+	eofWithData bool
+}
+
+func (r *boundaryErrorReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if r.eofWithData && r.Len() == 0 {
+		err = io.EOF
+	}
+	return n, err
+}
+
+func (r *boundaryErrorReader) Close() error { return nil }

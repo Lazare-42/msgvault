@@ -4,6 +4,7 @@
 package sourceops
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strconv"
@@ -21,12 +22,21 @@ type Store interface {
 	GetSourcesByTypeAndAccount(sourceType, account string) ([]*store.Source, error)
 }
 
+// ContextStore is implemented by request-aware source catalogs. Resolvers
+// keep the legacy Store interface for callers outside request paths, while
+// context-aware callers can cancel catalog reads when the request ends.
+type ContextStore interface {
+	GetSourceByIDContext(ctx context.Context, sourceID int64) (*store.Source, error)
+	GetSourcesByIdentifierOrDisplayNameContext(ctx context.Context, identifier string) ([]*store.Source, error)
+	GetSourcesByTypeAndAccountContext(ctx context.Context, sourceType, account string) ([]*store.Source, error)
+}
+
 // Selector identifies a source either by its exact database ID or by a
 // user-facing account token. SourceType is a compatibility filter for callers
 // that already expose one; it never makes a non-unique token exact.
 type Selector struct {
 	Account     string `json:"account,omitempty"`
-	SourceID    int64  `json:"source_id,omitempty"`
+	SourceID    int64  `json:"source_id,omitzero"`
 	SourceIDSet bool   `json:"-"`
 	SourceType  string `json:"-"`
 }
@@ -41,12 +51,18 @@ type Selection struct {
 
 // ResolveExactOne resolves exactly one source and rejects ambiguous tokens.
 func ResolveExactOne(st Store, selector Selector) (*store.Source, error) {
-	input, source, err := resolveSelector(st, selector)
+	return ResolveExactOneContext(context.Background(), st, selector)
+}
+
+// ResolveExactOneContext resolves one source using context-aware catalog reads
+// when the supplied store provides them.
+func ResolveExactOneContext(ctx context.Context, st Store, selector Selector) (*store.Source, error) {
+	input, source, err := resolveSelectorContext(ctx, st, selector)
 	if err != nil || source != nil {
 		return source, err
 	}
 
-	sources, err := lookupToken(st, input, selector.SourceType)
+	sources, err := lookupTokenContext(ctx, st, input, selector.SourceType)
 	if err != nil {
 		return nil, err
 	}
@@ -63,7 +79,13 @@ func ResolveExactOne(st Store, selector Selector) (*store.Source, error) {
 // ResolveAccountFamily resolves one primary account source and its related
 // Google Calendar sources. An explicit source ID always remains exact.
 func ResolveAccountFamily(st Store, selector Selector) (Selection, error) {
-	input, source, err := resolveSelector(st, selector)
+	return ResolveAccountFamilyContext(context.Background(), st, selector)
+}
+
+// ResolveAccountFamilyContext resolves an account family using context-aware
+// catalog reads when the supplied store provides them.
+func ResolveAccountFamilyContext(ctx context.Context, st Store, selector Selector) (Selection, error) {
+	input, source, err := resolveSelectorContext(ctx, st, selector)
 	if err != nil {
 		return Selection{}, err
 	}
@@ -71,7 +93,7 @@ func ResolveAccountFamily(st Store, selector Selector) (Selection, error) {
 		return Selection{Input: strconv.FormatInt(source.ID, 10), Primary: source, Sources: []*store.Source{source}}, nil
 	}
 
-	direct, err := lookupToken(st, input, selector.SourceType)
+	direct, err := lookupTokenContext(ctx, st, input, selector.SourceType)
 	if err != nil {
 		return Selection{}, err
 	}
@@ -87,7 +109,12 @@ func ResolveAccountFamily(st Store, selector Selector) (Selection, error) {
 			calendarAccount = primary.Identifier
 		}
 	}
-	calendars, err := st.GetSourcesByTypeAndAccount(gcal.SourceType, calendarAccount)
+	var calendars []*store.Source
+	if contextStore, ok := st.(ContextStore); ok {
+		calendars, err = contextStore.GetSourcesByTypeAndAccountContext(ctx, gcal.SourceType, calendarAccount)
+	} else {
+		calendars, err = st.GetSourcesByTypeAndAccount(gcal.SourceType, calendarAccount)
+	}
 	if err != nil {
 		return Selection{}, opserr.Internal(fmt.Errorf("resolve calendar sources: %w", err))
 	}
@@ -114,7 +141,7 @@ func ResolveAccountFamily(st Store, selector Selector) (Selection, error) {
 // ResolveAllMatches resolves every source matching an account token. An
 // explicit source ID always remains exact.
 func ResolveAllMatches(st Store, selector Selector) (Selection, error) {
-	input, source, err := resolveSelector(st, selector)
+	input, source, err := resolveSelectorContext(context.Background(), st, selector)
 	if err != nil {
 		return Selection{}, err
 	}
@@ -122,7 +149,7 @@ func ResolveAllMatches(st Store, selector Selector) (Selection, error) {
 		return Selection{Input: strconv.FormatInt(source.ID, 10), Primary: source, Sources: []*store.Source{source}}, nil
 	}
 
-	sources, err := lookupToken(st, input, selector.SourceType)
+	sources, err := lookupTokenContext(context.Background(), st, input, selector.SourceType)
 	if err != nil {
 		return Selection{}, err
 	}
@@ -133,7 +160,7 @@ func ResolveAllMatches(st Store, selector Selector) (Selection, error) {
 	return Selection{Input: input, Primary: primary, Sources: sources}, nil
 }
 
-func resolveSelector(st Store, selector Selector) (string, *store.Source, error) {
+func resolveSelectorContext(ctx context.Context, st Store, selector Selector) (string, *store.Source, error) {
 	input := strings.TrimSpace(selector.Account)
 	sourceType := strings.TrimSpace(selector.SourceType)
 	idSet := selector.SourceIDSet || selector.SourceID != 0
@@ -145,7 +172,7 @@ func resolveSelector(st Store, selector Selector) (string, *store.Source, error)
 	case idSet && sourceType != "":
 		return "", nil, opserr.Invalid(errors.New("source type and source ID are mutually exclusive"))
 	case idSet:
-		source, err := st.GetSourceByID(selector.SourceID)
+		source, err := getSourceByID(ctx, st, selector.SourceID)
 		if errors.Is(err, store.ErrSourceNotFound) {
 			return "", nil, opserr.NotFound(err)
 		}
@@ -160,8 +187,8 @@ func resolveSelector(st Store, selector Selector) (string, *store.Source, error)
 	}
 }
 
-func lookupToken(st Store, input, sourceType string) ([]*store.Source, error) {
-	sources, err := st.GetSourcesByIdentifierOrDisplayName(input)
+func lookupTokenContext(ctx context.Context, st Store, input, sourceType string) ([]*store.Source, error) {
+	sources, err := getSourcesByIdentifierOrDisplayName(ctx, st, input)
 	if err != nil {
 		return nil, opserr.Internal(fmt.Errorf("resolve source token: %w", err))
 	}
@@ -175,6 +202,20 @@ func lookupToken(st Store, input, sourceType string) ([]*store.Source, error) {
 		}
 	}
 	return uniqueSources(filtered), nil
+}
+
+func getSourceByID(ctx context.Context, st Store, sourceID int64) (*store.Source, error) {
+	if contextStore, ok := st.(ContextStore); ok {
+		return contextStore.GetSourceByIDContext(ctx, sourceID)
+	}
+	return st.GetSourceByID(sourceID)
+}
+
+func getSourcesByIdentifierOrDisplayName(ctx context.Context, st Store, identifier string) ([]*store.Source, error) {
+	if contextStore, ok := st.(ContextStore); ok {
+		return contextStore.GetSourcesByIdentifierOrDisplayNameContext(ctx, identifier)
+	}
+	return st.GetSourcesByIdentifierOrDisplayName(identifier)
 }
 
 func uniqueSources(sources []*store.Source) []*store.Source {

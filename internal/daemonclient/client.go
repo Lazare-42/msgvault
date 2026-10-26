@@ -33,6 +33,7 @@ const (
 type Config struct {
 	URL              string
 	APIKey           string
+	AgentToken       string
 	LocalDaemonToken string
 	AllowInsecure    bool
 	Timeout          time.Duration
@@ -45,6 +46,7 @@ type Config struct {
 type Client struct {
 	baseURL          string
 	apiKey           string
+	agentToken       string
 	httpClient       *http.Client
 	typedClient      *apiclient.Client
 	busyNotify       func(message string)
@@ -73,30 +75,26 @@ type operationBusyWaiter struct {
 	lastNotify time.Time
 }
 
-// wait reports whether err is a gate-busy rejection worth retrying, pausing
-// one retry delay before the next attempt.
-func (w *operationBusyWaiter) wait(ctx context.Context, err error) bool {
+// notify reports the current gate owner without repeating frequent notices.
+func (w *operationBusyWaiter) notify(err error, _ time.Duration) {
 	var busy *OperationInProgressError
 	if !errors.As(err, &busy) {
-		return false
+		return
 	}
 	if w.c.busyNotify != nil &&
 		(w.lastNotify.IsZero() || time.Since(w.lastNotify) >= operationBusyNotifyEvery) {
 		w.c.busyNotify(busy.Message)
 		w.lastNotify = time.Now()
 	}
-	select {
-	case <-ctx.Done():
-		return false
-	case <-time.After(operationBusyRetryDelay):
-	}
-	return true
 }
 
 // New creates a daemon HTTP client.
 func New(cfg Config) (*Client, error) {
 	if cfg.URL == "" {
 		return nil, errors.New("daemon URL is required")
+	}
+	if cfg.APIKey != "" && cfg.AgentToken != "" {
+		return nil, errors.New("APIKey and AgentToken are mutually exclusive")
 	}
 
 	parsedURL, err := url.Parse(cfg.URL)
@@ -105,6 +103,12 @@ func New(cfg Config) (*Client, error) {
 	}
 
 	if parsedURL.Scheme == "http" && !cfg.AllowInsecure {
+		if cfg.AgentToken != "" {
+			return nil, errors.New("HTTPS required for agent token connections\n\n" +
+				"Options:\n" +
+				"  1. Use HTTPS for the daemon URL\n" +
+				"  2. Pass --agent-allow-insecure to override (trusted networks only)")
+		}
 		return nil, errors.New("HTTPS required for daemon connections\n\n" +
 			"Options:\n" +
 			"  1. Use HTTPS for configured remote servers\n" +
@@ -137,9 +141,18 @@ func New(cfg Config) (*Client, error) {
 	}
 	httpClient.Timeout = timeout
 
+	// Delegated callers must not follow redirects: a redirect to a login page
+	// would silently drop the agent token header, making the error opaque.
+	if cfg.AgentToken != "" {
+		httpClient.CheckRedirect = func(_ *http.Request, _ []*http.Request) error {
+			return errors.New("agent token client does not follow redirects")
+		}
+	}
+
 	c := &Client{
 		baseURL:          strings.TrimSuffix(cfg.URL, "/"),
 		apiKey:           cfg.APIKey,
+		agentToken:       cfg.AgentToken,
 		httpClient:       httpClient,
 		rootContext:      rootContext,
 		requestMode:      cfg.RequestMode,
@@ -190,7 +203,7 @@ func (c *Client) GeneratedClient() (*apiclient.Client, error) {
 			client:      c.httpClient,
 			rootContext: c.requestContext(),
 		}),
-		runtime.WithRequestEditorFn(requestEditor(c.apiKey, c.requestMode, c.localDaemonToken)),
+		runtime.WithRequestEditorFn(requestEditor(c.apiKey, c.agentToken, c.requestMode, c.localDaemonToken)),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("create generated API client: %w", err)
@@ -207,7 +220,7 @@ func (c *Client) DoGeneratedRequestWithContext(
 	path string,
 	options runtime.RequestOptions,
 ) (*http.Response, error) {
-	return c.doGeneratedRequestWithHTTPClient(ctx, method, path, options, c.httpClient)
+	return c.doGeneratedRequestWithHTTPClient(ctx, method, path, options, c.httpClient, maxErrorBodyBytes)
 }
 
 // DoGeneratedStreamingRequestWithContext is like DoGeneratedRequestWithContext
@@ -219,7 +232,7 @@ func (c *Client) DoGeneratedStreamingRequestWithContext(
 	path string,
 	options runtime.RequestOptions,
 ) (*http.Response, error) {
-	return c.doGeneratedRequestWithHTTPClient(ctx, method, path, options, httpClientWithoutTimeout(c.httpClient))
+	return c.doGeneratedRequestWithHTTPClient(ctx, method, path, options, httpClientWithoutTimeout(c.httpClient), maxErrorBodyBytes)
 }
 
 func (c *Client) doGeneratedRequestWithHTTPClient(
@@ -228,6 +241,7 @@ func (c *Client) doGeneratedRequestWithHTTPClient(
 	path string,
 	options runtime.RequestOptions,
 	httpClient *http.Client,
+	errorBodyLimit int64,
 ) (*http.Response, error) {
 	client, err := c.GeneratedClient()
 	if err != nil {
@@ -250,7 +264,7 @@ func (c *Client) doGeneratedRequestWithHTTPClient(
 	if httpClient == nil {
 		httpClient = http.DefaultClient
 	}
-	resp, err := doRequestWithRootContext(c.requestContext(), httpClient, req)
+	resp, err := doRequestWithRootContext(c.requestContext(), httpClient, req, errorBodyLimit)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
 	}
@@ -279,13 +293,14 @@ func (d httpDoer) Do(ctx context.Context, req *http.Request) (*http.Response, er
 	if ctx != nil {
 		req = req.WithContext(ctx)
 	}
-	return doRequestWithRootContext(d.rootContext, client, req)
+	return doRequestWithRootContext(d.rootContext, client, req, maxErrorBodyBytes)
 }
 
 func doRequestWithRootContext(
 	rootContext context.Context,
 	client *http.Client,
 	req *http.Request,
+	errorBodyLimit int64,
 ) (*http.Response, error) {
 	requestContext := req.Context()
 	switch {
@@ -313,12 +328,48 @@ func doRequestWithRootContext(
 			stopRootCancellation: stopRootCancellation,
 			cancel:               cancel,
 		}
-		return resp, nil
+		return boundErrorBody(resp, errorBodyLimit), nil
 	}
 
 	// #nosec G704 -- daemonclient intentionally sends requests to the
 	// caller-resolved msgvault daemon URL after New validates the scheme.
-	return client.Do(req)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	return boundErrorBody(resp, errorBodyLimit), nil
+}
+
+const maxErrorBodyBytes = 64 << 10
+
+// boundErrorBody caps how much of an error response any caller can buffer.
+func boundErrorBody(resp *http.Response, limit int64) *http.Response {
+	if resp.StatusCode >= http.StatusBadRequest {
+		resp.Body = &boundedErrorBody{ReadCloser: resp.Body, remaining: limit + 1, limit: limit}
+	}
+	return resp
+}
+
+type boundedErrorBody struct {
+	io.ReadCloser
+
+	remaining int64
+	limit     int64
+}
+
+func (b *boundedErrorBody) Read(p []byte) (int, error) {
+	if b.remaining <= 0 {
+		return 0, fmt.Errorf("error response exceeds %d KiB", b.limit>>10)
+	}
+	if int64(len(p)) > b.remaining {
+		p = p[:b.remaining]
+	}
+	n, err := b.ReadCloser.Read(p)
+	b.remaining -= int64(n)
+	if b.remaining <= 0 {
+		return n, fmt.Errorf("error response exceeds %d KiB", b.limit>>10)
+	}
+	return n, err
 }
 
 type cancelOnCloseBody struct {
@@ -337,9 +388,13 @@ func (b *cancelOnCloseBody) Close() error {
 
 type grantDecisionContextKey struct{}
 
-func requestEditor(apiKey string, mode RequestMode, localDaemonToken string) apiclient.RequestEditorFn {
+func requestEditor(apiKey, agentToken string, mode RequestMode, localDaemonToken string) apiclient.RequestEditorFn {
 	return func(ctx context.Context, req *http.Request) error {
-		if apiKey != "" {
+		if agentToken != "" {
+			// #nosec G101 -- this is a header value set from the configured agent
+			// token, not a hardcoded credential.
+			req.Header.Set(apiprotocol.AgentTokenHeader, agentToken)
+		} else if apiKey != "" {
 			req.Header.Set("X-Api-Key", apiKey)
 		}
 		if mode == RequestModeCLI {

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"path/filepath"
 
 	"github.com/spf13/cobra"
@@ -197,15 +198,14 @@ func openMergeTargetStore(intoCfg *config.Config, apply bool) (*store.Store, fun
 
 	lock, err := tryAcquireWriteOwnerLock(intoCfg.Data.DataDir)
 	if err != nil {
-		var heldErr writeOwnerLockHeldError
-		if errors.As(err, &heldErr) {
+		if _, ok := errors.AsType[writeOwnerLockHeldError](err); ok {
 			return nil, nil, archiveOwnedError(intoCfg.Data.DataDir)
 		}
 		return nil, nil, fmt.Errorf("acquire --into write lock: %w", err)
 	}
 	release := func() {
 		if cerr := lock.Close(); cerr != nil {
-			logger.Warn("release --into write-owner lock", "error", cerr)
+			slog.Warn("release --into write-owner lock", "error", cerr)
 		}
 	}
 
@@ -220,7 +220,7 @@ func openMergeTargetStore(intoCfg *config.Config, apply bool) (*store.Store, fun
 		return nil, nil, fmt.Errorf("init --into schema: %w", err)
 	}
 	if _, err := st.RunStartupMigrations(intoCfg.Identity.Addresses); err != nil {
-		logger.Warn("--into startup migration failed", "error", err)
+		slog.Warn("--into startup migration failed", "error", err)
 	}
 	return st, release, nil
 }

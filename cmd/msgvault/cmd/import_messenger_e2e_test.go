@@ -12,10 +12,17 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
 func saveMessengerState(t *testing.T) func() {
 	t.Helper()
+	cfg := testConfigValue()
+	cfgFile := ""
+	homeDir := ""
+	logger := testLoggerValue()
+	verbose := false
+
 	prevCfg := cfg
 	prevLogger := logger
 	prevMe := importMessengerMe
@@ -120,11 +127,9 @@ func TestImportMessengerRunsPostSourceMigrationWithoutMessengerIdentity(t *testi
 	t.Cleanup(saveMessengerState(t))
 	testCfg := lifecycleTestConfig(tmp)
 	testCfg.Identity.Addresses = []string{"legacy@example.com"}
-	withStoreResolverConfig(t, testCfg)
+	testCtx := withStoreResolverConfig(t, testCfg)
 
-	st, err := store.Open(testCfg.DatabaseDSN())
-	require.NoError(err, "open seed store")
-	require.NoError(st.InitSchema(), "init seed schema")
+	st := testutil.NewSQLiteTestStoreAt(t, testCfg.DatabaseDSN())
 	emailSource, err := st.GetOrCreateSource("gmail", "mailbox@example.com")
 	require.NoError(err, "create eligible email source")
 	require.NoError(st.Close(), "close seed store")
@@ -137,7 +142,8 @@ func TestImportMessengerRunsPostSourceMigrationWithoutMessengerIdentity(t *testi
 
 	var stdout bytes.Buffer
 	cmd := &cobra.Command{Use: "import-messenger"}
-	cmd.SetContext(context.Background())
+	cmd.SetContext(testCtx)
+	cmd.SetContext(testCtx)
 	cmd.SetOut(&stdout)
 	cmd.SetErr(io.Discard)
 

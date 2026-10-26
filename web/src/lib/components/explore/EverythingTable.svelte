@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Button, Checkbox, EmptyState, virtualSlice } from '@kenn-io/kit-ui';
+  import { Button, EmptyState, Tooltip, virtualSlice } from '@kenn-io/kit-ui';
   import { onDestroy, onMount, tick, untrack } from 'svelte';
 
   import type {
@@ -8,9 +8,12 @@
     ExploreColumn,
     ExploreScrollAnchor
   } from '../../explore/models';
+  import { EXPLORE_COLUMNS } from '../../explore/labels';
   import { DEFAULT_EXPLORE_COLUMNS, isEmailMessageType } from '../../explore/models';
   import type { ExploreSelectionState } from '../../explore/state.svelte';
   import { rebaseVirtualScroll, RowGeometry, tableViewportHeight } from '../../theme/preferences.svelte';
+  import { formatBytes, formatShortDate as formatTime } from '../../util/format';
+  import SelectionCheckbox from '../common/SelectionCheckbox.svelte';
   import IdentityBadge from './IdentityBadge.svelte';
   import RowKind from './RowKind.svelte';
 
@@ -32,7 +35,6 @@
     scrollAnchor?: ExploreScrollAnchor | null;
     restoring?: boolean;
     onOpen?: (row: EntryRow) => void;
-    onColumnsChange?: (columns: ExploreColumn[]) => void;
     onScrollAnchor?: (key: string, offset: number) => void;
     onLoadMore?: () => Promise<unknown>;
     onLoadThroughEnd?: () => Promise<void>;
@@ -59,7 +61,6 @@
     scrollAnchor = null,
     restoring = false,
     onOpen = undefined,
-    onColumnsChange = undefined,
     onScrollAnchor = undefined,
     onLoadMore = undefined,
     onLoadThroughEnd = undefined,
@@ -71,22 +72,13 @@
   const geometry = new RowGeometry();
   const rowHeight = $derived(geometry.height);
   const OVERSCAN = 6;
-  const ALL_COLUMNS: Array<{ id: ExploreColumn; label: string }> = [
-    { id: 'kind', label: 'Kind' },
-    { id: 'people', label: 'People / source' },
-    { id: 'title', label: 'Subject / title' },
-    { id: 'excerpt', label: 'Excerpt' },
-    { id: 'time', label: 'Time' },
-    { id: 'attachments', label: 'Attachments' },
-    { id: 'size', label: 'Size' }
-  ];
 
   let gridElement = $state<HTMLDivElement>();
   let headerElement = $state<HTMLDivElement>();
   let scrollTop = $state(0);
   let viewport = $state(360);
   let activeKey = $state<string | null>(untrack(() => focusedKey ?? rows[0]?.key ?? null));
-  let visibleColumns = $state<ExploreColumn[]>(untrack(() => [...providedColumns]));
+  const visibleColumns = $derived(providedColumns);
   let restoredAnchor = '';
   let previousRowCount = untrack(() => rows.length);
   let suppressedScrollTop: number | undefined;
@@ -113,10 +105,6 @@
     requestAnimationFrame(() => applyDensityRebase(
       element, nextHeight, expectedScrollHeight, rebased, preservedKey
     ));
-  });
-
-  $effect(() => {
-    visibleColumns = [...providedColumns];
   });
 
   $effect(() => {
@@ -195,9 +183,18 @@
   });
   const activeIndex = $derived(activeKey ? rows.findIndex((row) => row.key === activeKey) : -1);
   const activeRow = $derived(activeIndex >= 0 ? rows[activeIndex] : undefined);
+  const orderedKeys = $derived(rows.map((row) => row.key));
+  const allLoadedSelected = $derived(
+    orderedKeys.length > 0 && orderedKeys.every((key) => selection.isSelected(key))
+  );
+  const someLoadedSelected = $derived(
+    orderedKeys.some((key) => selection.isSelected(key))
+  );
+  const selectionMode = $derived(selection.mode === 'all_matching' || selection.count > 0);
   const template = $derived(
-    visibleColumns
-      .map((column) => {
+    [
+      '32px',
+      ...visibleColumns.map((column) => {
         const configured = columnWidths[column];
         if (configured !== undefined) return `${configured}px`;
         if (column === 'kind') return 'minmax(86px, 0.7fr)';
@@ -208,7 +205,7 @@
         if (column === 'attachments') return '42px';
         return '76px';
       })
-      .join(' ')
+    ].join(' ')
   );
 
   onMount(() => {
@@ -243,21 +240,6 @@
     return labels.length > 0 ? labels.join(', ') : row.source_identifier;
   }
 
-  function formatTime(value: string): string {
-    const date = new Date(value);
-    if (Number.isNaN(date.valueOf())) return value;
-    return new Intl.DateTimeFormat(undefined, {
-      month: 'short',
-      day: 'numeric',
-      year: date.getFullYear() === new Date().getFullYear() ? undefined : 'numeric'
-    }).format(date);
-  }
-
-  function formatBytes(value: number): string {
-    if (value < 1024) return `${value} B`;
-    if (value < 1024 * 1024) return `${Math.round(value / 1024)} KB`;
-    return `${(value / (1024 * 1024)).toFixed(1)} MB`;
-  }
 
   function scrollActiveIntoView(index: number): void {
     const height = rowHeight;
@@ -410,33 +392,13 @@
     if (!restoring && hasMore && !loadingMore && slice.end >= rows.length - OVERSCAN) void onLoadMore?.();
   }
 
-  function toggleColumn(column: ExploreColumn): void {
-    const next = visibleColumns.includes(column)
-      ? visibleColumns.filter((item) => item !== column)
-      : ALL_COLUMNS.map(({ id }) => id).filter(
-          (id) => visibleColumns.includes(id) || id === column
-        );
-    visibleColumns = next.length > 0 ? next : ['title'];
-    onColumnsChange?.([...visibleColumns]);
+  function toggleLoadedSelection(): void {
+    if (allLoadedSelected) selection.clear();
+    else selection.selectVisible(orderedKeys);
   }
 </script>
 
 <section class="everything-table" aria-label="Everything table">
-  <div class="table-tools">
-    <details>
-      <summary>Columns</summary>
-      <div class="column-picker kit-popover-card">
-        {#each ALL_COLUMNS as column (column.id)}
-          <Checkbox
-            checked={visibleColumns.includes(column.id)}
-            label={column.label === 'Size' ? 'Size' : column.label}
-            onchange={() => toggleColumn(column.id)}
-          />
-        {/each}
-      </div>
-    </details>
-  </div>
-
   <div
     class="table-grid"
     bind:this={gridElement}
@@ -444,21 +406,31 @@
     data-scroll
     aria-label="Everything results"
     aria-rowcount={accessibilityRowCount}
-    aria-colcount={visibleColumns.length}
+    aria-colcount={visibleColumns.length + 1}
     aria-busy={loading || loadingMore}
     aria-activedescendant={activeRow ? rowId(activeRow) : undefined}
+    class:selection-mode={selectionMode}
     tabindex="0"
     onkeydown={handleKeydown}
     onscroll={handleScroll}
   >
     <div class="table-header" bind:this={headerElement} role="row" style:grid-template-columns={template}>
+      <span role="columnheader" class="selection-header">
+        <SelectionCheckbox
+          checked={allLoadedSelected}
+          mixed={!allLoadedSelected && someLoadedSelected}
+          label={allLoadedSelected ? 'Unselect all loaded items' : 'Select all loaded items'}
+          inGrid
+          onToggle={toggleLoadedSelection}
+        />
+      </span>
       {#each visibleColumns as column (column)}
         <span
           role="columnheader"
           class={`header-cell header-cell--${column}`}
           aria-label={column === 'attachments' ? 'Attachments' : undefined}
         >
-          {column === 'attachments' ? '⌕' : ALL_COLUMNS.find((entry) => entry.id === column)?.label}
+          {column === 'attachments' ? '⌕' : EXPLORE_COLUMNS.find((entry) => entry.id === column)?.label}
         </span>
       {/each}
     </div>
@@ -467,7 +439,7 @@
       role="rowgroup"
     >
       {#if unavailable}
-        <div role="row"><div role="gridcell" aria-colspan={visibleColumns.length}><div class="cache-unavailable" role="alert">
+        <div role="row"><div role="gridcell" aria-colspan={visibleColumns.length + 1}><div class="cache-unavailable" role="alert">
             <strong>{unavailable.readiness === 'building' ? 'Preparing analytical cache' : 'Analytical cache unavailable'}</strong>
             <span>{unavailable.message}</span>
             {#if unavailable.readiness === 'building'}
@@ -480,7 +452,7 @@
         </div>
         </div>
       {:else if error}
-        <div role="row"><div role="gridcell" aria-colspan={visibleColumns.length}><div class="request-error" role="alert">
+        <div role="row"><div role="gridcell" aria-colspan={visibleColumns.length + 1}><div class="request-error" role="alert">
             <span>{error}</span>
             <Button
               label={restoring ? 'Retry restoration' : 'Retry request'}
@@ -500,6 +472,7 @@
               role="row"
               style:grid-template-columns={template}
             >
+              <span class="skeleton-cell selection-cell" role="gridcell"><i></i></span>
               {#each visibleColumns as column (column)}
                 <span class="skeleton-cell" role="gridcell"><i></i></span>
               {/each}
@@ -507,18 +480,18 @@
           {/each}
         </div>
       {:else if rows.length === 0}
-        <div role="row"><div class="empty" role="gridcell" aria-colspan={visibleColumns.length}>
+        <div role="row"><div class="empty" role="gridcell" aria-colspan={visibleColumns.length + 1}>
           <EmptyState title="No items match this view" description="Adjust the search or clear filters to widen the view." />
         </div></div>
       {:else if !slice || rowHeight === undefined}
-        <div role="row"><div role="gridcell" aria-colspan={visibleColumns.length}><p class="empty" role="status">Preparing table layout…</p></div></div>
+        <div role="row"><div role="gridcell" aria-colspan={visibleColumns.length + 1}><p class="empty" role="status">Preparing table layout…</p></div></div>
       {:else}
         <div class="virtual-spacer" style:height={`${slice.totalHeight}px`}>
-          <div class="virtual-window" style:transform={`translateY(${slice.topPad}px)`}>
+          <div class="virtual-window" style:top={`${slice.topPad}px`}>
             {#each renderedRows as row, offset (row.key)}
               {@const index = slice.start + offset}
-              <!-- svelte-ignore a11y_click_events_have_key_events -- Enter on
-                   the focused grid opens the same row via handleKeydown. -->
+              <!-- svelte-ignore a11y_click_events_have_key_events, a11y_interactive_supports_focus --
+                   The grid owns focus and opens its active row with Enter. -->
               <div
                 class="data-row"
                 class:data-row--active={index === activeIndex}
@@ -527,7 +500,6 @@
                 id={rowId(row)}
                 data-row-key={row.key}
                 role="row"
-                tabindex="-1"
                 aria-rowindex={index + 2}
                 aria-selected={selection.isSelected(row.key)}
                 aria-current={inspectedKey === row.key ? 'true' : undefined}
@@ -539,15 +511,25 @@
                 }}
                 onclick={() => onOpen?.(row)}
               >
+                <span class="selection-cell" role="gridcell">
+                  <SelectionCheckbox
+                    checked={selection.isSelected(row.key)}
+                    label={`${selection.isSelected(row.key) ? 'Unselect' : 'Select'} ${row.title || 'item'}`}
+                    inGrid
+                    onToggle={(range) => {
+                      activeKey = row.key;
+                      onActiveKey?.(row.key);
+                      selection.toggle(row.key, index, orderedKeys, range);
+                    }}
+                  />
+                </span>
                 {#each visibleColumns as column (column)}
                   <span class={`cell cell--${column}`} role="gridcell">
                     {#if column === 'kind'}
-                      {#if selection.isSelected(row.key)}
-                        <span class="selection-marker" aria-hidden="true">✓</span>
-                      {/if}
                       <RowKind kind={row.kind} messageType={row.message_type} />
                     {:else if column === 'people'}
-                      {people(row)}
+                      {@const label = people(row)}
+                      <Tooltip text={label}><span class="people-label" title={label}>{label}</span></Tooltip>
                       {#if isEmailMessageType(row.message_type)}
                         <IdentityBadge
                           senderIdentities={row.matched_sender_identities}
@@ -584,7 +566,7 @@
              cursor survived (a transient failure), offer a quiet retry that
              re-attempts the same page; a terminal failure dropped the
              cursor, so the only recovery is reloading the view. -->
-        <div role="row"><div role="gridcell" aria-colspan={visibleColumns.length}>
+        <div role="row"><div role="gridcell" aria-colspan={visibleColumns.length + 1}>
           <div class="page-error" role="alert">
             <span>{pageError}</span>
             {#if hasMore}
@@ -596,7 +578,7 @@
         </div></div>
       {/if}
       {#if loadingMore}
-        <div role="row"><div role="gridcell" aria-colspan={visibleColumns.length}>
+        <div role="row"><div role="gridcell" aria-colspan={visibleColumns.length + 1}>
           <div class="page-progress" role="status">Loading more… {rows.length.toLocaleString()} loaded</div>
         </div></div>
       {/if}
@@ -605,6 +587,7 @@
 </section>
 
 <style>
+  .cell--people :global(.kit-tooltip) { white-space: normal; overflow-wrap: anywhere; }
   .everything-table {
     display: flex;
     min-height: 0;
@@ -615,44 +598,6 @@
     border-radius: var(--radius-md);
     background: var(--bg-surface);
     box-shadow: var(--shadow-sm);
-  }
-
-  .table-tools {
-    display: flex;
-    min-height: 30px;
-    align-items: center;
-    justify-content: flex-end;
-    padding: 0 var(--space-4);
-    border-bottom: 1px solid var(--border-muted);
-    background: var(--bg-subtle);
-  }
-
-  details {
-    position: relative;
-    color: var(--text-secondary);
-    font-size: var(--font-size-xs);
-  }
-
-  summary {
-    cursor: pointer;
-  }
-
-  .column-picker {
-    position: absolute;
-    z-index: var(--z-popover);
-    top: 24px;
-    right: 0;
-    display: grid;
-    width: 176px;
-    gap: var(--space-3);
-    padding: var(--space-4);
-  }
-
-  .column-picker :global(.kit-checkbox) {
-    display: flex;
-    align-items: center;
-    gap: var(--space-3);
-    white-space: nowrap;
   }
 
   .table-header,
@@ -675,7 +620,7 @@
     outline: none;
   }
 
-  /* Column headers speak the small-caps label voice; the sheen under the
+  /* Column headers use the small sentence-case label voice; the sheen under the
    * header hairline gives the sticky edge its machined depth. */
   .table-header {
     position: sticky;
@@ -689,8 +634,6 @@
     color: var(--text-muted);
     font-size: var(--font-size-2xs);
     font-weight: 600;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
   }
 
   .header-cell--time,
@@ -705,6 +648,26 @@
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  .selection-header,
+  .selection-cell {
+    display: grid;
+    min-width: 0;
+    place-items: center;
+  }
+
+  .selection-cell :global(.selection-checkbox) {
+    opacity: 0;
+    transform: scale(0.9);
+    transition: opacity 80ms ease-out, transform 80ms ease-out;
+  }
+
+  .data-row:hover .selection-cell :global(.selection-checkbox),
+  .data-row:focus-within .selection-cell :global(.selection-checkbox),
+  .table-grid.selection-mode .selection-cell :global(.selection-checkbox) {
+    opacity: 1;
+    transform: scale(1);
   }
 
   .table-body {
@@ -754,9 +717,12 @@
   }
 
   .data-row--selected {
-    background: color-mix(in srgb, var(--accent-teal) 12%, var(--bg-surface));
+    background: var(--selected-bg);
     box-shadow: inset 2px 0 0 var(--accent-blue), inset 0 0 0 1px var(--selected-border);
   }
+
+  .cell--people :global(.kit-tooltip-trigger) { max-width: 100%; }
+  .people-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
   /* Tabular data columns sit on the right edge, mono-aligned. */
   .cell--time,
@@ -794,12 +760,6 @@
 
   .attachment {
     color: var(--artifact-ink);
-  }
-
-  .selection-marker {
-    margin-right: var(--space-2);
-    color: var(--active-ink);
-    font-weight: 800;
   }
 
   .empty {

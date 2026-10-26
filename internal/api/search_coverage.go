@@ -41,7 +41,7 @@ type SearchCoverageResponse struct {
 	EligibleCount     int64                  `json:"eligible_count"`
 	EmbeddedCount     int64                  `json:"embedded_count"`
 	Percentage        float64                `json:"percentage"`
-	VectorGeneration  *int64                 `json:"vector_generation,omitempty"`
+	VectorGeneration  *int64                 `json:"vector_generation,omitzero" nullable:"false"`
 	VectorFingerprint string                 `json:"vector_fingerprint,omitempty"`
 	CacheRevision     string                 `json:"cache_revision"`
 	Status            SearchCoverageStatus   `json:"status" enum:"disabled,initializing,stale,incomplete,unavailable,ready"`
@@ -145,7 +145,7 @@ func (s *Server) handleSearchCoverage(w http.ResponseWriter, r *http.Request) {
 		s.writeExploreError(r.Context(), w, err)
 		return
 	}
-	currentStatus, _, current, _ := resolveSearchCoverageGeneration(
+	currentStatus, _, current, _ := s.resolveSearchCoverageGeneration(
 		r.Context(), backend, cfg, coverage.resolvedStatus, coverage.detail,
 	)
 	if !sameCoverageGeneration(coverage.resolvedStatus, *generation, currentStatus, current) {
@@ -189,7 +189,7 @@ func (s *Server) resolveSearchCoverageState(
 	backendStatus := coverageStatusForVectorStatus(status)
 	state := searchCoverageState{status: backendStatus, detail: detail, resolvedStatus: backendStatus}
 	if backend != nil && backendStatus != SearchCoverageDisabled && backendStatus != SearchCoverageUnavailable {
-		state.status, state.detail, state.generation, state.fullBuildAvailable = resolveSearchCoverageGeneration(
+		state.status, state.detail, state.generation, state.fullBuildAvailable = s.resolveSearchCoverageGeneration(
 			ctx, backend, cfg, backendStatus, detail,
 		)
 		state.resolvedStatus = state.status
@@ -255,11 +255,11 @@ func searchCoverageContextHash(ctx query.Context) string {
 	}
 	return hashCanonicalValue(struct {
 		Context  query.Context `json:"context"`
-		Identity *identityKey  `json:"identity,omitempty"`
+		Identity *identityKey  `json:"identity,omitzero" nullable:"false"`
 	}{Context: ctx, Identity: identity}, false)
 }
 
-func resolveSearchCoverageGeneration(
+func (s *Server) resolveSearchCoverageGeneration(
 	ctx context.Context,
 	backend vector.Backend,
 	cfg vector.Config,
@@ -282,14 +282,12 @@ func resolveSearchCoverageGeneration(
 	}
 	switch {
 	case errors.Is(err, vector.ErrIndexStale):
-		active, activeErr := backend.ActiveGeneration(ctx)
-		if activeErr != nil {
-			return SearchCoverageUnavailable, "The active vector generation could not be read", nil, false
-		}
+		s.MarkVectorIndexStale(ctx, err)
+		_, detail = s.VectorStatus()
 		building, buildingErr := backend.BuildingGeneration(ctx)
 		fullBuildAvailable := buildingErr == nil && (building == nil ||
 			expectedFingerprint == "" || building.Fingerprint == expectedFingerprint)
-		return SearchCoverageStale, err.Error(), &active, fullBuildAvailable
+		return SearchCoverageStale, detail, &generation, fullBuildAvailable && cachedStaleAdvice(detail) == vectorRebuildAdvice
 	case errors.Is(err, vector.ErrIndexBuilding):
 		building, buildingErr := backend.BuildingGeneration(ctx)
 		if buildingErr != nil || building == nil {

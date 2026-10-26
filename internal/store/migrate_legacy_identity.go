@@ -42,7 +42,7 @@ func (s *Store) MigrateLegacyIdentityConfigContext(
 	ctx context.Context,
 	addresses []string,
 ) (applied, deferred bool, sourceCount, addressCount int, err error) {
-	already, err := s.IsMigrationAppliedContext(ctx, migrationLegacyIdentity)
+	already, err := s.IsMigrationAppliedContext(ctx, migrationLegacyIdentity, 1)
 	if err != nil {
 		return false, false, 0, 0, err
 	}
@@ -71,7 +71,7 @@ func (s *Store) MigrateLegacyIdentityConfigContext(
 	}
 
 	if len(normalized) == 0 {
-		if err := s.MarkMigrationAppliedContext(ctx, migrationLegacyIdentity); err != nil {
+		if err := s.MarkMigrationAppliedContext(ctx, migrationLegacyIdentity, 1); err != nil {
 			return false, false, 0, 0, err
 		}
 		return false, false, 0, 0, nil
@@ -110,7 +110,9 @@ func (s *Store) MigrateLegacyIdentityConfigContext(
 		return false, true, 0, len(normalized), nil
 	}
 
+	pending := make(map[int64][]int64)
 	if err := s.withTxContext(ctx, func(tx *loggedTx) error {
+		clear(pending)
 		// Fast path first, read-only: this migration runs on every store
 		// open, and the marker check must not take any write lock — an
 		// unconditional identity-row write here would add a WAL commit and
@@ -146,56 +148,40 @@ func (s *Store) MigrateLegacyIdentityConfigContext(
 			if !SourceTypeUsesEmailIdentity(src.SourceType) {
 				continue
 			}
-			insertedForSource := false
+			var insertedForSource []string
 			for _, addr := range normalized {
 				// Comparison rule (email-shaped → case-insensitive;
 				// everything else → case-sensitive) is shared with
-				// AddAccountIdentity via identifierMatch — see
-				// identifier_match.go.
-				match := newIdentifierMatch(addr)
-				var existing string
-				qerr := tx.QueryRowContext(ctx,
-					`SELECT source_signal FROM account_identities
-					 WHERE source_id = ? AND `+match.WhereClause("address"),
-					src.ID, match.BindValue(),
-				).Scan(&existing)
-				switch {
-				case errors.Is(qerr, sql.ErrNoRows):
-					_, txErr := tx.ExecContext(ctx,
-						`INSERT INTO account_identities (source_id, address, source_signal)
-						 VALUES (?, ?, ?)`,
-						src.ID, addr, "config_migration",
-					)
-					if txErr != nil {
-						return fmt.Errorf("insert identity (source=%d, addr=%s): %w", src.ID, addr, txErr)
-					}
-					// A brand new (source_id, address) pair changes
-					// owner_participants and the is_from_me derivation for
-					// this source, exactly like AddAccountIdentity's insert
-					// branch — see the matching comment there.
+				// AddAccountIdentity via the row-level merge helper,
+				// which keys on the persisted address_key — see
+				// mergeAccountIdentitySignalsTxWith.
+				inserted, merr := s.mergeAccountIdentitySignalsTx(
+					ctx, tx, src.ID, addr,
+					[]string{"config_migration"}, newIdentifierMatch(addr),
+				)
+				if merr != nil {
+					return fmt.Errorf("merge identity (source=%d, addr=%s): %w", src.ID, addr, merr)
+				}
+				if inserted {
+					// A brand new identity row changes owner_participants
+					// and the is_from_me derivation for this source,
+					// exactly like AddAccountIdentity's insert branch —
+					// see the matching comment there.
 					insertedAny = true
-					insertedForSource = true
-				case qerr != nil:
-					return fmt.Errorf("read existing identity (source=%d, addr=%s): %w", src.ID, addr, qerr)
-				default:
-					merged := mergeSignalSet(existing, "config_migration")
-					if merged != existing {
-						_, uerr := tx.ExecContext(ctx,
-							`UPDATE account_identities
-							 SET source_signal = ?
-							 WHERE source_id = ? AND `+match.WhereClause("address"),
-							merged, src.ID, match.BindValue(),
-						)
-						if uerr != nil {
-							return fmt.Errorf("update identity (source=%d, addr=%s): %w", src.ID, addr, uerr)
-						}
-					}
+					insertedForSource = append(insertedForSource, addr)
 				}
 			}
-			if insertedForSource {
-				if err := refreshSourceMessageAttributionContext(ctx, tx, src.ID, ""); err != nil {
+			if len(insertedForSource) > 0 {
+				if err := refreshSourceMessageAttributionContext(ctx, tx, src.ID); err != nil {
 					return fmt.Errorf("refresh migrated identity attribution (source=%d): %w", src.ID, err)
 				}
+				// A file import migrates after storing its messages, so
+				// their account attribution must change with the identities.
+				ids, err := s.markAccountAttributionPendingForAddressesTx(ctx, tx, src.ID, insertedForSource)
+				if err != nil {
+					return err
+				}
+				pending[src.ID] = ids
 			}
 		}
 
@@ -222,6 +208,9 @@ func (s *Store) MigrateLegacyIdentityConfigContext(
 		return txErr
 	}); err != nil {
 		return false, false, 0, 0, fmt.Errorf("migrate legacy identity config: %w", err)
+	}
+	for sourceID, ids := range pending {
+		s.deriveAccountAttributionAfterCommit(ctx, sourceID, ids)
 	}
 
 	return true, false, eligibleSources, len(normalized), nil
@@ -330,7 +319,7 @@ func (s *Store) legacyIdentityMigrationAppliedTx(ctx context.Context, tx *logged
 
 func SourceTypeUsesEmailIdentity(sourceType string) bool {
 	switch sourceType {
-	case "gmail", "imap", "o365", "mbox", "hey", "apple-mail", "pst":
+	case "gmail", "imap", "o365", "msmail", "mbox", "hey", "apple-mail", "pst", "eml", "maildir":
 		return true
 	}
 	return false

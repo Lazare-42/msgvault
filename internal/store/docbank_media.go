@@ -1,0 +1,1567 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json/v2"
+	"errors"
+	"fmt"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+
+	"go.kenn.io/msgvault/internal/attachmentpolicy"
+	"go.kenn.io/msgvault/internal/personscope"
+)
+
+// beeperMediaLocalGapCodes are source gaps that a daemon restart cannot fix.
+var beeperMediaLocalGapCodes = []any{"source_raw_invalid", "source_part_missing", "source_part_ambiguous",
+	"unsupported_media", "source_transcript_invalid", "source_transcript_too_large", "source_changed",
+	"source_unavailable", "no_live_occurrence"}
+
+// beeperMediaResumedPhase is the step a reopened delivery resumes from.
+const beeperMediaResumedPhase = `CASE WHEN job_id <> '' THEN 'observing'
+	WHEN profile = 'supplied-transcript' AND supplied_input_id = '' THEN 'pending-artifact'
+	ELSE 'pending-process' END`
+
+// beeperMediaLocalGapFilter matches error_code against beeperMediaLocalGapCodes.
+func beeperMediaLocalGapFilter() string {
+	return `error_code IN (?` + strings.Repeat(", ?", len(beeperMediaLocalGapCodes)-1) + `)`
+}
+
+const (
+	BeeperMediaAttachmentConsumerKey = "beeper-media/v1"
+
+	BeeperMediaRetentionPending           = "pending"
+	BeeperMediaRetentionRetained          = "retained"
+	BeeperMediaRetentionBlocked           = "blocked"
+	BeeperMediaRetentionSourceUnavailable = "source_unavailable"
+	BeeperMediaRetentionRevoked           = "revoked"
+
+	BeeperMediaOperationRetain   = "retain"
+	BeeperMediaOperationArtifact = "artifact"
+	BeeperMediaOperationProcess  = "process"
+	BeeperMediaOperationStatus   = "status"
+
+	beeperMediaPhasePendingArtifact = "pending-artifact"
+	beeperMediaPhasePendingProcess  = "pending-process"
+	beeperMediaPhaseObserving       = "observing"
+	beeperMediaPhaseDone            = "done"
+	beeperMediaPhaseBlocked         = "blocked"
+
+	beeperMediaProcessingProfile = "supplied-transcript"
+	beeperMediaRetryDelay        = 5 * time.Minute
+	beeperMediaPollDelay         = time.Minute
+)
+
+const attachmentHashedBytes = `(length(COALESCE(a.content_hash, '')) = 64
+	  AND COALESCE(a.storage_path, '') <> '')`
+
+// Audio processing needs a positive size; the attachment mirror also accepts empty files.
+const attachmentBytesArchived = `(` + attachmentHashedBytes + ` AND COALESCE(a.size, 0) > 0)`
+
+var docbankAliasProviders = []string{sourceTypeSlack, sourceTypeDiscord}
+
+var docbankAliasProvider = func() string {
+	var aliases []string
+	for _, provider := range docbankAliasProviders {
+		aliases = append(aliases, fmt.Sprintf("SUBSTR(a.source_attachment_id,1,%d)='%s:'", len(provider)+1, provider))
+	}
+	return "(" + strings.Join(aliases, " OR ") + ")"
+}()
+
+var hashlessProviderAliasBytes = `(COALESCE(a.content_hash, '') = ''
+	  AND COALESCE(a.storage_path, '') <> ''
+	  AND ` + docbankAliasProvider + `)`
+
+// hashlessProviderAlias needs casPathHash to verify its storage path.
+var hashlessProviderAlias = `(` + hashlessProviderAliasBytes + ` AND COALESCE(a.size, 0) > 0)`
+
+// beeperMediaEligible is the shared provider, capture and role predicate. It
+// assumes a (attachments), m (messages), cv (conversations) and src (sources).
+// Merge-preserved copies retain old provider attachment references and are
+// archive evidence rather than current media occurrences. Archives older than
+// attachment_state leave it NULL on stored Beeper audio.
+const beeperMediaEligible = attachmentBytesArchived + `
+	  AND NOT EXISTS (SELECT 1 FROM source_merge_preserved_attachments spa WHERE spa.attachment_id = a.id)
+	  AND COALESCE(src.source_type, '') <> ''
+	  AND COALESCE(src.identifier, '') <> ''
+	  AND COALESCE(m.source_message_id, '') <> ''
+	  AND (
+		(src.source_type = 'beeper'
+		  AND COALESCE(a.attachment_state, '') IN ('', 'stored')
+		  AND COALESCE(a.media_type, '') IN ('audio', 'voice_note')
+		  AND COALESCE(a.attachment_role, 'unknown') = 'standalone')
+		OR (src.source_type <> 'beeper'
+		  AND COALESCE(NULLIF(a.source_part_key, ''), a.source_attachment_id, '') <> ''
+		  AND COALESCE(cv.source_conversation_id, '') <> ''
+		  AND COALESCE(a.attachment_state, '') IN ('', 'stored')
+		  AND COALESCE(a.attachment_role, 'unknown') IN ('standalone', 'unknown'))
+	  )`
+
+// beeperMediaTupleJoin follows occurrence row o by stable source tuple, including historical deliveries.
+var beeperMediaTupleJoin = `
+	JOIN sources src ON src.source_type = o.source_type AND src.identifier = o.source_identifier
+	JOIN messages m ON m.source_id = src.id AND m.source_message_id = o.source_message_id
+	JOIN conversations cv ON cv.id = m.conversation_id
+	JOIN attachments a ON a.message_id = m.id
+	WHERE COALESCE(cv.source_conversation_id, '') = o.source_conversation_id
+	  AND COALESCE(a.source_attachment_id, '') = o.source_attachment_id
+	  AND COALESCE(NULLIF(a.source_part_key, ''), NULLIF(a.source_attachment_id, ''), src.source_type || ':unknown') = o.source_part_key`
+
+var beeperMediaCurrentJoin = beeperMediaTupleJoin + `
+	  AND a.content_hash = o.source_sha256
+	  AND ` + beeperMediaEligible + `
+	  AND ` + LiveMessagesWhere("m", true)
+
+// BeeperMediaCandidate is the current archive evidence for a stored attachment
+// to inspect for audio. The source tuple, rather than AttachmentID, is stable.
+type BeeperMediaCandidate struct {
+	AttachmentID            int64
+	MessageID               int64
+	SentAt                  sql.NullTime
+	ConversationID          int64
+	SourceID                int64
+	SourceType              string
+	SourceIdentifier        string
+	SourceConversationID    string
+	SourceMessageID         string
+	OriginalSourceMessageID string
+	SourceAttachmentID      string
+	SourcePartKey           string
+	Filename                string
+	MIMEType                string
+	MediaType               string
+	Role                    string
+	ContentHash             string
+	ByteLength              int64
+	AttachmentState         string
+	AttachmentMetadata      string
+}
+
+// BeeperMediaMapping is one occurrence row together with the optional shared
+// processing row. Text and bytes stay in their existing archive owners.
+type BeeperMediaMapping struct {
+	DestinationKey       string
+	OccurrenceRef        string
+	Revision             string
+	SourceType           string
+	SourceIdentifier     string
+	SourceConversationID string
+	SourceMessageID      string
+	SourceAttachmentID   string
+	SourcePartKey        string
+	LocalSourceID        int64
+	MessageID            int64
+	AttachmentID         int64
+	SourceSHA256         string
+	ByteLength           int64
+	RawHash              string
+	TranscriptSHA256     string
+	Language             string
+	OccurrenceJSON       string
+	Filename             string
+	MIMEType             string
+	RetentionOperationID string
+	RetentionState       string
+	NextActionAt         time.Time
+	ErrorCode            string
+
+	VaultUID            string
+	DocbankSourceID     string
+	SourceVersionID     string
+	ContentVersionID    string
+	DocbankOccurrenceID string
+	CoverageState       string
+	ProcessingKey       string
+
+	ProcessingPhase       string
+	ProcessingOperationID string
+	DonorOccurrenceID     string
+	SuppliedInputID       string
+	JobID                 string
+	OperationState        string
+	ProcessingCoverage    string
+	ProcessingProvider    string
+	ProcessingProfile     string
+}
+
+// BeeperMediaOperation is the one remote action selected by a bounded pass.
+// FrozenRequestJSON holds the saved nonsecret request for replay.
+type BeeperMediaOperation struct {
+	Kind                string
+	PreparedReplay      bool
+	DestinationKey      string
+	OccurrenceRef       string
+	Revision            string
+	ProcessingKey       string
+	ProcessingProvider  string
+	ProcessingProfile   string
+	OperationID         string
+	FrozenRequestJSON   string
+	SourceSHA256        string
+	ByteLength          int64
+	Filename            string
+	MIMEType            string
+	TranscriptSHA256    string
+	Language            string
+	MessageID           int64
+	AttachmentID        int64
+	VaultUID            string // expected receipt destination, carried only in memory
+	DocbankSourceID     string
+	SourceVersionID     string
+	ContentVersionID    string
+	DocbankOccurrenceID string
+	SuppliedInputID     string
+	JobID               string
+	NextActionAt        time.Time
+}
+
+// BeeperMediaResult contains only receipt identity and stable error state.
+// Raw response bodies never cross this boundary.
+type BeeperMediaResult struct {
+	VaultUID            string
+	DocbankSourceID     string
+	SourceVersionID     string
+	ContentVersionID    string
+	DocbankOccurrenceID string
+	SuppliedInputID     string
+	JobID               string
+	OperationState      string
+	CoverageState       string
+	Terminal            bool
+	ErrorCode           string
+	Retry               bool
+	SourceUnavailable   bool
+	Revoked             bool
+}
+
+// BeeperMediaScan is a namespaced rolling scan checkpoint. BaselineSequence
+// ties a pass to the journal registration it can complete.
+type BeeperMediaScan struct {
+	DestinationKey    string    `json:"destination_key"`
+	Generation        string    `json:"generation,omitempty"`
+	AfterAttachmentID int64     `json:"after_attachment_id"`
+	PassHighWater     int64     `json:"pass_high_water"`
+	BaselineSequence  int64     `json:"baseline_sequence"`
+	NextFullScanAt    time.Time `json:"next_full_scan_at,omitzero"`
+}
+
+const beeperMediaCandidateColumns = `
+	SELECT a.id, m.id, cv.id, src.id, src.source_type, src.identifier,
+	       COALESCE(cv.source_conversation_id, ''), COALESCE(m.source_message_id, ''),
+	       COALESCE(NULLIF((SELECT marker.original_source_message_id
+	                        FROM source_merge_archive_only_messages marker
+	                        WHERE marker.message_id = m.id), ''),
+	                (SELECT smm.original_message_id FROM source_merge_messages smm
+	                 WHERE smm.message_id = m.id AND smm.archive_only = TRUE), ''),
+	       COALESCE(a.source_attachment_id, ''),
+	       COALESCE(NULLIF(a.source_part_key, ''), a.source_attachment_id, ''),
+	       COALESCE(a.filename, ''), COALESCE(a.mime_type, ''),
+	       COALESCE(a.media_type, ''), COALESCE(a.attachment_role, 'unknown'),
+	       COALESCE(a.content_hash, ''), COALESCE(a.size, 0),
+	       COALESCE(a.attachment_state, ''),
+	       COALESCE(CAST(a.attachment_metadata AS TEXT), ''), m.sent_at
+	FROM attachments a
+	JOIN messages m ON m.id = a.message_id
+	JOIN conversations cv ON cv.id = m.conversation_id
+	JOIN sources src ON src.id = m.source_id`
+
+// ListBeeperMediaCandidates returns a bounded page of captured attachments on
+// live messages. Beeper candidates must be explicitly marked as standalone audio.
+func (s *Store) ListBeeperMediaCandidates(
+	ctx context.Context, afterID int64, limit int,
+) ([]BeeperMediaCandidate, error) {
+	if afterID < 0 || limit < 1 || limit > 1000 {
+		return nil, errors.New("beeper media candidate page is invalid")
+	}
+	return s.queryBeeperMediaCandidates(ctx, `a.id > ?`, afterID, limit)
+}
+
+// GetBeeperMediaCandidate resolves one journaled attachment row through the
+// current source, capture and visibility predicates.
+func (s *Store) GetBeeperMediaCandidate(ctx context.Context, attachmentID int64) (BeeperMediaCandidate, error) {
+	rows, err := s.queryBeeperMediaCandidates(ctx, `a.id = ?`, attachmentID, 1)
+	if err != nil {
+		return BeeperMediaCandidate{}, err
+	}
+	if len(rows) == 0 {
+		return BeeperMediaCandidate{}, sql.ErrNoRows
+	}
+	return rows[0], nil
+}
+
+func (s *Store) queryBeeperMediaCandidates(
+	ctx context.Context, idFilter string, id int64, limit int,
+) ([]BeeperMediaCandidate, error) {
+	return s.readBeeperMediaCandidates(ctx, idFilter, limit, id, limit)
+}
+
+// GetBeeperMediaCandidates resolves a caller-bounded selection of attachments.
+func (s *Store) GetBeeperMediaCandidates(ctx context.Context, ids []int64) ([]BeeperMediaCandidate, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	args := make([]any, len(ids), len(ids)+1)
+	for i, id := range ids {
+		args[i] = id
+	}
+	args = append(args, len(ids))
+	return s.readBeeperMediaCandidates(ctx, `a.id IN (?`+strings.Repeat(", ?", len(ids)-1)+`)`, len(ids), args...)
+}
+
+func (s *Store) readBeeperMediaCandidates(ctx context.Context, idFilter string, limit int, args ...any) ([]BeeperMediaCandidate, error) {
+	rows, err := s.db.QueryContext(ctx, s.Rebind(beeperMediaCandidateColumns+`
+		WHERE `+idFilter+` AND `+beeperMediaEligible+` AND `+LiveMessagesWhere("m", true)+`
+		ORDER BY a.id
+		LIMIT ?`), args...)
+	if err != nil {
+		return nil, fmt.Errorf("list beeper media candidates: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	result := make([]BeeperMediaCandidate, 0, limit)
+	for rows.Next() {
+		var candidate BeeperMediaCandidate
+		if err := rows.Scan(
+			&candidate.AttachmentID, &candidate.MessageID, &candidate.ConversationID,
+			&candidate.SourceID, &candidate.SourceType, &candidate.SourceIdentifier,
+			&candidate.SourceConversationID, &candidate.SourceMessageID,
+			&candidate.OriginalSourceMessageID,
+			&candidate.SourceAttachmentID, &candidate.SourcePartKey,
+			&candidate.Filename, &candidate.MIMEType, &candidate.MediaType,
+			&candidate.Role, &candidate.ContentHash, &candidate.ByteLength,
+			&candidate.AttachmentState, &candidate.AttachmentMetadata, &candidate.SentAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan beeper media candidate: %w", err)
+		}
+		result = append(result, candidate)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate beeper media candidates: %w", err)
+	}
+	return result, nil
+}
+
+// BeeperMediaAttachmentHighWater returns the current highest attachment ID.
+func (s *Store) BeeperMediaAttachmentHighWater(ctx context.Context) (int64, error) {
+	var highWater int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(id), 0) FROM attachments`).Scan(&highWater); err != nil {
+		return 0, fmt.Errorf("read beeper media high-water mark: %w", err)
+	}
+	return highWater, nil
+}
+
+// ReconcileBeeperMediaMapping records the current revision of one occurrence.
+// Other revisions of that occurrence become revoked. Receipt identity and a
+// saved operation ID survive; an unchanged row is left untouched.
+func (s *Store) ReconcileBeeperMediaMapping(ctx context.Context, mapping BeeperMediaMapping) error {
+	if err := validateBeeperMediaMapping(mapping); err != nil {
+		return err
+	}
+	existing, err := s.readBeeperMediaOccurrence(boundQuerier{ctx: ctx, q: s.db},
+		mapping.DestinationKey, mapping.OccurrenceRef, mapping.Revision)
+	if err == nil && existing.RetentionState != BeeperMediaRetentionRevoked &&
+		sameBeeperMediaOccurrence(existing, reconciledBeeperMediaOccurrence(existing, mapping)) {
+		return nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("read beeper media occurrence: %w", err)
+	}
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
+		q := boundQuerier{ctx: ctx, q: tx}
+		if _, err := q.Exec(`
+			UPDATE beeper_media_occurrences
+			SET retention_state = 'revoked', next_action_at = NULL, updated_at = `+s.dialect.Now()+`
+			WHERE destination_key = ? AND occurrence_ref = ? AND revision <> ?
+			  AND retention_state <> 'revoked'`,
+			mapping.DestinationKey, mapping.OccurrenceRef, mapping.Revision); err != nil {
+			return fmt.Errorf("revoke old beeper media revisions: %w", err)
+		}
+
+		existing, err := s.readBeeperMediaOccurrence(q, mapping.DestinationKey, mapping.OccurrenceRef, mapping.Revision)
+		reopened := true
+		if errors.Is(err, sql.ErrNoRows) {
+			if mapping.RetentionState != BeeperMediaRetentionBlocked {
+				mapping.RetentionState = BeeperMediaRetentionPending
+				mapping.RetentionOperationID = newBeeperMediaOperationID()
+				mapping.NextActionAt = time.Now().UTC()
+				mapping.ErrorCode = ""
+			} else {
+				mapping.RetentionOperationID = ""
+				mapping.NextActionAt = time.Time{}
+			}
+			if err := s.insertBeeperMediaOccurrence(q, mapping); err != nil {
+				return err
+			}
+		} else if err != nil {
+			return fmt.Errorf("read beeper media occurrence: %w", err)
+		} else {
+			previousProcessingKey := existing.ProcessingKey
+			next := reconciledBeeperMediaOccurrence(existing, mapping)
+			if !sameBeeperMediaOccurrence(existing, next) {
+				if err := s.updateBeeperMediaOccurrence(q, next); err != nil {
+					return err
+				}
+			}
+			if previousProcessingKey != "" && previousProcessingKey != next.ProcessingKey {
+				if _, err := q.Exec(`
+				UPDATE beeper_media_deliveries
+				SET phase = 'blocked', next_action_at = NULL, error_code = 'processing_key_changed',
+				    updated_at = `+s.dialect.Now()+`
+				WHERE destination_key = ? AND processing_key = ?
+				  AND NOT EXISTS (
+					SELECT 1 FROM beeper_media_occurrences o
+					WHERE o.destination_key = beeper_media_deliveries.destination_key
+					  AND o.processing_key = beeper_media_deliveries.processing_key
+					  AND o.retention_state IN ('pending', 'source_unavailable', 'retained'))
+				  AND COALESCE(job_id, '') = ''
+				  AND (phase = 'pending-artifact' OR (phase = 'pending-process' AND
+				       (COALESCE(pending_operation_id, '') = '' OR COALESCE(frozen_request_json, '') = '' OR
+				        COALESCE(source_id, '') = '' OR COALESCE(source_version_id, '') = '' OR
+				        COALESCE(content_version_id, '') = '' OR COALESCE(donor_occurrence_id, '') = '')))`,
+					mapping.DestinationKey, previousProcessingKey); err != nil {
+					return fmt.Errorf("retire changed beeper media processing state: %w", err)
+				}
+			}
+			reopened = existing.RetentionState != next.RetentionState
+			mapping = next
+		}
+
+		if mapping.ProcessingKey != "" {
+			provider, profile := beeperMediaDeliveryProfile(mapping)
+			if provider == "" || profile == "" {
+				return errors.New("beeper media processing provider and profile are required")
+			}
+			phase := beeperMediaPhasePendingProcess
+			if profile == beeperMediaProcessingProfile {
+				phase = beeperMediaPhasePendingArtifact
+			}
+			if _, err := q.Exec(`
+			INSERT INTO beeper_media_deliveries
+				(destination_key, processing_key, source_sha256, byte_length, transcript_sha256,
+				language, provider, profile, phase, next_action_at, created_at, updated_at)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, `+s.dialect.Now()+`, `+s.dialect.Now()+`)
+			ON CONFLICT (destination_key, processing_key) DO NOTHING`,
+				mapping.DestinationKey, mapping.ProcessingKey, mapping.SourceSHA256, mapping.ByteLength,
+				mapping.TranscriptSHA256, mapping.Language, provider, profile, phase,
+				s.timestampValue(time.Now().UTC())); err != nil {
+				return fmt.Errorf("create beeper media processing state: %w", err)
+			}
+			if reopened {
+				// A new or restored occurrence can supply audio again, so a delivery retired by a source gap resumes.
+				if _, err := q.Exec(`
+			UPDATE beeper_media_deliveries
+			SET phase = `+beeperMediaResumedPhase+`, next_action_at = ?, error_code = '', updated_at = `+s.dialect.Now()+`
+			WHERE destination_key = ? AND processing_key = ? AND phase = 'blocked' AND `+beeperMediaLocalGapFilter(),
+					append([]any{s.timestampValue(time.Now().UTC()), mapping.DestinationKey, mapping.ProcessingKey},
+						beeperMediaLocalGapCodes...)...); err != nil {
+					return fmt.Errorf("reopen beeper media processing state: %w", err)
+				}
+			}
+		}
+		retireCode := errBeeperMediaNoLiveOccurrenceCode
+		if mapping.RetentionState == BeeperMediaRetentionBlocked {
+			retireCode = mapping.ErrorCode
+		}
+		if err := s.retireBeeperMediaDeliveries(q, mapping.DestinationKey, mapping.OccurrenceRef, retireCode); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+const errBeeperMediaNoLiveOccurrenceCode = "no_live_occurrence"
+
+// retireBeeperMediaDeliveries blocks unprepared work once no occurrence can
+// supply its audio. Prepared processing may have reached Docbank already.
+func (s *Store) retireBeeperMediaDeliveries(q boundQuerier, destination, occurrenceRef, code string) error {
+	if !slices.Contains(beeperMediaLocalGapCodes, any(code)) {
+		return nil
+	}
+	if _, err := q.Exec(`
+		UPDATE beeper_media_deliveries
+		SET phase = 'blocked', next_action_at = NULL, error_code = ?, updated_at = `+s.dialect.Now()+`
+		WHERE destination_key = ?
+		  AND (phase = 'pending-artifact' OR (phase = 'pending-process' AND COALESCE(job_id, '') = '' AND
+		       (COALESCE(pending_operation_id, '') = '' OR COALESCE(frozen_request_json, '') = '' OR
+		        COALESCE(source_id, '') = '' OR COALESCE(source_version_id, '') = '' OR
+		        COALESCE(content_version_id, '') = '' OR COALESCE(donor_occurrence_id, '') = '')))
+		  AND processing_key IN (
+			SELECT processing_key FROM beeper_media_occurrences
+			WHERE destination_key = ? AND occurrence_ref = ? AND processing_key <> '')
+		  AND NOT EXISTS (
+			SELECT 1 FROM beeper_media_occurrences o
+			WHERE o.destination_key = beeper_media_deliveries.destination_key
+			  AND o.processing_key = beeper_media_deliveries.processing_key
+			  AND o.retention_state IN ('pending', 'source_unavailable', 'retained'))`,
+		code, destination, destination, occurrenceRef); err != nil {
+		return fmt.Errorf("retire beeper media processing state: %w", err)
+	}
+	return nil
+}
+
+// reconciledBeeperMediaOccurrence merges current local evidence into a saved
+// row. Receipts restore a revoked revision; a gap never discards a receipt.
+func reconciledBeeperMediaOccurrence(existing, current BeeperMediaMapping) BeeperMediaMapping {
+	next := existing
+	next.SourceIdentifier, next.SourceConversationID = current.SourceIdentifier, current.SourceConversationID
+	next.SourceMessageID, next.SourceAttachmentID = current.SourceMessageID, current.SourceAttachmentID
+	next.SourcePartKey, next.LocalSourceID = current.SourcePartKey, current.LocalSourceID
+	next.MessageID, next.AttachmentID, next.RawHash = current.MessageID, current.AttachmentID, current.RawHash
+	next.ProcessingKey = current.ProcessingKey
+	next.ProcessingProvider, next.ProcessingProfile = current.ProcessingProvider, current.ProcessingProfile
+	switch {
+	case existing.DocbankSourceID != "":
+		next.RetentionState = BeeperMediaRetentionRetained
+	case current.RetentionState == BeeperMediaRetentionBlocked:
+		next.RetentionState, next.ErrorCode, next.NextActionAt = BeeperMediaRetentionBlocked, current.ErrorCode, time.Time{}
+	case existing.RetentionState == BeeperMediaRetentionRevoked,
+		existing.RetentionState == BeeperMediaRetentionBlocked && existing.RetentionOperationID == "":
+		next.RetentionState, next.ErrorCode, next.NextActionAt = BeeperMediaRetentionPending, "", time.Now().UTC()
+		if next.RetentionOperationID == "" {
+			next.RetentionOperationID = newBeeperMediaOperationID()
+		}
+	}
+	return next
+}
+
+func sameBeeperMediaOccurrence(a, b BeeperMediaMapping) bool {
+	return a.SourceIdentifier == b.SourceIdentifier && a.SourceConversationID == b.SourceConversationID &&
+		a.SourceMessageID == b.SourceMessageID && a.SourceAttachmentID == b.SourceAttachmentID &&
+		a.SourcePartKey == b.SourcePartKey && a.LocalSourceID == b.LocalSourceID &&
+		a.MessageID == b.MessageID && a.AttachmentID == b.AttachmentID && a.RawHash == b.RawHash &&
+		a.RetentionState == b.RetentionState && a.RetentionOperationID == b.RetentionOperationID &&
+		a.ErrorCode == b.ErrorCode && a.ProcessingKey == b.ProcessingKey && a.NextActionAt.Equal(b.NextActionAt)
+}
+
+// ListLiveBeeperMediaMappings returns retained mappings whose current source,
+// message, part and bytes still agree with the saved occurrence.
+// Mappings that no longer agree enter the revoked state.
+func (s *Store) ListLiveBeeperMediaMappings(
+	ctx context.Context, destination, processingKey string, limit int,
+) ([]BeeperMediaMapping, error) {
+	if destination == "" || limit < 1 || limit > 1000 {
+		return nil, errors.New("beeper media mapping query is invalid")
+	}
+	if err := s.RevokeStaleBeeperMediaMappings(ctx, destination); err != nil {
+		return nil, err
+	}
+	args := []any{destination}
+	processingFilter := ""
+	if processingKey != "" {
+		processingFilter = ` AND o.processing_key = ?`
+		args = append(args, processingKey)
+	}
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, s.Rebind(`
+		SELECT `+beeperMediaOccurrenceColumns("o")+`,
+		       COALESCE(d.phase, ''), COALESCE(d.processing_operation_id, ''),
+		       COALESCE(d.donor_occurrence_id, ''), COALESCE(d.supplied_input_id, ''),
+		       COALESCE(d.job_id, ''), COALESCE(d.operation_state, ''), COALESCE(d.coverage_state, ''),
+		       COALESCE(d.provider, ''), COALESCE(d.profile, '')
+		FROM beeper_media_occurrences o
+		LEFT JOIN beeper_media_deliveries d
+		  ON d.destination_key = o.destination_key AND d.processing_key = o.processing_key
+		WHERE o.destination_key = ? AND o.retention_state = 'retained'`+processingFilter+`
+		ORDER BY o.occurrence_ref, o.revision
+		LIMIT ?`), args...)
+	if err != nil {
+		return nil, fmt.Errorf("list live beeper media mappings: %w", err)
+	}
+	var candidates []BeeperMediaMapping
+	for rows.Next() {
+		var mapping BeeperMediaMapping
+		dest := beeperMediaOccurrenceScanTargets(&mapping)
+		dest = append(dest, &mapping.ProcessingPhase, &mapping.ProcessingOperationID,
+			&mapping.DonorOccurrenceID, &mapping.SuppliedInputID, &mapping.JobID,
+			&mapping.OperationState, &mapping.ProcessingCoverage,
+			&mapping.ProcessingProvider, &mapping.ProcessingProfile)
+		var next sql.NullTime
+		dest[beeperMediaNextActionIndex] = &next
+		if err := rows.Scan(dest...); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("scan beeper media mapping: %w", err)
+		}
+		mapping.NextActionAt = nullTimeValue(next)
+		candidates = append(candidates, mapping)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, fmt.Errorf("iterate live beeper media mappings: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close live beeper media mappings: %w", err)
+	}
+	mappings := make([]BeeperMediaMapping, 0, len(candidates))
+	for _, mapping := range candidates {
+		live, err := s.currentBeeperMediaMessage(ctx, mapping)
+		if err != nil {
+			return nil, err
+		}
+		if !live {
+			if err := s.markBeeperMediaMappingRevoked(ctx, mapping); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		mappings = append(mappings, mapping)
+	}
+	return mappings, nil
+}
+
+// currentBeeperMediaMessage resolves the saved source tuple to its current
+// live message and attachment. Unrelated raw-message changes do not revoke it.
+func (s *Store) currentBeeperMediaMessage(ctx context.Context, mapping BeeperMediaMapping) (bool, error) {
+	var messageID int64
+	err := s.db.QueryRowContext(ctx, s.Rebind(`
+		SELECT m.id FROM beeper_media_occurrences o`+beeperMediaCurrentJoin+`
+		  AND o.destination_key = ? AND o.occurrence_ref = ? AND o.revision = ?
+		LIMIT 1`), mapping.DestinationKey, mapping.OccurrenceRef, mapping.Revision).Scan(&messageID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("resolve beeper media occurrence: %w", err)
+	}
+	return true, nil
+}
+
+// MessageMediaOccurrence joins visible local audio with its optional Docbank mapping.
+type MessageMediaOccurrence struct {
+	MessageID        int64
+	ConversationID   int64
+	AttachmentID     int64
+	Filename         string
+	ContainingTitle  string
+	OccurredAt       *time.Time
+	Size             int64
+	OccurrenceRef    string
+	Revision         string
+	RetentionState   string
+	ErrorCode        string
+	VaultUID         string
+	DocbankSourceID  string
+	SourceVersionID  string
+	ContentVersionID string
+	// The delivery of the occurrence's current processing key, which for a
+	// provider transcript is keyed by that transcript's text.
+	DeliveryProfile        string
+	DeliveryPhase          string
+	DeliveryOperationState string
+	SuppliedInputID        string
+	BytesArchived          bool
+	AttachmentState        attachmentpolicy.DownloadState
+}
+
+// messageAudioHint matches attachment a when its metadata says audio.
+const messageAudioHint = `(COALESCE(a.media_type, '') IN ('audio', 'voice_note')
+	OR LOWER(COALESCE(a.mime_type, '')) LIKE 'audio/%'
+	OR LOWER(COALESCE(a.filename, '')) LIKE '%.wav'
+	OR LOWER(COALESCE(a.filename, '')) LIKE '%.mp3'
+	OR LOWER(COALESCE(a.filename, '')) LIKE '%.m4a'
+	OR LOWER(COALESCE(a.filename, '')) LIKE '%.aac'
+	OR LOWER(COALESCE(a.filename, '')) LIKE '%.ogg'
+	OR LOWER(COALESCE(a.filename, '')) LIKE '%.oga'
+	OR LOWER(COALESCE(a.filename, '')) LIKE '%.opus')`
+
+const messageRecordingMapping = `o.retention_state <> 'revoked'
+	  AND NOT (o.retention_state = 'blocked' AND o.retention_operation_id = ''
+	    AND o.error_code = 'unsupported_media' AND NOT ` + messageAudioHint + `)`
+
+// Current mappings recognize inspected audio with generic file metadata.
+func messageRecordingAudio(where string) string {
+	return `(` + messageAudioHint + ` OR a.id IN (
+	SELECT a.id FROM beeper_media_occurrences o` + beeperMediaCurrentJoin + where + `
+	  AND ` + messageRecordingMapping + `))`
+}
+
+// ListMessageMediaOccurrences lists visible archived audio and missing bytes.
+// A destination adds current remote mappings; empty means a local-only read.
+// The media worker owns stale mapping revocation.
+func (s *Store) ListMessageMediaOccurrences(
+	ctx context.Context, destination string, messageID int64,
+) ([]MessageMediaOccurrence, error) {
+	if messageID < 1 {
+		return nil, errors.New("message media occurrence query is invalid")
+	}
+	var occurrences []MessageMediaOccurrence
+	if destination != "" {
+		var err error
+		occurrences, err = s.listMessageOccurrenceRows(ctx, destination, messageID, nil)
+		if err != nil {
+			return nil, err
+		}
+	}
+	archived, err := s.listMessageAudio(ctx, "list archived message audio", true, `
+		SELECT a.id, COALESCE(a.filename, ''), COALESCE(a.size, 0), COALESCE(a.attachment_state, ''),
+		       CASE WHEN `+hashlessProviderAlias+` THEN COALESCE(a.storage_path, '') ELSE '' END
+		FROM attachments a
+		JOIN messages m ON m.id = a.message_id
+		WHERE m.id = ? AND `+LiveMessagesWhere("m", true)+`
+		  AND `+messageRecordingAudio(" AND m.id = ?")+`
+		  AND (`+attachmentBytesArchived+` OR `+hashlessProviderAlias+`)
+		  AND COALESCE(a.attachment_state, '') IN ('', 'stored')
+		ORDER BY a.id`, messageID, messageID)
+	if err != nil {
+		return nil, err
+	}
+	mapped := make(map[int64]bool, len(occurrences))
+	for _, o := range occurrences {
+		mapped[o.AttachmentID] = true
+	}
+	archived = slices.DeleteFunc(archived, func(o MessageMediaOccurrence) bool { return mapped[o.AttachmentID] })
+	for i := range archived {
+		archived[i].BytesArchived = true
+	}
+	uncaptured, err := s.listMessageAudio(ctx, "list uncaptured message audio", false, `
+		SELECT a.id, COALESCE(a.filename, ''), COALESCE(a.size, 0), COALESCE(a.attachment_state, ''),
+		       CASE WHEN COALESCE(a.attachment_state, '') = '' AND `+hashlessProviderAlias+`
+		         THEN COALESCE(a.storage_path, '') ELSE '' END
+		FROM attachments a
+		JOIN messages m ON m.id = a.message_id
+		WHERE m.id = ? AND `+LiveMessagesWhere("m", true)+`
+		  AND `+messageAudioHint+`
+		  AND (COALESCE(a.attachment_state, '') IN ('pending', 'skipped', 'failed', 'unavailable')
+		    OR (COALESCE(a.attachment_state, '') = '' AND NOT `+attachmentBytesArchived+`))
+		ORDER BY a.id`, messageID)
+	if err != nil {
+		return nil, err
+	}
+	return slices.Concat(occurrences, archived, uncaptured), nil
+}
+
+func (s *Store) listMessageOccurrenceRows(
+	ctx context.Context, destination string, messageID int64, scope *personscope.Scope,
+) ([]MessageMediaOccurrence, error) {
+	where := ""
+	args := []any{destination}
+	if messageID > 0 {
+		where += " AND m.id = ?"
+		args = append(args, messageID)
+	}
+	if scope != nil {
+		predicate, values := personscope.MessagePredicate(*scope, "m", "cv")
+		where += " AND (" + predicate + ")"
+		args = append(args, values...)
+	}
+	rows, err := s.db.QueryContext(ctx, s.Rebind(`
+		SELECT m.id, cv.id, a.id, COALESCE(a.filename, ''), COALESCE(a.size, 0), COALESCE(a.attachment_state, ''), o.occurrence_ref, o.revision,
+		       o.retention_state, o.error_code, o.vault_uid, o.source_id, o.source_version_id,
+		       o.content_version_id, COALESCE(d.profile, ''), COALESCE(d.phase, ''),
+		       COALESCE(d.operation_state, ''), COALESCE(d.supplied_input_id, ''),
+		       `+containingTitleMCVSQL+`,
+		       COALESCE(m.sent_at, m.received_at, m.internal_date)
+		FROM beeper_media_occurrences o
+		LEFT JOIN beeper_media_deliveries d
+		  ON d.destination_key = o.destination_key AND d.processing_key = o.processing_key`+
+		beeperMediaCurrentJoin+`
+		  AND o.destination_key = ? AND `+messageRecordingMapping+where+`
+		ORDER BY a.id, o.occurrence_ref, o.revision`), args...)
+	if err != nil {
+		return nil, fmt.Errorf("list message media occurrences: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var occurrences []MessageMediaOccurrence
+	for rows.Next() {
+		var o MessageMediaOccurrence
+		var occurredAt nullableTimestamp
+		if err := rows.Scan(&o.MessageID, &o.ConversationID, &o.AttachmentID, &o.Filename, &o.Size, &o.AttachmentState, &o.OccurrenceRef, &o.Revision,
+			&o.RetentionState, &o.ErrorCode, &o.VaultUID, &o.DocbankSourceID, &o.SourceVersionID,
+			&o.ContentVersionID, &o.DeliveryProfile, &o.DeliveryPhase, &o.DeliveryOperationState,
+			&o.SuppliedInputID, &o.ContainingTitle, &occurredAt); err != nil {
+			return nil, fmt.Errorf("scan message media occurrence: %w", err)
+		}
+		o.BytesArchived = true
+		o.OccurredAt = optionalTimestamp(occurredAt)
+		occurrences = append(occurrences, o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate message media occurrences: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close message media occurrences: %w", err)
+	}
+	return occurrences, nil
+}
+
+// listMessageAudio reads attachment rows that have no occurrence identity.
+// listMessageAudio reads attachment rows without occurrence identity. Each row
+// ends with a hashless provider alias's storage path, or "" for other rows.
+// The archived list keeps an alias only when that path is trusted CAS storage,
+// and the uncaptured list only when it is not.
+func (s *Store) listMessageAudio(
+	ctx context.Context, operation string, archived bool, query string, args ...any,
+) ([]MessageMediaOccurrence, error) {
+	rows, err := s.db.QueryContext(ctx, s.Rebind(query), args...)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", operation, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var audio []MessageMediaOccurrence
+	for rows.Next() {
+		var o MessageMediaOccurrence
+		var aliasPath string
+		if err := rows.Scan(&o.AttachmentID, &o.Filename, &o.Size, &o.AttachmentState, &aliasPath); err != nil {
+			return nil, fmt.Errorf("scan %s: %w", operation, err)
+		}
+		if aliasPath != "" {
+			if _, trusted := casPathHash(aliasPath); trusted != archived {
+				continue
+			}
+		}
+		audio = append(audio, o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate %s: %w", operation, err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close %s: %w", operation, err)
+	}
+	return audio, nil
+}
+
+// RevokeStaleBeeperMediaMappings moves non-revoked mappings without a current
+// live source attachment into the revoked state.
+func (s *Store) RevokeStaleBeeperMediaMappings(ctx context.Context, destination string) error {
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
+		q := boundQuerier{ctx: ctx, q: tx}
+		rows, err := tx.QueryContext(ctx, `
+			SELECT occurrence_ref
+			FROM beeper_media_occurrences
+			WHERE destination_key = ? AND retention_state <> 'revoked'
+			  AND NOT EXISTS (SELECT 1 FROM beeper_media_occurrences o`+beeperMediaCurrentJoin+`
+				AND o.destination_key = beeper_media_occurrences.destination_key
+				AND o.occurrence_ref = beeper_media_occurrences.occurrence_ref
+				AND o.revision = beeper_media_occurrences.revision)`, destination)
+		if err != nil {
+			return fmt.Errorf("list stale beeper media mappings: %w", err)
+		}
+		var stale []string
+		for rows.Next() {
+			var occurrenceRef string
+			if err := rows.Scan(&occurrenceRef); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("scan stale beeper media mapping: %w", err)
+			}
+			stale = append(stale, occurrenceRef)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("iterate stale beeper media mappings: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("close stale beeper media mappings: %w", err)
+		}
+		if _, err := q.Exec(`
+			UPDATE beeper_media_occurrences
+			SET retention_state = 'revoked', error_code = 'no_live_occurrence', next_action_at = NULL, updated_at = `+s.dialect.Now()+`
+			WHERE destination_key = ? AND retention_state <> 'revoked'
+			  AND NOT EXISTS (SELECT 1 FROM beeper_media_occurrences o`+beeperMediaCurrentJoin+`
+				AND o.destination_key = beeper_media_occurrences.destination_key
+				AND o.occurrence_ref = beeper_media_occurrences.occurrence_ref
+				AND o.revision = beeper_media_occurrences.revision)`, destination); err != nil {
+			return fmt.Errorf("revoke stale beeper media mappings: %w", err)
+		}
+		for _, occurrenceRef := range stale {
+			if err := s.retireBeeperMediaDeliveries(q, destination, occurrenceRef, errBeeperMediaNoLiveOccurrenceCode); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Store) markBeeperMediaMappingRevoked(ctx context.Context, mapping BeeperMediaMapping) error {
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
+		q := boundQuerier{ctx: ctx, q: tx}
+		if _, err := q.Exec(`
+			UPDATE beeper_media_occurrences SET retention_state = 'revoked', next_action_at = NULL, updated_at = `+s.dialect.Now()+`
+			WHERE destination_key = ? AND occurrence_ref = ? AND revision = ? AND retention_state = 'retained'`,
+			mapping.DestinationKey, mapping.OccurrenceRef, mapping.Revision); err != nil {
+			return fmt.Errorf("revoke beeper media mapping: %w", err)
+		}
+		return s.retireBeeperMediaDeliveries(q, mapping.DestinationKey, mapping.OccurrenceRef,
+			errBeeperMediaNoLiveOccurrenceCode)
+	})
+}
+
+// NextBeeperMediaOperation chooses the earliest ready retention or shared
+// processing step. Unstarted processing steps need a retained live member.
+func (s *Store) NextBeeperMediaOperation(
+	ctx context.Context, destination string, now time.Time,
+) (BeeperMediaOperation, bool, error) {
+	if destination == "" {
+		return BeeperMediaOperation{}, false, errors.New("beeper media destination is required")
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	var retain BeeperMediaOperation
+	var retainNext sql.NullTime
+	retainErr := s.db.QueryRowContext(ctx, s.Rebind(`
+		SELECT retention_operation_id, destination_key, occurrence_ref, revision,
+		       source_sha256, byte_length, request_filename, request_mime_type,
+		       transcript_sha256, language, message_id, attachment_id, occurrence_json,
+		       processing_key, next_action_at
+		FROM beeper_media_occurrences
+		WHERE destination_key = ? AND retention_state IN ('pending', 'source_unavailable')
+		  AND retention_operation_id <> '' AND next_action_at IS NOT NULL AND next_action_at <= ?
+		ORDER BY next_action_at, occurrence_ref, revision
+		LIMIT 1`), destination, s.dialect.TimestampParam(now)).Scan(
+		&retain.OperationID, &retain.DestinationKey, &retain.OccurrenceRef, &retain.Revision,
+		&retain.SourceSHA256, &retain.ByteLength, &retain.Filename, &retain.MIMEType,
+		&retain.TranscriptSHA256, &retain.Language, &retain.MessageID, &retain.AttachmentID,
+		&retain.FrozenRequestJSON, &retain.ProcessingKey, &retainNext)
+	if retainErr != nil && !errors.Is(retainErr, sql.ErrNoRows) {
+		return BeeperMediaOperation{}, false, fmt.Errorf("select beeper media retention operation: %w", retainErr)
+	}
+	retain.Kind = BeeperMediaOperationRetain
+	retain.NextActionAt = nullTimeValue(retainNext)
+
+	var delivery BeeperMediaOperation
+	var phase, pendingID, processingID, frozen, provider, profile string
+	var preparedReplay int
+	var deliveryNext sql.NullTime
+	deliveryErr := s.db.QueryRowContext(ctx, s.Rebind(`
+		SELECT d.phase,
+		       CASE WHEN d.phase = 'pending-process' AND COALESCE(d.pending_operation_id, '') <> ''
+		              AND COALESCE(d.frozen_request_json, '') <> '' AND NOT EXISTS (
+				SELECT 1 FROM beeper_media_occurrences o`+beeperMediaCurrentJoin+`
+				  AND o.destination_key = d.destination_key AND o.processing_key = d.processing_key
+				  AND o.retention_state = 'retained') THEN 1 ELSE 0 END,
+		       d.destination_key, d.processing_key, COALESCE(d.pending_operation_id, ''),
+		       d.processing_operation_id, d.source_sha256, d.byte_length, d.transcript_sha256,
+		       d.language, d.source_id, d.source_version_id, d.content_version_id,
+		       d.donor_occurrence_id, d.supplied_input_id, d.job_id,
+		       COALESCE(d.frozen_request_json, ''),
+		       COALESCE(d.provider, ''), COALESCE(d.profile, ''),
+		       COALESCE((SELECT o.vault_uid FROM beeper_media_occurrences o
+			WHERE o.destination_key = d.destination_key
+			  AND ((d.donor_occurrence_id <> '' AND o.occurrence_id = d.donor_occurrence_id)
+			       OR (d.donor_occurrence_id = '' AND o.processing_key = d.processing_key))
+			  AND (d.donor_occurrence_id = '' OR (o.source_id = d.source_id
+			       AND o.source_version_id = d.source_version_id
+			       AND o.content_version_id = d.content_version_id))
+			  AND o.vault_uid <> ''
+			ORDER BY CASE WHEN o.occurrence_id = d.donor_occurrence_id THEN 0 ELSE 1 END
+			LIMIT 1), ''),
+		       d.next_action_at
+		FROM beeper_media_deliveries d
+		WHERE d.destination_key = ?
+		  AND d.phase IN ('pending-artifact', 'pending-process', 'observing')
+		  AND d.next_action_at IS NOT NULL AND d.next_action_at <= ?
+		  AND (
+			(d.phase IN ('pending-artifact', 'pending-process') AND EXISTS (
+				SELECT 1 FROM beeper_media_occurrences o`+beeperMediaCurrentJoin+`
+				  AND o.destination_key = d.destination_key AND o.processing_key = d.processing_key
+				  AND o.retention_state = 'retained'))
+			OR (d.phase = 'pending-process' AND COALESCE(d.pending_operation_id, '') <> ''
+			    AND COALESCE(d.frozen_request_json, '') <> '' AND COALESCE(d.source_id, '') <> ''
+			    AND COALESCE(d.source_version_id, '') <> '' AND COALESCE(d.content_version_id, '') <> ''
+			    AND d.donor_occurrence_id <> ''
+			    AND EXISTS (
+				SELECT 1 FROM beeper_media_occurrences o
+				WHERE o.destination_key = d.destination_key AND o.occurrence_id = d.donor_occurrence_id
+				  AND o.source_id = d.source_id AND o.source_version_id = d.source_version_id
+				  AND o.content_version_id = d.content_version_id AND o.source_sha256 = d.source_sha256
+				  AND o.byte_length = d.byte_length AND o.vault_uid <> ''))
+			OR (d.phase = 'observing' AND d.job_id <> '' AND d.donor_occurrence_id <> '' AND EXISTS (
+				SELECT 1 FROM beeper_media_occurrences o
+				WHERE o.destination_key = d.destination_key AND o.occurrence_id = d.donor_occurrence_id
+				  AND o.source_id = d.source_id
+				  AND o.source_version_id = d.source_version_id
+				  AND o.content_version_id = d.content_version_id
+				  AND o.vault_uid <> ''))
+		  )
+		ORDER BY d.next_action_at, d.processing_key
+		LIMIT 1`), destination, s.dialect.TimestampParam(now)).Scan(
+		&phase, &preparedReplay, &delivery.DestinationKey, &delivery.ProcessingKey, &pendingID, &processingID,
+		&delivery.SourceSHA256, &delivery.ByteLength, &delivery.TranscriptSHA256, &delivery.Language,
+		&delivery.DocbankSourceID, &delivery.SourceVersionID, &delivery.ContentVersionID,
+		&delivery.DocbankOccurrenceID, &delivery.SuppliedInputID, &delivery.JobID, &frozen,
+		&provider, &profile, &delivery.VaultUID, &deliveryNext)
+	if deliveryErr != nil && !errors.Is(deliveryErr, sql.ErrNoRows) {
+		return BeeperMediaOperation{}, false, fmt.Errorf("select beeper media processing operation: %w", deliveryErr)
+	}
+	delivery.NextActionAt = nullTimeValue(deliveryNext)
+	delivery.PreparedReplay = preparedReplay != 0
+	delivery.FrozenRequestJSON = frozen
+	delivery.ProcessingProvider, delivery.ProcessingProfile = provider, profile
+	switch phase {
+	case beeperMediaPhasePendingArtifact:
+		delivery.Kind, delivery.OperationID = BeeperMediaOperationArtifact, pendingID
+	case beeperMediaPhasePendingProcess:
+		delivery.Kind, delivery.OperationID = BeeperMediaOperationProcess, pendingID
+	case beeperMediaPhaseObserving:
+		delivery.Kind, delivery.OperationID = BeeperMediaOperationStatus, processingID
+	}
+
+	switch {
+	case retainErr == nil && deliveryErr == nil:
+		if delivery.NextActionAt.Before(retain.NextActionAt) {
+			return delivery, true, nil
+		}
+		return retain, true, nil
+	case retainErr == nil:
+		return retain, true, nil
+	case deliveryErr == nil:
+		return delivery, true, nil
+	default:
+		return BeeperMediaOperation{}, false, nil
+	}
+}
+
+// PrepareBeeperMediaOperation saves an operation ID and its frozen nonsecret
+// request before a remote call. A saved request wins over the caller's copy,
+// so every replay sends the same UUIDv4 and metadata.
+func (s *Store) PrepareBeeperMediaOperation(
+	ctx context.Context, operation BeeperMediaOperation,
+) (BeeperMediaOperation, error) {
+	if err := validateBeeperMediaOperation(operation); err != nil {
+		return BeeperMediaOperation{}, err
+	}
+	if operation.Kind == BeeperMediaOperationStatus {
+		return operation, nil
+	}
+	if len(operation.FrozenRequestJSON) > 64<<10 {
+		return BeeperMediaOperation{}, errors.New("beeper media frozen request is too large")
+	}
+	err := s.withTxContext(ctx, func(tx *loggedTx) error {
+		q := boundQuerier{ctx: ctx, q: tx}
+		if operation.Kind == BeeperMediaOperationRetain {
+			var storedID, frozen, state string
+			if err := q.QueryRow(`
+				SELECT retention_operation_id, occurrence_json, retention_state
+				FROM beeper_media_occurrences
+				WHERE destination_key = ? AND occurrence_ref = ? AND revision = ?`,
+				operation.DestinationKey, operation.OccurrenceRef, operation.Revision).Scan(&storedID, &frozen, &state); err != nil {
+				return fmt.Errorf("read beeper media retention operation: %w", err)
+			}
+			if state != BeeperMediaRetentionPending && state != BeeperMediaRetentionSourceUnavailable {
+				return errors.New("beeper media retention is no longer pending")
+			}
+			if storedID == "" {
+				storedID = newBeeperMediaOperationID()
+				if _, err := q.Exec(`
+					UPDATE beeper_media_occurrences SET retention_operation_id = ?, updated_at = `+s.dialect.Now()+`
+					WHERE destination_key = ? AND occurrence_ref = ? AND revision = ?`,
+					storedID, operation.DestinationKey, operation.OccurrenceRef, operation.Revision); err != nil {
+					return fmt.Errorf("save beeper media retention operation: %w", err)
+				}
+			}
+			operation.OperationID, operation.FrozenRequestJSON = storedID, frozen
+			return nil
+		}
+		var storedID, frozen, sourceID, sourceVersion, contentVersion, donor, supplied, phase string
+		if err := q.QueryRow(`
+			SELECT COALESCE(pending_operation_id, ''), COALESCE(frozen_request_json, ''),
+			       source_id, source_version_id, content_version_id, donor_occurrence_id,
+			       supplied_input_id, phase
+			FROM beeper_media_deliveries
+			WHERE destination_key = ? AND processing_key = ?`,
+			operation.DestinationKey, operation.ProcessingKey).Scan(
+			&storedID, &frozen, &sourceID, &sourceVersion, &contentVersion, &donor, &supplied, &phase); err != nil {
+			return fmt.Errorf("read beeper media delivery operation: %w", err)
+		}
+		wantPhase := beeperMediaPhasePendingArtifact
+		if operation.Kind == BeeperMediaOperationProcess {
+			wantPhase = beeperMediaPhasePendingProcess
+		}
+		if phase != wantPhase {
+			return errors.New("beeper media processing step is no longer pending")
+		}
+		if storedID != "" && frozen != "" {
+			operation.OperationID, operation.FrozenRequestJSON = storedID, frozen
+			operation.DocbankSourceID, operation.SourceVersionID = sourceID, sourceVersion
+			operation.ContentVersionID, operation.DocbankOccurrenceID = contentVersion, donor
+			operation.SuppliedInputID = supplied
+			return nil
+		}
+		if storedID == "" {
+			storedID = newBeeperMediaOperationID()
+		}
+		if operation.FrozenRequestJSON == "" {
+			return errors.New("beeper media request metadata is required")
+		}
+		operation.OperationID = storedID
+		if operation.Kind == BeeperMediaOperationProcess {
+			// A first ASR request supplies the retained donor identity. Once
+			// saved, the delivery identity wins on every replay.
+			if sourceID != "" || operation.DocbankSourceID == "" {
+				operation.DocbankSourceID = sourceID
+			}
+			if sourceVersion != "" || operation.SourceVersionID == "" {
+				operation.SourceVersionID = sourceVersion
+			}
+			if contentVersion != "" || operation.ContentVersionID == "" {
+				operation.ContentVersionID = contentVersion
+			}
+			if donor != "" || operation.DocbankOccurrenceID == "" {
+				operation.DocbankOccurrenceID = donor
+			}
+			operation.SuppliedInputID = supplied
+		}
+		if _, err := q.Exec(`
+			UPDATE beeper_media_deliveries
+			SET pending_operation_id = ?, frozen_request_json = ?, source_id = ?,
+			    source_version_id = ?, content_version_id = ?, donor_occurrence_id = ?,
+			    error_code = '', updated_at = `+s.dialect.Now()+`
+			WHERE destination_key = ? AND processing_key = ?`,
+			operation.OperationID, operation.FrozenRequestJSON, operation.DocbankSourceID,
+			operation.SourceVersionID, operation.ContentVersionID, operation.DocbankOccurrenceID,
+			operation.DestinationKey, operation.ProcessingKey); err != nil {
+			return fmt.Errorf("save beeper media delivery operation: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return BeeperMediaOperation{}, err
+	}
+	return operation, nil
+}
+
+// FinishBeeperMediaOperation applies a result only when its pending identity
+// still matches. The bool reports whether this completion won. Retention
+// receipts own audio identity; later receipts never replace it.
+func (s *Store) FinishBeeperMediaOperation(
+	ctx context.Context, operation BeeperMediaOperation, result BeeperMediaResult,
+) (bool, error) {
+	if err := validateBeeperMediaOperation(operation); err != nil {
+		return false, err
+	}
+	if operation.OperationID == "" && operation.Kind != BeeperMediaOperationStatus {
+		return false, errors.New("beeper media operation ID is required")
+	}
+	if len(result.ErrorCode) > 128 {
+		return false, errors.New("beeper media error code is too long")
+	}
+	now := time.Now().UTC()
+	retryAt := s.timestampValue(now.Add(beeperMediaRetryDelay))
+	var applied bool
+	err := s.withTxContext(ctx, func(tx *loggedTx) error {
+		q := boundQuerier{ctx: ctx, q: tx}
+		var res sql.Result
+		var err error
+		var retireCode string
+		switch operation.Kind {
+		case BeeperMediaOperationRetain:
+			where := `WHERE destination_key = ? AND occurrence_ref = ? AND revision = ?
+				  AND retention_operation_id = ? AND retention_state IN ('pending', 'source_unavailable')`
+			key := []any{operation.DestinationKey, operation.OccurrenceRef, operation.Revision, operation.OperationID}
+			if result.ErrorCode == "" && result.VaultUID != "" {
+				var boundVault string
+				if err := q.QueryRow(`
+					SELECT vault_uid FROM beeper_media_occurrences
+					WHERE destination_key = ? AND vault_uid <> '' LIMIT 1`,
+					operation.DestinationKey).Scan(&boundVault); err != nil && !errors.Is(err, sql.ErrNoRows) {
+					return fmt.Errorf("read beeper media vault binding: %w", err)
+				}
+				if boundVault != "" && boundVault != result.VaultUID {
+					result = BeeperMediaResult{ErrorCode: "destination_mismatch"}
+				}
+			}
+			if result.ErrorCode != "" {
+				state, next := BeeperMediaRetentionBlocked, any(nil)
+				if result.Revoked {
+					state = BeeperMediaRetentionRevoked
+				} else if result.Retry {
+					state, next = BeeperMediaRetentionPending, retryAt
+				} else if result.SourceUnavailable {
+					state, next = BeeperMediaRetentionSourceUnavailable, retryAt
+				}
+				res, err = q.Exec(`
+					UPDATE beeper_media_occurrences
+					SET retention_state = ?, next_action_at = ?, error_code = ?, updated_at = `+s.dialect.Now()+`
+					`+where, append([]any{state, next, result.ErrorCode}, key...)...)
+				if state == BeeperMediaRetentionBlocked || state == BeeperMediaRetentionRevoked {
+					retireCode = result.ErrorCode
+				}
+				break
+			}
+			res, err = q.Exec(`
+				UPDATE beeper_media_occurrences
+				SET vault_uid = ?, source_id = ?, source_version_id = ?, content_version_id = ?,
+				    occurrence_id = ?, coverage_state = ?, retention_state = 'retained',
+				    next_action_at = NULL, error_code = '', updated_at = `+s.dialect.Now()+`
+				`+where, append([]any{result.VaultUID, result.DocbankSourceID, result.SourceVersionID,
+				result.ContentVersionID, result.DocbankOccurrenceID, result.CoverageState}, key...)...)
+
+		case BeeperMediaOperationArtifact, BeeperMediaOperationProcess:
+			phase := beeperMediaPhasePendingArtifact
+			if operation.Kind == BeeperMediaOperationProcess {
+				phase = beeperMediaPhasePendingProcess
+			}
+			key := []any{operation.DestinationKey, operation.ProcessingKey, operation.OperationID, phase}
+			where := `WHERE destination_key = ? AND processing_key = ? AND pending_operation_id = ? AND phase = ?`
+			switch {
+			case result.ErrorCode != "" && result.Retry:
+				res, err = q.Exec(`
+					UPDATE beeper_media_deliveries
+					SET next_action_at = ?, error_code = ?, updated_at = `+s.dialect.Now()+`
+					`+where, append([]any{retryAt, result.ErrorCode}, key...)...)
+			case result.Terminal && operation.Kind == BeeperMediaOperationProcess:
+				res, err = q.Exec(`
+					UPDATE beeper_media_deliveries
+					SET processing_operation_id = pending_operation_id, job_id = ?, phase = 'done',
+					    operation_state = ?, coverage_state = ?, pending_operation_id = NULL,
+					    frozen_request_json = NULL, next_action_at = NULL, error_code = ?,
+					    updated_at = `+s.dialect.Now()+`
+					`+where, append([]any{result.JobID, result.OperationState, result.CoverageState,
+					result.ErrorCode}, key...)...)
+			case result.ErrorCode != "":
+				res, err = q.Exec(`
+					UPDATE beeper_media_deliveries
+					SET phase = 'blocked', next_action_at = NULL, error_code = ?, updated_at = `+s.dialect.Now()+`
+					`+where, append([]any{result.ErrorCode}, key...)...)
+			case operation.Kind == BeeperMediaOperationArtifact:
+				res, err = q.Exec(`
+					UPDATE beeper_media_deliveries
+					SET supplied_input_id = ?, phase = 'pending-process', pending_operation_id = ?,
+					    frozen_request_json = NULL, next_action_at = ?, error_code = '',
+					    updated_at = `+s.dialect.Now()+`
+					`+where, append([]any{result.SuppliedInputID, newBeeperMediaOperationID(),
+					s.timestampValue(now)}, key...)...)
+			default:
+				res, err = q.Exec(`
+					UPDATE beeper_media_deliveries
+					SET processing_operation_id = pending_operation_id, job_id = ?, phase = 'observing',
+					    operation_state = ?, coverage_state = ?, pending_operation_id = NULL,
+					    frozen_request_json = NULL, next_action_at = ?, error_code = '',
+					    updated_at = `+s.dialect.Now()+`
+					`+where, append([]any{result.JobID, result.OperationState, result.CoverageState,
+					s.timestampValue(now)}, key...)...)
+			}
+
+		case BeeperMediaOperationStatus:
+			phase, next := beeperMediaPhaseObserving, s.timestampValue(now.Add(beeperMediaPollDelay))
+			switch {
+			case result.Retry:
+				next = retryAt
+			case result.Terminal:
+				phase, next = beeperMediaPhaseDone, nil
+			case result.ErrorCode != "":
+				// Keep the job ID so a restart resumes observing after a rejected poll.
+				phase, next = beeperMediaPhaseBlocked, nil
+			}
+			res, err = q.Exec(`
+				UPDATE beeper_media_deliveries
+				SET phase = ?, operation_state = COALESCE(NULLIF(?, ''), operation_state),
+				    coverage_state = COALESCE(NULLIF(?, ''), coverage_state), error_code = ?,
+				    next_action_at = ?, updated_at = `+s.dialect.Now()+`
+				WHERE destination_key = ? AND processing_key = ? AND job_id = ? AND phase = 'observing'`,
+				phase, result.OperationState, result.CoverageState, result.ErrorCode, next,
+				operation.DestinationKey, operation.ProcessingKey, operation.JobID)
+		}
+		if err != nil {
+			return fmt.Errorf("finish beeper media %s operation: %w", operation.Kind, err)
+		}
+		count, err := res.RowsAffected()
+		applied = count == 1
+		if err != nil || !applied || retireCode == "" {
+			return err
+		}
+		return s.retireBeeperMediaDeliveries(q, operation.DestinationKey, operation.OccurrenceRef, retireCode)
+	})
+	return applied, err
+}
+
+// ReconsiderBlockedBeeperMediaOperations lets a daemon start retry remote
+// steps that were blocked by configuration or service capability. Local
+// source gaps stay blocked until the source changes.
+func (s *Store) ReconsiderBlockedBeeperMediaOperations(ctx context.Context, destination string) error {
+	if destination == "" {
+		return errors.New("beeper media destination is required")
+	}
+	now := s.timestampValue(time.Now().UTC())
+	localGaps := `NOT ` + beeperMediaLocalGapFilter()
+	return s.withTxContext(ctx, func(tx *loggedTx) error {
+		q := boundQuerier{ctx: ctx, q: tx}
+		if _, err := q.Exec(`
+			UPDATE beeper_media_occurrences
+			SET retention_state = 'pending', next_action_at = ?, updated_at = `+s.dialect.Now()+`
+			WHERE destination_key = ? AND retention_state = 'blocked' AND retention_operation_id <> ''
+			  AND `+localGaps, append([]any{now, destination}, beeperMediaLocalGapCodes...)...); err != nil {
+			return fmt.Errorf("reconsider blocked beeper media retention: %w", err)
+		}
+		if _, err := q.Exec(`
+			UPDATE beeper_media_deliveries
+			SET phase = `+beeperMediaResumedPhase+`,
+			    next_action_at = ?, updated_at = `+s.dialect.Now()+`
+			WHERE destination_key = ? AND phase = 'blocked' AND `+localGaps,
+			append([]any{now, destination}, beeperMediaLocalGapCodes...)...); err != nil {
+			return fmt.Errorf("reconsider blocked beeper media processing: %w", err)
+		}
+		return nil
+	})
+}
+
+// LoadBeeperMediaScan loads the destination-namespaced rolling checkpoint.
+func (s *Store) LoadBeeperMediaScan(ctx context.Context, destination string) (BeeperMediaScan, error) {
+	return s.loadBeeperMediaScan(ctx, destination, false)
+}
+
+func (s *Store) loadBeeperMediaScan(ctx context.Context, destination string, create bool) (BeeperMediaScan, error) {
+	if destination == "" {
+		return BeeperMediaScan{}, errors.New("beeper media destination is required")
+	}
+	var encoded string
+	err := s.db.QueryRowContext(ctx, s.Rebind(`SELECT value FROM archive_metadata WHERE key = ?`),
+		beeperMediaScanKey(destination)).Scan(&encoded)
+	if errors.Is(err, sql.ErrNoRows) {
+		if !create {
+			return BeeperMediaScan{DestinationKey: destination}, nil
+		}
+		// Persist a unique checkpoint before reading a page so resets reject stale commits.
+		initialValue, marshalErr := json.Marshal(BeeperMediaScan{DestinationKey: destination, Generation: uuid.NewString()})
+		if marshalErr != nil {
+			return BeeperMediaScan{}, marshalErr
+		}
+		err = s.db.QueryRowContext(ctx, s.Rebind(`
+			INSERT INTO archive_metadata (key, value) VALUES (?, ?)
+			ON CONFLICT (key) DO UPDATE SET value = archive_metadata.value
+			RETURNING value`), beeperMediaScanKey(destination), string(initialValue)).Scan(&encoded)
+	}
+	if err != nil {
+		return BeeperMediaScan{}, fmt.Errorf("read beeper media scan: %w", err)
+	}
+	var scan BeeperMediaScan
+	if err := json.Unmarshal([]byte(encoded), &scan); err != nil {
+		return BeeperMediaScan{}, fmt.Errorf("decode beeper media scan: %w", err)
+	}
+	if err := validateBeeperMediaScan(destination, scan); err != nil {
+		return BeeperMediaScan{}, err
+	}
+	return scan, nil
+}
+
+// AdvanceBeeperMediaScan compares and swaps the rolling scan checkpoint.
+func (s *Store) AdvanceBeeperMediaScan(
+	ctx context.Context, destination string, before, after BeeperMediaScan,
+) (bool, error) {
+	return s.advanceBeeperMediaScan(ctx, destination, before, after, true)
+}
+
+func (s *Store) advanceBeeperMediaScan(ctx context.Context, destination string, before, after BeeperMediaScan, initialize bool) (bool, error) {
+	if err := errors.Join(validateBeeperMediaScan(destination, before),
+		validateBeeperMediaScan(destination, after)); err != nil {
+		return false, err
+	}
+	oldValue, err := json.Marshal(before)
+	if err != nil {
+		return false, err
+	}
+	newValue, err := json.Marshal(after)
+	if err != nil {
+		return false, err
+	}
+	var swapped bool
+	err = s.withTxContext(ctx, func(tx *loggedTx) error {
+		q := boundQuerier{ctx: ctx, q: tx}
+		if initialize {
+			if _, err := q.Exec(`INSERT INTO archive_metadata (key, value) VALUES (?, ?) ON CONFLICT (key) DO NOTHING`, beeperMediaScanKey(destination), string(oldValue)); err != nil {
+				return fmt.Errorf("initialize beeper media scan: %w", err)
+			}
+		}
+		result, err := q.Exec(`UPDATE archive_metadata SET value = ? WHERE key = ? AND value = ?`, string(newValue), beeperMediaScanKey(destination), string(oldValue))
+		if err != nil {
+			return fmt.Errorf("advance beeper media scan: %w", err)
+		}
+		count, err := result.RowsAffected()
+		swapped = count == 1
+		return err
+	})
+	return swapped, err
+}
+
+func validateBeeperMediaScan(destination string, scan BeeperMediaScan) error {
+	if destination == "" || scan.DestinationKey != destination || scan.AfterAttachmentID < 0 ||
+		scan.PassHighWater < 0 || scan.BaselineSequence < 0 {
+		return errors.New("invalid beeper media scan checkpoint")
+	}
+	return nil
+}
+
+func validateBeeperMediaMapping(mapping BeeperMediaMapping) error {
+	for _, field := range []struct{ name, value string }{
+		{"destination", mapping.DestinationKey}, {"occurrence reference", mapping.OccurrenceRef},
+		{"revision", mapping.Revision}, {"source identifier", mapping.SourceIdentifier},
+		{"message", mapping.SourceMessageID}, {"part", mapping.SourcePartKey},
+		{"occurrence JSON", mapping.OccurrenceJSON}, {"filename", mapping.Filename},
+	} {
+		if strings.TrimSpace(field.value) == "" {
+			return fmt.Errorf("beeper media %s is required", field.name)
+		}
+	}
+	if strings.TrimSpace(mapping.SourceType) == "" {
+		return errors.New("beeper media source type is invalid")
+	}
+	if mapping.ByteLength < 1 || !isBeeperMediaSHA256(mapping.SourceSHA256) {
+		return errors.New("beeper media source identity is invalid")
+	}
+	if err := validateBeeperMediaJSON(mapping.OccurrenceJSON); err != nil {
+		return err
+	}
+	switch mapping.RetentionState {
+	case "", BeeperMediaRetentionPending, BeeperMediaRetentionBlocked:
+	default:
+		return errors.New("beeper media reconciliation state is invalid")
+	}
+	return nil
+}
+
+func validateBeeperMediaOperation(operation BeeperMediaOperation) error {
+	if operation.DestinationKey == "" {
+		return errors.New("beeper media operation destination is required")
+	}
+	switch operation.Kind {
+	case BeeperMediaOperationRetain:
+		if operation.OccurrenceRef == "" || operation.Revision == "" {
+			return errors.New("beeper media retention operation identity is required")
+		}
+	case BeeperMediaOperationArtifact, BeeperMediaOperationProcess, BeeperMediaOperationStatus:
+		if operation.ProcessingKey == "" {
+			return errors.New("beeper media processing key is required")
+		}
+	default:
+		return errors.New("beeper media operation kind is invalid")
+	}
+	if operation.OperationID != "" {
+		id, err := uuid.Parse(operation.OperationID)
+		if err != nil || id.Version() != 4 || id.Variant() != uuid.RFC4122 {
+			return errors.New("beeper media operation ID must be UUIDv4")
+		}
+	}
+	return nil
+}
+
+func beeperMediaOccurrenceColumns(alias string) string {
+	columns := []string{"destination_key", "occurrence_ref", "revision", "source_type",
+		"source_identifier", "source_conversation_id", "source_message_id", "source_attachment_id",
+		"source_part_key", "source_row_id", "message_id", "attachment_id", "source_sha256",
+		"byte_length", "raw_hash", "transcript_sha256", "language", "occurrence_json",
+		"request_filename", "request_mime_type", "retention_operation_id", "retention_state",
+		"next_action_at", "error_code", "vault_uid", "source_id", "source_version_id",
+		"content_version_id", "occurrence_id", "coverage_state", "processing_key"}
+	for i := range columns {
+		columns[i] = alias + "." + columns[i]
+	}
+	return strings.Join(columns, ", ")
+}
+
+func beeperMediaDeliveryProfile(mapping BeeperMediaMapping) (string, string) {
+	return strings.TrimSpace(mapping.ProcessingProvider), strings.TrimSpace(mapping.ProcessingProfile)
+}
+
+// beeperMediaNextActionIndex is next_action_at's position in the column list.
+const beeperMediaNextActionIndex = 22
+
+func beeperMediaOccurrenceScanTargets(m *BeeperMediaMapping) []any {
+	return []any{&m.DestinationKey, &m.OccurrenceRef, &m.Revision, &m.SourceType,
+		&m.SourceIdentifier, &m.SourceConversationID, &m.SourceMessageID, &m.SourceAttachmentID,
+		&m.SourcePartKey, &m.LocalSourceID, &m.MessageID, &m.AttachmentID, &m.SourceSHA256,
+		&m.ByteLength, &m.RawHash, &m.TranscriptSHA256, &m.Language, &m.OccurrenceJSON,
+		&m.Filename, &m.MIMEType, &m.RetentionOperationID, &m.RetentionState,
+		nil, &m.ErrorCode, &m.VaultUID, &m.DocbankSourceID, &m.SourceVersionID,
+		&m.ContentVersionID, &m.DocbankOccurrenceID, &m.CoverageState, &m.ProcessingKey}
+}
+
+func (s *Store) readBeeperMediaOccurrence(
+	q boundQuerier, destination, occurrenceRef, revision string,
+) (BeeperMediaMapping, error) {
+	var mapping BeeperMediaMapping
+	var next sql.NullTime
+	dest := beeperMediaOccurrenceScanTargets(&mapping)
+	dest[beeperMediaNextActionIndex] = &next
+	err := q.QueryRow(`SELECT `+beeperMediaOccurrenceColumns("o")+`
+		FROM beeper_media_occurrences o
+		WHERE o.destination_key = ? AND o.occurrence_ref = ? AND o.revision = ?`,
+		destination, occurrenceRef, revision).Scan(dest...)
+	mapping.NextActionAt = nullTimeValue(next)
+	return mapping, err
+}
+
+func (s *Store) insertBeeperMediaOccurrence(q boundQuerier, m BeeperMediaMapping) error {
+	_, err := q.Exec(`
+		INSERT INTO beeper_media_occurrences
+			(destination_key, occurrence_ref, revision, source_type, source_identifier,
+			 source_conversation_id, source_message_id, source_attachment_id, source_part_key,
+			 source_row_id, message_id, attachment_id, source_sha256, byte_length, raw_hash,
+			 transcript_sha256, language, occurrence_json, request_filename, request_mime_type,
+			 retention_operation_id, retention_state, next_action_at, error_code,
+			 processing_key, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+		        `+s.dialect.Now()+`, `+s.dialect.Now()+`)`,
+		m.DestinationKey, m.OccurrenceRef, m.Revision, m.SourceType, m.SourceIdentifier,
+		m.SourceConversationID, m.SourceMessageID, m.SourceAttachmentID, m.SourcePartKey,
+		m.LocalSourceID, m.MessageID, m.AttachmentID, m.SourceSHA256, m.ByteLength, m.RawHash,
+		m.TranscriptSHA256, m.Language, m.OccurrenceJSON, m.Filename, m.MIMEType,
+		m.RetentionOperationID, m.RetentionState, s.timestampValue(m.NextActionAt), m.ErrorCode,
+		m.ProcessingKey)
+	if err != nil {
+		return fmt.Errorf("insert beeper media occurrence: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) updateBeeperMediaOccurrence(q boundQuerier, m BeeperMediaMapping) error {
+	_, err := q.Exec(`
+		UPDATE beeper_media_occurrences
+		SET source_identifier = ?, source_conversation_id = ?, source_message_id = ?,
+		    source_attachment_id = ?, source_part_key = ?, source_row_id = ?, message_id = ?,
+		    attachment_id = ?, raw_hash = ?, retention_operation_id = ?, retention_state = ?,
+		    next_action_at = ?, error_code = ?, processing_key = ?, updated_at = `+s.dialect.Now()+`
+		WHERE destination_key = ? AND occurrence_ref = ? AND revision = ?`,
+		m.SourceIdentifier, m.SourceConversationID, m.SourceMessageID, m.SourceAttachmentID,
+		m.SourcePartKey, m.LocalSourceID, m.MessageID, m.AttachmentID, m.RawHash,
+		m.RetentionOperationID, m.RetentionState, s.timestampValue(m.NextActionAt), m.ErrorCode,
+		m.ProcessingKey,
+		m.DestinationKey, m.OccurrenceRef, m.Revision)
+	if err != nil {
+		return fmt.Errorf("update beeper media occurrence: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) timestampValue(value time.Time) any {
+	if value.IsZero() {
+		return nil
+	}
+	return s.dialect.TimestampParam(value)
+}
+
+func nullTimeValue(value sql.NullTime) time.Time {
+	if !value.Valid {
+		return time.Time{}
+	}
+	return value.Time.UTC()
+}
+
+func beeperMediaScanKey(destination string) string {
+	return "beeper_media_scan:" + destination
+}
+
+func newBeeperMediaOperationID() string {
+	return uuid.New().String()
+}
+
+func isBeeperMediaSHA256(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, char := range value {
+		if (char < '0' || char > '9') && (char < 'a' || char > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func validateBeeperMediaJSON(value string) error {
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(value), &raw); err != nil {
+		return errors.New("beeper media occurrence JSON is invalid")
+	}
+	return nil
+}

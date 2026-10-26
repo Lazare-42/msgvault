@@ -19,6 +19,7 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
 type relationshipIndexHTTPFixture struct {
@@ -41,10 +42,7 @@ func newRelationshipIndexHTTPFixture(t *testing.T) relationshipIndexHTTPFixture 
 
 	root := t.TempDir()
 	dbPath := filepath.Join(root, "msgvault.db")
-	st, err := store.OpenForTest(dbPath)
-	requirementsForTest.NoError(err)
-	t.Cleanup(func() { require.NoError(t, st.Close()) })
-	requirementsForTest.NoError(st.InitSchema())
+	st := testutil.NewSQLiteTestStoreAt(t, dbPath)
 
 	source, err := st.GetOrCreateSource("gmail", "owner@example.test")
 	requirementsForTest.NoError(err)
@@ -136,6 +134,8 @@ func (f relationshipIndexHTTPFixture) newServer(t *testing.T, disableLegacyViews
 		Data:    config.DataConfig{DataDir: filepath.Dir(f.dbPath)},
 		Server:  config.ServerConfig{APIPort: 8080},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	server := api.NewServerWithOptions(api.ServerOptions{
 		Config: cfg,
 		Store: &storeAPIAdapter{

@@ -23,6 +23,7 @@ import (
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/export"
 	"go.kenn.io/msgvault/internal/googledocs"
@@ -206,31 +207,9 @@ type paginatedListMessages struct {
 	HasMore  bool                   `json:"has_more"`
 }
 
-type compactMessageSummary struct {
-	ID                   int64  `json:"id"`
-	SourceMessageID      string `json:"source_message_id"`
-	ConversationID       int64  `json:"conversation_id"`
-	SourceConversationID string `json:"source_conversation_id"`
-	Subject              string `json:"subject"`
-	FromEmail            string `json:"from_email"`
-	FromName             string `json:"from_name"`
-	SentAt               string `json:"sent_at"`
-	HasAttachments       bool   `json:"has_attachments"`
-}
-
-// paginatedCompactMessages is the default (compact) search/list response:
-// a paginated envelope whose Data is the compact summary projection.
-type paginatedCompactMessages struct {
-	Data     []compactMessageSummary `json:"data"`
-	Total    int64                   `json:"total"`
-	Returned int                     `json:"returned"`
-	Offset   int                     `json:"offset"`
-	HasMore  bool                    `json:"has_more"`
-}
-
 // newTestHandlers creates a handlers instance with the given mock engine.
 func newTestHandlers(eng query.Engine) *handlers {
-	return &handlers{engine: eng}
+	return &handlers{engine: eng, downloads: &downloadCache{}}
 }
 
 type listAccountsTrackingEngine struct {
@@ -275,617 +254,6 @@ func runToolExpectError(t *testing.T, name string, fn toolHandler, args map[stri
 	r := callToolDirect(t, name, fn, args)
 	require.True(t, r.isError, "expected error result")
 	return r
-}
-
-func TestWhatsAppStatusUsesWhatsAppAccountScope(t *testing.T) {
-	eng := &querytest.MockEngine{
-		Accounts: []query.AccountInfo{
-			{ID: 1, SourceType: "gmail", Identifier: "lazare@example.com"},
-			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
-		},
-	}
-	var factoryAccount string
-	client := &mockWhatsAppClient{
-		status: whatsapplive.Status{
-			Account:    "15551234567@s.whatsapp.net",
-			AccountJID: "15551234567@s.whatsapp.net",
-			Paired:     true,
-			Connected:  true,
-			LoggedIn:   true,
-		},
-	}
-	h := &handlers{
-		engine: eng,
-		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
-			factoryAccount = account
-			return client, nil
-		},
-	}
-
-	status := runTool[whatsapplive.Status](t, ToolWhatsAppStatus, h.whatsAppStatus, map[string]any{})
-	assert.Equal(t, "15551234567@s.whatsapp.net", factoryAccount)
-	assert.True(t, status.Paired)
-	assert.True(t, status.Ready)
-	assert.Equal(t, "15551234567@s.whatsapp.net", status.AccountJID)
-}
-
-func TestWhatsAppStartLoginReturnsQRPayload(t *testing.T) {
-	eng := &querytest.MockEngine{}
-	client := &mockWhatsAppClient{
-		loginState: whatsapplive.LoginState{
-			Status: whatsapplive.Status{Paired: false},
-			Pairing: whatsapplive.QRPairingState{
-				Active: true,
-				Code:   "test-qr-code",
-				Event:  "code",
-			},
-		},
-	}
-	h := &handlers{
-		engine:           eng,
-		whatsAppLoginURL: "https://whats.lazare.ai/work/qr",
-		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
-			assert.Empty(t, account)
-			return client, nil
-		},
-	}
-
-	result := runTool[whatsAppLoginResponse](t, ToolWhatsAppStartLogin, h.whatsAppStartLogin, map[string]any{
-		"include_qr_png": false,
-		"wait_ms":        float64(0),
-	})
-	assert.True(t, result.NeedsPairing)
-	assert.Equal(t, "test-qr-code", result.QRCode)
-	assert.Empty(t, result.QRPNGBase64)
-	assert.Equal(t, "https://whats.lazare.ai/work/qr", result.QRPageURL)
-}
-
-func TestWhatsAppLoginStatusCanIncludeQRPNG(t *testing.T) {
-	eng := &querytest.MockEngine{}
-	client := &mockWhatsAppClient{
-		loginState: whatsapplive.LoginState{
-			Status: whatsapplive.Status{Paired: false},
-			Pairing: whatsapplive.QRPairingState{
-				Active: true,
-				Code:   "test-qr-code",
-				Event:  "code",
-			},
-		},
-	}
-	h := &handlers{
-		engine: eng,
-		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
-			assert.Empty(t, account)
-			return client, nil
-		},
-	}
-
-	result := runTool[whatsAppLoginResponse](t, ToolWhatsAppLoginStatus, h.whatsAppLoginStatus, map[string]any{})
-	assert.Equal(t, "test-qr-code", result.QRCode)
-	assert.NotEmpty(t, result.QRPNGBase64)
-}
-
-func TestWhatsAppLoginStatusReportsPairedButNotReady(t *testing.T) {
-	eng := &querytest.MockEngine{}
-	client := &mockWhatsAppClient{
-		loginState: whatsapplive.LoginState{
-			Status: whatsapplive.Status{
-				AccountJID: "15551234567@s.whatsapp.net",
-				Paired:     true,
-				Connected:  true,
-				LoggedIn:   false,
-			},
-			Pairing: whatsapplive.QRPairingState{
-				Active: false,
-				Paired: true,
-			},
-		},
-	}
-	h := &handlers{
-		engine: eng,
-		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
-			assert.Empty(t, account)
-			return client, nil
-		},
-	}
-
-	result := runTool[whatsAppLoginResponse](t, ToolWhatsAppLoginStatus, h.whatsAppLoginStatus, map[string]any{})
-	assert.True(t, result.AlreadyPaired)
-	assert.False(t, result.NeedsPairing)
-	assert.False(t, result.Ready)
-	assert.False(t, result.Status.Ready)
-	assert.True(t, result.NeedsReconnect)
-	assert.True(t, result.NeedsAuth)
-	assert.Equal(t, 5, result.PollAfterSecs)
-}
-
-func TestWhatsAppLogoutRequiresConfirm(t *testing.T) {
-	eng := &querytest.MockEngine{}
-	var called bool
-	client := &mockWhatsAppClient{
-		logout: func(context.Context, whatsapplive.LogoutRequest) (whatsapplive.LogoutResult, error) {
-			called = true
-			return whatsapplive.LogoutResult{}, nil
-		},
-	}
-	h := &handlers{
-		engine: eng,
-		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
-			assert.Empty(t, account)
-			return client, nil
-		},
-	}
-
-	result := runToolExpectError(t, ToolWhatsAppLogout, h.whatsAppLogout, map[string]any{})
-	assert.Contains(t, resultText(t, result), "confirm=true is required")
-	assert.False(t, called)
-}
-
-func TestWhatsAppLogoutForwardsForceLocal(t *testing.T) {
-	eng := &querytest.MockEngine{
-		Accounts: []query.AccountInfo{
-			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
-		},
-	}
-	var gotReq whatsapplive.LogoutRequest
-	client := &mockWhatsAppClient{
-		logout: func(_ context.Context, req whatsapplive.LogoutRequest) (whatsapplive.LogoutResult, error) {
-			gotReq = req
-			return whatsapplive.LogoutResult{
-				StatusBefore: whatsapplive.Status{
-					AccountJID: "15551234567@s.whatsapp.net",
-					Paired:     true,
-					Connected:  true,
-				},
-				StatusAfter:         whatsapplive.Status{},
-				RemoteLogout:        true,
-				LocalSessionCleared: true,
-			}, nil
-		},
-	}
-	h := &handlers{
-		engine: eng,
-		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
-			assert.Equal(t, "15551234567@s.whatsapp.net", account)
-			return client, nil
-		},
-	}
-
-	result := runTool[whatsapplive.LogoutResult](t, ToolWhatsAppLogout, h.whatsAppLogout, map[string]any{
-		"confirm":     true,
-		"force_local": false,
-	})
-	assert.Equal(t, "15551234567@s.whatsapp.net", gotReq.Account)
-	assert.False(t, gotReq.ForceLocal)
-	assert.True(t, result.RemoteLogout)
-	assert.True(t, result.LocalSessionCleared)
-}
-
-func TestSendWhatsAppMessage(t *testing.T) {
-	eng := &querytest.MockEngine{
-		Accounts: []query.AccountInfo{
-			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
-		},
-	}
-	var gotReq whatsapplive.SendMessageRequest
-	client := &mockWhatsAppClient{
-		status: whatsapplive.Status{
-			Paired:    true,
-			Connected: true,
-			LoggedIn:  true,
-		},
-		sendMessage: func(_ context.Context, req whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error) {
-			gotReq = req
-			return whatsapplive.SendResult{
-				LocalRequestID:  req.LocalRequestID,
-				OutboxID:        7,
-				MessageID:       8,
-				RemoteMessageID: "remote-1",
-				ChatJID:         req.ChatID,
-				Status:          "sent",
-			}, nil
-		},
-	}
-	h := &handlers{
-		engine: eng,
-		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
-			assert.Equal(t, "15551234567@s.whatsapp.net", account)
-			return client, nil
-		},
-	}
-
-	result := runTool[whatsapplive.SendResult](t, ToolSendWhatsAppMessage, h.sendWhatsAppMessage, map[string]any{
-		"chat_id":          "15557654321@s.whatsapp.net",
-		"body":             "hello",
-		"local_request_id": "req-1",
-	})
-	assert.Equal(t, "15557654321@s.whatsapp.net", gotReq.ChatID)
-	assert.Equal(t, "hello", gotReq.Body)
-	assert.Equal(t, "req-1", gotReq.LocalRequestID)
-	assert.Equal(t, int64(8), result.MessageID)
-	assert.Equal(t, "remote-1", result.RemoteMessageID)
-}
-
-func TestSendWhatsAppMessageRejectsNotReady(t *testing.T) {
-	eng := &querytest.MockEngine{
-		Accounts: []query.AccountInfo{
-			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
-		},
-	}
-	var called bool
-	client := &mockWhatsAppClient{
-		status: whatsapplive.Status{
-			AccountJID: "15551234567@s.whatsapp.net",
-			Paired:     true,
-			Connected:  true,
-			LoggedIn:   false,
-		},
-		sendMessage: func(context.Context, whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error) {
-			called = true
-			return whatsapplive.SendResult{}, errors.New("send should not be called")
-		},
-	}
-	h := &handlers{
-		engine: eng,
-		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
-			assert.Equal(t, "15551234567@s.whatsapp.net", account)
-			return client, nil
-		},
-	}
-
-	result := runToolExpectError(t, ToolSendWhatsAppMessage, h.sendWhatsAppMessage, map[string]any{
-		"chat_id": "15557654321@s.whatsapp.net",
-		"body":    "hello",
-	})
-	assert.Contains(t, resultText(t, result), "ready=true")
-	assert.False(t, called)
-}
-
-func TestWhatsAppRequestHistorySync(t *testing.T) {
-	eng := &querytest.MockEngine{
-		Accounts: []query.AccountInfo{
-			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
-		},
-	}
-	var gotReq whatsapplive.RequestHistorySyncRequest
-	anchorTime := time.Date(2022, 1, 1, 0, 0, 0, 0, time.UTC)
-	client := &mockWhatsAppClient{
-		status: whatsapplive.Status{
-			Paired:    true,
-			Connected: true,
-			LoggedIn:  true,
-		},
-		requestHistorySync: func(_ context.Context, req whatsapplive.RequestHistorySyncRequest) (whatsapplive.RequestHistorySyncResult, error) {
-			gotReq = req
-			return whatsapplive.RequestHistorySyncResult{
-				ChatJID:         req.ChatID,
-				AnchorMessageID: "anchor-msg",
-				AnchorTimestamp: anchorTime,
-				AnchorIsFromMe:  true,
-				RequestedCount:  req.Count,
-			}, nil
-		},
-	}
-	h := &handlers{
-		engine: eng,
-		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
-			assert.Equal(t, "15551234567@s.whatsapp.net", account)
-			return client, nil
-		},
-	}
-
-	result := runTool[struct {
-		whatsapplive.RequestHistorySyncResult
-		Message string `json:"message"`
-	}](t, ToolWhatsAppRequestHistorySync, h.whatsAppRequestHistorySync, map[string]any{
-		"chat_id": "15557654321@s.whatsapp.net",
-		"count":   float64(30),
-	})
-	assert.Equal(t, "15557654321@s.whatsapp.net", gotReq.ChatID)
-	assert.Equal(t, 30, gotReq.Count)
-	assert.Equal(t, "anchor-msg", result.AnchorMessageID)
-	assert.Equal(t, 30, result.RequestedCount)
-	assert.NotEmpty(t, result.Message)
-}
-
-func TestWhatsAppRequestHistorySyncDefaultsCount(t *testing.T) {
-	eng := &querytest.MockEngine{
-		Accounts: []query.AccountInfo{
-			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
-		},
-	}
-	var gotReq whatsapplive.RequestHistorySyncRequest
-	client := &mockWhatsAppClient{
-		status: whatsapplive.Status{Paired: true, Connected: true, LoggedIn: true},
-		requestHistorySync: func(_ context.Context, req whatsapplive.RequestHistorySyncRequest) (whatsapplive.RequestHistorySyncResult, error) {
-			gotReq = req
-			return whatsapplive.RequestHistorySyncResult{RequestedCount: req.Count}, nil
-		},
-	}
-	h := &handlers{
-		engine: eng,
-		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
-			return client, nil
-		},
-	}
-
-	runTool[struct {
-		whatsapplive.RequestHistorySyncResult
-		Message string `json:"message"`
-	}](t, ToolWhatsAppRequestHistorySync, h.whatsAppRequestHistorySync, map[string]any{
-		"chat_id": "15557654321@s.whatsapp.net",
-	})
-	assert.Equal(t, whatsapplive.DefaultHistorySyncRequestCount, gotReq.Count)
-}
-
-func TestWhatsAppRequestHistorySyncRejectsNotReady(t *testing.T) {
-	eng := &querytest.MockEngine{
-		Accounts: []query.AccountInfo{
-			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
-		},
-	}
-	var called bool
-	client := &mockWhatsAppClient{
-		status: whatsapplive.Status{
-			AccountJID: "15551234567@s.whatsapp.net",
-			Paired:     true,
-			Connected:  true,
-			LoggedIn:   false,
-		},
-		requestHistorySync: func(context.Context, whatsapplive.RequestHistorySyncRequest) (whatsapplive.RequestHistorySyncResult, error) {
-			called = true
-			return whatsapplive.RequestHistorySyncResult{}, errors.New("request should not be called")
-		},
-	}
-	h := &handlers{
-		engine: eng,
-		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
-			return client, nil
-		},
-	}
-
-	result := runToolExpectError(t, ToolWhatsAppRequestHistorySync, h.whatsAppRequestHistorySync, map[string]any{
-		"chat_id": "15557654321@s.whatsapp.net",
-	})
-	assert.Contains(t, resultText(t, result), "ready=true")
-	assert.False(t, called)
-}
-
-func TestWhatsAppRequestHistorySyncRequiresChatID(t *testing.T) {
-	client := &mockWhatsAppClient{
-		status: whatsapplive.Status{Paired: true, Connected: true, LoggedIn: true},
-	}
-	h := &handlers{
-		engine: &querytest.MockEngine{},
-		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
-			return client, nil
-		},
-	}
-
-	result := runToolExpectError(t, ToolWhatsAppRequestHistorySync, h.whatsAppRequestHistorySync, map[string]any{})
-	assert.Contains(t, resultText(t, result), "chat_id")
-}
-
-func TestSendWhatsAppReactionAllowsEmptyEmojiToClear(t *testing.T) {
-	eng := &querytest.MockEngine{
-		Accounts: []query.AccountInfo{
-			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
-		},
-	}
-	var gotReq whatsapplive.SendReactionRequest
-	client := &mockWhatsAppClient{
-		status: whatsapplive.Status{
-			Paired:    true,
-			Connected: true,
-			LoggedIn:  true,
-		},
-		sendReaction: func(_ context.Context, req whatsapplive.SendReactionRequest) (whatsapplive.SendResult, error) {
-			gotReq = req
-			return whatsapplive.SendResult{
-				LocalRequestID: req.LocalRequestID,
-				MessageID:      req.MessageID,
-				Status:         "sent",
-			}, nil
-		},
-	}
-	h := &handlers{
-		engine: eng,
-		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
-			assert.Equal(t, "15551234567@s.whatsapp.net", account)
-			return client, nil
-		},
-	}
-
-	result := runTool[whatsapplive.SendResult](t, ToolSendWhatsAppReaction, h.sendWhatsAppReaction, map[string]any{
-		"message_id":       float64(42),
-		"emoji":            "",
-		"local_request_id": "react-1",
-	})
-	assert.Equal(t, int64(42), gotReq.MessageID)
-	assert.Equal(t, "", gotReq.Emoji)
-	assert.Equal(t, "react-1", gotReq.LocalRequestID)
-	assert.Equal(t, int64(42), result.MessageID)
-}
-
-func TestGoogleDocsHandlers(t *testing.T) {
-	t.Run("list forwards filters", func(t *testing.T) {
-		assert := assert.New(t)
-		client := &mockGoogleDocsClient{
-			listDocs: func(_ context.Context, sourceName, query string, limit int) ([]googledocs.File, error) {
-				assert.Equal("work", sourceName, "sourceName")
-				assert.Equal("roadmap", query, "query")
-				assert.Equal(7, limit, "limit")
-				return []googledocs.File{{
-					Source:     "work",
-					DocumentID: "doc-1",
-					Name:       "Roadmap",
-				}}, nil
-			},
-		}
-		h := &handlers{
-			engine: &querytest.MockEngine{},
-			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
-				return client, nil
-			},
-		}
-
-		files := runTool[[]googledocs.File](t, ToolListGoogleDocs, h.listGoogleDocs, map[string]any{
-			"source": "work",
-			"query":  "roadmap",
-			"limit":  float64(7),
-		})
-		require.Len(t, files, 1, "files")
-		assert.Equal("doc-1", files[0].DocumentID, "document_id")
-	})
-
-	t.Run("get returns bounded text", func(t *testing.T) {
-		assert := assert.New(t)
-		client := &mockGoogleDocsClient{
-			getDoc: func(_ context.Context, sourceName, documentID string, maxChars int) (*googledocs.Document, error) {
-				assert.Equal("work", sourceName, "sourceName")
-				assert.Equal("doc-1", documentID, "documentID")
-				assert.Equal(50, maxChars, "maxChars")
-				return &googledocs.Document{
-					File:       googledocs.File{Source: "work", DocumentID: "doc-1", Name: "Notes"},
-					Text:       "body",
-					TextLength: 4,
-				}, nil
-			},
-		}
-		h := &handlers{
-			engine: &querytest.MockEngine{},
-			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
-				return client, nil
-			},
-		}
-
-		doc := runTool[googledocs.Document](t, ToolGetGoogleDoc, h.getGoogleDoc, map[string]any{
-			"source":      "work",
-			"document_id": "doc-1",
-			"max_chars":   float64(50),
-		})
-		assert.Equal("body", doc.Text, "text")
-	})
-
-	t.Run("search returns snippets", func(t *testing.T) {
-		client := &mockGoogleDocsClient{
-			listDocs: func(context.Context, string, string, int) ([]googledocs.File, error) {
-				return []googledocs.File{{
-					Source:     "work",
-					DocumentID: "doc-1",
-					Name:       "Strategy",
-				}}, nil
-			},
-			getDoc: func(_ context.Context, sourceName, documentID string, maxChars int) (*googledocs.Document, error) {
-				assert.Equal(t, "work", sourceName, "sourceName")
-				assert.Equal(t, "doc-1", documentID, "documentID")
-				assert.Equal(t, maxGoogleDocsMaxChars, maxChars, "maxChars")
-				return &googledocs.Document{
-					File:       googledocs.File{Source: "work", DocumentID: "doc-1", Name: "Strategy"},
-					Text:       "intro alpha beta target phrase gamma delta conclusion",
-					TextLength: 53,
-				}, nil
-			},
-		}
-		h := &handlers{
-			engine: &querytest.MockEngine{},
-			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
-				return client, nil
-			},
-		}
-
-		results := runTool[[]googleDocsSearchResult](t, ToolSearchGoogleDocs, h.searchGoogleDocs, map[string]any{
-			"query":         "target",
-			"snippet_chars": float64(20),
-		})
-		require.Len(t, results, 1, "results")
-		assert.Contains(t, results[0].Snippet, "target", "snippet")
-	})
-
-	t.Run("append forwards text unchanged", func(t *testing.T) {
-		assert := assert.New(t)
-		client := &mockGoogleDocsClient{
-			appendText: func(_ context.Context, sourceName, documentID, text string) (*googledocs.AppendResult, error) {
-				assert.Equal("work", sourceName, "sourceName")
-				assert.Equal("doc-1", documentID, "documentID")
-				assert.Equal("\nnew note", text, "text")
-				return &googledocs.AppendResult{
-					Source:        sourceName,
-					DocumentID:    documentID,
-					InsertedChars: 9,
-					Status:        "appended",
-				}, nil
-			},
-		}
-		h := &handlers{
-			engine: &querytest.MockEngine{},
-			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
-				return client, nil
-			},
-		}
-
-		result := runTool[googledocs.AppendResult](t, ToolAppendGoogleDocText, h.appendGoogleDocText, map[string]any{
-			"source":      "work",
-			"document_id": "doc-1",
-			"text":        "\nnew note",
-		})
-		assert.Equal("appended", result.Status, "status")
-	})
-
-	t.Run("replace accepts explicit empty replacement", func(t *testing.T) {
-		assert := assert.New(t)
-		client := &mockGoogleDocsClient{
-			replaceText: func(_ context.Context, sourceName, documentID, find, replacement string, matchCase bool) (*googledocs.ReplaceResult, error) {
-				assert.Equal("work", sourceName, "sourceName")
-				assert.Equal("doc-1", documentID, "documentID")
-				assert.Equal("remove me", find, "find")
-				assert.Equal("", replacement, "replacement")
-				assert.True(matchCase, "matchCase")
-				return &googledocs.ReplaceResult{
-					Source:             sourceName,
-					DocumentID:         documentID,
-					OccurrencesChanged: 2,
-					Status:             "replaced",
-				}, nil
-			},
-		}
-		h := &handlers{
-			engine: &querytest.MockEngine{},
-			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
-				return client, nil
-			},
-		}
-
-		result := runTool[googledocs.ReplaceResult](t, ToolReplaceGoogleDocText, h.replaceGoogleDocText, map[string]any{
-			"source":      "work",
-			"document_id": "doc-1",
-			"find":        "remove me",
-			"replacement": "",
-			"match_case":  true,
-		})
-		assert.Equal(int64(2), result.OccurrencesChanged, "occurrences_changed")
-	})
-}
-func TestJSONResultIsStructured(t *testing.T) {
-	must := require.New(t)
-	localResult, err := jsonResult(map[string]any{
-		"count": float64(2),
-		"items": []any{"alpha", "beta"},
-	})
-	must.NoError(err)
-	wireResult, output, err := officialToolHandler(func(context.Context, toolRequest) (*toolResult, error) {
-		return localResult, nil
-	})(context.Background(), &sdkmcp.CallToolRequest{}, map[string]any{})
-	must.NoError(err)
-	must.NotNil(wireResult)
-
-	var textPayload any
-	must.NoError(json.Unmarshal([]byte(resultText(t, localResult)), &textPayload))
-	var outputPayload any
-	outputJSON, err := json.Marshal(output)
-	must.NoError(err)
-	must.NoError(json.Unmarshal(outputJSON, &outputPayload))
-	assert.Equal(t, textPayload, outputPayload)
 }
 
 func TestToolErrorHasNoStructuredOutput(t *testing.T) {
@@ -946,13 +314,609 @@ func TestErrorIsolationMiddlewarePreservesWrappedJSONRPCErrors(t *testing.T) {
 	checks.Same(protocolErr, gotProtocolErr)
 }
 
+func TestWhatsAppStatusUsesWhatsAppAccountScope(t *testing.T) {
+	assert := assert.New(t)
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 1, SourceType: "gmail", Identifier: "lazare@example.com"},
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var factoryAccount string
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			Account:    "15551234567@s.whatsapp.net",
+			AccountJID: "15551234567@s.whatsapp.net",
+			Paired:     true,
+			Connected:  true,
+			LoggedIn:   true,
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			factoryAccount = account
+			return client, nil
+		},
+	}
+
+	status := runTool[whatsapplive.Status](t, ToolWhatsAppStatus, h.whatsAppStatus, map[string]any{})
+	assert.Equal("15551234567@s.whatsapp.net", factoryAccount)
+	assert.True(status.Paired)
+	assert.True(status.Ready)
+	assert.Equal("15551234567@s.whatsapp.net", status.AccountJID)
+}
+
+func TestWhatsAppStartLoginReturnsQRPayload(t *testing.T) {
+	assert := assert.New(t)
+	eng := &querytest.MockEngine{}
+	client := &mockWhatsAppClient{
+		loginState: whatsapplive.LoginState{
+			Status: whatsapplive.Status{Paired: false},
+			Pairing: whatsapplive.QRPairingState{
+				Active: true,
+				Code:   "test-qr-code",
+				Event:  "code",
+			},
+		},
+	}
+	h := &handlers{
+		engine:           eng,
+		whatsAppLoginURL: "https://whats.lazare.ai/work/qr",
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Empty(account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsAppLoginResponse](t, ToolWhatsAppStartLogin, h.whatsAppStartLogin, map[string]any{
+		"include_qr_png": false,
+		"wait_ms":        float64(0),
+	})
+	assert.True(result.NeedsPairing)
+	assert.Equal("test-qr-code", result.QRCode)
+	assert.Empty(result.QRPNGBase64)
+	assert.Equal("https://whats.lazare.ai/work/qr", result.QRPageURL)
+}
+
+func TestWhatsAppLoginStatusCanIncludeQRPNG(t *testing.T) {
+	eng := &querytest.MockEngine{}
+	client := &mockWhatsAppClient{
+		loginState: whatsapplive.LoginState{
+			Status: whatsapplive.Status{Paired: false},
+			Pairing: whatsapplive.QRPairingState{
+				Active: true,
+				Code:   "test-qr-code",
+				Event:  "code",
+			},
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Empty(t, account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsAppLoginResponse](t, ToolWhatsAppLoginStatus, h.whatsAppLoginStatus, map[string]any{})
+	assert.Equal(t, "test-qr-code", result.QRCode)
+	assert.NotEmpty(t, result.QRPNGBase64)
+}
+
+func TestWhatsAppLoginStatusReportsPairedButNotReady(t *testing.T) {
+	assert := assert.New(t)
+	eng := &querytest.MockEngine{}
+	client := &mockWhatsAppClient{
+		loginState: whatsapplive.LoginState{
+			Status: whatsapplive.Status{
+				AccountJID: "15551234567@s.whatsapp.net",
+				Paired:     true,
+				Connected:  true,
+				LoggedIn:   false,
+			},
+			Pairing: whatsapplive.QRPairingState{
+				Active: false,
+				Paired: true,
+			},
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Empty(account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsAppLoginResponse](t, ToolWhatsAppLoginStatus, h.whatsAppLoginStatus, map[string]any{})
+	assert.True(result.AlreadyPaired)
+	assert.False(result.NeedsPairing)
+	assert.False(result.Ready)
+	assert.False(result.Status.Ready)
+	assert.True(result.NeedsReconnect)
+	assert.True(result.NeedsAuth)
+	assert.Equal(5, result.PollAfterSecs)
+}
+
+func TestWhatsAppLogoutRequiresConfirm(t *testing.T) {
+	eng := &querytest.MockEngine{}
+	var called bool
+	client := &mockWhatsAppClient{
+		logout: func(context.Context, whatsapplive.LogoutRequest) (whatsapplive.LogoutResult, error) {
+			called = true
+			return whatsapplive.LogoutResult{}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Empty(t, account)
+			return client, nil
+		},
+	}
+
+	result := runToolExpectError(t, ToolWhatsAppLogout, h.whatsAppLogout, map[string]any{})
+	assert.Contains(t, resultText(t, result), "confirm=true is required")
+	assert.False(t, called)
+}
+
+func TestWhatsAppLogoutForwardsForceLocal(t *testing.T) {
+	assert := assert.New(t)
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var gotReq whatsapplive.LogoutRequest
+	client := &mockWhatsAppClient{
+		logout: func(_ context.Context, req whatsapplive.LogoutRequest) (whatsapplive.LogoutResult, error) {
+			gotReq = req
+			return whatsapplive.LogoutResult{
+				StatusBefore: whatsapplive.Status{
+					AccountJID: "15551234567@s.whatsapp.net",
+					Paired:     true,
+					Connected:  true,
+				},
+				StatusAfter:         whatsapplive.Status{},
+				RemoteLogout:        true,
+				LocalSessionCleared: true,
+			}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Equal("15551234567@s.whatsapp.net", account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsapplive.LogoutResult](t, ToolWhatsAppLogout, h.whatsAppLogout, map[string]any{
+		"confirm":     true,
+		"force_local": false,
+	})
+	assert.Equal("15551234567@s.whatsapp.net", gotReq.Account)
+	assert.False(gotReq.ForceLocal)
+	assert.True(result.RemoteLogout)
+	assert.True(result.LocalSessionCleared)
+}
+
+func TestSendWhatsAppMessage(t *testing.T) {
+	assert := assert.New(t)
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var gotReq whatsapplive.SendMessageRequest
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			Paired:    true,
+			Connected: true,
+			LoggedIn:  true,
+		},
+		sendMessage: func(_ context.Context, req whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error) {
+			gotReq = req
+			return whatsapplive.SendResult{
+				LocalRequestID:  req.LocalRequestID,
+				OutboxID:        7,
+				MessageID:       8,
+				RemoteMessageID: "remote-1",
+				ChatJID:         req.ChatID,
+				Status:          "sent",
+			}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Equal("15551234567@s.whatsapp.net", account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsapplive.SendResult](t, ToolSendWhatsAppMessage, h.sendWhatsAppMessage, map[string]any{
+		"chat_id":          "15557654321@s.whatsapp.net",
+		"body":             "hello",
+		"local_request_id": "req-1",
+	})
+	assert.Equal("15557654321@s.whatsapp.net", gotReq.ChatID)
+	assert.Equal("hello", gotReq.Body)
+	assert.Equal("req-1", gotReq.LocalRequestID)
+	assert.Equal(int64(8), result.MessageID)
+	assert.Equal("remote-1", result.RemoteMessageID)
+}
+
+func TestSendWhatsAppMessageRejectsNotReady(t *testing.T) {
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var called bool
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			AccountJID: "15551234567@s.whatsapp.net",
+			Paired:     true,
+			Connected:  true,
+			LoggedIn:   false,
+		},
+		sendMessage: func(context.Context, whatsapplive.SendMessageRequest) (whatsapplive.SendResult, error) {
+			called = true
+			return whatsapplive.SendResult{}, errors.New("send should not be called")
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Equal(t, "15551234567@s.whatsapp.net", account)
+			return client, nil
+		},
+	}
+
+	result := runToolExpectError(t, ToolSendWhatsAppMessage, h.sendWhatsAppMessage, map[string]any{
+		"chat_id": "15557654321@s.whatsapp.net",
+		"body":    "hello",
+	})
+	assert.Contains(t, resultText(t, result), "ready=true")
+	assert.False(t, called)
+}
+
+func TestWhatsAppRequestHistorySync(t *testing.T) {
+	assert := assert.New(t)
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var gotReq whatsapplive.RequestHistorySyncRequest
+	anchorTime := time.Date(2022, 1, 1, 0, 0, 0, 0, time.UTC)
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			Paired:    true,
+			Connected: true,
+			LoggedIn:  true,
+		},
+		requestHistorySync: func(_ context.Context, req whatsapplive.RequestHistorySyncRequest) (whatsapplive.RequestHistorySyncResult, error) {
+			gotReq = req
+			return whatsapplive.RequestHistorySyncResult{
+				ChatJID:         req.ChatID,
+				AnchorMessageID: "anchor-msg",
+				AnchorTimestamp: anchorTime,
+				AnchorIsFromMe:  true,
+				RequestedCount:  req.Count,
+			}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Equal("15551234567@s.whatsapp.net", account)
+			return client, nil
+		},
+	}
+
+	result := runTool[struct {
+		whatsapplive.RequestHistorySyncResult
+
+		Message string `json:"message"`
+	}](t, ToolWhatsAppRequestHistorySync, h.whatsAppRequestHistorySync, map[string]any{
+		"chat_id": "15557654321@s.whatsapp.net",
+		"count":   float64(30),
+	})
+	assert.Equal("15557654321@s.whatsapp.net", gotReq.ChatID)
+	assert.Equal(30, gotReq.Count)
+	assert.Equal("anchor-msg", result.AnchorMessageID)
+	assert.Equal(30, result.RequestedCount)
+	assert.NotEmpty(result.Message)
+}
+
+func TestWhatsAppRequestHistorySyncDefaultsCount(t *testing.T) {
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var gotReq whatsapplive.RequestHistorySyncRequest
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{Paired: true, Connected: true, LoggedIn: true},
+		requestHistorySync: func(_ context.Context, req whatsapplive.RequestHistorySyncRequest) (whatsapplive.RequestHistorySyncResult, error) {
+			gotReq = req
+			return whatsapplive.RequestHistorySyncResult{RequestedCount: req.Count}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			return client, nil
+		},
+	}
+
+	runTool[struct {
+		whatsapplive.RequestHistorySyncResult
+
+		Message string `json:"message"`
+	}](t, ToolWhatsAppRequestHistorySync, h.whatsAppRequestHistorySync, map[string]any{
+		"chat_id": "15557654321@s.whatsapp.net",
+	})
+	assert.Equal(t, whatsapplive.DefaultHistorySyncRequestCount, gotReq.Count)
+}
+
+func TestWhatsAppRequestHistorySyncRejectsNotReady(t *testing.T) {
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var called bool
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			AccountJID: "15551234567@s.whatsapp.net",
+			Paired:     true,
+			Connected:  true,
+			LoggedIn:   false,
+		},
+		requestHistorySync: func(context.Context, whatsapplive.RequestHistorySyncRequest) (whatsapplive.RequestHistorySyncResult, error) {
+			called = true
+			return whatsapplive.RequestHistorySyncResult{}, errors.New("request should not be called")
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			return client, nil
+		},
+	}
+
+	result := runToolExpectError(t, ToolWhatsAppRequestHistorySync, h.whatsAppRequestHistorySync, map[string]any{
+		"chat_id": "15557654321@s.whatsapp.net",
+	})
+	assert.Contains(t, resultText(t, result), "ready=true")
+	assert.False(t, called)
+}
+
+func TestWhatsAppRequestHistorySyncRequiresChatID(t *testing.T) {
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{Paired: true, Connected: true, LoggedIn: true},
+	}
+	h := &handlers{
+		engine: &querytest.MockEngine{},
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			return client, nil
+		},
+	}
+
+	result := runToolExpectError(t, ToolWhatsAppRequestHistorySync, h.whatsAppRequestHistorySync, map[string]any{})
+	assert.Contains(t, resultText(t, result), "chat_id")
+}
+
+func TestSendWhatsAppReactionAllowsEmptyEmojiToClear(t *testing.T) {
+	assert := assert.New(t)
+	eng := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 2, SourceType: "whatsapp", Identifier: "15551234567@s.whatsapp.net"},
+		},
+	}
+	var gotReq whatsapplive.SendReactionRequest
+	client := &mockWhatsAppClient{
+		status: whatsapplive.Status{
+			Paired:    true,
+			Connected: true,
+			LoggedIn:  true,
+		},
+		sendReaction: func(_ context.Context, req whatsapplive.SendReactionRequest) (whatsapplive.SendResult, error) {
+			gotReq = req
+			return whatsapplive.SendResult{
+				LocalRequestID: req.LocalRequestID,
+				MessageID:      req.MessageID,
+				Status:         "sent",
+			}, nil
+		},
+	}
+	h := &handlers{
+		engine: eng,
+		whatsAppFactory: func(_ context.Context, account string) (whatsapplive.Client, error) {
+			assert.Equal("15551234567@s.whatsapp.net", account)
+			return client, nil
+		},
+	}
+
+	result := runTool[whatsapplive.SendResult](t, ToolSendWhatsAppReaction, h.sendWhatsAppReaction, map[string]any{
+		"message_id":       float64(42),
+		"emoji":            "",
+		"local_request_id": "react-1",
+	})
+	assert.Equal(int64(42), gotReq.MessageID)
+	assert.Empty(gotReq.Emoji)
+	assert.Equal("react-1", gotReq.LocalRequestID)
+	assert.Equal(int64(42), result.MessageID)
+}
+
+func TestGoogleDocsHandlers(t *testing.T) {
+	t.Run("list forwards filters", func(t *testing.T) {
+		assert := assert.New(t)
+		client := &mockGoogleDocsClient{
+			listDocs: func(_ context.Context, sourceName, query string, limit int) ([]googledocs.File, error) {
+				assert.Equal("work", sourceName, "sourceName")
+				assert.Equal("roadmap", query, "query")
+				assert.Equal(7, limit, "limit")
+				return []googledocs.File{{
+					Source:     "work",
+					DocumentID: "doc-1",
+					Name:       "Roadmap",
+				}}, nil
+			},
+		}
+		h := &handlers{
+			engine: &querytest.MockEngine{},
+			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
+				return client, nil
+			},
+		}
+
+		files := runTool[[]googledocs.File](t, ToolListGoogleDocs, h.listGoogleDocs, map[string]any{
+			"source": "work",
+			"query":  "roadmap",
+			"limit":  float64(7),
+		})
+		require.Len(t, files, 1, "files")
+		assert.Equal("doc-1", files[0].DocumentID, "document_id")
+	})
+
+	t.Run("get returns bounded text", func(t *testing.T) {
+		assert := assert.New(t)
+		client := &mockGoogleDocsClient{
+			getDoc: func(_ context.Context, sourceName, documentID string, maxChars int) (*googledocs.Document, error) {
+				assert.Equal("work", sourceName, "sourceName")
+				assert.Equal("doc-1", documentID, "documentID")
+				assert.Equal(50, maxChars, "maxChars")
+				return &googledocs.Document{
+					Source: "work", DocumentID: "doc-1", Name: "Notes",
+					Text:       "body",
+					TextLength: 4,
+				}, nil
+			},
+		}
+		h := &handlers{
+			engine: &querytest.MockEngine{},
+			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
+				return client, nil
+			},
+		}
+
+		doc := runTool[googledocs.Document](t, ToolGetGoogleDoc, h.getGoogleDoc, map[string]any{
+			"source":      "work",
+			"document_id": "doc-1",
+			"max_chars":   float64(50),
+		})
+		assert.Equal("body", doc.Text, "text")
+	})
+
+	t.Run("search returns snippets", func(t *testing.T) {
+		client := &mockGoogleDocsClient{
+			listDocs: func(context.Context, string, string, int) ([]googledocs.File, error) {
+				return []googledocs.File{{
+					Source:     "work",
+					DocumentID: "doc-1",
+					Name:       "Strategy",
+				}}, nil
+			},
+			getDoc: func(_ context.Context, sourceName, documentID string, maxChars int) (*googledocs.Document, error) {
+				assert.Equal(t, "work", sourceName, "sourceName")
+				assert.Equal(t, "doc-1", documentID, "documentID")
+				assert.Equal(t, maxGoogleDocsMaxChars, maxChars, "maxChars")
+				return &googledocs.Document{
+					Source: "work", DocumentID: "doc-1", Name: "Strategy",
+					Text:       "intro alpha beta target phrase gamma delta conclusion",
+					TextLength: 53,
+				}, nil
+			},
+		}
+		h := &handlers{
+			engine: &querytest.MockEngine{},
+			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
+				return client, nil
+			},
+		}
+
+		results := runTool[[]googleDocsSearchResult](t, ToolSearchGoogleDocs, h.searchGoogleDocs, map[string]any{
+			"query":         "target",
+			"snippet_chars": float64(20),
+		})
+		require.Len(t, results, 1, "results")
+		assert.Contains(t, results[0].Snippet, "target", "snippet")
+	})
+
+	t.Run("append forwards text unchanged", func(t *testing.T) {
+		assert := assert.New(t)
+		client := &mockGoogleDocsClient{
+			appendText: func(_ context.Context, sourceName, documentID, text string) (*googledocs.AppendResult, error) {
+				assert.Equal("work", sourceName, "sourceName")
+				assert.Equal("doc-1", documentID, "documentID")
+				assert.Equal("\nnew note", text, "text")
+				return &googledocs.AppendResult{
+					Source:        sourceName,
+					DocumentID:    documentID,
+					InsertedChars: 9,
+					Status:        "appended",
+				}, nil
+			},
+		}
+		h := &handlers{
+			engine: &querytest.MockEngine{},
+			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
+				return client, nil
+			},
+		}
+
+		result := runTool[googledocs.AppendResult](t, ToolAppendGoogleDocText, h.appendGoogleDocText, map[string]any{
+			"source":      "work",
+			"document_id": "doc-1",
+			"text":        "\nnew note",
+		})
+		assert.Equal("appended", result.Status, "status")
+	})
+
+	t.Run("replace accepts explicit empty replacement", func(t *testing.T) {
+		assert := assert.New(t)
+		client := &mockGoogleDocsClient{
+			replaceText: func(_ context.Context, sourceName, documentID, find, replacement string, matchCase bool) (*googledocs.ReplaceResult, error) {
+				assert.Equal("work", sourceName, "sourceName")
+				assert.Equal("doc-1", documentID, "documentID")
+				assert.Equal("remove me", find, "find")
+				assert.Empty(replacement, "replacement")
+				assert.True(matchCase, "matchCase")
+				return &googledocs.ReplaceResult{
+					Source:             sourceName,
+					DocumentID:         documentID,
+					OccurrencesChanged: 2,
+					Status:             "replaced",
+				}, nil
+			},
+		}
+		h := &handlers{
+			engine: &querytest.MockEngine{},
+			googleDocsFactory: func(context.Context) (googledocs.Client, error) {
+				return client, nil
+			},
+		}
+
+		result := runTool[googledocs.ReplaceResult](t, ToolReplaceGoogleDocText, h.replaceGoogleDocText, map[string]any{
+			"source":      "work",
+			"document_id": "doc-1",
+			"find":        "remove me",
+			"replacement": "",
+			"match_case":  true,
+		})
+		assert.Equal(int64(2), result.OccurrencesChanged, "occurrences_changed")
+	})
+}
+
 func TestSearchMetadata(t *testing.T) {
 	eng := &querytest.MockEngine{
 		SearchFastResults: []query.MessageSummary{
 			testutil.NewMessageSummary(1).WithSubject("Hello").WithFromEmail("alice@example.com").WithSourceConversationID("thread-abc").WithConversationID(99).Build(),
-		},
-		SearchFastCountFunc: func(_ context.Context, _ *search.Query, _ query.MessageFilter) (int64, error) {
-			return 1, nil
 		},
 	}
 	h := newTestHandlers(eng)
@@ -979,11 +943,79 @@ func TestSearchMetadata(t *testing.T) {
 		runToolExpectError(t, "search_metadata", h.searchMetadata, map[string]any{})
 	})
 
-	t.Run("unsupported Gmail list operator rejected", func(t *testing.T) {
-		r := runToolExpectError(t, "search_metadata", h.searchMetadata, map[string]any{"query": "list:(alerts.example.com)"})
-		txt := resultText(t, r)
-		assert.Contains(t, txt, "unsupported_search_operator", "expected unsupported-operator error, got: %s")
-		assert.Contains(t, txt, "list:", "expected list operator context, got: %s")
+	t.Run("delegated pagination", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			rows     int
+			total    int64
+			returned int
+			hasMore  bool
+		}{
+			{"unknown extra", 3, -1, 2, true},
+			{"unknown exact", 2, -1, 2, false},
+			{"unknown short", 1, -1, 1, false},
+			{"unknown empty", 0, -1, 0, false},
+			{"known extra", 3, 10, 2, true},
+			{"known last", 1, 5, 1, false},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				checks := assert.New(t)
+				eng := &querytest.MockEngine{
+					SearchFastWithStatsFunc: func(_ context.Context, _ *search.Query, _ string, _ query.MessageFilter, _ query.ViewType, limit, offset int) (*query.SearchFastResult, error) {
+						checks.Equal(3, limit)
+						checks.Equal(4, offset)
+						return &query.SearchFastResult{
+							Messages: make([]query.MessageSummary, tc.rows), TotalCount: tc.total, IndexState: "building",
+						}, nil
+					},
+				}
+				h := newTestHandlers(eng)
+				h.delegatedOnly = true
+				resp := runTool[searchMetadataResponse](t, "search_metadata", h.searchMetadata, map[string]any{
+					"query": "from:alice", "limit": float64(2), "offset": float64(4),
+				})
+				checks.Len(resp.Data, tc.returned)
+				checks.NotNil(resp.Data)
+				checks.Equal(tc.returned, resp.Returned)
+				checks.Equal(tc.total, resp.Total)
+				checks.Equal(4, resp.Offset)
+				checks.Equal(tc.hasMore, resp.HasMore)
+				checks.Equal("building", resp.IndexState)
+			})
+		}
+	})
+
+	for _, tc := range []struct {
+		name  string
+		query string
+	}{
+		{name: "list alias", query: "list:alerts.example.test"},
+		{name: "list id alias", query: "list-id:alerts.example.test"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			var got *search.Query
+			eng := &querytest.MockEngine{
+				SearchFastWithStatsFunc: func(_ context.Context, q *search.Query, _ string, _ query.MessageFilter, group query.ViewType, _, _ int) (*query.SearchFastResult, error) {
+					assert.Equal(query.ViewNoStats, group)
+					got = q
+					return &query.SearchFastResult{Messages: []query.MessageSummary{testutil.NewMessageSummary(1).Build()}, TotalCount: 1}, nil
+				},
+			}
+
+			resp := runTool[paginatedSearchMessages](t, "search_metadata", newTestHandlers(eng).searchMetadata, map[string]any{"query": tc.query})
+			require.Len(resp.Data, 1, "search_metadata result")
+			require.NotNil(got, "search_metadata must call local metadata search")
+			assert.Equal([]string{"alerts.example.test"}, got.ListIDs, "forwarded List-Id filter")
+			assert.Empty(got.UnsupportedOperators, "List-Id aliases must not be rejected")
+		})
+	}
+
+	t.Run("parenthesized list syntax rejected", func(t *testing.T) {
+		r := runToolExpectError(t, "search_metadata", h.searchMetadata,
+			map[string]any{"query": "list:(alerts.example.test)"})
+		assert.Contains(t, resultText(t, r), "parenthesized values are not supported")
 	})
 }
 
@@ -1160,7 +1192,6 @@ func TestSearchRejectsInvalidQueryBeforeDispatch(t *testing.T) {
 		want []string
 	}{
 		{name: "invalid typed value", text: "needle before:not-a-date", want: []string{"invalid value", "before:"}},
-		{name: "unsupported operator", text: "needle list:alerts.example.com", want: []string{"unsupported_search_operator", "list:"}},
 	}
 	paths := []string{"metadata", "local hybrid", "daemon hybrid"}
 	for _, queryCase := range queries {
@@ -1170,9 +1201,9 @@ func TestSearchRejectsInvalidQueryBeforeDispatch(t *testing.T) {
 				var backendCalled bool
 				engine := &listAccountsTrackingEngine{MockEngine: &querytest.MockEngine{
 					Accounts: []query.AccountInfo{{ID: 1, Identifier: "alice@example.com"}},
-					SearchFastFunc: func(context.Context, *search.Query, query.MessageFilter, int, int) ([]query.MessageSummary, error) {
+					SearchFastWithStatsFunc: func(context.Context, *search.Query, string, query.MessageFilter, query.ViewType, int, int) (*query.SearchFastResult, error) {
 						backendCalled = true
-						return nil, nil
+						return &query.SearchFastResult{}, nil
 					},
 				}}
 				h := &handlers{engine: engine}
@@ -1232,9 +1263,6 @@ func TestSearchMetadata_MetadataOnly(t *testing.T) {
 		SearchResults: []query.MessageSummary{
 			testutil.NewMessageSummary(2).WithSubject("Body match").WithFromEmail("bob@example.com").Build(),
 		},
-		SearchFastCountFunc: func(_ context.Context, _ *search.Query, _ query.MessageFilter) (int64, error) {
-			return 1, nil
-		},
 	}
 	h := newTestHandlers(eng)
 
@@ -1255,15 +1283,11 @@ func TestSearchMetadata_NonPositiveLimitUsesDefault(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			assert := assert.New(t)
 			eng := &querytest.MockEngine{
-				SearchFastFunc: func(_ context.Context, _ *search.Query, _ query.MessageFilter, gotLimit, offset int) ([]query.MessageSummary, error) {
-					assert.Equal(defaultSearchLimit, gotLimit, "limit")
+				SearchFastWithStatsFunc: func(_ context.Context, _ *search.Query, _ string, _ query.MessageFilter, group query.ViewType, gotLimit, offset int) (*query.SearchFastResult, error) {
+					assert.Equal(query.ViewNoStats, group)
+					assert.Equal(defaultSearchLimit+1, gotLimit, "limit")
 					assert.Equal(0, offset, "offset")
-					return []query.MessageSummary{
-						testutil.NewMessageSummary(1).WithSubject("Hello").Build(),
-					}, nil
-				},
-				SearchFastCountFunc: func(context.Context, *search.Query, query.MessageFilter) (int64, error) {
-					return 1, nil
+					return &query.SearchFastResult{Messages: []query.MessageSummary{testutil.NewMessageSummary(1).WithSubject("Hello").Build()}, TotalCount: 1}, nil
 				},
 			}
 			h := newTestHandlers(eng)
@@ -1282,9 +1306,6 @@ func TestSearchMessagesCompatibilityDispatchesMetadata(t *testing.T) {
 	eng := &querytest.MockEngine{
 		SearchFastResults: []query.MessageSummary{
 			testutil.NewMessageSummary(3).WithSubject("legacy metadata result").Build(),
-		},
-		SearchFastCountFunc: func(context.Context, *search.Query, query.MessageFilter) (int64, error) {
-			return 1, nil
 		},
 	}
 	h := newTestHandlers(eng)
@@ -2031,6 +2052,7 @@ func TestSearchMessageBodies_HybridUsesDaemonSearcher(t *testing.T) {
 	var gotReq HybridSearchRequest
 	rrf := 0.42
 	engine := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{{ID: 1, Identifier: "alice@example.com"}},
 		GetMessageSummariesByIDsFunc: func(_ context.Context, ids []int64) ([]query.MessageSummary, error) {
 			assert.Equal([]int64{102}, ids, "hydrated ids")
 			return []query.MessageSummary{
@@ -2051,6 +2073,13 @@ func TestSearchMessageBodies_HybridUsesDaemonSearcher(t *testing.T) {
 				},
 				HasMore:       true,
 				PoolSaturated: true,
+				Accelerator:   "vec1_ivf_opq",
+				TookMS:        12,
+				Timings: HybridSearchTimings{
+					QueryEmbeddingMS: 2,
+					RetrievalMS:      7,
+					HydrationMS:      3,
+				},
 				Generation: hybridGenerationSummary{
 					ID:          7,
 					Model:       "fake",
@@ -2080,6 +2109,7 @@ func TestSearchMessageBodies_HybridUsesDaemonSearcher(t *testing.T) {
 	assert.True(gotReq.IncludeMatches, "include matches")
 	assert.InDelta(0.75, gotReq.MinScore, 0.001, "min score")
 	assert.Equal(searchModeHybrid, resp.Mode, "response mode")
+	assert.Equal("vec1_ivf_opq", resp.Accelerator)
 	assert.True(resp.HasMore, "has_more")
 	require.Len(resp.Data, 1, "data")
 	assert.Equal(int64(102), resp.Data[0].ID, "message id")
@@ -2091,6 +2121,32 @@ func TestSearchMessageBodies_HybridUsesDaemonSearcher(t *testing.T) {
 	require.NotNil(resp.Data[0].Matches[0].Score, "match score")
 	assert.InDelta(0.88, *resp.Data[0].Matches[0].Score, 0.001, "match score")
 	assert.Equal(int64(7), resp.Generation.ID, "generation")
+	assert.Equal(int64(12), resp.TookMS, "total timing")
+	assert.Equal(HybridSearchTimings{
+		QueryEmbeddingMS: 2,
+		RetrievalMS:      7,
+		HydrationMS:      3,
+	}, resp.Timings, "phase timings")
+}
+
+func TestSemanticSearchMessages_DaemonIndexStaleKeepsRebuildAdvice(t *testing.T) {
+	const advice = "the vector index does not match configured embedding settings; run `msgvault embeddings build --full-rebuild`"
+	h := &handlers{
+		engine: &querytest.MockEngine{},
+		hybridSearcher: hybridSearcherFunc(func(context.Context, HybridSearchRequest) (*HybridSearchResult, error) {
+			return nil, fmt.Errorf("search daemon: %w", &daemonclient.APIError{
+				Status: http.StatusServiceUnavailable, Code: "index_stale", Message: advice,
+			})
+		}),
+	}
+
+	r := runToolExpectError(t, "semantic_search_messages", h.semanticSearchMessages, map[string]any{
+		"query": "semantic terms",
+		"mode":  searchModeHybrid,
+	})
+	text := resultText(t, r)
+	assert.Equal(t, "index_stale: "+advice, text)
+	assert.NotContains(t, text, "restart that daemon")
 }
 
 func TestSearchMessageBodies_HybridDaemonFilterOnlyGuidance(t *testing.T) {
@@ -2111,6 +2167,27 @@ func TestSearchMessageBodies_HybridDaemonFilterOnlyGuidance(t *testing.T) {
 	assert.Contains(t, text, "search_metadata", "filter-only guidance")
 	assert.NotContains(t, text, "mode=fts", "mode=fts is not a valid mode for search_message_bodies")
 	assert.False(t, searcherCalled, "filter-only query must fail before remote search")
+}
+
+func TestSearchMessageBodies_HybridResponseIncludesPhaseTimings(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	h := &handlers{
+		engine: &querytest.MockEngine{},
+		hybridSearcher: hybridSearcherFunc(func(context.Context, HybridSearchRequest) (*HybridSearchResult, error) {
+			return &HybridSearchResult{Generation: HybridGeneration{State: "active"}}, nil
+		}),
+	}
+
+	result := callToolDirect(t, "semantic_search_messages", h.semanticSearchMessages, map[string]any{
+		"query": "semantic terms",
+		"mode":  searchModeHybrid,
+	})
+	require.False(result.isError, "unexpected error: %s", resultText(t, result))
+	var payload map[string]json.RawMessage
+	require.NoError(json.Unmarshal([]byte(resultText(t, result)), &payload))
+	assert.Contains(payload, "took_ms")
+	assert.Contains(payload, "timings")
 }
 
 func TestAttachVectorChunkMatches_HTMLOnlyUsesEmbeddingCorpus(t *testing.T) {
@@ -2899,15 +2976,6 @@ func TestGetMessage(t *testing.T) {
 	}
 }
 
-func TestGetMessageToolDescriptionDoesNotReferenceFutureTools(t *testing.T) {
-	tool := getMessageDefinition(&handlers{}).tool()
-	assert.NotContains(t, tool.Description, "search_in_message")
-	centerAt := toolInputSchema(t, tool).Properties["center_at"]
-	raw, err := json.Marshal(centerAt)
-	require.NoError(t, err, "marshal center_at schema")
-	assert.NotContains(t, string(raw), "search_in_message")
-}
-
 func TestGetStats_VectorDisabled(t *testing.T) {
 	assert := assert.New(t)
 	eng := &querytest.MockEngine{
@@ -3013,35 +3081,11 @@ func TestGetStats_VectorStatsFailureReturnsPartialResponse(t *testing.T) {
 	checks.Contains(logs.String(), sentinel)
 }
 
-// toolPropertyDescription returns the description string for a tool input property.
 func toolInputSchema(t *testing.T, tool *sdkmcp.Tool) *jsonschema.Schema {
 	t.Helper()
 	schema, ok := tool.InputSchema.(*jsonschema.Schema)
 	require.True(t, ok, "input schema type: %T", tool.InputSchema)
 	return schema
-}
-
-func toolPropertyDescription(t *testing.T, tool *sdkmcp.Tool, name string) string {
-	t.Helper()
-	property := toolInputSchema(t, tool).Properties[name]
-	if property == nil {
-		return ""
-	}
-	return property.Description
-}
-
-// TestAggregateTool_DocumentsTimeGranularity guards the group_by=time contract:
-// MCP always buckets by calendar year (the handler does not set TimeGranularity).
-func TestAggregateTool_DocumentsTimeGranularity(t *testing.T) {
-	tool := aggregateDefinition(&handlers{}).tool()
-	desc := tool.Description
-	groupByDesc := toolPropertyDescription(t, tool, "group_by")
-
-	assert := assert.New(t)
-	assert.Contains(desc, "calendar year", "tool description should document yearly time buckets")
-	assert.Contains(desc, "TotalUnique", "tool description should list response fields")
-	assert.Contains(groupByDesc, "calendar year", "group_by description should document yearly granularity")
-	assert.Contains(groupByDesc, `"2024"`, "group_by description should show example year key")
 }
 
 func TestAggregate(t *testing.T) {
@@ -3053,12 +3097,26 @@ func TestAggregate(t *testing.T) {
 	}
 	h := newTestHandlers(eng)
 
-	for _, groupBy := range []string{"sender", "recipient", "domain", "label", "time"} {
+	for _, groupBy := range []string{"sender", "recipient", "domain", "label", "list", "time"} {
 		t.Run(groupBy, func(t *testing.T) {
 			response := runTool[dataResponse[query.AggregateRow]](t, "aggregate", h.aggregate, map[string]any{"group_by": groupBy})
 			assert.Len(t, response.Data, 2, "rows")
 		})
 	}
+
+	t.Run("list uses mailing-list dimension", func(t *testing.T) {
+		f := storetest.New(t)
+		messageID := f.NewMessage().WithSourceMessageID("mcp-list-aggregate").Create(t, f.Store)
+		_, err := f.Store.DB().Exec(f.Store.Rebind(`UPDATE messages SET list_id = ? WHERE id = ?`),
+			"<announce.example.test>", messageID)
+		require.NoError(t, err)
+		realHandlers := newTestHandlers(query.NewEngine(f.Store.DB(), f.Store.IsPostgreSQL()))
+
+		response := runTool[dataResponse[query.AggregateRow]](t, "aggregate", realHandlers.aggregate,
+			map[string]any{"group_by": "list"})
+		require.Len(t, response.Data, 1)
+		assert.Equal(t, "<announce.example.test>", response.Data[0].Key)
+	})
 
 	errorCases := []struct {
 		name string
@@ -3601,9 +3659,6 @@ func TestAccountFilter(t *testing.T) {
 	h := newTestHandlers(eng)
 
 	t.Run("search with valid account", func(t *testing.T) {
-		eng.SearchFastCountFunc = func(_ context.Context, _ *search.Query, _ query.MessageFilter) (int64, error) {
-			return 1, nil
-		}
 		resp := runTool[paginatedSearchMessages](t, "search_metadata", h.searchMetadata, map[string]any{
 			"query":   "test",
 			"account": "alice@gmail.com",
@@ -3614,7 +3669,7 @@ func TestAccountFilter(t *testing.T) {
 	t.Run("search with invalid account", func(t *testing.T) {
 		r := runToolExpectError(t, "search_message_bodies", h.searchMessageBodies, map[string]any{
 			"query":   "test",
-			"account": "unknown@gmail.com",
+			"account": "unknown-account",
 		})
 		txt := resultText(t, r)
 		assert.Contains(t, txt, "account not found", "expected 'account not found' error, got: %s")
@@ -3629,7 +3684,7 @@ func TestAccountFilter(t *testing.T) {
 
 	t.Run("list with invalid account", func(t *testing.T) {
 		r := runToolExpectError(t, "list_messages", h.listMessages, map[string]any{
-			"account": "unknown@gmail.com",
+			"account": "unknown-account",
 		})
 		txt := resultText(t, r)
 		assert.Contains(t, txt, "account not found", "expected 'account not found' error, got: %s")
@@ -3646,7 +3701,7 @@ func TestAccountFilter(t *testing.T) {
 	t.Run("aggregate with invalid account", func(t *testing.T) {
 		r := runToolExpectError(t, "aggregate", h.aggregate, map[string]any{
 			"group_by": "sender",
-			"account":  "unknown@gmail.com",
+			"account":  "unknown-account",
 		})
 		txt := resultText(t, r)
 		assert.Contains(t, txt, "account not found", "expected 'account not found' error, got: %s")
@@ -3654,9 +3709,6 @@ func TestAccountFilter(t *testing.T) {
 
 	t.Run("empty account means no filter", func(t *testing.T) {
 		// Empty string should not filter - return all results
-		eng.SearchFastCountFunc = func(_ context.Context, _ *search.Query, _ query.MessageFilter) (int64, error) {
-			return 1, nil
-		}
 		resp := runTool[paginatedSearchMessages](t, "search_metadata", h.searchMetadata, map[string]any{
 			"query":   "test",
 			"account": "",
@@ -3954,19 +4006,6 @@ func TestStageDeletion(t *testing.T) {
 		assert.Contains(t, txt, "not both", "expected mutual exclusion error, got: %s")
 	})
 
-	t.Run("query with unsupported Gmail list operator rejected", func(t *testing.T) {
-		dataDir := t.TempDir()
-		h := &handlers{engine: eng, dataDir: dataDir}
-
-		r := runToolExpectError(
-			t, "stage_deletion", h.stageDeletion,
-			map[string]any{"query": "list:(alerts.example.com)"},
-		)
-		txt := resultText(t, r)
-		assert.Contains(t, txt, "unsupported_search_operator", "expected unsupported-operator error, got: %s")
-		assert.Contains(t, txt, "list:", "expected list operator context, got: %s")
-	})
-
 	t.Run("no filters rejected", func(t *testing.T) {
 		dataDir := t.TempDir()
 		h := &handlers{engine: eng, dataDir: dataDir}
@@ -4030,7 +4069,7 @@ func TestStageDeletion(t *testing.T) {
 		r := runToolExpectError(
 			t, "stage_deletion", h.stageDeletion,
 			map[string]any{
-				"account": "unknown@gmail.com",
+				"account": "unknown-account",
 				"from":    "news@example.com",
 			},
 		)
@@ -4078,6 +4117,31 @@ func TestStageDeletion(t *testing.T) {
 		)
 		assert.Equal(t, maxStageDeletionResults, capturedFilter.Pagination.Limit, "limit")
 	})
+}
+
+func TestStageDeletionRejectsInvalidOrEmptyParsedQuery(t *testing.T) {
+	f := storetest.New(t)
+	messageID := f.NewMessage().
+		WithSourceMessageID("unrelated-message").
+		WithSubject("Unrelated message").
+		Create(t, f.Store)
+	h := &handlers{
+		engine: query.NewEngine(f.Store.DB(), f.Store.IsPostgreSQL()),
+	}
+
+	for _, queryText := range []string{"list:", "list:(example.org)"} {
+		t.Run(queryText, func(t *testing.T) {
+			saver := &captureDeletionManifestSaver{}
+			h.manifestSaver = saver
+
+			result := callToolDirect(t, "stage_deletion", h.stageDeletion,
+				map[string]any{"query": queryText})
+
+			assert.True(t, result.isError, "invalid query must be rejected")
+			assert.Nil(t, saver.manifest,
+				"invalid query must not stage unrelated message %d", messageID)
+		})
+	}
 }
 
 // fakeBackend is a minimal vector.Backend used to exercise
@@ -4148,10 +4212,10 @@ func (f *fakeBackend) ScoreMessageChunks(_ context.Context, gen vector.Generatio
 	}
 	return nil, nil
 }
-func (f *fakeBackend) FusedSearch(_ context.Context, req vector.FusedRequest) ([]vector.FusedHit, bool, error) {
+func (f *fakeBackend) FusedSearch(_ context.Context, req vector.FusedRequest) ([]vector.FusedHit, vector.SearchMetadata, error) {
 	f.fusedCalls++
 	if f.fusedErr != nil {
-		return nil, false, f.fusedErr
+		return nil, vector.SearchMetadata{}, f.fusedErr
 	}
 	hits := f.fusedHits
 	if hits == nil {
@@ -4165,7 +4229,7 @@ func (f *fakeBackend) FusedSearch(_ context.Context, req vector.FusedRequest) ([
 			}
 		}
 	}
-	return hits, len(hits) >= req.Limit, nil
+	return hits, vector.SearchMetadata{PoolSaturated: len(hits) >= req.Limit}, nil
 }
 func (f *fakeBackend) CreateGeneration(_ context.Context, _ string, _ int, _ string) (vector.GenerationID, error) {
 	return 0, errors.New("not implemented")
@@ -4255,7 +4319,7 @@ func TestFindSimilarMessages_UsesDaemonSearcher(t *testing.T) {
 	hasAttachment := true
 	after := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 	h := &handlers{
-		engine: &querytest.MockEngine{},
+		engine: &querytest.MockEngine{Accounts: []query.AccountInfo{{ID: 1, Identifier: "alice@example.com"}}},
 		similarSearcher: similarSearcherFunc(func(_ context.Context, req SimilarSearchRequest) (*SimilarSearchResult, error) {
 			gotReq = req
 			return &SimilarSearchResult{
@@ -4372,80 +4436,6 @@ func TestSearchInMessageTool_AdvertisesVectorModeWhenConfigured(t *testing.T) {
 	assert.Contains(enabled.Description, "mode=vector", "vector-in-message available: tool description should mention vector mode, got: %q", enabled.Description)
 }
 
-func TestFindSimilarMessagesTool_AdvertisesMessageTypeFilter(t *testing.T) {
-	assert := assert.New(t)
-	tool := findSimilarMessagesDefinition(&handlers{}).tool()
-	assert.Contains(toolInputSchema(t, tool).Properties, "message_type")
-}
-
-// TestSearchMetadataTool_DocumentsQuerySyntax guards the operator-support
-// contract so clients do not assume full Gmail compatibility.
-func TestSearchMetadataTool_DocumentsQuerySyntax(t *testing.T) {
-	assert := assert.New(t)
-	tool := searchMetadataDefinition(&handlers{}).tool()
-	desc := tool.Description
-	for _, want := range []string{
-		"cc:",
-		"bcc:",
-		"older_than:",
-		"Not supported: negation",
-		"subject, snippet",
-	} {
-		assert.Contains(desc, want, "description missing %q", want)
-	}
-	assert.NotContains(desc, "Gmail-like", "description should not over-promise Gmail compatibility")
-	assert.Contains(desc, "semantic_search_messages", "metadata guidance should name the semantic tool")
-
-	queryDesc := toolPropertyDescription(t, tool, "query")
-	assert.Contains(queryDesc, "supported operators", "query param should reference operator docs")
-}
-
-// TestSearchMessageBodiesTool_DocumentsQuerySyntax guards the query-syntax
-// contract so MCP clients know how body FTS interprets free-text terms.
-func TestSearchMessageBodiesTool_DocumentsQuerySyntax(t *testing.T) {
-	assert := assert.New(t)
-	tool := searchMessageBodiesDefinition(&handlers{}).tool()
-
-	assert.Contains(tool.Description, "ANDed", "tool description should document implicit AND, got: %q", tool.Description)
-	assert.Contains(tool.Description, "double-quoted phrase", "tool description should document phrase matching, got: %q", tool.Description)
-	assert.Contains(tool.Description, "OR and NOT are not supported", "tool description should document missing boolean ops, got: %q", tool.Description)
-
-	queryDesc := toolPropertyDescription(t, tool, "query")
-	assert.Contains(queryDesc, "ANDed", "query param should document implicit AND, got: %q", queryDesc)
-	assert.Contains(queryDesc, "double quotes", "query param should document phrase matching, got: %q", queryDesc)
-	assert.Contains(queryDesc, "OR/NOT unsupported", "query param should document missing boolean ops, got: %q", queryDesc)
-}
-
-// TestSearchMessageBodiesTool_DocumentsFilterVsFreeText guards the contract
-// that Gmail operators are metadata filters and unrecognized word:value
-// tokens are literal body text.
-func TestSearchMessageBodiesTool_DocumentsFilterVsFreeText(t *testing.T) {
-	assert := assert.New(t)
-	tool := searchMessageBodiesDefinition(&handlers{}).tool()
-
-	assert.Contains(tool.Description, "metadata filters", "tool description should distinguish filters from free text, got: %q", tool.Description)
-	assert.Contains(tool.Description, "Unrecognized word:value", "tool description should document literal colon tokens, got: %q", tool.Description)
-
-	queryDesc := toolPropertyDescription(t, tool, "query")
-	assert.Contains(queryDesc, "metadata filters", "query param should distinguish filters from free text, got: %q", queryDesc)
-	assert.Contains(queryDesc, "subject:test alone is rejected", "query param should warn subject: is not free text, got: %q", queryDesc)
-	assert.Contains(queryDesc, "Unrecognized word:value", "query param should document literal colon tokens, got: %q", queryDesc)
-}
-
-// TestSearchMessageBodiesTool_DocumentsMatchesTruncated guards the response-field
-// contract for when excerpt lists are capped.
-func TestSearchMessageBodiesTool_DocumentsMatchesTruncated(t *testing.T) {
-	assert := assert.New(t)
-	tool := searchMessageBodiesDefinition(&handlers{}).tool()
-
-	assert.Contains(tool.Description, "matches_truncated",
-		"tool description should document matches_truncated, got: %q", tool.Description)
-	assert.Contains(tool.Description, "search_in_message",
-		"tool description should point callers to search_in_message, got: %q", tool.Description)
-	assert.Contains(tool.Description, "get_message",
-		"tool description should point callers to get_message, got: %q", tool.Description)
-}
-
 func TestFindSimilarMessages_MissingID(t *testing.T) {
 	h := &handlers{
 		engine:  &querytest.MockEngine{},
@@ -4501,6 +4491,7 @@ func TestFindSimilarMessages_HappyPath(t *testing.T) {
 }
 
 func TestFindSimilarMessages_RejectsStaleActiveGeneration(t *testing.T) {
+	assert := assert.New(t)
 	cfg := vector.Config{
 		Embeddings: vector.EmbeddingsConfig{
 			Model:         "nomic-embed",
@@ -4524,9 +4515,10 @@ func TestFindSimilarMessages_RejectsStaleActiveGeneration(t *testing.T) {
 		"message_id": float64(100),
 	})
 	txt := resultText(t, r)
-	assert.Contains(t, txt, "index_stale", "expected stale-index error, got: %s", txt)
-	assert.Equal(t, 0, fb.searchCalls, "backend search calls")
-	assert.Equal(t, 0, fb.loadCalls, "seed vector load calls")
+	assert.Contains(txt, "index_stale", "expected stale-index error, got: %s", txt)
+	assert.Contains(txt, "if the embedding settings on the archive host changed since its daemon started, restart that daemon")
+	assert.Equal(0, fb.searchCalls, "backend search calls")
+	assert.Equal(0, fb.loadCalls, "seed vector load calls")
 }
 
 func TestFindSimilarMessages_ScopedIndexRequiresMatchingMessageTypeFilter(t *testing.T) {
@@ -4666,46 +4658,54 @@ func TestSearchByDomains(t *testing.T) {
 		var capturedDomains []string
 		var capturedLimit, capturedOffset int
 		eng := &querytest.MockEngine{
-			SearchByDomainsFunc: func(_ context.Context, domains []string, after, before *time.Time, limit, offset int) ([]query.MessageSummary, error) {
+			SearchByDomainsFunc: func(_ context.Context, domains []string, after, before *time.Time, limit, offset int, _ []int64) (query.DomainSearchResult, error) {
 				capturedDomains = domains
 				capturedLimit = limit
 				capturedOffset = offset
 				assert.NotNil(after, "expected after to be set")
 				assert.NotNil(before, "expected before to be set")
-				return []query.MessageSummary{
-					testutil.NewMessageSummary(1).WithSubject("Match").Build(),
+				return query.DomainSearchResult{
+					Messages: []query.MessageSummary{
+						testutil.NewMessageSummary(1).WithSubject("Match").Build(),
+					},
+					HasMore: true,
 				}, nil
 			},
 		}
 		h := newTestHandlers(eng)
 
-		response := runTool[dataResponse[query.MessageSummary]](t, "search_by_domains", h.searchByDomains,
+		response := runTool[searchByDomainsResponse](t, "search_by_domains", h.searchByDomains,
 			map[string]any{
 				"domains": "acme.com,globex.com",
-				"limit":   float64(50),
+				"limit":   float64(1),
 				"offset":  float64(10),
 				"after":   "2024-01-01",
 				"before":  "2024-12-31",
 			})
 		assert.Len(response.Data, 1, "msgs")
+		assert.Equal(1, response.Returned, "returned")
+		assert.Equal(10, response.Offset, "offset echoed")
+		assert.True(response.HasMore, "the engine's has_more is reported as is")
 		assert.Equal([]string{"acme.com", "globex.com"}, capturedDomains, "domains")
-		assert.Equal(50, capturedLimit, "limit")
+		assert.Equal(1, capturedLimit, "limit")
 		assert.Equal(10, capturedOffset, "offset")
 	})
 
 	t.Run("default limit and offset", func(t *testing.T) {
-		var capturedLimit, capturedOffset int
+		var capturedLimit, capturedOffset, calls int
 		eng := &querytest.MockEngine{
-			SearchByDomainsFunc: func(_ context.Context, _ []string, _, _ *time.Time, limit, offset int) ([]query.MessageSummary, error) {
+			SearchByDomainsFunc: func(_ context.Context, _ []string, _, _ *time.Time, limit, offset int, _ []int64) (query.DomainSearchResult, error) {
+				calls++
 				capturedLimit = limit
 				capturedOffset = offset
-				return nil, nil
+				return query.DomainSearchResult{}, nil
 			},
 		}
 		h := newTestHandlers(eng)
 
-		runTool[dataResponse[query.MessageSummary]](t, "search_by_domains", h.searchByDomains,
+		runTool[searchByDomainsResponse](t, "search_by_domains", h.searchByDomains,
 			map[string]any{"domains": "acme.com"})
+		assert.Equal(t, 1, calls, "one engine call per page")
 		assert.Equal(t, 100, capturedLimit, "default limit")
 		assert.Equal(t, 0, capturedOffset, "default offset")
 	})
@@ -4734,7 +4734,7 @@ func TestServeHTTPWithOptions_ContextCancellation(t *testing.T) {
 	}()
 
 	// Give the goroutine a moment to start the listener.
-	time.Sleep(50 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond) //nolint:kennlint // gives the real TCP listener time to start
 	cancel()
 
 	select {
@@ -4959,6 +4959,102 @@ func TestMCPHTTPServerMountsProtectedEndpoint(t *testing.T) {
 	stdlibServer.Handler.ServeHTTP(authorized, authorizedRequest)
 	checks.Equal(http.StatusMethodNotAllowed, authorized.Code)
 	checks.Equal(http.MethodPost, authorized.Header().Get("Allow"))
+}
+
+func TestGetMessagePreservesBrowserURLAndRelatedID(t *testing.T) {
+	const link = "https://archive.example/?explore=%7B%22workspace%22%3A%22everything%22%2C%22selectedRow%22%3A%22message%3A42%22%7D"
+	h := newTestHandlers(&querytest.MockEngine{Messages: map[int64]*query.MessageDetail{42: {ID: 42, WebURL: link, RelatedMessageID: new(int64(43))}}})
+	result := runTool[map[string]any](t, "get_message", h.getMessage, map[string]any{"id": float64(42)})
+	assert.Equal(t, link, result["web_url"])
+	assert.InDelta(t, 43, result["related_message_id"], 0)
+}
+
+func TestGetStats_AccountLastSyncAt(t *testing.T) {
+	checks := assert.New(t)
+	must := require.New(t)
+	syncedAt := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	eng := &querytest.MockEngine{
+		Stats: &query.TotalStats{AccountCount: 2},
+		Accounts: []query.AccountInfo{
+			{ID: 1, Identifier: "synced@example.com", LastSyncAt: &syncedAt},
+			{ID: 2, Identifier: "never@example.com"},
+		},
+	}
+	r := callToolDirect(t, "get_stats", newTestHandlers(eng).getStats, map[string]any{})
+	var raw struct {
+		Accounts []map[string]json.RawMessage `json:"accounts"`
+	}
+	must.NoError(json.Unmarshal([]byte(resultText(t, r)), &raw))
+	must.Len(raw.Accounts, 2)
+	checks.JSONEq(`"2026-03-04T05:06:07Z"`, string(raw.Accounts[0]["LastSyncAt"]))
+	checks.NotContains(raw.Accounts[1], "LastSyncAt", "unknown sync time is omitted, not null")
+}
+
+func TestStageDeletionPipeORUsesSearchFast(t *testing.T) {
+	assert := assert.New(t)
+	var searchCalled, fastCalled bool
+	engine := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{{ID: 1, SourceType: "gmail", Identifier: "archive@example.com"}},
+		SearchFunc: func(context.Context, *search.Query, int, int) ([]query.MessageSummary, error) {
+			searchCalled = true
+			return nil, nil
+		},
+		SearchFastFunc: func(context.Context, *search.Query, query.MessageFilter, int, int) ([]query.MessageSummary, error) {
+			fastCalled = true
+			return []query.MessageSummary{
+				{ID: 1, SourceID: 1, SourceMessageID: "gmail-first"},
+				{ID: 2, SourceID: 1, SourceMessageID: "gmail-second"},
+			}, nil
+		},
+	}
+	saver := &captureDeletionManifestSaver{}
+	h := &handlers{engine: engine, manifestSaver: saver}
+	resp := runTool[stageDeletionResponse](t, "stage_deletion", h.stageDeletion, map[string]any{"query": "subject:first | subject:second"})
+	require.NotNil(t, saver.manifest)
+	assert.Equal([]string{"gmail-first", "gmail-second"}, saver.manifest.GmailIDs)
+	assert.Equal(2, resp.MessageCount)
+	assert.True(fastCalled)
+	assert.False(searchCalled)
+	assert.NotContains(resp.NextStep, "body matches")
+}
+
+func TestStageDeletionPipeORUsesSearch(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	var searchCalled, fastCalled bool
+	var parsed *search.Query
+	engine := &querytest.MockEngine{
+		Accounts: []query.AccountInfo{
+			{ID: 1, SourceType: "gmail", Identifier: "other@example.com"},
+			{ID: 2, SourceType: "gmail", Identifier: "archive@example.com"},
+		},
+		SearchFunc: func(_ context.Context, q *search.Query, _, _ int) ([]query.MessageSummary, error) {
+			searchCalled = true
+			parsed = q
+			return []query.MessageSummary{
+				{ID: 3, SourceID: 2, SourceMessageID: "gmail-alpha"},
+				{ID: 4, SourceID: 2, SourceMessageID: "gmail-gamma"},
+			}, nil
+		},
+		SearchFastFunc: func(context.Context, *search.Query, query.MessageFilter, int, int) ([]query.MessageSummary, error) {
+			fastCalled = true
+			return nil, nil
+		},
+	}
+	saver := &captureDeletionManifestSaver{}
+	h := &handlers{engine: engine, manifestSaver: saver}
+	resp := runTool[stageDeletionResponse](t, "stage_deletion", h.stageDeletion, map[string]any{"query": "alpha | gamma", "account": "archive@example.com"})
+	require.NotNil(saver.manifest)
+	assert.Equal([]string{"gmail-alpha", "gmail-gamma"}, saver.manifest.GmailIDs)
+	assert.Equal("archive@example.com", saver.manifest.Filters.Account)
+	require.NotNil(saver.manifest.Source)
+	assert.Equal(deletion.SourceReference{ID: 2, Type: "gmail", Identifier: "archive@example.com"}, *saver.manifest.Source)
+	require.NotNil(parsed)
+	assert.Equal([]int64{2}, parsed.AccountIDs)
+	assert.Equal(2, resp.MessageCount)
+	assert.Contains(resp.NextStep, "Full-text OR search includes body matches.")
+	assert.True(searchCalled)
+	assert.False(fastCalled)
 }
 
 // TestResolveDraftAttachments_UsesAttachmentReaderOverLocalDisk locks in the
@@ -5205,6 +5301,7 @@ func TestResolveDraftAttachments_NewAttachmentSizeLimits(t *testing.T) {
 // upload (new_attachments) in the same call, each resolved through its own
 // path but landing in one combined attachment list.
 func TestResolveDraftAttachments_ArchivedAndNewCombined(t *testing.T) {
+	assert := assert.New(t)
 	require := require.New(t)
 	hash := "abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890"
 	archivedContent := []byte("previously archived attachment bytes")
@@ -5235,11 +5332,11 @@ func TestResolveDraftAttachments_ArchivedAndNewCombined(t *testing.T) {
 	})
 	require.NoError(err)
 	require.Len(atts, 2)
-	assert.Equal(t, hash, gotHash)
-	assert.Equal(t, "id-card.jpg", atts[0].Filename)
-	assert.Equal(t, "image/jpeg", atts[0].ContentType)
-	assert.Equal(t, archivedContent, atts[0].Content)
-	assert.Equal(t, "insurance-form.pdf", atts[1].Filename)
-	assert.Equal(t, "application/pdf", atts[1].ContentType)
-	assert.Equal(t, newContent, atts[1].Content)
+	assert.Equal(hash, gotHash)
+	assert.Equal("id-card.jpg", atts[0].Filename)
+	assert.Equal("image/jpeg", atts[0].ContentType)
+	assert.Equal(archivedContent, atts[0].Content)
+	assert.Equal("insurance-form.pdf", atts[1].Filename)
+	assert.Equal("application/pdf", atts[1].ContentType)
+	assert.Equal(newContent, atts[1].Content)
 }

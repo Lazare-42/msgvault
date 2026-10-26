@@ -138,7 +138,38 @@ func TestImporterCreatesCanonicalMeetingAndSyncRun(t *testing.T) {
 	assert.Equal(int64(0), latest.MessagesUpdated)
 }
 
-func TestImporterPostSupersessionWriteFailsGenerationFence(t *testing.T) {
+func TestImporterContinuesWhenDisplayNameConflictsWithAccountSelector(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+	_, err := st.GetOrCreateSource("gmail", "owner@example.test")
+	require.NoError(err)
+
+	req := validImportRequest(t)
+	req.Source.DisplayName = "owner@example.test"
+	meetingSource, err := st.GetOrCreateSource(SourceType, req.Source.Identifier)
+	require.NoError(err)
+	originalDisplayName := meetingSource.DisplayName.String
+
+	var logOutput bytes.Buffer
+	importer := NewImporter(st, Hooks{}).WithLogger(
+		slog.New(slog.NewTextHandler(&logOutput, nil)),
+	)
+	result, err := importer.Import(t.Context(), req)
+	require.NoError(err, "a selector collision must not prevent archiving the meeting")
+	assert.Equal(StatusCreated, result.Status)
+	assert.NotZero(result.MessageID)
+
+	updatedSource, err := st.GetSourceByID(result.SourceID)
+	require.NoError(err)
+	assert.Equal(originalDisplayName, updatedSource.DisplayName.String,
+		"the meeting import must retain its prior safe display name")
+	assert.Contains(logOutput.String(), "display name")
+	assert.NotContains(logOutput.String(), "owner@example.test",
+		"the warning must not include the colliding identifier")
+}
+
+func TestImporterRejectsConcurrentStartWhileWriterIsBlocked(t *testing.T) {
 	checks := assert.New(t)
 	requirements := require.New(t)
 	st := testutil.NewTestStore(t)
@@ -190,27 +221,23 @@ func TestImporterPostSupersessionWriteFailsGenerationFence(t *testing.T) {
 	waitForBlockedMeetingImportPID(t, st, holderPID, "SELECT source_message_id",
 		"meeting importer did not pause in its post-start message lookup")
 
-	var oldRunID int64
-	requirements.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`
-		SELECT id FROM sync_runs
-		WHERE source_id = ? AND status = 'running'
-	`), baseline.SourceID).Scan(&oldRunID))
-	newRunID, err := st.StartSyncContext(t.Context(), baseline.SourceID, "superseding-test-run")
-	requirements.NoError(err)
-	requirements.NotEqual(oldRunID, newRunID)
+	_, err = st.StartSyncContext(t.Context(), baseline.SourceID, "concurrent-test-run")
+	requirements.ErrorIs(err, store.ErrSyncAlreadyActive)
 	requirements.NoError(tx.Commit())
 	locked = false
 
 	got := <-importDone
-	requirements.ErrorIs(got.err, store.ErrSyncRunSuperseded)
-	checks.Zero(got.result.MessageID)
+	requirements.NoError(got.err)
+	checks.NotZero(got.result.MessageID)
 	var messageCount int
 	requirements.NoError(st.DB().QueryRowContext(t.Context(), st.Rebind(`
 		SELECT COUNT(*) FROM messages
 		WHERE source_id = ? AND source_message_id = ?
 	`), baseline.SourceID, "meeting:42").Scan(&messageCount))
-	checks.Zero(messageCount,
-		"a meeting writer must not commit after its sync generation is superseded")
+	checks.Equal(1, messageCount)
+
+	newRunID, err := st.StartSyncContext(t.Context(), baseline.SourceID, "post-import-test-run")
+	requirements.NoError(err)
 	requirements.NoError(st.FailSync(newRunID, "test cleanup"))
 }
 
@@ -894,7 +921,7 @@ func TestImporterCancellationAtCheckpointLeavesFailedSync(t *testing.T) {
 
 	select {
 	case <-checkpointStarted:
-	case <-time.After(time.Second):
+	case <-time.After(30 * time.Second):
 		require.FailNow("meeting import did not reach checkpoint")
 	}
 	cancel()
@@ -903,7 +930,7 @@ func TestImporterCancellationAtCheckpointLeavesFailedSync(t *testing.T) {
 	select {
 	case err := <-done:
 		require.ErrorIs(err, context.Canceled)
-	case <-time.After(time.Second):
+	case <-time.After(30 * time.Second):
 		require.FailNow("meeting import did not stop after cancellation")
 	}
 

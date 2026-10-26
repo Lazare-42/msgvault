@@ -4,22 +4,27 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 	"go.kenn.io/docbank/document/mistral"
 	"go.kenn.io/msgvault/internal/attachmentstore"
+	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/documentindex"
 	"go.kenn.io/msgvault/internal/fileutil"
+	"go.kenn.io/msgvault/internal/operations"
 	"go.kenn.io/msgvault/internal/personscope"
 	personresolver "go.kenn.io/msgvault/internal/personscope/resolver"
 	"go.kenn.io/msgvault/internal/store"
@@ -27,9 +32,113 @@ import (
 )
 
 const (
-	documentsCommandName    = "documents"
-	documentBuildSubcommand = "build"
+	documentsCommandName            = "documents"
+	documentBuildSubcommand         = "build"
+	commandOperationRecorderTimeout = 5 * time.Second
 )
+
+type commandOperationPass struct {
+	recorder operations.Recorder
+	id       operations.StableID
+	kind     operations.Kind
+}
+
+func newOperationPassScope(prefix string, trigger operations.Trigger) operations.PassScope {
+	return operations.PassScope{
+		Key: prefix + ":" + uuid.NewString(), Trigger: trigger, StartedAt: time.Now().UTC(),
+	}
+}
+
+func beginCommandOperationPass(
+	ctx context.Context, recorder operations.Recorder, kind operations.Kind, scope operations.PassScope,
+) (*commandOperationPass, *operations.Run, error) {
+	spec := scope.InvocationSpec(kind)
+	if err := spec.Validate(); err != nil {
+		return nil, nil, fmt.Errorf("%s operation pass scope: %w", kind, err)
+	}
+	if operationRecorderIsNil(recorder) {
+		return nil, nil, fmt.Errorf("begin %s operation pass: operation recorder is required", kind)
+	}
+	begun, err := recorder.Begin(ctx, spec)
+	if err != nil {
+		return nil, nil, fmt.Errorf("begin %s operation pass: %w", kind, err)
+	}
+	switch begun.Disposition {
+	case operations.BeginCreated:
+		return &commandOperationPass{recorder: recorder, id: begun.ID, kind: kind}, nil, nil
+	case operations.BeginTerminal:
+		if begun.Terminal == nil {
+			return nil, nil, fmt.Errorf("begin %s operation pass returned terminal without outcome", kind)
+		}
+		return nil, begun.Terminal, nil
+	case operations.BeginActive:
+		return nil, nil, fmt.Errorf("begin %s operation pass found an active invocation", kind)
+	default:
+		return nil, nil, fmt.Errorf("begin %s operation pass returned invalid disposition %q", kind, begun.Disposition)
+	}
+}
+
+func operationRecorderIsNil(recorder operations.Recorder) bool {
+	if recorder == nil {
+		return true
+	}
+	value := reflect.ValueOf(recorder)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+func (p *commandOperationPass) checkpoint(ctx context.Context, counters operations.InvocationCounters) {
+	if p == nil {
+		return
+	}
+	checkpointCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), commandOperationRecorderTimeout)
+	defer cancel()
+	if err := p.recorder.Checkpoint(checkpointCtx, p.id, counters); err != nil {
+		if state := invocationFromContext(ctx); state != nil && state.logger != nil {
+			state.logger.Error("operation recorder checkpoint failed", "kind", p.kind, "error", err)
+		}
+	}
+}
+
+func (p *commandOperationPass) finish(
+	ctx context.Context, counters operations.InvocationCounters, runErr error,
+) {
+	if p == nil {
+		return
+	}
+	publicError := commandOperationPublicError(ctx, runErr)
+	state, err := operations.DeriveInvocationState(p.kind, counters, publicError)
+	if err != nil {
+		if state := invocationFromContext(ctx); state != nil && state.logger != nil {
+			state.logger.Error("operation recorder finish state failed", "kind", p.kind, "error", err)
+		}
+		return
+	}
+	finishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), commandOperationRecorderTimeout)
+	defer cancel()
+	if err := p.recorder.Finish(finishCtx, p.id, counters, state, publicError); err != nil {
+		if inv := invocationFromContext(ctx); inv != nil && inv.logger != nil {
+			inv.logger.Error("operation recorder finish failed", "kind", p.kind, "error", err)
+		}
+	}
+}
+
+func commandOperationPublicError(ctx context.Context, runErr error) *operations.PublicError {
+	if errors.Is(runErr, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+		return operations.FixedPublicError(operations.PublicErrorInvocationCancelled)
+	}
+	if errors.Is(runErr, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return operations.FixedPublicError(operations.PublicErrorInvocationTimeout)
+	}
+	if runErr != nil {
+		return operations.FixedPublicError(operations.PublicErrorInvocationUpstreamFailed)
+	}
+	return nil
+}
 
 type documentBuildMode int
 
@@ -41,6 +150,7 @@ const (
 
 type documentStatusOutput struct {
 	ProfileID                  string                    `json:"profile_id"`
+	ConfiguredFormats          int                       `json:"configured_formats,omitzero"`
 	AuthenticatedFormats       int                       `json:"authenticated_formats"`
 	Provider                   string                    `json:"provider"`
 	Endpoint                   string                    `json:"endpoint"`
@@ -52,10 +162,10 @@ type documentStatusOutput struct {
 	BackupsMayContainText      bool                      `json:"backups_may_contain_normalized_plaintext"`
 	HostedTextEmbeddings       bool                      `json:"hosted_text_embeddings_enabled"`
 	PricingAssumptionOn        string                    `json:"pricing_assumption_on,omitempty"`
-	EstimatedSuccessfulCostUSD *float64                  `json:"estimated_successful_cost_usd,omitempty"`
+	EstimatedSuccessfulCostUSD *float64                  `json:"estimated_successful_cost_usd,omitzero"`
 	SpoolQuotaBytes            int64                     `json:"spool_quota_bytes"`
 	MinFreeSpaceBytes          int64                     `json:"min_free_space_bytes"`
-	ActiveRebuild              *documentRebuildStatus    `json:"active_rebuild,omitempty"`
+	ActiveRebuild              *documentRebuildStatus    `json:"active_rebuild,omitzero"`
 	Status                     store.DocumentIndexStatus `json:"status"`
 }
 
@@ -81,6 +191,7 @@ type documentBuildResult struct {
 type documentBuildFailure struct {
 	CanonicalBlobHash string
 	ReasonCode        string
+	Detail            string
 }
 
 type documentsCommandDeps struct {
@@ -88,8 +199,9 @@ type documentsCommandDeps struct {
 	newMistralProcessor   func(*documentindex.DocumentsConfig) (documentindex.MistralProcessor, error)
 	validateProbeFixtures func(context.Context, mistral.Policy, mistral.ProbeFixtureConfig) error
 	runCapabilityProbe    func(context.Context, *mistral.Client, mistral.ProbeConfig) (mistral.CapabilityManifest, error)
-	openStore             func() (*store.Store, func(), error)
-	openAttachments       func(*store.Store) (documentindex.DocumentAttachmentOpener, func() error, error)
+	openStore             func(context.Context) (*store.Store, func(), error)
+	openInitializedStore  func(context.Context) (*store.Store, func(), error)
+	openAttachments       func(context.Context, *store.Store) (documentindex.DocumentAttachmentOpener, func() error, error)
 	openReadClient        func(context.Context) (documentReadClient, func(), error)
 	runDocumentVector     func(context.Context, *store.Store, int64, int) (vectordocument.ReconcileResult, error)
 }
@@ -111,9 +223,16 @@ func defaultDocumentsCommandDeps() documentsCommandDeps {
 		newMistralProcessor:   newConfiguredMistralProcessor,
 		validateProbeFixtures: mistral.ValidateProbeFixtures,
 		runCapabilityProbe:    mistral.RunCapabilityProbe,
-		openStore:             openWritableStoreAndInit,
-		runDocumentVector:     runConfiguredDocumentVectorGeneration,
-		openAttachments:       openDocumentAttachments,
+		openStore: func(ctx context.Context) (*store.Store, func(), error) {
+			return openWritableStoreAndInitForInvocation(invocationFromContext(ctx))
+		},
+		runDocumentVector: runConfiguredDocumentVectorGeneration,
+		openInitializedStore: func(ctx context.Context) (*store.Store, func(), error) {
+			return openInitializedStoreForInvocation(ctx, invocationFromContext(ctx))
+		},
+		openAttachments: func(ctx context.Context, st *store.Store) (documentindex.DocumentAttachmentOpener, func() error, error) {
+			return openDocumentAttachments(st, invocationFromContext(ctx))
+		},
 		openReadClient: func(ctx context.Context) (documentReadClient, func(), error) {
 			client, _, err := OpenHTTPStore(ctx)
 			if err != nil {
@@ -131,6 +250,7 @@ func newDocumentsCmd(deps documentsCommandDeps) *cobra.Command {
 	}
 	parent.AddCommand(newProbeMistralCmd(deps))
 	parent.AddCommand(newConsentMistralCmd(deps))
+	parent.AddCommand(newConsentDoclingCmd(deps))
 	parent.AddCommand(newBuildDocumentsCmd(deps))
 	parent.AddCommand(newResumeDocumentsCmd(deps))
 	parent.AddCommand(newSearchDocumentsCmd(deps))
@@ -271,7 +391,7 @@ func newBuildDocumentsCmd(deps documentsCommandDeps) *cobra.Command {
 				mode = documentBuildStartRebuild
 			}
 			if !isDaemonCLISubprocess() {
-				return runDaemonCLICommandHTTPFromCobraWithLocalFiles(command, args, documentProviderForwardEnv())
+				return runDocumentMutationViaDaemon(command, args, documentProviderForwardEnv(invocationFromCommand(command)))
 			}
 			return runBuildDocuments(command, capabilityPath, limit, mode, confirmed, deps)
 		},
@@ -280,7 +400,6 @@ func newBuildDocumentsCmd(deps documentsCommandDeps) *cobra.Command {
 	command.Flags().IntVar(&limit, "limit", 100, "Maximum canonical documents to process")
 	command.Flags().BoolVar(&fullRebuild, "full-rebuild", false, "Replace current extractions for all eligible documents")
 	command.Flags().BoolVar(&confirmed, "yes", false, "Confirm the disclosed provider uploads for this build")
-	_ = command.MarkFlagRequired("capabilities")
 	return command
 }
 
@@ -294,7 +413,7 @@ func newResumeDocumentsCmd(deps documentsCommandDeps) *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, args []string) error {
 			if !isDaemonCLISubprocess() {
-				return runDaemonCLICommandHTTPFromCobraWithLocalFiles(command, args, documentProviderForwardEnv())
+				return runDocumentMutationViaDaemon(command, args, documentProviderForwardEnv(invocationFromCommand(command)))
 			}
 			return runBuildDocuments(command, capabilityPath, limit, documentBuildResume, confirmed, deps)
 		},
@@ -302,7 +421,6 @@ func newResumeDocumentsCmd(deps documentsCommandDeps) *cobra.Command {
 	command.Flags().StringVar(&capabilityPath, "capabilities", "", "Authenticated Mistral capability manifest")
 	command.Flags().IntVar(&limit, "limit", 100, "Maximum canonical documents to process")
 	command.Flags().BoolVar(&confirmed, "yes", false, "Confirm the disclosed provider uploads for this resume pass")
-	_ = command.MarkFlagRequired("capabilities")
 	return command
 }
 
@@ -313,13 +431,17 @@ func newDocumentStatusCmd(deps documentsCommandDeps) *cobra.Command {
 		Use:   statusValue,
 		Short: "Show document attachment indexing status",
 		Args:  cobra.NoArgs,
-		RunE: func(command *cobra.Command, _ []string) error {
+		RunE: func(command *cobra.Command, args []string) error {
+			// Without a Mistral manifest, the daemon's own provider policy
+			// defines the profile, so a remote-only client can inspect it.
+			if capabilityPath == "" && !isDaemonCLISubprocess() {
+				return runDaemonCLICommandHTTPFromCobra(command, args)
+			}
 			return runDocumentStatus(command, capabilityPath, jsonOutput, deps)
 		},
 	}
 	command.Flags().StringVar(&capabilityPath, "capabilities", "", "Authenticated Mistral capability manifest")
 	command.Flags().BoolVar(&jsonOutput, flagJSON, false, "Output structured JSON")
-	_ = command.MarkFlagRequired("capabilities")
 	return command
 }
 
@@ -332,14 +454,13 @@ func newRetryDocumentCmd(deps documentsCommandDeps) *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(command *cobra.Command, args []string) error {
 			if !isDaemonCLISubprocess() {
-				return runDaemonCLICommandHTTPFromCobraWithLocalFiles(command, args, nil)
+				return runDocumentMutationViaDaemon(command, args, nil)
 			}
 			return runRetryDocument(command, capabilityPath, canonicalBlobHash, deps)
 		},
 	}
 	command.Flags().StringVar(&capabilityPath, "capabilities", "", "Authenticated Mistral capability manifest")
 	command.Flags().StringVar(&canonicalBlobHash, "hash", "", "Exact lowercase attachment SHA-256")
-	_ = command.MarkFlagRequired("capabilities")
 	_ = command.MarkFlagRequired("hash")
 	return command
 }
@@ -383,10 +504,12 @@ func newPurgeDocumentDerivedCmd(deps documentsCommandDeps) *cobra.Command {
 
 // documentProviderForwardEnv carries the caller's configured provider key to
 // the daemon-owned subprocess that performs an explicitly requested build.
-func documentProviderForwardEnv() map[string]string {
-	if cfg == nil {
+func documentProviderForwardEnv(state *invocation) map[string]string {
+	state = invocationState(context.Background(), state)
+	if state == nil || state.cfg == nil {
 		return nil
 	}
+	cfg := state.cfg
 	name := cfg.Attachments.Documents.APIKeyEnv
 	if name == "" {
 		return nil
@@ -404,9 +527,14 @@ func runProbeMistral(
 	validateOnly bool,
 	deps documentsCommandDeps,
 ) error {
-	if cfg == nil {
+	state := invocationFromCommand(command)
+	if state == nil || state.cfg == nil {
 		return errors.New("document probe requires loaded configuration")
 	}
+	if err := requireDocumentProvider(state, documentindex.ProviderMistral); err != nil {
+		return err
+	}
+	cfg := state.cfg
 	documentsConfig := &cfg.Attachments.Documents
 	if !validateOnly {
 		if !documentsConfig.Enabled {
@@ -469,7 +597,10 @@ func runConsentMistral(
 	confirmed bool,
 	deps documentsCommandDeps,
 ) error {
-	documentsConfig, manifest, allowedMediaTypes, profile, err := configuredDocumentProfile(capabilityPath)
+	if err := requireDocumentProvider(invocationFromCommand(command), documentindex.ProviderMistral); err != nil {
+		return err
+	}
+	documentsConfig, manifest, inputPolicy, profile, err := configuredDocumentProfile(capabilityPath, invocationFromCommand(command))
 	if err != nil {
 		return err
 	}
@@ -477,34 +608,25 @@ func runConsentMistral(
 		return errors.New("document consent requires attachments.documents.enabled=true")
 	}
 	printDocumentConsentDisclosure(
-		command.OutOrStdout(), documentsConfig, profile, len(allowedMediaTypes),
+		command.OutOrStdout(), documentsConfig, profile, inputPolicy,
 	)
 	if !confirmed {
 		return errors.New("document consent requires --yes after reviewing the configured retention and training postures")
 	}
-	if manifest.MaxUnits < documentsConfig.MaxPagesPerDocument || len(allowedMediaTypes) == 0 {
+	if manifest.MaxUnits < documentsConfig.MaxPagesPerDocument || len(inputPolicy.AllowedMediaTypes) == 0 {
 		return errors.New("document capability manifest does not authorize the configured policy")
 	}
-	st, cleanup, err := deps.openStore()
+	st, cleanup, err := deps.openStore(command.Context())
 	if err != nil {
 		return err
 	}
 	defer cleanup()
-	if _, err := st.EnsureDocumentExtractionProfile(command.Context(), profile); err != nil {
-		return err
-	}
-	if err := st.RecordDocumentProviderConsent(command.Context(), store.DocumentProviderConsent{
-		ProfileID: profile.ID, ProfileFingerprint: profile.Fingerprint,
-		RetentionPosture: profile.RetentionPosture, TrainingPosture: profile.TrainingPosture,
-	}); err != nil {
-		return err
-	}
-	if err := bootstrapDocumentOccurrencesIfConsented(command.Context(), st); err != nil {
+	if err := recordDocumentConsent(command.Context(), st, profile); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintf(command.OutOrStdout(),
 		"Recorded Mistral document consent for profile %s (%d authenticated format(s), retention=%s, training=%s).\n",
-		profile.ID, len(allowedMediaTypes), profile.RetentionPosture, profile.TrainingPosture)
+		profile.ID, len(inputPolicy.AllowedMediaTypes), profile.RetentionPosture, profile.TrainingPosture)
 	return nil
 }
 
@@ -525,15 +647,32 @@ func printDocumentConsentDisclosure(
 	w io.Writer,
 	documentsConfig *documentindex.DocumentsConfig,
 	profile store.DocumentExtractionProfile,
-	authenticatedFormats int,
+	inputPolicy documentindex.ResolvedInputPolicy,
 ) {
+	if profile.Provider == documentindex.ProviderDocling {
+		printDoclingConsentDisclosure(w, documentsConfig, profile, inputPolicy)
+		return
+	}
 	_, _ = fmt.Fprintln(w, "Hosted document extraction disclosure:")
-	_, _ = fmt.Fprintf(w,
-		"- Complete original document bytes and their media type will be sent to %s (%s).\n",
-		profile.Endpoint, profile.Region)
+	roles := "standalone document attachments"
+	if profile.IncludeInline {
+		roles = "standalone and inline document attachments"
+	}
+	_, _ = fmt.Fprintf(w, "- Scope includes %s in the configured document formats and message sources.\n", roles)
+	_, _ = fmt.Fprintf(w, "- Authenticated upload routes target %s (%s):\n", profile.Endpoint, profile.Region)
+	for _, mediaType := range inputPolicy.AllowedMediaTypes {
+		route := inputPolicy.Routes[mediaType]
+		if route.Conversion != nil {
+			_, _ = fmt.Fprintf(w,
+				"  - source %s is converted locally; generated %s bytes are sent.\n",
+				mediaType, route.Format.MediaType)
+			continue
+		}
+		_, _ = fmt.Fprintf(w, "  - original %s bytes and media type are sent.\n", mediaType)
+	}
 	_, _ = fmt.Fprintf(w,
 		"- The exact authenticated policy allows %d format(s), at most %s and %d provider unit(s) per document.\n",
-		authenticatedFormats, formatSize(documentsConfig.MaxFileBytes), documentsConfig.MaxPagesPerDocument)
+		len(inputPolicy.AllowedMediaTypes), formatSize(documentsConfig.MaxFileBytes), documentsConfig.MaxPagesPerDocument)
 	_, _ = fmt.Fprintf(w, "- Private temporary spools are capped at %s and preserve %s of free disk space.\n",
 		formatSize(documentsConfig.MaxSpoolBytes), formatSize(documentsConfig.MinFreeSpaceBytes))
 	_, _ = fmt.Fprintf(w, "- Provider assertions: retention=%s, training=%s.\n",
@@ -561,10 +700,15 @@ func runBuildDocuments(
 	confirmed bool,
 	deps documentsCommandDeps,
 ) (runErr error) {
+	state := invocationFromCommand(command)
+	if state == nil || state.cfg == nil {
+		return errors.New("document build requires loaded configuration")
+	}
+	cfg := state.cfg
 	if limit <= 0 || limit > 10_000 {
 		return errors.New("document build limit must be between 1 and 10000")
 	}
-	documentsConfig, manifest, allowedMediaTypes, profile, err := configuredDocumentProfile(capabilityPath)
+	documentsConfig, manifest, inputPolicy, profile, err := configuredDocumentProfile(capabilityPath, invocationFromCommand(command))
 	if err != nil {
 		return err
 	}
@@ -578,11 +722,11 @@ func runBuildDocuments(
 	if !confirmed {
 		_, _ = fmt.Fprintln(command.OutOrStdout(), "Document build upload preflight:")
 		printDocumentConsentDisclosure(
-			command.OutOrStdout(), documentsConfig, profile, len(allowedMediaTypes),
+			command.OutOrStdout(), documentsConfig, profile, inputPolicy,
 		)
 		return errors.New("document build requires --yes after reviewing the provider upload preflight")
 	}
-	st, cleanup, err := deps.openStore()
+	st, cleanup, err := deps.openStore(command.Context())
 	if err != nil {
 		return err
 	}
@@ -595,7 +739,7 @@ func runBuildDocuments(
 		return err
 	}
 	if !consentStatus.ProfileEnabled || !consentStatus.ExactConsent {
-		return errors.New("document build requires exact consent; run `msgvault documents consent-mistral --capabilities <manifest> --yes`")
+		return fmt.Errorf("document build requires exact consent; run `%s`", documentConsentCommand(documentsConfig.Provider))
 	}
 	if err := repairHistoricalAttachmentRoles(command.Context(), st); err != nil {
 		return err
@@ -611,26 +755,36 @@ func runBuildDocuments(
 		return err
 	}
 	status, err := st.GetDocumentIndexStatusForScope(
-		command.Context(), profile.ID, "original", allowedMediaTypes, documentsConfig.Scope.MessageTypes,
+		command.Context(), profile.ID, "original", inputPolicy.AllowedMediaTypes, documentsConfig.Scope.MessageTypes,
 	)
 	if err != nil {
 		return err
 	}
 	printDocumentBuildPreflight(
-		command.OutOrStdout(), documentsConfig, profile, len(allowedMediaTypes), status, limit, mode,
+		command.OutOrStdout(), documentsConfig, profile, inputPolicy, status, limit, mode,
 	)
-	attachments, closeAttachments, err := deps.openAttachments(st)
+	attachments, closeAttachments, err := deps.openAttachments(command.Context(), st)
 	if err != nil {
 		return err
 	}
 	defer func() { runErr = errors.Join(runErr, closeAttachments()) }()
-	processor, err := deps.newMistralProcessor(documentsConfig)
-	if err != nil {
-		return err
+	var processor documentindex.MistralProcessor
+	if documentsConfig.Provider == documentindex.ProviderMistral {
+		processor, err = deps.newMistralProcessor(documentsConfig)
+		if err != nil {
+			return err
+		}
+	} else if documentsConfig.APIKeyEnv != "" {
+		// Check before a full rebuild is recorded, as Mistral's processor does.
+		if _, err := documentsConfig.ResolveAPIKey(); err != nil {
+			return err
+		}
 	}
 	result, err := executeDocumentBuild(
-		command.Context(), st, attachments, processor, documentsConfig, manifest,
-		allowedMediaTypes, profile, limit, "documents-cli", cfg.Data.DataDir, mode, &reconcileResult,
+		command.Context(), st,
+		newOperationPassScope("cli:document-extraction", operations.TriggerManual),
+		st, attachments, processor, documentsConfig, manifest,
+		inputPolicy.AllowedMediaTypes, profile, limit, "documents-cli", cfg.Data.DataDir, mode, &reconcileResult,
 	)
 	_, _ = fmt.Fprintf(command.OutOrStdout(),
 		"Reconciled %d attachment(s), consumed %d change(s); indexed %d document(s), %d unit(s), skipped %d, failed %d.\n",
@@ -645,8 +799,8 @@ func runBuildDocuments(
 			_, _ = fmt.Fprintln(command.OutOrStdout(), "Full document rebuild completed.")
 		} else {
 			_, _ = fmt.Fprintf(command.OutOrStdout(),
-				"Full document rebuild has %d current owner(s) remaining; run `msgvault documents resume --capabilities <manifest>` with the same capability manifest.\n",
-				result.Remaining)
+				"Full document rebuild has %d current owner(s) remaining; run `%s --yes` with the same provider policy.\n",
+				result.Remaining, documentResumeCommand(documentsConfig.Provider))
 		}
 	}
 	return err
@@ -656,7 +810,7 @@ func printDocumentBuildPreflight(
 	w io.Writer,
 	documentsConfig *documentindex.DocumentsConfig,
 	profile store.DocumentExtractionProfile,
-	authenticatedFormats int,
+	inputPolicy documentindex.ResolvedInputPolicy,
 	status store.DocumentIndexStatus,
 	limit int,
 	mode documentBuildMode,
@@ -671,17 +825,25 @@ func printDocumentBuildPreflight(
 		modeName = cmdUseResume
 	}
 	_, _ = fmt.Fprintln(w, "Document build upload preflight:")
-	_, _ = fmt.Fprintf(w,
-		"- The current scope contains %d eligible attachment occurrence(s), %d unique canonical document(s), and %s of original bytes.\n",
-		status.EligibleOccurrences, status.EligibleOwners, formatSize(status.EligibleBytes))
+	if documentsConfig.Conversion.CSV.Enabled {
+		_, _ = fmt.Fprintf(w,
+			"- The current scope contains %d eligible attachment occurrence(s), %d unique canonical document(s), and %s of source bytes. CSV inputs are converted locally, and their generated PDF upload bytes are recorded after each request.\n",
+			status.EligibleOccurrences, status.EligibleOwners, formatSize(status.EligibleBytes))
+	} else {
+		_, _ = fmt.Fprintf(w,
+			"- The current scope contains %d eligible attachment occurrence(s), %d unique canonical document(s), and %s of source bytes.\n",
+			status.EligibleOccurrences, status.EligibleOwners, formatSize(status.EligibleBytes))
+	}
 	_, _ = fmt.Fprintf(w,
 		"- This %s pass will process at most %d canonical document(s) and %d provider unit(s).\n",
 		modeName, limit, documentsConfig.MaxPagesPerRun)
-	printDocumentConsentDisclosure(w, documentsConfig, profile, authenticatedFormats)
+	printDocumentConsentDisclosure(w, documentsConfig, profile, inputPolicy)
 }
 
 func executeDocumentBuild(
 	ctx context.Context,
+	recorder operations.Recorder,
+	scope operations.PassScope,
 	st *store.Store,
 	attachments documentindex.DocumentAttachmentOpener,
 	processor documentindex.MistralProcessor,
@@ -694,8 +856,19 @@ func executeDocumentBuild(
 	dataDirectory string,
 	mode documentBuildMode,
 	preReconciled *documentindex.ReconcileResult,
-) (documentBuildResult, error) {
-	result := documentBuildResult{}
+) (result documentBuildResult, runErr error) {
+	pass, terminal, err := beginCommandOperationPass(
+		ctx, recorder, operations.KindDocumentExtraction, scope,
+	)
+	if err != nil {
+		return result, err
+	}
+	if terminal != nil {
+		return documentBuildResultFromOperationRun(terminal)
+	}
+	defer func() {
+		pass.finish(ctx, documentExtractionCounters(result), runErr)
+	}()
 	var reconcileResult documentindex.ReconcileResult
 	if preReconciled != nil {
 		reconcileResult = *preReconciled
@@ -738,35 +911,10 @@ func executeDocumentBuild(
 	default:
 		return result, errors.New("document build mode is invalid")
 	}
-	if dataDirectory == "" {
-		return result, errors.New("document build requires a data directory")
-	}
-	spoolDirectory := filepath.Join(dataDirectory, "tmp", "document-index")
-	if err := fileutil.SecureMkdirAll(spoolDirectory, 0o700); err != nil {
-		return result, fmt.Errorf("create private document spool directory: %w", err)
-	}
-	if _, err := mistral.ScavengeSpoolDirectory(
-		spoolDirectory, time.Now().UTC().Add(-2*time.Hour),
-	); err != nil {
-		return result, fmt.Errorf("scavenge Mistral document spool: %w", err)
-	}
-	policy, err := documentsConfig.MistralPolicy()
-	if err != nil {
-		return result, err
-	}
-	workerConfig := documentindex.MistralWorkerConfig{
-		ProfileID: profile.ID, LeaseOwner: leaseOwner, LeaseDuration: documentsConfig.RequestTimeout + time.Minute,
-		RetryDelay: 15 * time.Minute, SpoolDirectory: spoolDirectory,
-		MaxSpoolBytes: documentsConfig.MaxSpoolBytes, MinFreeBytes: documentsConfig.MinFreeSpaceBytes,
-		MessageTypes:     documentsConfig.Scope.MessageTypes,
-		CapabilityPolicy: manifest, Policy: policy,
-	}
 	if rebuild != nil {
-		workerConfig.RebuildID = rebuild.ID
-		workerConfig.ReplaceCurrent = true
 		result.RebuildID = rebuild.ID
 	}
-	worker, err := documentindex.NewMistralWorker(st, attachments, processor, workerConfig)
+	worker, err := newDocumentBuildWorker(st, attachments, processor, documentsConfig, manifest, profile.ID, leaseOwner, dataDirectory, rebuild)
 	if err != nil {
 		return result, err
 	}
@@ -796,14 +944,17 @@ func executeDocumentBuild(
 			result.Failures = append(result.Failures, documentBuildFailure{
 				CanonicalBlobHash: extraction.CanonicalBlobHash,
 				ReasonCode:        extraction.FailureReasonCode,
+				Detail:            extraction.FailureDetail,
 			})
+			pass.checkpoint(ctx, documentExtractionCounters(result))
 			continue
 		}
 		result.Processed++
-		result.Units += extraction.Units
+		result.Units += extraction.ProviderUnits
 		if extraction.CleanupError != nil {
 			result.CleanupFailures++
 		}
+		pass.checkpoint(ctx, documentExtractionCounters(result))
 		if result.Units > documentsConfig.MaxPagesPerRun {
 			return result, errors.New("document provider output exceeded max_pages_per_run")
 		}
@@ -826,13 +977,37 @@ func executeDocumentBuild(
 		var details strings.Builder
 		for _, failure := range result.Failures {
 			fmt.Fprintf(&details, "\n%s: %s", failure.CanonicalBlobHash, failure.ReasonCode)
+			if failure.Detail != "" {
+				fmt.Fprintf(&details, ": %s", failure.Detail)
+			}
 		}
 		return result, fmt.Errorf(
-			"document build completed with %d extraction failure(s):%s\nretry one with `msgvault documents retry --capabilities <manifest> --hash <sha256>`",
-			result.Failed, details.String(),
+			"document build completed with %d extraction failure(s):%s\nretry one with `%s --hash <sha256>`",
+			result.Failed, details.String(), documentRetryCommand(documentsConfig.Provider),
 		)
 	}
 	return result, nil
+}
+
+func documentExtractionCounters(result documentBuildResult) operations.InvocationCounters {
+	succeeded := int64(result.Processed)
+	failed := int64(result.Failed)
+	return operations.InvocationCounters{
+		Attempted: succeeded + failed, Succeeded: succeeded, Failed: failed,
+	}
+}
+
+func documentBuildResultFromOperationRun(run *operations.Run) (documentBuildResult, error) {
+	if run == nil {
+		return documentBuildResult{}, errors.New("document extraction operation outcome is required")
+	}
+	counters, err := operations.InvocationCountersFromPublic(run.ID.Kind(), run.Counters)
+	if err != nil {
+		return documentBuildResult{}, err
+	}
+	return documentBuildResult{
+		Processed: int(counters.Succeeded), Failed: int(counters.Failed),
+	}, operations.TerminalReplayOutcome(run)
 }
 
 func newDocumentRebuildID() (string, error) {
@@ -849,13 +1024,15 @@ func runDocumentStatus(
 	jsonOutput bool,
 	deps documentsCommandDeps,
 ) error {
-	documentsConfig, _, allowedMediaTypes, profile, err := configuredDocumentProfile(capabilityPath)
+	documentsConfig, _, inputPolicy, profile, err := configuredDocumentProfile(
+		capabilityPath, invocationFromCommand(command),
+	)
 	if err != nil {
 		return err
 	}
 	response, cleanup, err := readDocumentStatus(command.Context(), store.DocumentIndexStatusRequest{
 		ProfileID: profile.ID, ExtractionInputKey: "original",
-		AllowedMediaTypes: allowedMediaTypes, AllowedMessageTypes: documentsConfig.Scope.MessageTypes,
+		AllowedMediaTypes: inputPolicy.AllowedMediaTypes, AllowedMessageTypes: documentsConfig.Scope.MessageTypes,
 	}, deps)
 	if err != nil {
 		return err
@@ -876,7 +1053,7 @@ func runDocumentStatus(
 		estimatedSuccessfulCost = &cost
 	}
 	output := documentStatusOutput{
-		ProfileID: profile.ID, AuthenticatedFormats: len(allowedMediaTypes),
+		ProfileID: profile.ID, AuthenticatedFormats: len(inputPolicy.AllowedMediaTypes),
 		Provider: profile.Provider, Endpoint: profile.Endpoint, Region: profile.Region, Model: profile.Model,
 		RetentionPosture: profile.RetentionPosture, TrainingPosture: profile.TrainingPosture,
 		StoresPlaintext: storesPlaintext, BackupsMayContainText: storesPlaintext,
@@ -886,14 +1063,21 @@ func runDocumentStatus(
 		SpoolQuotaBytes:            documentsConfig.MaxSpoolBytes, MinFreeSpaceBytes: documentsConfig.MinFreeSpaceBytes,
 		ActiveRebuild: rebuildStatus, Status: status,
 	}
+	formatsLabel := "authenticated"
+	preparation := fmt.Sprintf("Private spool: %s quota, %s free-space reserve", formatSize(documentsConfig.MaxSpoolBytes), formatSize(documentsConfig.MinFreeSpaceBytes))
+	if documentsConfig.Provider == documentindex.ProviderDocling {
+		output.ConfiguredFormats, output.AuthenticatedFormats = len(inputPolicy.AllowedMediaTypes), 0
+		output.SpoolQuotaBytes, output.MinFreeSpaceBytes = 0, 0
+		formatsLabel = "configured"
+		preparation = fmt.Sprintf("Source preparation: bounded memory, %s per document", formatSize(documentsConfig.MaxFileBytes))
+	}
 	if jsonOutput {
-		return json.NewEncoder(command.OutOrStdout()).Encode(output)
+		return json.MarshalEncode(jsontext.NewEncoder(command.OutOrStdout()), output, json.Deterministic(true))
 	}
 	_, _ = fmt.Fprintf(command.OutOrStdout(),
-		"Profile: %s\nProvider: %s %s (%s, %s)\nFormats: %d authenticated\nRetention: %s\nTraining: %s\nPrivate spool: %s quota, %s free-space reserve\nEnabled: %t\nExact consent: %t\nEligible: %d occurrence(s), %d unique document(s), %s\nExcluded roles: %d unknown, %d ineligible\nCoverage: %d ready, %d staging, %d retrying, %d terminal, %d missing\nExtraction accounting: %d attempt(s), %d successful, %d failed, %s verified upload bytes\nProvider accounting: %d request(s), %d internal retry(s), %d ms total latency (%.1f ms average), %d processed unit(s), %s reported bytes, %d successful response(s) without provider bytes\nNormalized plaintext stored: %t\nBackups may contain normalized plaintext: %t\nHosted document text embeddings: %t\n",
+		"Profile: %s\nProvider: %s %s (%s, %s)\nFormats: %d %s\nRetention: %s\nTraining: %s\n%s\nEnabled: %t\nExact consent: %t\nEligible: %d occurrence(s), %d unique document(s), %s\nExcluded roles: %d unknown, %d ineligible\nCoverage: %d ready, %d staging, %d retrying, %d terminal, %d missing\nExtraction accounting: %d attempt(s), %d successful, %d failed, %s verified upload bytes\nProvider accounting: %d request(s), %d internal retry(s), %d ms total latency (%.1f ms average), %d processed unit(s), %s reported bytes, %d successful response(s) without provider bytes\nNormalized plaintext stored: %t\nBackups may contain normalized plaintext: %t\nHosted document text embeddings: %t\n",
 		profile.ID, profile.Provider, profile.Model, profile.Region, profile.Endpoint,
-		len(allowedMediaTypes), profile.RetentionPosture, profile.TrainingPosture,
-		formatSize(documentsConfig.MaxSpoolBytes), formatSize(documentsConfig.MinFreeSpaceBytes),
+		len(inputPolicy.AllowedMediaTypes), formatsLabel, profile.RetentionPosture, profile.TrainingPosture, preparation,
 		status.ProfileEnabled, status.ExactConsent, status.EligibleOccurrences,
 		status.EligibleOwners, formatSize(status.EligibleBytes), status.UnknownRoleOccurrences,
 		status.IneligibleRoleOccurrences, status.ReadyOwners, status.StagingOwners,
@@ -912,6 +1096,16 @@ func runDocumentStatus(
 		_, _ = fmt.Fprintf(command.OutOrStdout(), "Active full rebuild: %d of %d owner(s) remaining\n",
 			rebuildStatus.RemainingOwners, rebuildStatus.SnapshotOwners)
 	}
+	for _, failure := range status.Failures {
+		_, _ = fmt.Fprintf(command.OutOrStdout(), "%s: %s", failure.CanonicalBlobHash, failure.ReasonCode)
+		if failure.Detail != "" {
+			_, _ = fmt.Fprintf(command.OutOrStdout(), ": %s", failure.Detail)
+		}
+		_, _ = fmt.Fprintln(command.OutOrStdout())
+	}
+	if len(status.Failures) > 0 && !status.FailuresExhausted {
+		_, _ = fmt.Fprintln(command.OutOrStdout(), "Additional document failures omitted; retry reported documents and check status again.")
+	}
 	return nil
 }
 
@@ -921,11 +1115,11 @@ func runRetryDocument(
 	canonicalBlobHash string,
 	deps documentsCommandDeps,
 ) error {
-	profile, err := configuredDocumentProfileOnly(capabilityPath)
+	profile, err := configuredDocumentProfileOnly(capabilityPath, invocationFromCommand(command))
 	if err != nil {
 		return err
 	}
-	st, cleanup, err := deps.openStore()
+	st, cleanup, err := deps.openStore(command.Context())
 	if err != nil {
 		return err
 	}
@@ -942,11 +1136,11 @@ func runRetryDocument(
 	return nil
 }
 
-func configuredDocumentProfileOnly(capabilityPath string) (store.DocumentExtractionProfile, error) {
-	documentsConfig, manifest, allowedMediaTypes, profile, err := configuredDocumentProfile(capabilityPath)
+func configuredDocumentProfileOnly(capabilityPath string, state *invocation) (store.DocumentExtractionProfile, error) {
+	documentsConfig, manifest, inputPolicy, profile, err := configuredDocumentProfile(capabilityPath, state)
 	_ = documentsConfig
 	_ = manifest
-	_ = allowedMediaTypes
+	_ = inputPolicy
 	return profile, err
 }
 
@@ -959,7 +1153,7 @@ func runRetireDocumentProfile(
 	if !confirmed {
 		return errors.New("document profile retirement requires --yes")
 	}
-	st, cleanup, err := deps.openStore()
+	st, cleanup, err := deps.openStore(command.Context())
 	if err != nil {
 		return err
 	}
@@ -984,7 +1178,7 @@ func runPurgeDocumentDerived(
 	if !confirmed {
 		return errors.New("document derivative purge requires --yes")
 	}
-	st, cleanup, err := deps.openStore()
+	st, cleanup, err := deps.openStore(command.Context())
 	if err != nil {
 		return err
 	}
@@ -1004,7 +1198,7 @@ func runSearchDocuments(
 	request store.DocumentSearchRequest,
 	jsonOutput bool,
 	deps documentsCommandDeps,
-) error {
+) (result error) {
 	reader, cleanup, err := openDocumentReadClient(command.Context(), deps)
 	if err != nil {
 		return err
@@ -1014,8 +1208,19 @@ func runSearchDocuments(
 	if err != nil {
 		return err
 	}
+	client, remote := reader.(*daemonclient.Client)
+	if remote && request.Cursor == "" && strings.TrimSpace(request.Query) != "" {
+		kind := response.EffectiveMode
+		if kind != "semantic" && kind != "hybrid" {
+			kind = "text"
+		}
+		defer reportSuccessfulCLIAction(command, client, "search_run", "search_type", kind, &result)
+		if len(response.Results) == 0 {
+			defer reportSuccessfulCLIAction(command, client, "search_empty", "search_type", kind, &result)
+		}
+	}
 	if jsonOutput {
-		return json.NewEncoder(command.OutOrStdout()).Encode(response)
+		return json.MarshalEncode(jsontext.NewEncoder(command.OutOrStdout()), response, json.Deterministic(true))
 	}
 	writer := tabwriter.NewWriter(command.OutOrStdout(), 0, 4, 2, ' ', 0)
 	_, _ = fmt.Fprintln(writer, "RANK\tATTACHMENT\tMESSAGE\tFILE\tMATCH\tEXCERPT")
@@ -1040,7 +1245,7 @@ func openDocumentReadClient(
 	if deps.openReadClient != nil {
 		return deps.openReadClient(ctx)
 	}
-	st, cleanup, err := deps.openStore()
+	st, cleanup, err := deps.openStore(ctx)
 	if err != nil {
 		return nil, func() {}, err
 	}
@@ -1052,7 +1257,21 @@ func readDocumentStatus(
 	request store.DocumentIndexStatusRequest,
 	deps documentsCommandDeps,
 ) (store.DocumentIndexStatusResponse, func(), error) {
-	reader, cleanup, err := openDocumentReadClient(ctx, deps)
+	var reader documentReadClient
+	var cleanup func()
+	var err error
+	if isDaemonCLISubprocess() {
+		// The daemon already owns the archive; calling back into its HTTP API
+		// from its own CLI runner would be a needless loop. Status runs outside
+		// the operation gate, so it must not run schema setup or startup
+		// migrations: a legacy identity migration racing account creation
+		// would skip the new account's own address.
+		var st *store.Store
+		st, cleanup, err = deps.openInitializedStore(ctx)
+		reader = localDocumentReadClient{store: st}
+	} else {
+		reader, cleanup, err = openDocumentReadClient(ctx, deps)
+	}
 	if err != nil {
 		return store.DocumentIndexStatusResponse{}, func() {}, err
 	}
@@ -1173,26 +1392,36 @@ func bootstrapDocumentOccurrencesIfConsented(ctx context.Context, st *store.Stor
 
 func configuredDocumentProfile(
 	capabilityPath string,
-) (*documentindex.DocumentsConfig, mistral.CapabilityManifest, []string, store.DocumentExtractionProfile, error) {
-	if cfg == nil {
-		return nil, mistral.CapabilityManifest{}, nil, store.DocumentExtractionProfile{},
+	state *invocation,
+) (*documentindex.DocumentsConfig, mistral.CapabilityManifest, documentindex.ResolvedInputPolicy, store.DocumentExtractionProfile, error) {
+	state = invocationState(context.Background(), state)
+	if state == nil || state.cfg == nil {
+		return nil, mistral.CapabilityManifest{}, documentindex.ResolvedInputPolicy{}, store.DocumentExtractionProfile{},
 			errors.New("document operation requires loaded configuration")
 	}
+	cfg := state.cfg
 	documentsConfig := &cfg.Attachments.Documents
 	if documentsConfig.RetentionPosture == documentindex.RetentionUnknown ||
 		documentsConfig.TrainingPosture == documentindex.TrainingUnknown {
-		return nil, mistral.CapabilityManifest{}, nil, store.DocumentExtractionProfile{},
+		return nil, mistral.CapabilityManifest{}, documentindex.ResolvedInputPolicy{}, store.DocumentExtractionProfile{},
 			errors.New("document operation requires explicit retention_posture and training_posture")
 	}
-	manifest, err := loadDocumentCapabilityManifest(capabilityPath)
-	if err != nil {
-		return nil, mistral.CapabilityManifest{}, nil, store.DocumentExtractionProfile{}, err
+	var manifest mistral.CapabilityManifest
+	if documentsConfig.Provider == documentindex.ProviderMistral {
+		if capabilityPath == "" {
+			return nil, manifest, documentindex.ResolvedInputPolicy{}, store.DocumentExtractionProfile{}, errors.New("mistral document operation requires --capabilities <manifest>")
+		}
+		var err error
+		manifest, err = loadDocumentCapabilityManifest(capabilityPath)
+		if err != nil {
+			return nil, manifest, documentindex.ResolvedInputPolicy{}, store.DocumentExtractionProfile{}, err
+		}
 	}
-	allowedMediaTypes, profile, err := documentProfileForConfig(documentsConfig, manifest)
+	inputPolicy, profile, err := documentProfileForConfig(documentsConfig, manifest)
 	if err != nil {
-		return nil, mistral.CapabilityManifest{}, nil, store.DocumentExtractionProfile{}, err
+		return nil, mistral.CapabilityManifest{}, documentindex.ResolvedInputPolicy{}, store.DocumentExtractionProfile{}, err
 	}
-	return documentsConfig, manifest, allowedMediaTypes, profile, nil
+	return documentsConfig, manifest, inputPolicy, profile, nil
 }
 
 func loadDocumentCapabilityManifest(capabilityPath string) (mistral.CapabilityManifest, error) {
@@ -1211,45 +1440,49 @@ func loadDocumentCapabilityManifest(capabilityPath string) (mistral.CapabilityMa
 func documentProfileForConfig(
 	documentsConfig *documentindex.DocumentsConfig,
 	manifest mistral.CapabilityManifest,
-) ([]string, store.DocumentExtractionProfile, error) {
-	policy, err := documentsConfig.MistralPolicy()
+) (documentindex.ResolvedInputPolicy, store.DocumentExtractionProfile, error) {
+	inputPolicy, err := documentindex.ResolveInputPolicy(documentsConfig, manifest)
 	if err != nil {
-		return nil, store.DocumentExtractionProfile{}, err
+		return documentindex.ResolvedInputPolicy{}, store.DocumentExtractionProfile{}, err
 	}
-	allowedMediaTypes := make([]string, 0, len(mistral.CandidateFormats()))
-	for _, format := range mistral.CandidateFormats() {
-		if _, authorizeErr := policy.Authorize(manifest, format.ID); authorizeErr == nil {
-			allowedMediaTypes = append(allowedMediaTypes, format.MediaType)
-		}
-	}
-	if len(allowedMediaTypes) == 0 {
-		return nil, store.DocumentExtractionProfile{}, errors.New(
-			"no format has authorized upload authority; run the authenticated capability probe and supply its manifest",
-		)
-	}
+	allowedMediaTypes := inputPolicy.AllowedMediaTypes
 	fingerprint, err := documentsConfig.ProfileFingerprint(manifest, allowedMediaTypes)
 	if err != nil {
-		return nil, store.DocumentExtractionProfile{}, err
+		return documentindex.ResolvedInputPolicy{}, store.DocumentExtractionProfile{}, err
 	}
 	policyJSON, err := documentsConfig.ProfilePolicyJSON(manifest, allowedMediaTypes)
 	if err != nil {
-		return nil, store.DocumentExtractionProfile{}, err
+		return documentindex.ResolvedInputPolicy{}, store.DocumentExtractionProfile{}, err
 	}
-	values := policy.Values()
 	profile := store.DocumentExtractionProfile{
 		ID: "documents-v1:" + fingerprint, Fingerprint: fingerprint,
-		Provider: values.Provider, Endpoint: values.Endpoint, Region: values.Region,
-		Model: values.Model, RetentionPosture: values.Retention,
-		TrainingPosture:   values.Training,
+		Provider: documentsConfig.Provider, Endpoint: documentsConfig.Endpoint, Region: documentsConfig.Region,
+		Model: documentsConfig.Model, RetentionPosture: documentsConfig.RetentionPosture,
+		TrainingPosture:   documentsConfig.TrainingPosture,
 		AllowedMediaTypes: allowedMediaTypes, PolicyJSON: policyJSON,
+		IncludeInline: documentsConfig.Scope.IncludeInline,
 	}
-	return allowedMediaTypes, profile, nil
+	if documentsConfig.Provider == documentindex.ProviderMistral {
+		policy, err := documentsConfig.MistralPolicy()
+		if err != nil {
+			return documentindex.ResolvedInputPolicy{}, store.DocumentExtractionProfile{}, err
+		}
+		values := policy.Values()
+		profile.Provider, profile.Endpoint, profile.Region = values.Provider, values.Endpoint, values.Region
+		profile.Model, profile.RetentionPosture, profile.TrainingPosture = values.Model, values.Retention, values.Training
+	}
+	return inputPolicy, profile, nil
 }
 
 func openDocumentAttachments(
 	st *store.Store,
+	state *invocation,
 ) (documentindex.DocumentAttachmentOpener, func() error, error) {
-	attachments, err := attachmentstore.New(store.NewPackCatalog(st), cfg.AttachmentsDir())
+	state = invocationState(context.Background(), state)
+	if state == nil || state.cfg == nil {
+		return nil, nil, errors.New("configuration is unavailable")
+	}
+	attachments, err := attachmentstore.New(store.NewPackCatalog(st), state.cfg.AttachmentsDir())
 	if err != nil {
 		return nil, nil, err
 	}

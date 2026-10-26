@@ -12,12 +12,12 @@ import (
 type ParticipantContactObservation struct {
 	Envelope             ValueEnvelope      `json:"envelope"`
 	ParticipantID        int64              `json:"participant_id"`
-	SourceID             *int64             `json:"source_id,omitempty"`
+	SourceID             *int64             `json:"source_id,omitzero" nullable:"false"`
 	AddressKind          ContactAddressKind `json:"address_kind"`
-	ServiceSlug          *string            `json:"service_slug,omitempty"`
-	ScopeKind            *string            `json:"scope_kind,omitempty"`
-	ScopeValue           *string            `json:"scope_value,omitempty"`
-	ProviderUserID       *string            `json:"provider_user_id,omitempty"`
+	ServiceSlug          *string            `json:"service_slug,omitzero" nullable:"false"`
+	ScopeKind            *string            `json:"scope_kind,omitzero" nullable:"false"`
+	ScopeValue           *string            `json:"scope_value,omitzero" nullable:"false"`
+	ProviderUserID       *string            `json:"provider_user_id,omitzero" nullable:"false"`
 	OriginalValue        string             `json:"original_value"`
 	NormalizedValue      string             `json:"normalized_value"`
 	Normalization        string             `json:"normalization"`
@@ -44,7 +44,7 @@ type RecordContactObservationResult struct {
 	CandidateIDs []int64                        `json:"candidate_ids,omitempty"`
 	// CandidateID is the first conflict candidate, retained for callers that
 	// predate complete conflict-graph reporting.
-	CandidateID *int64 `json:"candidate_id,omitempty"`
+	CandidateID *int64 `json:"candidate_id,omitzero" nullable:"false"`
 }
 
 var ErrObservationValueMissing = errors.New("participant contact observation requires a non-empty value")
@@ -192,13 +192,7 @@ func (s *Store) RecordContactObservationContext(
 		}
 	}
 	result := &RecordContactObservationResult{}
-	err = s.withTxContext(ctx, func(tx *loggedTx) error {
-		// Observation writes can create participant-level identity conflicts.
-		// Use the same outer lock as conflict cleanup, source removal, and
-		// participant merge so none of them can act on a stale observation set.
-		if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
-			return err
-		}
+	err = s.withAttributionTxContext(ctx, attributionLock{Exclusive: true}, func(tx *loggedTx) error {
 		// Normal source removal takes this source-scoped lock before it
 		// recomputes generated conflicts and deletes the source. An importer for
 		// that source must finish its observation/candidate transaction before
@@ -320,7 +314,7 @@ func (s *Store) RecordContactObservationContext(
 				return err
 			}
 			result.Created = true
-			if err := s.bumpParticipantIdentifierRevision(tx); err != nil {
+			if err := s.bumpParticipantIdentifierRevision(ctx, tx); err != nil {
 				return err
 			}
 			if providerContradicted {
@@ -490,7 +484,7 @@ func (s *Store) SupersedeParticipantObservationContext(
 		); err != nil {
 			return err
 		}
-		return s.bumpParticipantIdentifierRevision(tx)
+		return s.bumpParticipantIdentifierRevision(ctx, tx)
 	})
 }
 

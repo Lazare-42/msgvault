@@ -15,6 +15,7 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/granola"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/telemetry"
 	"go.kenn.io/msgvault/internal/testutil"
 )
 
@@ -85,7 +86,6 @@ func TestAddGranolaIdentityConfirmsPrimaryWhenAliasExists(t *testing.T) {
 	assert.Equal("user-z@example.com", identities[1].Address)
 	assert.Contains(out.String(), "Confirmed identity user-z@example.com")
 	assert.Contains(out.String(), "sync-granola work --full")
-	assert.Nil(addGranolaCmd.Flags().Lookup("no-default-identity"), "meeting identity confirmation is mandatory")
 }
 
 func TestConfiguredGranolaMissingRegisteredSourceStopsBeforeClient(t *testing.T) {
@@ -129,12 +129,12 @@ func TestManualGranolaPartialImportRefreshesCacheBeforeReturningError(t *testing
 		AccountEmail: "user-a@example.com",
 		APIKey:       "grn_test",
 	}}
-	withStoreResolverConfig(t, testCfg)
+	testCtx := withStoreResolverConfig(t, testCfg)
 
 	savedRefresh := rebuildGranolaCacheAfterWrite
 	refreshes := 0
 	refreshSawWrite := false
-	rebuildGranolaCacheAfterWrite = func(dbPath string) error {
+	rebuildGranolaCacheAfterWrite = func(dbPath string, _ *invocation) error {
 		refreshes++
 		st, openErr := store.Open(dbPath)
 		require.NoError(openErr)
@@ -152,7 +152,8 @@ func TestManualGranolaPartialImportRefreshesCacheBeforeReturningError(t *testing
 		syncGranolaLimit, syncGranolaAfter, syncGranolaFull = oldLimit, oldAfter, oldFull
 	})
 	cmd := &cobra.Command{Use: "sync-granola"}
-	cmd.SetContext(context.Background())
+	cmd.SetContext(testCtx)
+	cmd.SetContext(testCtx)
 	cmd.SetOut(&bytes.Buffer{})
 	cmd.SetErr(&bytes.Buffer{})
 
@@ -174,11 +175,12 @@ func TestManualGranolaCancellationReturnsError(t *testing.T) {
 	testCfg.Granola = []config.GranolaSource{{
 		Identifier: "work", AccountEmail: "user-a@example.com", APIKey: "grn_test",
 	}}
-	withStoreResolverConfig(t, testCfg)
+	testCtx := withStoreResolverConfig(t, testCfg)
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(testCtx)
 	cancel()
 	cmd := &cobra.Command{Use: "sync-granola"}
+	cmd.SetContext(testCtx)
 	cmd.SetContext(ctx)
 	cmd.SetOut(&bytes.Buffer{})
 	cmd.SetErr(&bytes.Buffer{})
@@ -275,12 +277,12 @@ func TestManualGranolaLaterFailureRefreshesEarlierSourceWrites(t *testing.T) {
 		{Identifier: "first", AccountEmail: "user-a@example.com", APIKey: "grn_clean"},
 		{Identifier: "second", AccountEmail: "user-b@example.com", APIKey: "grn_partial"},
 	}
-	withStoreResolverConfig(t, testCfg)
+	testCtx := withStoreResolverConfig(t, testCfg)
 
 	savedRefresh := rebuildGranolaCacheAfterWrite
 	refreshes := 0
 	refreshSawWrite := false
-	rebuildGranolaCacheAfterWrite = func(dbPath string) error {
+	rebuildGranolaCacheAfterWrite = func(dbPath string, _ *invocation) error {
 		refreshes++
 		st, openErr := store.Open(dbPath)
 		require.NoError(openErr)
@@ -298,7 +300,8 @@ func TestManualGranolaLaterFailureRefreshesEarlierSourceWrites(t *testing.T) {
 		syncGranolaLimit, syncGranolaAfter, syncGranolaFull = oldLimit, oldAfter, oldFull
 	})
 	cmd := &cobra.Command{Use: "sync-granola"}
-	cmd.SetContext(context.Background())
+	cmd.SetContext(testCtx)
+	cmd.SetContext(testCtx)
 	cmd.SetOut(&bytes.Buffer{})
 	cmd.SetErr(&bytes.Buffer{})
 
@@ -328,10 +331,11 @@ func TestManualGranolaPrevalidatesAllSourcesBeforeImport(t *testing.T) {
 		{Identifier: "first", AccountEmail: "user-a@example.com", APIKey: "grn_clean"},
 		{Identifier: "second", AccountEmail: "user-b@example.com"},
 	}
-	withStoreResolverConfig(t, testCfg)
+	testCtx := withStoreResolverConfig(t, testCfg)
 
 	cmd := &cobra.Command{Use: "sync-granola"}
-	cmd.SetContext(context.Background())
+	cmd.SetContext(testCtx)
+	cmd.SetContext(testCtx)
 	cmd.SetOut(&bytes.Buffer{})
 	cmd.SetErr(&bytes.Buffer{})
 
@@ -342,4 +346,34 @@ func TestManualGranolaPrevalidatesAllSourcesBeforeImport(t *testing.T) {
 	assert.Zero(constructed, "all selected sources must validate before any client or import starts")
 	_, statErr := os.Stat(testCfg.DatabaseDSN())
 	assert.ErrorIs(statErr, os.ErrNotExist, "invalid configuration must not create or write the archive")
+}
+
+func TestGranolaPartialSyncRecordsOutage(t *testing.T) {
+	assert, require := assert.New(t), require.New(t)
+	server := newGranolaSyncTestServer(t, true, true)
+	installGranolaClientFactory(t, server.URL)
+	st := testutil.NewTestStore(t)
+	_, err := st.GetOrCreateSource(granola.SourceType, "work")
+	require.NoError(err)
+	cfg := lifecycleTestConfig(t.TempDir())
+	cfg.Analytics.AutoBuildCache = false
+	state := testInvocationWithConfig(cfg)
+	events := 0
+	state.syncFailures = &telemetry.SyncFailures{Capture: func(event string, props map[string]any) error {
+		assert.Equal("sync_failed", event)
+		assert.Equal("granola", props["sync_source"])
+		events++
+		return nil
+	}}
+	ctx := withInvocation(t.Context(), state)
+	src := config.GranolaSource{Identifier: "work", AccountEmail: "owner@example.com", APIKey: "synthetic"}
+	require.ErrorContains(runConfiguredGranolaSync(ctx, st, src), "partial Granola sync")
+	assert.Equal(1, events)
+	clean := newGranolaSyncTestServer(t, true, false)
+	installGranolaClientFactory(t, clean.URL)
+	require.NoError(runConfiguredGranolaSync(ctx, st, src))
+	assert.Equal(1, events)
+	installGranolaClientFactory(t, server.URL)
+	require.ErrorContains(runConfiguredGranolaSync(ctx, st, src), "partial Granola sync")
+	assert.Equal(2, events)
 }

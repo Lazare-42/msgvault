@@ -37,12 +37,13 @@ func TestSyncUsesConfiguredRemoteHTTPAndPreservesOutput(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	configureRemoteSyncTest(t, server.URL)
+	testCtx := configureRemoteSyncTest(t, server.URL)
 	resetSyncFullFlagsForTest(t)
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd := &cobra.Command{Use: syncIncrementalCmd.Use, Args: syncIncrementalCmd.Args, RunE: syncIncrementalCmd.RunE}
+	cmd.SetContext(testCtx)
 	cmd.Flags().StringArrayVar(&syncFolders, "folder", []string{}, "IMAP folders to include")
 	cmd.Flags().StringArrayVar(&syncSkipFolders, "skip-folder", []string{}, "IMAP folders to exclude")
 	cmd.SetArgs([]string{
@@ -74,10 +75,11 @@ func TestSyncSourceIDUsesConfiguredRemoteHTTP(t *testing.T) {
 		_, _ = w.Write([]byte(`{"type":"complete"}` + "\n"))
 	}))
 	t.Cleanup(server.Close)
-	configureRemoteSyncTest(t, server.URL)
+	testCtx := configureRemoteSyncTest(t, server.URL)
 	resetSyncFullFlagsForTest(t)
 
 	cmd := &cobra.Command{Use: syncIncrementalCmd.Use, Args: syncIncrementalCmd.Args, RunE: syncIncrementalCmd.RunE}
+	cmd.SetContext(testCtx)
 	cmd.Flags().Int64("source-id", 0, "Exact source ID")
 	cmd.SetArgs([]string{"--source-id", "42"})
 	require.NoError(t, cmd.Execute())
@@ -126,12 +128,13 @@ func TestSyncFullUsesConfiguredRemoteHTTPAndPreservesOutput(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 
-	configureRemoteSyncTest(t, server.URL)
+	testCtx := configureRemoteSyncTest(t, server.URL)
 	resetSyncFullFlagsForTest(t)
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd := &cobra.Command{Use: syncFullCmd.Use, Args: syncFullCmd.Args, RunE: syncFullCmd.RunE}
+	cmd.SetContext(testCtx)
 	cmd.Flags().StringVar(&syncQuery, "query", "", "Gmail search query")
 	cmd.Flags().BoolVar(&syncNoResume, "noresume", false, "Force fresh sync")
 	cmd.Flags().StringVar(&syncBefore, "before", "", "Only messages before this date")
@@ -155,11 +158,12 @@ func TestSyncFullUsesConfiguredRemoteHTTPAndPreservesOutput(t *testing.T) {
 	assert.Equal("sync-full warning\n", stderr.String())
 }
 
-func configureRemoteSyncTest(t *testing.T, remoteURL string) {
+func configureRemoteSyncTest(t *testing.T, remoteURL string) context.Context {
 	t.Helper()
+	logger := testLoggerValue()
 
 	dataDir := t.TempDir()
-	withStoreResolverConfig(t, &config.Config{
+	testCtx := withStoreResolverConfig(t, &config.Config{
 		HomeDir: dataDir,
 		Data:    config.DataConfig{DataDir: dataDir},
 		Remote: config.RemoteConfig{
@@ -170,6 +174,7 @@ func configureRemoteSyncTest(t *testing.T, remoteURL string) {
 	oldLogger := logger
 	logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
 	t.Cleanup(func() { logger = oldLogger })
+	return testCtx
 }
 
 // newValidPreflightManager returns a mock whose token source always succeeds.
@@ -205,7 +210,7 @@ func basePreflight(managers map[string]*mockReauthorizer, accounts ...preflightA
 		ListGmailAccounts: func(context.Context) ([]preflightAccount, error) {
 			return accounts, nil
 		},
-		ManagerFor: func(appName string) (preflightReauthManager, error) {
+		ManagerFor: func(ctx context.Context, appName string) (preflightReauthManager, error) {
 			return managers[appName], nil
 		},
 	}
@@ -235,7 +240,7 @@ func TestPreflightReauth(t *testing.T) {
 		},
 		{
 			name:          "no token → skip (no enroll)",
-			manager:       &mockReauthorizer{hasTokenVal: false},
+			manager:       &mockReauthorizer{tokenSourceFn: func(context.Context, string) (extOAuth2.TokenSource, error) { return nil, os.ErrNotExist }},
 			config:        func(m map[string]*mockReauthorizer) preflightConfig { return basePreflight(m, acct) },
 			wantAuthorize: 0,
 		},

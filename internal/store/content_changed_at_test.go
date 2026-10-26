@@ -189,6 +189,14 @@ func updateMessageColumn(t *testing.T, st *store.Store, id int64, col string) er
 	switch col {
 	case "source_message_id":
 		value = fmt.Sprintf("changed-src-%d", id)
+	case "source_id":
+		source, err := st.GetOrCreateSource("gmail", fmt.Sprintf("alternate-%d@example.test", id))
+		if err != nil {
+			return err
+		}
+		value = source.ID
+	case "list_id":
+		value = fmt.Sprintf("<changed-list-%d.example.test>", id)
 	case "conversation_id":
 		value = altConversationID(t, st, id)
 	case "sender_id":
@@ -474,7 +482,7 @@ func dropContentChangedAtColumn(t *testing.T, st *store.Store) {
 // contentChangedBackfillMigration is the ledger name InitSchema records once the
 // content_changed_at backfill has run.
 const contentChangedBackfillMigration = "messages_content_changed_at_backfill"
-const messageWatermarkTriggersMigration = "message_and_attachment_triggers_v9"
+const messageWatermarkTriggersMigration = "message_and_attachment_triggers_v12"
 
 // clearContentChangedBackfillLedger deletes that row from applied_migrations so
 // InitSchema treats the migration as never having run -- the ledger state of
@@ -1093,8 +1101,9 @@ func insertMessagesTriggerPrograms(t *testing.T, st *store.Store, insert string,
 	return programs
 }
 
-// TestContentChangedAt_InsertRunsNoTriggerOnAFreshDatabase keeps message ingest
-// at the cost it had before the watermark existed.
+// TestContentChangedAt_InsertNeedsNoWatermarkTrigger verifies that the
+// fresh-schema watermark still comes from the column DEFAULT. The retired-source
+// guard necessarily compiles one trigger subprogram for every messages INSERT.
 //
 // SQLite triggers cannot assign to NEW, so an AFTER INSERT trigger that stamps
 // the watermark has to re-UPDATE the row that was just inserted. Worse, merely
@@ -1109,10 +1118,14 @@ func insertMessagesTriggerPrograms(t *testing.T, st *store.Store, insert string,
 // stamps fresh databases instead, and EnsureTriggers omits the INSERT trigger
 // entirely when that DEFAULT is present.
 //
+// Metadata indexing intentionally adds its own INSERT trigger and index writes.
+// Remove that maintenance trigger in this private fixture to isolate the
+// watermark's cost; metadata index maintenance is covered separately.
+//
 // total_changes() is SQLite's per-connection count of rows written, and unlike
 // changes() it does include rows written by trigger programs — which is exactly
 // what has to be counted.
-func TestContentChangedAt_InsertRunsNoTriggerOnAFreshDatabase(t *testing.T) {
+func TestContentChangedAt_InsertNeedsNoWatermarkTrigger(t *testing.T) {
 	testutil.SkipIfPostgres(t, "PostgreSQL stamps in a BEFORE trigger, which needs no second write")
 	require := require.New(t)
 	assert := assert.New(t)
@@ -1122,14 +1135,15 @@ func TestContentChangedAt_InsertRunsNoTriggerOnAFreshDatabase(t *testing.T) {
 	require.NoError(err)
 	conv, err := st.EnsureConversationWithType(src.ID, "insert-cost", "email_thread", "Insert cost")
 	require.NoError(err)
+	_, err = st.DB().Exec(`DROP TRIGGER IF EXISTS messages_metadata_fts_insert`)
+	require.NoError(err)
 
 	const insert = `INSERT INTO messages (source_id, source_message_id, conversation_id, message_type, subject)
 		 VALUES (?,?,?,?,?)`
 
-	assert.Zero(insertMessagesTriggerPrograms(t, st, insert, src.ID, "explain-only", conv, "email", "x"),
-		"an INSERT into messages must compile no trigger subprogram on a fresh database: "+
-			"SQLite opens a statement journal for every INSERT that has one, whether or not the "+
-			"trigger body runs")
+	assert.Equal(1, insertMessagesTriggerPrograms(t, st, insert, src.ID, "explain-only", conv, "email", "x"),
+		"with metadata maintenance excluded, only the retired-source guard must remain; "+
+			"the watermark DEFAULT must not add a second trigger subprogram")
 
 	// One pinned connection: total_changes() is per-connection and the pool
 	// would otherwise hand the two readings out of different sessions.

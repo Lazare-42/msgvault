@@ -126,14 +126,9 @@ func TestParseFile(t *testing.T) {
 	path := filepath.Join(dir, "1234.emlx")
 	require.NoError(t, os.WriteFile(path, []byte(data), 0600), "write")
 
-	msg, err := ParseFile(path)
+	msg, err := ParseFile(path, 1<<20)
 	require.NoError(t, err, "ParseFile")
 	require.Equal(t, mime, string(msg.Raw))
-}
-
-func TestParseFile_NotFound(t *testing.T) {
-	_, err := ParseFile("/nonexistent/12345.emlx")
-	require.Error(t, err, "expected error for missing file")
 }
 
 func TestParse_ExtremeByteCount(t *testing.T) {

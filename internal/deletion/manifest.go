@@ -5,7 +5,8 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"log"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+	"go.kenn.io/kit/atomicfile"
 	"go.kenn.io/msgvault/internal/fileutil"
 )
 
@@ -26,7 +28,7 @@ func (m *Manifest) Digest() (string, error) {
 	if err := m.ValidateVersion(); err != nil {
 		return "", err
 	}
-	data, err := json.Marshal(m)
+	data, err := json.Marshal(m, json.Deterministic(true), json.FormatNilSliceAsNull(true), json.FormatNilMapAsNull(true))
 	if err != nil {
 		return "", fmt.Errorf("marshal manifest digest: %w", err)
 	}
@@ -63,6 +65,7 @@ type Filters struct {
 	SenderDomains []string `json:"sender_domains,omitempty"`
 	Recipients    []string `json:"recipients,omitempty"`
 	Labels        []string `json:"labels,omitempty"`
+	ListIDs       []string `json:"list_ids,omitempty"`
 	After         string   `json:"after,omitempty"`  // ISO date
 	Before        string   `json:"before,omitempty"` // ISO date
 	Account       string   `json:"account,omitempty"`
@@ -112,16 +115,16 @@ type Manifest struct {
 	CreatedBy   string           `json:"created_by"` // "tui", "cli", "api"
 	Description string           `json:"description"`
 	Filters     Filters          `json:"filters"`
-	Summary     *Summary         `json:"summary,omitempty"`
+	Summary     *Summary         `json:"summary,omitzero" nullable:"false"`
 	GmailIDs    []string         `json:"gmail_ids"`
 	Status      Status           `json:"status"`
-	Execution   *Execution       `json:"execution,omitempty"`
-	Source      *SourceReference `json:"source,omitempty"`
-	// RawFilter records the serialized HTTP API staging request fields for
-	// provenance — Filters cannot represent every request field
-	// (sender_name, recipient_name, source_id). Absent on manifests created
-	// by the TUI/CLI.
-	RawFilter json.RawMessage `json:"raw_filter,omitempty"`
+	Execution   *Execution       `json:"execution,omitzero" nullable:"false"`
+	Source      *SourceReference `json:"source,omitzero" nullable:"false"`
+	// RawFilter records the serialized staging criteria for provenance. Filters
+	// cannot represent every request field (search query, sender_name,
+	// recipient_name, source_id), so API and all-match TUI staging preserve the
+	// complete input here. It remains absent for explicit TUI/CLI selections.
+	RawFilter jsontext.Value `json:"raw_filter,omitzero"`
 }
 
 // NewManifestForSource creates a source-bound version-2 manifest.
@@ -263,7 +266,7 @@ func (m *Manifest) Save(path string) error {
 		return err
 	}
 
-	data, err := json.MarshalIndent(m, "", "  ")
+	data, err := json.Marshal(m, jsontext.WithIndent("  "), json.Deterministic(true), json.FormatNilSliceAsNull(true), json.FormatNilMapAsNull(true))
 	if err != nil {
 		return err
 	}
@@ -386,40 +389,16 @@ func (m *Manager) acquireManifestLock(id string) (*flock.Flock, error) {
 	return lock, nil
 }
 
-// writeManifestAtomic serializes manifest and publishes it at path via a
-// temp-file + os.Rename, so a reader never observes an empty or partially
-// written file: the previous contents at path remain intact until the rename
-// atomically replaces them. The temp file is written in the destination
-// directory (same filesystem, required for an atomic rename) and removed on any
-// error so no ".tmp" file is left behind. Callers must hold the per-manifest
-// lock and verify the destination's presence under that lock; the rename then
-// replaces the existing file rather than resurrecting a moved one.
-func writeManifestAtomic(manifest *Manifest, path string) (retErr error) {
-	data, err := json.MarshalIndent(manifest, "", "  ")
+// writeManifestAtomic serializes manifest and atomically replaces path through
+// SecureReplaceFile. Readers see complete contents, and a symlink or junction at
+// path is refused. Callers must hold the per-manifest lock and verify the
+// destination's presence under that lock to avoid resurrecting a moved manifest.
+func writeManifestAtomic(manifest *Manifest, path string) error {
+	data, err := json.Marshal(manifest, jsontext.WithIndent("  "), json.Deterministic(true), json.FormatNilSliceAsNull(true), json.FormatNilMapAsNull(true))
 	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".manifest-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp manifest: %w", err)
-	}
-	tmpPath := tmp.Name()
-	defer func() {
-		if retErr != nil {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("write temp manifest: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp manifest: %w", err)
-	}
-	if err := fileutil.SecureChmod(tmpPath, 0600); err != nil {
-		return fmt.Errorf("protect temp manifest: %w", err)
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
+	if err := fileutil.SecureReplaceFile(path, data, 0o600); err != nil {
 		return fmt.Errorf("publish manifest: %w", err)
 	}
 	return nil
@@ -480,7 +459,7 @@ func (m *Manager) FinalizeInProgress(id string, target Status) error {
 	}
 	fromPath := filepath.Join(m.dirForStatus(StatusInProgress), id+".json")
 	toPath := filepath.Join(m.dirForStatus(target), id+".json")
-	if err := os.Rename(fromPath, toPath); err != nil {
+	if err := atomicfile.Replace(fromPath, toPath); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return ErrManifestCancelled
 		}
@@ -900,7 +879,7 @@ func (m *Manager) MoveManifest(id string, fromStatus, toStatus Status) error {
 
 	fromPath := filepath.Join(m.dirForStatus(fromStatus), id+".json")
 	toPath := filepath.Join(m.dirForStatus(toStatus), id+".json")
-	return os.Rename(fromPath, toPath)
+	return atomicfile.Replace(fromPath, toPath)
 }
 
 // CancelManifest moves a pending or in-progress manifest to the

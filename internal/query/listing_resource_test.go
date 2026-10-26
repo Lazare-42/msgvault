@@ -36,6 +36,42 @@ func TestExploreFastPathCountsBeyondEndWithinConstrainedMemory(t *testing.T) {
 	assert.Equal(t, int64(104), result.TotalCount)
 }
 
+func TestExploreGroupsFitsConstrainedMemory(t *testing.T) {
+	engine := constrainedListingEngine(t)
+	for _, tc := range []struct {
+		dimension string
+		count     int64
+	}{
+		{"participant", 500},
+		{"domain", 50},
+	} {
+		t.Run(tc.dimension, func(t *testing.T) {
+			result, err := engine.ExploreGroups(t.Context(), ExploreGroupRequest{
+				Dimension: tc.dimension, Page: PageSpec{Limit: 50},
+			})
+			require.NoError(t, err)
+			assert.Len(t, result.Rows, 50)
+			assert.Equal(t, tc.count, result.TotalCount)
+		})
+	}
+}
+
+func TestExploreDomainFilterFitsConstrainedMemory(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	engine := constrainedListingEngine(t)
+	// Exercise four query threads even when the test runner has fewer CPUs.
+	_, err := engine.db.Exec("SET threads=4")
+	require.NoError(err)
+	result, err := engine.Explore(t.Context(), ExploreRequest{
+		Context: Context{Domains: []string{"acme.com"}},
+		Page:    PageSpec{Limit: 50},
+	})
+	require.NoError(err)
+	assert.Len(result.Rows, 8)
+	assert.Equal(int64(8), result.TotalCount)
+}
+
 func TestFileSearchFastPathFitsConstrainedMemory(t *testing.T) {
 	engine := constrainedListingEngine(t)
 	result, err := engine.SearchFiles(context.Background(), FileSearchRequest{

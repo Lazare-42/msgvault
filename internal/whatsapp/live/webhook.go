@@ -6,7 +6,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -99,19 +99,19 @@ func (n *WebhookNotifier) Close() {
 }
 
 func (n *WebhookNotifier) run() {
-	backoffs := []time.Duration{time.Second, 5 * time.Second, 25 * time.Second}
+	backoffs := []time.Duration{0, time.Second, 5 * time.Second, 25 * time.Second}
 	for {
 		select {
 		case <-n.done:
 			return
 		case event := <-n.queue:
 			var lastErr error
-			for attempt := 0; attempt <= len(backoffs); attempt++ {
-				if attempt > 0 {
+			for _, delay := range backoffs {
+				if delay > 0 {
 					select {
 					case <-n.done:
 						return
-					case <-time.After(backoffs[attempt-1]):
+					case <-time.After(delay):
 					}
 				}
 				if lastErr = n.deliver(event); lastErr == nil {

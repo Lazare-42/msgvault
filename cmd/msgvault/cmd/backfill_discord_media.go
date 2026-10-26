@@ -69,6 +69,9 @@ With no guild argument, every registered guild is processed sequentially.
 Source URLs are treated as private provenance and are never printed.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if invocationFromContext(cmd.Context()) != nil && deps.bind != nil {
+				deps = deps.bind(cmd.Context())
+			}
 			selector := ""
 			if len(args) == 1 {
 				selector = args[0]
@@ -152,7 +155,7 @@ func backfillDiscordSourceMedia(
 	// unreadable roster as unresolved rather than trust a stale count, and a
 	// readable one has to reconcile the archived floor before retry selection
 	// decides which skips the current membership releases.
-	if err := discord.NewImporter(st, client).ArchiveGuildMembership(
+	if err := discord.NewImporter(st, client).ArchiveGuildMembership(ctx,
 		source.ID, guildParticipants, membershipErr,
 	); err != nil {
 		return summary, fmt.Errorf("archive Discord guild membership: %w", err)

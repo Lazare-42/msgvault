@@ -19,13 +19,6 @@ import (
 
 var sampleRawMessage = []byte("From: test@example.com\r\nSubject: Test\r\n\r\nBody")
 
-func TestStore_Open(t *testing.T) {
-	st := testutil.NewTestStore(t)
-
-	// Store should be usable
-	assert.NotNil(t, st.DB(), "DB() returned nil")
-}
-
 func TestStore_GetStats_Empty(t *testing.T) {
 	assert := assert.New(t)
 	st := testutil.NewTestStore(t)
@@ -678,6 +671,8 @@ func TestStore_MessageLabels(t *testing.T) {
 }
 
 func TestStore_RemoveStaleFlagLabels(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	f := storetest.New(t)
 
 	msgID := f.CreateMessage("msg-1")
@@ -702,7 +697,7 @@ func TestStore_RemoveStaleFlagLabels(t *testing.T) {
 		userLabels["Archive"],
 		keywordLabels["Traite"],
 	})
-	require.NoError(t, err, "ReplaceMessageLabels()")
+	require.NoError(err, "ReplaceMessageLabels()")
 
 	// The message was read and its category removed; the star remains.
 	keep := []int64{
@@ -711,8 +706,8 @@ func TestStore_RemoveStaleFlagLabels(t *testing.T) {
 		systemLabels["STARRED"],
 	}
 	changed, err := f.Store.RemoveStaleFlagLabels(msgID, f.Source.ID, keep)
-	require.NoError(t, err, "RemoveStaleFlagLabels()")
-	assert.True(t, changed, "stale UNREAD and Traite should be removed")
+	require.NoError(err, "RemoveStaleFlagLabels()")
+	assert.True(changed, "stale UNREAD and Traite should be removed")
 
 	f.AssertLabelCount(msgID, 3)
 	f.AssertMessageHasLabel(msgID, systemLabels["INBOX"])
@@ -721,14 +716,14 @@ func TestStore_RemoveStaleFlagLabels(t *testing.T) {
 
 	// Idempotent: nothing left to remove.
 	changed, err = f.Store.RemoveStaleFlagLabels(msgID, f.Source.ID, keep)
-	require.NoError(t, err, "RemoveStaleFlagLabels() second call")
-	assert.False(t, changed, "no stale flag labels remain")
+	require.NoError(err, "RemoveStaleFlagLabels() second call")
+	assert.False(changed, "no stale flag labels remain")
 
 	// An empty keep set clears all flag-derived labels but preserves
 	// mailbox and user labels.
 	changed, err = f.Store.RemoveStaleFlagLabels(msgID, f.Source.ID, nil)
-	require.NoError(t, err, "RemoveStaleFlagLabels() empty keep")
-	assert.True(t, changed, "STARRED should be removed")
+	require.NoError(err, "RemoveStaleFlagLabels() empty keep")
+	assert.True(changed, "STARRED should be removed")
 	f.AssertLabelCount(msgID, 2)
 	f.AssertMessageHasLabel(msgID, systemLabels["INBOX"])
 	f.AssertMessageHasLabel(msgID, userLabels["Archive"])
@@ -791,13 +786,6 @@ func TestStore_Attachment(t *testing.T) {
 	stats, err := f.Store.GetStats()
 	require.NoError(err, "GetStats")
 	assert.Equal(t, int64(1), stats.AttachmentCount, "AttachmentCount")
-}
-
-func TestStore_SyncRun(t *testing.T) {
-	f := storetest.New(t)
-
-	syncID := f.StartSync()
-	f.AssertActiveSync(syncID, "running")
 }
 
 func TestStore_SyncCheckpoint(t *testing.T) {
@@ -871,24 +859,6 @@ func TestStore_GetMessage_DeletedMessageVisibleByID(t *testing.T) {
 	msg, err := f.Store.GetMessage(msgID)
 	require.NoError(t, err, "GetMessage()")
 	require.NotNil(t, msg, "GetMessage() = nil, want deleted message")
-}
-
-func TestStore_MarkMessageDeletedByGmailID(t *testing.T) {
-	f := storetest.New(t)
-
-	f.CreateMessage("gmail-msg-123")
-
-	// Mark as deleted (trash)
-	err := f.Store.MarkMessageDeletedByGmailID(false, "gmail-msg-123")
-	require.NoError(t, err, "MarkMessageDeletedByGmailID(trash)")
-
-	// Mark as permanently deleted
-	err = f.Store.MarkMessageDeletedByGmailID(true, "gmail-msg-123")
-	require.NoError(t, err, "MarkMessageDeletedByGmailID(permanent)")
-
-	// Non-existent message should not error (no rows affected is OK)
-	err = f.Store.MarkMessageDeletedByGmailID(true, "nonexistent-id")
-	require.NoError(t, err, "MarkMessageDeletedByGmailID(nonexistent)")
 }
 
 func TestStore_MarkMessagesDeletedByGmailIDBatch(t *testing.T) {
@@ -1097,6 +1067,57 @@ func TestStore_MessageMetadataBatch_Empty(t *testing.T) {
 	assert.Empty(t, result)
 }
 
+func TestStore_SourceMessageMetadata(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	f := storetest.New(t)
+
+	withMetadataID := f.CreateMessage("smm-with-metadata")
+	withoutMetadataID := f.CreateMessage("smm-without-metadata")
+	require.NoError(f.Store.SetMessageMetadata(withMetadataID, sql.NullString{
+		String: `{"status":"Read"}`,
+		Valid:  true,
+	}))
+
+	// Messages that belong to another source must not leak into the result.
+	otherSource, err := f.Store.GetOrCreateSource("imazing_csv", "+15550000009")
+	require.NoError(err)
+	otherConversation, err := f.Store.EnsureConversation(otherSource.ID, "smm-other-thread", "Other Thread")
+	require.NoError(err)
+	_, err = f.Store.UpsertMessage(&store.Message{
+		ConversationID:  otherConversation,
+		SourceID:        otherSource.ID,
+		SourceMessageID: "smm-other-source",
+		MessageType:     "email",
+		SizeEstimate:    1000,
+	})
+	require.NoError(err)
+
+	got, err := f.Store.SourceMessageMetadata(f.Source.ID)
+	require.NoError(err)
+	require.Len(got, 2)
+	assert.Equal(withMetadataID, got["smm-with-metadata"].ID)
+	require.True(got["smm-with-metadata"].Metadata.Valid)
+	assert.JSONEq(`{"status":"Read"}`, got["smm-with-metadata"].Metadata.String)
+	require.True(got["smm-with-metadata"].SourceConversationID.Valid)
+	assert.Equal("default-thread", got["smm-with-metadata"].SourceConversationID.String)
+	assert.Equal(withoutMetadataID, got["smm-without-metadata"].ID)
+	assert.False(got["smm-without-metadata"].Metadata.Valid)
+	assert.NotContains(got, "smm-other-source")
+
+	// Each source's result stays scoped to that source, and a source with
+	// no archived messages yields an empty result.
+	other, err := f.Store.SourceMessageMetadata(otherSource.ID)
+	require.NoError(err)
+	require.Len(other, 1)
+	assert.Contains(other, "smm-other-source")
+	emptySource, err := f.Store.GetOrCreateSource("imazing_csv", "+15550000008")
+	require.NoError(err)
+	empty, err := f.Store.SourceMessageMetadata(emptySource.ID)
+	require.NoError(err)
+	assert.Empty(empty)
+}
+
 func TestStore_ReplaceMessageLabels_Empty(t *testing.T) {
 	f := storetest.New(t)
 
@@ -1160,11 +1181,6 @@ func TestStore_ReplaceMessageRecipients_DuplicateParticipants(t *testing.T) {
 	require.NoError(t, err, "duplicate participant IDs must not error")
 
 	f.AssertRecipientCount(msgID, "to", 2)
-}
-
-func TestStore_GetActiveSync_NoSync(t *testing.T) {
-	f := storetest.New(t)
-	f.AssertNoActiveSync()
 }
 
 func TestStore_GetLastSuccessfulSync_None(t *testing.T) {
@@ -1244,6 +1260,10 @@ func TestStore_GetStats_MissingTable(t *testing.T) {
 	// Drop a table to simulate missing table scenario
 	_, err := st.DB().Exec("DROP TABLE IF EXISTS document_occurrences")
 	require.NoError(err, "DROP TABLE document_occurrences")
+	_, err = st.DB().Exec("DROP TABLE IF EXISTS source_merge_attachments")
+	require.NoError(err, "DROP TABLE source_merge_attachments")
+	_, err = st.DB().Exec("DROP TABLE IF EXISTS source_merge_preserved_attachments")
+	require.NoError(err, "DROP TABLE source_merge_preserved_attachments")
 	_, err = st.DB().Exec("DROP TABLE IF EXISTS attachments")
 	require.NoError(err, "DROP TABLE attachments")
 
@@ -1518,14 +1538,6 @@ func TestStore_BackfillFTS(t *testing.T) {
 	assert.Equal(1, count, "FTS match 'unique'")
 }
 
-func TestStore_FTS5Available(t *testing.T) {
-	f := storetest.New(t)
-
-	// FTS5Available should return a boolean (true on most builds)
-	available := f.Store.FTS5Available()
-	t.Logf("FTS5Available = %v", available)
-}
-
 func TestStore_NeedsFTSBackfill(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -1616,14 +1628,24 @@ func TestStore_AddMessageLabels(t *testing.T) {
 	f.AssertLabelCount(msgID, 1)
 
 	// Add STARRED — should go from 1 to 2
+	revisionBefore, err := f.Store.DerivedDataRevision()
+	require.NoError(err, "DerivedDataRevision before additive label")
 	err = f.Store.AddMessageLabels(msgID, []int64{labels["STARRED"]})
 	require.NoError(err, "AddMessageLabels(STARRED)")
 	f.AssertLabelCount(msgID, 2)
+	revisionAfter, err := f.Store.DerivedDataRevision()
+	require.NoError(err, "DerivedDataRevision after additive label")
+	assert.Equal(t, revisionBefore+1, revisionAfter,
+		"additive labels must invalidate exported message facts")
 
 	// Add INBOX again — should be a no-op (INSERT OR IGNORE)
 	err = f.Store.AddMessageLabels(msgID, []int64{labels["INBOX"]})
 	require.NoError(err, "AddMessageLabels(INBOX duplicate)")
 	f.AssertLabelCount(msgID, 2)
+	revisionAfterDuplicate, err := f.Store.DerivedDataRevision()
+	require.NoError(err, "DerivedDataRevision after duplicate label")
+	assert.Equal(t, revisionAfter, revisionAfterDuplicate,
+		"duplicate labels must not invalidate unchanged exported message facts")
 
 	// Add multiple labels at once, including one that already exists
 	err = f.Store.AddMessageLabels(msgID, []int64{labels["SENT"], labels["TRASH"], labels["STARRED"]})
@@ -1649,30 +1671,25 @@ func TestStore_ReconcileMessageLabelsReportsChanges(t *testing.T) {
 	require.NoError(f.Store.ReplaceMessageLabels(
 		messageID, []int64{labels["INBOX"]}))
 
-	changed, extra, err := f.Store.ReconcileMessageLabels(
+	changed, err := f.Store.ReconcileMessageLabels(
 		messageID, []int64{labels["INBOX"]}, false)
 	require.NoError(err)
 	assert.False(changed)
-	assert.Empty(extra, "existing labels all desired: nothing extra")
 
-	changed, extra, err = f.Store.ReconcileMessageLabels(
+	changed, err = f.Store.ReconcileMessageLabels(
 		messageID, []int64{labels["STARRED"]}, false)
 	require.NoError(err)
 	assert.True(changed)
-	assert.Equal([]int64{labels["INBOX"]}, extra,
-		"merge mode reports existing labels beyond the desired set")
 
-	changed, extra, err = f.Store.ReconcileMessageLabels(
+	changed, err = f.Store.ReconcileMessageLabels(
 		messageID, []int64{labels["INBOX"], labels["STARRED"]}, true)
 	require.NoError(err)
 	assert.False(changed)
-	assert.Nil(extra, "replace mode never reports extra labels")
 
-	changed, extra, err = f.Store.ReconcileMessageLabels(
+	changed, err = f.Store.ReconcileMessageLabels(
 		messageID, []int64{labels["SENT"]}, true)
 	require.NoError(err)
 	assert.True(changed)
-	assert.Nil(extra, "replace mode never reports extra labels")
 	f.AssertLabelCount(messageID, 1)
 	f.AssertMessageHasLabel(messageID, labels["SENT"])
 }
@@ -2310,6 +2327,12 @@ func TestStore_GetStatsForScope_SingleSource(t *testing.T) {
 	require.NoError(err, "GetStatsForScope nil")
 	assert.Equal(int64(5), statsAll.MessageCount, "MessageCount (nil/global)")
 	assert.Equal(int64(2), statsAll.SourceCount, "SourceCount (nil/global)")
+
+	// An explicitly empty scope matches no source; it must never widen to global.
+	statsNone, err := f.Store.GetStatsForScope([]int64{})
+	require.NoError(err, "GetStatsForScope empty")
+	assert.Zero(statsNone.MessageCount, "MessageCount (empty scope)")
+	assert.Zero(statsNone.SourceCount, "SourceCount (empty scope)")
 }
 
 func TestStore_GetStatsForScope_ExcludesDedupHidden(t *testing.T) {

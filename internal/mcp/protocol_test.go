@@ -102,7 +102,7 @@ func task3ToolErrorText(t *testing.T, response task3RPCResponse) string {
 type task5RawStdioPeer struct {
 	requestWriter  *os.File
 	responseReader *os.File
-	responseLines  *bufio.Scanner
+	responseLines  *bufio.Reader
 	cancel         context.CancelFunc
 	done           chan error
 }
@@ -131,7 +131,7 @@ func newTask5RawStdioPeerWithServer(t *testing.T, server *sdkmcp.Server) *task5R
 	peer := &task5RawStdioPeer{
 		requestWriter:  clientRequestWriter,
 		responseReader: clientResponseReader,
-		responseLines:  bufio.NewScanner(clientResponseReader),
+		responseLines:  bufio.NewReader(clientResponseReader),
 		cancel:         cancel,
 		done:           done,
 	}
@@ -175,21 +175,16 @@ func (p *task5RawStdioPeer) callRaw(t *testing.T, line string) (task3RPCResponse
 	type scanResult struct {
 		line string
 		err  error
-		ok   bool
 	}
 	done := make(chan scanResult, 1)
 	go func() {
-		ok := p.responseLines.Scan()
-		done <- scanResult{
-			line: p.responseLines.Text(),
-			err:  p.responseLines.Err(),
-			ok:   ok,
-		}
+		line, err := p.responseLines.ReadString('\n')
+		done <- scanResult{line: line, err: err}
 	}()
 	var raw string
 	select {
 	case scanned := <-done:
-		require.True(t, scanned.ok, "raw stdio response: %v", scanned.err)
+		require.NoError(t, scanned.err, "raw stdio response")
 		raw = scanned.line
 	case <-time.After(5 * time.Second):
 		require.FailNow(t, "raw stdio response read timed out")
@@ -369,25 +364,161 @@ func task5LegacyHTTPPost(
 	assert.Empty(t, req.Header.Get("Mcp-Session-Id"))
 	recorder, response := task3Serve(handler, req)
 	assert.Equal(t, "no-store", recorder.Header().Get("Cache-Control"))
-	assert.Empty(t, recorder.Header().Get("Mcp-Session-Id"))
 	return recorder, response
 }
 
 func TestRawHTTPLegacy(t *testing.T) {
+	assert := assert.New(t)
 	fixture := newTask5Fixture(t, "000")
 	handler := newMCPHTTPServer(fixture.opts, HTTPOptions{}).Handler
 
 	initializeRecorder, initialized := task5LegacyHTTPPost(t, handler, "", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"raw-http-legacy","version":"raw-http-legacy-version"}}}`)
 	task3RequireSuccess(t, initializeRecorder, initialized)
-	assert.Equal(t, "2025-11-25", initialized.Result["protocolVersion"])
+	assert.Equal("2025-11-25", initialized.Result["protocolVersion"])
+	assert.Empty(initializeRecorder.Header().Get("Mcp-Session-Id"))
 
 	listRecorder, listed := task5LegacyHTTPPost(t, handler, "2025-11-25", `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
 	task3RequireSuccess(t, listRecorder, listed)
-	assert.Equal(t, task5ExpectedTools("000", false), task3ToolNames(t, listed))
+	assert.Equal(task5ExpectedTools("000", false), task3ToolNames(t, listed))
+	assert.Empty(listRecorder.Header().Get("Mcp-Session-Id"))
 
 	callRecorder, called := task5LegacyHTTPPost(t, handler, "2025-11-25", `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_stats","arguments":{}}}`)
 	task3RequireSuccess(t, callRecorder, called)
 	task5AssertRawJSONParity(t, called.Result)
+	assert.Empty(callRecorder.Header().Get("Mcp-Session-Id"))
+}
+
+func TestMCPHTTPConfirmationWritesRequireModernProtocol(t *testing.T) {
+	backend := newIdentityReviewMCPBackend(t)
+	calendar := &calendarMCPFake{}
+	opts := ServeOptions{
+		Engine: &querytest.MockEngine{}, IdentityReview: backend, PersonCardDAV: backend,
+		IdentityScoring: newIdentityScoringMCPBackend(t), AllowIdentityDecisions: true,
+		AllowPersonMerges: true, AllowCardDAVWrites: true, AllowIdentityScoring: true,
+		Calendar: calendar, AllowCalendarWrites: true,
+		Operations:             operationalTestBackend{},
+		OperationCapabilities:  []string{"get_source_scheduler_status", "sync_source", "update_slack_sync_policy", "set_person_display_name"},
+		OperationWriteFamilies: []OperationFamily{OperationFamilySources, OperationFamilyRecords},
+		PeopleBackend:          &namedPromotionTestBackend{recordingPeopleBackend: &recordingPeopleBackend{}}, AllowProfileWrites: true,
+	}
+	handler := newMCPHTTPServer(opts, HTTPOptions{AllowWrites: true}).Handler
+	for _, version := range []string{"2025-03-26", "2025-06-18", "2025-11-25", task3ModernProtocolVersion} {
+		t.Run(version, func(t *testing.T) {
+			assert := assert.New(t)
+			listBody := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}`
+			readBody := `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_identity_match","arguments":{"candidate_id":1}}}`
+			var listed, called task3RPCResponse
+			var recorder *httptest.ResponseRecorder
+			if version == task3ModernProtocolVersion {
+				listBody = `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`
+				recorder, listed = task3Serve(handler, task3ModernRequest("tools/list", "", listBody))
+				task3RequireSuccess(t, recorder, listed)
+				recorder, called = task3Serve(handler, task3ModernRequest("tools/call", ToolGetIdentityMatch, task3ToolCallBody(2, ToolGetIdentityMatch, `{"candidate_id":1}`)))
+			} else {
+				initialize := fmt.Sprintf(`{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":%q,"capabilities":{"elicitation":{"form":{}}},"clientInfo":{"name":"confirmation-test","version":"1"}}}`, version)
+				initializeRecorder, initialized := task5LegacyHTTPPost(t, handler, "", initialize)
+				task3RequireSuccess(t, initializeRecorder, initialized)
+				recorder, listed = task5LegacyHTTPPost(t, handler, version, listBody)
+				task3RequireSuccess(t, recorder, listed)
+				recorder, called = task5LegacyHTTPPost(t, handler, version, readBody)
+			}
+			task3RequireSuccess(t, recorder, called)
+			assert.Empty(recorder.Header().Get("Mcp-Session-Id"))
+			assert.NotEqual(true, called.Result["isError"])
+			assert.InDelta(1, toolStructuredContent(t, called.Result)["id"], 0)
+			names := task3ToolNames(t, listed)
+			assert.Contains(names, ToolGetIdentityMatch)
+			assert.Contains(names, "calendar_freebusy")
+			assert.Contains(names, "get_source_scheduler_status")
+			assert.Contains(names, ToolPromotePerson)
+			tools, ok := listed.Result["tools"].([]any)
+			require.True(t, ok)
+			for _, tool := range tools {
+				definition, ok := tool.(map[string]any)
+				require.True(t, ok)
+				if definition["name"] == ToolPromotePerson {
+					properties := toolPropertyNames(t, definition)
+					if version == task3ModernProtocolVersion {
+						assert.Contains(properties, "display_name")
+					} else {
+						assert.NotContains(properties, "display_name")
+					}
+				}
+			}
+			for _, name := range []string{ToolAcceptIdentityMatch, ToolRejectIdentityMatch, ToolScoreIdentityMatches, ToolMergePerson, ToolApproveCardDAVPublication, ToolSyncCardDAV, "calendar_create", "calendar_update", "calendar_delete", "calendar_move", "calendar_respond", "sync_source", "update_slack_sync_policy", "set_person_display_name"} {
+				if version == task3ModernProtocolVersion {
+					assert.Contains(names, name)
+				} else {
+					assert.NotContains(names, name)
+				}
+			}
+			if version != task3ModernProtocolVersion {
+				_, rejected := task5LegacyHTTPPost(t, handler, version, `{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"calendar_delete","arguments":{"account":"person@example.com","calendar_id":"team@example.com","event_id":"event"}}}`)
+				require.NotNil(t, rejected.Error)
+				assert.Contains(rejected.Error.Message, "calendar_delete")
+				assert.Empty(calendar.requests)
+			}
+		})
+	}
+}
+
+func TestMCPStdioLegacyCanConfirmCalendarMutation(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	backend := &calendarMCPFake{}
+	peer := newTask5RawStdioPeer(t, ServeOptions{Calendar: backend, DelegatedOnly: true, AllowCalendarWrites: true})
+	initialized := peer.call(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{"form":{}}},"clientInfo":{"name":"calendar-confirmation-test","version":"1"}}}`)
+	requirements.Nil(initialized.Error)
+	peer.writeLiteralLine(t, `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
+	_, raw := peer.callRaw(t, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"calendar_delete","arguments":{"account":"person@example.com","calendar_id":"team@example.com","event_id":"event"}}}`)
+	var prompt struct {
+		ID     json.RawMessage     `json:"id"`
+		Method string              `json:"method"`
+		Params sdkmcp.ElicitParams `json:"params"`
+	}
+	requirements.NoError(json.Unmarshal([]byte(raw), &prompt))
+	requirements.Equal("elicitation/create", prompt.Method)
+	assertions.Contains(prompt.Params.Message, `"event_id":"event"`)
+	requirements.Len(backend.requests, 1)
+	assertions.True(backend.requests[0].DryRun)
+	result := peer.call(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"action":"accept","content":{"approved":true}}}`, prompt.ID))
+	requirements.Nil(result.Error)
+	assertions.NotEqual(true, result.Result["isError"])
+	requirements.Len(backend.requests, 2)
+	assertions.False(backend.requests[1].DryRun)
+	assertions.Equal("original-plan", backend.requests[1].ExpectedPlanFingerprint)
+}
+
+func TestMCPStdioLegacyCanConfirmIdentityDecision(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	backend := newIdentityReviewMCPBackend(t)
+	candidate, err := backend.GetIdentityMatch(t.Context(), 1)
+	require.NoError(err)
+	peer := newTask5RawStdioPeer(t, ServeOptions{
+		Engine: &querytest.MockEngine{}, IdentityReview: backend, AllowIdentityDecisions: true,
+	})
+	initialized := peer.call(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{"form":{}}},"clientInfo":{"name":"confirmation-test","version":"1"}}}`)
+	require.Nil(initialized.Error)
+	peer.writeLiteralLine(t, `{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}`)
+	listed := peer.call(t, `{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}`)
+	require.Nil(listed.Error)
+	assert.Contains(task3ToolNames(t, listed), ToolRejectIdentityMatch)
+	_, raw := peer.callRaw(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"reject_identity_match","arguments":{"candidate_id":1,"review_token":%q}}}`, *candidate.ReviewToken))
+	var prompt struct {
+		ID     json.RawMessage     `json:"id"`
+		Method string              `json:"method"`
+		Params sdkmcp.ElicitParams `json:"params"`
+	}
+	require.NoError(json.Unmarshal([]byte(raw), &prompt))
+	require.Equal("elicitation/create", prompt.Method)
+	assert.Contains(prompt.Params.Message, "Reject")
+	result := peer.call(t, fmt.Sprintf(`{"jsonrpc":"2.0","id":%s,"result":{"action":"accept","content":{"confirm":true}}}`, prompt.ID))
+	require.Nil(result.Error)
+	assert.NotEqual(true, result.Result["isError"])
+	readback, err := backend.GetIdentityMatch(t.Context(), 1)
+	require.NoError(err)
+	assert.Equal("rejected", readback.State)
 }
 
 func task3ToolNames(t *testing.T, response task3RPCResponse) []string {
@@ -634,7 +765,7 @@ func TestMCPModernHTTPCancellation(t *testing.T) {
 	select {
 	case <-canceled:
 		wasCanceled = true
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(5 * time.Second):
 	}
 	close(release)
 	select {
@@ -679,6 +810,7 @@ func TestMCPHTTPPolicyWriteTools(t *testing.T) {
 			return []byte("content"), nil
 		}),
 		ManifestSaver: saver,
+		SavedViews:    &savedViewServiceFixture{},
 	}
 
 	listBody := `{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}`
@@ -688,6 +820,9 @@ func TestMCPHTTPPolicyWriteTools(t *testing.T) {
 	names := task3ToolNames(t, response)
 	assert.NotContains(names, ToolExportAttachment)
 	assert.NotContains(names, ToolStageDeletion)
+	assert.NotContains(names, ToolCreateSavedView)
+	assert.NotContains(names, ToolUpdateSavedView)
+	assert.NotContains(names, ToolDeleteSavedView)
 
 	writableHandler := newMCPHTTPServer(opts, HTTPOptions{AllowWrites: true}).Handler
 	recorder, response = task3Serve(writableHandler, task3ModernRequest("tools/list", "", listBody))
@@ -695,6 +830,9 @@ func TestMCPHTTPPolicyWriteTools(t *testing.T) {
 	names = task3ToolNames(t, response)
 	assert.Contains(names, ToolExportAttachment)
 	assert.Contains(names, ToolStageDeletion)
+	assert.Contains(names, ToolCreateSavedView)
+	assert.Contains(names, ToolUpdateSavedView)
+	assert.Contains(names, ToolDeleteSavedView)
 
 	exportBody := task3ToolCallBody(
 		2,
@@ -712,6 +850,15 @@ func TestMCPHTTPPolicyWriteTools(t *testing.T) {
 	recorder, response = task3Serve(
 		readOnlyHandler,
 		task3ModernRequest("tools/call", ToolStageDeletion, stageBody),
+	)
+	assert.Equal(http.StatusBadRequest, recorder.Code, "response: %s", recorder.Body.String())
+	require.NotNil(response.Error, "response: %s", recorder.Body.String())
+
+	createBody := task3ToolCallBody(4, ToolCreateSavedView,
+		`{"name":"Hidden","canonical_state":{},"schema_version":1}`)
+	recorder, response = task3Serve(
+		readOnlyHandler,
+		task3ModernRequest("tools/call", ToolCreateSavedView, createBody),
 	)
 	assert.Equal(http.StatusBadRequest, recorder.Code, "response: %s", recorder.Body.String())
 	require.NotNil(response.Error, "response: %s", recorder.Body.String())

@@ -1,7 +1,7 @@
 package meetingimport
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
 	"strings"
 	"testing"
 
@@ -80,12 +80,12 @@ func TestDecodeRequestPreservesLargeNestedMetadataNumbers(t *testing.T) {
 
 	nested, ok := req.Meeting.Metadata["nested"].(map[string]any)
 	require.True(ok, "nested metadata object")
-	largeID, ok := nested["large_id"].(json.Number)
+	largeID, ok := nested["large_id"].(jsontext.Value)
 	require.True(ok, "large metadata identifier")
 	assert.Equal("9007199254740993", largeID.String())
 	deep, ok := nested["deep"].(map[string]any)
 	require.True(ok, "deep metadata object")
-	anotherID, ok := deep["another_id"].(json.Number)
+	anotherID, ok := deep["another_id"].(jsontext.Value)
 	require.True(ok, "deep metadata identifier")
 	assert.Equal("18446744073709551615", anotherID.String())
 }
@@ -116,6 +116,45 @@ func TestDecodeRequestRejectsMalformedAndTrailingJSON(t *testing.T) {
 			assert.ErrorIs(err, ErrMalformedRequest)
 		})
 	}
+}
+
+func TestDecodeRequestRejectsExplicitNullActionItems(t *testing.T) {
+	body := strings.Replace(
+		validRequestJSON,
+		`"organizer":`,
+		`"action_items": null, "organizer":`,
+		1,
+	)
+
+	_, err := DecodeRequest(strings.NewReader(body), MaxRequestBytes)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrMalformedRequest)
+	assert.Contains(t, err.Error(), "action_items")
+}
+
+func TestDecodeRequestDistinguishesOmittedAndEmptyActionItems(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+
+	omitted, err := DecodeRequest(strings.NewReader(validRequestJSON), MaxRequestBytes)
+	require.NoError(err)
+	assert.Nil(omitted.Meeting.ActionItems)
+
+	body := strings.Replace(
+		validRequestJSON,
+		`"organizer":`,
+		`"action_items": [], "organizer":`,
+		1,
+	)
+	decoded, err := DecodeRequest(strings.NewReader(body), MaxRequestBytes)
+	require.NoError(err)
+	require.NotNil(decoded.Meeting.ActionItems)
+	assert.Empty(*decoded.Meeting.ActionItems)
+
+	normalized, err := decoded.Normalize()
+	require.NoError(err)
+	require.NotNil(normalized.Meeting.ActionItems)
+	assert.Empty(*normalized.Meeting.ActionItems)
 }
 
 func TestDecodeRequestAllowsUnknownProviderMetadata(t *testing.T) {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -27,7 +28,7 @@ func run() error {
 	flag.Parse()
 
 	if configPath == "" {
-		return fmt.Errorf("--config is required")
+		return errors.New("--config is required")
 	}
 
 	cfg, err := loadConfig(configPath)

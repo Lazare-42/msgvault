@@ -1,5 +1,5 @@
-import { expect, test } from '@playwright/test';
-import { selectKitOption } from './kit-ui';
+import { expect, test, type BrowserContext } from '@playwright/test';
+import { expectKitTheme, selectKitOption, setKitTheme } from './kit-ui';
 
 test('Strict session cookie returns on same-origin bootstrap after a cross-site navigation', async ({
   context,
@@ -110,20 +110,105 @@ test('Settings navigation sends a CSRF-protected session mutation', async ({ pag
   await page.goto('/');
   await page.getByRole('button', { name: 'Settings' }).click();
   await selectKitOption(page, 'Theme', 'Dark');
-  await page.getByRole('button', { name: 'Save settings' }).click();
+  await page.getByRole('button', { name: 'Save changes' }).click();
 
   const patch = await patchCaptured;
   expect(patch.headers['x-csrf-token']).toBe('csrf-token');
   expect(patch.headers['if-match']).toBe('"etag-a"');
   expect(patch.body).toEqual({
-    updates: [{ key: 'web.theme', value: { string: 'dark' } }],
-    confirm_api_key_restart: false
+    updates: [{ key: 'web.theme', value: { string: 'dark' } }]
   });
-  await expect(page.getByText('Changes are pending restart.')).toBeVisible();
+  await expect(page.getByText('Restart the daemon to apply these changes.')).toBeVisible();
+});
+
+async function installSettingsDaemon(context: BrowserContext): Promise<void> {
+  const current: Record<string, string> = {
+    'web.theme': 'system', 'web.density': 'compact', 'web.default_search_mode': 'full_text'
+  };
+  const options: Record<string, string[]> = {
+    'web.theme': ['system', 'light', 'dark'],
+    'web.density': ['compact', 'comfortable'],
+    'web.default_search_mode': ['full_text', 'semantic', 'hybrid']
+  };
+  const labels: Record<string, string> = {
+    'web.theme': 'Theme', 'web.density': 'Density', 'web.default_search_mode': 'Default search mode'
+  };
+  const document = () => ({
+    groups: [
+      { id: 'browser', label: 'Appearance', description: 'How the web app looks.' },
+      { id: 'server', label: 'Daemon', description: 'How the daemon runs.' },
+      { id: 'search', label: 'Search', description: 'Semantic search.' }
+    ],
+    settings: [
+      ...Object.keys(current).map((key) => ({
+        key, group: 'browser', label: labels[key], kind: 'string', value: { string: current[key] },
+        options: options[key], restart_required: false
+      })),
+      { key: 'server.log_level', group: 'server', label: 'Log level', kind: 'string', value: { string: 'info' }, restart_required: true },
+      { key: 'vector.enabled', group: 'search', label: 'Semantic search', kind: 'boolean', value: { boolean: false }, restart_required: true }
+    ],
+    pending_restart: false
+  });
+  await context.route('**/api/session', (route) => route.fulfill({ json: {
+    auth_mode: 'session', csrf_token: 'csrf-token', https: true, plain_http_warning: false
+  } }));
+  await context.route('**/api/v1/settings', async (route) => {
+    if (route.request().method() === 'PATCH') {
+      const body = route.request().postDataJSON() as { updates: Array<{ key: string; value: { string: string } }> };
+      for (const { key, value } of body.updates) current[key] = value.string;
+    }
+    await route.fulfill({ headers: { ETag: '"settings"' }, json: document() });
+  });
+  await context.route('**/api/v1/explore', (route) => route.fulfill({ json: {
+    rows: [], total_count: 0, cache_revision: 'settings', search_provenance: {}
+  } }));
+}
+
+test('Settings keeps its category across reload and Back', async ({ context, page }) => {
+  await installSettingsDaemon(context);
+  await page.goto('/?workspace=settings');
+  const settings = page.getByRole('main', { name: 'Settings' });
+  await settings.getByRole('button', { name: 'Search', exact: true }).click();
+  await expect(settings.getByRole('heading', { level: 2, name: 'Search' })).toBeVisible();
+  await expect.poll(() => JSON.parse(new URL(page.url()).searchParams.get('explore') ?? '{}').settingsCategory).toBe('search');
+  await page.reload();
+  await expect(settings.getByRole('heading', { level: 2, name: 'Search' })).toBeVisible();
+  await settings.getByRole('button', { name: 'Appearance', exact: true }).click();
+  await expect(settings.getByRole('heading', { level: 2, name: 'Appearance' })).toBeVisible();
+  await page.goBack();
+  await expect(settings.getByRole('heading', { level: 2, name: 'Search' })).toBeVisible();
+});
+
+test('saved appearance reaches this tab, and the default mode only new tabs', async ({ context, page }) => {
+  await installSettingsDaemon(context);
+  await page.goto('/?workspace=settings');
+  await selectKitOption(page, 'Theme', 'Dark');
+  await selectKitOption(page, 'Default search mode', 'Hybrid');
+  const before = page.url();
+  await page.getByRole('button', { name: 'Save changes' }).click();
+  await expectKitTheme(page, 'dark');
+  expect(page.url()).toBe(before);
+  await expect(page.getByRole('radio', { name: 'Full text' })).toBeChecked();
+  expect(await page.evaluate(() => localStorage.getItem('msgvault-search-mode'))).toBe('hybrid');
+
+  const next = await context.newPage();
+  await next.goto('/?workspace=everything');
+  await expect(next.getByRole('radio', { name: 'Hybrid' })).toBeChecked();
+});
+
+test('a Display menu theme override wins over a saved theme', async ({ context, page }) => {
+  await installSettingsDaemon(context);
+  await page.goto('/?workspace=settings');
+  await setKitTheme(page, 'light');
+  await selectKitOption(page, 'Theme', 'Dark');
+  await page.getByRole('button', { name: 'Save changes' }).click();
+  await expect(page.getByRole('button', { name: 'Save changes' })).toHaveCount(0);
+  await expectKitTheme(page, 'light');
 });
 
 function settingsDocument(theme: string, pendingRestart: boolean) {
   return {
+    groups: [{ id: 'browser', label: 'Appearance', description: 'How the web app looks.' }],
     settings: [
       {
         key: 'web.theme',

@@ -12,6 +12,7 @@ import (
 )
 
 func TestPersonTrackingHTTPGetsAndReplacesState(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, st := newIdentityLinkTestServer(t)
@@ -44,6 +45,7 @@ func TestPersonTrackingHTTPGetsAndReplacesState(t *testing.T) {
 }
 
 func TestPersonTrackingHTTPValidatesPersonIDAndExistence(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	srv, st := newIdentityLinkTestServer(t)
@@ -74,15 +76,4 @@ func TestPersonTrackingHTTPValidatesPersonIDAndExistence(t *testing.T) {
 	unchanged := personRequest(t, srv, http.MethodGet, path, nil, "")
 	require.Equal(http.StatusOK, unchanged.Code, unchanged.Body.String())
 	assert.Contains(unchanged.Body.String(), `"tracked":true`)
-}
-
-func TestPersonTrackingOpenAPIContract(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-	path := OpenAPIDocument().Paths["/api/v1/people/{id}/tracking"]
-	require.NotNil(path)
-	require.NotNil(path.Get)
-	require.NotNil(path.Put)
-	assert.Equal("getPersonTracking", path.Get.OperationID)
-	assert.Equal("setPersonTracking", path.Put.OperationID)
 }

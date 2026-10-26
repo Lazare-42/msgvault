@@ -1,6 +1,7 @@
 package beeper
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -8,6 +9,27 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestMapMessageSizeEstimate(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  Message
+		add  int64
+	}{
+		{"text uses UTF-8 body bytes", Message{ID: "1", Type: "TEXT", Text: "привет"}, 0},
+		{"video includes declared size", Message{ID: "2", Type: "VIDEO", Text: "watch this", Attachments: []Attachment{{FileName: "clip.mp4", FileSize: 6_600_000}}}, 6_600_000},
+		{"missing and negative sizes ignored", Message{ID: "3", Type: "FILE", Attachments: []Attachment{{FileName: "a.bin"}, {FileName: "b.bin", FileSize: -5}}}, 0},
+		{"NaN and oversized sizes ignored", Message{ID: "4", Type: "FILE", Attachments: []Attachment{{FileName: "a.bin", FileSize: math.NaN()}, {FileName: "b.bin", FileSize: math.MaxFloat64}}}, 0},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tt.msg.Timestamp = time.Date(2026, 8, 11, 15, 46, 5, 0, time.UTC)
+			msg, body := mapMessage(&tt.msg, 1, 1)
+			require.NotEmpty(t, body)
+			assert.Equal(t, int64(len(body))+tt.add, msg.SizeEstimate)
+		})
+	}
+}
 
 func TestBodyText(t *testing.T) {
 	tests := []struct {
@@ -34,6 +56,20 @@ func TestBodyText(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, bodyText(&tt.msg))
+		})
+	}
+}
+
+func TestMessageHTML(t *testing.T) {
+	attachments := []Attachment{{Transcription: &Transcription{Transcription: "<b>quoted</b> & plain\nsecond line"}}}
+	for _, tc := range []struct {
+		name, text, want string
+	}{
+		{"reply and transcript", `<mx-reply><a href="https://loom.com/share/parent">Parent</a></mx-reply><a href="https://loom.com/share/abc">Watch recording</a>`, `<a href="https://loom.com/share/abc">Watch recording</a><br>🎤 transcript: &lt;b&gt;quoted&lt;/b&gt; &amp; plain<br>second line`},
+		{"plain text", "source words", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, MessageHTML(&Message{Text: tc.text, Attachments: attachments}))
 		})
 	}
 }
@@ -139,13 +175,13 @@ func TestSharedLink(t *testing.T) {
 func TestShareMetadata(t *testing.T) {
 	assert := assert.New(t)
 	att := []Attachment{{FileName: "image.jpg"}}
-	assert.Empty(shareMetadata(&Message{Type: typeImage, Attachments: att}))
+	assert.Empty(attachmentMetadataJSON(&Message{Type: typeImage, Attachments: att}, &att[0]))
 	assert.JSONEq(
 		`{"shared_url":"https://www.instagram.com/p/ABC/"}`,
-		shareMetadata(&Message{Type: typeImage, Text: "https://www.instagram.com/p/ABC/", Attachments: att}),
+		attachmentMetadataJSON(&Message{Type: typeImage, Text: "https://www.instagram.com/p/ABC/", Attachments: att}, &att[0]),
 	)
 	// A URL carrying a quote must not be able to break out of the JSON value.
-	meta := shareMetadata(&Message{Type: typeImage, Text: `https://x.example/"+evil`, Attachments: att})
+	meta := attachmentMetadataJSON(&Message{Type: typeImage, Text: `https://x.example/"+evil`, Attachments: att}, &att[0])
 	assert.NotEmpty(meta)
 	assert.JSONEq(`{"shared_url":"https://x.example/\"+evil"}`, meta)
 }

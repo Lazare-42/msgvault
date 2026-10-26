@@ -15,17 +15,25 @@
   import { appShortcuts, Button, DetailDrawer, EmptyState, ROOT_SCOPE } from '@kenn-io/kit-ui';
   import { onDestroy, onMount, tick, untrack } from 'svelte';
 
+  import type { MeetingRef } from '../../api/generated/models';
+  import MeetingPanel from '../meetings/MeetingPanel.svelte';
+  import { relationshipMeetingScope } from '../../meetings/scopes';
   import type { APIClient } from '../../api/client';
+  import { listPersonAttributes } from '../../api/generated/api/api';
   import type { ExplorePredicate, FileMIMEFamily, FileSearchSort, PersonFileDirection } from '../../explore/models';
+  import { ExploreSelectionState } from '../../explore/state.svelte';
   import type { RelationshipsController } from '../../relationships/controller.svelte';
   import type { RelationshipFacet, RelationshipTimelineRow } from '../../relationships/models';
+  import type { PersonMergeSuccess, ValidatedPersonMergeRequired } from '../../directory/person-merge';
   import { bufferedCallback } from '../../util/buffered-callback';
   import FilesWorkspace from '../files/FilesWorkspace.svelte';
   import SplitPane from '../layout/SplitPane.svelte';
+  import PersonBindingConflictModal from '../directory/PersonBindingConflictModal.svelte';
   import ReadingPane, { type ReadingPaneSelection } from '../reader/ReadingPane.svelte';
   import RelationshipHeader from './RelationshipHeader.svelte';
   import RelationshipCalendar from './RelationshipCalendar.svelte';
   import RelationshipList from './RelationshipList.svelte';
+  import PageHeader from '../shell/PageHeader.svelte';
   import RelationshipTimeline from './RelationshipTimeline.svelte';
   import { localDayBoundsUTC, timelineRowToSelection } from './timeline-support';
 
@@ -51,6 +59,11 @@
      * Everything. Not part of the frozen Task 4 Props contract — AppShell
      * (Task 6) wires it to its own workspace-change callback. */
     onOpenEverything?: () => void;
+    /** Opens Directory with the currently loaded, API-validated participant. */
+    onOpenDirectory?: (participantID: number) => void;
+    onOpenDirectoryPerson?: (personID: number) => void;
+    onAnnounce?: (message: string) => void;
+    onOpenMeeting?: (meeting: MeetingRef) => void;
     /** Opening a file (or its containing conversation) from the hub's own
      * embedded Files pane has no reading pane of its own to resolve a full
      * EntryRow into — AppShell wires these to the same openFileItem/
@@ -79,6 +92,10 @@
     onPersonFilePresentationChange = undefined,
     onPersonFileDirectionsChange = undefined,
     onOpenEverything = undefined,
+    onOpenDirectory = undefined,
+    onOpenDirectoryPerson = undefined,
+    onAnnounce = undefined,
+    onOpenMeeting = undefined,
     onOpenFileItem = undefined,
     onOpenFileConversation = undefined
   }: Props = $props();
@@ -97,6 +114,19 @@
   // never the text shown in the search box, matching LinkIdentityDialog's
   // "local state for display, debounced write for the network call" split.
   let queryInput = $state(untrack(() => controller.query));
+  const listSelection = new ExploreSelectionState();
+  let bulkPending = $state(false);
+  let bulkMessage = $state<string | null>(null);
+  let bulkError = $state(false);
+  let bulkConflict = $state<ValidatedPersonMergeRequired>();
+  let bulkAnchorID = $state<number>();
+  let bulkQueue = $state<number[]>([]);
+  let bulkCompleted = $state(0);
+  let bulkTotal = $state(0);
+  let bulkContext = $state<ReturnType<RelationshipsController['personMergeContextSnapshot']>>();
+  // The latest successful link reports whether the identity cache refreshed.
+  // A stale cache keeps a warning and Retry, which repeats this idempotent link.
+  let bulkStaleLink = $state<{ a: number; b: number } | null>(null);
 
   // A dedicated instance per component, never shared — LinkIdentityDialog's
   // own debounced search is a separate instance for the same reason; sharing
@@ -112,6 +142,11 @@
 
   function handleQueryChange(value: string): void {
     queryInput = value;
+    if (!bulkPending && !bulkConflict) listSelection.clear();
+    if (!bulkStaleLink) {
+      bulkMessage = null;
+      bulkError = false;
+    }
     debouncedSetQuery(value);
   }
 
@@ -125,6 +160,33 @@
   const layout = $derived(computeHubLayout(containerWidth));
   const predicateFingerprint = $derived(JSON.stringify(predicate));
   const selectedRowKey = $derived(selection?.kind === 'entry' ? selection.row.key : null);
+
+  let previousSelectionContext = '';
+  // A context change during a batch (Back/Forward can change filters while
+  // the list is locked) must still drop the selection once the batch stops,
+  // so the next batch cannot link people the new filters hide.
+  let selectionResetPending = false;
+  $effect(() => {
+    const next = `${facet}\u0000${showAll}\u0000${controller.query}\u0000${predicateFingerprint}`;
+    const locked = bulkPending || bulkConflict !== undefined;
+    if (next !== previousSelectionContext) {
+      previousSelectionContext = next;
+      if (locked) {
+        selectionResetPending = true;
+        return;
+      }
+      untrack(() => listSelection.clear());
+      if (!untrack(() => bulkStaleLink)) {
+        bulkMessage = null;
+        bulkError = false;
+      }
+      return;
+    }
+    if (!locked && selectionResetPending) {
+      selectionResetPending = false;
+      untrack(() => listSelection.clear());
+    }
+  });
 
   // One effect ties facet/showAll/query/predicate to a single loadList call
   // — mirrors PeopleWorkspace's search effect (the fingerprint sweep is
@@ -192,6 +254,15 @@
     (controller.target !== target || controller.canonicalID === null)
   );
   const filesReady = $derived(target !== null && !clusterScopePending);
+  const meetingContext = $derived.by(() => {
+    if (!target || controller.target !== target || clusterScopePending) return undefined;
+    const domain = domainOf(target);
+    try {
+      return { scope: relationshipMeetingScope(domain ? { domains: [domain] } : { participant_id: controller.canonicalID! }, contextPredicate(predicate)) };
+    } catch (cause: unknown) {
+      return { error: cause instanceof Error ? cause.message : 'Meeting activity cannot use these filters.' };
+    }
+  });
 
   function focusPane(selector: string): boolean {
     const element = rootElement?.querySelector<HTMLElement>(selector);
@@ -226,11 +297,15 @@
   // shape): only re-focus the timeline when a pane was actually open, so
   // this stays a no-op when called defensively (e.g. from selectListRow).
   async function closeReadingPane(): Promise<void> {
+    if (clearReadingPane()) await focusTimelinePane();
+  }
+
+  function clearReadingPane(): boolean {
     const wasOpen = selection !== undefined;
     selection = undefined;
     conversationAnchorId = undefined;
     conversationBounds = undefined;
-    if (wasOpen) await focusTimelinePane();
+    return wasOpen;
   }
 
   function selectListRow(nextTarget: string): void {
@@ -243,6 +318,96 @@
     // search input auto-focused on open), the browser blurs it to <body>.
     // Re-home focus on the timeline so Esc-chaining keeps working.
     if (wasDrawerOpen) void focusTimelinePane();
+  }
+
+  function selectedPersonIDs(): number[] {
+    return [...listSelection.explicitKeys]
+      .map((target) => /^cluster:([1-9][0-9]*)$/.exec(target)?.[1])
+      .filter((id): id is string => id !== undefined)
+      .map(Number);
+  }
+
+  async function startBulkSamePerson(): Promise<void> {
+    if (bulkPending || bulkConflict) return;
+    const ids = selectedPersonIDs();
+    if (ids.length < 2) return;
+    bulkAnchorID = ids[0];
+    bulkQueue = ids.slice(1);
+    bulkCompleted = 0;
+    bulkTotal = bulkQueue.length;
+    bulkContext = controller.personMergeContextSnapshot();
+    bulkError = false;
+    bulkPending = true;
+    await continueBulkSamePerson();
+  }
+
+  async function continueBulkSamePerson(): Promise<void> {
+    if (bulkAnchorID === undefined) return;
+    while (bulkQueue.length > 0) {
+      const nextID = bulkQueue[0]!;
+      bulkMessage = `Linking ${bulkCompleted + 1} of ${bulkTotal}…`;
+      const outcome = await controller.linkParticipants(bulkAnchorID, nextID);
+      if (outcome.ok || outcome.code === 'already_linked') {
+        if (outcome.ok) bulkStaleLink = outcome.cacheState === 'stale' ? { a: bulkAnchorID, b: nextID } : null;
+        bulkQueue = bulkQueue.slice(1);
+        bulkCompleted += 1;
+        continue;
+      }
+      if (outcome.code === 'merge_required') {
+        bulkPending = false;
+        bulkConflict = outcome.conflict;
+        bulkMessage = 'Resolve this profile merge to continue linking the selection.';
+        return;
+      }
+      bulkPending = false;
+      bulkError = true;
+      bulkMessage = `${bulkCompleted} of ${bulkTotal} linked. ${outcome.message}${staleCacheNote()}`;
+      return;
+    }
+    bulkPending = false;
+    bulkError = bulkStaleLink !== null;
+    bulkMessage = `${bulkTotal + 1} people are now treated as the same person.${staleCacheNote()}`;
+    listSelection.clear();
+    onAnnounce?.(bulkMessage);
+  }
+
+  async function completeBulkMerge(success: PersonMergeSuccess): Promise<void> {
+    const context = bulkContext;
+    // Stay locked while the merge reconciles; otherwise Same person is enabled
+    // again and a second batch would share this batch's queue and counters.
+    bulkPending = true;
+    bulkConflict = undefined;
+    onAnnounce?.(`Profiles merged into ${success.survivor.display_name?.trim() || `Person ${success.survivor.id}`}.`);
+    if (context) await controller.reconcilePersonMerge(context);
+    await continueBulkSamePerson();
+  }
+
+  function cancelBulkMerge(): void {
+    bulkConflict = undefined;
+    bulkQueue = [];
+    bulkError = true;
+    bulkMessage = `${bulkCompleted} of ${bulkTotal} linked. Bulk linking was stopped.${staleCacheNote()}`;
+  }
+
+  function staleCacheNote(): string {
+    return bulkStaleLink
+      ? ' The cache refresh failed — groupings may be stale until a rebuild. Retrying is safe.'
+      : '';
+  }
+
+  async function retryBulkCacheRefresh(): Promise<void> {
+    if (!bulkStaleLink || bulkPending) return;
+    const { a, b } = bulkStaleLink;
+    bulkPending = true;
+    try {
+      const outcome = await controller.linkParticipants(a, b);
+      if (!outcome.ok || outcome.cacheState === 'stale') return;
+      bulkStaleLink = null;
+      bulkError = false;
+      bulkMessage = 'Identity cache refreshed.';
+    } finally {
+      bulkPending = false;
+    }
   }
 
   // Esc closes the reading pane before it ever clears `target` (see
@@ -259,9 +424,7 @@
   $effect(() => {
     if (target === previousTarget) return;
     previousTarget = target;
-    selection = undefined;
-    conversationAnchorId = undefined;
-    conversationBounds = undefined;
+    clearReadingPane();
   });
 
   async function closeDrawer(): Promise<void> {
@@ -288,6 +451,21 @@
       ? localDayBoundsUTC(row.first_at ?? row.occurred_at)
       : undefined;
   }
+
+  // Focus stays on the calendar control the person just used.
+  function selectCalendarDate(date: string | null): void {
+    clearReadingPane();
+    if (filesOpen) onFilesToggle(false);
+    void controller.selectTimelineDay(date
+      ? { date, ...localDayBoundsUTC(`${date}T00:00:00`) }
+      : null);
+  }
+
+  // The day filters only the message timeline, so Files never shows a day.
+  $effect(() => {
+    if (!filesOpen || !controller.timelineDay) return;
+    untrack(() => { void controller.selectTimelineDay(null); });
+  });
 
   function editableTarget(value: EventTarget | null): boolean {
     const element = value as HTMLElement | null;
@@ -333,10 +511,16 @@
     {showAll}
     autofocusSearch={layout === 'narrow' && mobileListOpen}
     activeTarget={target}
+    selection={listSelection}
+    {bulkPending}
+    {bulkMessage}
+    {bulkError}
     onQueryChange={handleQueryChange}
     {onFacetChange}
     {onShowAllChange}
     onSelect={selectListRow}
+    onBulkSamePerson={() => { void startBulkSamePerson(); }}
+    onBulkRetry={bulkStaleLink ? () => { void retryBulkCacheRefresh(); } : undefined}
     onLoadMore={() => { void controller.loadMoreList(); }}
     {onOpenEverything}
   />
@@ -364,58 +548,82 @@
             </div>
           {:else}
             <div class="pane-center-column">
-              <RelationshipHeader
-                detail={controller.detail}
-                loading={controller.timelineLoading}
-                {filesOpen}
-                {onFilesToggle}
-                {client}
-                onLinkParticipants={(a, b) => controller.linkParticipants(a, b)}
-                onUnlinkParticipants={(a, b) => controller.unlinkParticipants(a, b)}
-              />
-              {#if target !== null && domainOf(target) === undefined}
-                <RelationshipCalendar
-                  calendar={controller.relationshipCalendar}
-                  loading={controller.relationshipCalendarLoading}
-                  error={controller.relationshipCalendarError}
-                  year={controller.relationshipCalendarYear}
-                  firstYear={controller.relationshipCalendarFirstYear}
-                  currentYear={controller.relationshipCalendarCurrentYear}
-                  onYearChange={(year) => { void controller.loadRelationshipYear(year); }}
-                />
-              {/if}
-              {#if filesOpen && filesReady}
-                <FilesWorkspace
-                  {client}
-                  embedded
-                  predicate={contextPredicate(predicate)}
-                  identityScope={identityScopeFor(target)}
-                  sort={fileSort}
-                  filenameQuery={fileFilenameQuery}
-                  mimeFamilies={fileMIMEFamilies}
-                  personPresentation={personFilePresentation}
-                  personDirections={personFileDirections}
-                  onSortChange={(value) => (fileSort = value)}
-                  onFilenameQueryChange={(value) => (fileFilenameQuery = value)}
-                  onMIMEFamiliesChange={(value) => (fileMIMEFamilies = value)}
-                  onPersonPresentationChange={onPersonFilePresentationChange}
-                  onPersonDirectionsChange={onPersonFileDirectionsChange}
-                  onOpenItem={onOpenFileItem}
-                  onOpenConversation={onOpenFileConversation}
-                />
-              {:else}
-                <RelationshipTimeline
-                  rows={controller.timelineRows}
+              <div class="relationship-overview">
+                <RelationshipHeader
+                  detail={controller.detail}
                   loading={controller.timelineLoading}
-                  loadingMore={controller.timelineLoadingMore}
-                  hasMore={Boolean(controller.timelineCursor)}
-                  error={controller.timelineError}
-                  restartNotice={controller.timelineRestartNotice}
-                  selectedKey={selectedRowKey}
-                  onRowOpen={openTimelineRow}
-                  onLoadMore={() => { void controller.loadMoreTimeline(); }}
+                  {filesOpen}
+                  {onFilesToggle}
+                  {client}
+                  {onOpenDirectory}
+                  {onOpenDirectoryPerson}
+                  loadAttributes={async (id) => (await listPersonAttributes({ id }, { history: false }, { ...client })).data?.attributes ?? []}
+                  {onAnnounce}
+                  capturePersonMergeContext={() => controller.personMergeContextSnapshot()}
+                  onReconcilePersonMerge={(context) => controller.reconcilePersonMerge(context)}
+                  onLinkParticipants={(a, b) => controller.linkParticipants(a, b)}
+                  onUnlinkParticipants={(a, b) => controller.unlinkParticipants(a, b)}
                 />
-              {/if}
+                {#if target !== null && domainOf(target) === undefined}
+                  <RelationshipCalendar
+                    calendar={controller.relationshipCalendar}
+                    loading={controller.relationshipCalendarLoading}
+                    error={controller.relationshipCalendarError}
+                    year={controller.relationshipCalendarYear}
+                    firstYear={controller.relationshipCalendarFirstYear}
+                    currentYear={controller.relationshipCalendarCurrentYear}
+                    selectedDate={controller.timelineDay?.date}
+                    onDateChange={selectCalendarDate}
+                    onYearChange={(year) => {
+                      if (controller.timelineDay) selectCalendarDate(null);
+                      void controller.loadRelationshipYear(year);
+                    }}
+                  />
+                {/if}
+                {#if meetingContext?.scope}
+                  <details class="meeting-overview" open>
+                    <summary>Meeting activity and follow-ups</summary>
+                    <MeetingPanel {client} scope={meetingContext.scope} refreshKey={String(controller.identityRevision ?? '')} showHeading={false} {onOpenMeeting} />
+                  </details>
+                {:else if meetingContext?.error}
+                  <p role="status">{meetingContext.error}</p>
+                {/if}
+              </div>
+              <div class="relationship-activity">
+                {#if filesOpen && filesReady}
+                  <FilesWorkspace
+                    {client}
+                    embedded
+                    predicate={contextPredicate(predicate)}
+                    identityScope={identityScopeFor(target)}
+                    sort={fileSort}
+                    filenameQuery={fileFilenameQuery}
+                    mimeFamilies={fileMIMEFamilies}
+                    personPresentation={personFilePresentation}
+                    personDirections={personFileDirections}
+                    onSortChange={(value) => (fileSort = value)}
+                    onFilenameQueryChange={(value) => (fileFilenameQuery = value)}
+                    onMIMEFamiliesChange={(value) => (fileMIMEFamilies = value)}
+                    onPersonPresentationChange={onPersonFilePresentationChange}
+                    onPersonDirectionsChange={onPersonFileDirectionsChange}
+                    onOpenItem={onOpenFileItem}
+                    onOpenConversation={onOpenFileConversation}
+                  />
+                {:else}
+                  <RelationshipTimeline
+                    rows={controller.timelineRows}
+                    loading={controller.timelineLoading}
+                    loadingMore={controller.timelineLoadingMore}
+                    hasMore={Boolean(controller.timelineCursor)}
+                    error={controller.timelineError}
+                    restartNotice={controller.timelineRestartNotice}
+                    daySelected={controller.timelineDay !== null}
+                    selectedKey={selectedRowKey}
+                    onRowOpen={openTimelineRow}
+                    onLoadMore={() => { void controller.loadMoreTimeline(); }}
+                  />
+                {/if}
+              </div>
             </div>
           {/if}
         </div>
@@ -427,6 +635,7 @@
               {client}
               {selection}
               predicate={contextPredicate(predicate)}
+              {onOpenMeeting}
               onClose={() => { void closeReadingPane(); }}
               {conversationAnchorId}
               conversationStart={conversationBounds?.start}
@@ -448,45 +657,57 @@
   bind:this={rootElement}
   onkeydown={handleEscape}
 >
-  <h1 class="kit-sr-only">Relationships</h1>
-  {#if layout === 'narrow'}
-    <Button
-      class="drawer-toggle"
-      label="Contacts"
-      ariaLabel="Show relationship list"
-      ariaExpanded={mobileListOpen}
-      onclick={() => (mobileListOpen = !mobileListOpen)}
-    />
-    {@render centerAndReading()}
-    {#if mobileListOpen}
-      <DetailDrawer
-        title="Contacts"
-        ariaLabel="Relationship search and results"
-        width="min(390px, 100vw)"
-        onclose={closeDrawer}
+  <div class="hub-header">
+    <PageHeader title="Relationships" description="People and domains you've exchanged messages with." />
+  </div>
+  <div class="hub-body">
+    {#if layout === 'narrow'}
+      <Button
+        class="drawer-toggle"
+        label="People"
+        ariaExpanded={mobileListOpen}
+        onclick={() => (mobileListOpen = !mobileListOpen)}
+      />
+      {@render centerAndReading()}
+      {#if mobileListOpen}
+        <DetailDrawer
+          title="People"
+          ariaLabel="Relationship search and results"
+          width="min(390px, 100vw)"
+          onclose={closeDrawer}
+        >
+          <div class="pane-list">
+            {@render listPane()}
+          </div>
+        </DetailDrawer>
+      {/if}
+    {:else}
+      <SplitPane
+        ariaLabel="Resize relationship list"
+        storageKey="msgvault.relationships.list-pane.size"
+        initialSize={300}
+        minPrimary={240}
+        maxPrimary={440}
       >
-        <div class="pane-list">
-          {@render listPane()}
-        </div>
-      </DetailDrawer>
+        {#snippet primary()}
+          <div class="pane-list">
+            {@render listPane()}
+          </div>
+        {/snippet}
+        {#snippet secondary()}
+          {@render centerAndReading()}
+        {/snippet}
+      </SplitPane>
     {/if}
-  {:else}
-    <SplitPane
-      ariaLabel="Resize relationship list"
-      storageKey="msgvault.relationships.list-pane.size"
-      initialSize={300}
-      minPrimary={240}
-      maxPrimary={440}
-    >
-      {#snippet primary()}
-        <div class="pane-list">
-          {@render listPane()}
-        </div>
-      {/snippet}
-      {#snippet secondary()}
-        {@render centerAndReading()}
-      {/snippet}
-    </SplitPane>
+  </div>
+  {#if bulkConflict}
+    <PersonBindingConflictModal
+      {client}
+      conflict={bulkConflict}
+      onOpenProfile={(personID) => onOpenDirectoryPerson?.(personID)}
+      onSuccess={completeBulkMerge}
+      onClose={cancelBulkMerge}
+    />
   {/if}
 </main>
 
@@ -496,7 +717,18 @@
     display: flex;
     min-height: 0;
     height: 100%;
+    flex-direction: column;
     background: var(--bg-canvas);
+  }
+
+  .hub-header {
+    padding: var(--space-5) var(--page-gutter) var(--space-4);
+  }
+
+  .hub-body {
+    display: flex;
+    min-height: 0;
+    flex: 1;
   }
 
   .pane-list {
@@ -508,28 +740,11 @@
     background: var(--bg-primary);
   }
 
-  /* Machined, draggable pane boundary: the kit handle spans 4px of grab
-   * area but paints only a centered hairline, so the rail reads as a single
-   * machined edge until hovered/focused, when the accent fills the grip. */
-  .relationships-hub :global(.kit-split-resize-handle) {
-    background: linear-gradient(
-      to right,
-      transparent calc(50% - 0.5px),
-      var(--border-muted) calc(50% - 0.5px),
-      var(--border-muted) calc(50% + 0.5px),
-      transparent calc(50% + 0.5px)
-    );
-  }
-
-  .relationships-hub :global(.kit-split-resize-handle:hover),
-  .relationships-hub :global(.kit-split-resize-handle:focus-visible) {
-    background: var(--accent-blue);
-  }
-
   .pane-center-and-reading {
     display: flex;
     min-width: 0;
     height: 100%;
+    min-height: 0;
     flex: 1;
     overflow: hidden;
   }
@@ -554,6 +769,7 @@
     gap: var(--space-4);
     margin-inline: auto;
     padding: var(--space-6) var(--space-7);
+    overflow: auto;
   }
 
   .hub-empty {
@@ -561,6 +777,35 @@
     flex: 1;
     flex-direction: column;
   }
+
+  /* Keep the activity usable while the calendar and expanded meeting overview
+   * scroll independently, including when the reading pane reduces our height. */
+  .relationship-overview {
+    display: flex;
+    flex: 0 1 auto;
+    min-height: 80px;
+    max-height: 50%;
+    flex-direction: column;
+    gap: var(--space-4);
+    overflow: auto;
+  }
+
+  .relationship-overview > :global(*) { flex: none; }
+
+  .relationship-activity {
+    display: flex;
+    min-width: 0;
+    min-height: 240px;
+    flex: 1 0 240px;
+  }
+
+  .layout-narrow .relationship-activity { min-height: 340px; flex-basis: 340px; }
+  .layout-narrow .hub-body { flex-direction: column; }
+  .layout-narrow :global(.drawer-toggle) { align-self: flex-start; flex: none; margin-inline: var(--page-gutter); }
+
+  .meeting-overview { flex: none; }
+  .meeting-overview summary { cursor: pointer; padding: var(--space-3) 0; color: var(--text-primary); font-size: var(--font-size-sm); font-weight: 600; }
+  .meeting-overview[open] summary { margin-bottom: var(--space-2); }
 
   .pane-reading {
     height: 100%;

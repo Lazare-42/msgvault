@@ -3,7 +3,8 @@ package taskclient
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -61,12 +62,12 @@ func Discover(_ context.Context, options DiscoveryOptions) (*Client, error) {
 		return nil, err
 	}
 	var value descriptor
-	decoder := json.NewDecoder(bytes.NewReader(data))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&value); err != nil {
+	decoder := jsontext.NewDecoder(bytes.NewReader(data), json.RejectUnknownMembers(true))
+
+	if err := json.UnmarshalDecode(decoder, &value); err != nil {
 		return nil, fmt.Errorf("%w: malformed descriptor", ErrIncompatible)
 	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+	if err := json.UnmarshalDecode(decoder, &struct{}{}); !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("%w: trailing descriptor data", ErrIncompatible)
 	}
 	if value.ProtocolVersion != ProtocolVersion || strings.TrimSpace(value.InstanceID) == "" {
@@ -113,22 +114,6 @@ func DefaultDescriptorPath() string {
 	return filepath.Join(os.TempDir(), fmt.Sprintf("msgvault-%d", currentUserID()), "task-integration.json")
 }
 
-func validateSecureRegularFile(path string, expectedOwner uint32) error {
-	file, err := openSecureRegularFile(path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return os.ErrNotExist
-		}
-		return fmt.Errorf("%w: open secure file", ErrInsecureDescriptor)
-	}
-	defer func() { _ = file.Close() }()
-	info, err := file.Stat()
-	if err != nil {
-		return fmt.Errorf("%w: inspect secure file", ErrInsecureDescriptor)
-	}
-	return validateSecureFileInfo(info, expectedOwner)
-}
-
 func readSecureRegularFile(path string, expectedOwner uint32, maximum int64) ([]byte, error) {
 	file, err := openSecureRegularFile(path)
 	if err != nil {
@@ -155,9 +140,5 @@ func validateSecureFileInfo(info os.FileInfo, expectedOwner uint32) error {
 	if info.Mode().Perm()&0o077 != 0 {
 		return fmt.Errorf("%w: file permissions must deny group and other access", ErrInsecureDescriptor)
 	}
-	owner, err := fileInfoOwnerID(info)
-	if err != nil || owner != expectedOwner {
-		return fmt.Errorf("%w: file owner does not match daemon user", ErrInsecureDescriptor)
-	}
-	return nil
+	return validateSecureFileOwner(info, expectedOwner)
 }

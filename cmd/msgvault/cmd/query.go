@@ -2,18 +2,21 @@ package cmd
 
 import (
 	"encoding/csv"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/query"
 )
 
 var queryFormat string
+var queryFresh bool
 
 var queryCmd = &cobra.Command{
 	Use:   "query [sql]",
@@ -36,10 +39,12 @@ Output formats:
   csv    - CSV with header row
   table  - Aligned text table
 
-Examples:
-  msgvault query "SELECT from_email, COUNT(*) AS n FROM v_messages GROUP BY 1 ORDER BY 2 DESC LIMIT 10"
-	msgvault query --format csv "SELECT * FROM v_senders ORDER BY message_count DESC"
-	msgvault query --format table "SELECT name, message_count FROM v_labels"`,
+Columns: run SELECT * FROM <view> LIMIT 1. The analytics cache includes
+messages deleted at the source; 'msgvault stats' breaks out active and
+source-deleted message counts.`,
+	Example: `  msgvault query "SELECT from_email, COUNT(*) AS n FROM v_messages GROUP BY 1 ORDER BY 2 DESC LIMIT 10"
+  msgvault query --format csv "SELECT * FROM v_senders ORDER BY message_count DESC"
+  msgvault query --format table "SELECT name, message_count FROM v_labels"`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runHTTPQuery(cmd, args[0])
@@ -53,9 +58,31 @@ func runHTTPQuery(cmd *cobra.Command, sqlStr string) error {
 	}
 	defer func() { _ = st.Close() }()
 
-	result, err := st.RunSQLQuery(cmd.Context(), sqlStr)
+	result, accepted, err := st.RunSQLQueryWithFresh(cmd.Context(), sqlStr, queryFresh)
 	if err != nil {
 		return fmt.Errorf("query: %w", err)
+	}
+	for accepted != nil {
+		_, err := fmt.Fprintf(cmd.ErrOrStderr(), "Analytics cache build %s: %s; waiting for completion\n",
+			accepted.Status, accepted.JobID)
+		if err != nil {
+			return fmt.Errorf("write cache build status: %w", err)
+		}
+		if err := st.WaitForCacheBuild(cmd.Context(), accepted.JobID); err != nil {
+			return fmt.Errorf("query: %w", err)
+		}
+		result, accepted, err = st.RunSQLQueryWithFresh(cmd.Context(), sqlStr, false)
+		if err != nil {
+			return fmt.Errorf("query: %w", err)
+		}
+	}
+	if strings.ToLower(strings.TrimSpace(queryFormat)) != outputFormatJSON && result.Cache != nil {
+		_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Analytics cache published %s; generation %s",
+			result.Cache.PublishedAt.Format(time.RFC3339), result.Cache.Generation)
+		if result.Cache.StaleReason != "" {
+			_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "; stale: %s", result.Cache.StaleReason)
+		}
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr())
 	}
 	return writeQueryResult(cmd.OutOrStdout(), result, queryFormat)
 }
@@ -67,7 +94,7 @@ func writeQueryResult(w io.Writer, result *query.QueryResult, format string) err
 	format = strings.ToLower(strings.TrimSpace(format))
 	switch format {
 	case outputFormatJSON:
-		return writeJSON(w, result.Columns, result.Rows)
+		return writeJSON(w, result)
 	case "csv":
 		return writeCSV(w, result.Columns, result.Rows)
 	case "table":
@@ -77,17 +104,10 @@ func writeQueryResult(w io.Writer, result *query.QueryResult, format string) err
 	}
 }
 
-func writeJSON(
-	w io.Writer, cols []string, rows [][]any,
-) error {
-	result := query.QueryResult{
-		Columns:  cols,
-		Rows:     rows,
-		RowCount: len(rows),
-	}
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	return enc.Encode(result)
+func writeJSON(w io.Writer, result *query.QueryResult) error {
+	enc := jsontext.NewEncoder(w, jsontext.WithIndentPrefix(""), jsontext.WithIndent("  "))
+
+	return json.MarshalEncode(enc, result, json.Deterministic(true))
 }
 
 // displayVal formats a value for CSV/table output. SQL NULLs become
@@ -131,7 +151,6 @@ func writeCSV(
 
 // nil error return mirrors writeJSON/writeCSV so the format switch can
 // `return writeTable(...)` uniformly; text printing never fails.
-
 func writeTable(
 	w io.Writer, cols []string, rows [][]any,
 ) error {
@@ -193,6 +212,7 @@ func writeTable(
 
 func init() {
 	rootCmd.AddCommand(queryCmd)
+	queryCmd.Flags().BoolVar(&queryFresh, "fresh", false, "Wait for analytics to include writes committed before this request, then return rows")
 	queryCmd.Flags().StringVar(
 		&queryFormat, "format", outputFormatJSON,
 		"Output format: json, csv, or table",

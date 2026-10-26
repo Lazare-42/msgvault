@@ -1,107 +1,138 @@
 ---
-title: People, Profiles, and Source Identities
-description: Discover the addresses that mean you inside each source, curate stable person profiles, and store typed profile attributes.
+last_edited: "2026-10-02"
+title: People and Profiles
+description: Find people across your archive, keep their details together, and understand your contact history.
 ---
 
-Msgvault keeps three related concepts separate so archive evidence is not
-mistaken for user-curated data:
+Find someone across email, chats, and meetings, then keep their contact details
+and the things you want to remember in one profile. Start in the Web UI's
+**Relationships** workspace to explore contacts already in your archive, then
+save selected people in **Directory**. You can also use the
+[TUI People browser](/docs/usage/tui/#people).
 
-- A **source identity** is an address or handle that means you inside one
-  ingestion source. It drives sent-message classification and deduplication.
-- An **observed person** is an identity cluster assembled from explicit archive
-  links. Equal display names alone never merge people.
-- A **durable person profile** is an observed cluster you explicitly promote.
-  It has a stable numeric ID and vCard UID, so curated data survives later
-  identity-link changes.
+| I want to… | Start here |
+|---|---|
+| Save someone's name, details, or notes | [Create a profile](#promote-a-durable-person) |
+| Remember what they recently shared | [Person briefs](/docs/usage/people-briefs/) |
+| Review meeting time and recorded follow-ups | [Meeting activity](meetings.md#export-context-and-read-follow-ups) |
+| Find files you exchanged | [Person files](#find-files-related-to-a-person) |
+| Keep profile facts current from messages | [Profile automation](/docs/usage/people-automation/) |
+| Look up public profile information | [External enrichment](/docs/usage/people-enrichment/) |
+| Sync contacts with an address book | [CardDAV contacts](/docs/usage/people-carddav/) |
+| Tell msgvault which accounts and aliases are mine | [Source identities](#discover-source-identities) |
+| Review suggested identity links | [Identity match review](#review-identity-matches) |
 
-The Web UI's People and Relationships workspaces use observed identity
-evidence. The commands on this page add explicit source identities and durable
-profile data through the selected local or remote daemon.
+Ordinary profile editing and identity discovery use your archive. Briefs,
+automatic fact extraction, semantic person search, and external enrichment
+need separate provider configuration and consent. You can use the Directory
+without enabling them.
 
-## Discover source identities
+## Understand the records
 
-Full and incremental email sync enrich identities already confirmed for the
-source with strong sender evidence from trusted Sent metadata. Sync does not
-confirm first-time aliases; review them with `msgvault identity discover` and
-apply strong candidates with `msgvault identity discover --apply`.
-Recipient-only evidence remains a review candidate: receiving mail at an
-address does not by itself prove that the address is you.
+- A **source identity** is an address or handle that belongs to you in one
+  source. It helps msgvault recognize messages you sent.
+- An **observed person** groups addresses and handles linked by archive
+  evidence. Matching display names alone do not combine people.
+- A **person profile** is a saved record with a stable person ID. Your curated
+  details stay attached when archive links change.
 
-Preview all evidence for one source without changing the archive:
+Observed contacts use **participant IDs**. Saved profiles use **person IDs**.
+Commands name the ID they require; the two are not interchangeable. Promotion
+creates a profile from an observed person. Subscribed CardDAV contacts can also
+create profiles when imported.
 
-```bash
-msgvault list-accounts
-msgvault identity discover --source-id 14
-```
+Each saved profile also has a vCard UID. A new profile imported from a subscribed
+CardDAV book adopts the card's UID when it is a UUID that no other profile uses
+or has used. Existing profiles keep their UID. Use
+`msgvault person get --vcard-uid <uid>` with a current or retired profile UID,
+or a UID from one of its bound CardDAV cards. JSON profile reads include
+`vcard_uid` and `carddav_bindings`, which show the connection, book, resource
+href, remote UID, and mapping status. UID lookup needs daemon API schema 3.10.0
+or newer.
 
-Use the numeric source ID when account identifiers or display names are not
-unique. After reviewing the classifications, apply strong evidence:
+## Review identity matches
 
-```bash
-msgvault identity discover --source-id 14 --apply
-```
+Msgvault can retain uncertain identity suggestions for a person to review.
+Muesli sync supplies review-only suggestions when duplicate Contacts cards share
+an attendee email and a proposed phone already exists in the archive. See
+[duplicate Contacts review](/docs/usage/meetings/#review-duplicate-contacts-cards).
+Inspect the endpoints, archive evidence, and blockers before deciding.
 
-Weak evidence is never applied implicitly. Confirm an exact weak candidate
-deliberately with a repeatable flag:
-
-```bash
-msgvault identity discover --source-id 14 --apply \
-  --confirm you+archive@example.com
-```
-
-`--json` suppresses progress and returns the final structured result. Discovery
-does not modify source messages or provider state.
-
-## Import an owned identity list
-
-`identity import` accepts either a text file with one identifier per line or a
-JSON array/envelope. It validates and previews by default:
-
-```bash
-msgvault identity import --source-id 14 --file aliases.txt
-msgvault identity import --source-id 14 --file aliases.json --apply
-printf '%s\n' you@example.com you+news@example.com | \
-  msgvault identity import --source-id 14 --stdin --apply
-```
-
-Exactly one of `--file` and `--stdin` is required. `--signal` changes the
-recorded evidence name from its `manual` default. Imported provider state is
-reporting metadata only; imports never remove a previously confirmed identity.
-
-## Fastmail alias inventory
-
-An optional Fastmail JMAP token can add masked and send-as addresses to the same
-review. Select exactly one archive source by `source_id`, or by an unambiguous
-account identifier or display name:
-
-```toml
-[[fastmail]]
-source_id = 14
-api_token = "replace-with-a-Fastmail-API-token"
-auto_confirm_identities = false
-```
-
-Fetch the inventory only when requested:
+The archive-observation seeder skips email addresses seen on more than 20
+participants because they create too many low-value pairs.
 
 ```bash
-msgvault identity discover --source-id 14 --provider
-msgvault identity discover --source-id 14 --provider --apply
+msgvault identity matches list
+msgvault identity matches show <candidate-id>
+msgvault identity matches accept <candidate-id> --review-token <token>
+# or
+msgvault identity matches reject <candidate-id> --review-token <token>
 ```
 
-Enabled, disabled, and deleted aliases are strong historical evidence; pending
-aliases remain review-only, and wildcard identities are rejected. Set
-`auto_confirm_identities = true` to refresh and apply strong Fastmail evidence
-after successful mailbox syncs. A changed mailbox refreshes immediately; a
-no-change sync rechecks only when the last successful provider refresh is more
-than 24 hours old or the prior attempt failed.
+The token belongs to the evidence and endpoint snapshot you inspected. If
+evidence changes, the decision is rejected as stale; run `show` again and use
+its current token. Acceptance applies the participant link in the same guarded
+operation. A link into one saved profile extends its participant bindings. A
+candidate that spans two different saved profiles needs a separate person
+merge review.
 
-The API token is stored in `config.toml`; protect that file like the rest of the
-msgvault data directory.
+In the Web UI, a stale decision closes its dialog and refreshes the queue.
+Review the changed evidence, then reopen the decision. Your draft notes remain
+available; the open dialog never silently replaces the token you reviewed.
+
+Review notes are private profile data. Avoid putting unnecessary personal
+details in them. The matching CLI and token-guarded API are documented in the
+[CLI reference](/docs/cli-reference/#identity-matches) and
+[API reference](/docs/api-server/#identity-match-review-and-scoring).
+
+## Optional identity scoring
+
+Manual scoring creates identity review suggestions and records judgments. It
+requires a provider key, a retention declaration, and consent to the exact
+current disclosure. Local blockers are checked before sending eligible pairs
+to Typesafe Jev at the fixed endpoint in
+[configuration](../configuration.md#people-identity-scoring). A score proposes
+an action; you still review the candidate's evidence and token before deciding.
+
+The provider receives raw identity data for two participants: display names,
+email addresses, phone numbers, and up to eight identifiers each. Identifiers
+include email, phone, Beeper, Apple ID, WhatsApp, or iMessage values, with service
+and scope fields. Evidence includes identity classes, matching values, and
+source counts. `status` shows the exact field limits. Message bodies and
+freeform notes are outside this packet.
+
+Start by inspecting readiness and the disclosed endpoint, model, packet schema,
+and retention declaration:
+
+```bash
+msgvault person scoring status
+msgvault person scoring consent <disclosure-fingerprint>
+msgvault person scoring run --limit 20
+msgvault person scoring history --limit 20
+```
+
+Consent applies only while that disclosure fingerprint remains current. Use
+`msgvault person scoring revoke <disclosure-fingerprint>` to withdraw it;
+this leaves the configuration enabled. Each provider attempt has a 15-second
+timeout. Revocation waits for requests already admitted by the daemon, and
+later attempts recheck consent. Provider requests do not hold the archive's
+writer gate or a database write transaction.
+Scoring records redacted judgments; provider payloads and responses are not
+stored in the judgment history. See [identity scoring configuration](/docs/configuration/#people-identity-scoring)
+and the [API reference](/docs/api-server/#identity-match-review-and-scoring)
+for exact settings and routes.
 
 ## Promote a durable person
 
-People returned by the Web UI or API include participant IDs. Promote any
-participant in one identity cluster to reserve a stable profile:
+Directory starts empty until you save profiles or import contacts. In
+**Relationships**, select a person, choose **Open in Directory**, then
+**Promote to person**. This creates a saved profile from the contact already
+observed in your archive. The profile starts with the first nonblank observed
+name in the linked cluster, ordered by participant ID. A contact without an
+observed name keeps the `Person N` fallback.
+
+With the CLI, use the contact's participant ID. Replace `42` with that ID and
+`7` with the person ID returned by promotion:
 
 ```bash
 msgvault person promote 42
@@ -110,13 +141,20 @@ msgvault person get 7
 msgvault person set-display-name 7 "Alex Example"
 ```
 
-Promotion is explicit and idempotent; observed people are not promoted
-automatically. Linking another cluster into a promoted one expands that
+You can edit or clear this saved name with `set-display-name`. Repeating
+promotion returns the same profile and preserves an edited or cleared name.
+Archive observation alone does not promote people. Sources that assert a stable
+identity link addresses automatically: Beeper user IDs, Notion user IDs, Apple
+Contacts cards for Muesli attendees, and person `id` values in meeting imports.
+See [how meetings connect to people](/docs/usage/meetings/#how-meetings-connect-to-people).
+Linking another cluster into a promoted one expands that
 profile's participant bindings. Linking two clusters that already belong to
 different profiles reports a conflict instead of silently merging curated
 data. Unlinking evidence does not move or delete profile bindings.
 
-Clear only the display-name override with `--clear`:
+Your display-name override is also used in analytics, search results, and
+exports. Original addresses and message content stay available. Clear the
+override with `--clear`:
 
 ```bash
 msgvault person set-display-name 7 --clear
@@ -125,6 +163,158 @@ msgvault person set-display-name 7 --clear
 `person delete` is permanent. It removes the profile bindings and retires the
 vCard UID forever; promoting the same observed cluster later creates a new
 person and UID.
+
+### Browse people by last contact
+
+Use `person directory` to browse promoted people, most recent contact first. It queries the selected daemon and returns a page of up to 50 people by default.
+
+```bash
+msgvault person directory --last-contact-after 2026-06-01
+msgvault person directory --sort last_contact_asc
+msgvault person directory --sort name
+msgvault person directory --last-contact-after 2026-06-01 --last-contact-before 2026-07-01 --json
+```
+
+`--last-contact-after` and `--last-contact-before` are inclusive. Both accept `YYYY-MM-DD` or RFC3339 timestamps with offsets and fractional seconds. A date alone means midnight UTC, so an upper bound of `2026-07-01` includes the start of that day. The default sort is `last_contact_desc`. Use `last_contact_asc` for oldest contact first or `name` for name order.
+
+Drafts and unsent messages don't set last contact or cadence.
+
+The table shows ID, display name, and last contact in UTC. Missing names and timestamps show `-`. JSON returns the Directory envelope with a `people` array and optional `next_cursor`. It preserves the daemon's fields and omits `last_contact_at` when no timestamp exists.
+
+When output includes `Next cursor`, pass it unchanged with the same date bounds and sort to read the next page. For JSON, use the `next_cursor` value.
+
+```bash
+msgvault person directory --last-contact-after 2026-06-01 --cursor "<next_cursor>"
+```
+
+`person list` continues to show the full unpaginated profile collection. Its `--json` output remains an array of profiles.
+
+## Keep private notes
+
+Save context in your own words with the Notes field. It preserves line breaks
+and keeps earlier values in attribute history:
+
+```bash
+msgvault person notes get 7
+msgvault person notes set 7 --text "Met at the community workshop."
+msgvault person notes append 7 --text "Ask how the garden project is going."
+msgvault person notes set 7 --text @person-notes.txt
+```
+
+`--text -` reads standard input. Append adds a new line atomically, so two
+concurrent appends do not overwrite each other. When replacing text in an
+automated workflow, `set --expected-value-id <id>` rejects a concurrent change.
+Notes are marked sensitive and
+excluded from semantic person search and MCP's general `get_person_profile`
+response. The separate MCP `get_person_notes` tool can read them. If you publish
+a profile to CardDAV, Notes map to the vCard `NOTE` property.
+
+## Record employment and relationships
+
+Organizations have their own profiles. Employment connects a person to an
+organization and can retain a title, role, department, location, and dates:
+
+```bash
+msgvault organization create "Example Cooperative" --domain example.com
+msgvault employment add --person 7 --organization 3 --title "Engineer" --start 2024-03
+msgvault employment list --person 7
+msgvault employment end 9 --end 2026-08
+```
+
+Use the IDs returned by your commands. `employment set-primary` chooses the
+primary current job. Ending a job keeps its history. Organization commands
+also support profile edits, custom attributes, retirement, and merging
+duplicates; `organization show 3 --history` includes superseded profile rows.
+
+Relationships connect two saved people and have a direction. The forward label
+reads “source person is the ___ of target person.” List the available types
+before choosing one:
+
+```bash
+msgvault relationship-type list
+msgvault person relationship add 7 parent 12 --from 2020
+msgvault person relationship list 7 --include-ended
+```
+
+The same stored relationship appears from both people's perspectives, with the
+appropriate forward or reverse label. Dates accept `YYYY`, `YYYY-MM`, or
+`YYYY-MM-DD`. Use `person relationship end <relationship-id> <until-date>` to
+keep an ended relationship in history. `relationship-type create` adds your
+own types; symmetric types require identical forward and reverse labels.
+
+## Find a person by what you remember
+
+Directory name and identity searches work without an embedding provider. For a
+description such as “people who enjoy gardening,” enable
+[semantic people search](/docs/configuration/#vectorpeople), grant its separate
+consent, and build the embeddings:
+
+```bash
+msgvault person provider status --semantic-embeddings
+msgvault person provider consent --semantic-embeddings --yes
+msgvault daemon restart
+msgvault embeddings build
+msgvault person search "people who enjoy gardening" --limit 10
+```
+
+This searches saved profiles, using current names, categories, locations,
+employment, relationships, and eligible searchable attributes. It does not
+search your messages or private Notes. Sensitive attributes and `how_we_met`
+are excluded. Search text and the curated person documents go to the configured
+embedding endpoint. `--limit` defaults to 20 and accepts 1–100; `--json` includes
+person IDs and scores.
+
+## Find files related to a person
+
+Use a saved person ID to find attachments across their linked identities:
+
+```bash
+msgvault person files 7 --direction from_person --filename proposal
+msgvault person files 7 --mime-family pdf --after 2026-01-01
+msgvault person files 7 --lane documents --query "project proposal"
+msgvault person files 7 --lane visual --query "garden plan"
+msgvault person files 7 --lane all --query "project proposal" --json
+```
+
+The default `metadata` lane lists archived attachments without semantic search.
+`--direction` accepts `from_person`, `to_person`, and `group`; it is repeatable.
+`--filename` matches a case-insensitive substring. MIME families are `image`,
+`pdf`, `audio`, `video`, `text`, `document`, `archive`, and `other`.
+
+The `documents` and `visual` lanes need their respective indexes; see
+[document search](/docs/usage/document-indexing/) and
+[visual search](/docs/usage/vector-search/). Both require `--query`, as does
+`all`. The `all` result reports each lane separately, including unavailable
+lanes; its metadata results do not use the semantic query. Document search
+cannot apply filename or MIME-family filters.
+
+Each lane has its own cursor. Use `--cursor` with one lane to continue a result;
+`all` cannot take a cursor. `--limit` is per lane, defaults to 100, and accepts
+1–100. `--after` is inclusive and `--before` exclusive; both accept a date or
+RFC3339 timestamp.
+
+## Catch up before your next conversation
+
+[Person briefs](/docs/usage/people-briefs/) summarize recent chat and text
+messages with citations. The guide covers enrollment, generation, reading in
+Directory or the TUI, refresh timing, and saved versions. Email-only contacts
+cannot receive a brief yet.
+
+## Keep a person’s follow-ups in view
+
+Enable the [Kata connection](../configuration.md#integrationskata) to see live
+todos on a person's Directory page. Create or unlink tasks there, and link
+existing tasks with the [CLI](../cli-reference.md#person-agenda) or API. Edit
+and complete tasks in Kata. Tasks stay in Kata; this connection requires Kata
+API schema 0.21.0 or later.
+
+## Configure provider-backed person sweeps
+
+[Profile automation](/docs/usage/people-automation/) maintains facts for people
+you choose to track. Follow that guide to check and consent to a provider,
+change its policy, recover stale consent after an upgrade, and inspect or pin
+automatic facts. [External enrichment](/docs/usage/people-enrichment/) has a
+separate setup for looking up public information.
 
 ## Merge duplicate profiles and reverse a merge
 
@@ -181,14 +371,39 @@ personal data.
 
 ## Store typed attributes
 
-Every archive starts with four person-field definitions:
+Every archive starts with the same seeded person-field catalog. The
+definitions are system-owned and cannot be deleted; labels, descriptions, and
+display order can be edited. Sensitive fields are not searchable and stay out
+of provider inference unless a provider profile opts in. The seeded descriptive fields, including `ask_me_about` and `how_we_met`,
+accept up to 280 characters per value. The private `notes` field is a separate
+multiline text field. Older 120-character descriptive-field limits are widened
+on the next store open.
 
-| Slug | Type | Cardinality | Behavior |
-|---|---|---|---|
-| `primary_channel` | text choice | single | Writable: email, phone, SMS, chat, or in person |
-| `contact_frequency` | integer days | single | Writable |
-| `ask_me_about` | text | multiple | Writable and searchable |
-| `last_contacted` | timestamp | single | Read-only derived field; it remains empty until its producer supplies a value |
+| Slug | Label | Type | Cardinality | Sensitive | Behavior |
+|---|---|---|---|---|---|
+| `primary_channel` | Primary channel | text choice | single | no | Writable: email, phone, SMS, chat, or in person |
+| `contact_frequency` | Contact frequency | integer days | single | no | Writable |
+| `ask_me_about` | Ask me about | text | multiple | no | Writable and searchable |
+| `last_contacted` | Last contacted | timestamp | single | no | Read-only derived field; it remains empty until its producer supplies a value |
+| `notes` | Notes | text | single | yes | Private free-form notes; maps to the vCard `NOTE` property |
+| `location` | Location | text | single | no | Where this person lives or is based |
+| `birthplace` | Born in | text | single | no | Where this person was born |
+| `membership` | Membership | text | multiple | no | Groups and communities |
+| `religion` | Religion | text | single | yes | Religious identity or affiliation |
+| `politics` | Politics | text | single | yes | Political views or affiliation |
+| `personality` | Personality | text | multiple | yes | Traits and working style |
+| `family_pets` | Pets | text | multiple | no | Pets in this person's family |
+| `interests_fun_now` | Fun now | text | multiple | no | Activities this person enjoys now |
+| `interests_fun_growing_up` | Fun growing up | text | multiple | no | Activities this person enjoyed growing up |
+| `favorites_food` | Favorite food | text | multiple | no | Foods this person especially likes |
+| `favorites_place` | Favorite place | text | multiple | no | Places this person especially likes |
+| `how_we_met` | How we met | text | single | no | How you and this person first met; the one seeded field about your relationship rather than the person alone. Not searchable, so it stays out of the semantic person document |
+
+Contact points, addresses, dates such as birthdays, categories, organizations
+and employment, and typed relationships such as partner or child are structured
+records rather than attributes. Manage them with `msgvault person`,
+`msgvault organization`, `msgvault employment`, and `msgvault person
+relationship`, or through the `/api/v1/people` routes in the OpenAPI contract.
 
 List fields and values, set scalar values, and retain superseded history:
 
@@ -239,3 +454,106 @@ For automation, run `msgvault openapi` or read `/openapi.json` from the daemon.
 The contract includes source identities, person profiles, attribute
 definitions, and historized person-attribute routes, and the generated Go
 client exposes the same operations.
+
+## Discover source identities
+
+Full and incremental email sync enrich identities already confirmed for the
+source with strong sender evidence from trusted Sent metadata. Sync does not
+confirm first-time aliases; review them with `msgvault identity discover` and
+apply strong candidates with `msgvault identity discover --apply`.
+Recipient-only evidence remains a review candidate: receiving mail at an
+address does not by itself prove that the address is you.
+
+Preview all evidence for one source without changing the archive:
+
+```bash
+msgvault list-accounts
+msgvault identity discover --source-id 14
+```
+
+Use the numeric source ID when account identifiers or display names are not
+unique. After reviewing the classifications, apply strong evidence:
+
+```bash
+msgvault identity discover --source-id 14 --apply
+```
+
+Weak evidence is never applied implicitly. Confirm an exact weak candidate
+deliberately with a repeatable flag:
+
+```bash
+msgvault identity discover --source-id 14 --apply \
+  --confirm you+archive@example.com
+```
+
+`--json` suppresses progress and returns the final structured result. Discovery
+does not modify source messages or provider state.
+
+Adding, confirming, or removing an owned address rechecks only matching messages.
+Analytics still rebuilds the full archive after ownership changes.
+
+## Import an owned identity list
+
+`identity import` accepts either a text file with one identifier per line or a
+JSON array/envelope. It validates and previews by default:
+
+```bash
+msgvault identity import --source-id 14 --file aliases.txt
+msgvault identity import --source-id 14 --file aliases.json --apply
+printf '%s\n' you@example.com you+news@example.com | \
+  msgvault identity import --source-id 14 --stdin --apply
+```
+
+Exactly one of `--file` and `--stdin` is required. `--signal` changes the
+recorded evidence name from its `manual` default. Imported provider state is
+reporting metadata only; imports never remove a previously confirmed identity.
+
+## Gmail profile evidence
+
+For a Gmail source, `--provider` includes the address returned by its
+authenticated Gmail profile. The daemon uses the source's existing OAuth app
+or service-account credentials. It does not open a browser or request wider
+permissions. The profile must match the selected source under Gmail's account
+equivalence rules before it can supply strong `oauth` evidence.
+
+```bash
+# Preview provider and archived evidence together
+msgvault identity discover --source-id 14 --provider
+
+# Confirm strong candidates from that preview
+msgvault identity discover --source-id 14 --provider --apply
+```
+
+Preview does not confirm ownership. Ordinary sync only adds `oauth` provenance
+to matching addresses that are already confirmed; it does not restore removed
+identities.
+
+## Fastmail alias inventory
+
+An optional Fastmail JMAP token can add masked and send-as addresses to the same
+review. Select exactly one archive source by `source_id`, or by an unambiguous
+account identifier or display name:
+
+```toml
+[[fastmail]]
+source_id = 14
+api_token = "replace-with-a-Fastmail-API-token"
+auto_confirm_identities = false
+```
+
+Fetch the inventory only when requested:
+
+```bash
+msgvault identity discover --source-id 14 --provider
+msgvault identity discover --source-id 14 --provider --apply
+```
+
+Enabled, disabled, and deleted aliases are strong historical evidence; pending
+aliases remain review-only, and wildcard identities are rejected. Set
+`auto_confirm_identities = true` to refresh and apply strong Fastmail evidence
+after successful mailbox syncs. A changed mailbox refreshes immediately; a
+no-change sync rechecks only when the last successful provider refresh is more
+than 24 hours old or the prior attempt failed.
+
+The API token is stored in `config.toml`; protect that file like the rest of the
+msgvault data directory.

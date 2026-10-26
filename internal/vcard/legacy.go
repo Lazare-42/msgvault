@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -22,8 +23,21 @@ type Contact struct {
 	Emails   []string // lowercased
 }
 
+// ParseFileOptions controls optional vCard projection behavior.
+// NormalizePhone receives the decoded phone candidate after tel URI and
+// phone-context assembly. A nil callback uses the package normalizer.
+type ParseFileOptions struct {
+	NormalizePhone func(string) string
+}
+
 // ParseFile reads a vCard file and projects its contact identity fields.
 func ParseFile(path string) ([]Contact, error) {
+	return ParseFileWithOptions(path, ParseFileOptions{})
+}
+
+// ParseFileWithOptions reads a vCard file and projects its contact identity
+// fields with optional phone normalization.
+func ParseFileWithOptions(path string, options ParseFileOptions) ([]Contact, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open vCard %q: %w", path, err)
@@ -33,6 +47,11 @@ func ParseFile(path string) ([]Contact, error) {
 	document, err := Decode(file)
 	if err != nil {
 		return nil, fmt.Errorf("decode vCard %q: %w", path, err)
+	}
+
+	normalize := options.NormalizePhone
+	if normalize == nil {
+		normalize = normalizePhone
 	}
 
 	contacts := make([]Contact, 0, len(document.Cards))
@@ -54,7 +73,7 @@ func ParseFile(path string) ([]Contact, error) {
 				if decodeErr != nil {
 					return nil, fmt.Errorf("decode TEL in %q: %w", path, decodeErr)
 				}
-				if normalized := normalizeLegacyPhone(strings.TrimSpace(phone)); normalized != "" {
+				if normalized := normalizeLegacyPhone(strings.TrimSpace(phone), normalize); normalized != "" {
 					contact.Phones = append(contact.Phones, normalized)
 				}
 			case strings.EqualFold(property.Name, "EMAIL"):
@@ -193,30 +212,59 @@ func normalizePhone(raw string) string {
 	return normalized
 }
 
-func normalizeLegacyPhone(raw string) string {
-	if len(raw) < len("tel:") || !strings.EqualFold(raw[:len("tel:")], "tel:") {
-		return normalizePhone(raw)
-	}
+func normalizeLegacyPhone(raw string, normalize func(string) string) string {
+	subscriber, _ := decodeTelephoneEndpoint(raw)
+	return normalize(subscriber)
+}
 
+func decodeTelephoneEndpoint(raw string) (string, []string) {
+	if len(raw) < len("tel:") || !strings.EqualFold(raw[:len("tel:")], "tel:") {
+		return raw, nil
+	}
 	parts := strings.Split(raw[len("tel:"):], ";")
 	subscriber, err := url.PathUnescape(parts[0])
 	if err != nil {
-		return ""
+		return "", nil
 	}
-	if strings.HasPrefix(subscriber, "+") {
-		return normalizePhone(subscriber)
-	}
-
+	var parameters []string
 	for _, part := range parts[1:] {
 		name, value, found := strings.Cut(part, "=")
-		if !found || !strings.EqualFold(name, "phone-context") {
+		decoded, err := url.PathUnescape(value)
+		if err != nil {
+			if found && strings.EqualFold(name, "phone-context") && !strings.HasPrefix(subscriber, "+") {
+				return "", nil
+			}
+			decoded = value
+		}
+		name = strings.ToLower(name)
+		if found && name == "phone-context" && strings.HasPrefix(decoded, "+") {
+			if !strings.HasPrefix(subscriber, "+") {
+				subscriber = decoded + subscriber
+			}
 			continue
 		}
-		context, err := url.PathUnescape(value)
-		if err != nil || !strings.HasPrefix(context, "+") {
-			return ""
+		if found && name == "phone-context" {
+			if !strings.HasPrefix(subscriber, "+") {
+				return "", nil
+			}
+			decoded = strings.ToLower(decoded)
 		}
-		return normalizePhone(context + subscriber)
+		if found {
+			name += "=" + decoded
+		}
+		parameters = append(parameters, name)
 	}
-	return normalizePhone(subscriber)
+	slices.Sort(parameters)
+	return subscriber, parameters
+}
+
+// TelephoneParameters returns endpoint parameters after numeric phone-context assembly.
+func TelephoneParameters(raw string) []string {
+	_, parameters := decodeTelephoneEndpoint(strings.TrimSpace(raw))
+	return parameters
+}
+
+// TelephoneNumber extracts the subscriber and phone context without URI parameters.
+func TelephoneNumber(raw string) string {
+	return normalizeLegacyPhone(strings.TrimSpace(raw), func(value string) string { return value })
 }

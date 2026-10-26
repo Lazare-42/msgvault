@@ -1,6 +1,7 @@
 <script lang="ts">
   import { SplitResizeHandle, type SplitResizeEvent } from '@kenn-io/kit-ui';
-  import { onMount, untrack, type Snippet } from 'svelte';
+  import { untrack, type Snippet } from 'svelte';
+  import { splitHandleSize } from './split-handle';
 
   interface Props {
     ariaLabel: string;
@@ -47,8 +48,7 @@
   }: Props = $props();
 
   const keyboardStep = 24;
-  const vertical = untrack(() => orientation) === 'vertical';
-  const handleThickness = 4;
+  const vertical = $derived(orientation === 'vertical');
   const minSized = $derived(vertical ? minSecondary ?? 160 : minPrimary);
   const minOther = $derived(vertical ? minPrimary : minSecondary ?? 320);
 
@@ -75,16 +75,15 @@
     }
   }
 
-  let host: HTMLDivElement;
-  const storedSize = readStoredSize();
-  let sizedSize = $state(untrack(() => storedSize ?? initialSize));
-  let userSized = storedSize !== undefined;
+  let host = $state<HTMLDivElement>();
+  let sizedSize = $state(untrack(() => initialSize));
+  let userSized = false;
   let available = $state(0);
   let resizeStartSize = 0;
 
   const maximum = $derived.by(() => {
     const byAvailable = available > 0
-      ? Math.max(0, available - minOther - handleThickness)
+      ? Math.max(0, available - minOther - splitHandleSize)
       : Math.max(minSized, sizedSize);
     return !vertical && maxPrimary !== undefined ? Math.min(byAvailable, maxPrimary) : byAvailable;
   });
@@ -133,7 +132,19 @@
     return vertical ? entry.contentRect.height : entry.contentRect.width;
   }
 
-  onMount(() => {
+  // Reconfigure sizing without remounting either pane's content when the
+  // layout changes. Each orientation can retain its own stored dimensions.
+  $effect(() => {
+    const target = host;
+    void orientation;
+    void storageKey;
+    if (!target) return;
+    untrack(() => {
+      const stored = readStoredSize();
+      userSized = stored !== undefined;
+      sizedSize = stored ?? initialSize;
+      available = 0;
+    });
     const observer = new ResizeObserver((entries) => {
       const entry = entries[0];
       if (!entry) return;
@@ -145,12 +156,12 @@
         setSize(Math.round(available * initialFraction), false);
       } else setSize(sizedSize, false);
     });
-    observer.observe(host);
+    observer.observe(target);
     return () => observer.disconnect();
   });
 </script>
 
-<div class="split-pane" class:split-pane--vertical={vertical} data-split-pane bind:this={host}>
+<div class="split-pane" class:split-pane--vertical={vertical} class:split-pane--collapsed={collapsed} data-split-pane bind:this={host}>
   <section
     class="pane primary"
     data-pane="primary"
@@ -223,12 +234,18 @@
     overflow: hidden;
   }
 
+  .split-pane--collapsed > .primary {
+    flex: 1;
+  }
+
+  /* The wrapper spans the split's cross axis; the kit handle stretches to
+   * fill it and owns its own thickness. */
   .handle-reset {
     display: flex;
     flex: none;
   }
 
-  .handle-reset :global(.kit-split-resize-handle--horizontal) {
-    height: 100%;
+  .split-pane--vertical > .handle-reset {
+    flex-direction: column;
   }
 </style>

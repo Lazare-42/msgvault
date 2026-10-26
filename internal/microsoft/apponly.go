@@ -9,7 +9,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/json/v2"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -270,7 +270,7 @@ func appOnlyTokenError(status int, body []byte) error {
 // certificate, returning the key and the base64url SHA-1 thumbprint (x5t)
 // of the certificate.
 func loadAppOnlyCert(path string) (*rsa.PrivateKey, string, error) {
-	raw, err := os.ReadFile(path) //nolint:gosec // operator-supplied cert path on the local machine
+	raw, err := os.ReadFile(path)
 	if err != nil {
 		return nil, "", fmt.Errorf("read cert file %s: %w", path, err)
 	}
@@ -318,7 +318,7 @@ func loadAppOnlyCert(path string) (*rsa.PrivateKey, string, error) {
 func newJTI() (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
-		return "", err
+		return "", fmt.Errorf("generate assertion ID: %w", err)
 	}
 	b[6] = (b[6] & 0x0f) | 0x40
 	b[8] = (b[8] & 0x3f) | 0x80

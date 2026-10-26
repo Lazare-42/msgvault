@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -22,6 +23,8 @@ func TestHelperProcess(t *testing.T) {
 		return
 	}
 	switch os.Getenv("GO_HELPER_MODE") {
+	case "paused":
+		os.Exit(ExitCodeSyncPaused)
 	case "exit3":
 		os.Exit(3)
 	case "stdout-stderr-ok":
@@ -54,18 +57,25 @@ func helperProcessCommand(ctx context.Context, mode string) *exec.Cmd {
 }
 
 func TestClassifyDaemonCLIWaitErrExitStatus(t *testing.T) {
-	require := require.New(t)
-
-	// A normal non-zero exit yields an *exec.ExitError with Exited() == true.
-	waitErr := helperProcessCommand(context.Background(), "exit3").Run()
-	require.Error(waitErr, "helper should exit non-zero")
-	var exitErr *exec.ExitError
-	require.ErrorAs(waitErr, &exitErr, "want *exec.ExitError")
-
-	got := classifyDaemonCLIWaitErr(waitErr, []string{"show-deletion", "0"})
-	require.Error(got, "want error")
-	require.Equal(cliSubprocessExitSentinel, got.Error(),
-		"non-zero exit must map to the sentinel, not a wrapped 'exit status' line")
+	for _, mode := range []string{"exit3", "paused"} {
+		t.Run(mode, func(t *testing.T) {
+			require, assert := require.New(t), assert.New(t)
+			waitErr := helperProcessCommand(t.Context(), mode).Run()
+			require.Error(waitErr)
+			var events []string
+			got := classifyDaemonCLIWaitErr(waitErr, []string{"sync-omi"}, func(stream, data string) error {
+				events = append(events, stream+"="+data)
+				return nil
+			})
+			if mode == "paused" {
+				require.NoError(got)
+				assert.Equal([]string{"outcome=paused"}, events)
+			} else {
+				require.EqualError(got, cliSubprocessExitSentinel)
+				assert.Empty(events)
+			}
+		})
+	}
 }
 
 // TestClassifyDaemonCLIWaitErrSignalTerminated verifies a signal-terminated
@@ -88,7 +98,7 @@ func TestClassifyDaemonCLIWaitErrSignalTerminated(t *testing.T) {
 	require.ErrorAs(waitErr, &exitErr, "want *exec.ExitError")
 	require.False(exitErr.Exited(), "killed process did not exit normally")
 
-	got := classifyDaemonCLIWaitErr(waitErr, []string{"show-deletion", "0"})
+	got := classifyDaemonCLIWaitErr(waitErr, []string{"show-deletion", "0"}, nil)
 	require.Error(got, "want error")
 	require.ErrorContains(got, "CLI subprocess show-deletion 0",
 		"signal termination keeps context instead of the silent sentinel")
@@ -99,14 +109,10 @@ func TestClassifyDaemonCLIWaitErrOtherFailure(t *testing.T) {
 	require := require.New(t)
 
 	base := errors.New("fork/exec: permission denied")
-	got := classifyDaemonCLIWaitErr(base, []string{"logs"})
+	got := classifyDaemonCLIWaitErr(base, []string{"logs"}, nil)
 	require.Error(got, "want error")
 	require.ErrorContains(got, "CLI subprocess logs", "non-exit failures keep context")
 	require.ErrorIs(got, base, "wraps the original error")
-}
-
-func TestClassifyDaemonCLIWaitErrNil(t *testing.T) {
-	require.NoError(t, classifyDaemonCLIWaitErr(nil, []string{"logs"}), "nil stays nil")
 }
 
 func TestDaemonCLIChildEnvAppliesAllowlistedEnvOverrides(t *testing.T) {
@@ -125,6 +131,39 @@ func TestDaemonCLIChildEnvAppliesAllowlistedEnvOverrides(t *testing.T) {
 		daemonCLISubprocessEnv + "=" + strconv.Itoa(123),
 		"MSGVAULT_IMAP_PASSWORD=new-secret",
 	}, got)
+}
+
+func TestDaemonCLIChildEnvStripsUnforwardedRemoteDeleteConsent(t *testing.T) {
+	base := []string{
+		"PATH=/usr/bin",
+		"msgvault_enable_remote_delete=1",
+		"MsgVault_Enable_Remote_Delete=true",
+		remoteDeleteEnvVar + "=1",
+	}
+	tests := []struct {
+		name  string
+		extra map[string]string
+		want  []string
+	}{
+		{name: "no consent"},
+		{name: "lowercase extra ignored", extra: map[string]string{"msgvault_enable_remote_delete": "1"}},
+		{name: "mixed case extra ignored", extra: map[string]string{"MsgVault_Enable_Remote_Delete": "1"}},
+		{name: "canonical consent", extra: map[string]string{remoteDeleteEnvVar: "1"}, want: []string{remoteDeleteEnvVar + "=1"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := daemonCLIChildEnv(base, 123, tt.extra)
+			var equivalents []string
+			for _, entry := range got {
+				key, ok := splitEnvEntry(entry)
+				if ok && strings.EqualFold(key, remoteDeleteEnvVar) {
+					equivalents = append(equivalents, entry)
+				}
+			}
+			assert.Equal(t, tt.want, equivalents)
+		})
+	}
 }
 
 func TestNewDaemonCLISubprocessCommandAppliesWorkingDirectory(t *testing.T) {

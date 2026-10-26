@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"go.kenn.io/msgvault/internal/sqliteutil"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -144,7 +145,7 @@ func Generate(ctx context.Context, opts Options) (*Summary, error) {
 	if err := initSchema(dbPath); err != nil {
 		return nil, err
 	}
-	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_synchronous=OFF&_foreign_keys=ON")
+	db, err := sql.Open(sqliteutil.DriverName(), dbPath+"?_journal_mode=WAL&_synchronous=OFF&_foreign_keys=ON")
 	if err != nil {
 		return nil, fmt.Errorf("fakevault: opening database: %w", err)
 	}
@@ -739,6 +740,12 @@ func (g *generator) convMember(convID int64, j int) int64 {
 // finalize backfills the denormalized conversation stats and checkpoints
 // the WAL so the finished vault is a compact, self-contained database file.
 func (g *generator) finalize(ctx context.Context) error {
+	// Direct inserts bypass the Store paths that queue chats for discovery;
+	// the first search rebuilds every queued conversation that is a chat.
+	if _, err := g.db.ExecContext(ctx, `INSERT OR IGNORE INTO chat_members_dirty (conversation_id)
+		SELECT id FROM conversations`); err != nil {
+		return fmt.Errorf("fakevault: queueing chat members: %w", err)
+	}
 	if g.opts.ParticipantEdges > 0 {
 		if _, err := g.db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
 			return fmt.Errorf("fakevault: checkpointing WAL: %w", err)

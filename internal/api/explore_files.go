@@ -13,7 +13,7 @@ const exploreFilesMaxLimit = 100
 type ExploreFilesHTTPRequest struct {
 	Predicate ExploreHTTPRequest `json:"predicate"`
 	Cursor    string             `json:"cursor,omitempty"`
-	Limit     int                `json:"limit,omitempty" minimum:"0" maximum:"100"`
+	Limit     int                `json:"limit,omitzero" minimum:"0" maximum:"100"`
 }
 
 type ExploreFilesHTTPResponse struct {
@@ -23,6 +23,10 @@ type ExploreFilesHTTPResponse struct {
 	SearchProvenance    query.SearchProvenance  `json:"search_provenance"`
 	NextCursor          string                  `json:"next_cursor,omitempty"`
 	CandidateSnapshotID string                  `json:"candidate_snapshot_id,omitempty"`
+	// SearchDeletionScope is "active" when a semantic or hybrid search
+	// narrowed an unrestricted deletion context to active messages only,
+	// matching the entry and group responses.
+	SearchDeletionScope string `json:"search_deletion_scope,omitempty"`
 }
 
 func (s *Server) registerExploreFilesRoute(api huma.API) {
@@ -56,23 +60,8 @@ func (s *Server) handleExploreFiles(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var cursor exploreCursor
-	if request.Cursor != "" {
-		cursor, _ = s.decodeExploreCursor(request.Cursor)
-		if predicate.request.SearchMode == exploreSearchModeSemantic || predicate.request.SearchMode == exploreSearchModeHybrid {
-			if cursor.Snapshot == "" {
-				writeError(w, http.StatusBadRequest, "invalid_cursor", "semantic cursor is missing its candidate snapshot")
-				return
-			}
-			predicate.request.CandidateSnapshotID = cursor.Snapshot
-		}
-	}
-	searchSpec, snapshotID, ok := s.resolveExploreSearch(r.Context(), w, predicate.request)
-	if !ok || !requireCompleteCandidatePool(w, searchSpec) {
-		return
-	}
-	if request.Cursor != "" && cursor.SearchRevision != exploreResolvedSearchRevision(searchSpec) {
-		writeError(w, http.StatusConflict, "search_revision_changed", "The resolved search index revision changed; restart pagination")
+	_, searchSpec, snapshotID, ok := s.resolvePagedExploreSearch(r.Context(), w, request.Cursor, predicate.request)
+	if !ok {
 		return
 	}
 	predicate.query.Search = searchSpec
@@ -98,6 +87,7 @@ func (s *Server) handleExploreFiles(w http.ResponseWriter, r *http.Request) {
 	response := ExploreFilesHTTPResponse{
 		Files: result.Files, TotalCount: result.TotalCount, CacheRevision: result.CacheRevision,
 		SearchProvenance: result.SearchProvenance, CandidateSnapshotID: snapshotID,
+		SearchDeletionScope: predicate.searchDeletionScope,
 	}
 	if next := offset + len(result.Files); next < int(result.TotalCount) {
 		response.NextCursor = s.encodeExploreCursor(exploreCursor{

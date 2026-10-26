@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -11,8 +12,11 @@ import (
 )
 
 var (
+	o365Headless             bool
 	o365TenantID             string
 	noDefaultIdentityAddO365 bool
+	o365Graph                bool
+	o365SignIn               string
 )
 
 func newAddO365Cmd() *cobra.Command {
@@ -33,23 +37,24 @@ func newAddO365Cmd() *cobra.Command {
 // before proxying, so the daemon subprocess never opens a browser or waits
 // on human consent while holding the operation gate.
 func preflightAddO365Authorize(cmd *cobra.Command, email string) error {
-	if IsRemoteMode() {
+	mailWrite, err := o365MailWrite(cmd)
+	if err != nil {
+		return err
+	}
+	state := invocationFromCommand(cmd)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	if IsRemoteMode(state) {
 		// Tokens live on the remote host; authorization must happen there.
 		return nil
 	}
-	if err := requireMicrosoftOAuthConfig(); err != nil {
+	if err := requireMicrosoftOAuthConfig(cfg); err != nil {
 		return err
 	}
-	msMgr := microsoft.NewManager(
-		cfg.Microsoft.ClientID,
-		microsoftTenantID(o365TenantID),
-		cfg.Microsoft.EffectiveRedirectURI(),
-		cfg.TokensDir(),
-		logger,
-	)
-	fmt.Printf("Authorizing %s with Microsoft...\n", email)
-	if err := msMgr.Authorize(cmd.Context(), email); err != nil {
-		return fmt.Errorf("authorization failed: %w", err)
+	if err := authorizeO365(cmd, email, mailWrite); err != nil {
+		return err
 	}
 	if err := cmd.Flags().Set(oauthPreflightedFlag, "true"); err != nil {
 		return fmt.Errorf("set --%s after authorization: %w", oauthPreflightedFlag, err)
@@ -63,35 +68,67 @@ func newAddO365LocalCmd() *cobra.Command {
 		Short: "Add a Microsoft 365 account via OAuth",
 		Long: `Add a Microsoft 365 / Outlook.com email account using OAuth2 authentication.
 
-This opens a browser for Microsoft authorization, then configures IMAP access
+This opens a browser for Microsoft authorization (or, with --headless, prints a
+device code to enter on any device), then configures IMAP access
 to outlook.office365.com automatically using the XOAUTH2 SASL mechanism.
 
 Requires a [microsoft] section in config.toml with your Azure AD app's client_id.
 See the docs for Azure AD app registration setup.
 
+With --graph, the account syncs through the Microsoft Graph mail API instead
+of IMAP. Use it when IMAP is turned off for the mailbox. It needs the Mail.Read
+permission on the app registration. The first delete-staged for the account
+asks for Mail.ReadWrite, which the app registration must also list. A Graph
+account can request it during sign-in with --mail-write for category editing.
+The Graph account is separate: if the mailbox is also synced over IMAP, the
+vault holds two copies, and 'msgvault dedup --collection' hides the extra ones.
+
 Examples:
   msgvault add-o365 user@outlook.com
-  msgvault add-o365 user@company.com --tenant my-tenant-id`,
+  msgvault add-o365 user@outlook.com --headless
+  msgvault add-o365 user@company.com --tenant my-tenant-id
+  msgvault add-o365 user@company.com --sign-in jdoe@company.onmicrosoft.com
+  msgvault add-o365 user@company.com --graph`,
 		Args: cobra.ExactArgs(1),
 		RunE: runAddO365Local,
 	}
 	cmd.Flags().StringVar(&o365TenantID, "tenant", "",
 		"Azure AD tenant ID (default: \"common\" for multi-tenant)")
-	cmd.Flags().BoolVar(&noDefaultIdentityAddO365, "no-default-identity", false, noDefaultIdentityHelp)
+	cmd.Flags().BoolVar(&noDefaultIdentityAddO365, "no-default-identity", false, savedDefaultIdentityHelp)
+	cmd.Flags().BoolVar(&o365Headless, "headless", false,
+		"Sign in with a device code instead of a local browser")
+	cmd.Flags().BoolVar(&o365Graph, "graph", false, "sync through the Microsoft Graph mail API instead of IMAP")
+	cmd.Flags().StringVar(&o365SignIn, "sign-in", "",
+		"Microsoft sign-in name and browser login hint when it differs from the mailbox address (IMAP only)")
+	cmd.MarkFlagsMutuallyExclusive("graph", "sign-in")
+	cmd.Flags().Bool("mail-write", false, "With --graph, authorize category editing and remote deletion")
 	registerOAuthPreflightedFlag(cmd)
 	return cmd
 }
 
 func runAddO365Local(cmd *cobra.Command, args []string) error {
+	mailWrite, err := o365MailWrite(cmd)
+	if err != nil {
+		return err
+	}
+	state := invocationFromCommand(cmd)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	logger := state.logger
 	email := args[0]
 
-	if err := requireMicrosoftOAuthConfig(); err != nil {
+	if err := requireMicrosoftOAuthConfig(cfg); err != nil {
 		return err
+	}
+	if o365Graph {
+		return runAddO365GraphLocal(cmd, email, mailWrite)
 	}
 
 	msMgr := microsoft.NewManager(
 		cfg.Microsoft.ClientID,
-		microsoftTenantID(o365TenantID),
+		microsoftTenantID(o365TenantID, cfg),
 		cfg.Microsoft.EffectiveRedirectURI(),
 		cfg.TokensDir(),
 		logger,
@@ -102,9 +139,8 @@ func runAddO365Local(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if !preflighted {
-		fmt.Printf("Authorizing %s with Microsoft...\n", email)
-		if err := msMgr.Authorize(cmd.Context(), email); err != nil {
-			return fmt.Errorf("authorization failed: %w", err)
+		if err := authorizeO365(cmd, email, mailWrite); err != nil {
+			return err
 		}
 	}
 
@@ -124,7 +160,7 @@ func runAddO365Local(cmd *cobra.Command, args []string) error {
 		AuthMethod: imapclient.AuthXOAuth2,
 	}
 
-	s, cleanup, err := openWritableStoreAndInitForIngest()
+	s, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
 	if err != nil {
 		return err
 	}
@@ -168,16 +204,19 @@ func runAddO365Local(cmd *cobra.Command, args []string) error {
 	if err := s.UpdateSourceSyncConfig(source.ID, cfgJSON); err != nil {
 		return fmt.Errorf("store config: %w", err)
 	}
-	if err := s.UpdateSourceDisplayName(source.ID, email); err != nil {
+	if err := updateSourceDisplayNameForRegistration(s, source.ID, email, state.logger); err != nil {
 		return fmt.Errorf("set display name: %w", err)
 	}
 
 	// Auto-default-identity must run BEFORE the legacy migration
 	// retry — see comment in account_identity.go.
-	if !noDefaultIdentityAddO365 {
-		confirmDefaultIdentity(cmd.OutOrStdout(), s, source.ID, email, email, "account-identifier")
+	if err := setDefaultIdentityOptOut(cmd, s, source, noDefaultIdentityAddO365); err != nil {
+		return err
 	}
-	if err := runPostSourceCreateMigrations(s); err != nil {
+	if !noDefaultIdentityAddO365 {
+		confirmDefaultIdentity(cmd.OutOrStdout(), s, source.ID, email, email, "account-identifier", state.logger)
+	}
+	if err := runPostSourceCreateMigrationsForInvocation(s, state); err != nil {
 		return fmt.Errorf("post-source-create migrations: %w", err)
 	}
 
@@ -188,6 +227,103 @@ func runAddO365Local(cmd *cobra.Command, args []string) error {
 	fmt.Println("You can now run:")
 	fmt.Printf("  msgvault sync-full %s\n", email)
 
+	return nil
+}
+
+func o365MailWrite(cmd *cobra.Command) (bool, error) {
+	write, err := cmd.Flags().GetBool("mail-write")
+	if err != nil {
+		return false, fmt.Errorf("read --mail-write flag: %w", err)
+	}
+	if write && !o365Graph {
+		return false, errors.New("--mail-write requires --graph")
+	}
+	return write, nil
+}
+
+// authorizeO365 runs the Microsoft sign-in for the account kind: Graph mail
+// with --graph, IMAP otherwise.
+func authorizeO365(cmd *cobra.Command, email string, mailWrite bool) error {
+	state := invocationFromCommand(cmd)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	logger := state.logger
+	tenant := microsoftTenantID(o365TenantID, cfg)
+	redirect := cfg.Microsoft.EffectiveRedirectURI()
+	fmt.Printf("Authorizing %s with Microsoft...\n", email)
+	var err error
+	if o365Graph {
+		mgr := microsoft.NewGraphMailManager(cfg.Microsoft.ClientID, tenant, redirect, cfg.TokensDir(), logger)
+		if mailWrite {
+			mgr = microsoft.NewGraphMailWriteManager(cfg.Microsoft.ClientID, tenant, redirect, cfg.TokensDir(), logger)
+		}
+		if o365Headless {
+			mgr.UseDeviceCode()
+		}
+		err = mgr.Authorize(cmd.Context(), email)
+	} else {
+		mgr := microsoft.NewManager(cfg.Microsoft.ClientID, tenant, redirect, cfg.TokensDir(), logger)
+		if o365Headless {
+			mgr.UseDeviceCode()
+		}
+		if o365SignIn != "" {
+			mgr.UseSignInName(o365SignIn)
+		}
+		err = mgr.Authorize(cmd.Context(), email)
+	}
+	if err != nil {
+		return fmt.Errorf("authorization failed: %w", err)
+	}
+	return nil
+}
+
+// runAddO365GraphLocal creates an msmail source, the Graph mail counterpart of
+// the IMAP source that add-o365 makes by default.
+func runAddO365GraphLocal(cmd *cobra.Command, email string, mailWrite bool) error {
+	state := invocationFromCommand(cmd)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	preflighted, err := oauthPreflighted(cmd)
+	if err != nil {
+		return err
+	}
+	if !preflighted {
+		if err := authorizeO365(cmd, email, mailWrite); err != nil {
+			return err
+		}
+	}
+
+	s, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	source, err := s.GetOrCreateSource(sourceTypeMSMail, email)
+	if err != nil {
+		return fmt.Errorf("create source: %w", err)
+	}
+	if err := updateSourceDisplayNameForRegistration(s, source.ID, email, state.logger); err != nil {
+		return fmt.Errorf("set display name: %w", err)
+	}
+	if err := setDefaultIdentityOptOut(cmd, s, source, noDefaultIdentityAddO365); err != nil {
+		return err
+	}
+	if !noDefaultIdentityAddO365 {
+		confirmDefaultIdentity(cmd.OutOrStdout(), s, source.ID, email, email, "account-identifier", state.logger)
+	}
+	if err := runPostSourceCreateMigrationsForInvocation(s, state); err != nil {
+		return fmt.Errorf("post-source-create migrations: %w", err)
+	}
+
+	fmt.Printf("\nMicrosoft 365 account added for Graph mail sync!\n")
+	fmt.Printf("  Email: %s\n", email)
+	fmt.Println()
+	fmt.Println("You can now run:")
+	fmt.Printf("  msgvault sync %s\n", email)
 	return nil
 }
 

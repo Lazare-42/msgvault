@@ -5,7 +5,8 @@ package main
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"flag"
 	"fmt"
@@ -14,12 +15,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
-	"runtime"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"go.kenn.io/kit/atomicfile"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector/embed"
 )
@@ -67,10 +68,10 @@ type armEvalInput struct {
 }
 
 type armScenarioInput struct {
-	Scenario  Scenario      `json:"scenario"`
-	Judgment  Judgment      `json:"judgment"`
-	Query     []float32     `json:"query_vector"`
-	QueryTime time.Duration `json:"query_time"`
+	Scenario  Scenario  `json:"scenario"`
+	Judgment  Judgment  `json:"judgment"`
+	Query     []float32 `json:"query_vector"`
+	QueryTime int64     `json:"query_time"`
 }
 
 type armEvalOutput struct {
@@ -120,7 +121,7 @@ func runArmEval(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	return json.NewEncoder(os.Stdout).Encode(output)
+	return json.MarshalWrite(os.Stdout, output, json.Deterministic(true))
 }
 
 type commonFlags struct {
@@ -391,7 +392,7 @@ func readJSONFile(path string, target any) error {
 		return err
 	}
 	defer func() { _ = file.Close() }()
-	return json.NewDecoder(file).Decode(target)
+	return json.UnmarshalRead(file, target)
 }
 
 func scaleRunDirectories(base, runID string, scales []int) map[int]string {
@@ -517,7 +518,7 @@ func runPool(args []string) error {
 	}
 	defer func() { _ = file.Close() }()
 	var run evaluationRun
-	if err := json.NewDecoder(file).Decode(&run); err != nil {
+	if err := json.UnmarshalRead(file, &run); err != nil {
 		return err
 	}
 	public, private, err := buildBlindBundle(run)
@@ -565,7 +566,7 @@ func blindPoolHash(corpusHash, queryHash string, pool []pooledScenario) (string,
 		CorpusHash string           `json:"corpus_hash"`
 		QueryHash  string           `json:"query_hash"`
 		Pool       []pooledScenario `json:"pool"`
-	}{corpusHash, queryHash, pool})
+	}{corpusHash, queryHash, pool}, json.Deterministic(true))
 	if err != nil {
 		return "", err
 	}
@@ -706,50 +707,28 @@ func opaqueCandidateHandle(scenarioID, sourceID string) string {
 
 func writeJSON(path string, value any) error {
 	if path == "" || path == "-" {
-		encoder := json.NewEncoder(os.Stdout)
-		encoder.SetIndent("", "  ")
-		return encoder.Encode(value)
+		encoder := jsontext.NewEncoder(os.Stdout, jsontext.WithIndent("  "))
+
+		return json.MarshalEncode(encoder, value, json.Deterministic(true))
 	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	file, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	file, err := atomicfile.Create(path)
 	if err != nil {
+		return fmt.Errorf("stage %s: %w", path, err)
+	}
+	defer func() { _ = file.Abort() }()
+	encoder := jsontext.NewEncoder(file, jsontext.WithIndent("  "))
+
+	if err := json.MarshalEncode(encoder, value, json.Deterministic(true)); err != nil {
 		return err
 	}
-	tempPath := file.Name()
-	committed := false
-	defer func() {
-		_ = file.Close()
-		if !committed {
-			_ = os.Remove(tempPath)
-		}
-	}()
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(value); err != nil {
-		return err
+	if err := file.Commit(); err != nil {
+		return fmt.Errorf("publish %s: %w", path, err)
 	}
-	if err := file.Sync(); err != nil {
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tempPath, path); err != nil {
-		return err
-	}
-	committed = true
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-	directory, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = directory.Close() }()
-	return directory.Sync()
+	return nil
 }
 
 func repositoryCommit() string {

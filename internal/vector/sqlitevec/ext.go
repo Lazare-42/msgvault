@@ -13,6 +13,8 @@ import (
 
 	sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/cgo"
 	sqlite3 "github.com/mattn/go-sqlite3"
+	"go.kenn.io/msgvault/internal/sqliteutil"
+	"go.kenn.io/msgvault/internal/vector/sqlitevec/vec1"
 )
 
 // driverName is the sql.Open driver name exposed by this package.
@@ -46,12 +48,13 @@ var registerOnce sync.Once
 func RegisterExtension() error {
 	registerOnce.Do(func() {
 		sqlite_vec.Auto()
+		vec1.Auto()
 		sql.Register(driverName, &sqlite3.SQLiteDriver{
 			ConnectHook: func(conn *sqlite3.SQLiteConn) error {
 				if _, err := conn.Exec(`PRAGMA foreign_keys = ON`, nil); err != nil {
 					return fmt.Errorf("enable foreign_keys: %w", err)
 				}
-				return nil
+				return sqliteutil.RegisterUnicodeLower(conn)
 			},
 		})
 	})

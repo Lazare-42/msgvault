@@ -2,7 +2,7 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
@@ -28,7 +28,7 @@ var (
 type mboxCheckpoint struct {
 	File   string `json:"file"`
 	Offset int64  `json:"offset"`
-	Seq    int64  `json:"seq,omitempty"`
+	Seq    int64  `json:"seq,omitzero"`
 }
 
 var importMboxCmd = &cobra.Command{
@@ -42,16 +42,30 @@ one or more .mbox files.
 This is useful for email providers that offer an export but no IMAP/POP access.
 The importer stores raw MIME, bodies, recipients, and optional attachments.
 
+For Google Groups Takeout exports, use --source-type google-groups. Group
+labels, topic-state labels, and exported thread IDs are preserved. The identifier
+names the group or archive and is not automatically treated as your identity.
+Membership CSV files and group settings are not imported.
+
 Examples:
   msgvault init-db
   msgvault import-mbox you@example.com /path/to/export.mbox
   msgvault import-mbox you@example.com /path/to/export.zip
+
+  # Google Groups Takeout (MBOX or ZIP)
+  msgvault import-mbox test-group@googlegroups.com takeout.zip --source-type google-groups
 
   # HEY.com export (still MBOX)
   msgvault import-mbox you@hey.com hey-export.zip --source-type hey --label hey
 `,
 	Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		state := invocationFromCommand(cmd)
+		if state == nil || state.cfg == nil {
+			return errors.New("configuration is unavailable")
+		}
+		cfg := state.cfg
+		logger := state.logger
 		if !isDaemonCLISubprocess() {
 			return runDaemonCLICommandHTTPFromCobra(cmd, args)
 		}
@@ -101,7 +115,7 @@ Examples:
 			}
 		}()
 
-		st, cleanup, err := openWritableStoreAndInitForIngest()
+		st, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
 		if err != nil {
 			return err
 		}
@@ -260,6 +274,7 @@ Examples:
 				NoResume:           importMboxNoResume,
 				CheckpointInterval: importMboxCheckpointInterval,
 				AttachmentsDir:     attachmentsDir,
+				RemoteImages:       configuredRemoteImageFetcher(cfg),
 				Logger:             logger,
 			})
 			if err != nil {
@@ -304,9 +319,10 @@ Examples:
 		// ran the migration first and confirmDefaultIdentity later,
 		// which suppressed the source's own account identifier
 		// whenever the legacy [identity] block had populated rows.
-		if ctx.Err() == nil && !hadHardErrors && !noDefaultIdentityImportMbox {
+		// A Google Groups identifier names a shared archive, not its owner.
+		if ctx.Err() == nil && !hadHardErrors && !noDefaultIdentityImportMbox && importMboxSourceType != "google-groups" {
 			if sourceID != 0 {
-				confirmDefaultIdentity(cmd.OutOrStdout(), st, sourceID, identifier, identifier, "account-identifier")
+				confirmDefaultIdentity(cmd.OutOrStdout(), st, sourceID, identifier, identifier, "account-identifier", state.logger)
 			}
 		}
 
@@ -324,7 +340,7 @@ Examples:
 		// tracked in
 		// private/drafts/2026-05-02-issue-import-migration-error-ux.md.
 		if sourceID != 0 {
-			if err := runPostSourceCreateMigrations(st); err != nil {
+			if err := runPostSourceCreateMigrationsForInvocation(st, state); err != nil {
 				return fmt.Errorf("post-source-create migrations: %w", err)
 			}
 		}
@@ -352,7 +368,7 @@ Examples:
 		_, _ = fmt.Fprintf(out, "  Errors:         %d\n", totalErrors)
 		_, _ = fmt.Fprintf(out, "  Bytes:          %.2f MB\n", float64(totalBytes)/(1024*1024))
 
-		cacheErr := rebuildCacheAfterWrite(dbPath)
+		cacheErr := rebuildCacheAfterWrite(dbPath, state)
 
 		if ctx.Err() == nil && hadHardErrors {
 			return errors.Join(fmt.Errorf("import completed with %d errors", totalErrors), cacheErr)
@@ -367,7 +383,7 @@ Examples:
 func init() {
 	rootCmd.AddCommand(importMboxCmd)
 
-	importMboxCmd.Flags().StringVar(&importMboxSourceType, "source-type", "mbox", "Source type to record in the database (e.g. mbox, hey)")
+	importMboxCmd.Flags().StringVar(&importMboxSourceType, "source-type", "mbox", "Source type to record in the database (e.g. mbox, hey, google-groups)")
 	importMboxCmd.Flags().StringSliceVar(&importMboxLabels, "label", nil, "Label(s) to apply to imported messages (repeatable, or comma-separated)")
 	importMboxCmd.Flags().BoolVar(&importMboxNoResume, "no-resume", false, "Do not resume from an interrupted import")
 	importMboxCmd.Flags().IntVar(&importMboxCheckpointInterval, "checkpoint-interval", 200, "Save progress every N messages")

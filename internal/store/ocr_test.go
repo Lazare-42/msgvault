@@ -45,7 +45,7 @@ func TestOCRLifecycleDeduplicatesLeasesAndSearchesPages(t *testing.T) {
 	requirements.NoError(err)
 	assertions.Equal(store.OCRReady, result.Status)
 	assertions.Equal("mixed", result.Method)
-	assertions.Equal(94.0, result.AverageConfidence)
+	assertions.InDelta(94.0, result.AverageConfidence, 0.001)
 	assertions.Equal(pages, result.Pages)
 
 	hits, err := f.Store.SearchOCR(t.Context(), "ORCHID", 20)
@@ -143,7 +143,7 @@ func TestOCRStaleWorkerCannotCompleteReclaimedLease(t *testing.T) {
 	stale, err := f.Store.ClaimOCRJob(t.Context(), "extractor-v1", time.Minute)
 	requirements.NoError(err)
 	requirements.NotNil(stale)
-	_, err = f.Store.DB().ExecContext(t.Context(), `UPDATE attachment_ocr SET lease_expires_at = ? WHERE content_hash = ?`, "2000-01-01 00:00:00", hash)
+	_, err = f.Store.DB().ExecContext(t.Context(), f.Store.Rebind(`UPDATE attachment_ocr SET lease_expires_at = ? WHERE content_hash = ?`), "2000-01-01 00:00:00", hash)
 	requirements.NoError(err)
 	current, err := f.Store.ClaimOCRJob(t.Context(), "extractor-v1", time.Minute)
 	requirements.NoError(err)
@@ -160,17 +160,25 @@ func TestOCRStaleWorkerCannotCompleteReclaimedLease(t *testing.T) {
 	assertions.Equal("current", result.Pages[0].Text)
 }
 
-func TestOCRSearchReportsUnavailableFTS(t *testing.T) {
+func TestOCRSearchWithoutSQLiteFTS(t *testing.T) {
 	f := storetest.New(t)
 	store.SetFTS5AvailableForTest(f.Store, false)
 	_, err := f.Store.SearchOCR(t.Context(), "invoice", 20)
-	require.ErrorIs(t, err, store.ErrOCRSearchUnavailable)
+	if f.Store.IsPostgreSQL() {
+		require.NoError(t, err, "PostgreSQL search does not depend on SQLite FTS5")
+	} else {
+		require.ErrorIs(t, err, store.ErrOCRSearchUnavailable)
+	}
 }
 
 func TestOCRCandidateIndexExists(t *testing.T) {
 	f := storetest.New(t)
 	var name string
-	err := f.Store.DB().QueryRowContext(t.Context(), `SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_attachments_ocr_candidates'`).Scan(&name)
+	query := `SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_attachments_ocr_candidates'`
+	if f.Store.IsPostgreSQL() {
+		query = `SELECT indexname FROM pg_indexes WHERE schemaname = current_schema() AND indexname = 'idx_attachments_ocr_candidates'`
+	}
+	err := f.Store.DB().QueryRowContext(t.Context(), query).Scan(&name)
 	require.NoError(t, err)
 	assert.Equal(t, "idx_attachments_ocr_candidates", name)
 }

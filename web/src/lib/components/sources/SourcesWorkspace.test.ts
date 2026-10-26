@@ -1,8 +1,12 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { tick } from 'svelte';
 
-import { createAPIClient } from '../../api/client';
+import { createCaptureClient } from '../../telemetry/capture.test-support';
+import { formatDateTime } from '../../util/format';
 import SourcesWorkspace from './SourcesWorkspace.svelte';
+
+const createAPIClient = (fetchFn: typeof fetch) => createCaptureClient(fetchFn, []);
 
 function source(overrides: Record<string, unknown> = {}) {
   return {
@@ -17,14 +21,164 @@ function run(status: string, processed: number, overrides: Record<string, unknow
   return {
     id: 9, source_id: 1, started_at: '2026-07-19T10:00:00Z', completed_at: null,
     status, messages_processed: processed, messages_added: processed,
-    messages_updated: 0, errors_count: 0, error_message: null,
-    cursor_before: null, cursor_after: null, ...overrides
+    messages_updated: 0, errors_count: 0, error_message: null, ...overrides
   };
 }
 
-afterEach(() => vi.useRealTimers());
+const NOT_OBSERVED = "The sync was requested, but it hasn't started yet. Refresh to check again.";
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+});
 
 describe('SourcesWorkspace', () => {
+  it('reports each rejected click despite an unchanged stored run', async () => {
+    const events: unknown[] = [];
+    const client = createCaptureClient(async input => (input as Request).method === 'POST'
+      ? Response.json({ message: 'Credentials unavailable' }, { status: 500 })
+      : Response.json({ sources: [source({ latest_sync: run('failed', 0) })] }), events);
+    render(SourcesWorkspace, { client });
+    await screen.findByText('Failed');
+    expect(events).toEqual([]);
+    for (const count of [1, 2]) {
+      await fireEvent.click(screen.getByRole('button', { name: 'Sync now Archive' }));
+      await screen.findByText('Credentials unavailable');
+      await waitFor(() => expect(events).toHaveLength(count));
+    }
+    expect(events).toEqual(Array(2).fill({ event: 'error_shown', properties: { surface: 'web', kind: 'sync' } }));
+  });
+
+  it('shows a scheduler handoff as queued without concealing a real failure', async () => {
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json({ sources: [
+      source({ display_name: 'Resuming archive', scheduled: true, scheduler_queued: true,
+        can_sync: false, sync_unavailable_reason: 'sync_already_running', latest_sync: run('cancelled', 5) }),
+      source({ id: 2, display_name: 'Broken archive', scheduled: true, scheduler_queued: true,
+        can_sync: false, sync_unavailable_reason: 'sync_already_running',
+        latest_sync: run('failed', 0, { errors_count: 1, error_message: 'Channel unavailable' }) })
+    ] }));
+    render(SourcesWorkspace, { client: createAPIClient(fetchFn) });
+    expect(await screen.findByText('Queued')).toBeDefined();
+    expect(screen.getByText('Failed')).toBeDefined();
+    expect(screen.getAllByText('Sync queued')).toHaveLength(2);
+    expect(screen.queryByText('Sync in progress')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Show details for Resuming archive' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Show details for Broken archive' })).toBeDefined();
+  });
+
+  it('opens source-sync history from Sync history', async () => {
+    const onOpenOperations = vi.fn();
+    render(SourcesWorkspace, {
+      client: createAPIClient(vi.fn<typeof fetch>(async () => Response.json({ sources: [] }))),
+      onOpenOperations
+    });
+    await fireEvent.click(screen.getByRole('button', { name: 'Sync history' }));
+    expect(onOpenOperations).toHaveBeenCalledOnce();
+  });
+
+  it('shows a readable type and a muted reason with the raw code in its tooltip', async () => {
+    const unavailable = (id: number, identifier: string, display_name: string, reason: string, extra = {}) =>
+      source({ id, identifier, display_name, can_sync: false, sync_unavailable_reason: reason, ...extra });
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json({ sources: [
+      unavailable(1, 'import@example.com', 'Imported', 'source_not_schedulable', { source_type: 'mbox' }),
+      unavailable(2, 'busy@example.com', 'Busy', 'sync_already_running'),
+      unavailable(3, 'down@example.com', 'Down', 'scheduler_unavailable'),
+      unavailable(4, 'unset@example.com', 'Unset', 'sync_not_configured'),
+      unavailable(5, 'other@example.com', 'Other', 'future_reason')
+    ] }));
+    render(SourcesWorkspace, { client: createAPIClient(fetchFn) });
+
+    expect(await screen.findByText('Mbox import · import@example.com')).toBeDefined();
+    for (const [text, code] of [
+      ['Imported file — nothing to sync', 'source_not_schedulable'],
+      ['Sync in progress', 'sync_already_running'],
+      ['Scheduler unavailable', 'scheduler_unavailable'],
+      ['Sync not set up', 'sync_not_configured'],
+      ['Sync unavailable', 'future_reason']
+    ]) {
+      expect(screen.getByText(text).getAttribute('title')).toBe(code);
+    }
+    expect(screen.queryByText('source_not_schedulable')).toBeNull();
+    expect(screen.getByRole('columnheader', { name: 'Status' })).toBeDefined();
+  });
+
+  it('shows one status chip per latest result', async () => {
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json({ sources: [
+      source({ id: 1, display_name: 'Active', active_sync: run('running', 5) }),
+      source({ id: 2, identifier: 'b@example.com', display_name: 'Done',
+        latest_sync: run('completed', 3, { completed_at: '2026-07-19T11:00:00Z' }) }),
+      source({ id: 3, identifier: 'c@example.com', display_name: 'Partial',
+        latest_sync: run('completed', 3, { errors_count: 2 }) }),
+      source({ id: 4, identifier: 'd@example.com', display_name: 'Broken', latest_sync: run('failed', 0) }),
+      source({ id: 5, identifier: 'e@example.com', display_name: 'New' })
+    ] }));
+    render(SourcesWorkspace, {
+      client: createAPIClient(fetchFn), now: () => new Date('2026-07-19T12:00:00Z')
+    });
+
+    expect(await screen.findByText('Syncing')).toBeDefined();
+    expect(screen.getByText('5 processed')).toBeDefined();
+    for (const label of ['Completed', 'Completed with errors', 'Failed', 'Never synced']) {
+      expect(screen.getByText(label)).toBeDefined();
+    }
+  });
+
+  it('expands error details only for rows that have them', async () => {
+    const failed = run('failed', 10, {
+      completed_at: '2026-07-19T11:30:00Z', error_message: 'Mailbox unavailable', errors_count: 1,
+      item_errors: [{ source_message_id: 'm-1', phase: 'ingest', error_kind: 'mime_error',
+        error_message: 'Malformed MIME header', created_at: '2026-07-19T11:30:00Z' }]
+    });
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json({ sources: [
+      source({ display_name: 'Archive', latest_sync: failed, scheduler_last_error: 'Lock timeout' }),
+      source({ id: 2, identifier: 'clean@example.com', display_name: 'Clean', latest_sync: run('completed', 1) })
+    ] }));
+    render(SourcesWorkspace, {
+      client: createAPIClient(fetchFn), now: () => new Date('2026-07-19T12:00:00Z')
+    });
+
+    const toggle = await screen.findByRole('button', { name: 'Show details for Archive' });
+    expect(screen.queryByRole('button', { name: 'Show details for Clean' })).toBeNull();
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByText('Malformed MIME header')).toBeNull();
+    await fireEvent.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByText('Mailbox unavailable')).toBeDefined();
+    expect(screen.getByText('Scheduler: Lock timeout')).toBeDefined();
+    expect(screen.getByText('1 item error')).toBeDefined();
+    expect(screen.getByText('Malformed MIME header')).toBeDefined();
+    await fireEvent.click(toggle);
+    expect(screen.queryByText('Malformed MIME header')).toBeNull();
+  });
+
+  it('drops an open detail row when a refresh clears the errors', async () => {
+    const failed = run('failed', 1, { completed_at: '2026-07-19T11:30:00Z', error_message: 'Mailbox unavailable' });
+    let current = source({ latest_sync: failed });
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json({ sources: [current] }));
+    const { container } = render(SourcesWorkspace, {
+      client: createAPIClient(fetchFn), now: () => new Date('2026-07-19T12:00:00Z')
+    });
+    await fireEvent.click(await screen.findByRole('button', { name: 'Show details for Archive' }));
+    expect(screen.getByText('Mailbox unavailable')).toBeDefined();
+
+    current = source({ latest_sync: run('completed', 1, { completed_at: '2026-07-19T11:45:00Z' }) });
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    await waitFor(() => expect(screen.queryByText('Mailbox unavailable')).toBeNull());
+    expect(screen.queryByRole('button', { name: 'Show details for Archive' })).toBeNull();
+    expect(container.querySelector('#source-1-details')).toBeNull();
+  });
+
+  it('keeps the cron text in the schedule tooltip only', async () => {
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json({ sources: [source({
+      scheduled: true, schedule: '0 */6 * * *', next_sync_at: '2026-07-19T18:00:00Z'
+    })] }));
+    render(SourcesWorkspace, { client: createAPIClient(fetchFn) });
+    const summary = await screen.findByText('At :00 past every 6th hour');
+    expect(summary.getAttribute('title')).toBe('0 */6 * * *');
+    expect(screen.queryByText('0 */6 * * *')).toBeNull();
+  });
+
   it('shows status and only exposes Sync now from server capability truth', async () => {
     const fetchFn = vi.fn<typeof fetch>(async () => Response.json({ sources: [
       source(),
@@ -38,10 +192,11 @@ describe('SourcesWorkspace', () => {
     expect(screen.getByRole('columnheader', { name: 'Last successful sync' })).toBeDefined();
     expect(screen.getByRole('button', { name: 'Sync now Archive' })).toBeDefined();
     expect(screen.queryByRole('button', { name: 'Sync now readonly@example.com' })).toBeNull();
-    expect(screen.getByText('sync_not_configured')).toBeDefined();
+    expect(screen.getByText('Sync not set up')).toBeDefined();
     expect(screen.getAllByText('Not scheduled')).toHaveLength(2);
-    expect(screen.getAllByText('No prior sync result')).toHaveLength(2);
-    expect(screen.getAllByTitle('2026-07-19T10:00:00Z')).toHaveLength(2);
+    expect(screen.getAllByText('Never synced')).toHaveLength(2);
+    expect(screen.getAllByTitle(formatDateTime('2026-07-19T10:00:00Z', 'long'))).toHaveLength(2);
+    expect(screen.queryAllByTitle('2026-07-19T10:00:00Z')).toHaveLength(0);
   });
 
   it('presents generic meeting imports as on-demand API sources', async () => {
@@ -77,11 +232,24 @@ describe('SourcesWorkspace', () => {
       client: createAPIClient(fetchFn), now: () => new Date('2026-07-19T12:00:00Z')
     });
 
-    expect(await screen.findByText('0 */6 * * *')).toBeDefined();
-    expect(screen.getByTitle('2026-07-19T18:00:00Z')).toBeDefined();
-    expect(screen.queryByText('stale_last_result')).toBeNull();
+    expect(await screen.findByText('At :00 past every 6th hour')).toBeDefined();
+    expect(screen.getByTitle(formatDateTime('2026-07-19T18:00:00Z', 'long'))).toBeDefined();
+    expect(screen.getByTitle(formatDateTime('2026-07-19T11:30:00Z', 'long'))).toBeDefined();
+    expect(screen.queryByTitle(/T\d\d:\d\d:\d\dZ$/)).toBeNull();
+    expect(screen.queryByText('This result may be out of date.')).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Show details for Archive' }));
     expect(screen.getByText('1 item error')).toBeDefined();
     expect(screen.getByText('Malformed MIME header')).toBeDefined();
+  });
+
+  it('shows the last successful sync with a readable full date in its tooltip', async () => {
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json({ sources: [source({
+      last_successful_sync: run('completed', 4, { completed_at: '2026-07-18T08:15:00Z' })
+    })] }));
+    render(SourcesWorkspace, { client: createAPIClient(fetchFn) });
+
+    expect(await screen.findByTitle(formatDateTime('2026-07-18T08:15:00Z', 'long'))).toBeDefined();
+    expect(screen.queryByTitle('2026-07-18T08:15:00Z')).toBeNull();
   });
 
   it('names a terminal result older than the documented threshold as stale', async () => {
@@ -92,7 +260,7 @@ describe('SourcesWorkspace', () => {
       client: createAPIClient(fetchFn), now: () => new Date('2026-07-19T12:00:00Z')
     });
 
-    expect(await screen.findByText('stale_last_result')).toBeDefined();
+    expect(await screen.findByText('This result may be out of date.')).toBeDefined();
   });
 
   it('keeps polling through idle status races until the accepted run appears and completes', async () => {
@@ -154,7 +322,7 @@ describe('SourcesWorkspace', () => {
     await screen.findByText('5 processed');
     await vi.advanceTimersByTimeAsync(500);
     await waitFor(() => expect(statusReads).toBe(2));
-    expect(screen.getByText('sync_already_running')).toBeDefined();
+    expect(screen.getByText('Sync in progress')).toBeDefined();
     expect(screen.queryByRole('button', { name: 'Sync now Archive' })).toBeNull();
 
     // Polling continues (with backoff) while the lock is held...
@@ -195,7 +363,7 @@ describe('SourcesWorkspace', () => {
 
     expect(screen.getByText('Completed')).toBeDefined();
     await waitFor(() => expect(screen.queryByText('Awaiting accepted sync run…')).toBeNull());
-    expect(screen.queryByText('sync_start_not_observed')).toBeNull();
+    expect(screen.queryByText(NOT_OBSERVED)).toBeNull();
     rendered.unmount();
   });
 
@@ -216,7 +384,7 @@ describe('SourcesWorkspace', () => {
     await vi.advanceTimersByTimeAsync(500);
     await vi.advanceTimersByTimeAsync(1_000);
 
-    expect(await screen.findByText('sync_start_not_observed')).toBeDefined();
+    expect(await screen.findByText(NOT_OBSERVED)).toBeDefined();
     expect(reads).toBe(4);
     await vi.advanceTimersByTimeAsync(8_000);
     expect(reads).toBe(4);
@@ -261,25 +429,84 @@ describe('SourcesWorkspace', () => {
     rendered.unmount();
   });
 
-  it('retries an idle status failure without an active sync or an awaited accepted run', async () => {
+  it('releases Sync now buttons after a timeout and refreshes status without retriggering', async () => {
+    let statusReads = 0;
+    let triggers = 0;
+    const fetchFn = vi.fn<typeof fetch>((input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      if (request.method === 'POST') {
+        triggers += 1;
+        return new Promise<Response>((_resolve, reject) => {
+          request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true });
+        });
+      }
+      statusReads += 1;
+      return Promise.resolve(Response.json({ sources: [
+        source(statusReads === 1 ? {} : {
+          can_sync: false, sync_unavailable_reason: 'sync_already_running', active_sync: run('running', 5)
+        }),
+        source({ id: 2, identifier: 'other@example.com', display_name: 'Other' })
+      ] }));
+    });
+    const rendered = render(SourcesWorkspace, {
+      client: createAPIClient(fetchFn), requestTimeoutMs: 20
+    });
+
+    const archiveButton = await screen.findByRole<HTMLButtonElement>('button', { name: 'Sync now Archive' });
+    const otherButton = screen.getByRole<HTMLButtonElement>('button', { name: 'Sync now Other' });
+    await fireEvent.click(archiveButton);
+    expect(archiveButton.disabled).toBe(true);
+    expect(otherButton.disabled).toBe(true);
+    expect((await screen.findByRole('alert')).textContent).toMatch(/timed out/i);
+    expect(archiveButton.disabled).toBe(false);
+    expect(otherButton.disabled).toBe(false);
+    await fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(await screen.findByText('5 processed')).toBeDefined();
+    expect(screen.queryByRole('button', { name: 'Sync now Archive' })).toBeNull();
+    expect(triggers).toBe(1);
+    rendered.unmount();
+  });
+
+  it('holds a first-load error until manual Retry', async () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     let reads = 0;
+    const events: unknown[] = [], requests: Promise<void>[] = [];
     const fetchFn = vi.fn<typeof fetch>(async () => {
       reads += 1;
       if (reads === 1) throw new Error('status endpoint unreachable');
       return Response.json({ sources: [source()] });
     });
-    const rendered = render(SourcesWorkspace, { client: createAPIClient(fetchFn) });
+    const rendered = render(SourcesWorkspace, { client: createCaptureClient(fetchFn, events, requests) });
 
     expect((await screen.findByRole('alert')).textContent).toContain('status endpoint unreachable');
     expect(reads).toBe(1);
+    await tick();
+    await Promise.all(requests);
+    expect(events).toEqual([]);
 
-    // No source is syncing and no accepted run is awaited, so this retry
-    // relies on the error path bypassing the active-sync gate.
-    await vi.advanceTimersByTimeAsync(500);
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(reads).toBe(1);
+    await fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
     await waitFor(() => expect(reads).toBe(2));
     expect(await screen.findByText('Archive')).toBeDefined();
     expect(screen.queryByRole('alert')).toBeNull();
+    rendered.unmount();
+  });
+
+  it('holds a first-load response processing error until manual Retry', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let reads = 0;
+    const fetchFn = vi.fn<typeof fetch>(async () => {
+      reads += 1;
+      return Response.json(reads === 1 ? { sources: {} } : { sources: [source()] });
+    });
+    const rendered = render(SourcesWorkspace, { client: createAPIClient(fetchFn) });
+
+    expect(await screen.findByRole('alert')).toBeDefined();
+    await vi.advanceTimersByTimeAsync(8_000);
+    expect(reads).toBe(1);
+    await fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(await screen.findByText('Archive')).toBeDefined();
     rendered.unmount();
   });
 
@@ -336,5 +563,223 @@ describe('SourcesWorkspace', () => {
     rendered.unmount();
 
     expect(signals[1]!.aborted).toBe(true);
+  });
+
+  it('aborts a stalled first status load and offers Retry', async () => {
+    const signals: AbortSignal[] = [];
+    const fetchFn = vi.fn<typeof fetch>((input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      signals.push(request.signal);
+      if (signals.length > 1) return Promise.resolve(Response.json({ sources: [source()] }));
+      return new Promise<Response>((_resolve, reject) => {
+        request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true });
+      });
+    });
+    const rendered = render(SourcesWorkspace, {
+      client: createAPIClient(fetchFn), requestTimeoutMs: 20
+    });
+
+    expect((await screen.findByRole('alert')).textContent).toMatch(/timed out/i);
+    expect(signals[0]!.aborted).toBe(true);
+    expect(screen.queryByText('Loading source status…')).toBeNull();
+    await fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    expect(await screen.findByText('Archive')).toBeDefined();
+    rendered.unmount();
+  });
+
+  it('defers loading in a hidden tab and bounds the visible reload', async () => {
+    const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+    const fetchFn = vi.fn<typeof fetch>((input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      return new Promise<Response>((_resolve, reject) => {
+        request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true });
+      });
+    });
+    const rendered = render(SourcesWorkspace, { client: createAPIClient(fetchFn), requestTimeoutMs: 20 });
+
+    expect(screen.queryByText('Loading source status…')).toBeNull();
+    expect(fetchFn).not.toHaveBeenCalled();
+    hidden.mockReturnValue(false);
+    document.dispatchEvent(new Event('visibilitychange'));
+    expect((await screen.findByRole('alert')).textContent).toMatch(/timed out/i);
+    expect(fetchFn).toHaveBeenCalledOnce();
+    rendered.unmount();
+  });
+
+  it('bounds a later status poll after the first load succeeds', async () => {
+    let reads = 0;
+    const fetchFn = vi.fn<typeof fetch>((input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      reads += 1;
+      if (reads === 1) return Promise.resolve(Response.json({ sources: [source({
+        can_sync: false, sync_unavailable_reason: 'sync_already_running', active_sync: run('running', 1)
+      })] }));
+      return new Promise<Response>((_resolve, reject) => {
+        request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true });
+      });
+    });
+    const rendered = render(SourcesWorkspace, {
+      client: createAPIClient(fetchFn), requestTimeoutMs: 20
+    });
+
+    expect(await screen.findByText('1 processed')).toBeDefined();
+    expect((await screen.findByRole('alert')).textContent).toMatch(/timed out/i);
+    expect(reads).toBe(2);
+    rendered.unmount();
+  });
+
+  it('resumes bounded polling after an active-sync status timeout', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let reads = 0;
+    let timedOutSignal: AbortSignal | undefined;
+    const fetchFn = vi.fn<typeof fetch>((input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      reads += 1;
+      if (reads === 2) {
+        timedOutSignal = request.signal;
+        return new Promise<Response>((_resolve, reject) => {
+          request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true });
+        });
+      }
+      if (reads === 1) return Promise.resolve(Response.json({ sources: [source({
+        can_sync: false, sync_unavailable_reason: 'sync_already_running', active_sync: run('running', 1)
+      })] }));
+      return Promise.resolve(Response.json({ sources: [source({
+        latest_sync: run('completed', 3, { completed_at: '2026-07-19T10:01:00Z' })
+      })] }));
+    });
+    const rendered = render(SourcesWorkspace, {
+      client: createAPIClient(fetchFn), requestTimeoutMs: 20
+    });
+
+    expect(await screen.findByText('1 processed')).toBeDefined();
+    await vi.advanceTimersByTimeAsync(10_000);
+    await waitFor(() => expect(timedOutSignal?.aborted).toBe(true));
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(reads).toBe(3);
+    expect(screen.queryByRole('alert')).toBeNull();
+    rendered.unmount();
+  });
+
+  it('keeps a newer load pending when an obsolete request settles', async () => {
+    let resolveOld: ((value: Response) => void) | undefined;
+    let resolveNew: ((value: Response) => void) | undefined;
+    const fetchFn = vi.fn<typeof fetch>(() => new Promise<Response>((resolve) => {
+      if (!resolveOld) resolveOld = resolve;
+      else resolveNew = resolve;
+    }));
+    const rendered = render(SourcesWorkspace, { client: createAPIClient(fetchFn) });
+    await waitFor(() => expect(fetchFn).toHaveBeenCalledOnce());
+
+    const hidden = vi.spyOn(document, 'hidden', 'get').mockReturnValue(true);
+    document.dispatchEvent(new Event('visibilitychange'));
+    hidden.mockReturnValue(false);
+    document.dispatchEvent(new Event('visibilitychange'));
+    await waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(2));
+    resolveOld!(Response.json({ sources: [source({ display_name: 'Obsolete' })] }));
+    await Promise.resolve();
+    expect(screen.getByText('Loading source status…')).toBeDefined();
+    expect(screen.queryByText('Obsolete')).toBeNull();
+
+    resolveNew!(Response.json({ sources: [source()] }));
+    expect(await screen.findByText('Archive')).toBeDefined();
+    rendered.unmount();
+  });
+
+  it('caps lock-hold polling and offers a manual refresh', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let reads = 0;
+    const held = source({ can_sync: false, sync_unavailable_reason: 'sync_already_running' });
+    const fetchFn = vi.fn<typeof fetch>(async () => {
+      reads += 1;
+      return Response.json({ sources: [held] });
+    });
+    const rendered = render(SourcesWorkspace, {
+      client: createAPIClient(fetchFn), maxLockHoldPolls: 3
+    });
+
+    await screen.findByText('Sync in progress');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(reads).toBe(4);
+    expect(screen.getByText(/Automatic refresh paused/)).toBeDefined();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(reads).toBe(4);
+    await fireEvent.click(screen.getByRole('button', { name: 'Refresh' }));
+    expect(reads).toBe(5);
+    rendered.unmount();
+  });
+
+  it('resets the lock-hold poll budget after a real active sync appears', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let reads = 0;
+    const held = source({ can_sync: false, sync_unavailable_reason: 'sync_already_running' });
+    const fetchFn = vi.fn<typeof fetch>(async () => {
+      reads += 1;
+      if (reads === 3) return Response.json({ sources: [source({
+        can_sync: false, sync_unavailable_reason: 'sync_already_running', active_sync: run('running', 1)
+      })] });
+      return Response.json({ sources: [held] });
+    });
+    const rendered = render(SourcesWorkspace, {
+      client: createAPIClient(fetchFn), maxLockHoldPolls: 2
+    });
+
+    await screen.findByText('Sync in progress');
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(reads).toBe(6);
+    expect(screen.getByText(/Automatic refresh paused/)).toBeDefined();
+    rendered.unmount();
+  });
+
+  it('does not bypass the lock-poll cap after a status error', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let reads = 0;
+    const fetchFn = vi.fn<typeof fetch>(async () => {
+      reads += 1;
+      if (reads === 1) return Response.json({ sources: [source({
+        can_sync: false, sync_unavailable_reason: 'sync_already_running'
+      })] });
+      throw new Error('status unavailable');
+    });
+    const rendered = render(SourcesWorkspace, {
+      client: createAPIClient(fetchFn), maxLockHoldPolls: 1
+    });
+
+    expect(await screen.findByText('Sync in progress')).toBeDefined();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(reads).toBe(2);
+    expect(screen.getByRole('alert').textContent).toContain('status unavailable');
+    rendered.unmount();
+  });
+
+  it('counts timed-out lock-hold retries toward the poll cap', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let reads = 0;
+    const timedOutSignals: AbortSignal[] = [];
+    const fetchFn = vi.fn<typeof fetch>((input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      reads += 1;
+      if (reads === 1) return Promise.resolve(Response.json({ sources: [source({
+        can_sync: false, sync_unavailable_reason: 'sync_already_running'
+      })] }));
+      timedOutSignals.push(request.signal);
+      return new Promise<Response>((_resolve, reject) => {
+        request.signal.addEventListener('abort', () => reject(request.signal.reason), { once: true });
+      });
+    });
+    const rendered = render(SourcesWorkspace, {
+      client: createAPIClient(fetchFn), requestTimeoutMs: 20, maxLockHoldPolls: 3
+    });
+
+    expect(await screen.findByText('Sync in progress')).toBeDefined();
+    for (let expectedReads = 2; expectedReads <= 4; expectedReads += 1) {
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(reads).toBe(expectedReads);
+      await waitFor(() => expect(timedOutSignals[expectedReads - 2]?.aborted).toBe(true));
+    }
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(reads).toBe(4);
+    expect(screen.getByText(/Automatic refresh paused/)).toBeDefined();
+    rendered.unmount();
   });
 });

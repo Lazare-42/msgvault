@@ -1,9 +1,12 @@
 ---
+last_edited: "2026-09-27"
 title: SQL Queries
-description: Run arbitrary SQL against your archived email using DuckDB.
+description: Run read-only DuckDB queries against the analytics cache.
 ---
 
-The `msgvault query` command lets you run SQL directly against your archive's Parquet analytics cache using an in-memory DuckDB engine. This gives you full SQL expressiveness for ad-hoc analysis, custom reports, and data exploration beyond what the built-in analytics commands provide.
+Use `msgvault query` for ad-hoc analysis across email, chat, calendar, and
+meeting data in the Parquet analytics cache. The daemon runs one read-only
+DuckDB statement. It rejects writes, session changes, and multiple statements.
 
 ## Basic Usage
 
@@ -11,7 +14,17 @@ The `msgvault query` command lets you run SQL directly against your archive's Pa
 msgvault query "SELECT count(*) AS total FROM messages"
 ```
 
-The command takes a single argument: the SQL string. If the analytics cache is stale, it is automatically rebuilt before the query runs (progress is printed to stderr).
+The command takes a single argument: the SQL string. A usable stale cache stays
+queryable. The JSON result reports the committed publication time and, when
+known, why the cache is stale and how many additions are pending. CSV and table
+output print that cache information to stderr.
+
+`msgvault query --fresh "SELECT 1"` waits for a freshness check and any required
+rebuild, then returns rows. This includes archive writes committed before the
+request. If a build is already running, the daemon queues a follow-up check.
+With automatic builds enabled, a missing or incompatible cache also starts
+recovery. In either case the command reports the job ID on stderr and waits;
+a failed build or interrupted wait exits with an error.
 
 ## Output Formats
 
@@ -30,7 +43,7 @@ msgvault query --format table "SELECT from_email, message_count FROM v_senders L
 
 | Format | Description |
 |---|---|
-| `json` | JSON object with `columns`, `rows`, and `row_count` fields (default) |
+| `json` | JSON object with `columns`, `rows`, `row_count`, and optional `cache` metadata (default) |
 | `csv` | Standard CSV with a header row |
 | `table` | Aligned text table with separator line and `(N rows)` footer |
 
@@ -44,12 +57,32 @@ These map directly to the Parquet files in `~/.msgvault/analytics/`.
 |---|---|
 | `messages` | id, source_id, source_message_id, conversation_id, subject, snippet, sent_at, size_estimate, has_attachments, attachment_count, sender_id, message_type, year, month, deleted_from_source_at |
 | `participants` | id, email_address, domain, display_name, phone_number |
-| `message_recipients` | message_id, participant_id, recipient_type (from/to/cc/bcc), display_name |
+| `message_recipients` | message_id, participant_id, recipient_type (from/to/cc/bcc), display_name, email_address, envelope_address |
 | `labels` | id, name |
 | `message_labels` | message_id, label_id |
 | `attachments` | message_id, filename, size |
 | `conversations` | id, source_conversation_id, title, conversation_type |
 | `sources` | id, source_type |
+
+`messages.rfc822_message_id` is NULL when the stored identifier contains invalid
+UTF-8. The archive retains the original bytes; `repair-encoding` reports these
+IDs without rewriting them. See the [encoding repair limits](../cli-reference.md#repair-encoding).
+
+`message_recipients.email_address` is the recipient's address: the address
+written in the message header when one was recorded, otherwise the
+participant's current address. It is NULL for participants without an
+email address, such as phone-number contacts, and for addresses whose
+stored bytes are invalid UTF-8. `envelope_address` is the header
+address exactly as written, NULL when none was recorded (chat and
+calendar rows, mail imported before v0.19.0), and NULL when its stored
+bytes are invalid UTF-8. A recorded envelope is authoritative even when
+damaged: the participant's current address is never substituted for it,
+so `email_address` stays NULL instead. Damaged addresses export as
+unknown rather than as a repaired value, so a broken byte sequence
+cannot be mistaken for a different real address. `msgvault repair-encoding`
+does not repair recorded envelope addresses. They need separate recovery
+from verified original values before `msgvault build-cache --full-rebuild`
+can include them. See the [encoding repair limits](../cli-reference.md#repair-encoding).
 
 ### Convenience views
 
@@ -138,10 +171,10 @@ msgvault query --format table "
 "
 ```
 
-Known values are `email`, `calendar_event`, `meeting_transcript`, `beeper`,
-`teams`, `discord`, `sms`, `mms`, `whatsapp`, `imessage`, `fbmessenger`,
-`synctech_sms_call`, `google_voice_text`, `google_voice_call`, and
-`google_voice_voicemail`.
+Known values are `email`, `google_chat`, `calendar_event`,
+`meeting_transcript`, `beeper`, `chatwoot`, `teams`, `discord`, `slack`, `sms`, `mms`,
+`rcs`, `whatsapp`, `imessage`, `fbmessenger`, `synctech_sms_call`,
+`google_voice_text`, `google_voice_call`, and `google_voice_voicemail`.
 
 ### Label statistics
 
@@ -210,7 +243,13 @@ msgvault query "
 
 **Partition pruning.** The `messages` view is hive-partitioned by year. Adding `WHERE year = 2024` to queries on `messages` lets DuckDB skip irrelevant Parquet files, which speeds up queries on large archives.
 
-**Auto-cache rebuild.** If the analytics cache is stale or missing, `msgvault query` rebuilds it automatically before running your SQL. The rebuild progress prints to stderr, so it does not interfere with piping query output.
+**Cache freshness.** A usable stale publication serves queries during
+`min_rebuild_interval`. Once that interval expires, a query can schedule a
+background freshness check and refresh. Set `auto_build_cache = false` to
+disable automatic builds; `--fresh` still requests one explicitly. A query
+waits for the build when `--fresh` is set or no usable cache exists. Deleted
+messages can remain in the published cache until it refreshes; see the
+[cache freshness policy](../configuration.md#analytics).
 
 **Pipe-friendly.** JSON and CSV output modes are designed for piping into other tools (`jq`, `csvkit`, `xsv`, etc.). Use `--format csv` for spreadsheet workflows or `--format json` for programmatic consumption.
 
@@ -218,4 +257,4 @@ msgvault query "
 
 ## See Also
 
-For pre-built analytics commands (top senders, domains, labels, overall stats), see [Analytics & Stats](/usage/analytics/). The `query` command is for when you need more flexibility than those commands provide.
+For pre-built analytics commands (top senders, domains, labels, overall stats), see [Analytics & Stats](/docs/usage/analytics/). The `query` command is for when you need more flexibility than those commands provide.

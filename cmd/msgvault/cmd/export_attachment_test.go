@@ -1,10 +1,12 @@
 package cmd
 
 import (
-	"context"
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -116,6 +118,9 @@ func TestExportAttachmentBinaryDownloadPreservesExistingFileOnCloseError(t *test
 }
 
 func TestExportAttachmentUsesLocalDaemonHTTPAndPreservesFileOutput(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	require := require.New(t)
 	assert := assert.New(t)
 	dataDir := t.TempDir()
@@ -142,7 +147,10 @@ func TestExportAttachmentUsesLocalDaemonHTTPAndPreservesFileOutput(t *testing.T)
 		Data:    config.DataConfig{DataDir: dataDir},
 		Remote:  config.RemoteConfig{URL: "http://configured-daemonclient.invalid"},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	useLocal = true
+	invocationFromContext(testCtx).options.useLocal = true
 	t.Chdir(dataDir)
 	exportAttachmentOutput = "attachment.bin"
 	exportAttachmentJSON = false
@@ -150,7 +158,8 @@ func TestExportAttachmentUsesLocalDaemonHTTPAndPreservesFileOutput(t *testing.T)
 
 	doneErr := captureStderr(t)
 	cmd := &cobra.Command{Use: "export-attachment"}
-	cmd.SetContext(context.Background())
+	cmd.SetContext(testCtx)
+	cmd.SetContext(testCtx)
 
 	err := runExportAttachment(cmd, []string{contentHash})
 	stderr := doneErr()
@@ -166,6 +175,9 @@ func TestExportAttachmentUsesLocalDaemonHTTPAndPreservesFileOutput(t *testing.T)
 }
 
 func TestExportAttachmentUsesLocalDaemonHTTPAndPreservesJSONOutput(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	require := require.New(t)
 	assert := assert.New(t)
 	dataDir := t.TempDir()
@@ -192,14 +204,18 @@ func TestExportAttachmentUsesLocalDaemonHTTPAndPreservesJSONOutput(t *testing.T)
 		Data:    config.DataConfig{DataDir: dataDir},
 		Remote:  config.RemoteConfig{URL: "http://configured-daemonclient.invalid"},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	useLocal = true
+	invocationFromContext(testCtx).options.useLocal = true
 	exportAttachmentOutput = ""
 	exportAttachmentJSON = true
 	exportAttachmentBase64 = false
 
 	done := captureStdout(t)
 	cmd := &cobra.Command{Use: "export-attachment"}
-	cmd.SetContext(context.Background())
+	cmd.SetContext(testCtx)
+	cmd.SetContext(testCtx)
 
 	err := runExportAttachment(cmd, []string{contentHash})
 	out := done()
@@ -207,17 +223,13 @@ func TestExportAttachmentUsesLocalDaemonHTTPAndPreservesJSONOutput(t *testing.T)
 
 	var result map[string]any
 	require.NoError(json.Unmarshal([]byte(out), &result), "decode JSON")
-	assert.Equal(contentHash, result["content_hash"], "content_hash")
-	assert.InDelta(float64(len(wantData)), result["size"], 0, "size")
-	dataB64, ok := result["data_base64"].(string)
-	require.True(ok, "data_base64 is string")
-	got, err := base64.StdEncoding.DecodeString(dataB64)
-	require.NoError(err, "decode base64")
-	assert.Equal(wantData, got, "decoded data")
 	assert.Equal(1, int(attachmentRequests.Load()), "attachment endpoint calls")
 }
 
 func TestExportAttachmentUsesLocalDaemonHTTPAndPreservesBase64Output(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	require := require.New(t)
 	assert := assert.New(t)
 	dataDir := t.TempDir()
@@ -244,14 +256,18 @@ func TestExportAttachmentUsesLocalDaemonHTTPAndPreservesBase64Output(t *testing.
 		Data:    config.DataConfig{DataDir: dataDir},
 		Remote:  config.RemoteConfig{URL: "http://configured-daemonclient.invalid"},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	useLocal = true
+	invocationFromContext(testCtx).options.useLocal = true
 	exportAttachmentOutput = ""
 	exportAttachmentJSON = false
 	exportAttachmentBase64 = true
 
 	done := captureStdout(t)
 	cmd := &cobra.Command{Use: "export-attachment"}
-	cmd.SetContext(context.Background())
+	cmd.SetContext(testCtx)
+	cmd.SetContext(testCtx)
 
 	err := runExportAttachment(cmd, []string{contentHash})
 	out := done()
@@ -344,4 +360,19 @@ func TestExportAttachment_HashValidation(t *testing.T) {
 			assert.ErrorContains(t, err, "invalid content hash")
 		})
 	}
+}
+
+func TestExportAttachmentStreamAsJSONMatchesEncoderLayout(t *testing.T) {
+	data := []byte("daemon attachment content")
+	done := captureStdout(t)
+	err := exportAttachmentStreamAsJSON(bytes.NewReader(data), "abc123")
+	out := done()
+	require.NoError(t, err)
+
+	var want bytes.Buffer
+	enc := jsontext.NewEncoder(&want, jsontext.WithIndentPrefix(""), jsontext.WithIndent("  "))
+	require.NoError(t, jsonv2.MarshalEncode(enc, map[string]any{
+		"content_hash": "abc123", "size": len(data), "data_base64": base64.StdEncoding.EncodeToString(data),
+	}, jsonv2.Deterministic(true)))
+	assert.Equal(t, want.String(), out)
 }

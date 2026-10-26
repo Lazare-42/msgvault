@@ -3,6 +3,8 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"sort"
@@ -26,6 +28,12 @@ const accountIdentityRevisionKey = "account_identity_revision"
 // identity-only refresh) is required.
 func (s *Store) AccountIdentityRevision() (int64, error) {
 	return readAccountIdentityRevision(s.db)
+}
+
+// AccountIdentityRevisionContext is the request-aware form of
+// AccountIdentityRevision.
+func (s *Store) AccountIdentityRevisionContext(ctx context.Context) (int64, error) {
+	return readArchiveMetadataRevisionContext(ctx, s.db, accountIdentityRevisionKey, "account identity")
 }
 
 // readAccountIdentityRevision reads the archive_metadata account-identity
@@ -83,6 +91,9 @@ type AccountIdentity struct {
 	ConfirmedAt  time.Time
 }
 
+// Callers comparing identifiers must use NormalizeIdentifierForCompare or
+// EqualIdentifier; raw string equality violates the case-insensitive email
+// and case-preserving non-email contract.
 // looksLikeEmail returns true for tokens that have the shape of an
 // email address. Emails are matched case-insensitively in the identity
 // store; other identifier shapes (phone E.164, Matrix MXIDs like
@@ -147,8 +158,8 @@ func (s *Store) AddAccountIdentityContext(
 		sourceID,
 		address,
 		signal,
-		func(ctx context.Context, tx *loggedTx) error {
-			return refreshSourceMessageAttributionContext(ctx, tx, sourceID, "")
+		func(ctx context.Context, tx *loggedTx, address string) error {
+			return refreshIdentityMessageAttributionContext(ctx, tx, sourceID, []string{address}, "")
 		},
 	)
 }
@@ -168,15 +179,15 @@ func (s *Store) AddAccountIdentityAndRefreshMessageAttributionContext(
 		sourceID,
 		address,
 		signal,
-		func(ctx context.Context, tx *loggedTx) error {
-			return refreshSourceMessageAttributionContext(
-				ctx, tx, sourceID, excludeSourceMessageID,
+		func(ctx context.Context, tx *loggedTx, address string) error {
+			return refreshIdentityMessageAttributionContext(
+				ctx, tx, sourceID, []string{address}, excludeSourceMessageID,
 			)
 		},
 	)
 }
 
-type accountIdentityInsertHook func(context.Context, *loggedTx) error
+type accountIdentityInsertHook func(context.Context, *loggedTx, string) error
 
 func (s *Store) addAccountIdentityContext(
 	ctx context.Context,
@@ -219,10 +230,9 @@ func (s *Store) addAccountIdentityOnce(
 	match identifierMatch,
 	onInsert accountIdentityInsertHook,
 ) error {
-	return s.withTxContext(ctx, func(tx *loggedTx) error {
-		if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
-			return err
-		}
+	var pending []int64
+	err := s.withAttributionTxContext(ctx, attributionLock{Exclusive: true}, func(tx *loggedTx) error {
+		pending = nil
 		added, err := s.mergeAccountIdentitySignalsTx(ctx, tx, sourceID, addr, []string{signal}, match)
 		if err != nil {
 			return err
@@ -235,13 +245,20 @@ func (s *Store) addAccountIdentityOnce(
 				return err
 			}
 			if onInsert != nil {
-				if err := onInsert(ctx, tx); err != nil {
+				if err := onInsert(ctx, tx, addr); err != nil {
 					return err
 				}
 			}
+			pending, err = s.markAccountAttributionPendingForAddressesTx(ctx, tx, sourceID, []string{addr})
+			return err
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	s.deriveAccountAttributionAfterCommit(ctx, sourceID, pending)
+	return nil
 }
 
 // mergeAccountIdentitySignalsTx applies the row-level insert/signal-merge
@@ -267,6 +284,18 @@ func (s *Store) mergeAccountIdentitySignalsTx(
 // the same writer-locked transaction as the write, so a removal that lands
 // after the caller read the confirmed set cannot be undone. It reports whether
 // a row was inserted and whether one was present to merge into.
+//
+// The lookup keys on address_key, the persisted comparison-canonical form,
+// so both backends match under the same Go-owned rule and the partial unique
+// index on (source_id, address_key) can reject a concurrent case-variant
+// insert (the retry loop in the callers then re-reads and merges). Rows
+// written by binaries that predate the column carry address_key = ” until
+// the next store open repairs them; the fallback predicate matches those
+// under the legacy case-aware rule so an in-session legacy row is merged
+// into (and promoted to keyed) rather than shadowed by an insert that would
+// then collide on the raw-bytes primary key. ORDER BY prefers the keyed row
+// when a legacy duplicate coexists; the unique index guarantees at most one
+// keyed row per key.
 func (s *Store) mergeAccountIdentitySignalsTxWith(
 	ctx context.Context,
 	tx *loggedTx,
@@ -276,11 +305,14 @@ func (s *Store) mergeAccountIdentitySignalsTxWith(
 	match identifierMatch,
 	allowInsert bool,
 ) (inserted, present bool, err error) {
-	whereAddr := match.WhereClause("address")
-	var existing string
-	selectSQL := `SELECT source_signal FROM account_identities
-		WHERE source_id = ? AND ` + whereAddr + s.dialect.SelectForUpdate()
-	err = tx.QueryRowContext(ctx, selectSQL, sourceID, match.BindValue()).Scan(&existing)
+	key := NormalizeIdentifierForCompare(addr)
+	var existingAddr, existingKey, existing string
+	selectSQL := `SELECT address, address_key, source_signal FROM account_identities
+		WHERE source_id = ? AND (address_key = ?
+			OR (address_key = '' AND ` + match.WhereClause("address") + `))
+		ORDER BY address_key DESC LIMIT 1` + s.dialect.SelectForUpdate()
+	err = tx.QueryRowContext(ctx, selectSQL, sourceID, key, match.BindValue()).
+		Scan(&existingAddr, &existingKey, &existing)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		if !allowInsert {
@@ -291,9 +323,9 @@ func (s *Store) mergeAccountIdentitySignalsTxWith(
 			merged = mergeSignalSet(merged, signal)
 		}
 		if _, err := tx.ExecContext(ctx,
-			`INSERT INTO account_identities (source_id, address, source_signal)
-				VALUES (?, ?, ?)`,
-			sourceID, addr, merged,
+			`INSERT INTO account_identities (source_id, address, address_key, source_signal)
+				VALUES (?, ?, ?, ?)`,
+			sourceID, addr, key, merged,
 		); err != nil {
 			return false, false, fmt.Errorf("insert account identity: %w", err)
 		}
@@ -305,11 +337,12 @@ func (s *Store) mergeAccountIdentitySignalsTxWith(
 		for _, signal := range signals {
 			merged = mergeSignalSet(merged, signal)
 		}
-		if merged != existing {
+		wantKey := NormalizeIdentifierForCompare(existingAddr)
+		if merged != existing || existingKey != wantKey {
 			if _, err := tx.ExecContext(ctx,
-				`UPDATE account_identities SET source_signal = ?
-					WHERE source_id = ? AND `+whereAddr,
-				merged, sourceID, match.BindValue(),
+				`UPDATE account_identities SET source_signal = ?, address_key = ?
+					WHERE source_id = ? AND address = ?`,
+				merged, wantKey, sourceID, existingAddr,
 			); err != nil {
 				return false, true, fmt.Errorf("update source_signal: %w", err)
 			}
@@ -375,10 +408,7 @@ func (s *Store) mergeConfirmedAccountIdentityChunkOnce(
 	confirmations []normalizedIdentityConfirmation,
 ) ([]IdentityConfirmationOutcome, error) {
 	outcomes := make([]IdentityConfirmationOutcome, 0, len(confirmations))
-	err := s.withTxContext(ctx, func(tx *loggedTx) error {
-		if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
-			return err
-		}
+	err := s.withAttributionTxContext(ctx, attributionLock{Exclusive: true}, func(tx *loggedTx) error {
 		for _, confirmation := range confirmations {
 			_, present, err := s.mergeAccountIdentitySignalsTxWith(
 				ctx,
@@ -502,10 +532,29 @@ func (s *Store) RemoveAccountIdentityContext(
 ) (int64, error) {
 	match := newIdentifierMatch(address)
 	var removed int64
-	err := s.withTxContext(ctx, func(tx *loggedTx) error {
-		if err := s.lockIdentityMutationTxContext(ctx, tx); err != nil {
-			return err
+	var pending []int64
+	err := s.withAttributionTxContext(ctx, attributionLock{Exclusive: true}, func(tx *loggedTx) error {
+		pending = nil
+		var removedAddresses []string
+		rows, err := tx.QueryContext(ctx,
+			`SELECT address FROM account_identities WHERE source_id = ? AND `+match.WhereClause("address"),
+			sourceID, match.BindValue())
+		if err != nil {
+			return fmt.Errorf("read account identity to remove: %w", err)
 		}
+		for rows.Next() {
+			var addr string
+			if err := rows.Scan(&addr); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("scan account identity to remove: %w", err)
+			}
+			removedAddresses = append(removedAddresses, addr)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("read account identity to remove: %w", err)
+		}
+		_ = rows.Close()
 		res, err := tx.ExecContext(ctx,
 			`DELETE FROM account_identities WHERE source_id = ? AND `+match.WhereClause("address"),
 			sourceID, match.BindValue(),
@@ -521,18 +570,77 @@ func (s *Store) RemoveAccountIdentityContext(
 		if n == 0 {
 			return nil
 		}
+		var remaining int64
+		if err := tx.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM account_identities WHERE source_id = ?`, sourceID,
+		).Scan(&remaining); err != nil {
+			return fmt.Errorf("count remaining account identities: %w", err)
+		}
+		if remaining == 0 {
+			if err := s.persistDefaultIdentityOptOutAfterLastRemovalContext(ctx, tx, sourceID); err != nil {
+				return err
+			}
+		}
 		if _, err := s.bumpIdentityRevisionContext(ctx, tx); err != nil {
 			return err
 		}
 		if err := s.bumpAccountIdentityRevisionContext(ctx, tx); err != nil {
 			return err
 		}
-		return refreshSourceMessageAttributionContext(ctx, tx, sourceID, "")
+		if err := refreshIdentityMessageAttributionContext(ctx, tx, sourceID, removedAddresses, ""); err != nil {
+			return err
+		}
+		pending, err = s.markAccountAttributionPendingForAddressesTx(ctx, tx, sourceID, removedAddresses)
+		return err
 	})
 	if err != nil {
 		return 0, err
 	}
+	s.deriveAccountAttributionAfterCommit(ctx, sourceID, pending)
 	return removed, nil
+}
+
+func (s *Store) persistDefaultIdentityOptOutAfterLastRemovalContext(
+	ctx context.Context,
+	tx *loggedTx,
+	sourceID int64,
+) error {
+	var syncConfig sql.NullString
+	if err := tx.QueryRowContext(ctx,
+		`SELECT sync_config FROM sources WHERE id = ?`, sourceID,
+	).Scan(&syncConfig); err != nil {
+		return fmt.Errorf("read sync config after final identity removal: %w", err)
+	}
+	config := make(map[string]jsontext.Value)
+	invalidConfig := false
+	if syncConfig.Valid && strings.TrimSpace(syncConfig.String) != "" {
+		invalidConfig = json.Unmarshal([]byte(syncConfig.String), &config) != nil
+	}
+	if invalidConfig {
+		// Invalid non-object configuration also makes default confirmation
+		// fail closed, so do not prevent identity removal over it.
+		return nil
+	}
+	if config == nil {
+		config = make(map[string]jsontext.Value)
+	}
+	if value, exists := config["no_default_identity"]; exists {
+		var alreadyOptedOut bool
+		if err := json.Unmarshal([]byte(value), &alreadyOptedOut); err == nil && alreadyOptedOut {
+			return nil
+		}
+	}
+	config["no_default_identity"] = jsontext.Value("true")
+	encoded, err := json.Marshal(config, json.Deterministic(true))
+	if err != nil {
+		return fmt.Errorf("encode default identity preference after final removal: %w", err)
+	}
+	query := fmt.Sprintf(`UPDATE sources SET sync_config = %s, updated_at = %s WHERE id = ?`,
+		s.dialect.JSONBindExpr(), s.dialect.Now())
+	if _, err := tx.ExecContext(ctx, query, string(encoded), sourceID); err != nil {
+		return fmt.Errorf("save default identity opt-out after final removal: %w", err)
+	}
+	return nil
 }
 
 // GetIdentitiesForScope returns the union of confirmed identifier addresses

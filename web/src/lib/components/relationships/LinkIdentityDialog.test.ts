@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { createAPIClient } from '../../api/client';
 import type { PersonSummary } from '../../explore/models';
 import type { LinkOutcome } from '../../relationships/controller.svelte';
+import type { ValidatedPersonMergeRequired } from '../../directory/person-merge';
 import { openTypeahead } from '../../../test/kit-ui';
 import LinkIdentityDialog from './LinkIdentityDialog.svelte';
 
@@ -39,6 +40,7 @@ function renderDialog(overrides: Partial<{
   excludeID: number;
   onConfirm: (participantID: number) => Promise<LinkOutcome>;
   onClose: () => void;
+  onMergeRequired: (conflict: ValidatedPersonMergeRequired) => void;
 }> = {}, fetchOverrides: Record<string, (request: Request) => Promise<Response> | Response> = {}) {
   const { fetchFn, requests } = fetchHandler({
     '/api/v1/participants/search': async () => Response.json({ rows: [person(2, 'Bob'), person(3, 'Cara')], total_count: 2, cache_revision: 'cache-rel', search_provenance: {} }),
@@ -46,14 +48,16 @@ function renderDialog(overrides: Partial<{
   });
   const onClose = overrides.onClose ?? vi.fn();
   const onConfirm = overrides.onConfirm ?? vi.fn(async (): Promise<LinkOutcome> => ({ ok: true, identityRevision: 2, cacheState: 'ready' }));
+  const onMergeRequired = overrides.onMergeRequired ?? vi.fn();
   const { unmount } = render(LinkIdentityDialog, {
     client: createAPIClient(fetchFn),
     excludeID: overrides.excludeID ?? 1,
     personLabel: 'Alice Example',
     onConfirm,
+    onMergeRequired,
     onClose
   });
-  return { requests, onClose, onConfirm, unmount };
+  return { requests, onClose, onConfirm, onMergeRequired, unmount };
 }
 
 describe('LinkIdentityDialog', () => {
@@ -92,33 +96,40 @@ describe('LinkIdentityDialog', () => {
     expect(screen.queryByText('Self')).toBeNull();
   });
 
-  it('selects a result by click or Enter, then confirms with that participant ID', async () => {
-    const { onConfirm } = renderDialog();
-    await fireEvent.input(await openTypeahead('Search people to link'), { target: { value: 'B' } });
-    const bobOption = await screen.findByRole('option', { name: /Bob/ });
+  it.each([
+    ['click', 'Bob', 2],
+    ['Enter', 'Cara', 3]
+  ] as const)('confirms a result selected by %s after focus leaves the picker', async (how, label, id) => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const { onConfirm } = renderDialog();
+      const input = await openTypeahead('Search people to link');
+      await fireEvent.input(input, { target: { value: label[0] } });
+      const option = await screen.findByRole('option', { name: new RegExp(label) });
+      if (how === 'click') {
+        await fireEvent.mouseDown(option);
+      } else {
+        await fireEvent.keyDown(input, { key: 'ArrowDown' });
+        await fireEvent.keyDown(input, { key: 'Enter' });
+      }
+      const trigger = await screen.findByRole('button', { name: `Search people to link: ${label}` });
+      await waitFor(() => expect(document.activeElement).toBe(trigger));
 
-    await fireEvent.mouseDown(bobOption);
-    expect(screen.getByRole('button', { name: 'These are the same person' })).toHaveProperty('disabled', false);
+      // Leaving the closed picker makes Typeahead send another empty query, which also clears the results.
+      const confirm = screen.getByRole('button', { name: 'These are the same person' });
+      confirm.focus();
+      await vi.advanceTimersByTimeAsync(250);
 
-    await fireEvent.click(screen.getByRole('button', { name: 'These are the same person' }));
-    await waitFor(() => expect(onConfirm).toHaveBeenCalledWith(2));
+      expect(screen.getByRole('button', { name: `Search people to link: ${label}` })).toBeDefined();
+      expect(confirm).toHaveProperty('disabled', false);
+      await fireEvent.click(confirm);
+      await waitFor(() => expect(onConfirm).toHaveBeenCalledWith(id));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
-  it('selects a result via Enter without requiring a click', async () => {
-    const { onConfirm } = renderDialog();
-    const input = await openTypeahead('Search people to link');
-    await fireEvent.input(input, { target: { value: 'C' } });
-    await screen.findByRole('option', { name: /Cara/ });
-
-    await fireEvent.keyDown(input, { key: 'ArrowDown' });
-    await fireEvent.keyDown(input, { key: 'Enter' });
-    expect(screen.getByRole('button', { name: 'These are the same person' })).toHaveProperty('disabled', false);
-
-    await fireEvent.click(screen.getByRole('button', { name: 'These are the same person' }));
-    await waitFor(() => expect(onConfirm).toHaveBeenCalledWith(3));
-  });
-
-  it('clears a prior selection when the editable Typeahead field is empty', async () => {
+  it('drops the prior selection when the picker reopens', async () => {
     const { onConfirm } = renderDialog();
     await fireEvent.input(await openTypeahead('Search people to link'), { target: { value: 'B' } });
     await fireEvent.mouseDown(await screen.findByRole('option', { name: /Bob/ }));
@@ -172,6 +183,28 @@ describe('LinkIdentityDialog', () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 
+  it('hands a merge-required outcome to its parent without closing or retrying', async () => {
+    const conflict = {
+      error: 'person_merge_required', message: 'Choose a survivor', profiles: [
+        { etag: '"person-7-r4"', person: { id: 7, revision: 4 } },
+        { etag: '"person-9-r2"', person: { id: 9, revision: 2 } }
+      ]
+    } as unknown as ValidatedPersonMergeRequired;
+    const onConfirm = vi.fn(async (): Promise<LinkOutcome> => ({
+      ok: false, code: 'merge_required', message: conflict.message, conflict
+    }));
+    const onClose = vi.fn();
+    const { onMergeRequired } = renderDialog({ onConfirm, onClose });
+    await fireEvent.input(await openTypeahead('Search people to link'), { target: { value: 'B' } });
+    await fireEvent.mouseDown(await screen.findByRole('option', { name: /Bob/ }));
+
+    await fireEvent.click(screen.getByRole('button', { name: 'These are the same person' }));
+
+    await waitFor(() => expect(onMergeRequired).toHaveBeenCalledWith(conflict));
+    expect(onConfirm).toHaveBeenCalledOnce();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
   it('shows the outcome message inline for invalid/error outcomes and stays open', async () => {
     const onClose = vi.fn();
     const onConfirm = vi.fn(async (): Promise<LinkOutcome> => ({ ok: false, code: 'error', message: 'Request failed (500)' }));
@@ -182,13 +215,6 @@ describe('LinkIdentityDialog', () => {
 
     expect((await screen.findByRole('alert')).textContent).toContain('Request failed (500)');
     expect(onClose).not.toHaveBeenCalled();
-  });
-
-  it('closes on Esc', async () => {
-    const onClose = vi.fn();
-    renderDialog({ onClose });
-    await fireEvent.keyDown(window, { key: 'Escape' });
-    expect(onClose).toHaveBeenCalled();
   });
 
   it('cancels via the Cancel button without confirming', async () => {

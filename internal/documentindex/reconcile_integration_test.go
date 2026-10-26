@@ -26,6 +26,13 @@ func TestReconcilerBootstrapAndReplayConvergeOnCurrentOccurrences(t *testing.T) 
 		unknownMessage, "unknown.pdf", "application/pdf",
 		unknownHash[:2]+"/"+unknownHash, unknownHash, 64,
 	))
+	inlineMessage := f.CreateMessage("document-reconcile-inline-image")
+	inlineHash := strings.Repeat("d", 64)
+	require.NoError(f.Store.UpsertAttachmentRecord(t.Context(), inlineMessage, store.AttachmentWrite{
+		Filename: "logo.png", MIMEType: "image/png", MediaType: "image", Size: 64,
+		StoragePath: inlineHash[:2] + "/" + inlineHash, ContentHash: inlineHash,
+		Role: store.AttachmentRoleInline, RoleSource: store.AttachmentRoleSourceMIMEDisposition,
+	}))
 
 	reconciler, err := NewReconciler(f.Store, ReconcilerConfig{
 		AttachmentPageSize: 1, ChangePageSize: 1,
@@ -35,7 +42,7 @@ func TestReconcilerBootstrapAndReplayConvergeOnCurrentOccurrences(t *testing.T) 
 	require.NoError(err)
 	assert.True(result.ConsumerCreated)
 	assert.True(result.FullScanCompleted)
-	assert.Equal(2, result.AttachmentsExamined)
+	assert.Equal(3, result.AttachmentsExamined)
 	assert.Equal(1, result.EligibleOccurrences)
 	assert.Equal(0, result.ChangesConsumed)
 	assert.Equal([]int64{firstID}, documentOccurrenceAttachmentIDs(t, f))
@@ -44,7 +51,7 @@ func TestReconcilerBootstrapAndReplayConvergeOnCurrentOccurrences(t *testing.T) 
 	secondID := createReconcileAttachment(t, f, secondMessage, "c")
 	_, err = f.Store.DB().Exec(f.Store.Rebind(
 		`UPDATE attachments SET attachment_role = ?, role_source = ? WHERE id = ?`),
-		store.AttachmentRoleInline, store.AttachmentRoleSourceMIMEDisposition, firstID)
+		store.AttachmentRolePreview, store.AttachmentRoleSourceMIMEDisposition, firstID)
 	require.NoError(err)
 
 	result, err = reconciler.Reconcile(t.Context())
@@ -86,7 +93,7 @@ func TestReconcilerReenableUsesDurableJournalHighWater(t *testing.T) {
 	))
 	_, err = f.Store.DB().Exec(f.Store.Rebind(`
 		UPDATE attachments SET attachment_role = ?, role_source = ? WHERE id = ?`),
-		store.AttachmentRoleInline, store.AttachmentRoleSourceMIMEDisposition, attachmentID)
+		store.AttachmentRolePreview, store.AttachmentRoleSourceMIMEDisposition, attachmentID)
 	require.NoError(err)
 
 	result, err := reconciler.Reconcile(t.Context())
@@ -142,7 +149,7 @@ func TestOccurrenceReconciliationIgnoresStaleSourceSequence(t *testing.T) {
 
 	_, err = f.Store.DB().Exec(f.Store.Rebind(
 		`UPDATE attachments SET filename = ?, attachment_role = ?, role_source = ? WHERE id = ?`),
-		"stale-name.pdf", store.AttachmentRoleInline,
+		"stale-name.pdf", store.AttachmentRolePreview,
 		store.AttachmentRoleSourceMIMEDisposition, attachmentID)
 	require.NoError(err)
 	_, eligible, err = f.Store.ReconcileDocumentOccurrence(t.Context(), attachmentID, 9)
@@ -238,11 +245,11 @@ func TestSQLiteOccurrenceReconciliationReadsAfterWriterSlot(t *testing.T) {
 	select {
 	case <-result:
 		require.Fail("reconciliation returned while the SQLite writer slot was held")
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(50 * time.Millisecond): //nolint:kennlint // absence check: the held SQLite writer slot keeps reconciliation waiting
 	}
 	_, err = holder.ExecContext(t.Context(), `
 		UPDATE attachments SET attachment_role = ? WHERE id = ?`,
-		store.AttachmentRoleInline, attachmentID)
+		store.AttachmentRolePreview, attachmentID)
 	require.NoError(err)
 	_, err = holder.ExecContext(t.Context(), `
 		DELETE FROM document_occurrences
@@ -310,7 +317,7 @@ func TestPostgreSQLOccurrenceReconciliationSerializesEligibilityRead(t *testing.
 
 	_, err = f.Store.DB().Exec(f.Store.Rebind(`
 		UPDATE attachments SET attachment_role = ? WHERE id = ?`),
-		store.AttachmentRoleInline, attachmentID)
+		store.AttachmentRolePreview, attachmentID)
 	require.NoError(err)
 	higher := make(chan reconcileResult, 1)
 	go func() {

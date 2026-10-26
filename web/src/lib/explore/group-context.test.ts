@@ -5,7 +5,8 @@ import { filtersForGroup, parseGroupSelection } from './group-context';
 describe('group context', () => {
   it.each([
     ['source', '7'],
-    ['message_type', 'email']
+    ['message_type', 'email'],
+    ['mailing_list', '<dev_1@example.test>']
   ] as const)('constrains %s details by replacing the existing filter', (dimension, key) => {
     expect(filtersForGroup(
       [{ dimension: 'deletion', values: ['active'] }, { dimension, values: ['old'] }],
@@ -82,7 +83,8 @@ describe('group context', () => {
     expect(filtersForGroup([], 'year', '20x6')).toBeUndefined();
     expect(filtersForGroup([], 'month', '2026-13')).toBeUndefined();
     expect(parseGroupSelection('group:domain:example.com')).toEqual({ dimension: 'domain', key: 'example.com' });
-    expect(parseGroupSelection('group:kind:email')).toBeUndefined();
+    expect(parseGroupSelection('group:kind:message')).toEqual({ dimension: 'kind', key: 'message' });
+    expect(filtersForGroup([], 'kind', 'message')).toBeUndefined();
     expect(parseGroupSelection('message:1')).toBeUndefined();
   });
 });

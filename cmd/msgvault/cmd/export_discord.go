@@ -1,7 +1,8 @@
 package cmd
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"strings"
@@ -53,6 +54,9 @@ func newExportDiscordLocalCmd(deps discordCommandDeps) *cobra.Command {
 		Short: "Export bounded Discord history from the local archive",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if invocationFromContext(cmd.Context()) != nil && deps.bind != nil {
+				deps = deps.bind(cmd.Context())
+			}
 			return runExportDiscord(cmd, deps, args[0], opts)
 		},
 	}
@@ -124,9 +128,9 @@ func runExportDiscord(
 		End:                   end,
 		Containers:            containers,
 	}
-	encoder := json.NewEncoder(cmd.OutOrStdout())
-	encoder.SetEscapeHTML(false)
-	if err := encoder.Encode(envelope); err != nil {
+	encoder := jsontext.NewEncoder(cmd.OutOrStdout(), jsontext.EscapeForHTML(false))
+
+	if err := json.MarshalEncode(encoder, envelope, json.Deterministic(true)); err != nil {
 		return fmt.Errorf("encode Discord export: %w", err)
 	}
 	return nil

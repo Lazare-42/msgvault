@@ -7,6 +7,8 @@ explore, search, and manage their archive.
 
 All data is stored in `~/.msgvault/` by default (override with `MSGVAULT_HOME`).
 
+For current search and reading options, run `msgvault search --help`, `msgvault show --help`, and `msgvault show-thread --help`.
+
 ## Setup and account management
 
 ### Initialize the database
@@ -41,6 +43,11 @@ client_secrets = "/path/to/client_secret.json"
 
 [sync]
 rate_limit_qps = 5
+
+[deletion]
+# Durable consent for remote deletion execution. Opt in deliberately;
+# defaults to false.
+remote_enabled = false
 ```
 
 ## Syncing email
@@ -139,6 +146,7 @@ msgvault search "quarterly report" --limit 100 --offset 50
 | `bcc:`        | BCC recipient                        | `bcc:hr@company.com`       |
 | `subject:`    | Subject text                         | `subject:meeting`          |
 | `label:`      | Gmail label (or `l:`)                | `label:IMPORTANT`          |
+| `list:`       | List-Id substring (or `list-id:`)    | `list:announce.example`    |
 | `has:`        | `has:attachment`                     | `has:attachment`           |
 | `before:`     | Messages before date                 | `before:2024-06-01`        |
 | `after:`      | Messages after date                  | `after:2024-01-01`         |
@@ -147,8 +155,22 @@ msgvault search "quarterly report" --limit 100 --offset 50
 | `larger:`     | Minimum size                         | `larger:10M`               |
 | `smaller:`    | Maximum size                         | `smaller:100K`             |
 | `message_type:` | Message type                       | `message_type:teams`       |
+| `received:`   | Confirmed address that received it   | `received:work@example.org` |
+| `account:`    | Confirmed address that received or sent it | `account:work@example.org` |
 
-Bare words and `"quoted phrases"` perform full-text search across subject and body.
+Unlike `--account`, which selects a whole archive source, `account:` matches
+only messages attributed to that address.
+
+`list:` and `list-id:` match case-insensitive literal substrings. Quote values
+that contain spaces; repeat either operator to require every value. Bare words
+and `"quoted phrases"` perform full-text search across subject and body.
+
+Existing archives can backfill List-Id values without contacting providers:
+
+```bash
+msgvault repair-list-ids          # dry run
+msgvault repair-list-ids --apply  # write changes
+```
 
 ## View a single message
 
@@ -212,26 +234,32 @@ msgvault cancel-deletion <batch-id>
 # List staged batches without executing (always allowed)
 msgvault delete-staged --list
 
-# Execute pending deletions (gated; default = trash, recoverable for 30 days)
-MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged --yes
+# Execute pending deletions (default = trash, recoverable for 30 days)
+msgvault delete-staged --yes
 
 # Execute a specific batch
-MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged <batch-id>
+msgvault delete-staged <batch-id>
 
 # Permanently delete via batch API (fast, no recovery — opt-in)
-MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged --permanent
+msgvault delete-staged --permanent
 
 # Dry run — show what would be deleted without doing it (always allowed)
 msgvault delete-staged --dry-run
 
 # Specify which account to delete from
-MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged --account user@gmail.com
+msgvault delete-staged --account user@gmail.com
+
+# One-command alternative to durable config consent
+MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged <batch-id>
 ```
 
-**Note:** Remote deletion is gated for the v1 release. Staging, listing,
-inspecting, and dry-running deletion batches works without the gate;
-executing against Gmail requires `MSGVAULT_ENABLE_REMOTE_DELETE=1` in the
-environment.
+**Note:** Starting in v0.20.0, remote deletion remains permanently opt-in. The
+invoking CLI may enable it durably with `[deletion] remote_enabled = true` or
+for one command with `MSGVAULT_ENABLE_REMOTE_DELETE=1`. Both mechanisms are
+permanent; there is no planned automatic removal of the guardrail. A remote
+daemon's own `[deletion]` section is not policy for a command invoked
+elsewhere. Staging, listing, inspecting, and dry-running deletion batches
+remain ungated.
 
 **Warning:** `delete-staged --permanent` permanently deletes messages from
 Gmail with no Gmail-side recovery. The default mode moves messages to Gmail
@@ -332,3 +360,23 @@ file on the CLI machine.
 - All query/search commands are read-only and never modify data.
 - Deletion requires explicit staging (TUI) + execution (`delete-staged`).
 - Use `--verbose` (`-v`) on any command for debug logging.
+
+## Restricted remote reads
+
+Issue a source-scoped grant for an agent instead of giving it the owner API
+key. The owner enables `[server] agent_access = true` and keeps the owner key
+for grant management. Grants live in daemon memory and end when revoked, at
+their optional expiry, or when the daemon restarts.
+
+```bash
+msgvault agent-token issue --label researcher --permissions search.read,message.read --source-ids 1,2 --expires 24h
+msgvault --agent-url https://archive.example.test --agent-token-file ./reader.token search 'subject:meeting' --json
+msgvault --agent-url https://archive.example.test --agent-token-file ./reader.token show-message 42 --json
+```
+
+Add `stats.read` for source statistics and `attachment.read` for attachment
+bytes. `mcp` accepts the same agent flags for scoped reads over stdio, alongside
+delegated draft and calendar tools. Explicit account,
+collection, and multi-source scopes must fit entirely inside the grant. Read
+grants do not authorize sync, deletion, SQL, export, or administration. See the
+CLI reference's agent-token section for supported read paths and limitations.

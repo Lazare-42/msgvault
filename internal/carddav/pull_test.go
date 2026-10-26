@@ -1,9 +1,13 @@
 package carddav
 
 import (
+	"bytes"
+	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -11,6 +15,7 @@ import (
 	"path"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -20,6 +25,7 @@ import (
 )
 
 func TestParseSyncPageRecognizesEquivalentAbsoluteCollectionHref(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -29,7 +35,7 @@ func TestParseSyncPageRecognizesEquivalentAbsoluteCollectionHref(t *testing.T) {
 	require.NoError(err)
 	service := NewService(nil, client)
 
-	changed, removed, token, truncated, err := service.parseSyncPage(t.Context(), collection, MultiStatus{
+	changed, removed, token, truncated, err := service.dav().parseSyncPage(t.Context(), collection, MultiStatus{
 		SyncToken: "next-token",
 		Responses: []MultiStatusResponse{{
 			Href:      "https://CONTACTS.example:443/books/personal",
@@ -45,6 +51,7 @@ func TestParseSyncPageRecognizesEquivalentAbsoluteCollectionHref(t *testing.T) {
 }
 
 func TestPullBudgetChargesHTTPErrorBodies(t *testing.T) {
+	t.Parallel()
 	const errorBody = "remote error response body"
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
@@ -53,15 +60,16 @@ func TestPullBudgetChargesHTTPErrorBodies(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	service, _, _ := newPullService(t, server, false)
-	budget := &operationBudget{remaining: int64(len(errorBody) + 1)}
+	budget := &Budget{remaining: int64(len(errorBody) + 1)}
 
-	_, err := service.do(t.Context(), Request{Method: http.MethodGet, URL: server.URL + "/missing-one"}, budget)
+	_, err := service.dav().do(t.Context(), Request{Method: http.MethodGet, URL: server.URL + "/missing-one"}, budget)
 	require.Error(t, err)
-	_, err = service.do(t.Context(), Request{Method: http.MethodGet, URL: server.URL + "/missing-two"}, budget)
+	_, err = service.dav().do(t.Context(), Request{Method: http.MethodGet, URL: server.URL + "/missing-two"}, budget)
 	require.ErrorIs(t, err, ErrOperationLimit)
 }
 
 func TestPullBudgetChargesPartialBodiesOnResponseLimit(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -74,17 +82,17 @@ func TestPullBudgetChargesPartialBodiesOnResponseLimit(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	service, _, _ := newPullService(t, server, false)
-	service.client.responseBytes = 2
-	service.client.operationBytes = 10
-	budget := &operationBudget{remaining: 5}
+	service.dav().client.responseBytes = 2
+	service.dav().client.operationBytes = 10
+	budget := &Budget{remaining: 5}
 
-	response, err := service.do(t.Context(), Request{Method: http.MethodGet, URL: server.URL + "/oversized-one"}, budget)
+	response, err := service.dav().do(t.Context(), Request{Method: http.MethodGet, URL: server.URL + "/oversized-one"}, budget)
 	require.ErrorIs(err, ErrResponseLimit)
 	require.NotNil(response)
 	assert.Equal([]byte(responseBody), response.Body)
 	assert.Equal(int64(2), budget.remaining)
 
-	response, err = service.do(t.Context(), Request{Method: http.MethodGet, URL: server.URL + "/oversized-two"}, budget)
+	response, err = service.dav().do(t.Context(), Request{Method: http.MethodGet, URL: server.URL + "/oversized-two"}, budget)
 	require.ErrorIs(err, ErrOperationLimit)
 	assert.Nil(response)
 	assert.Equal(int64(-1), budget.remaining)
@@ -92,6 +100,7 @@ func TestPullBudgetChargesPartialBodiesOnResponseLimit(t *testing.T) {
 }
 
 func TestPullBudgetChargesRedirectResponseBodies(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -110,9 +119,9 @@ func TestPullBudgetChargesRedirectResponseBodies(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	service, _, _ := newPullService(t, server, false)
-	budget := &operationBudget{remaining: 4}
+	budget := &Budget{remaining: 4}
 
-	response, err := service.do(t.Context(), Request{Method: http.MethodGet, URL: server.URL + "/start"}, budget)
+	response, err := service.dav().do(t.Context(), Request{Method: http.MethodGet, URL: server.URL + "/start"}, budget)
 	require.ErrorIs(err, ErrOperationLimit)
 	assert.Nil(response)
 	assert.Equal(int64(-1), budget.remaining)
@@ -120,6 +129,7 @@ func TestPullBudgetChargesRedirectResponseBodies(t *testing.T) {
 }
 
 func TestIndividualMemberFetchTreatsGoneAsMissing(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -132,14 +142,15 @@ func TestIndividualMemberFetchTreatsGoneAsMissing(t *testing.T) {
 	require.NoError(err)
 	href := book.CanonicalURL + "gone.vcf"
 
-	resources, missing, err := service.fetchMembersIndividually(
-		t.Context(), collection, []string{href}, &operationBudget{remaining: defaultOperationBytes})
+	resources, missing, err := service.dav().fetchMembersIndividually(
+		t.Context(), collection, []string{href}, &Budget{remaining: defaultOperationBytes})
 	require.NoError(err)
 	assert.Empty(resources)
 	assert.Equal([]string{href}, missing)
 }
 
 func TestSyncPageTreatsGoneMemberAsRemoved(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -150,7 +161,7 @@ func TestSyncPageTreatsGoneMemberAsRemoved(t *testing.T) {
 	require.NoError(err)
 	href := book.CanonicalURL + "gone.vcf"
 
-	changed, removed, token, truncated, err := service.parseSyncPage(t.Context(), collection, MultiStatus{
+	changed, removed, token, truncated, err := service.dav().parseSyncPage(t.Context(), collection, MultiStatus{
 		SyncToken: "next-token",
 		Responses: []MultiStatusResponse{{Href: href, StatusCode: http.StatusGone}},
 	})
@@ -162,6 +173,7 @@ func TestSyncPageTreatsGoneMemberAsRemoved(t *testing.T) {
 }
 
 func TestSyncContinuesAfterOneBookFailsAndReconcilesPublications(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	var requestedPaths []string
@@ -212,6 +224,13 @@ func TestSyncContinuesAfterOneBookFailsAndReconcilesPublications(t *testing.T) {
 	_, publicationErr := st.GetCardDAVPublicationContext(t.Context(), personID)
 	require.ErrorIs(publicationErr, store.ErrCardDAVPublicationNotFound,
 		"publication reconciliation must still run after an independent book failure")
+	runs, listErr := st.ListCardDAVSyncRunsContext(t.Context(), 10, nil, store.AllCardDAVAccounts)
+	require.NoError(listErr)
+	require.Len(runs, 1)
+	assert.Equal(store.CardDAVSyncRunPartial, runs[0].State)
+	assert.Equal(int64(result.Books), runs[0].Books)
+	assert.Equal("upstream_failed", runs[0].ErrorCode)
+	assert.Equal("CardDAV server request failed.", runs[0].ErrorMessage)
 }
 
 func newPullService(t *testing.T, server *httptest.Server, supportsSync bool) (*Service, *store.Store, store.CardDAVAddressBook) {
@@ -310,7 +329,192 @@ func writeDAVXML(t *testing.T, w http.ResponseWriter, body string) {
 	require.NoError(t, err)
 }
 
+func TestSyncRecordsOneSucceededManualRunWithExactCounters(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := readRequestBody(t, r)
+		if strings.Contains(body, "sync-collection") {
+			writeDAVXML(t, w, syncResponse(
+				changedResponse("/books/personal/alice.vcf", `&quot;one&quot;`), "token-1",
+			))
+			return
+		}
+		writeDAVXML(t, w, syncResponse(
+			cardResponse("/books/personal/alice.vcf", `&quot;one&quot;`, "alice"), "",
+		))
+	}))
+	t.Cleanup(server.Close)
+	service, st, _ := newPullService(t, server, true)
+
+	result, err := service.Sync(t.Context(), SyncOptions{Full: true})
+	require.NoError(err)
+	assert.Equal(SyncResult{Books: 1, Created: 1}, result)
+
+	runs, err := st.ListCardDAVSyncRunsContext(t.Context(), 10, nil, store.AllCardDAVAccounts)
+	require.NoError(err)
+	require.Len(runs, 1)
+	assert.Equal(store.CardDAVSyncTriggerManual, runs[0].Trigger)
+	assert.True(runs[0].Full)
+	assert.Equal(store.CardDAVSyncRunSucceeded, runs[0].State)
+	assert.NotNil(runs[0].FinishedAt)
+	assert.Equal(int64(result.Books), runs[0].Books)
+	assert.Equal(int64(result.Created), runs[0].Created)
+	assert.Equal(int64(result.Updated), runs[0].Updated)
+	assert.Equal(int64(result.Removed), runs[0].Removed)
+}
+
+func TestSyncRecordsExplicitScheduledTrigger(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeDAVXML(t, w, syncResponse("", "token-1"))
+	}))
+	t.Cleanup(server.Close)
+	service, st, _ := newPullService(t, server, true)
+
+	_, err := service.Sync(t.Context(), SyncOptions{Trigger: store.CardDAVSyncTriggerScheduled})
+	require.NoError(err)
+	runs, err := st.ListCardDAVSyncRunsContext(t.Context(), 10, nil, store.AllCardDAVAccounts)
+	require.NoError(err)
+	require.Len(runs, 1)
+	assert.Equal(t, store.CardDAVSyncTriggerScheduled, runs[0].Trigger)
+}
+
+func TestSyncCancellationFinishesRunWithUncancelledCleanupContext(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	requestStarted := make(chan struct{})
+	releaseRequest := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(requestStarted)
+		<-releaseRequest
+	}))
+	t.Cleanup(server.Close)
+	service, st, _ := newPullService(t, server, true)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() {
+		_, err := service.Sync(ctx, SyncOptions{})
+		done <- err
+	}()
+	<-requestStarted
+	cancel()
+
+	err := <-done
+	close(releaseRequest)
+	require.ErrorIs(err, context.Canceled)
+	runs, err := st.ListCardDAVSyncRunsContext(t.Context(), 10, nil, store.AllCardDAVAccounts)
+	require.NoError(err)
+	require.Len(runs, 1)
+	assert.Equal(store.CardDAVSyncRunCancelled, runs[0].State)
+	assert.Equal("cancelled", runs[0].ErrorCode)
+	assert.NotNil(runs[0].FinishedAt)
+}
+
+func TestSyncActiveClaimPreventsNetworkAndSecondRun(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { requests++ }))
+	t.Cleanup(server.Close)
+	service, st, _ := newPullService(t, server, true)
+	_, err := st.StartCardDAVSyncRunContext(t.Context(), store.CardDAVSyncRunStart{AccountID: store.DefaultCardDAVAccountID, Trigger: store.CardDAVSyncTriggerManual})
+	require.NoError(err)
+
+	_, err = service.Sync(t.Context(), SyncOptions{})
+	require.ErrorIs(err, store.ErrCardDAVSyncActive)
+	assert.Zero(requests)
+	runs, err := st.ListCardDAVSyncRunsContext(t.Context(), 10, nil, store.AllCardDAVAccounts)
+	require.NoError(err)
+	assert.Len(runs, 1)
+}
+
+func TestSyncTotalFailureRecordsSafeFailedTerminalState(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+	service, st, _ := newPullService(t, server, true)
+
+	result, err := service.Sync(t.Context(), SyncOptions{})
+	require.Error(err)
+	assert.Equal(SyncResult{}, result)
+	assert.Equal("CardDAV server request failed.", err.Error())
+	runs, listErr := st.ListCardDAVSyncRunsContext(t.Context(), 10, nil, store.AllCardDAVAccounts)
+	require.NoError(listErr)
+	require.Len(runs, 1)
+	assert.Equal(store.CardDAVSyncRunFailed, runs[0].State)
+	assert.Equal("upstream_failed", runs[0].ErrorCode)
+	assert.Equal("CardDAV server request failed.", runs[0].ErrorMessage)
+}
+
+func TestSyncFailureProjectionRejectsPrivateMaterial(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	privateErr := errors.New("Authorization: Bearer synthetic-secret BEGIN:VCARD https://private.invalid/dav")
+	finish := cardDAVSyncRunFinish(SyncResult{}, privateErr)
+	returned := publicCardDAVSyncError(privateErr)
+	assert.Equal("sync_failed", finish.ErrorCode)
+	assert.Equal("CardDAV sync failed.", finish.ErrorMessage)
+	require.Error(t, returned)
+	assert.Equal("CardDAV sync failed.", returned.Error())
+	for _, private := range []string{"synthetic-secret", "BEGIN:VCARD", "private.invalid"} {
+		assert.NotContains(finish.ErrorMessage, private)
+		assert.NotContains(returned.Error(), private)
+	}
+	assert.ErrorIs(returned, privateErr, "safe projection must preserve machine-readable cause semantics")
+}
+
+func TestSyncJoinsExecutionAndFinishFailuresWithoutReplay(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests++
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+	service, st, _ := newPullService(t, server, true)
+	var err error
+	if st.IsPostgreSQL() {
+		_, err = st.DB().Exec(`CREATE FUNCTION fail_carddav_run_finish_fn() RETURNS trigger AS $$
+			BEGIN
+				IF OLD.state = 'running' THEN
+					RAISE EXCEPTION 'injected finish failure';
+				END IF;
+				RETURN NEW;
+			END $$ LANGUAGE plpgsql`)
+		require.NoError(err)
+		_, err = st.DB().Exec(`CREATE TRIGGER fail_carddav_run_finish
+			BEFORE UPDATE OF state ON carddav_sync_runs
+			FOR EACH ROW EXECUTE FUNCTION fail_carddav_run_finish_fn()`)
+	} else {
+		_, err = st.DB().Exec(`CREATE TRIGGER fail_carddav_run_finish
+			BEFORE UPDATE OF state ON carddav_sync_runs
+			WHEN OLD.state = 'running'
+			BEGIN SELECT RAISE(ABORT, 'injected finish failure'); END`)
+	}
+	require.NoError(err)
+
+	result, err := service.Sync(t.Context(), SyncOptions{})
+	require.Error(err)
+	assert.Equal(SyncResult{}, result)
+	var statusErr *StatusError
+	require.ErrorAs(err, &statusErr, "execution error must remain inspectable")
+	require.ErrorContains(err, "injected finish failure")
+	assert.Equal(1, requests, "finish failure must not replay network work")
+}
+
 func TestSyncEmptyTokenReturnsMembersAndAdvancesToken(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -338,6 +542,7 @@ func TestSyncEmptyTokenReturnsMembersAndAdvancesToken(t *testing.T) {
 }
 
 func TestSyncMultigetUsesBatchesOfOneHundred(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -378,6 +583,7 @@ func TestSyncMultigetUsesBatchesOfOneHundred(t *testing.T) {
 }
 
 func TestMultigetMatchesEquivalentAbsoluteHref(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -399,8 +605,8 @@ func TestMultigetMatchesEquivalentAbsoluteHref(t *testing.T) {
 	collection := mustParseURL(t, origin.String()+"/books/personal/")
 	requestedHref := origin.String() + "/books/personal/alice.vcf"
 
-	resources, missing, err := service.fetchMultiget(t.Context(), collection,
-		[]string{requestedHref}, &operationBudget{remaining: defaultOperationBytes})
+	resources, missing, err := service.dav().fetchMultiget(t.Context(), collection,
+		[]string{requestedHref}, &Budget{remaining: defaultOperationBytes})
 
 	require.NoError(err)
 	assert.Empty(missing)
@@ -409,6 +615,7 @@ func TestMultigetMatchesEquivalentAbsoluteHref(t *testing.T) {
 }
 
 func TestMultigetCanonicalizesEquivalentMissingHref(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -432,8 +639,8 @@ func TestMultigetCanonicalizesEquivalentMissingHref(t *testing.T) {
 	collection := mustParseURL(t, origin.String()+"/books/personal/")
 	requestedHref := origin.String() + "/books/personal/alice.vcf"
 
-	resources, missing, err := service.fetchMultiget(t.Context(), collection,
-		[]string{requestedHref}, &operationBudget{remaining: defaultOperationBytes})
+	resources, missing, err := service.dav().fetchMultiget(t.Context(), collection,
+		[]string{requestedHref}, &Budget{remaining: defaultOperationBytes})
 
 	require.NoError(err)
 	assert.Empty(resources)
@@ -441,10 +648,18 @@ func TestMultigetCanonicalizesEquivalentMissingHref(t *testing.T) {
 }
 
 func TestSyncContinuesTruncated507PageWithNextToken(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+
 	syncRequests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body := readRequestBody(t, r)
 		if strings.Contains(body, "sync-collection") {
+			if !assert.Equal("0", r.Header.Get("Depth")) {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
 			syncRequests++
 			if syncRequests == 1 {
 				events := changedResponse("/books/personal/alice.vcf", `&quot;one&quot;`) +
@@ -452,7 +667,7 @@ func TestSyncContinuesTruncated507PageWithNextToken(t *testing.T) {
 				writeDAVXML(t, w, syncResponse(events, "page-2"))
 				return
 			}
-			assert.Equal(t, "page-2", syncRequestToken(body))
+			assert.Equal("page-2", syncRequestToken(body))
 			writeDAVXML(t, w, syncResponse(changedResponse("/books/personal/bob.vcf", `&quot;two&quot;`), "final"))
 			return
 		}
@@ -463,15 +678,20 @@ func TestSyncContinuesTruncated507PageWithNextToken(t *testing.T) {
 		writeDAVXML(t, w, syncResponse(cards.String(), ""))
 	}))
 	t.Cleanup(server.Close)
-	service, _, _ := newPullService(t, server, true)
+	service, st, _ := newPullService(t, server, true)
 
 	result, err := service.Sync(t.Context(), SyncOptions{Full: true})
-	require.NoError(t, err)
-	assert.Equal(t, 2, result.Created)
-	assert.Equal(t, 2, syncRequests)
+	require.NoError(err)
+	assert.Equal(2, result.Created)
+	assert.Equal(2, syncRequests)
+	books, err := st.ListCardDAVAddressBooksContext(t.Context(), store.AllCardDAVAccounts)
+	require.NoError(err)
+	require.Len(books, 1)
+	assert.Equal("final", books[0].SyncToken)
 }
 
 func TestInitialSyncSendsEmptyTokenAndFallsBackToIndividualGET(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -513,8 +733,10 @@ func TestInitialSyncSendsEmptyTokenAndFallsBackToIndividualGET(t *testing.T) {
 }
 
 func TestSyncFallsBackWhenAdvertisedMultigetIsUnsupported(t *testing.T) {
+	t.Parallel()
 	for _, status := range []int{http.StatusMethodNotAllowed, http.StatusNotImplemented} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Parallel()
 			assert := assert.New(t)
 			require := require.New(t)
 			reports, gets := 0, 0
@@ -551,7 +773,43 @@ func TestSyncFallsBackWhenAdvertisedMultigetIsUnsupported(t *testing.T) {
 	}
 }
 
+func TestSyncMultigetSendsAbsolutePathsNotAbsoluteURIs(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := readRequestBody(t, r)
+		if strings.Contains(body, "sync-collection") {
+			writeDAVXML(t, w, syncResponse(
+				changedResponse("/books/personal/alice.vcf", `&quot;one&quot;`)+
+					changedResponse("/books/personal/bob.vcf", `&quot;two&quot;`), "next",
+			))
+			return
+		}
+		// Apple's CardDAV answers an addressbook-multiget whose DAV:href values
+		// carry a scheme and host with HTTP 400.
+		var cards strings.Builder
+		for _, href := range requestedHrefs(body) {
+			assert.NotContains(href, "://")
+			if !strings.HasPrefix(href, "/") {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			cards.WriteString(cardResponse(href, `&quot;card&quot;`, strings.TrimSuffix(path.Base(href), ".vcf")))
+		}
+		writeDAVXML(t, w, syncResponse(cards.String(), ""))
+	}))
+	t.Cleanup(server.Close)
+	service, _, _ := newPullService(t, server, true)
+
+	result, err := service.Sync(t.Context(), SyncOptions{Full: true})
+	require.NoError(err)
+	assert.Equal(2, result.Created)
+}
+
 func TestSyncContinuesTruncated507PageAcrossEquivalentCollectionURLs(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -589,6 +847,7 @@ func TestSyncContinuesTruncated507PageAcrossEquivalentCollectionURLs(t *testing.
 }
 
 func TestSyncRejectsContinuationTokenCycle(t *testing.T) {
+	t.Parallel()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		events := `<D:response><D:href>/books/personal/</D:href><D:status>HTTP/1.1 507 Insufficient Storage</D:status></D:response>`
 		writeDAVXML(t, w, syncResponse(events, "cycle"))
@@ -601,6 +860,7 @@ func TestSyncRejectsContinuationTokenCycle(t *testing.T) {
 }
 
 func TestSyncReconcilesInvalidSyncTokenOnce(t *testing.T) {
+	t.Parallel()
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body := readRequestBody(t, r)
@@ -625,8 +885,10 @@ func TestSyncReconcilesInvalidSyncTokenOnce(t *testing.T) {
 }
 
 func TestManualFullSyncMarksSnapshotAsCompleteReconciliation(t *testing.T) {
+	t.Parallel()
 	for _, supportsSync := range []bool{false, true} {
 		t.Run(fmt.Sprintf("sync-collection=%t", supportsSync), func(t *testing.T) {
+			t.Parallel()
 			assert := assert.New(t)
 			require := require.New(t)
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -634,12 +896,12 @@ func TestManualFullSyncMarksSnapshotAsCompleteReconciliation(t *testing.T) {
 			}))
 			t.Cleanup(server.Close)
 			service, st, book := newPullService(t, server, supportsSync)
-			account, err := st.GetCardDAVAccountContext(t.Context())
+			account, err := st.GetCardDAVAccountByIDContext(t.Context(), store.DefaultCardDAVAccountID)
 			require.NoError(err)
 			require.NotNil(account)
 
 			plan, err := service.fetchBookPlan(t.Context(), *account, book, SyncOptions{Full: true},
-				&operationBudget{remaining: defaultOperationBytes}, &bookSyncState{})
+				&Budget{remaining: defaultOperationBytes}, &bookSyncState{})
 			require.NoError(err)
 			assert.True(plan.CompletesFullReconcile)
 		})
@@ -647,8 +909,10 @@ func TestManualFullSyncMarksSnapshotAsCompleteReconciliation(t *testing.T) {
 }
 
 func TestSyncDowngradesUnsupportedSyncCollectionToSnapshot(t *testing.T) {
+	t.Parallel()
 	for _, status := range []int{http.StatusMethodNotAllowed, http.StatusNotImplemented} {
 		t.Run(http.StatusText(status), func(t *testing.T) {
+			t.Parallel()
 			requests := 0
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				body := readRequestBody(t, r)
@@ -670,17 +934,19 @@ func TestSyncDowngradesUnsupportedSyncCollectionToSnapshot(t *testing.T) {
 	}
 }
 
-func TestParseRemoteResourceStripsContactSchemesCaseInsensitively(t *testing.T) {
+func TestParseRemoteResourceRetainsPhoneEndpoint(t *testing.T) {
+	t.Parallel()
 	body := []byte("BEGIN:VCARD\r\nVERSION:4.0\r\nUID:schemes\r\nFN:Schemes\r\n" +
 		"EMAIL:MAILTO:Alice@Example.test\r\nTEL:TeL:+1-202-555-0100\r\nEND:VCARD\r\n")
 
 	resource, err := parseRemoteResource("https://contacts.example/schemes.vcf", `"one"`, body)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"Alice@Example.test"}, resource.Emails)
-	assert.Equal(t, []string{"+1-202-555-0100"}, resource.Phones)
+	assert.Equal(t, []string{"TeL:+1-202-555-0100"}, resource.Phones)
 }
 
 func TestParseRemoteResourceDecodesTextContactValues(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	body := []byte("BEGIN:VCARD\r\nVERSION:3.0\r\nUID:escaped\r\n" +
 		`FN:Doe\, Jane` + "\r\n" +
@@ -692,4 +958,409 @@ func TestParseRemoteResourceDecodesTextContactValues(t *testing.T) {
 	assert.Equal("Doe, Jane", resource.DisplayName)
 	assert.Equal([]string{"local,tag@example.test"}, resource.Emails)
 	assert.Equal([]string{"+1,202"}, resource.Phones)
+}
+
+// googleLikeState drives a fake with Google's observed CardDAV behavior:
+// sync-collection rejects an empty token with a JSON 400, addressbook-query
+// answers with an empty multistatus even when the book has members, and
+// PROPFIND plus addressbook-multiget work normally.
+type googleLikeState struct {
+	mu       sync.Mutex
+	requests []string
+	token    string
+	listing  []string          // member hrefs returned by PROPFIND Depth 1
+	uids     map[string]string // href -> UID served by multiget
+	etags    map[string]string // href -> escaped ETag
+	changes  string            // sync-collection events for a non-empty token
+
+	omitCollection bool            // Depth 1 listing leaves out the collection's own response
+	untagged       map[string]bool // members listed with a 404 getetag and no resourcetype
+}
+
+func multiStatusBody(responses string) string {
+	return `<?xml version="1.0"?><D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav">` + responses + `</D:multistatus>`
+}
+
+// untaggedResponse is a member whose getetag is absent and whose resourcetype
+// says nothing, which a listing must treat as a fault rather than skip.
+func untaggedResponse(href string) string {
+	return `<D:response><D:href>` + href + `</D:href><D:propstat><D:prop><D:getetag/></D:prop><D:status>HTTP/1.1 404 Not Found</D:status></D:propstat></D:response>`
+}
+
+// collectionResponse is what a collection looks like in a Depth 1 listing:
+// a resourcetype naming DAV:collection and no entity tag.
+func collectionResponse(href string) string {
+	return `<D:response><D:href>` + href + `</D:href>` +
+		`<D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>` +
+		`<D:propstat><D:prop><D:getetag/></D:prop><D:status>HTTP/1.1 404 Not Found</D:status></D:propstat></D:response>`
+}
+
+func newGoogleLikeHandler(t *testing.T, state *googleLikeState) http.HandlerFunc {
+	t.Helper()
+	return func(w http.ResponseWriter, r *http.Request) {
+		body := readRequestBody(t, r)
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		switch {
+		case r.Method == "PROPFIND" && r.Header.Get("Depth") == "0":
+			state.requests = append(state.requests, "PROPFIND 0")
+			writeDAVXML(t, w, multiStatusBody(`<D:response><D:href>/books/personal/</D:href><D:propstat><D:prop><D:sync-token>`+
+				state.token+`</D:sync-token></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`))
+		case r.Method == "PROPFIND":
+			state.requests = append(state.requests, "PROPFIND "+r.Header.Get("Depth"))
+			var responses strings.Builder
+			if !state.omitCollection {
+				responses.WriteString(collectionResponse("/books/personal/"))
+			}
+			for _, href := range state.listing {
+				switch {
+				case strings.HasSuffix(href, "/"):
+					responses.WriteString(collectionResponse(href))
+				case state.untagged[href]:
+					responses.WriteString(untaggedResponse(href))
+				default:
+					responses.WriteString(changedResponse(href, state.etags[href]))
+				}
+			}
+			writeDAVXML(t, w, multiStatusBody(responses.String()))
+		case r.Method == "REPORT" && strings.Contains(body, "sync-collection"):
+			token := syncRequestToken(body)
+			state.requests = append(state.requests, "REPORT sync-collection "+token)
+			if token == "" {
+				w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+				w.WriteHeader(http.StatusBadRequest)
+				_, err := w.Write([]byte(`{"error": {"code": 400, "message": "Request contains an invalid argument.", "status": "INVALID_ARGUMENT"}}`))
+				assert.NoError(t, err)
+				return
+			}
+			writeDAVXML(t, w, syncResponse(state.changes, state.token))
+		case r.Method == "REPORT" && strings.Contains(body, "addressbook-query"):
+			state.requests = append(state.requests, "REPORT addressbook-query")
+			writeDAVXML(t, w, `<?xml version="1.0"?><D:multistatus xmlns:D="DAV:"/>`)
+		case r.Method == "REPORT" && strings.Contains(body, "addressbook-multiget"):
+			hrefs := requestedHrefs(body)
+			state.requests = append(state.requests, "REPORT addressbook-multiget "+strings.Join(hrefs, ","))
+			var responses strings.Builder
+			for _, href := range hrefs {
+				responses.WriteString(cardResponse(href, state.etags[href], state.uids[href]))
+			}
+			writeDAVXML(t, w, multiStatusBody(responses.String()))
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}
+}
+
+func newGoogleLikeState() *googleLikeState {
+	return &googleLikeState{
+		token:   "token-1",
+		listing: []string{"/books/personal/alice.vcf", "/books/personal/bob.vcf"},
+		uids:    map[string]string{"/books/personal/alice.vcf": "alice", "/books/personal/bob.vcf": "bob"},
+		etags:   map[string]string{"/books/personal/alice.vcf": `&quot;a1&quot;`, "/books/personal/bob.vcf": `&quot;b1&quot;`},
+	}
+}
+
+func TestInitialSyncFallsBackToEnumeratedSnapshotWhenEmptyTokenIsRejected(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+	state := newGoogleLikeState()
+	state.listing = append(state.listing, "/books/personal/nested/")
+	server := httptest.NewServer(newGoogleLikeHandler(t, state))
+	t.Cleanup(server.Close)
+	service, st, book := newPullService(t, server, true)
+
+	result, err := service.Sync(t.Context(), SyncOptions{})
+	require.NoError(err)
+	assert.Equal(SyncResult{Books: 1, Created: 2}, result)
+	assert.Equal([]string{
+		"REPORT sync-collection ",
+		"PROPFIND 0",
+		"PROPFIND 1",
+		"REPORT addressbook-multiget /books/personal/alice.vcf,/books/personal/bob.vcf",
+	}, state.requests)
+	books, err := st.ListCardDAVAddressBooksContext(t.Context(), store.AllCardDAVAccounts)
+	require.NoError(err)
+	require.Len(books, 1)
+	assert.Equal("token-1", books[0].SyncToken, "the token read before the listing must be stored")
+	resource, err := st.GetCardDAVResourceContext(t.Context(), book.ID, server.URL+"/books/personal/bob.vcf")
+	require.NoError(err)
+	assert.Equal(`"b1"`, resource.RemoteETag)
+
+	// The stored token routes the next sync through sync-collection.
+	state.mu.Lock()
+	state.requests = nil
+	state.token = "token-2"
+	state.etags["/books/personal/alice.vcf"] = `&quot;a2&quot;`
+	state.changes = changedResponse("/books/personal/alice.vcf", `&quot;a2&quot;`)
+	state.mu.Unlock()
+	result, err = service.Sync(t.Context(), SyncOptions{})
+	require.NoError(err)
+	assert.Equal(SyncResult{Books: 1, Updated: 1}, result)
+	assert.Equal([]string{
+		"REPORT sync-collection token-1",
+		"REPORT addressbook-multiget /books/personal/alice.vcf",
+	}, state.requests)
+	books, err = st.ListCardDAVAddressBooksContext(t.Context(), store.AllCardDAVAccounts)
+	require.NoError(err)
+	assert.Equal("token-2", books[0].SyncToken)
+}
+
+func TestGoogleInitialSyncSkipsEmptyTokenSyncCollection(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+	state := newGoogleLikeState()
+	server := httptest.NewServer(newGoogleLikeHandler(t, state))
+	t.Cleanup(server.Close)
+	base, st, _ := newPullService(t, server, true)
+	service := NewGoogleService(st, base.dav().client)
+
+	result, err := service.Sync(t.Context(), SyncOptions{Full: true})
+	require.NoError(err)
+	assert.Equal(SyncResult{Books: 1, Created: 2}, result)
+	assert.Equal([]string{
+		"PROPFIND 0",
+		"PROPFIND 1",
+		"REPORT addressbook-multiget /books/personal/alice.vcf,/books/personal/bob.vcf",
+	}, state.requests, "Google never receives the empty-token sync-collection it rejects")
+	books, err := st.ListCardDAVAddressBooksContext(t.Context(), store.AllCardDAVAccounts)
+	require.NoError(err)
+	require.Len(books, 1)
+	assert.Equal("token-1", books[0].SyncToken)
+	runs, err := st.ListCardDAVSyncRunsContext(t.Context(), 10, nil, store.AllCardDAVAccounts)
+	require.NoError(err)
+	require.Len(runs, 1)
+	assert.Equal(store.CardDAVSyncRunSucceeded, runs[0].State)
+
+	state.mu.Lock()
+	state.requests = nil
+	state.mu.Unlock()
+	result, err = service.Sync(t.Context(), SyncOptions{})
+	require.NoError(err)
+	assert.Equal(SyncResult{Books: 1}, result)
+	assert.Equal([]string{"REPORT sync-collection token-1"}, state.requests)
+}
+
+func TestGoogleInvalidTokenReconcileUsesEnumeratedSnapshot(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+	state := newGoogleLikeState()
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) == 1 {
+			w.WriteHeader(http.StatusForbidden)
+			_, err := w.Write([]byte(`<D:error xmlns:D="DAV:"><D:valid-sync-token/></D:error>`))
+			assert.NoError(err)
+			return
+		}
+		newGoogleLikeHandler(t, state)(w, r)
+	}))
+	t.Cleanup(server.Close)
+	base, st, book := newPullService(t, server, true)
+	service := NewGoogleService(st, base.dav().client)
+	_, err := st.DB().Exec(st.Rebind(`UPDATE carddav_address_books SET sync_token = ? WHERE id = ?`), "stale-token", book.ID)
+	require.NoError(err)
+
+	result, err := service.Sync(t.Context(), SyncOptions{})
+	require.NoError(err)
+	assert.Equal(SyncResult{Books: 1, Created: 2}, result)
+	assert.Equal([]string{
+		"PROPFIND 0",
+		"PROPFIND 1",
+		"REPORT addressbook-multiget /books/personal/alice.vcf,/books/personal/bob.vcf",
+	}, state.requests)
+}
+
+func TestIncrementalSyncBadRequestIsNotDowngraded(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+	var mu sync.Mutex
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := readRequestBody(t, r)
+		mu.Lock()
+		defer mu.Unlock()
+		if strings.Contains(body, "sync-collection") {
+			requests = append(requests, "REPORT sync-collection "+syncRequestToken(body))
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		requests = append(requests, r.Method)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+	service, st, book := newPullService(t, server, true)
+	_, err := st.DB().Exec(st.Rebind(`UPDATE carddav_address_books SET sync_token = ? WHERE id = ?`), "token-1", book.ID)
+	require.NoError(err)
+
+	_, err = service.Sync(t.Context(), SyncOptions{})
+	require.Error(err)
+	var status *StatusError
+	require.ErrorAs(err, &status)
+	assert.Equal(http.StatusBadRequest, status.StatusCode)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal([]string{"REPORT sync-collection token-1"}, requests)
+}
+
+func TestEnumeratedSnapshotRejectsEmptyMemberListing(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+	state := newGoogleLikeState()
+	var emptyListing atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if emptyListing.Load() && r.Method == "PROPFIND" && r.Header.Get("Depth") == "1" {
+			writeDAVXML(t, w, `<?xml version="1.0"?><D:multistatus xmlns:D="DAV:"/>`)
+			return
+		}
+		newGoogleLikeHandler(t, state)(w, r)
+	}))
+	t.Cleanup(server.Close)
+	base, st, book := newPullService(t, server, true)
+	service := NewGoogleService(st, base.dav().client)
+	_, err := service.Sync(t.Context(), SyncOptions{Full: true})
+	require.NoError(err)
+
+	emptyListing.Store(true)
+	_, err = service.Sync(t.Context(), SyncOptions{Full: true})
+	require.ErrorContains(err, "sync failed")
+	resource, err := st.GetCardDAVResourceContext(t.Context(), book.ID, server.URL+"/books/personal/alice.vcf")
+	require.NoError(err, "a listing that omits even the collection must not tombstone the book")
+	assert.Equal(`"a1"`, resource.RemoteETag)
+}
+
+func TestEnumeratedSnapshotTreatsTruncatedListingAsTruncatedSnapshot(t *testing.T) {
+	t.Parallel()
+	state := newGoogleLikeState()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "PROPFIND" && r.Header.Get("Depth") == "1" {
+			w.WriteHeader(http.StatusInsufficientStorage)
+			return
+		}
+		newGoogleLikeHandler(t, state)(w, r)
+	}))
+	t.Cleanup(server.Close)
+	base, st, _ := newPullService(t, server, true)
+	service := NewGoogleService(st, base.dav().client)
+
+	_, err := service.Sync(t.Context(), SyncOptions{Full: true})
+	require.ErrorIs(t, err, ErrTruncatedSnapshot)
+}
+
+func TestGoogleSnapshotNeverUsesAddressbookQuery(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+	state := newGoogleLikeState()
+	server := httptest.NewServer(newGoogleLikeHandler(t, state))
+	t.Cleanup(server.Close)
+	base, st, _ := newPullService(t, server, false)
+	service := NewGoogleService(st, base.dav().client)
+
+	result, err := service.Sync(t.Context(), SyncOptions{Full: true})
+	require.NoError(err)
+	assert.Equal(SyncResult{Books: 1, Created: 2}, result)
+	assert.NotContains(state.requests, "REPORT addressbook-query",
+		"Google's empty addressbook-query must never become a replace-all plan")
+	assert.Equal([]string{
+		"PROPFIND 0",
+		"PROPFIND 1",
+		"REPORT addressbook-multiget /books/personal/alice.vcf,/books/personal/bob.vcf",
+	}, state.requests)
+}
+
+// serial: replaces the process-wide slog logger.
+func TestEnumeratedSnapshotWarnsWhenCollectionOmitsSyncToken(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	state := newGoogleLikeState()
+	state.token = ""
+	server := httptest.NewServer(newGoogleLikeHandler(t, state))
+	t.Cleanup(server.Close)
+	var logged bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logged, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	base, st, _ := newPullService(t, server, true)
+	service := NewGoogleService(st, base.dav().client)
+
+	result, err := service.Sync(t.Context(), SyncOptions{})
+	require.NoError(err)
+	assert.Equal(SyncResult{Books: 1, Created: 2}, result)
+	assert.Contains(logged.String(), "level=WARN")
+	assert.Contains(logged.String(), "no sync token")
+	books, err := st.ListCardDAVAddressBooksContext(t.Context(), store.AllCardDAVAccounts)
+	require.NoError(err)
+	require.Len(books, 1)
+	assert.Empty(books[0].SyncToken)
+
+	// Without a token the next sync enumerates again rather than failing.
+	state.mu.Lock()
+	state.requests = nil
+	state.mu.Unlock()
+	result, err = service.Sync(t.Context(), SyncOptions{})
+	require.NoError(err)
+	assert.Equal(SyncResult{Books: 1}, result)
+	assert.Equal([]string{
+		"PROPFIND 0",
+		"PROPFIND 1",
+		"REPORT addressbook-multiget /books/personal/alice.vcf,/books/personal/bob.vcf",
+	}, state.requests)
+}
+
+func TestEnumeratedSnapshotRejectsListingThatOmitsCollection(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+	state := newGoogleLikeState()
+	server := httptest.NewServer(newGoogleLikeHandler(t, state))
+	t.Cleanup(server.Close)
+	base, st, book := newPullService(t, server, true)
+	service := NewGoogleService(st, base.dav().client)
+	_, err := service.Sync(t.Context(), SyncOptions{Full: true})
+	require.NoError(err)
+
+	state.mu.Lock()
+	state.omitCollection = true
+	state.listing = []string{"/books/personal/alice.vcf"}
+	state.mu.Unlock()
+	_, err = service.Sync(t.Context(), SyncOptions{Full: true})
+	require.ErrorContains(err, "sync failed")
+	resource, err := st.GetCardDAVResourceContext(t.Context(), book.ID, server.URL+"/books/personal/bob.vcf")
+	require.NoError(err, "a listing without the collection's own response is incomplete and must not remove members")
+	assert.Equal(`"b1"`, resource.RemoteETag)
+}
+
+func TestEnumeratedSnapshotRejectsMemberWithoutETag(t *testing.T) {
+	t.Parallel()
+	assert := assert.New(t)
+	require := require.New(t)
+	state := newGoogleLikeState()
+	server := httptest.NewServer(newGoogleLikeHandler(t, state))
+	t.Cleanup(server.Close)
+	base, st, book := newPullService(t, server, true)
+	service := NewGoogleService(st, base.dav().client)
+	_, err := service.Sync(t.Context(), SyncOptions{Full: true})
+	require.NoError(err)
+
+	state.mu.Lock()
+	state.untagged = map[string]bool{"/books/personal/bob.vcf": true}
+	state.mu.Unlock()
+	_, err = service.Sync(t.Context(), SyncOptions{Full: true})
+	require.ErrorContains(err, "sync failed")
+	resource, err := st.GetCardDAVResourceContext(t.Context(), book.ID, server.URL+"/books/personal/bob.vcf")
+	require.NoError(err, "a member with no ETag and no resourcetype may still exist and must not be removed")
+	assert.Equal(`"b1"`, resource.RemoteETag)
+}
+
+func (s *Service) dav() *davRemote {
+	remote, ok := s.remote.(*davRemote)
+	if !ok {
+		panic("service does not use the CardDAV remote")
+	}
+	return remote
 }

@@ -2,10 +2,12 @@ package slack
 
 import (
 	"database/sql"
+	"math"
 	"regexp"
 	"strings"
 
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/textutil"
 )
 
 // messageType is the msgvault message_type for all Slack-archived messages.
@@ -136,14 +138,6 @@ func payloadText(m *Message, lookupName func(string) string) string {
 	return strings.Join(parts, "\n")
 }
 
-func snippet(text string) string {
-	r := []rune(text)
-	if len(r) > 100 {
-		return string(r[:100])
-	}
-	return text
-}
-
 // mapMessage converts a Slack Message into a store.Message plus its rendered
 // plain-text body. isFromMe is decided by the caller (archiving user's ID).
 //
@@ -174,11 +168,22 @@ func mapMessage(m *Message, channelID string, conversationID, storeSourceID int6
 		SentAt:          sql.NullTime{Time: t, Valid: !t.IsZero()},
 		ReceivedAt:      sql.NullTime{Time: t, Valid: !t.IsZero()},
 		IsFromMe:        isFromMe,
-		Snippet:         sql.NullString{String: snippet(text), Valid: text != ""},
+		Snippet:         sql.NullString{String: textutil.PrefixRunes(text, 100), Valid: text != ""},
+		SizeEstimate:    messageSizeEstimate(m, text),
 		HasAttachments:  len(m.Files) > 0,
 		AttachmentCount: len(m.Files),
 	}
 	return msg, text
+}
+
+func messageSizeEstimate(m *Message, body string) int64 {
+	size := int64(len(body))
+	for _, file := range m.Files {
+		if file.Size > 0 && file.Size <= math.MaxInt64-size {
+			size += file.Size
+		}
+	}
+	return size
 }
 
 // conversationType maps a Slack conversation to the msgvault conversation

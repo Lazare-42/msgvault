@@ -1,19 +1,18 @@
 package query
 
 import (
-	"bytes"
 	"cmp"
-	"compress/zlib"
 	"context"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
-	"io"
 	"slices"
 	"strings"
 
 	"go.kenn.io/msgvault/internal/mime"
 	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/sourcescope"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -27,6 +26,7 @@ const (
 	datasetConversations            = "conversations"
 	datasetConversationParticipants = "conversation_participants"
 	datasetOwnerParticipants        = "owner_participants"
+	datasetPersonDisplayNames       = "person_display_names"
 	datasetParticipantClusters      = "participant_clusters"
 	messageTypeDimension            = "message_type"
 	messageTypeEmail                = "email"
@@ -55,14 +55,24 @@ const emailOnlyFilterMsg = "(msg.message_type = '" + messageTypeEmail + "' OR ms
 // NULL and empty string handle old data where message_type was not yet populated.
 const emailOnlyFilterM = "(m.message_type = '" + messageTypeEmail + "' OR m.message_type IS NULL OR m.message_type = '')"
 
-// hasExplicitMessageTypeSearch reports whether a parsed search query selects
-// one or more message types. Default analytics use this to apply the positive
-// email-only predicate without overriding an explicit message-type scope.
-func hasExplicitMessageTypeSearch(searchQuery string) bool {
-	if searchQuery == "" {
+// defaultsToEmail leaves OR defaults to each alternative.
+func defaultsToEmail(q *search.Query, filter *MessageFilter, accountScopes []search.AccountScope) bool {
+	if len(accountScopes) > 0 || (filter != nil && (strings.TrimSpace(filter.MessageType) != "" || len(filter.AccountScopes) > 0)) {
 		return false
 	}
-	return len(search.Parse(searchQuery).MessageTypes) > 0
+	return q == nil || (!q.HasOR() && len(q.MessageTypes) == 0 && len(q.AccountAddrs) == 0)
+}
+
+func parseAnalyticsSearch(raw string, defaultEmail bool) *search.Query {
+	q := search.ParseOR(raw)
+	if defaultEmail && q.HasOR() {
+		for _, branch := range q.Alternatives {
+			if defaultsToEmail(branch, nil, nil) {
+				branch.MessageTypes = []string{messageTypeEmail}
+			}
+		}
+	}
+	return q
 }
 
 // shouldDefaultStatsToEmail reports whether a generic stats query should use
@@ -70,7 +80,39 @@ func hasExplicitMessageTypeSearch(searchQuery string) bool {
 // message-type scope as search, while an explicit message_type remains
 // authoritative in either mode.
 func shouldDefaultStatsToEmail(opts StatsOptions) bool {
-	return !opts.SearchScope && !hasExplicitMessageTypeSearch(opts.SearchQuery)
+	return !opts.SearchScope && defaultsToEmail(search.ParseOR(opts.SearchQuery), opts.Filter, nil)
+}
+
+// appendAccountScopeConditions adds one predicate per account scope against
+// the messages table aliased as alias.
+func appendAccountScopeConditions(
+	conditions []string, args []any, scopes []search.AccountScope, alias string,
+) ([]string, []any) {
+	scopeConditions, scopeArgs := search.AccountScopeConditions(scopes, alias)
+	return append(conditions, scopeConditions...), append(args, scopeArgs...)
+}
+
+// effectiveStatsFilter returns the complete message scope for a stats query.
+// Legacy top-level options remain authoritative so existing callers can add a
+// full filter without changing their source, attachment, or deletion scope.
+func effectiveStatsFilter(opts StatsOptions) *MessageFilter {
+	if opts.Filter == nil {
+		return nil
+	}
+	filter := opts.Filter.Clone()
+	if opts.SourceIDs != nil {
+		filter.SourceIDs = make([]int64, len(opts.SourceIDs))
+		copy(filter.SourceIDs, opts.SourceIDs)
+		filter.SourceID = nil
+	} else if opts.SourceID != nil {
+		filter.SourceID = opts.SourceID
+		filter.SourceIDs = nil
+	}
+	filter.WithAttachmentsOnly = filter.WithAttachmentsOnly || opts.WithAttachmentsOnly
+	filter.HideDeletedFromSource = filter.HideDeletedFromSource || opts.HideDeletedFromSource
+	filter.Pagination = Pagination{}
+	filter.Sorting = MessageSorting{}
+	return &filter
 }
 
 // participantNameExpr returns the SQL expression for a participant's display
@@ -134,7 +176,7 @@ func noopRebind(q string) string { return q }
 // fetchLabelsForMessageList adds labels to message summaries using a batch query.
 // tablePrefix is "" for direct SQLite or "sqlite_db." for DuckDB's sqlite_scan.
 // rebind rewrites the ? placeholders for the driver in use.
-func fetchLabelsForMessageList(ctx context.Context, db *sql.DB, rebind rebindFunc, tablePrefix string, messages []MessageSummary) error {
+func fetchLabelsForMessageList(ctx context.Context, db store.SQLReader, rebind rebindFunc, tablePrefix string, messages []MessageSummary) error {
 	if len(messages) == 0 {
 		return nil
 	}
@@ -178,7 +220,7 @@ func fetchLabelsForMessageList(ctx context.Context, db *sql.DB, rebind rebindFun
 // fetchParticipantsForMessageList adds recipients to message summaries using a batch query.
 // tablePrefix is "" for direct SQLite or "sqlite_db." for DuckDB's sqlite_scan.
 // rebind rewrites the ? placeholders for the driver in use.
-func fetchParticipantsForMessageList(ctx context.Context, db *sql.DB, rebind rebindFunc, tablePrefix string, messages []MessageSummary) error {
+func fetchParticipantsForMessageList(ctx context.Context, db store.SQLReader, rebind rebindFunc, tablePrefix string, messages []MessageSummary) error {
 	if len(messages) == 0 {
 		return nil
 	}
@@ -238,7 +280,7 @@ func appendSummaryRecipient(msg *MessageSummary, recipType string, addr Address)
 // fetchMessageLabelsDetail fetches labels for a single message detail.
 // tablePrefix is "" for direct SQLite or "sqlite_db." for DuckDB's sqlite_scan.
 // rebind rewrites the ? placeholders for the driver in use.
-func fetchMessageLabelsDetail(ctx context.Context, db *sql.DB, rebind rebindFunc, tablePrefix string, msg *MessageDetail) error {
+func fetchMessageLabelsDetail(ctx context.Context, db store.SQLReader, rebind rebindFunc, tablePrefix string, msg *MessageDetail) error {
 	rows, err := db.QueryContext(ctx, rebind(fmt.Sprintf(`
 		SELECT l.name
 		FROM %smessage_labels ml
@@ -264,7 +306,7 @@ func fetchMessageLabelsDetail(ctx context.Context, db *sql.DB, rebind rebindFunc
 // fetchParticipantsShared fetches participants for a single message detail.
 // tablePrefix is "" for direct SQLite or "sqlite_db." for DuckDB's sqlite_scan.
 // rebind rewrites the ? placeholders for the driver in use.
-func fetchParticipantsShared(ctx context.Context, db *sql.DB, rebind rebindFunc, tablePrefix string, msg *MessageDetail) error {
+func fetchParticipantsShared(ctx context.Context, db store.SQLReader, rebind rebindFunc, tablePrefix string, msg *MessageDetail) error {
 	rows, err := db.QueryContext(ctx, rebind(fmt.Sprintf(`
 		SELECT mr.recipient_type,
 		       COALESCE(NULLIF(p.email_address, ''), NULLIF(p.phone_number, ''), ''),
@@ -319,9 +361,9 @@ func fetchParticipantsShared(ctx context.Context, db *sql.DB, rebind rebindFunc,
 // fetchAttachmentsShared fetches attachments for a single message detail.
 // tablePrefix is "" for direct SQLite or "sqlite_db." for DuckDB's sqlite_scan.
 // rebind rewrites the ? placeholders for the driver in use.
-func fetchAttachmentsShared(ctx context.Context, db *sql.DB, rebind rebindFunc, tablePrefix string, msg *MessageDetail) error {
+func fetchAttachmentsShared(ctx context.Context, db store.SQLReader, rebind rebindFunc, tablePrefix string, msg *MessageDetail) error {
 	rows, err := db.QueryContext(ctx, rebind(fmt.Sprintf(`
-		SELECT id, COALESCE(filename, ''), COALESCE(mime_type, ''), COALESCE(size, 0), COALESCE(content_hash, ''), COALESCE(storage_path, '')
+		SELECT id, COALESCE(filename, ''), COALESCE(mime_type, ''), COALESCE(size, 0), COALESCE(content_hash, ''), COALESCE(storage_path, ''), COALESCE(source_attachment_id, '')
 		FROM %sattachments
 		WHERE message_id = ?
 	`, tablePrefix)), msg.ID)
@@ -329,43 +371,42 @@ func fetchAttachmentsShared(ctx context.Context, db *sql.DB, rebind rebindFunc, 
 		return err
 	}
 	defer func() { _ = rows.Close() }()
+	var hashes []string
 
 	for rows.Next() {
 		var att AttachmentInfo
-		var storagePath string
-		if err := rows.Scan(&att.ID, &att.Filename, &att.MimeType, &att.Size, &att.ContentHash, &storagePath); err != nil {
+		var storagePath, sourceAttachmentID string
+		if err := rows.Scan(&att.ID, &att.Filename, &att.MimeType, &att.Size, &att.ContentHash, &storagePath, &sourceAttachmentID); err != nil {
 			return err
 		}
+		var receiptHash string
+		att.ContentHash, receiptHash = store.AttachmentReadHashes(att.ContentHash, storagePath, sourceAttachmentID)
 		if isURLStoragePath(storagePath) {
 			att.URL = storagePath
 			att.ContentHash = ""
-		} else if att.ContentHash == "" {
-			if pathHash, ok := attachmentCASPathHash(storagePath); ok {
-				att.ContentHash = pathHash
-			}
 		}
 		msg.Attachments = append(msg.Attachments, att)
+		hashes = append(hashes, receiptHash)
 	}
 
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	refs, err := store.LoadDocbankAttachmentRefs(ctx, db, rebind, tablePrefix, hashes)
+	if err != nil {
+		return err
+	}
+	for i := range msg.Attachments {
+		msg.Attachments[i].Docbank = refs[strings.ToLower(hashes[i])]
+	}
+	return nil
 }
 
 func isURLStoragePath(path string) bool {
 	return strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://")
-}
-
-func attachmentCASPathHash(storagePath string) (string, bool) {
-	if len(storagePath) != 67 || storagePath[2] != '/' {
-		return "", false
-	}
-	contentHash := storagePath[3:]
-	if contentHash != strings.ToLower(contentHash) || storagePath[:2] != contentHash[:2] {
-		return "", false
-	}
-	if _, err := hex.DecodeString(contentHash); err != nil {
-		return "", false
-	}
-	return contentHash, true
 }
 
 func attachmentCASPath(contentHash string) string {
@@ -381,30 +422,25 @@ func attachmentCASPath(contentHash string) string {
 // extractBodyFromRawShared extracts text body from compressed MIME data.
 // tablePrefix is "" for direct SQLite or "sqlite_db." for DuckDB's sqlite_scan.
 // rebind rewrites the ? placeholders for the driver in use.
-func extractBodyFromRawShared(ctx context.Context, db *sql.DB, rebind rebindFunc, tablePrefix string, messageID int64) (string, error) {
+func extractBodyFromRawShared(ctx context.Context, db store.SQLReader, rebind rebindFunc, tablePrefix string, messageID int64) (string, error) {
 	var compressed []byte
 	var compression sql.NullString
+	var storedBytes int64
 
+	limit := messageByteLimit(ctx)
+	rawColumn, rawSize := messageRawColumns(tablePrefix, limit)
 	err := db.QueryRowContext(ctx, rebind(fmt.Sprintf(`
-		SELECT raw_data, compression FROM %smessage_raw WHERE message_id = ?
-	`, tablePrefix)), messageID).Scan(&compressed, &compression)
+		SELECT %s, mr.compression, %s FROM %smessage_raw mr WHERE mr.message_id = ?
+	`, rawColumn, rawSize, tablePrefix)), messageID).Scan(&compressed, &compression, &storedBytes)
 	if err != nil {
 		return "", err
 	}
-
-	var rawData []byte
-	if compression.Valid && compression.String == "zlib" {
-		r, err := zlib.NewReader(bytes.NewReader(compressed))
-		if err != nil {
-			return "", fmt.Errorf("open zlib reader for raw message: %w", err)
-		}
-		defer func() { _ = r.Close() }()
-		rawData, err = io.ReadAll(r)
-		if err != nil {
-			return "", err
-		}
-	} else {
-		rawData = compressed
+	if limit > 0 && storedBytes > int64(len(compressed)) {
+		return "", ErrOriginalMessageTooLarge
+	}
+	rawData, err := inflateMessageRaw(compressed, compression, limit)
+	if err != nil {
+		return "", err
 	}
 
 	parsed, err := mime.Parse(rawData)
@@ -412,59 +448,64 @@ func extractBodyFromRawShared(ctx context.Context, db *sql.DB, rebind rebindFunc
 		return "", err
 	}
 
-	return parsed.GetBodyText(), nil
+	body := parsed.GetBodyText()
+	// Charset decoding can grow text past the raw size checked above.
+	if limit > 0 && int64(len(body)) > limit {
+		return "", ErrOriginalMessageTooLarge
+	}
+	return body, nil
 }
 
 // getMessageRawShared retrieves and decompresses raw MIME data for a message.
 // Returns nil, nil if no raw data is stored or if the message is an internal
 // deduplication loser (deleted_at). Source-deleted rows remain archive data and
 // are available to raw MIME consumers.
-func getMessageRawShared(ctx context.Context, db *sql.DB, rebind rebindFunc, tablePrefix string, messageID int64) ([]byte, error) {
+func getMessageRawShared(ctx context.Context, db store.SQLReader, rebind rebindFunc, tablePrefix string, messageID int64) ([]byte, error) {
 	var compressed []byte
 	var compression sql.NullString
+	var storedBytes int64
 
+	limit := messageByteLimit(ctx)
+	rawColumn, rawSize := messageRawColumns(tablePrefix, limit)
 	err := db.QueryRowContext(ctx, rebind(fmt.Sprintf(`
-		SELECT mr.raw_data, mr.compression
+		SELECT %s, mr.compression, %s
 		FROM %smessage_raw mr
 		JOIN %smessages m ON m.id = mr.message_id
 		WHERE mr.message_id = ? AND %s
-	`, tablePrefix, tablePrefix, store.LiveMessagesWhere("m", false))), messageID).Scan(&compressed, &compression)
-	if err == sql.ErrNoRows {
+	`, rawColumn, rawSize, tablePrefix, tablePrefix, store.LiveMessagesWhere("m", false))), messageID).Scan(&compressed, &compression, &storedBytes)
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, fmt.Errorf("query message_raw for id %d: %w", messageID, err)
 	}
 
-	if compression.Valid && compression.String == "zlib" {
-		r, err := zlib.NewReader(bytes.NewReader(compressed))
-		if err != nil {
-			return nil, fmt.Errorf("zlib reader for id %d: %w", messageID, err)
-		}
-		defer func() { _ = r.Close() }()
-		raw, err := io.ReadAll(r)
-		if err != nil {
-			return nil, fmt.Errorf("zlib decompress message_raw id %d: %w", messageID, err)
-		}
-		return raw, nil
+	if limit > 0 && storedBytes > int64(len(compressed)) {
+		return nil, ErrOriginalMessageTooLarge
 	}
-
-	return compressed, nil
+	raw, err := inflateMessageRaw(compressed, compression, limit)
+	if err != nil {
+		return nil, fmt.Errorf("message_raw id %d: %w", messageID, err)
+	}
+	return raw, nil
 }
 
 // getMessageByQueryShared retrieves a full message detail by an arbitrary WHERE clause.
 // tablePrefix is "" for direct SQLite or "sqlite_db." for DuckDB's sqlite_scan.
 // rebind rewrites the ? placeholders for the driver in use; it is applied
 // to every sub-query this function dispatches.
-func getMessageByQueryShared(ctx context.Context, db *sql.DB, rebind rebindFunc, tablePrefix string, whereClause string, args ...any) (*MessageDetail, error) {
+func getMessageByQueryShared(ctx context.Context, db store.SQLReader, rebind rebindFunc, tablePrefix string, whereClause string, args ...any) (*MessageDetail, error) {
+	conditions, args := appendSourceFilter([]string{whereClause}, args, "m.", nil, sourcescope.IDs(ctx))
+	whereClause = strings.Join(conditions, " AND ")
 	query := fmt.Sprintf(`
 		SELECT
 			m.id,
 			m.source_id,
 			m.source_message_id,
+			COALESCE(m.rfc822_message_id, ''),
 			m.conversation_id,
 			COALESCE(conv.source_conversation_id, ''),
-			COALESCE(m.rfc822_message_id, ''),
+			COALESCE(conv.title, ''),
 			COALESCE(m.subject, ''),
 			COALESCE(m.message_type, ''),
 			COALESCE(m.snippet, ''),
@@ -473,7 +514,8 @@ func getMessageByQueryShared(ctx context.Context, db *sql.DB, rebind rebindFunc,
 			COALESCE(m.size_estimate, 0),
 			m.has_attachments,
 			COALESCE(m.is_from_me, FALSE),
-			m.deleted_from_source_at
+			m.deleted_from_source_at,
+			CASE WHEN m.message_type IN ('chatwoot', 'meeting_transcript') THEN m.metadata ELSE NULL END
 		FROM %smessages m
 		LEFT JOIN %sconversations conv ON conv.id = m.conversation_id
 		WHERE %s
@@ -481,13 +523,15 @@ func getMessageByQueryShared(ctx context.Context, db *sql.DB, rebind rebindFunc,
 
 	var msg MessageDetail
 	var sentAt, receivedAt, deletedAt sql.NullTime
+	var metadata sql.NullString
 	err := db.QueryRowContext(ctx, rebind(query), args...).Scan(
 		&msg.ID,
 		&msg.SourceID,
 		&msg.SourceMessageID,
+		&msg.RFC822MessageID,
 		&msg.ConversationID,
 		&msg.SourceConversationID,
-		&msg.RFC822MessageID,
+		&msg.ConversationTitle,
 		&msg.Subject,
 		&msg.MessageType,
 		&msg.Snippet,
@@ -497,6 +541,7 @@ func getMessageByQueryShared(ctx context.Context, db *sql.DB, rebind rebindFunc,
 		&msg.HasAttachments,
 		&msg.IsFromMe,
 		&deletedAt,
+		&metadata,
 	)
 	if err == sql.ErrNoRows {
 		return nil, nil //nolint:nilnil // Engine.GetMessage/GetMessageBySourceID use (nil, nil) for not-found; callers chain fallback lookups on the nil result
@@ -505,6 +550,12 @@ func getMessageByQueryShared(ctx context.Context, db *sql.DB, rebind rebindFunc,
 		return nil, fmt.Errorf("get message: %w", err)
 	}
 
+	msg.RelatedMessageID = store.RelatedMessageCandidate(msg.ID, msg.MessageType, metadata.String)
+	related := []store.APIMessage{{SourceID: msg.SourceID, MessageType: msg.MessageType, RelatedMessageID: msg.RelatedMessageID}}
+	if err := store.PopulateRelatedMessagesContext(ctx, db, rebind, tablePrefix, related); err != nil {
+		return nil, err
+	}
+	msg.RelatedMessageID = related[0].RelatedMessageID
 	if sentAt.Valid {
 		msg.SentAt = sentAt.Time
 	}
@@ -519,9 +570,23 @@ func getMessageByQueryShared(ctx context.Context, db *sql.DB, rebind rebindFunc,
 
 	// Fetch body from separate table (PK lookup, avoids scanning large body B-tree)
 	var bodyText, bodyHTML sql.NullString
-	err = db.QueryRowContext(ctx, rebind(fmt.Sprintf(`
-		SELECT body_text, body_html FROM %smessage_bodies WHERE message_id = ?
-	`, tablePrefix)), msg.ID).Scan(&bodyText, &bodyHTML)
+	limit := messageByteLimit(ctx)
+	if limit > 0 {
+		sizeExpr := "COALESCE(octet_length(body_text),0)+COALESCE(octet_length(body_html),0)"
+		if tablePrefix == "sqlite_db." {
+			sizeExpr = "COALESCE(octet_length(encode(body_text)),0)+COALESCE(octet_length(encode(body_html)),0)"
+		}
+		bodyColumns := fmt.Sprintf("CASE WHEN %s<=%d THEN body_text END,CASE WHEN %s<=%d THEN body_html END", sizeExpr, limit, sizeExpr, limit)
+		var bodyBytes int64
+		err = db.QueryRowContext(ctx, rebind(fmt.Sprintf("SELECT %s,%s FROM %smessage_bodies WHERE message_id = ?", bodyColumns, sizeExpr, tablePrefix)), msg.ID).Scan(&bodyText, &bodyHTML, &bodyBytes)
+		if err == nil && bodyBytes > limit {
+			return nil, ErrOriginalMessageTooLarge
+		}
+	} else {
+		err = db.QueryRowContext(ctx, rebind(fmt.Sprintf(`
+			SELECT body_text, body_html FROM %smessage_bodies WHERE message_id = ?
+		`, tablePrefix)), msg.ID).Scan(&bodyText, &bodyHTML)
+	}
 	if err == nil {
 		if bodyText.Valid {
 			msg.BodyText = bodyText.String
@@ -537,6 +602,8 @@ func getMessageByQueryShared(ctx context.Context, db *sql.DB, rebind rebindFunc,
 	if msg.BodyText == "" && msg.BodyHTML == "" {
 		if body, err := extractBodyFromRawShared(ctx, db, rebind, tablePrefix, msg.ID); err == nil && body != "" {
 			msg.BodyText = body
+		} else if errors.Is(err, ErrOriginalMessageTooLarge) {
+			return nil, err
 		}
 	}
 

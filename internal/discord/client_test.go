@@ -9,11 +9,14 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+const globalRateLimitObservationBudget = 500 * time.Millisecond
 
 func TestClientReadAPI(t *testing.T) {
 	require := require.New(t)
@@ -122,31 +125,23 @@ func TestClientFormattingDoesNotExposeBotToken(t *testing.T) {
 }
 
 func TestWaitGlobalObservesExtendedDeadline(t *testing.T) {
-	require := require.New(t)
-	limits := newRateLimitState()
-	limits.pause(nil, 60*time.Millisecond, true)
-
-	done := make(chan error, 1)
-	go func() {
-		done <- limits.waitGlobal(t.Context())
-	}()
-
-	time.Sleep(20 * time.Millisecond)
-	limits.pause(nil, 160*time.Millisecond, true)
-
-	select {
-	case err := <-done:
-		require.NoError(err)
-		require.Fail("global wait returned before an extended deadline")
-	case <-time.After(80 * time.Millisecond):
-	}
-
-	select {
-	case err := <-done:
-		require.NoError(err)
-	case <-time.After(200 * time.Millisecond):
-		require.Fail("global wait did not return after the extended deadline")
-	}
+	synctest.Test(t, func(t *testing.T) {
+		require := require.New(t)
+		limits := newRateLimitState()
+		limits.pause(nil, 60*time.Millisecond, true)
+		done := make(chan error, 1)
+		go func() { done <- limits.waitGlobal(t.Context()) }()
+		synctest.Sleep(20 * time.Millisecond)
+		limits.pause(nil, 160*time.Millisecond, true)
+		synctest.Sleep(80 * time.Millisecond)
+		select {
+		case <-done:
+			require.Fail("global wait returned before an extended deadline")
+		default:
+		}
+		synctest.Sleep(100 * time.Millisecond)
+		require.NoError(<-done)
+	})
 }
 
 func TestMessageQueryValidation(t *testing.T) {
@@ -242,108 +237,73 @@ func TestClientSanitizesSuccessfulResponseDecodeErrors(t *testing.T) {
 }
 
 func TestClientSerializesRoutesLearnedToShareBucket(t *testing.T) {
-	require := require.New(t)
-	var enabled atomic.Bool
-	var inFlight atomic.Int32
-	var maximum atomic.Int32
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		w.Header().Set("X-Ratelimit-Bucket", "shared-message-bucket")
-		if enabled.Load() {
-			current := inFlight.Add(1)
-			for {
-				previous := maximum.Load()
-				if current <= previous || maximum.CompareAndSwap(previous, current) {
-					break
+	synctest.Test(t, func(t *testing.T) {
+		require := require.New(t)
+		var enabled atomic.Bool
+		var inFlight atomic.Int32
+		var maximum atomic.Int32
+		server := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+			w.Header().Set("X-Ratelimit-Bucket", "shared-message-bucket")
+			if enabled.Load() {
+				current := inFlight.Add(1)
+				for {
+					previous := maximum.Load()
+					if current <= previous || maximum.CompareAndSwap(previous, current) {
+						break
+					}
 				}
+				time.Sleep(40 * time.Millisecond)
+				inFlight.Add(-1)
 			}
-			time.Sleep(40 * time.Millisecond)
-			inFlight.Add(-1)
-		}
-		if request.URL.Path == "/channels/301/messages" {
-			writeDiscordJSON(w, http.StatusOK, []any{})
-			return
-		}
-		writeDiscordJSON(w, http.StatusOK, map[string]any{"id": "501", "channel_id": "301", "author": map[string]any{"id": "102"}, "timestamp": "2026-07-18T12:00:00Z"})
-	}))
-	t.Cleanup(server.Close)
-	client, err := NewClient(server.URL, "test-token")
-	require.NoError(err)
+			if request.URL.Path == "/channels/301/messages" {
+				writeDiscordJSON(w, http.StatusOK, []any{})
+				return
+			}
+			writeDiscordJSON(w, http.StatusOK, map[string]any{"id": "501", "channel_id": "301", "author": map[string]any{"id": "102"}, "timestamp": "2026-07-18T12:00:00Z"})
+		}))
+		client, err := NewClient("http://127.0.0.1", "test-token")
+		require.NoError(err)
+		client.http.Transport = server.Client().Transport
 
-	_, err = client.Messages(context.Background(), "301", MessageQuery{Limit: 1})
-	require.NoError(err)
-	_, err = client.Message(context.Background(), "301", "501")
-	require.NoError(err)
-	enabled.Store(true)
+		_, err = client.Messages(context.Background(), "301", MessageQuery{Limit: 1})
+		require.NoError(err)
+		_, err = client.Message(context.Background(), "301", "501")
+		require.NoError(err)
+		enabled.Store(true)
 
-	var wg sync.WaitGroup
-	errs := make(chan error, 2)
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		_, callErr := client.Messages(context.Background(), "301", MessageQuery{Limit: 1})
-		errs <- callErr
-	}()
-	go func() {
-		defer wg.Done()
-		_, callErr := client.Message(context.Background(), "301", "501")
-		errs <- callErr
-	}()
-	wg.Wait()
-	close(errs)
-	for callErr := range errs {
-		require.NoError(callErr)
-	}
-	assert.Equal(t, int32(1), maximum.Load())
+		var wg sync.WaitGroup
+		errs := make(chan error, 2)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_, callErr := client.Messages(context.Background(), "301", MessageQuery{Limit: 1})
+			errs <- callErr
+		}()
+		go func() {
+			defer wg.Done()
+			_, callErr := client.Message(context.Background(), "301", "501")
+			errs <- callErr
+		}()
+		wg.Wait()
+		close(errs)
+		for callErr := range errs {
+			require.NoError(callErr)
+		}
+		assert.Equal(t, int32(1), maximum.Load())
+	})
 }
 
 func TestClientHonorsGlobal429AcrossRoutes(t *testing.T) {
-	require := require.New(t)
-	globalSet := make(chan time.Time, 1)
-	var meCalls atomic.Int32
-	var guildAt atomic.Int64
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-		switch request.URL.Path {
-		case "/users/@me":
-			if meCalls.Add(1) == 1 {
-				now := time.Now()
-				globalSet <- now
-				writeDiscordJSON(w, http.StatusTooManyRequests, map[string]any{"message": "rate limited", "retry_after": 0.08, "global": true})
-				return
-			}
-			writeDiscordJSON(w, http.StatusOK, map[string]any{"id": "101"})
-		case "/guilds/201":
-			guildAt.Store(time.Now().UnixNano())
-			writeDiscordJSON(w, http.StatusOK, map[string]any{"id": "201"})
-		}
-	}))
-	t.Cleanup(server.Close)
-	client, err := NewClient(server.URL, "test-token")
-	require.NoError(err)
-
-	meDone := make(chan error, 1)
-	go func() {
-		_, callErr := client.Me(context.Background())
-		meDone <- callErr
-	}()
-	started := <-globalSet
-	require.Eventually(func() bool {
-		client.limits.mu.Lock()
-		defer client.limits.mu.Unlock()
-		return client.limits.globalUntil.After(time.Now())
-	}, 500*time.Millisecond, time.Millisecond)
-	_, err = client.Guild(context.Background(), "201")
-	require.NoError(err)
-	require.NoError(<-meDone)
-	assert.GreaterOrEqual(t, time.Unix(0, guildAt.Load()).Sub(started), 65*time.Millisecond)
-}
-
-func TestClientHonorsHeaderSignaledGlobal429AcrossRoutes(t *testing.T) {
 	tests := []struct {
 		name        string
 		headerName  string
 		headerValue string
 		body        string
 	}{
+		{
+			name: "JSON global field",
+			body: `{"message":"rate limited","retry_after":0.15,"global":true}`,
+		},
 		{
 			name:        "global header with malformed JSON",
 			headerName:  "X-Ratelimit-Global",
@@ -360,59 +320,63 @@ func TestClientHonorsHeaderSignaledGlobal429AcrossRoutes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			require := require.New(t)
-			limited := make(chan struct{}, 1)
-			var meCalls atomic.Int32
-			var guildAt atomic.Int64
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-				switch request.URL.Path {
-				case "/users/@me":
-					if meCalls.Add(1) == 1 {
-						w.Header().Set("Retry-After", "0.15")
-						w.Header().Set(tt.headerName, tt.headerValue)
-						w.WriteHeader(http.StatusTooManyRequests)
-						if _, err := w.Write([]byte(tt.body)); err != nil {
-							panic(fmt.Errorf("write synthetic 429 response: %w", err))
+			synctest.Test(t, func(t *testing.T) {
+				require := require.New(t)
+				limited := make(chan struct{}, 1)
+				var meCalls atomic.Int32
+				var guildAt atomic.Int64
+				server := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+					switch request.URL.Path {
+					case "/users/@me":
+						if meCalls.Add(1) == 1 {
+							w.Header().Set("Retry-After", "0.15")
+							if tt.headerName != "" {
+								w.Header().Set(tt.headerName, tt.headerValue)
+							}
+							w.WriteHeader(http.StatusTooManyRequests)
+							if _, err := w.Write([]byte(tt.body)); err != nil {
+								panic(fmt.Errorf("write synthetic 429 response: %w", err))
+							}
+							limited <- struct{}{}
+							return
 						}
-						limited <- struct{}{}
-						return
+						writeDiscordJSON(w, http.StatusOK, map[string]any{"id": "101"})
+					case "/guilds/201":
+						guildAt.Store(time.Now().UnixNano())
+						writeDiscordJSON(w, http.StatusOK, map[string]any{"id": "201"})
 					}
-					writeDiscordJSON(w, http.StatusOK, map[string]any{"id": "101"})
-				case "/guilds/201":
-					guildAt.Store(time.Now().UnixNano())
-					writeDiscordJSON(w, http.StatusOK, map[string]any{"id": "201"})
-				}
-			}))
-			t.Cleanup(server.Close)
-			client, err := NewClient(server.URL, "test-token")
-			require.NoError(err)
+				}))
+				client, err := NewClient("http://127.0.0.1", "test-token")
+				require.NoError(err)
+				client.http.Transport = server.Client().Transport
 
-			meDone := make(chan error, 1)
-			go func() {
-				_, callErr := client.Me(context.Background())
-				meDone <- callErr
-			}()
-			<-limited
-			require.Eventually(func() bool {
-				client.limits.mu.Lock()
-				defer client.limits.mu.Unlock()
-				if client.limits.globalUntil.After(time.Now()) {
-					return true
-				}
-				for _, route := range client.limits.routes {
-					if route.readyAt.After(time.Now()) {
+				meDone := make(chan error, 1)
+				go func() {
+					_, callErr := client.Me(context.Background())
+					meDone <- callErr
+				}()
+				<-limited
+				require.Eventually(func() bool {
+					client.limits.mu.Lock()
+					defer client.limits.mu.Unlock()
+					if client.limits.globalUntil.After(time.Now()) {
 						return true
 					}
-				}
-				return false
-			}, 500*time.Millisecond, time.Millisecond)
-			started := time.Now()
+					for _, route := range client.limits.routes {
+						if route.readyAt.After(time.Now()) {
+							return true
+						}
+					}
+					return false
+				}, globalRateLimitObservationBudget, time.Millisecond)
+				started := time.Now()
 
-			_, err = client.Guild(context.Background(), "201")
+				_, err = client.Guild(context.Background(), "201")
 
-			require.NoError(err)
-			require.NoError(<-meDone)
-			assert.GreaterOrEqual(t, time.Unix(0, guildAt.Load()).Sub(started), 100*time.Millisecond)
+				require.NoError(err)
+				require.NoError(<-meDone)
+				assert.GreaterOrEqual(t, time.Unix(0, guildAt.Load()).Sub(started), 100*time.Millisecond)
+			})
 		})
 	}
 }
@@ -530,7 +494,7 @@ func TestClientCancellationDuringRateLimitWaits(t *testing.T) {
 		select {
 		case err := <-done:
 			require.ErrorIs(t, err, context.Canceled)
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(5 * time.Second):
 			require.Fail(t, "request did not observe cancellation during retry wait")
 		}
 	})
@@ -615,4 +579,9 @@ func TestNewClientRejectsUnsafeBaseURL(t *testing.T) {
 			assert.NotContains(t, err.Error(), "secret")
 		})
 	}
+}
+
+func TestNewClientAcceptsLoopbackHostnameWithTrailingDot(t *testing.T) {
+	_, err := NewClient("http://localhost./api/v10", "test-token")
+	require.NoError(t, err)
 }

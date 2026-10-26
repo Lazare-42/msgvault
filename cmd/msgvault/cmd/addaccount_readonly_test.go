@@ -83,6 +83,13 @@ func saveAddAccountFlags(t *testing.T) {
 // the absence of that failure.
 func runAddAccountForTest(t *testing.T, args ...string) (string, error) {
 	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	return runAddAccountForTestContext(ctx, t, args...)
+}
+
+func runAddAccountForTestContext(ctx context.Context, t *testing.T, args ...string) (string, error) {
+	t.Helper()
 	testCmd := &cobra.Command{
 		Use:  addAccountUse,
 		Args: cobra.ExactArgs(1),
@@ -93,6 +100,23 @@ func runAddAccountForTest(t *testing.T, args ...string) (string, error) {
 	root := newTestRootCmd()
 	root.AddCommand(testCmd)
 	root.SetArgs(append([]string{"add-account"}, args...))
+	var options invocationOptions
+	if state := invocationFromContext(ctx); state != nil {
+		cfg := state.cfg
+		options = state.options
+		ctx = testInvocationContext(ctx, cfg, options)
+	} else {
+		cfg := config.NewDefaultConfig()
+		if home := os.Getenv("MSGVAULT_HOME"); home != "" {
+			cfg.HomeDir = home
+			cfg.Data.DataDir = home
+			if _, err := os.Stat(filepath.Join(home, "client_secret.json")); err == nil {
+				cfg.OAuth.ClientSecrets = filepath.Join(home, "client_secret.json")
+			}
+		}
+		ctx = testInvocationContext(ctx, cfg, options)
+	}
+	root.SetContext(ctx)
 
 	reader, writer, err := os.Pipe()
 	require.NoError(t, err, "create stdout pipe")
@@ -106,8 +130,6 @@ func runAddAccountForTest(t *testing.T, args ...string) (string, error) {
 		captured <- buf.String()
 	}()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
 	runErr := root.ExecuteContext(ctx)
 
 	os.Stdout = savedStdout
@@ -374,6 +396,8 @@ func TestDecideAddAccountGrant(t *testing.T) {
 }
 
 func TestAddAccountTokenHasGmailScopes_Readonly(t *testing.T) {
+	logger := testLoggerValue()
+
 	tests := []struct {
 		name      string
 		tokenJSON string
@@ -418,11 +442,13 @@ func TestAddAccountTokenHasGmailScopes_Readonly(t *testing.T) {
 			_, restore := seedTokenEnv(t, tt.tokenJSON)
 			defer restore()
 
-			mgr, err := oauth.NewManager(cfg.OAuth.ClientSecrets, cfg.TokensDir(), logger)
+			cfg, err := config.Load("", "")
+			require.NoError(t, err)
+			mgr, err := oauth.NewManagerWithCredentials(t.Context(), config.OAuthApp{ClientSecrets: cfg.OAuth.ClientSecrets}, cfg.TokensDir(), config.OAuthTokenCommands{}, logger, oauth.Scopes)
 			require.NoError(t, err)
 
 			assert.Equal(t, tt.want,
-				addAccountTokenHasGmailScopes(mgr, scopeEscalationAccount, tt.readonly))
+				addAccountTokenHasGmailScopes(t.Context(), mgr, scopeEscalationAccount, tt.readonly))
 		})
 	}
 }
@@ -475,11 +501,19 @@ func TestAddAccount_ReadonlyRemediationPreservesNamedOAuthApp(t *testing.T) {
 	saveAddAccountFlags(t)
 	_, restore := seedTokenEnv(t, gmailOnlyTokenJSON)
 	defer restore()
+	home := os.Getenv("MSGVAULT_HOME")
+	cfg := config.NewDefaultConfig()
+	cfg.HomeDir = home
+	cfg.Data.DataDir = home
+	cfg.OAuth.ClientSecrets = filepath.Join(home, "client_secret.json")
 	cfg.OAuth.Apps = map[string]config.OAuthApp{
 		"workspace app": {ClientSecrets: cfg.OAuth.ClientSecrets},
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ctx = testInvocationContext(ctx, cfg, invocationOptions{})
 
-	_, err := runAddAccountForTest(t,
+	_, err := runAddAccountForTestContext(ctx, t,
 		scopeEscalationAccount,
 		"--readonly",
 		"--oauth-app", "workspace app",
@@ -583,7 +617,7 @@ func TestAddAccount_LegacyTokenStillReusableWithoutReadonly(t *testing.T) {
 	_, restore := seedTokenEnv(t, legacyTokenJSON)
 	defer restore()
 
-	out, err := runAddAccountForTest(t, scopeEscalationAccount, "--no-default-identity")
+	out, err := runAddAccountForTestContext(gmailProfileContext(t, scopeEscalationAccount), t, scopeEscalationAccount, "--no-default-identity")
 
 	require.NoError(err)
 	assert.Contains(out, "already authorized")
@@ -599,7 +633,7 @@ func TestAddAccount_AuthenticatedPreflightRegistersWiderGrant(t *testing.T) {
 	defer restore()
 	t.Setenv(daemonCLISubprocessEnv, strconv.Itoa(os.Getppid()))
 
-	out, err := runAddAccountForTest(t,
+	out, err := runAddAccountForTestContext(gmailProfileContext(t, scopeEscalationAccount), t,
 		scopeEscalationAccount, "--readonly", "--grant-decided", "--no-default-identity")
 
 	require.NoError(err)
@@ -731,17 +765,19 @@ func TestAddAccount_HeadlessAppliesGrantDecision(t *testing.T) {
 
 func TestAddAccount_HeadlessReadonlyRefusesStoredTokenWithoutOAuthCredentials(t *testing.T) {
 	t.Run("exact token", func(t *testing.T) {
+		assert := assert.New(t)
+		require := require.New(t)
 		saveAddAccountFlags(t)
 		_, restore := seedTokenEnv(t, gmailOnlyTokenJSON)
 		defer restore()
-		cfg.OAuth.ClientSecrets = ""
+		require.NoError(os.Remove(filepath.Join(os.Getenv("MSGVAULT_HOME"), "client_secret.json")))
 
 		out, err := runAddAccountForTest(t,
 			scopeEscalationAccount, "--headless", "--readonly", "--no-default-identity")
 
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "cannot be verified")
-		assert.NotContains(t, out, "Headless Server Setup")
+		require.Error(err)
+		assert.Contains(err.Error(), "cannot be verified")
+		assert.NotContains(out, "Headless Server Setup")
 	})
 
 	t.Run("equivalent token", func(t *testing.T) {
@@ -751,10 +787,11 @@ func TestAddAccount_HeadlessReadonlyRefusesStoredTokenWithoutOAuthCredentials(t 
 		saveAddAccountFlags(t)
 		_, restore := seedTokenEnv(t, gmailReadonlyTokenJSON)
 		defer restore()
+		tokensDir := filepath.Join(os.Getenv("MSGVAULT_HOME"), "tokens")
 		require.NoError(os.WriteFile(
-			filepath.Join(cfg.TokensDir(), "username@gmail.com.json"),
+			filepath.Join(tokensDir, "username@gmail.com.json"),
 			[]byte(gmailOnlyTokenJSON), 0600))
-		cfg.OAuth.ClientSecrets = ""
+		require.NoError(os.Remove(filepath.Join(os.Getenv("MSGVAULT_HOME"), "client_secret.json")))
 
 		out, err := runAddAccountForTest(t,
 			"user.name@gmail.com", "--headless", "--readonly", "--no-default-identity")
@@ -765,16 +802,18 @@ func TestAddAccount_HeadlessReadonlyRefusesStoredTokenWithoutOAuthCredentials(t 
 	})
 
 	t.Run("new account still prints instructions", func(t *testing.T) {
+		assert := assert.New(t)
+		require := require.New(t)
 		saveAddAccountFlags(t)
 		_, restore := seedTokenEnv(t, gmailReadonlyTokenJSON)
 		defer restore()
-		cfg.OAuth.ClientSecrets = ""
+		require.NoError(os.Remove(filepath.Join(os.Getenv("MSGVAULT_HOME"), "client_secret.json")))
 
 		out, err := runAddAccountForTest(t,
 			"fresh@example.com", "--headless", "--readonly", "--no-default-identity")
 
-		require.NoError(t, err)
-		assert.Contains(t, out, "Headless Server Setup")
+		require.NoError(err)
+		assert.Contains(out, "Headless Server Setup")
 	})
 }
 
@@ -791,7 +830,7 @@ func TestAddAccount_ReadonlyReusesAlreadyNarrowToken(t *testing.T) {
 	before, err := os.ReadFile(tokenPath)
 	require.NoError(err)
 
-	out, err := runAddAccountForTest(t, scopeEscalationAccount, "--readonly", "--no-default-identity")
+	out, err := runAddAccountForTestContext(gmailProfileContext(t, scopeEscalationAccount), t, scopeEscalationAccount, "--readonly", "--no-default-identity")
 
 	require.NoError(err)
 	assert.Contains(out, "already authorized")
@@ -830,6 +869,8 @@ func TestAddAccount_WarnsBeforeRewideningNarrowGrant(t *testing.T) {
 // would skip source registration, leaving a token on disk that no command can
 // see while the obvious retry is refused for holding write access.
 func TestReadonlyGrantWarning(t *testing.T) {
+	logger := testLoggerValue()
+
 	tests := []struct {
 		name      string
 		tokenJSON string
@@ -862,10 +903,12 @@ func TestReadonlyGrantWarning(t *testing.T) {
 			_, restore := seedTokenEnv(t, tt.tokenJSON)
 			defer restore()
 
-			mgr, err := oauth.NewManager(cfg.OAuth.ClientSecrets, cfg.TokensDir(), logger)
+			loadedCfg, err := config.Load("", "")
+			require.NoError(err)
+			mgr, err := oauth.NewManagerWithCredentials(t.Context(), config.OAuthApp{ClientSecrets: loadedCfg.OAuth.ClientSecrets}, loadedCfg.TokensDir(), config.OAuthTokenCommands{}, logger, oauth.Scopes)
 			require.NoError(err)
 
-			got := readonlyGrantWarning(mgr, scopeEscalationAccount, "")
+			got := readonlyGrantWarning(t.Context(), mgr, scopeEscalationAccount, "")
 
 			if !tt.wantWarn {
 				assert.Empty(got)
@@ -901,10 +944,13 @@ func TestAddAccount_NoWarningForBrandNewAccount(t *testing.T) {
 // spellings hold tokens, the refusal names the revoke-and-re-add procedure
 // instead of bouncing between the two spellings.
 func TestAddAccount_ReadonlyRefusesAliasOfStoredToken(t *testing.T) {
+	logger := testLoggerValue()
+
 	seedAliasToken := func(t *testing.T, tokenJSON string) {
 		t.Helper()
+		tokensDir := filepath.Join(os.Getenv("MSGVAULT_HOME"), "tokens")
 		require.NoError(t, os.WriteFile(
-			filepath.Join(cfg.TokensDir(), "username@gmail.com.json"),
+			filepath.Join(tokensDir, "username@gmail.com.json"),
 			[]byte(tokenJSON), 0600))
 	}
 
@@ -929,8 +975,9 @@ func TestAddAccount_ReadonlyRefusesAliasOfStoredToken(t *testing.T) {
 		_, restore := seedTokenEnv(t, gmailReadonlyTokenJSON)
 		defer restore()
 		seedAliasToken(t, gmailOnlyTokenJSON)
+		tokensDir := filepath.Join(os.Getenv("MSGVAULT_HOME"), "tokens")
 		require.NoError(os.WriteFile(
-			filepath.Join(cfg.TokensDir(), "user.name@gmail.com.json"),
+			filepath.Join(tokensDir, "user.name@gmail.com.json"),
 			[]byte(gmailReadonlyTokenJSON), 0600))
 
 		out, err := runAddAccountForTest(t, "user.name@gmail.com", "--readonly", "--no-default-identity")
@@ -986,17 +1033,21 @@ func TestAddAccount_ReadonlyRefusesAliasOfStoredToken(t *testing.T) {
 	})
 
 	t.Run("remediation preserves named OAuth app", func(t *testing.T) {
+		assert := assert.New(t)
+		require := require.New(t)
 		saveAddAccountFlags(t)
 		_, restore := seedTokenEnv(t, gmailReadonlyTokenJSON)
 		defer restore()
 		seedAliasToken(t, gmailOnlyTokenJSON)
-		mgr, err := oauth.NewManager(cfg.OAuth.ClientSecrets, cfg.TokensDir(), logger)
-		require.NoError(t, err)
+		cfg, err := config.Load("", "")
+		require.NoError(err)
+		mgr, err := oauth.NewManagerWithCredentials(t.Context(), config.OAuthApp{ClientSecrets: cfg.OAuth.ClientSecrets}, cfg.TokensDir(), config.OAuthTokenCommands{}, logger, oauth.Scopes)
+		require.NoError(err)
 
-		err = refuseReadonlyUnderAliasSpelling(mgr, "user.name@gmail.com", "workspace app")
+		err = refuseReadonlyUnderAliasSpelling(t.Context(), mgr, "user.name@gmail.com", "workspace app")
 
-		require.Error(t, err)
-		assert.Contains(t, err.Error(),
+		require.Error(err)
+		assert.Contains(err.Error(),
 			"msgvault add-account username@gmail.com --oauth-app 'workspace app' --readonly")
 	})
 }

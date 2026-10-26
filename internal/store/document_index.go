@@ -6,7 +6,8 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"reflect"
@@ -14,12 +15,14 @@ import (
 	"strings"
 	"time"
 
+	"go.kenn.io/msgvault/internal/jsonexact"
 	"go.kenn.io/msgvault/internal/peoplesweep"
 )
 
 var (
-	ErrDocumentExtractionRebuildActive  = errors.New("document extraction rebuild is already active")
-	ErrDocumentExtractionRebuildMissing = errors.New("document extraction rebuild is not active")
+	ErrDocumentExtractionRebuildActive     = errors.New("document extraction rebuild is already active")
+	ErrDocumentExtractionRebuildMissing    = errors.New("document extraction rebuild is not active")
+	ErrDocumentIndexStatusScopeUnavailable = errors.New("current document index status scope is unavailable")
 )
 
 const authoritativeDocumentRoleSourcesSQL = "('mime_disposition','provider_explicit','importer_semantics','raw_mime_repair')"
@@ -41,7 +44,8 @@ type DocumentExtractionProfile struct {
 	RetentionPosture  string
 	TrainingPosture   string
 	AllowedMediaTypes []string
-	PolicyJSON        json.RawMessage
+	IncludeInline     bool
+	PolicyJSON        jsontext.Value
 }
 
 type DocumentProviderConsent struct {
@@ -90,31 +94,33 @@ type DocumentExtractionRebuild struct {
 }
 
 type DocumentIndexStatus struct {
-	ProfileExists              bool    `json:"profile_exists"`
-	ProfileEnabled             bool    `json:"profile_enabled"`
-	ExactConsent               bool    `json:"exact_consent"`
-	ExtractionAttempts         int64   `json:"extraction_attempts"`
-	SuccessfulAttempts         int64   `json:"successful_attempts"`
-	FailedAttempts             int64   `json:"failed_attempts"`
-	ProviderRequests           int64   `json:"provider_requests"`
-	ProviderRetries            int64   `json:"provider_retries"`
-	ProviderLatencyMillis      int64   `json:"provider_latency_millis"`
-	AverageProviderLatencyMS   float64 `json:"average_provider_latency_millis"`
-	VerifiedUploadBytes        int64   `json:"verified_upload_bytes"`
-	ProcessedProviderUnits     int64   `json:"processed_provider_units"`
-	ReportedProviderBytes      int64   `json:"reported_provider_bytes"`
-	MissingProviderByteReports int64   `json:"missing_provider_byte_reports"`
-	EligibleOccurrences        int64   `json:"eligible_occurrences"`
-	EligibleOwners             int64   `json:"eligible_owners"`
-	EligibleBytes              int64   `json:"eligible_bytes"`
-	UnknownRoleOccurrences     int64   `json:"unknown_role_occurrences"`
-	IneligibleRoleOccurrences  int64   `json:"ineligible_role_occurrences"`
-	ReadyOwners                int64   `json:"ready_owners"`
-	StagingOwners              int64   `json:"staging_owners"`
-	RetryOwners                int64   `json:"retry_owners"`
-	TerminalOwners             int64   `json:"terminal_owners"`
-	MissingOwners              int64   `json:"missing_owners"`
-	StoredPlaintextChunks      int64   `json:"stored_plaintext_chunks"`
+	Failures                   []DocumentFailureDiagnostic `json:"failures"`
+	FailuresExhausted          bool                        `json:"failures_exhausted"`
+	ProfileExists              bool                        `json:"profile_exists"`
+	ProfileEnabled             bool                        `json:"profile_enabled"`
+	ExactConsent               bool                        `json:"exact_consent"`
+	ExtractionAttempts         int64                       `json:"extraction_attempts"`
+	SuccessfulAttempts         int64                       `json:"successful_attempts"`
+	FailedAttempts             int64                       `json:"failed_attempts"`
+	ProviderRequests           int64                       `json:"provider_requests"`
+	ProviderRetries            int64                       `json:"provider_retries"`
+	ProviderLatencyMillis      int64                       `json:"provider_latency_millis"`
+	AverageProviderLatencyMS   float64                     `json:"average_provider_latency_millis"`
+	VerifiedUploadBytes        int64                       `json:"verified_upload_bytes"`
+	ProcessedProviderUnits     int64                       `json:"processed_provider_units"`
+	ReportedProviderBytes      int64                       `json:"reported_provider_bytes"`
+	MissingProviderByteReports int64                       `json:"missing_provider_byte_reports"`
+	EligibleOccurrences        int64                       `json:"eligible_occurrences"`
+	EligibleOwners             int64                       `json:"eligible_owners"`
+	EligibleBytes              int64                       `json:"eligible_bytes"`
+	UnknownRoleOccurrences     int64                       `json:"unknown_role_occurrences"`
+	IneligibleRoleOccurrences  int64                       `json:"ineligible_role_occurrences"`
+	ReadyOwners                int64                       `json:"ready_owners"`
+	StagingOwners              int64                       `json:"staging_owners"`
+	RetryOwners                int64                       `json:"retry_owners"`
+	TerminalOwners             int64                       `json:"terminal_owners"`
+	MissingOwners              int64                       `json:"missing_owners"`
+	StoredPlaintextChunks      int64                       `json:"stored_plaintext_chunks"`
 }
 
 // DocumentIndexStatusRequest identifies one exact profile and configured scope.
@@ -134,7 +140,7 @@ type DocumentIndexRebuildStatus struct {
 // DocumentIndexStatusResponse combines scoped coverage and rebuild progress.
 type DocumentIndexStatusResponse struct {
 	Status        DocumentIndexStatus         `json:"status"`
-	ActiveRebuild *DocumentIndexRebuildStatus `json:"active_rebuild,omitempty"`
+	ActiveRebuild *DocumentIndexRebuildStatus `json:"active_rebuild,omitzero" nullable:"false"`
 }
 
 type DocumentDerivativeGCResult struct {
@@ -164,12 +170,12 @@ func (s *Store) EnsureDocumentExtractionProfile(
 			INSERT INTO document_extraction_profiles
 				(id, fingerprint, provider, endpoint, region, model,
 				 retention_posture, training_posture, allowed_media_types,
-				 policy_json, enabled)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, `+s.dialect.JSONBindExpr()+`, `+s.dialect.JSONBindExpr()+`, FALSE)
+				 policy_json, include_inline, enabled)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, `+s.dialect.JSONBindExpr()+`, `+s.dialect.JSONBindExpr()+`, ?, FALSE)
 			ON CONFLICT (id) DO NOTHING`,
 			profile.ID, profile.Fingerprint, profile.Provider, profile.Endpoint,
 			profile.Region, profile.Model, profile.RetentionPosture,
-			profile.TrainingPosture, string(allowedJSON), string(policyJSON),
+			profile.TrainingPosture, string(allowedJSON), string(policyJSON), profile.IncludeInline,
 		)
 		if execErr != nil {
 			return fmt.Errorf("insert document extraction profile: %w", execErr)
@@ -185,11 +191,11 @@ func (s *Store) EnsureDocumentExtractionProfile(
 		if scanErr := tx.QueryRow(`
 			SELECT id, fingerprint, provider, endpoint, region, model,
 			       retention_posture, training_posture,
-			       CAST(allowed_media_types AS TEXT), CAST(policy_json AS TEXT)
+			       CAST(allowed_media_types AS TEXT), CAST(policy_json AS TEXT), include_inline
 			FROM document_extraction_profiles WHERE id = ?`, profile.ID).Scan(
 			&stored.ID, &stored.Fingerprint, &stored.Provider, &stored.Endpoint,
 			&stored.Region, &stored.Model, &stored.RetentionPosture,
-			&stored.TrainingPosture, &storedAllowed, &storedPolicy,
+			&stored.TrainingPosture, &storedAllowed, &storedPolicy, &stored.IncludeInline,
 		); scanErr != nil {
 			return fmt.Errorf("read document extraction profile: %w", scanErr)
 		}
@@ -197,7 +203,7 @@ func (s *Store) EnsureDocumentExtractionProfile(
 			stored.Provider != profile.Provider || stored.Endpoint != profile.Endpoint ||
 			stored.Region != profile.Region || stored.Model != profile.Model ||
 			stored.RetentionPosture != profile.RetentionPosture ||
-			stored.TrainingPosture != profile.TrainingPosture ||
+			stored.TrainingPosture != profile.TrainingPosture || stored.IncludeInline != profile.IncludeInline ||
 			!equalJSON([]byte(storedAllowed), allowedJSON) ||
 			!equalJSON([]byte(storedPolicy), policyJSON) {
 			return errors.New("document extraction profile ID already has different immutable policy")
@@ -205,6 +211,40 @@ func (s *Store) EnsureDocumentExtractionProfile(
 		return nil
 	})
 	return created, err
+}
+
+// GetCurrentDocumentIndexStatusScope resolves the exact durable target profile
+// selected by document_index_state and its immutable media allowlist. The
+// profile identifier is used only as an internal query coordinate; API status
+// responses do not publish it.
+func (s *Store) GetCurrentDocumentIndexStatusScope(
+	ctx context.Context,
+) (string, []string, error) {
+	var profileID string
+	var allowedJSON string
+	err := s.db.QueryRowContext(ctx, s.dialect.Rebind(`
+		SELECT p.id, CAST(p.allowed_media_types AS TEXT)
+		FROM document_index_state state
+		JOIN document_extraction_profiles p ON p.id = state.target_profile_id
+		WHERE state.singleton = 1
+		  AND p.enabled = TRUE
+		  AND p.retired_at IS NULL`)).Scan(&profileID, &allowedJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil, ErrDocumentIndexStatusScopeUnavailable
+	}
+	if err != nil {
+		return "", nil, fmt.Errorf("read current document index status scope: %w", err)
+	}
+	var mediaTypes []string
+	if err := json.Unmarshal([]byte(allowedJSON), &mediaTypes); err != nil {
+		return "", nil, errors.New("current document index status scope is invalid")
+	}
+	slices.Sort(mediaTypes)
+	mediaTypes = slices.Compact(mediaTypes)
+	if profileID == "" || len(mediaTypes) == 0 || slices.Contains(mediaTypes, "") {
+		return "", nil, ErrDocumentIndexStatusScopeUnavailable
+	}
+	return profileID, mediaTypes, nil
 }
 
 // RecordDocumentProviderConsent enables one exact immutable profile. A change
@@ -293,9 +333,11 @@ func (s *Store) RecordDocumentProviderConsent(
 }
 
 // ReconcileDocumentOccurrence resolves current metadata through the same
-// trusted-CAS authority as file downloads. Only live, standalone occurrences
-// with authoritative role provenance and locally available canonical bytes
-// are retained. It returns false for an ineligible or missing attachment.
+// trusted-CAS authority as file downloads. Live occurrences with authoritative
+// role provenance and locally available canonical bytes are retained. Inline
+// occurrences also require an active, exactly consented profile that permits them.
+// Each profile grants extraction and serving authority separately.
+// It returns false for an ineligible or missing attachment.
 func (s *Store) ReconcileDocumentOccurrence(
 	ctx context.Context,
 	attachmentID int64,
@@ -430,7 +472,16 @@ func (s *Store) getDocumentFileMetadataTx(
 		FROM attachments a
 		JOIN messages m ON m.id = a.message_id
 		JOIN conversations c ON c.id = m.conversation_id
-		WHERE a.id = ? AND `+LiveMessagesWhere("m", true), attachmentID).Scan(
+		WHERE a.id = ? AND `+LiveMessagesWhere("m", true)+`
+		  AND (a.attachment_role <> 'inline' OR EXISTS (
+		      SELECT 1 FROM document_extraction_profiles p
+		      JOIN document_provider_consents consent ON consent.profile_id = p.id
+		      WHERE p.include_inline = TRUE AND p.enabled = TRUE
+		        AND p.retired_at IS NULL
+		        AND consent.profile_fingerprint = p.fingerprint
+		        AND consent.retention_posture = p.retention_posture
+		        AND consent.training_posture = p.training_posture
+		  ))`, attachmentID).Scan(
 		&file.ID, &file.MessageID, &file.ConversationID,
 		&file.SourceID, &file.SourceMessageID, &file.MessageType, &file.ConversationType,
 		&file.Filename, &file.MimeType, &file.Size, &file.ContentHash, &file.StoragePath,
@@ -442,7 +493,7 @@ func (s *Store) getDocumentFileMetadataTx(
 	if err != nil {
 		return FileMetadata{}, false, fmt.Errorf("read document occurrence attachment metadata: %w", err)
 	}
-	normalizeFileMetadataStorage(&file)
+	normalizeFileMetadataStorage(&file, "")
 	return file, true, nil
 }
 
@@ -473,6 +524,30 @@ func (s *Store) HasActiveDocumentProviderConsent(ctx context.Context) (bool, err
 		)`).Scan(&consented)
 	if err != nil {
 		return false, fmt.Errorf("read active document provider consent: %w", err)
+	}
+	return consented, nil
+}
+
+// HasMatchingDocumentProviderConsent reports consent for an enabled, unretired
+// profile with the requested immutable policy identity.
+// Unlike the journal bootstrap gate, setup must not borrow consent from an
+// older policy that shares the same provider but has different content limits,
+// normalization, scope, or capability evidence.
+func (s *Store) HasMatchingDocumentProviderConsent(ctx context.Context, profile DocumentExtractionProfile) (bool, error) {
+	var consented bool
+	err := s.db.QueryRowContext(ctx, s.dialect.Rebind(`
+		SELECT EXISTS (
+			SELECT 1
+			FROM document_extraction_profiles p
+			JOIN document_provider_consents c ON c.profile_id = p.id
+			WHERE p.enabled = TRUE AND p.retired_at IS NULL
+			  AND c.profile_fingerprint = p.fingerprint
+			  AND c.retention_posture = p.retention_posture
+			  AND c.training_posture = p.training_posture
+			  AND p.id = ? AND p.fingerprint = ?
+		)`), profile.ID, profile.Fingerprint).Scan(&consented)
+	if err != nil {
+		return false, fmt.Errorf("read matching document provider consent: %w", err)
 	}
 	return consented, nil
 }
@@ -510,8 +585,10 @@ func (s *Store) GetDocumentIndexStatus(ctx context.Context, profileID string) (D
 		       (SELECT COALESCE(SUM(request_count), 0) FROM document_extractions WHERE profile_id = ?),
 		       (SELECT COALESCE(SUM(retry_count), 0) FROM document_extractions WHERE profile_id = ?),
 		       (SELECT COALESCE(SUM(provider_latency_ms), 0) FROM document_extractions WHERE profile_id = ?),
-		       (SELECT COALESCE(SUM(CASE WHEN request_count > 0 THEN local_bytes ELSE 0 END), 0)
-		        FROM document_extractions WHERE profile_id = ?),
+		       (SELECT COALESCE(SUM(CASE WHEN e.request_count > 0 THEN COALESCE(c.pdf_bytes, e.local_bytes) ELSE 0 END), 0)
+		        FROM document_extractions e
+		        LEFT JOIN document_extraction_conversions c ON c.extraction_id = e.id
+		        WHERE e.profile_id = ?),
 		       (SELECT COALESCE(SUM(units_processed), 0) FROM document_extractions WHERE profile_id = ?),
 		       (SELECT COALESCE(SUM(provider_bytes), 0) FROM document_extractions WHERE profile_id = ?),
 		       (SELECT COUNT(*) FROM document_extractions
@@ -553,7 +630,7 @@ func (s *Store) GetDocumentIndexStatusForScope(
 		return DocumentIndexStatus{}, err
 	}
 	scopeSQL, scopeArgs, err := documentOccurrenceScopeSQL(
-		"o", "m", allowedMediaTypes, allowedMessageTypes,
+		profileID, "o", "m", allowedMediaTypes, allowedMessageTypes,
 	)
 	if err != nil {
 		return DocumentIndexStatus{}, err
@@ -564,22 +641,30 @@ func (s *Store) GetDocumentIndexStatusForScope(
 	}
 	err = s.db.QueryRowContext(ctx, s.dialect.Rebind(`
 		WITH eligible_occurrences AS (
-			SELECT o.canonical_blob_hash, COALESCE(a.size, 0) AS owner_size
+			SELECT o.canonical_blob_hash, o.occurrence_key, COALESCE(o.mime_type, '') AS mime_type,
+			       COALESCE(a.size, 0) AS owner_size
 			FROM document_occurrences o
 			JOIN attachments a ON a.id = o.attachment_id
 			JOIN messages m ON m.id = o.message_id
 			WHERE `+scopeSQL+`
 		), eligible AS (
-			SELECT canonical_blob_hash, MAX(owner_size) AS owner_size
+			SELECT canonical_blob_hash, MAX(owner_size) AS owner_size,
+			       MIN(occurrence_key) AS representative_key
 			FROM eligible_occurrences
 			GROUP BY canonical_blob_hash
+		), representatives AS (
+			SELECT e.canonical_blob_hash, e.owner_size, r.mime_type
+			FROM eligible e
+			JOIN eligible_occurrences r ON r.occurrence_key = e.representative_key
 		), classified AS (
 			SELECT e.canonical_blob_hash, e.owner_size,
 			       CASE
 			         WHEN EXISTS (
 			             SELECT 1 FROM document_extraction_heads h
+			             JOIN document_extractions he ON he.id = h.extraction_id
 			             WHERE h.profile_id = ? AND h.extraction_input_key = ?
 			               AND h.canonical_blob_hash = e.canonical_blob_hash
+			               AND `+documentHeadRouteMatchesSQL("he", "e")+`
 			         ) THEN 'ready'
 			         WHEN EXISTS (
 			             SELECT 1 FROM document_extractions x
@@ -599,7 +684,7 @@ func (s *Store) GetDocumentIndexStatusForScope(
 			         ) THEN 'terminal'
 			         ELSE 'missing'
 			       END AS coverage_state
-			FROM eligible e
+			FROM representatives e
 		)
 		SELECT (SELECT COUNT(*) FROM eligible_occurrences),
 		       COUNT(*), COALESCE(SUM(owner_size), 0),
@@ -624,10 +709,10 @@ func (s *Store) GetDocumentIndexStatusForScope(
 	}
 	err = s.db.QueryRowContext(ctx, s.dialect.Rebind(`
 		SELECT COALESCE(SUM(CASE WHEN a.attachment_role = 'unknown' THEN 1 ELSE 0 END), 0),
-		       COALESCE(SUM(CASE WHEN a.attachment_role NOT IN ('standalone', 'unknown') THEN 1 ELSE 0 END), 0)
+		       COALESCE(SUM(CASE WHEN a.attachment_role <> 'unknown' AND NOT `+documentRoleScopeSQL("a", "COALESCE((SELECT include_inline FROM document_extraction_profiles WHERE id = ?), FALSE)")+` THEN 1 ELSE 0 END), 0)
 		FROM attachments a
 		JOIN messages m ON m.id = a.message_id
-		WHERE `+mediaScopeSQL), mediaScopeArgs...).Scan(
+		WHERE `+mediaScopeSQL), append([]any{profileID}, mediaScopeArgs...)...).Scan(
 		&status.UnknownRoleOccurrences, &status.IneligibleRoleOccurrences,
 	)
 	if err != nil {
@@ -637,6 +722,10 @@ func (s *Store) GetDocumentIndexStatusForScope(
 		&status.StoredPlaintextChunks,
 	); err != nil {
 		return DocumentIndexStatus{}, fmt.Errorf("count stored document plaintext chunks: %w", err)
+	}
+	status.Failures, status.FailuresExhausted, err = s.documentFailureDiagnostics(ctx, profileID, extractionInputKey, allowedMediaTypes, allowedMessageTypes)
+	if err != nil {
+		return DocumentIndexStatus{}, err
 	}
 	return status, nil
 }
@@ -653,7 +742,7 @@ func (s *Store) StartDocumentExtractionRebuild(
 		return DocumentExtractionRebuild{}, errors.New("document extraction rebuild identity is incomplete")
 	}
 	scopeSQL, scopeArgs, err := documentOccurrenceScopeSQL(
-		"o", "m", allowedMediaTypes, allowedMessageTypes,
+		profileID, "o", "m", allowedMediaTypes, allowedMessageTypes,
 	)
 	if err != nil {
 		return DocumentExtractionRebuild{}, err
@@ -759,7 +848,7 @@ func (s *Store) CountIncompleteDocumentExtractionRebuild(
 		return 0, errors.New("document extraction rebuild is invalid")
 	}
 	scopeSQL, scopeArgs, err := documentOccurrenceScopeSQL(
-		"o", "m", allowedMediaTypes, allowedMessageTypes,
+		rebuild.ProfileID, "o", "m", allowedMediaTypes, allowedMessageTypes,
 	)
 	if err != nil {
 		return 0, err
@@ -836,7 +925,7 @@ func (s *Store) GarbageCollectDocumentDerivatives(
 			      SELECT 1 FROM document_occurrences o
 			      JOIN messages m ON m.id = o.message_id
 			      WHERE o.canonical_blob_hash = e.canonical_blob_hash
-			        AND o.attachment_role = 'standalone'
+			        AND `+documentRoleScopeSQL("o", "(SELECT include_inline FROM document_extraction_profiles WHERE id = e.profile_id)")+`
 			        AND `+LiveMessagesWhere("m", true)+`
 			  ))
 			ORDER BY e.updated_at, e.id
@@ -923,13 +1012,56 @@ func (s *Store) RetryDocumentExtraction(
 				return fmt.Errorf("check active rebuild failure before retry: %w", err)
 			}
 			if !activeRebuildFailure {
-				return errors.New("document extraction is already current for this profile")
+				// A route change leaves the old head serving until replacement
+				// succeeds, while any terminal failure suppresses the whole owner.
+				// Clear failures from other routes only while a live occurrence
+				// uses a route the head cannot cover; the attachment may have
+				// moved on from the failed route by now.
+				var failedReplacementRoute bool
+				if err := tx.QueryRow(`
+					SELECT EXISTS (
+						SELECT 1 FROM document_extractions e
+						JOIN document_extraction_heads h
+						  ON h.profile_id = e.profile_id
+						 AND h.canonical_blob_hash = e.canonical_blob_hash
+						 AND h.extraction_input_key = e.extraction_input_key
+						JOIN document_extractions he ON he.id = h.extraction_id
+						WHERE e.profile_id = ? AND e.canonical_blob_hash = ?
+						  AND e.state IN ('terminal', 'tombstoned')
+						  AND e.source_media_type IS NOT NULL
+						  AND he.source_media_type IS NOT NULL
+						  AND e.source_media_type <> he.source_media_type
+						  AND EXISTS (
+						      SELECT 1 FROM document_occurrences o
+						      JOIN messages m ON m.id = o.message_id
+						      WHERE o.canonical_blob_hash = e.canonical_blob_hash
+						        AND COALESCE(o.mime_type, '') <> he.source_media_type
+						        AND `+LiveMessagesWhere("m", true)+`
+						  )
+					)`, profileID, canonicalBlobHash).Scan(&failedReplacementRoute); err != nil {
+					return fmt.Errorf("check failed document replacement route before retry: %w", err)
+				}
+				if !failedReplacementRoute {
+					return errors.New("document extraction is already current for this profile")
+				}
+				retryScope = `
+				  AND EXISTS (
+				      SELECT 1 FROM document_extraction_heads h
+				      JOIN document_extractions he ON he.id = h.extraction_id
+				      WHERE h.profile_id = document_extractions.profile_id
+				        AND h.canonical_blob_hash = document_extractions.canonical_blob_hash
+				        AND h.extraction_input_key = document_extractions.extraction_input_key
+				        AND document_extractions.source_media_type IS NOT NULL
+				        AND he.source_media_type IS NOT NULL
+				        AND document_extractions.source_media_type <> he.source_media_type
+				  )`
+			} else {
+				retryScope = `
+				  AND EXISTS (
+				      SELECT 1 FROM document_extraction_rebuilds r
+				      WHERE r.id = document_extractions.rebuild_id AND r.state = 'building'
+				  )`
 			}
-			retryScope = `
-			  AND EXISTS (
-			      SELECT 1 FROM document_extraction_rebuilds r
-			      WHERE r.id = document_extractions.rebuild_id AND r.state = 'building'
-			  )`
 		}
 		var terminalRows int
 		if err := tx.QueryRow(`
@@ -1137,13 +1269,13 @@ func (s *Store) ListDocumentExtractionCandidates(
 		return nil, errors.New("pending document extraction scan has invalid bounds")
 	}
 	outerScopeSQL, outerScopeArgs, err := documentOccurrenceScopeSQL(
-		"o", "m", allowedMediaTypes, allowedMessageTypes,
+		profileID, "o", "m", allowedMediaTypes, allowedMessageTypes,
 	)
 	if err != nil {
 		return nil, err
 	}
 	innerScopeSQL, innerScopeArgs, err := documentOccurrenceScopeSQL(
-		"o2", "m2", allowedMediaTypes, allowedMessageTypes,
+		profileID, "o2", "m2", allowedMediaTypes, allowedMessageTypes,
 	)
 	if err != nil {
 		return nil, err
@@ -1157,9 +1289,11 @@ func (s *Store) ListDocumentExtractionCandidates(
 		ownerStateFilter = `
 		  AND NOT EXISTS (
 		      SELECT 1 FROM document_extraction_heads h
+		      JOIN document_extractions he ON he.id = h.extraction_id
 		      WHERE h.profile_id = p.id
 		        AND h.canonical_blob_hash = o.canonical_blob_hash
 		        AND h.extraction_input_key = ?
+		        AND ` + documentHeadRouteMatchesSQL("he", "o") + `
 		  )
 		  AND NOT EXISTS (
 		      SELECT 1 FROM document_extractions e
@@ -1231,7 +1365,19 @@ func (s *Store) ListDocumentExtractionCandidates(
 	return candidates, nil
 }
 
+// documentHeadRouteMatchesSQL is true when a served extraction was produced
+// through the upload route the representative occurrence selects now. An
+// extraction recorded before routes were tracked counts as matching. A head
+// through another route no longer covers its owner, so any scope change that
+// selects a different representative reaches the next candidate scan without
+// reconcile-time bookkeeping.
+func documentHeadRouteMatchesSQL(extractionAlias, occurrenceAlias string) string {
+	return "(" + extractionAlias + ".source_media_type IS NULL OR " +
+		extractionAlias + ".source_media_type = COALESCE(" + occurrenceAlias + ".mime_type, ''))"
+}
+
 func documentOccurrenceScopeSQL(
+	profileID string,
 	occurrenceAlias string,
 	messageAlias string,
 	allowedMediaTypes []string,
@@ -1243,7 +1389,8 @@ func documentOccurrenceScopeSQL(
 	if err != nil {
 		return "", nil, err
 	}
-	return occurrenceAlias + ".attachment_role = 'standalone' AND " + mediaScopeSQL, args, nil
+	roleSQL := documentRoleScopeSQL(occurrenceAlias, "(SELECT include_inline FROM document_extraction_profiles WHERE id = ?)")
+	return roleSQL + " AND " + mediaScopeSQL, append([]any{profileID}, args...), nil
 }
 
 func documentOccurrenceMediaScopeSQL(
@@ -1470,7 +1617,7 @@ func bumpDocumentIndexRevision(q querier) error {
 }
 
 func eligibleDocumentFile(file FileMetadata) bool {
-	if file.AttachmentRole != AttachmentRoleStandalone || file.StoragePath == "" ||
+	if (file.AttachmentRole != AttachmentRoleStandalone && file.AttachmentRole != AttachmentRoleInline) || file.StoragePath == "" ||
 		file.Size <= 0 || !validLowerSHA256(file.ContentHash) {
 		return false
 	}
@@ -1505,7 +1652,7 @@ func validateDocumentProfile(profile DocumentExtractionProfile) ([]byte, []byte,
 	if len(allowed) == 0 || slices.Contains(allowed, "") {
 		return nil, nil, errors.New("document extraction profile requires a media allowlist")
 	}
-	allowedJSON, err := json.Marshal(allowed)
+	allowedJSON, err := json.Marshal(allowed, json.Deterministic(true))
 	if err != nil {
 		return nil, nil, fmt.Errorf("encode document extraction profile allowlist: %w", err)
 	}
@@ -1517,22 +1664,22 @@ func validateDocumentProfile(profile DocumentExtractionProfile) ([]byte, []byte,
 }
 
 func compactJSON(value []byte) ([]byte, error) {
-	if len(value) == 0 || !json.Valid(value) {
+	if len(value) == 0 || !jsontext.Value(value).IsValid() {
 		return nil, errors.New("value is not valid JSON")
 	}
-	var output bytes.Buffer
-	if err := json.Compact(&output, value); err != nil {
+	output := jsontext.Value(value).Clone()
+	if err := output.Compact(); err != nil {
 		return nil, err
 	}
-	return output.Bytes(), nil
+	return output, nil
 }
 
 func equalJSON(first, second []byte) bool {
 	decode := func(value []byte) (any, error) {
-		decoder := json.NewDecoder(bytes.NewReader(value))
-		decoder.UseNumber()
+		decoder := jsontext.NewDecoder(bytes.NewReader(value), jsonexact.PreserveNumbers)
+
 		var decoded any
-		if err := decoder.Decode(&decoded); err != nil {
+		if err := json.UnmarshalDecode(decoder, &decoded); err != nil {
 			return nil, err
 		}
 		return decoded, nil
@@ -1548,4 +1695,10 @@ func validLowerSHA256(value string) bool {
 	}
 	_, err := hex.DecodeString(value)
 	return err == nil
+}
+
+// documentRoleScopeSQL accepts only document occurrence roles, using immutable
+// profile authority for inline attachments. Other media roles never qualify.
+func documentRoleScopeSQL(alias, includeInlineExpression string) string {
+	return "(" + alias + ".attachment_role = 'standalone' OR (" + alias + ".attachment_role = 'inline' AND " + includeInlineExpression + " = TRUE))"
 }

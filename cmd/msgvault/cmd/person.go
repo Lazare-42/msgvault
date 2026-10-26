@@ -1,7 +1,8 @@
 package cmd
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"net/http"
@@ -25,13 +26,31 @@ const personValue = "person"
 
 var personCmd = &cobra.Command{
 	Use:   personValue,
-	Short: "Manage durable person profiles",
+	Short: "Find contacts and manage durable person profiles",
+	Long: `A participant is one address or handle seen in messages. A person is a
+durable profile that groups participants and carries notes, attributes,
+relationships, and briefs. People come from 'person promote' or from
+imported CardDAV contacts.
+
+Find a contact by address (read-only):
+  msgvault query "SELECT id, email_address, display_name FROM participants WHERE email_address ILIKE '%alice%'"
+Promote that participant id to a person (writes):
+  msgvault person promote <participant-id> --json
+Then read it with person get, identities, or files <person-id>.
+person search needs semantic search; see 'msgvault setup status'.`,
+	Example: `  msgvault person list --json
+  msgvault person identities 1 --json`,
 }
 
 var personPromoteCmd = &cobra.Command{
 	Use:   "promote <participant-id>",
 	Short: "Promote a participant's identity cluster to a durable person",
-	Args:  cobra.ExactArgs(1),
+	Long: `Create a durable person from a participant and its identity cluster, or
+return the person it already belongs to. <participant-id> is an id from
+the participants query in 'msgvault person --help'. Prints the person;
+--json prints it as JSON.`,
+	Example: `  msgvault person promote 1 --json`,
+	Args:    cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		participantID, err := positivePersonCLIArg(cmd, args[0], "participant")
 		if err != nil {
@@ -62,19 +81,39 @@ var personPromoteCmd = &cobra.Command{
 }
 
 var personGetCmd = &cobra.Command{
-	Use:   "get <person-id>",
+	Use:   "get [person-id]",
 	Short: "Get a durable person profile",
-	Args:  cobra.ExactArgs(1),
+	Long: `Show one durable person: id, display_name (when known), vcard_uid,
+participant_ids, revision, created_at, and updated_at. Pass a <person-id>
+from 'msgvault person list --json', or --vcard-uid with the person's vcard_uid
+or a bound CardDAV contact UID. Addresses are in 'person identities'.`,
+	Example: `  msgvault person get 1 --json
+  msgvault person get --vcard-uid 4f6c1a2e-0000-4000-8000-000000000001 --json`,
+	Args: personGetArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		id, err := positivePersonCLIArg(cmd, args[0], personValue)
+		uid, err := personGetUID(cmd)
 		if err != nil {
 			return err
+		}
+		var id int64
+		if uid == "" {
+			id, err = positivePersonCLIArg(cmd, args[0], personValue)
+			if err != nil {
+				return err
+			}
 		}
 		client, _, err := OpenHTTPStore(cmd.Context())
 		if err != nil {
 			return err
 		}
 		defer func() { _ = client.Close() }()
+		if uid != "" {
+			resp, err := getCLIPersonByUID(cmd, client, uid)
+			if err != nil {
+				return err
+			}
+			return writeCLIPerson(cmd, resp.JSON200)
+		}
 		resp, err := getCLIPerson(cmd, client, id)
 		if err != nil {
 			return err
@@ -83,10 +122,40 @@ var personGetCmd = &cobra.Command{
 	},
 }
 
+func personGetUID(cmd *cobra.Command) (string, error) {
+	uid, err := cmd.Flags().GetString("vcard-uid")
+	if err != nil {
+		return "", fmt.Errorf("read --vcard-uid: %w", err)
+	}
+	return strings.TrimSpace(uid), nil
+}
+
+func personGetArgs(cmd *cobra.Command, args []string) error {
+	uid, err := personGetUID(cmd)
+	if err != nil {
+		return err
+	}
+	if uid != "" {
+		if len(args) != 0 {
+			return usageErr(cmd, errors.New("--vcard-uid cannot be combined with a person ID"))
+		}
+		return nil
+	}
+	if len(args) != 1 {
+		return usageErr(cmd, errors.New("provide a person ID or --vcard-uid"))
+	}
+	return nil
+}
+
 var personListCmd = &cobra.Command{
 	Use:   cmdUseList,
 	Short: "List durable person profiles",
-	Args:  cobra.NoArgs,
+	Long: `List durable people as id, participant_ids, revision, vcard_uid,
+created_at, updated_at, and display_name (when known). Addresses
+are not included: use 'person identities <id>'. Empty until a participant is
+promoted with 'person promote' or a CardDAV contact is imported.`,
+	Example: `  msgvault person list --json`,
+	Args:    cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, _ []string) error {
 		client, _, err := OpenHTTPStore(cmd.Context())
 		if err != nil {
@@ -101,7 +170,7 @@ var personListCmd = &cobra.Command{
 			return err
 		}
 		if personJSON {
-			return json.NewEncoder(cmd.OutOrStdout()).Encode(resp.JSON200.People)
+			return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), resp.JSON200.People, json.Deterministic(true))
 		}
 		w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 		_, _ = fmt.Fprintln(w, "ID\tDISPLAY NAME\tVCARD UID\tPARTICIPANTS\tREVISION")
@@ -269,7 +338,7 @@ func newPersonMergeCommand() *cobra.Command {
 				return err
 			}
 			if jsonOutput {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(resp.JSON200)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), resp.JSON200, json.Deterministic(true))
 			}
 			writePersonMergeResult(cmd, resp.JSON200)
 			return nil
@@ -335,7 +404,7 @@ func newPersonSplitCommand() *cobra.Command {
 				return err
 			}
 			if jsonOutput {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(resp.JSON200)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), resp.JSON200, json.Deterministic(true))
 			}
 			writePersonSplitResult(cmd, resp.JSON200)
 			return nil
@@ -378,7 +447,7 @@ func newPersonMergeHistoryCommand() *cobra.Command {
 				return err
 			}
 			if jsonOutput {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(resp.JSON200.Merges)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), resp.JSON200.Merges, json.Deterministic(true))
 			}
 			return writePersonMergeHistory(cmd, resp.JSON200.Merges)
 		},
@@ -415,7 +484,7 @@ func newPersonMergeShowCommand() *cobra.Command {
 					return loadErr
 				}
 				if jsonOutput {
-					return json.NewEncoder(cmd.OutOrStdout()).Encode(resp.JSON200)
+					return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), resp.JSON200, json.Deterministic(true))
 				}
 				_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 					"Merge snapshot: %d\nVersion: %d\nSHA-256: %s\nSnapshot: %s\n",
@@ -433,7 +502,7 @@ func newPersonMergeShowCommand() *cobra.Command {
 				return loadErr
 			}
 			if jsonOutput {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(resp.JSON200)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), resp.JSON200, json.Deterministic(true))
 			}
 			writePersonMergeDetail(cmd, resp.JSON200)
 			return nil
@@ -490,7 +559,7 @@ func newPersonMergeCandidateCommand() *cobra.Command {
 				return err
 			}
 			if jsonOutput {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(resp.JSON200)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), resp.JSON200, json.Deterministic(true))
 			}
 			personETag := ""
 			if resp.Headers200 != nil {
@@ -640,12 +709,32 @@ func getCLIPerson(
 		})
 }
 
+func getCLIPersonByUID(
+	cmd *cobra.Command, client *daemonclient.Client, uid string,
+) (*generated.GetPersonByUIDResp, error) {
+	supported, err := client.SupportsAPISchemaVersion(cmd.Context(), daemonclient.PersonUIDLookupMinAPISchemaVersion)
+	if err != nil {
+		return nil, fmt.Errorf("check person UID lookup capability: %w", err)
+	}
+	if !supported {
+		return nil, fmt.Errorf("person UID lookup requires daemon API schema %s or newer; upgrade the daemon",
+			daemonclient.PersonUIDLookupMinAPISchemaVersion)
+	}
+	return daemonclient.APIResponse(client,
+		func(api *apiclient.Client) (*generated.GetPersonByUIDResp, error) {
+			return api.GetPersonByUIDWithResponse(cmd.Context(),
+				&generated.GetPersonByUIDRequestOptions{
+					Query: &generated.GetPersonByUIDQuery{UID: uid},
+				})
+		})
+}
+
 func writeCLIPerson(cmd *cobra.Command, person *generated.Person) error {
 	if person == nil {
 		return errors.New("person response was empty")
 	}
 	if personJSON {
-		return json.NewEncoder(cmd.OutOrStdout()).Encode(person)
+		return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), person, json.Deterministic(true))
 	}
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(),
 		"Person: %d\nDisplay name: %s\nvCard UID: %s\nParticipants: %v\nRevision: %d\n",
@@ -678,18 +767,22 @@ func init() {
 	personCmd.AddCommand(newPersonProviderCommand(defaultPersonProviderCommandDeps()))
 	personCmd.AddCommand(newPersonSweepCommand(defaultPersonSweepCommandDeps()))
 	personCmd.AddCommand(newPersonEnrichmentCommand(defaultPersonEnrichmentCommandDeps()))
+	personCmd.AddCommand(newPersonBriefCommand())
+	personCmd.AddCommand(newPersonAgendaCommand())
+	personCmd.AddCommand(newPersonScoringCommand())
 	personCmd.AddCommand(personPromoteCmd, personGetCmd, personListCmd,
 		personSetDisplayNameCmd, personDeleteCmd, personTrackCmd, personUntrackCmd,
 		personMergeCmd, personSplitCmd, personMergeHistoryCmd, personMergeShowCmd,
 		personMergeCandidateCmd, personNotesCmd,
 		newPersonFilesCommand(defaultPersonFilesCommandDeps()), personSearchCmd,
-		newPersonFactsCommand())
+		newPersonFactsCommand(), newPersonDirectoryCommand(), newPersonIdentitiesCommand())
 	for _, command := range []*cobra.Command{
 		personPromoteCmd, personGetCmd, personListCmd, personSetDisplayNameCmd,
 		personTrackCmd, personUntrackCmd,
 	} {
 		command.Flags().BoolVar(&personJSON, flagJSON, false, "Output as JSON")
 	}
+	personGetCmd.Flags().String("vcard-uid", "", "Look up by a person or bound CardDAV UID")
 	personSetDisplayNameCmd.Flags().BoolVar(
 		&personClearDisplayName, "clear", false, "Clear the display-name override",
 	)

@@ -2,7 +2,8 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/peoplesweep"
 	"go.kenn.io/msgvault/internal/personfacts"
 	"go.kenn.io/msgvault/internal/store"
@@ -31,6 +33,7 @@ type personSweepCommandStore interface {
 }
 
 type personSweepCommandDeps struct {
+	bind               func(context.Context) personSweepCommandDeps
 	config             func() peoplesweep.Config
 	openStore          func() (personSweepCommandStore, func(), error)
 	newRunner          func(peoplesweep.Config, personSweepCommandStore) (personSweepRunner, error)
@@ -100,16 +103,45 @@ type personSweepHistoryOutput struct {
 
 func defaultPersonSweepCommandDeps() personSweepCommandDeps {
 	return personSweepCommandDeps{
-		config: func() peoplesweep.Config { return cfg.People.Sweep },
+		bind: func(ctx context.Context) personSweepCommandDeps {
+			deps := defaultPersonSweepCommandDeps()
+			state := invocationFromContext(ctx)
+			var currentCfg *config.Config
+			if state != nil && state.cfg != nil {
+				currentCfg = state.cfg
+			}
+			deps.config = func() peoplesweep.Config {
+				if currentCfg == nil {
+					return peoplesweep.Config{}
+				}
+				return currentCfg.People.Sweep
+			}
+			deps.newRunner = func(sweepConfig peoplesweep.Config, commandStore personSweepCommandStore) (personSweepRunner, error) {
+				if currentCfg == nil {
+					return nil, errors.New("configuration is unavailable")
+				}
+				st, ok := commandStore.(*store.Store)
+				if !ok {
+					return nil, errors.New("people sweep production store is unavailable")
+				}
+				productionConfig := *currentCfg
+				productionConfig.People.Sweep = sweepConfig
+				return newProductionPersonSweepWorker(&productionConfig, st)
+			}
+			deps.openStore = func() (personSweepCommandStore, func(), error) {
+				return openWritableStoreAndInitForInvocation(state)
+			}
+			return deps
+		},
+		config: func() peoplesweep.Config { return peoplesweep.Config{} },
 		openStore: func() (personSweepCommandStore, func(), error) {
-			return openWritableStoreAndInit()
+			return nil, nil, errors.New("configuration is unavailable")
 		},
 		newRunner: func(config peoplesweep.Config, commandStore personSweepCommandStore) (personSweepRunner, error) {
-			st, ok := commandStore.(*store.Store)
-			if !ok {
+			if _, ok := commandStore.(*store.Store); !ok {
 				return nil, errors.New("people sweep production store is unavailable")
 			}
-			return newProductionPersonSweepWorker(config, st, os.LookupEnv)
+			return nil, errors.New("configuration is unavailable")
 		},
 		isDaemonSubprocess: isDaemonCLISubprocess,
 		lookupEnv:          os.LookupEnv,
@@ -136,6 +168,9 @@ func newPersonSweepRunCommand(deps personSweepCommandDeps) *cobra.Command {
 	command := &cobra.Command{
 		Use: "run", Short: "Run bounded person maintenance", Args: cobra.NoArgs,
 		RunE: func(command *cobra.Command, args []string) error {
+			if invocationFromContext(command.Context()) != nil && deps.bind != nil {
+				deps = deps.bind(command.Context())
+			}
 			config := deps.config()
 			personSet := command.Flags().Changed("person")
 			if personSet && personID <= 0 {
@@ -197,6 +232,9 @@ func newPersonSweepStatusCommand(deps personSweepCommandDeps) *cobra.Command {
 	command := &cobra.Command{
 		Use: statusValue, Short: "Show redacted person maintenance state", Args: cobra.NoArgs,
 		RunE: func(command *cobra.Command, args []string) error {
+			if invocationFromContext(command.Context()) != nil && deps.bind != nil {
+				deps = deps.bind(command.Context())
+			}
 			if !deps.isDaemonSubprocess() {
 				return deps.proxy(command, args, nil)
 			}
@@ -243,6 +281,9 @@ func newPersonSweepHistoryCommand(deps personSweepCommandDeps) *cobra.Command {
 	command := &cobra.Command{
 		Use: "history", Short: "Show redacted person maintenance history", Args: cobra.NoArgs,
 		RunE: func(command *cobra.Command, args []string) error {
+			if invocationFromContext(command.Context()) != nil && deps.bind != nil {
+				deps = deps.bind(command.Context())
+			}
 			if !deps.isDaemonSubprocess() {
 				return deps.proxy(command, args, nil)
 			}
@@ -274,14 +315,15 @@ func newPersonSweepHistoryCommand(deps personSweepCommandDeps) *cobra.Command {
 func personSweepForwardEnv(
 	config peoplesweep.Config, lookup peoplesweep.CredentialLookup,
 ) map[string]string {
-	if config.Provider.Kind != peoplesweep.ProviderOpenAICompatible || config.Provider.APIKeyEnv == "" {
+	_, provider, err := config.ActiveProviderConfig()
+	if err != nil || provider.Credential != peoplesweep.CredentialEnv || lookup == nil {
 		return nil
 	}
-	value, ok := lookup(config.Provider.APIKeyEnv)
+	value, ok := lookup(provider.CredentialEnv)
 	if !ok || value == "" {
 		return nil
 	}
-	return map[string]string{config.Provider.APIKeyEnv: value}
+	return map[string]string{provider.CredentialEnv: value}
 }
 
 func writePersonSweepRun(w io.Writer, result peoplesweep.RunResult, jsonOutput bool) error {
@@ -289,7 +331,7 @@ func writePersonSweepRun(w io.Writer, result peoplesweep.RunResult, jsonOutput b
 		PeopleSucceeded: result.PeopleSucceeded, ProjectedWrites: result.ProjectedWrites,
 		Usage: personSweepUsage(result.Usage)}
 	if jsonOutput {
-		return json.NewEncoder(w).Encode(output)
+		return json.MarshalEncode(jsontext.NewEncoder(w), output, json.Deterministic(true))
 	}
 	_, err := fmt.Fprintf(w, "Run %s: attempted=%d succeeded=%d projected_writes=%d\n",
 		output.RunID, output.PeopleAttempted, output.PeopleSucceeded, output.ProjectedWrites)
@@ -301,7 +343,7 @@ func writePersonSweepRun(w io.Writer, result peoplesweep.RunResult, jsonOutput b
 
 func writePersonSweepStatus(w io.Writer, output personSweepStatusOutput, jsonOutput bool) error {
 	if jsonOutput {
-		return json.NewEncoder(w).Encode(output)
+		return json.MarshalEncode(jsontext.NewEncoder(w), output, json.Deterministic(true))
 	}
 	oldestDirty := "-"
 	if output.OldestDirtyAt != nil {
@@ -355,7 +397,7 @@ func personSweepUsage(usage peoplesweep.Usage) personSweepUsageOutput {
 
 func writePersonSweepHistory(w io.Writer, output personSweepHistoryOutput, jsonOutput bool) error {
 	if jsonOutput {
-		return json.NewEncoder(w).Encode(output)
+		return json.MarshalEncode(jsontext.NewEncoder(w), output, json.Deterministic(true))
 	}
 	table := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(table, "TYPE\tSTATUS\tMODE\tPERSON\tFAILURE\tATTEMPTS\tWRITES")

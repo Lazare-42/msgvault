@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -40,6 +41,7 @@ type RuleConfig struct {
 
 type compiledConfig struct {
 	Config
+
 	MsgvaultHomeAbs string
 	OutputDirAbs    string
 	StateFileAbs    string
@@ -50,6 +52,7 @@ type compiledConfig struct {
 
 type compiledRule struct {
 	RuleConfig
+
 	AttachmentFilenamePattern *regexp.Regexp
 	SubjectPattern            *regexp.Regexp
 	FromPattern               *regexp.Regexp
@@ -74,7 +77,7 @@ func loadConfig(path string) (*compiledConfig, error) {
 		cfg.PageSize = defaultPageSize
 	}
 	if len(cfg.Rules) == 0 {
-		return nil, fmt.Errorf("config must contain at least one [[rule]]")
+		return nil, errors.New("config must contain at least one [[rule]]")
 	}
 	if cfg.PageSize > 1000 {
 		return nil, fmt.Errorf("page_size too large: %d", cfg.PageSize)
@@ -130,16 +133,16 @@ func loadConfig(path string) (*compiledConfig, error) {
 
 func compileRule(rule RuleConfig) (compiledRule, error) {
 	if strings.TrimSpace(rule.Name) == "" {
-		return compiledRule{}, fmt.Errorf("name is required")
+		return compiledRule{}, errors.New("name is required")
 	}
 	if strings.TrimSpace(rule.Query) == "" {
-		return compiledRule{}, fmt.Errorf("query is required")
+		return compiledRule{}, errors.New("query is required")
 	}
 	if strings.TrimSpace(rule.WealthfolioAccountID) == "" {
-		return compiledRule{}, fmt.Errorf("wealthfolio_account_id is required")
+		return compiledRule{}, errors.New("wealthfolio_account_id is required")
 	}
 	if rule.MaxMessages < 0 {
-		return compiledRule{}, fmt.Errorf("max_messages cannot be negative")
+		return compiledRule{}, errors.New("max_messages cannot be negative")
 	}
 
 	cr := compiledRule{RuleConfig: rule}

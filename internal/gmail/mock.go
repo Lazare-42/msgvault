@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"sync"
+
+	"go.kenn.io/msgvault/internal/store"
 )
 
 // MockAPI is a mock implementation of the Gmail API for testing.
@@ -92,7 +94,7 @@ func (m *MockAPI) ListLabels(ctx context.Context) ([]*Label, error) {
 	if m.Labels == nil {
 		return []*Label{
 			{ID: "INBOX", Name: "INBOX", Type: "system"},
-			{ID: "SENT", Name: "SENT", Type: "system", SystemRole: SystemRoleForLabelID("SENT")},
+			{ID: "SENT", Name: "SENT", Type: "system", SystemRole: store.GmailSystemRoleForLabelID("SENT")},
 			{ID: "STARRED", Name: "STARRED", Type: "system"},
 			{ID: "TRASH", Name: "TRASH", Type: "system"},
 			{ID: "UNREAD", Name: "UNREAD", Type: "system"},
@@ -104,7 +106,7 @@ func (m *MockAPI) ListLabels(ctx context.Context) ([]*Label, error) {
 	labels := make([]*Label, len(m.Labels))
 	for i, source := range m.Labels {
 		label := *source
-		label.SystemRole = SystemRoleForLabelID(label.ID)
+		label.SystemRole = store.GmailSystemRoleForLabelID(label.ID)
 		labels[i] = &label
 	}
 	return labels, nil
@@ -277,22 +279,22 @@ func (m *MockAPI) Close() error {
 	return nil
 }
 
-// Draft stubs — MockAPI is primarily for sync testing; draft tests use real Client.
+// ComposedDraft stubs — MockAPI is primarily for sync testing; draft tests use real Client.
 
-func (m *MockAPI) ListDrafts(ctx context.Context, query string, maxResults int) ([]*Draft, error) {
+func (m *MockAPI) ListDrafts(ctx context.Context, query string, maxResults int) ([]*ComposedDraft, error) {
 	return nil, nil
 }
 
-func (m *MockAPI) GetDraft(ctx context.Context, draftID string) (*Draft, error) {
+func (m *MockAPI) GetDraft(ctx context.Context, draftID string) (*ComposedDraft, error) {
 	return nil, &NotFoundError{Path: "/drafts/" + draftID}
 }
 
-func (m *MockAPI) CreateDraft(ctx context.Context, draft *DraftCompose) (*Draft, error) {
-	return &Draft{ID: "mock_draft_1"}, nil
+func (m *MockAPI) CreateDraft(ctx context.Context, draft *DraftCompose) (*ComposedDraft, error) {
+	return &ComposedDraft{ID: "mock_draft_1"}, nil
 }
 
-func (m *MockAPI) UpdateDraft(ctx context.Context, draftID string, draft *DraftCompose) (*Draft, error) {
-	return &Draft{ID: draftID}, nil
+func (m *MockAPI) UpdateDraft(ctx context.Context, draftID string, draft *DraftCompose) (*ComposedDraft, error) {
+	return &ComposedDraft{ID: draftID}, nil
 }
 
 func (m *MockAPI) DeleteDraft(ctx context.Context, draftID string) error {

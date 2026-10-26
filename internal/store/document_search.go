@@ -5,7 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -47,50 +48,52 @@ type DocumentSearchRequest struct {
 	SourceIDs      []int64                 `json:"source_ids,omitempty"`
 	MessageIDs     []int64                 `json:"message_ids,omitempty"`
 	MessageTypes   []string                `json:"message_types,omitempty"`
-	AttachmentID   int64                   `json:"attachment_id,omitempty"`
-	MessageID      int64                   `json:"message_id,omitempty"`
+	AttachmentID   int64                   `json:"attachment_id,omitzero"`
+	MessageID      int64                   `json:"message_id,omitzero"`
 	PageSize       int                     `json:"page_size"`
 	Cursor         string                  `json:"cursor,omitempty"`
 	SearchMode     string                  `json:"search_mode,omitempty"`
-	CandidateLimit int                     `json:"candidate_limit,omitempty"`
+	CandidateLimit int                     `json:"candidate_limit,omitzero"`
 	After          *time.Time              `json:"after,omitempty"`
 	Before         *time.Time              `json:"before,omitempty"`
-	PersonID       int64                   `json:"person_id,omitempty"`
-	ParticipantID  int64                   `json:"participant_id,omitempty"`
+	PersonID       int64                   `json:"person_id,omitzero"`
+	ParticipantID  int64                   `json:"participant_id,omitzero"`
 	Directions     []personscope.Direction `json:"directions,omitempty"`
-	Person         *personscope.Scope      `json:"person,omitempty"`
+	Person         *personscope.Scope      `json:"person,omitzero" nullable:"false"`
 }
 
 type DocumentSearchResponse struct {
 	Results                     []DocumentSearchResult `json:"results"`
 	NextCursor                  string                 `json:"next_cursor,omitempty"`
 	Revision                    int64                  `json:"revision"`
-	Truncated                   bool                   `json:"truncated,omitempty"`
+	Truncated                   bool                   `json:"truncated,omitzero"`
 	EffectiveMode               string                 `json:"effective_mode,omitempty"`
-	VectorGenerationID          int64                  `json:"vector_generation_id,omitempty"`
+	VectorGenerationID          int64                  `json:"vector_generation_id,omitzero"`
 	VectorGenerationFingerprint string                 `json:"vector_generation_fingerprint,omitempty"`
 }
 
 type DocumentSearchResult struct {
-	AttachmentID                int64                   `json:"attachment_id"`
-	MessageID                   int64                   `json:"message_id"`
-	ConversationID              int64                   `json:"conversation_id"`
-	SourceID                    int64                   `json:"source_id"`
-	SourceMessageID             string                  `json:"source_message_id,omitempty"`
-	OccurredAt                  *time.Time              `json:"occurred_at,omitempty"`
-	OccurrenceKey               string                  `json:"occurrence_key"`
-	SourcePartKey               string                  `json:"source_part_key,omitempty"`
-	Filename                    string                  `json:"filename,omitempty"`
-	ContainingTitle             string                  `json:"containing_title,omitempty"`
-	MIMEType                    string                  `json:"mime_type,omitempty"`
-	CanonicalBlobHash           string                  `json:"canonical_blob_hash"`
-	OtherLiveCopies             int                     `json:"other_live_copies"`
-	ChunkKey                    string                  `json:"chunk_key"`
-	ChunkOrdinal                int                     `json:"chunk_ordinal"`
-	HeadingPath                 []string                `json:"heading_path,omitempty"`
-	FirstUnitIndex              int                     `json:"first_unit_index"`
-	LastUnitIndex               int                     `json:"last_unit_index"`
-	Excerpt                     string                  `json:"excerpt"`
+	AttachmentID      int64      `json:"attachment_id"`
+	MessageID         int64      `json:"message_id"`
+	ConversationID    int64      `json:"conversation_id"`
+	SourceID          int64      `json:"source_id"`
+	SourceMessageID   string     `json:"source_message_id,omitempty"`
+	OccurredAt        *time.Time `json:"occurred_at,omitempty"`
+	OccurrenceKey     string     `json:"occurrence_key"`
+	SourcePartKey     string     `json:"source_part_key,omitempty"`
+	Filename          string     `json:"filename,omitempty"`
+	ContainingTitle   string     `json:"containing_title,omitempty"`
+	MIMEType          string     `json:"mime_type,omitempty"`
+	CanonicalBlobHash string     `json:"canonical_blob_hash"`
+	OtherLiveCopies   int        `json:"other_live_copies"`
+	ChunkKey          string     `json:"chunk_key"`
+	ChunkOrdinal      int        `json:"chunk_ordinal"`
+	HeadingPath       []string   `json:"heading_path,omitempty"`
+	FirstUnitIndex    int        `json:"first_unit_index"`
+	LastUnitIndex     int        `json:"last_unit_index"`
+	Excerpt           string     `json:"excerpt"`
+	// ExcerptStartRune is the zero-based start of Excerpt in the matched chunk.
+	ExcerptStartRune            int                     `json:"excerpt_start_rune"`
 	HighlightStart              int                     `json:"highlight_start"`
 	HighlightEnd                int                     `json:"highlight_end"`
 	ProfileID                   string                  `json:"profile_id"`
@@ -100,17 +103,17 @@ type DocumentSearchResult struct {
 	MatchedSignals              []string                `json:"matched_signals"`
 	Truncated                   bool                    `json:"truncated"`
 	Rank                        int                     `json:"rank"`
-	PersonProvenance            *personscope.Provenance `json:"person_provenance,omitempty"`
-	LexicalRank                 int                     `json:"lexical_rank,omitempty"`
-	SemanticRank                int                     `json:"semantic_rank,omitempty"`
-	SemanticScore               float64                 `json:"semantic_score,omitempty"`
-	FusionScore                 float64                 `json:"fusion_score,omitempty"`
+	PersonProvenance            *personscope.Provenance `json:"person_provenance,omitzero" nullable:"false"`
+	LexicalRank                 int                     `json:"lexical_rank,omitzero"`
+	SemanticRank                int                     `json:"semantic_rank,omitzero"`
+	SemanticScore               float64                 `json:"semantic_score,omitzero"`
+	FusionScore                 float64                 `json:"fusion_score,omitzero"`
 	VectorToken                 string                  `json:"vector_token,omitempty"`
-	VectorGenerationID          int64                   `json:"vector_generation_id,omitempty"`
+	VectorGenerationID          int64                   `json:"vector_generation_id,omitzero"`
 	VectorGenerationFingerprint string                  `json:"vector_generation_fingerprint,omitempty"`
 	VectorEmbeddingProfile      string                  `json:"vector_embedding_profile,omitempty"`
 	VectorModel                 string                  `json:"vector_model,omitempty"`
-	VectorDimension             int                     `json:"vector_dimension,omitempty"`
+	VectorDimension             int                     `json:"vector_dimension,omitzero"`
 }
 
 // DocumentVectorSearchHit is an opaque backend hit presented for authoritative
@@ -342,7 +345,7 @@ func (s *Store) ResolveDocumentVectorSearchOccurrences(
 		if err := json.Unmarshal([]byte(headingJSON), &result.HeadingPath); err != nil {
 			return nil, false, fmt.Errorf("decode document vector search heading path: %w", err)
 		}
-		result.Excerpt, result.HighlightStart, result.HighlightEnd = documentSearchExcerpt(text, nil)
+		result.Excerpt, result.ExcerptStartRune, result.HighlightStart, result.HighlightEnd = documentSearchExcerpt(text, nil)
 		result.MatchedSignals = []string{"semantic"}
 		results = append(results, result)
 	}
@@ -557,13 +560,15 @@ func (s *Store) searchDocumentFilenames(
 	return s.scanDocumentSearchRows(ctx, query, args, false, limit)
 }
 
+const containingTitleMCVSQL = "COALESCE(NULLIF(m.subject, ''), NULLIF(cv.title, ''), '')"
+
 const documentSearchSelectColumns = `
 		a.id, m.id, m.conversation_id, m.source_id,
 		COALESCE(m.source_message_id, ''),
 		COALESCE(m.sent_at, m.received_at, m.internal_date),
 		o.occurrence_key,
 		COALESCE(o.source_part_key, ''), COALESCE(o.filename, ''),
-		COALESCE(NULLIF(m.subject, ''), NULLIF(cv.title, ''), ''),
+		` + containingTitleMCVSQL + `,
 		COALESCE(o.mime_type, ''), h.canonical_blob_hash,
 		dc.chunk_key, dc.ordinal, CAST(dc.heading_path AS TEXT),
 		dc.first_unit_index, dc.last_unit_index, dc.text,
@@ -578,7 +583,7 @@ const documentSearchRankedSelectColumns = `
 		o.occurrence_key AS occurrence_key,
 		COALESCE(o.source_part_key, '') AS source_part_key,
 		COALESCE(o.filename, '') AS filename,
-		COALESCE(NULLIF(m.subject, ''), NULLIF(cv.title, ''), '') AS containing_title,
+		` + containingTitleMCVSQL + ` AS containing_title,
 		COALESCE(o.mime_type, '') AS mime_type,
 		h.canonical_blob_hash AS canonical_blob_hash,
 		dc.chunk_key AS chunk_key, dc.ordinal AS chunk_ordinal,
@@ -608,8 +613,10 @@ func documentSearchValidityForConsent(consentName string) string {
 		AND ` + consentName + `.profile_fingerprint = ` + profile + `.fingerprint
 		AND ` + consentName + `.retention_posture = ` + profile + `.retention_posture
 		AND ` + consentName + `.training_posture = ` + profile + `.training_posture
-		AND o.attachment_role = 'standalone'
-		AND ` + attachment + `.attachment_role = 'standalone'
+		AND ` + documentRoleScopeSQL("o", profile+".include_inline") + `
+		AND ` + documentRoleScopeSQL(attachment, profile+".include_inline") + `
+		AND ` + attachment + `.attachment_role = o.attachment_role
+		AND ` + documentRoleScopeSQL(attachment, "COALESCE((SELECT include_inline FROM document_extraction_profiles WHERE id = ds.target_profile_id), FALSE)") + `
 		AND o.role_source IN ('mime_disposition', 'provider_explicit', 'importer_semantics', 'raw_mime_repair')
 		AND ` + attachment + `.role_source IN ('mime_disposition', 'provider_explicit', 'importer_semantics', 'raw_mime_repair')
 		AND ` + LiveMessagesWhere(message, true) + `
@@ -631,6 +638,7 @@ func documentSearchValidityForConsent(consentName string) string {
 		              AND target_head.profile_id = ` + state + `.target_profile_id
 		              AND target_profile.enabled = TRUE
 		              AND target_profile.retired_at IS NULL
+		              AND ` + documentRoleScopeSQL(attachment, "target_profile.include_inline") + `
 		              AND target_consent.profile_fingerprint = target_profile.fingerprint
 		              AND target_consent.retention_posture = target_profile.retention_posture
 		              AND target_consent.training_posture = target_profile.training_posture
@@ -653,6 +661,7 @@ func documentSearchValidityForConsent(consentName string) string {
 		            WHERE fallback_head.canonical_blob_hash = ` + head + `.canonical_blob_hash
 		              AND fallback_profile.enabled = TRUE
 		              AND fallback_profile.retired_at IS NULL
+		              AND ` + documentRoleScopeSQL(attachment, "fallback_profile.include_inline") + `
 		              AND fallback_consent.profile_fingerprint = fallback_profile.fingerprint
 		              AND fallback_consent.retention_posture = fallback_profile.retention_posture
 		              AND fallback_consent.training_posture = fallback_profile.training_posture
@@ -861,7 +870,7 @@ func fuseDocumentSearchRows(
 	}
 	results := make([]documentSearchRow, 0, len(byOccurrence))
 	for _, row := range byOccurrence {
-		row.Excerpt, row.HighlightStart, row.HighlightEnd = documentSearchExcerpt(row.Text, terms)
+		row.Excerpt, row.ExcerptStartRune, row.HighlightStart, row.HighlightEnd = documentSearchExcerpt(row.Text, terms)
 		row.Text = ""
 		results = append(results, row)
 	}
@@ -880,7 +889,7 @@ func fuseDocumentSearchRows(
 	return results, false
 }
 
-func documentSearchExcerpt(text string, terms []string) (string, int, int) {
+func documentSearchExcerpt(text string, terms []string) (string, int, int, int) {
 	runes := []rune(text)
 	matchStart, matchEnd := 0, 0
 	lower := []rune(strings.ToLower(text))
@@ -906,6 +915,7 @@ func documentSearchExcerpt(text string, terms []string) (string, int, int) {
 	}
 	excerpt := strings.TrimSpace(string(runes[start:end]))
 	trimmedPrefix := utf8.RuneCountInString(string(runes[start:end])) - utf8.RuneCountInString(strings.TrimLeftFunc(string(runes[start:end]), unicode.IsSpace))
+	excerptStartRune := start + trimmedPrefix
 	highlightStart := max(matchStart-start-trimmedPrefix, 0)
 	highlightEnd := max(matchEnd-start-trimmedPrefix, highlightStart)
 	if matchEnd == matchStart || highlightStart > utf8.RuneCountInString(excerpt) {
@@ -913,7 +923,7 @@ func documentSearchExcerpt(text string, terms []string) (string, int, int) {
 	} else {
 		highlightEnd = min(highlightEnd, utf8.RuneCountInString(excerpt))
 	}
-	return excerpt, highlightStart, highlightEnd
+	return excerpt, excerptStartRune, highlightStart, highlightEnd
 }
 
 func hashDocumentSearchRequest(request DocumentSearchRequest) (string, error) {
@@ -923,7 +933,7 @@ func hashDocumentSearchRequest(request DocumentSearchRequest) (string, error) {
 		AttachmentID: request.AttachmentID, MessageID: request.MessageID, PageSize: request.PageSize,
 		After: request.After, Before: request.Before, Person: request.Person,
 	}
-	encoded, err := json.Marshal(payload)
+	encoded, err := json.Marshal(payload, json.Deterministic(true))
 	if err != nil {
 		return "", fmt.Errorf("encode document search request: %w", err)
 	}
@@ -932,7 +942,7 @@ func hashDocumentSearchRequest(request DocumentSearchRequest) (string, error) {
 }
 
 func encodeDocumentSearchCursor(cursor documentSearchCursor) (string, error) {
-	encoded, err := json.Marshal(cursor)
+	encoded, err := json.Marshal(cursor, json.Deterministic(true))
 	if err != nil {
 		return "", fmt.Errorf("encode document search cursor: %w", err)
 	}
@@ -945,15 +955,15 @@ func decodeDocumentSearchCursor(value string) (documentSearchCursor, error) {
 		return documentSearchCursor{}, ErrDocumentSearchInvalidCursor
 	}
 	var cursor documentSearchCursor
-	decoder := json.NewDecoder(strings.NewReader(string(decoded)))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&cursor); err != nil || cursor.Version != documentSearchCursorVersion ||
+	decoder := jsontext.NewDecoder(strings.NewReader(string(decoded)), json.RejectUnknownMembers(true))
+
+	if err := json.UnmarshalDecode(decoder, &cursor); err != nil || cursor.Version != documentSearchCursorVersion ||
 		!validLowerSHA256(cursor.RequestHash) || cursor.Revision < 0 ||
 		cursor.Offset <= 0 || cursor.Offset > maxDocumentSearchOffset ||
 		cursor.CandidateLimit < 1 || cursor.CandidateLimit > MaxLexicalDocumentSearchCandidateLimit {
 		return documentSearchCursor{}, ErrDocumentSearchInvalidCursor
 	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+	if err := json.UnmarshalDecode(decoder, &struct{}{}); !errors.Is(err, io.EOF) {
 		return documentSearchCursor{}, ErrDocumentSearchInvalidCursor
 	}
 	return cursor, nil

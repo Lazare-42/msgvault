@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 
 	"github.com/spf13/cobra"
@@ -8,6 +9,7 @@ import (
 )
 
 var (
+	teamsHeadless             bool
 	teamsTenantID             string
 	noDefaultIdentityAddTeams bool
 )
@@ -30,20 +32,29 @@ func newAddTeamsCmd() *cobra.Command {
 // process before proxying, so the daemon subprocess never opens a browser
 // or waits on human consent while holding the operation gate.
 func preflightAddTeamsAuthorize(cmd *cobra.Command, email string) error {
-	if IsRemoteMode() {
+	state := invocationFromCommand(cmd)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	logger := state.logger
+	if IsRemoteMode(state) {
 		// Tokens live on the remote host; authorization must happen there.
 		return nil
 	}
-	if err := requireMicrosoftOAuthConfig(); err != nil {
+	if err := requireMicrosoftOAuthConfig(cfg); err != nil {
 		return err
 	}
 	mgr := microsoft.NewGraphManager(
 		cfg.Microsoft.ClientID,
-		microsoftTenantID(teamsTenantID),
+		microsoftTenantID(teamsTenantID, cfg),
 		cfg.Microsoft.EffectiveRedirectURI(),
 		cfg.TokensDir(),
 		logger,
 	)
+	if teamsHeadless {
+		mgr.UseDeviceCode()
+	}
 	fmt.Printf("Authorizing %s with Microsoft Teams...\n", email)
 	if err := mgr.Authorize(cmd.Context(), email); err != nil {
 		return fmt.Errorf("authorize Teams: %w", err)
@@ -60,7 +71,8 @@ func newAddTeamsLocalCmd() *cobra.Command {
 		Short: "Authorize Microsoft Teams (delegated Graph) for an account",
 		Long: `Authorize a Microsoft Teams account using OAuth2 (delegated Graph API).
 
-This opens a browser for Microsoft authorization, then stores the token for
+This opens a browser for Microsoft authorization (or, with --headless, prints a
+device code to enter on any device), then stores the token for
 Teams message ingestion.
 
 Requires a [microsoft] section in config.toml with your Azure AD app's client_id.
@@ -68,21 +80,30 @@ See the docs for Azure AD app registration setup.
 
 Examples:
   msgvault add-teams user@company.com
+  msgvault add-teams user@company.com --headless
   msgvault add-teams user@company.com --tenant my-tenant-id`,
 		Args: cobra.ExactArgs(1),
 		RunE: runAddTeamsLocal,
 	}
 	cmd.Flags().StringVar(&teamsTenantID, "tenant", "",
 		"Azure AD tenant ID (default: \"common\" for multi-tenant)")
-	cmd.Flags().BoolVar(&noDefaultIdentityAddTeams, "no-default-identity", false, noDefaultIdentityHelp)
+	cmd.Flags().BoolVar(&noDefaultIdentityAddTeams, "no-default-identity", false, savedDefaultIdentityHelp)
+	cmd.Flags().BoolVar(&teamsHeadless, "headless", false,
+		"Sign in with a device code instead of a local browser")
 	registerOAuthPreflightedFlag(cmd)
 	return cmd
 }
 
 func runAddTeamsLocal(cmd *cobra.Command, args []string) error {
+	state := invocationFromCommand(cmd)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	logger := state.logger
 	email := args[0]
 
-	if err := requireMicrosoftOAuthConfig(); err != nil {
+	if err := requireMicrosoftOAuthConfig(cfg); err != nil {
 		return err
 	}
 
@@ -93,18 +114,21 @@ func runAddTeamsLocal(cmd *cobra.Command, args []string) error {
 	if !preflighted {
 		mgr := microsoft.NewGraphManager(
 			cfg.Microsoft.ClientID,
-			microsoftTenantID(teamsTenantID),
+			microsoftTenantID(teamsTenantID, cfg),
 			cfg.Microsoft.EffectiveRedirectURI(),
 			cfg.TokensDir(),
 			logger,
 		)
+		if teamsHeadless {
+			mgr.UseDeviceCode()
+		}
 		fmt.Printf("Authorizing %s with Microsoft Teams...\n", email)
 		if err := mgr.Authorize(cmd.Context(), email); err != nil {
 			return fmt.Errorf("authorize Teams: %w", err)
 		}
 	}
 
-	s, cleanup, err := openWritableStoreAndInitForIngest()
+	s, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
 	if err != nil {
 		return err
 	}
@@ -114,14 +138,17 @@ func runAddTeamsLocal(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return fmt.Errorf("create source: %w", err)
 	}
-	if err := s.UpdateSourceDisplayName(source.ID, email); err != nil {
+	if err := updateSourceDisplayNameForRegistration(s, source.ID, email, state.logger); err != nil {
 		return fmt.Errorf("set display name: %w", err)
 	}
 
-	if !noDefaultIdentityAddTeams {
-		confirmDefaultIdentity(cmd.OutOrStdout(), s, source.ID, email, email, "account-identifier")
+	if err := setDefaultIdentityOptOut(cmd, s, source, noDefaultIdentityAddTeams); err != nil {
+		return err
 	}
-	if err := runPostSourceCreateMigrations(s); err != nil {
+	if !noDefaultIdentityAddTeams {
+		confirmDefaultIdentity(cmd.OutOrStdout(), s, source.ID, email, email, "account-identifier", state.logger)
+	}
+	if err := runPostSourceCreateMigrationsForInvocation(s, state); err != nil {
 		return fmt.Errorf("post-source-create migrations: %w", err)
 	}
 

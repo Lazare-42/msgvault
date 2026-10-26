@@ -83,6 +83,12 @@ Examples:
   msgvault add-imap --host mail.example.com --username user@example.com --starttls
   msgvault add-imap --host mail.example.com --username user@example.com --no-tls`,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			state := invocationFromCommand(cmd)
+			if state == nil || state.cfg == nil {
+				return errors.New("configuration is unavailable")
+			}
+			cfg := state.cfg
+			logger := state.logger
 			if imapHost == "" {
 				return usageErr(cmd, errors.New("--host is required"))
 			}
@@ -126,7 +132,7 @@ Examples:
 			}
 			fmt.Printf("Connected successfully as %s\n", profile.EmailAddress)
 
-			s, cleanup, err := openWritableStoreAndInitForIngest()
+			s, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
 			if err != nil {
 				return err
 			}
@@ -155,16 +161,19 @@ Examples:
 			}
 
 			// Set display name from username
-			if err := s.UpdateSourceDisplayName(source.ID, imapUsername); err != nil {
+			if err := updateSourceDisplayNameForRegistration(s, source.ID, imapUsername, logger); err != nil {
 				return fmt.Errorf("set display name: %w", err)
 			}
 
 			// Auto-default-identity must run BEFORE the legacy migration
 			// retry — see comment in account_identity.go.
-			if !noDefaultIdentityAddImap {
-				confirmDefaultIdentity(cmd.OutOrStdout(), s, source.ID, imapUsername, imapUsername, "account-identifier")
+			if err := setDefaultIdentityOptOut(cmd, s, source, noDefaultIdentityAddImap); err != nil {
+				return err
 			}
-			if err := runPostSourceCreateMigrations(s); err != nil {
+			if !noDefaultIdentityAddImap {
+				confirmDefaultIdentity(cmd.OutOrStdout(), s, source.ID, imapUsername, imapUsername, "account-identifier", state.logger)
+			}
+			if err := runPostSourceCreateMigrationsForInvocation(s, state); err != nil {
 				return fmt.Errorf("post-source-create migrations: %w", err)
 			}
 
@@ -183,7 +192,7 @@ Examples:
 	cmd.Flags().StringVar(&imapUsername, "username", "", "IMAP username / email address (required)")
 	cmd.Flags().BoolVar(&imapNoTLS, "no-tls", false, "Disable TLS (plain connection, not recommended)")
 	cmd.Flags().BoolVar(&imapSTARTTLS, "starttls", false, "Use STARTTLS instead of implicit TLS")
-	cmd.Flags().BoolVar(&noDefaultIdentityAddImap, "no-default-identity", false, noDefaultIdentityHelp)
+	cmd.Flags().BoolVar(&noDefaultIdentityAddImap, "no-default-identity", false, savedDefaultIdentityHelp)
 	return cmd
 }
 

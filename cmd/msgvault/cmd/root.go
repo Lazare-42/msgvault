@@ -11,6 +11,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/mattn/go-isatty"
 	"github.com/spf13/cobra"
@@ -19,185 +20,279 @@ import (
 	"go.kenn.io/msgvault/internal/oauth"
 	"go.kenn.io/msgvault/internal/store"
 	"golang.org/x/oauth2"
+	"golang.org/x/sync/singleflight"
 )
 
-var (
-	cfgFile    string
-	homeDir    string
-	verbose    bool
-	useLocal   bool // Use local daemon even when remote is configured
-	logFile    string
-	logLevel   string
-	noLogFile  bool
-	logSQL     bool
-	logSQLSlow int64
-	cfg        *config.Config
-	// logger is always non-nil so code paths outside the normal
-	// PersistentPreRunE flow (tests, library embeds) don't have
-	// to nil-check before calling logger.Info. PersistentPreRunE
-	// replaces this with a properly configured multi-handler at
-	// CLI startup.
-	logger    = slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	logResult *logging.Result // non-nil after PersistentPreRunE runs
-)
+var rootCmd = newRootCommand()
 
-var rootCmd = &cobra.Command{
-	Use:   daemonService,
-	Short: "Offline email, chat, and meeting archive tool",
-	Long: `msgvault is an offline archive tool that exports and stores email,
-chat, and meeting data locally with full-text search capabilities.
+func newRootCommand() *cobra.Command {
+	root := &cobra.Command{
+		Use:   daemonService,
+		Short: "Offline email, chat, and meeting archive tool",
+		Long: `msgvault archives email, chat, and meetings for offline search.
+Commands start or reuse a local daemon, or use [remote].url from config.toml.
+--local forces the local daemon.
 
-This is the Go implementation providing sync, search, and TUI functionality
-in a single binary.`,
-	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-		// Cobra's command lifecycle (v1.10.x) is:
-		//   1. ParseFlags + ValidateArgs (Args:)
-		//   2. PersistentPreRunE  ← we are here
-		//   3. PreRunE
-		//   4. ValidateRequiredFlags  ← MarkFlagRequired
-		//   5. ValidateFlagGroups     ← MarkFlagsMutuallyExclusive
-		//   6. RunE
-		//
-		// Errors from (2) (config load, logger setup) are runtime
-		// failures: hide the usage block. Errors from (4)/(5) are
-		// invocation-contract failures: keep the usage block. To get
-		// both, silence usage on entry and clear it before a successful
-		// return so the subsequent built-in validators see the default
-		// (usage on). Each command's RunE is wrapped separately (see
-		// silenceUsageInRunE) to re-silence usage once those validators
-		// have run; usageErr() flips it back on for RunE-internal
-		// invocation-contract violations.
-		cmd.SilenceUsage = true
+Start here:
+  msgvault list-accounts --json
+  msgvault search 'from:alice@example.com newer_than:30d' --json
+  # "id" feeds the commands below
+  msgvault show-message <id> --json
+  msgvault export-eml <id> -o msg.eml
+  msgvault export-messages --start 2026-09-01T00:00:00Z --end 2026-10-01T00:00:00Z
+  msgvault list-senders -n 20 --json
+  msgvault stats
+  msgvault person --help
+  msgvault daemon status
+  msgvault setup status --json
 
-		// Skip config loading (and therefore logging setup) for
-		// commands that must run without touching disk or config.
-		if skipsConfigLoad(cmd) {
+Output and exit status:
+  --json prints JSON on stdout (export-messages prints JSON Lines). Progress and
+  logs go to stderr; --log-level=warn quiets routine logs. Exit 0 success, 1 error,
+  130 interrupted. 'msgvault quickstart' has a longer agent guide.`,
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			inv := prepareInvocation(cmd)
+			if inv == nil {
+				return errors.New("missing invocation state")
+			}
+			// Cobra's command lifecycle (v1.10.x) is:
+			//   1. ParseFlags + ValidateArgs (Args:)
+			//   2. PersistentPreRunE  ← we are here
+			//   3. PreRunE
+			//   4. ValidateRequiredFlags  ← MarkFlagRequired
+			//   5. ValidateFlagGroups     ← MarkFlagsMutuallyExclusive
+			//   6. RunE
+			//
+			// Errors from (2) (config load, logger setup) are runtime
+			// failures: hide the usage block. Errors from (4)/(5) are
+			// invocation-contract failures: keep the usage block. To get
+			// both, silence usage on entry and clear it before a successful
+			// return so the subsequent built-in validators see the default
+			// (usage on). Each command's RunE is wrapped separately (see
+			// silenceUsageInRunE) to re-silence usage once those validators
+			// have run; usageErr() flips it back on for RunE-internal
+			// invocation-contract violations.
+			cmd.SilenceUsage = true
+
+			// A help-only group prints help and reads nothing, so it needs
+			// neither config nor the agent-delegated capability gate.
+			if isHelpOnlyGroup(cmd) {
+				cmd.SilenceUsage = false
+				return nil
+			}
+
+			// Agent-delegated mode: detect before any local owner lifecycle.
+			// Only commands in agentDelegatedCapable's set may run this way.
+			// Reject flags that are meaningless in delegated mode, then skip
+			// config.Load, EnsureHomeDir, and logging init entirely — a
+			// delegated invocation must not depend on local configuration or
+			// writable local storage.
+			if isAgentMode(inv) {
+				if !agentDelegatedCapable(cmd) {
+					return fmt.Errorf("%s is not available in agent-delegated mode", cmd.Name())
+				}
+				if inv.options.cfgFile != "" {
+					return errors.New("--config is not allowed in agent-delegated mode")
+				}
+				if inv.options.homeDir != "" {
+					return errors.New("--home is not allowed in agent-delegated mode")
+				}
+				inv.cfg = &config.Config{}
+				inv.logger = slog.New(slog.DiscardHandler)
+				cmd.SilenceUsage = false
+				return nil
+			}
+
+			// Skip config loading (and therefore logging setup) for
+			// commands that must run without touching disk or config.
+			if skipsConfigLoad(cmd) {
+				cmd.SilenceUsage = false
+				return nil
+			}
+
+			// Load config first; logging options live under [log].
+			var err error
+			load := config.LoadClientWithOverrides
+			if requiresStrictConfig(cmd) {
+				load = config.LoadWithOverrides
+			}
+			inv.cfg, err = load(inv.options.cfgFile, inv.options.homeDir, serveRuntimeOverrides(cmd))
+			if err != nil {
+				return fmt.Errorf("load config: %w", err)
+			}
+			if err := inv.cfg.EnsureHomeDir(); err != nil {
+				return fmt.Errorf(
+					"create data directory %s: %w",
+					inv.cfg.HomeDir, err,
+				)
+			}
+
+			// Resolve logging options. CLI flags override config;
+			// --verbose forces debug level regardless of other
+			// settings.
+			var levelOverride *slog.Level
+			if inv.options.verbose {
+				lv := slog.LevelDebug
+				levelOverride = &lv
+			}
+			levelString := inv.options.logLevel
+			if levelString == "" {
+				levelString = inv.cfg.Log.Level
+			}
+			if err := logging.ValidateLevel(levelString); err != nil {
+				return err
+			}
+			logsDir := inv.cfg.LogsDir()
+			// File logging is opt-in: requires [log].enabled,
+			// [log].dir, or --log-file. --no-log-file overrides.
+			fileDisabled := inv.options.noLogFile || (inv.options.logFile == "" && !inv.cfg.Log.Enabled && inv.cfg.Log.Dir == "")
+
+			// SQL tracing (--log-sql or [log].sql_trace) emits at INFO, so treat
+			// it as an implicit request for info-level logging: skip the
+			// interactive-terminal quieting below that would otherwise raise the
+			// console level to WARN and suppress the very output the user asked for.
+			sqlTrace := inv.options.logSQL || inv.cfg.Log.SQLTrace
+
+			// When the stderr fallback is the only sink and the user
+			// hasn't asked for a level, quiet routine INFO noise on an
+			// interactive terminal. The terminal check preserves INFO
+			// for the background daemon child (stderr → serve.log).
+			// The same condition means a person is reading stderr, so
+			// render records human-style (no timestamps or run_id)
+			// instead of logfmt.
+			humanConsole := false
+			if levelOverride == nil && !sqlTrace {
+				stderrIsTerminal := isatty.IsTerminal(os.Stderr.Fd()) ||
+					isatty.IsCygwinTerminal(os.Stderr.Fd())
+				if consoleLevel := logging.ResolveConsoleLevel(
+					levelString, inv.options.verbose, fileDisabled, stderrIsTerminal, isDaemonConsoleSubprocess(),
+				); consoleLevel != nil {
+					levelOverride = consoleLevel
+					humanConsole = true
+				}
+			}
+
+			// Close a previous log handler if tests re-enter
+			// PersistentPreRunE without going through ExecuteContext.
+			if inv.logResult != nil {
+				inv.logResult.Close()
+				inv.logResult = nil
+			}
+
+			inv.logResult, err = logging.BuildHandler(logging.Options{
+				LogsDir:       logsDir,
+				FilePath:      inv.options.logFile,
+				FileDisabled:  fileDisabled,
+				LevelOverride: levelOverride,
+				LevelString:   levelString,
+				HumanConsole:  humanConsole,
+			})
+			if err != nil {
+				return fmt.Errorf("build logger: %w", err)
+			}
+			inv.logger = slog.New(inv.logResult.Handler)
+			// logResult.RunID is available for any command that needs it.
+			slog.SetDefault(inv.logger)
+
+			// Configure the store's SQL logging adapter now that
+			// slog.Default is set. Flag overrides config; a zero
+			// SlowMs falls back to the built-in default (100 ms).
+			slowMs := inv.options.logSQLSlow
+			if slowMs == 0 {
+				slowMs = inv.cfg.Log.SQLSlowMs
+			}
+			store.ConfigureSQLLogging(store.SQLLogOptions{
+				SlowMs:    slowMs,
+				FullTrace: sqlTrace,
+			})
+
+			// Startup header: one structured line per run that
+			// captures everything you'd want to correlate later.
+			// Positional args may contain email addresses, search
+			// queries, or other PII — log only the count at info
+			// level and the full (sanitized) values at debug.
+			inv.logger.Info("msgvault startup",
+				"command", cmd.CommandPath(),
+				"argc", len(args),
+				"version", Version,
+				"go_version", runtime.Version(),
+				"os", runtime.GOOS,
+				"arch", runtime.GOARCH,
+				"config_path", inv.cfg.ConfigFilePath(),
+				"data_dir", inv.cfg.Data.DataDir,
+				"log_file", inv.logResult.FilePath,
+				"level", inv.logResult.Level.String(),
+			)
+			inv.logger.Debug("msgvault startup args",
+				"args", sanitizeArgs(args),
+			)
+			// Restore the default so cobra's required-flag and
+			// mutually-exclusive-flag validators (steps 4/5 above) print
+			// usage if they fail.
 			cmd.SilenceUsage = false
 			return nil
-		}
+		},
+		// Note: log file closing is handled by ExecuteContext's deferred
+		// shutdown, which runs after the exit record is written. Do not
+		// close logResult in PersistentPostRunE — doing so drops the
+		// "msgvault exit" log line on successful runs.
+	}
+	registerRootFlags(root)
+	registerAgentFlags(root)
+	return root
+}
 
-		// Load config first; logging options live under [log].
-		var err error
-		cfg, err = config.Load(cfgFile, homeDir)
-		if err != nil {
-			return fmt.Errorf("load config: %w", err)
-		}
-		if err := cfg.EnsureHomeDir(); err != nil {
-			return fmt.Errorf(
-				"create data directory %s: %w",
-				cfg.HomeDir, err,
-			)
-		}
+// strictConfigAnnotation marks the commands that start or replace a daemon,
+// and setup commands that must fail before an OAuth browser flow.
+const strictConfigAnnotation = "msgvault/strict-config"
 
-		// Resolve logging options. CLI flags override config;
-		// --verbose forces debug level regardless of other
-		// settings.
-		var levelOverride *slog.Level
-		if verbose {
-			lv := slog.LevelDebug
-			levelOverride = &lv
-		}
-		levelString := logLevel
-		if levelString == "" {
-			levelString = cfg.Log.Level
-		}
-		if err := logging.ValidateLevel(levelString); err != nil {
-			return err
-		}
-		logsDir := cfg.LogsDir()
-		// File logging is opt-in: requires [log].enabled,
-		// [log].dir, or --log-file. --no-log-file overrides.
-		fileDisabled := noLogFile || (logFile == "" && !cfg.Log.Enabled && cfg.Log.Dir == "")
+// requiresStrictConfig reports whether cmd must fail on invalid settings that
+// only the daemon reads. Every other command loads them leniently and warns,
+// so it can still reach a running daemon.
+func requiresStrictConfig(cmd *cobra.Command) bool {
+	return cmd.Annotations[strictConfigAnnotation] != ""
+}
 
-		// SQL tracing (--log-sql or [log].sql_trace) emits at INFO, so treat
-		// it as an implicit request for info-level logging: skip the
-		// interactive-terminal quieting below that would otherwise raise the
-		// console level to WARN and suppress the very output the user asked for.
-		sqlTrace := logSQL || cfg.Log.SQLTrace
+// markStrictConfig makes cmd fail at load on an invalid daemon-only setting.
+func markStrictConfig(cmd *cobra.Command) *cobra.Command {
+	if cmd.Annotations == nil {
+		cmd.Annotations = map[string]string{}
+	}
+	cmd.Annotations[strictConfigAnnotation] = "required"
+	return cmd
+}
 
-		// When the stderr fallback is the only sink and the user
-		// hasn't asked for a level, quiet routine INFO noise on an
-		// interactive terminal. The terminal check preserves INFO
-		// for the background daemon child (stderr → serve.log).
-		// The same condition means a person is reading stderr, so
-		// render records human-style (no timestamps or run_id)
-		// instead of logfmt.
-		humanConsole := false
-		if levelOverride == nil && !sqlTrace {
-			stderrIsTerminal := isatty.IsTerminal(os.Stderr.Fd()) ||
-				isatty.IsCygwinTerminal(os.Stderr.Fd())
-			if consoleLevel := logging.ResolveConsoleLevel(
-				levelString, verbose, fileDisabled, stderrIsTerminal, isDaemonConsoleSubprocess(),
-			); consoleLevel != nil {
-				levelOverride = consoleLevel
-				humanConsole = true
-			}
+// warnDaemonConfigError prints each invalid daemon-only setting once, after
+// the command ran, unless runErr or the stderr a proxied child streamed
+// already reports it. The daemon's own CLI
+// children stay quiet; their parent warned.
+func warnDaemonConfigError(root *cobra.Command, cfg *config.Config, runErr error) {
+	if cfg == nil || isDaemonConsoleSubprocess() {
+		return
+	}
+	err := cfg.DaemonConfigError()
+	if err == nil {
+		return
+	}
+	errs := []error{err}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		errs = joined.Unwrap()
+	}
+	for _, e := range errs {
+		if alreadyReported(runErr, e) {
+			continue
 		}
+		_, _ = fmt.Fprintf(root.ErrOrStderr(), "Warning: invalid daemon config: %v\n", e)
+	}
+}
 
-		// Close a previous log handler if tests re-enter
-		// PersistentPreRunE without going through ExecuteContext.
-		if logResult != nil {
-			logResult.Close()
-			logResult = nil
-		}
-
-		logResult, err = logging.BuildHandler(logging.Options{
-			LogsDir:       logsDir,
-			FilePath:      logFile,
-			FileDisabled:  fileDisabled,
-			LevelOverride: levelOverride,
-			LevelString:   levelString,
-			HumanConsole:  humanConsole,
-		})
-		if err != nil {
-			return fmt.Errorf("build logger: %w", err)
-		}
-		logger = slog.New(logResult.Handler)
-		// logResult.RunID is available for any command that needs it.
-		slog.SetDefault(logger)
-
-		// Configure the store's SQL logging adapter now that
-		// slog.Default is set. Flag overrides config; a zero
-		// SlowMs falls back to the built-in default (100 ms).
-		slowMs := logSQLSlow
-		if slowMs == 0 {
-			slowMs = cfg.Log.SQLSlowMs
-		}
-		store.ConfigureSQLLogging(store.SQLLogOptions{
-			SlowMs:    slowMs,
-			FullTrace: sqlTrace,
-		})
-
-		// Startup header: one structured line per run that
-		// captures everything you'd want to correlate later.
-		// Positional args may contain email addresses, search
-		// queries, or other PII — log only the count at info
-		// level and the full (sanitized) values at debug.
-		logger.Info("msgvault startup",
-			"command", cmd.CommandPath(),
-			"argc", len(args),
-			"version", Version,
-			"go_version", runtime.Version(),
-			"os", runtime.GOOS,
-			"arch", runtime.GOARCH,
-			"config_path", cfg.ConfigFilePath(),
-			"data_dir", cfg.Data.DataDir,
-			"log_file", logResult.FilePath,
-			"level", logResult.Level.String(),
-		)
-		logger.Debug("msgvault startup args",
-			"args", sanitizeArgs(args),
-		)
-		// Restore the default so cobra's required-flag and
-		// mutually-exclusive-flag validators (steps 4/5 above) print
-		// usage if they fail.
-		cmd.SilenceUsage = false
-		return nil
-	},
-	// Note: log file closing is handled by ExecuteContext's deferred
-	// shutdown, which runs after the exit record is written. Do not
-	// close logResult in PersistentPostRunE — doing so drops the
-	// "msgvault exit" log line on successful runs.
+// alreadyReported reports whether runErr, or the stderr a failed proxied child
+// streamed, already shows err.
+func alreadyReported(runErr, err error) bool {
+	if child, ok := errors.AsType[proxiedChildError](runErr); ok {
+		return child.reported(err)
+	}
+	return runErr != nil && (errors.Is(runErr, err) || strings.Contains(runErr.Error(), err.Error()))
 }
 
 // skipsConfigLoad reports whether cmd must run without loading config
@@ -205,7 +300,11 @@ in a single binary.`,
 // and the skills group, which only writes agent skill files).
 func skipsConfigLoad(cmd *cobra.Command) bool {
 	switch cmd.Name() {
+	case "schema-version":
+		database, _ := cmd.Flags().GetBool("database")
+		return !database
 	case "version", "update", "quickstart", "openapi", "completion",
+		embeddingsOptimizeWorkerName,
 		cobra.ShellCompRequestCmd, cobra.ShellCompNoDescRequestCmd:
 		return true
 	}
@@ -213,6 +312,28 @@ func skipsConfigLoad(cmd *cobra.Command) bool {
 		if c == skillsCmd {
 			return true
 		}
+	}
+	return false
+}
+
+// agentDelegatedCapable reports whether cmd may be invoked in agent-delegated
+// mode (i.e. with --agent-url and --agent-token-file). Only commands that
+// work without local configuration or a local daemon are permitted; all others
+// must be run by the owner.
+func agentDelegatedCapable(cmd *cobra.Command) bool {
+	for ancestor := cmd; ancestor != nil; ancestor = ancestor.Parent() {
+		if ancestor.Name() == "calendar" {
+			return true
+		}
+	}
+	return agentDelegatedCommand(cmd.Name()) && (!cmd.HasParent() || cmd.Parent() == cmd.Root())
+}
+
+// agentDelegatedCommand owns the command set offered to an agent grant.
+func agentDelegatedCommand(name string) bool {
+	switch name {
+	case "search", "show-message", "show-thread", "stats", "draft-reply", "draft-compose", "draft-get", "draft-edit", "draft-delete", "draft-recover", "mcp":
+		return true
 	}
 	return false
 }
@@ -232,6 +353,7 @@ func sanitizeArgs(args []string) []string {
 		"--access-token":   true,
 		"--refresh-token":  true,
 		"--client-secrets": true,
+		"--body":           true,
 	}
 	for _, a := range args {
 		if redactNext {
@@ -260,13 +382,13 @@ func sanitizeArgs(args []string) []string {
 // structured log line with a stack trace before re-raising the
 // process exit. Called in a deferred statement at the top of
 // Execute/ExecuteContext so crashes always leave a trail on disk.
-func recoverAndLogPanic() {
+func recoverAndLogPanic(inv *invocation) {
 	r := recover()
 	if r == nil {
 		return
 	}
-	if logger != nil {
-		logger.Error("msgvault panic",
+	if inv != nil && inv.logger != nil {
+		inv.logger.Error("msgvault panic",
 			"panic", fmt.Sprint(r),
 			"stack", string(debug.Stack()),
 		)
@@ -275,8 +397,8 @@ func recoverAndLogPanic() {
 			"msgvault panic: %v\n%s\n", r, debug.Stack(),
 		)
 	}
-	if logResult != nil {
-		logResult.Close()
+	if inv != nil && inv.logResult != nil {
+		inv.logResult.Close()
 	}
 	os.Exit(2)
 }
@@ -292,30 +414,49 @@ func Execute() error {
 // Installs a panic recovery and closes the log file handler on
 // return so every run ends cleanly in the log.
 func ExecuteContext(ctx context.Context) error {
-	silenceUsageOnce.Do(func() { silenceUsageInRunE(rootCmd) })
+	ensureHelpLayout(rootCmd)
+	ensureSilenceUsageWrapped(rootCmd)
+	return executeRootContext(ctx, rootCmd)
+}
+
+// executeRootContext gives one root execution a private owner for parsed
+// options, loaded configuration and cleanup resources. The Cobra registry is
+// shared by the process, so callers still serialize full tree executions.
+func executeRootContext(ctx context.Context, root *cobra.Command) error {
+	if root == nil {
+		return errors.New("nil root command")
+	}
+	ensureSilenceUsageWrapped(root)
+	inv := newInvocation()
+	root.SetContext(withInvocation(ctx, inv))
 
 	// Defer ordering is load-bearing. LIFO means recoverAndLogPanic
 	// runs before the log-file close. Because recoverAndLogPanic calls
 	// os.Exit (which skips remaining defers), it closes logResult
 	// itself before exiting. Do not reorder these defers.
 	defer func() {
-		if logResult != nil {
-			logResult.Close()
+		inv.sends.Wait(50 * time.Millisecond)
+		if inv.logResult != nil {
+			inv.logResult.Close()
+			inv.logResult = nil
 		}
+		inv.cfg = nil
+		clearInvocationFlags(root)
 	}()
-	defer recoverAndLogPanic()
+	defer recoverAndLogPanic(inv)
 
-	err := rootCmd.ExecuteContext(ctx)
+	err := root.ExecuteContext(root.Context())
+	warnDaemonConfigError(root, inv.cfg, err)
 
 	// Record the exit outcome so users can see the per-run
 	// result in the log without parsing error messages.
-	if logResult != nil && logger != nil {
+	if inv.logResult != nil && inv.logger != nil {
 		if err != nil {
-			logger.Info("msgvault exit",
+			inv.logger.Info("msgvault exit",
 				"outcome", "error", "error", err.Error(),
 			)
 		} else {
-			logger.Info("msgvault exit", "outcome", "ok")
+			inv.logger.Info("msgvault exit", "outcome", "ok")
 		}
 	}
 	if err != nil {
@@ -338,10 +479,16 @@ func usageErr(cmd *cobra.Command, err error) error {
 	return err
 }
 
-// silenceUsageOnce guards silenceUsageInRunE so each command's RunE is
-// only wrapped once, even if Execute is called more than once (e.g. in
-// tests that drive rootCmd repeatedly).
-var silenceUsageOnce sync.Once
+var silencedRoots sync.Map
+
+func ensureSilenceUsageWrapped(root *cobra.Command) {
+	if root == nil {
+		return
+	}
+	if _, loaded := silencedRoots.LoadOrStore(root, struct{}{}); !loaded {
+		silenceUsageInRunE(root)
+	}
+}
 
 // silenceUsageInRunE walks cmd's subtree and replaces each RunE with a
 // wrapper that sets SilenceUsage = true on entry, then delegates to the
@@ -367,13 +514,13 @@ func silenceUsageInRunE(cmd *cobra.Command) {
 
 // oauthSetupHint returns help text for OAuth configuration issues,
 // using the actual config file path so it's clear on all platforms.
-func oauthSetupHint() string {
+func oauthSetupHint(cfg *config.Config) string {
 	configPath := "<config file>"
 	if cfg != nil {
 		configPath = cfg.ConfigFilePath()
 	}
 	hint := fmt.Sprintf(`
-To use msgvault, you need a Google Cloud OAuth credential:
+Gmail and Google Calendar need a Google Cloud OAuth credential:
   1. Follow the setup guide: https://msgvault.io/guides/oauth-setup/
   2. Download the client_secret.json file
   3. Create or edit %s:
@@ -388,18 +535,18 @@ To use msgvault, you need a Google Cloud OAuth credential:
 
 // errOAuthNotConfigured returns a helpful error when OAuth client secrets are missing.
 // It also searches for client_secret*.json files in common locations.
-func errOAuthNotConfigured() error {
+func errOAuthNotConfigured(cfg *config.Config) error {
 	// Check common locations for client_secret*.json
-	hint := tryFindClientSecrets()
+	hint := tryFindClientSecrets(cfg)
 	if hint != "" {
 		return fmt.Errorf("OAuth client secrets not configured.%s", hint)
 	}
-	return fmt.Errorf("OAuth client secrets not configured.%s", oauthSetupHint())
+	return fmt.Errorf("OAuth client secrets not configured.%s", oauthSetupHint(cfg))
 }
 
 // tryFindClientSecrets looks for client_secret*.json in common locations
 // and returns a hint if found.
-func tryFindClientSecrets() string {
+func tryFindClientSecrets(cfg *config.Config) string {
 	home, _ := os.UserHomeDir()
 	candidates := []string{
 		filepath.Join(home, "Downloads", "client_secret*.json"),
@@ -433,9 +580,9 @@ Or copy the file to your msgvault home directory:
 
 // wrapOAuthError wraps an oauth/client-secrets error with setup instructions
 // if the root cause is a missing or unreadable secrets file.
-func wrapOAuthError(err error) error {
+func wrapOAuthError(err error, cfg *config.Config) error {
 	if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrPermission) {
-		return fmt.Errorf("OAuth client secrets file not accessible.%s", oauthSetupHint())
+		return fmt.Errorf("OAuth client secrets file not accessible: %w%s", errors.Join(oauth.ErrClientConfig, err), oauthSetupHint(cfg))
 	}
 	return err
 }
@@ -455,7 +602,6 @@ func isAuthInvalidError(err error) bool {
 // getTokenSourceWithReauth, making the function testable without real OAuth.
 type tokenReauthorizer interface {
 	TokenSource(ctx context.Context, email string) (oauth2.TokenSource, error)
-	HasToken(email string) bool
 	Authorize(ctx context.Context, email string) error
 	AuthorizeManual(ctx context.Context, email string) error
 }
@@ -469,19 +615,19 @@ type scopePreservingReauthorizer interface {
 // current grant: an account deliberately narrowed to read-only must not be
 // handed a command that would widen it again.
 type grantInspector interface {
-	GrantedScopes(email string) []string
+	GrantedScopes(ctx context.Context, email string) []string
 }
 
 // accountIsNarrowed reports whether the account's recorded grant is Gmail
 // read-only. A manager that cannot report scopes, or a grant with no Gmail
 // scopes at all, is treated as not narrowed, so guidance is unchanged for
 // every pre-existing case.
-func accountIsNarrowed(mgr tokenReauthorizer, email string) bool {
+func accountIsNarrowed(ctx context.Context, mgr tokenReauthorizer, email string) bool {
 	inspector, ok := mgr.(grantInspector)
 	if !ok {
 		return false
 	}
-	return oauth.IsNarrowedGmailGrant(inspector.GrantedScopes(email))
+	return oauth.IsNarrowedGmailGrant(inspector.GrantedScopes(ctx, email))
 }
 
 // readonlyFlagSuffix renders the grant-affecting flag for inclusion in
@@ -551,8 +697,8 @@ func getTokenSourceWithReauth(
 		return tokenSource, nil
 	}
 
-	// No token at all — user needs to run add-account
-	if !mgr.HasToken(email) {
+	// Missing or malformed token files need a new sign-in.
+	if errors.Is(err, os.ErrNotExist) || errors.Is(err, oauth.ErrInvalidTokenJSON) {
 		return nil, fmt.Errorf("get token source: %w (run 'add-account %s' first)", err, email)
 	}
 
@@ -569,7 +715,7 @@ func getTokenSourceWithReauth(
 	// device-code instructions instead (--force is browser-only).
 	// Read the recorded grant before any reauthorization replaces it, so the
 	// guidance reflects what the account holds now.
-	narrowed := accountIsNarrowed(mgr, email)
+	narrowed := accountIsNarrowed(ctx, mgr, email)
 
 	if !interactive {
 		return nil, fmt.Errorf(
@@ -619,26 +765,102 @@ func authorizeManualForReauth(ctx context.Context, mgr tokenReauthorizer, email 
 // oauthManagerCache returns a resolver function that lazily creates and
 // caches oauth.Manager instances keyed by app name. The cache is safe
 // for concurrent use (serve runs scheduled syncs in goroutines).
-func oauthManagerCache() func(appName string) (*oauth.Manager, error) {
-	var mu sync.Mutex
-	managers := map[string]*oauth.Manager{}
-	return func(appName string) (*oauth.Manager, error) {
-		mu.Lock()
-		defer mu.Unlock()
-		if mgr, ok := managers[appName]; ok {
+func oauthManagerCache(state *invocation) func(ctx context.Context, appName string) (*oauth.Manager, error) {
+	cache := &oauthManagers{state: state, managers: map[string]*oauth.Manager{}}
+	return cache.get
+}
+
+// oauthManagers creates a manager per app. Creating one can run
+// client_secrets_command, so the mutex guards only the map. Concurrent callers
+// for one app share a single load, and each caller stops waiting when its own
+// context ends.
+type oauthManagers struct {
+	state    *invocation
+	mu       sync.Mutex
+	loads    singleflight.Group
+	managers map[string]*oauth.Manager
+	// joined lets tests wait until a caller is attached to the in-flight load.
+	joined func(appName string)
+}
+
+// loaderContextEndedError marks a shared load that stopped because the caller
+// that started it was cancelled or ran out of time, not because loading failed.
+type loaderContextEndedError struct{ err error }
+
+func (e *loaderContextEndedError) Error() string { return e.err.Error() }
+func (e *loaderContextEndedError) Unwrap() error { return e.err }
+
+func (c *oauthManagers) cached(appName string) (*oauth.Manager, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	mgr, ok := c.managers[appName]
+	return mgr, ok
+}
+
+func (c *oauthManagers) get(ctx context.Context, appName string) (*oauth.Manager, error) {
+	for {
+		if mgr, ok := c.cached(appName); ok {
 			return mgr, nil
 		}
-		secretsPath, err := cfg.OAuth.ClientSecretsFor(appName)
-		if err != nil {
-			return nil, err
+		result := c.loads.DoChan(appName, func() (any, error) { return c.load(ctx, appName) })
+		if c.joined != nil {
+			c.joined(appName)
 		}
-		mgr, err := oauth.NewManager(secretsPath, cfg.TokensDir(), logger)
-		if err != nil {
-			return nil, wrapOAuthError(fmt.Errorf("create oauth manager: %w", err))
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case loaded := <-result:
+			// The load ran under another caller's context. If that context
+			// ended, this caller loads again under its own.
+			if _, ended := errors.AsType[*loaderContextEndedError](loaded.Err); ended && ctx.Err() == nil {
+				continue
+			}
+			if loaded.Err != nil {
+				return nil, loaded.Err
+			}
+			mgr, ok := loaded.Val.(*oauth.Manager)
+			if !ok {
+				return nil, fmt.Errorf("load OAuth manager for %q: unexpected result %T", appName, loaded.Val)
+			}
+			return mgr, nil
 		}
-		managers[appName] = mgr
+	}
+}
+
+// load runs once per app at a time. It checks the map again because a load
+// that finished just before this one began may already have published.
+func (c *oauthManagers) load(ctx context.Context, appName string) (*oauth.Manager, error) {
+	if mgr, ok := c.cached(appName); ok {
 		return mgr, nil
 	}
+	mgr, err := loadOAuthManager(ctx, c.state, appName)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil, &loaderContextEndedError{err: err}
+		}
+		return nil, err
+	}
+	c.mu.Lock()
+	c.managers[appName] = mgr
+	c.mu.Unlock()
+	return mgr, nil
+}
+
+func loadOAuthManager(ctx context.Context, state *invocation, appName string) (*oauth.Manager, error) {
+	if state == nil || state.cfg == nil || state.logger == nil {
+		return nil, errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	credentials, err := cfg.OAuth.CredentialsFor(appName)
+	if err != nil {
+		return nil, errors.Join(oauth.ErrClientConfig, err)
+	}
+	mgr, err := oauth.NewManagerWithCredentials(ctx, credentials, cfg.TokensDir(), cfg.OAuth.Tokens,
+		state.logger, oauth.Scopes)
+	if err != nil {
+		return nil, wrapOAuthError(fmt.Errorf("create oauth manager: %w", err), cfg)
+	}
+	return mgr, nil
 }
 
 // sourceOAuthApp extracts the oauth app name from a Source, returning ""
@@ -650,20 +872,21 @@ func sourceOAuthApp(src *store.Source) string {
 	return ""
 }
 
-func init() {
-	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default: ~/.msgvault/config.toml)")
-	rootCmd.PersistentFlags().StringVar(&homeDir, "home", "", "home directory (overrides MSGVAULT_HOME)")
-	rootCmd.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "verbose output (implies --log-level=debug)")
-	rootCmd.PersistentFlags().BoolVar(&useLocal, localValue, false, "use local daemon instead of configured remote")
-	rootCmd.PersistentFlags().StringVar(&logFile, "log-file", "",
+func registerRootFlags(root *cobra.Command) {
+	flags := root.PersistentFlags()
+	flags.String("config", "", "config file (default: ~/.msgvault/config.toml)")
+	flags.String("home", "", "home directory (overrides MSGVAULT_HOME)")
+	flags.BoolP("verbose", "v", false, "verbose output (implies --log-level=debug)")
+	flags.Bool(localValue, false, "use local daemon instead of configured remote")
+	flags.String("log-file", "",
 		"override log file path (default: <data dir>/logs/msgvault-YYYY-MM-DD.log)")
-	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "",
+	flags.String("log-level", "",
 		"log level: debug, info, warn, error (default: info)")
-	rootCmd.PersistentFlags().BoolVar(&noLogFile, "no-log-file", false,
+	flags.Bool("no-log-file", false,
 		"disable the log file for this run (stderr output stays on)")
-	rootCmd.PersistentFlags().BoolVar(&logSQL, "log-sql", false,
+	flags.Bool("log-sql", false,
 		"log every SQL query at info level (verbose; for debugging)")
-	rootCmd.PersistentFlags().Int64Var(&logSQLSlow, "log-sql-slow-ms", 0,
+	flags.Int64("log-sql-slow-ms", 0,
 		"threshold in ms above which a SQL query is logged as slow "+
 			"(default 100; 0 uses the default)")
 }

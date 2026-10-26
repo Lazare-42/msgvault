@@ -6,11 +6,12 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -18,6 +19,23 @@ import (
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/store"
 )
+
+// NamedPersonPromoter is optional. Legacy embedders retain the original
+// promotion schema; supporting backends preserve the daemon's structured receipt.
+type NamedPersonPromoter interface {
+	PromoteWithDisplayName(ctx context.Context, participantID int64, name *string) (*OperationResult, error)
+}
+
+var namedPromotionDefinition = sync.OnceValue(func() toolDefinition {
+	definition := promotePersonDefinition(nil)
+	definition.outputSchema = operationalOutputSchema(definition.outputSchema)
+	definition.description += " Optional display_name seeds a new profile; omitted or null uses observed names, empty leaves the name unset, and re-promotion preserves the existing name. A string name, including empty, requires confirmation."
+	definition.inputSchema = closedObject(map[string]*jsonschema.Schema{
+		toolArgParticipantID: safeIDSchema("Observed participant ID to promote"),
+		"display_name":       {Types: []string{"string", "null"}, Description: "Optional initial name; null uses the observed name, empty leaves it unset"},
+	}, toolArgParticipantID)
+	return definition
+})
 
 type searchPeopleResponse struct {
 	Rows          []searchPeopleRow `json:"rows"`
@@ -29,12 +47,14 @@ type searchPeopleResponse struct {
 type searchPeopleRow struct {
 	query.PersonSummary
 
-	PersonID int64 `json:"person_id,omitempty"`
+	PersonID        int64                  `json:"person_id,omitzero"`
+	VCardUID        string                 `json:"vcard_uid,omitzero"`
+	CardDAVBindings []store.CardDAVBinding `json:"carddav_bindings,omitzero"`
 }
 
 type searchPeopleCursor struct {
 	Phase               string `json:"phase"`
-	ProfileOffset       int    `json:"profile_offset,omitempty"`
+	ProfileOffset       int    `json:"profile_offset,omitzero"`
 	ObservedCursor      string `json:"observed_cursor,omitempty"`
 	Query               string `json:"query"`
 	Limit               int    `json:"limit"`
@@ -268,6 +288,8 @@ func (h *handlers) prepareCuratedPeopleSearch(
 		applyProfileToPeopleSummary(&summary, profile)
 		prepared.rows = append(prepared.rows, searchPeopleRow{
 			PersonSummary: summary, PersonID: profile.ID,
+			VCardUID:        profile.VCardUID,
+			CardDAVBindings: append([]store.CardDAVBinding{}, profile.CardDAVBindings...),
 		})
 	}
 	return prepared
@@ -295,6 +317,8 @@ func (h *handlers) searchObservedPeoplePage(
 			if profile, exists := profileForPeopleSummary(summary, prepared.byParticipant); exists {
 				applyProfileToPeopleSummary(&row.PersonSummary, profile)
 				row.PersonID = profile.ID
+				row.VCardUID = profile.VCardUID
+				row.CardDAVBindings = append([]store.CardDAVBinding{}, profile.CardDAVBindings...)
 			}
 			rows = append(rows, row)
 		}
@@ -339,7 +363,7 @@ func decodeSearchPeopleCursor(
 }
 
 func encodeSearchPeopleCursor(cursor searchPeopleCursor) (string, error) {
-	data, err := json.Marshal(cursor)
+	data, err := json.Marshal(cursor, json.Deterministic(true))
 	if err != nil {
 		return "", err
 	}
@@ -478,6 +502,25 @@ func (h *handlers) promotePerson(ctx context.Context, req toolRequest) (*toolRes
 	participantID, err := requiredPeopleID(req.GetArguments(), toolArgParticipantID)
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
+	}
+	if value := req.arguments["display_name"]; value != nil {
+		backend, ok := h.peopleBackend.(NamedPersonPromoter)
+		if !ok {
+			return toolErrorResult("named promotion is unavailable"), nil
+		}
+		name, ok := value.(string)
+		if !ok {
+			return toolErrorResult("display_name must be a string or null"), nil
+		}
+		message, err := json.Marshal(map[string]any{"operation": ToolPromotePerson, "participant_id": participantID, "display_name": name, "effect": "promote the participant's current identity cluster; seed the name only for a new profile; preserve an existing saved name"}, json.Deterministic(true))
+		if err != nil {
+			return nil, newInternalError("promote person disclosure", err)
+		}
+		if err := req.confirmUserAction(ctx, string(message)); err != nil {
+			return confirmationToolError(err)
+		}
+		result, err := backend.PromoteWithDisplayName(ctx, participantID, &name)
+		return operationalToolResponse(ToolPromotePerson, result, err)
 	}
 	person, err := h.peopleBackend.Promote(ctx, participantID)
 	if err != nil {

@@ -4,16 +4,17 @@ import type { APIClient } from '../api/client';
 import type {
   EntryRow,
   ExploreCacheUnavailable,
-  ExploreFileFact,
-  ExploreFilesResult,
   ExploreGroupDimension,
   ExploreGroupResult,
   ExploreGroupRow,
   ExploreResult,
+  ExploreSearchMode,
   FileMIMEFamily
 } from './models';
 import { createExploreAPI, type ExploreAPI } from './api';
 import { parseAttachmentSelection } from './attachment-authority';
+import { parseArchiveMeetingSelection } from '../meetings/archive-selection';
+import { parseRecordingSelection } from '../archive/recording-selection';
 import { parseGroupSelection } from './group-context';
 import { LOAD_THROUGH_END_MAX_PAGES } from './paging';
 import { canonicalFingerprint, predicateFingerprint } from './selection';
@@ -35,6 +36,7 @@ export interface ExploreLoaderCallbacks {
   onPredicateChange: () => void;
   onPagingNotice: (message: string | null) => void;
   onRestorationFocus: () => void;
+  onSearchAccepted?: (query: string, mode: ExploreSearchMode, signal: AbortSignal, count?: number) => void;
 }
 
 const REPEATED_CURSOR_NOTICE = 'Pagination stopped because the server repeated a cursor without progress.';
@@ -54,7 +56,7 @@ function samePageAuthority(
 }
 
 /**
- * Owns the Everything workspace's row/group/file loading: the main
+ * Owns the Everything workspace's row/group loading: the main
  * per-predicate load, cursor paging (including the End-key drain-to-end),
  * and deep-link restoration walk that pages forward until a durable
  * selection/scroll/active key becomes visible again.
@@ -67,13 +69,13 @@ function samePageAuthority(
 export class ExploreLoader {
   rows = $state<EntryRow[]>([]);
   groupRows = $state<ExploreGroupRow[]>([]);
-  fileFacts = $state<ExploreFileFact[]>([]);
   resultGeneration = $state(0);
   result = $state<ExploreResult>();
   unavailable = $state<ExploreCacheUnavailable>();
   loading = $state(false);
   loadingMore = $state(false);
   error = $state('');
+  errorKind = $state<'other' | undefined>();
   /** Cursor-page failure. Kept apart from `error` so a failed later page
    * never hides the rows already loaded; while `nextCursor` survived (a
    * transient failure) a retry re-attempts the same page. */
@@ -85,12 +87,13 @@ export class ExploreLoader {
   private readonly state: ExploreState;
   private readonly api: ExploreAPI;
   private readonly callbacks: ExploreLoaderCallbacks;
+  submitted = $state(false);
   private requestGeneration = 0;
   private requestController: AbortController | undefined;
   private pagePredicate: ReturnType<ExploreState['predicate']> | undefined;
   private pageGrouping: ExploreGroupDimension | undefined;
   private pageGroupsFiles = false;
-  private pageKind: 'entries' | 'groups' | 'files' = 'entries';
+  private pageKind: 'entries' | 'groups' = 'entries';
   private pageFileFilenameQuery = '';
   private pageFileMIMEFamilies: FileMIMEFamily[] = [];
   private pageAuthority: Pick<ExploreResult, 'cacheRevision' | 'searchProvenance' | 'candidateSnapshotId'> | undefined;
@@ -120,6 +123,8 @@ export class ExploreLoader {
   }
 
   private runLoad(requestFingerprint: string): void {
+    const submitted = untrack(() => this.submitted);
+    this.submitted = false;
     this.clearCacheBuildRetry();
     const workspace = this.state.current.workspace;
     const restorationEpoch = this.state.restorationEpoch;
@@ -134,6 +139,7 @@ export class ExploreLoader {
     const fileFilenameQuery = this.state.current.fileFilenameQuery;
     const fileMIMEFamilies = this.state.current.fileMIMEFamilies;
     if (!this.callbacks.isEnabled() || (workspace !== 'everything' && !filesGrouping)) {
+      if (workspace === 'files' && !filesGrouping) this.submitted = submitted;
       this.requestGeneration += 1;
       this.requestController?.abort();
       this.loading = false;
@@ -159,9 +165,8 @@ export class ExploreLoader {
     this.pagePredicate = predicate;
     this.pageGrouping = undefined;
     this.pageGroupsFiles = filesGrouping;
-    const presentation = this.state.current.presentation;
     const grouping = this.state.current.groupingChain;
-    this.pageKind = grouping.length > 0 ? 'groups' : presentation === 'files' ? 'files' : 'entries';
+    this.pageKind = grouping.length > 0 ? 'groups' : 'entries';
     this.pageFileFilenameQuery = fileFilenameQuery;
     this.pageFileMIMEFamilies = fileMIMEFamilies;
     this.pageRequest = undefined;
@@ -172,6 +177,7 @@ export class ExploreLoader {
     this.loadingMore = false;
     this.loading = true;
     this.error = '';
+    this.errorKind = undefined;
     this.pageError = '';
     this.unavailable = undefined;
     // A fresh predicate load must not leave the previous result visible and
@@ -181,7 +187,6 @@ export class ExploreLoader {
     // into their loading skeletons until the new response lands.
     this.rows = [];
     this.groupRows = [];
-    this.fileFacts = [];
     this.result = undefined;
     const request = grouping.length > 0
       ? (filesGrouping
@@ -190,22 +195,23 @@ export class ExploreLoader {
           (this.pageGrouping = grouping[0]!), controller.signal
         )
         : this.api.groups(predicate, (this.pageGrouping = grouping[0]!), controller.signal))
-      : presentation === 'files'
-        ? this.api.files({ ...predicate, grouping: undefined }, controller.signal)
-        : this.api.explore({ ...predicate, grouping: undefined, presentation: 'table' }, controller.signal);
+      : this.api.explore({ ...predicate, grouping: undefined, presentation: 'table' }, controller.signal);
     void request
       .then((loaded) => {
         if (generation !== this.requestGeneration) return;
+        if (loaded.status !== 'unavailable') {
+          this.callbacks.onSearchAccepted?.(predicate.query ?? '', predicate.search_mode ?? 'full_text', controller.signal, submitted ? loaded.result.rows.length : undefined);
+        }
         if (loaded.status === 'unavailable') {
           this.rows = [];
           this.groupRows = [];
-          this.fileFacts = [];
           this.result = undefined;
           this.unavailable = loaded.unavailable;
           if (loaded.unavailable.readiness === 'building') {
             this.cacheBuildRetry = setTimeout(() => {
               this.cacheBuildRetry = undefined;
               if (generation === this.requestGeneration && !controller.signal.aborted) {
+                this.submitted = submitted;
                 this.#retryRevision += 1;
               }
             }, CACHE_BUILD_RETRY_DELAY_MS);
@@ -217,10 +223,9 @@ export class ExploreLoader {
           this.result = entryResult;
           this.rows = entryResult.rows;
           this.groupRows = [];
-          this.fileFacts = [];
           this.resultFingerprint = fingerprint;
           this.pageAuthority = entryResult;
-        } else if (this.pageKind === 'groups') {
+        } else {
           const groupResult = loaded.result as ExploreGroupResult;
           this.result = {
             rows: [],
@@ -234,24 +239,8 @@ export class ExploreLoader {
           };
           this.rows = [];
           this.groupRows = groupResult.rows;
-          this.fileFacts = [];
-          this.resultFingerprint = '';
-          this.pageAuthority = groupResult;
-        } else {
-          const filesResult = loaded.result as ExploreFilesResult;
-          this.result = {
-            rows: [], totalCount: filesResult.totalCount,
-            cacheRevision: filesResult.cacheRevision,
-            searchProvenance: filesResult.searchProvenance,
-            candidateSnapshotId: filesResult.candidateSnapshotId,
-            candidatePoolSaturated: false,
-            nextCursor: filesResult.nextCursor
-          };
-          this.rows = [];
-          this.groupRows = [];
-          this.fileFacts = filesResult.files;
           this.resultFingerprint = fingerprint;
-          this.pageAuthority = filesResult;
+          this.pageAuthority = groupResult;
         }
         this.nextCursor = loaded.result.nextCursor;
       })
@@ -299,9 +288,7 @@ export class ExploreLoader {
       return this.failPaging(REPEATED_CURSOR_NOTICE);
     }
     const first = this.pageAuthority;
-    const previousCount = this.pageKind === 'groups'
-      ? this.groupRows.length
-      : this.pageKind === 'files' ? this.fileFacts.length : this.rows.length;
+    const previousCount = this.pageKind === 'groups' ? this.groupRows.length : this.rows.length;
     this.loadingMore = true;
     this.pageError = '';
     try {
@@ -313,9 +300,7 @@ export class ExploreLoader {
             this.pageGrouping, this.requestController.signal
           )
           : await this.api.groups(predicate, this.pageGrouping, this.requestController.signal))
-        : this.pageKind === 'files'
-          ? await this.api.files({ ...predicate, grouping: undefined }, this.requestController.signal)
-          : await this.api.explore({ ...predicate, grouping: undefined, presentation: 'table' }, this.requestController.signal);
+        : await this.api.explore({ ...predicate, grouping: undefined, presentation: 'table' }, this.requestController.signal);
       if (generation !== this.requestGeneration) return { status: 'stale' };
       if (loaded.status === 'unavailable') {
         if (this.restoring) {
@@ -341,23 +326,14 @@ export class ExploreLoader {
         this.rows = [...merged.values()];
         this.nextCursor = followingCursor;
         this.result = { ...entryResult, rows: this.rows, nextCursor: followingCursor };
-      } else if (this.pageKind === 'groups') {
+      } else {
         const groupResult = loaded.result as ExploreGroupResult;
         const merged = new Map(this.groupRows.map((row) => [row.key, row]));
         for (const row of groupResult.rows) merged.set(row.key, row);
         this.groupRows = [...merged.values()];
         this.nextCursor = followingCursor;
-      } else {
-        const filesResult = loaded.result as ExploreFilesResult;
-        const merged = new Map(this.fileFacts.map((file) => [file.key, file]));
-        for (const file of filesResult.files) merged.set(file.key, file);
-        this.fileFacts = [...merged.values()];
-        this.nextCursor = followingCursor;
-        this.result = this.result ? { ...this.result, nextCursor: followingCursor } : this.result;
       }
-      const currentCount = this.pageKind === 'groups'
-        ? this.groupRows.length
-        : this.pageKind === 'files' ? this.fileFacts.length : this.rows.length;
+      const currentCount = this.pageKind === 'groups' ? this.groupRows.length : this.rows.length;
       if (followingCursor && (followingCursor === cursor || this.seenCursors.has(followingCursor))) {
         return this.failPaging(REPEATED_CURSOR_NOTICE);
       }
@@ -407,11 +383,11 @@ export class ExploreLoader {
   private restorationKeys(): string[] {
     const current = this.state.current;
     const selectedAttachmentID = parseAttachmentSelection(current.selectedRow);
-    const selected = selectedAttachmentID === undefined ? current.selectedRow : null;
+    const selected = selectedAttachmentID === undefined && parseArchiveMeetingSelection(current.selectedRow) === undefined && !parseRecordingSelection(current.selectedRow) ? current.selectedRow : null;
     return [...new Set([
       current.activeRow,
       current.scrollAnchor?.key,
-      this.pageKind !== 'files' && selected && !parseGroupSelection(selected) ? selected : undefined
+      selected && !parseGroupSelection(selected) ? selected : undefined
     ].filter((key): key is string => Boolean(key)))];
   }
 
@@ -419,7 +395,6 @@ export class ExploreLoader {
     if (this.pageKind === 'groups' && this.pageGrouping) {
       return this.groupRows.some((row) => `group:${this.pageGrouping}:${row.key}` === key);
     }
-    if (this.pageKind === 'files') return this.fileFacts.some((file) => file.key === key);
     return this.rows.some((row) => row.key === key);
   }
 

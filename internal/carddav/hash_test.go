@@ -1,6 +1,8 @@
 package carddav
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -8,6 +10,7 @@ import (
 )
 
 func TestSemanticHashIgnoresOnlyServerOwnedProperties(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -27,11 +30,13 @@ func TestSemanticHashIgnoresOnlyServerOwnedProperties(t *testing.T) {
 }
 
 func TestSemanticHashRejectsMalformedVCard(t *testing.T) {
+	t.Parallel()
 	_, err := SemanticHash([]byte("not a vCard"))
 	require.Error(t, err)
 }
 
 func TestSemanticHashIgnoresPropertyOrderButPreservesDuplicates(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	left := []byte("BEGIN:VCARD\r\nVERSION:4.0\r\nUID:remote-1\r\nFN:Alice Example\r\nEMAIL;TYPE=work:alice@example.test\r\nEMAIL;TYPE=home:alice@home.test\r\nEND:VCARD\r\n")
@@ -50,6 +55,7 @@ func TestSemanticHashIgnoresPropertyOrderButPreservesDuplicates(t *testing.T) {
 }
 
 func TestSemanticHashCanonicalizesKnownTextAndURIValues(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	left := []byte("BEGIN:VCARD\r\nVERSION:4.0\r\nUID:remote-1\r\nFN:Alice Example\r\nNOTE:Line one\\nLine two\r\nURL;VALUE=URI:HTTPS://example.test/alice\r\nEND:VCARD\r\n")
@@ -65,4 +71,16 @@ func TestSemanticHashCanonicalizesKnownTextAndURIValues(t *testing.T) {
 
 	assert.Equal(leftHash, rightHash)
 	assert.NotEqual(leftHash, changedHash)
+}
+
+func TestSemanticHashPreservesStoredEscaping(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	body := []byte("BEGIN:VCARD\r\nVERSION:4.0\r\nFN:Example <&>\u2028\u2029\r\nEND:VCARD\r\n")
+	// These are the canonical bytes emitted before the JSON v2 migration.
+	legacy := `[{"name":"FN","value_type":"text","raw_value":"Example \u003c\u0026\u003e\u2028\u2029"},{"name":"VERSION","value_type":"text","raw_value":"4.0"}]`
+	digest := sha256.Sum256([]byte(legacy))
+	got, err := SemanticHash(body)
+	require.NoError(err)
+	assert.Equal(t, hex.EncodeToString(digest[:]), got)
 }

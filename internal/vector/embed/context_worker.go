@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"sort"
 	"strconv"
@@ -12,6 +13,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"go.kenn.io/msgvault/internal/operations"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 )
@@ -22,7 +24,7 @@ type ContextWorkStore interface {
 	ScanEmbeddingChanges(ctx context.Context, after int64, limit int) ([]store.EmbeddingChange, error)
 	LatestEmbeddingChangeSequence(ctx context.Context) (int64, error)
 	ScanForEmbeddingScoped(ctx context.Context, target, afterID int64, limit int, messageTypes []string, sourceIDs []int64) ([]int64, error)
-	SetEmbedGenGroupIfUnchanged(ctx context.Context, stamps []store.EmbedGenStamp, metadata store.EmbedGenMetadataVersion, target int64) (bool, error)
+	SetEmbedGenGroupIfUnchanged(ctx context.Context, stamps []store.EmbedGenStamp, metadata store.EmbedGenMetadataVersion, target int64) (bool, int, error)
 	ResetEmbedGen(ctx context.Context, ids []int64) error
 }
 
@@ -59,6 +61,9 @@ type ContextWorkerDeps struct {
 	MaxRunUTF8Bytes         int
 	DocumentPrefixUTF8Bytes int
 	Hooks                   ContextWorkerHooks
+	Recorder                operations.Recorder
+	Diagnostics             vector.EmbeddingDiagnosticWriter
+	Log                     *slog.Logger
 }
 
 // ContextConvergence is the durable state Task 10 can use for activation and
@@ -91,6 +96,9 @@ func NewContextWorker(d ContextWorkerDeps) *ContextWorker {
 		d.MaxRunUTF8Bytes = defaultContextRunUTF8Bytes
 	}
 	d.BuildScope = vector.NewBuildScope(d.BuildScope.MessageTypes, d.BuildScope.SourceIDs)
+	if d.Log == nil {
+		d.Log = slog.Default()
+	}
 	source, _ := d.Store.(*store.Store)
 	return &ContextWorker{deps: d, source: source}
 }
@@ -101,20 +109,58 @@ func (w *ContextWorker) ReclaimStale(context.Context) (int, error) { return 0, n
 
 // RunOnce drains the journal, preserves ordinary missing-row discovery, and
 // completes or resumes reconciliation.
-func (w *ContextWorker) RunOnce(ctx context.Context, gen vector.GenerationID) (RunResult, error) {
-	return w.run(ctx, gen)
+func (w *ContextWorker) RunOnce(
+	ctx context.Context, gen vector.GenerationID, scope operations.PassScope,
+) (RunResult, error) {
+	return w.runOperationPass(ctx, gen, scope, false)
 }
 
 // RunBackstop restarts only reconciliation. It never rewinds the consumed
 // mutation sequence.
-func (w *ContextWorker) RunBackstop(ctx context.Context, gen vector.GenerationID) (RunResult, error) {
+func (w *ContextWorker) RunBackstop(
+	ctx context.Context, gen vector.GenerationID, scope operations.PassScope,
+) (RunResult, error) {
+	return w.runOperationPass(ctx, gen, scope, true)
+}
+
+func (w *ContextWorker) runOperationPass(
+	ctx context.Context, gen vector.GenerationID, scope operations.PassScope, backstop bool,
+) (result RunResult, retErr error) {
+	pass, terminal, err := beginOperationPass(
+		ctx, w.deps.Recorder, operations.KindMessageEmbedding, scope, w.deps.Log,
+	)
+	if err != nil {
+		return result, err
+	}
+	if terminal != nil {
+		return runResultFromOperationRun(terminal)
+	}
+	diagnostics := passDiagnostics(ctx, w.deps.Diagnostics, w.deps.Log, gen, w.deps.Backend, pass)
+	ctx = withEmbeddingDiagnostics(ctx, diagnostics)
+	defer func() {
+		retErr = operationRunError(retErr)
+		counters := finalRunCounters(result)
+		// Finish the snapshot while the run is still active, so status never
+		// sees a closed run with an unfinished snapshot.
+		diagnostics.finish(retErr)
+		pass.checkpoint(ctx, counters)
+		pass.finish(ctx, counters, retErr)
+	}()
+	runCtx := contextWithOperationPass(ctx, pass)
+	if !backstop {
+		return w.run(runCtx, gen)
+	}
+	return w.runBackstop(runCtx, gen)
+}
+
+func (w *ContextWorker) runBackstop(ctx context.Context, gen vector.GenerationID) (RunResult, error) {
 	if err := w.validate(); err != nil {
 		return RunResult{Contextual: &ContextConvergence{}}, err
 	}
 	progress, err := w.deps.Publisher.GetDocumentProgress(ctx, gen)
 	if err != nil {
 		if errors.Is(err, vector.ErrGenerationRetired) {
-			return RunResult{Contextual: &ContextConvergence{}}, nil
+			return RunResult{Contextual: &ContextConvergence{}}, err
 		}
 		return RunResult{Contextual: &ContextConvergence{}}, fmt.Errorf("read contextual reconcile cursor: %w", err)
 	}
@@ -123,7 +169,7 @@ func (w *ContextWorker) RunBackstop(ctx context.Context, gen vector.GenerationID
 	}
 	if err := w.deps.Publisher.ResetDocumentReconcileCursor(ctx, gen); err != nil {
 		if errors.Is(err, vector.ErrGenerationRetired) {
-			return RunResult{Contextual: &ContextConvergence{}}, nil
+			return RunResult{Contextual: &ContextConvergence{}}, err
 		}
 		return RunResult{Contextual: &ContextConvergence{}}, fmt.Errorf("reset contextual reconcile cursor: %w", err)
 	}
@@ -186,17 +232,11 @@ func (w *ContextWorker) run(ctx context.Context, gen vector.GenerationID) (res R
 	ctx = context.WithValue(ctx, contextRunBudgetKey{}, &contextRunBudget{limit: w.deps.MaxRunUTF8Bytes})
 	fresh, err := w.initializeFreshGeneration(ctx, gen)
 	if err != nil {
-		if errors.Is(err, errContextGenerationRetired) {
-			return res, nil
-		}
 		return res, err
 	}
 	if !fresh {
 		if err := w.drainJournal(ctx, gen, &res); err != nil {
 			if errors.Is(err, errContextRunBudgetExhausted) {
-				return res, nil
-			}
-			if errors.Is(err, errContextGenerationRetired) {
 				return res, nil
 			}
 			return res, err
@@ -207,7 +247,7 @@ func (w *ContextWorker) run(ctx context.Context, gen vector.GenerationID) (res R
 		progress, err := w.deps.Publisher.GetDocumentProgress(ctx, gen)
 		if err != nil {
 			if errors.Is(err, vector.ErrGenerationRetired) {
-				return res, nil
+				return res, err
 			}
 			return res, fmt.Errorf("read contextual discovery progress: %w", err)
 		}
@@ -223,9 +263,6 @@ func (w *ContextWorker) run(ctx context.Context, gen vector.GenerationID) (res R
 			if errors.Is(err, errContextRunBudgetExhausted) {
 				return res, nil
 			}
-			if errors.Is(err, errContextGenerationRetired) {
-				return res, nil
-			}
 			return res, err
 		}
 	}
@@ -233,17 +270,11 @@ func (w *ContextWorker) run(ctx context.Context, gen vector.GenerationID) (res R
 		if errors.Is(err, errContextRunBudgetExhausted) {
 			return res, nil
 		}
-		if errors.Is(err, errContextGenerationRetired) {
-			return res, nil
-		}
 		return res, err
 	}
 	// Catch mutations committed while the bounded reconciliation pages ran.
 	if err := w.drainJournal(ctx, gen, &res); err != nil {
 		if errors.Is(err, errContextRunBudgetExhausted) {
-			return res, nil
-		}
-		if errors.Is(err, errContextGenerationRetired) {
 			return res, nil
 		}
 		return res, err
@@ -359,6 +390,7 @@ type preparedDocumentTarget struct {
 
 func (w *ContextWorker) drainJournal(ctx context.Context, gen vector.GenerationID, res *RunResult) error {
 	for {
+		batchStart := time.Now()
 		progress, err := w.deps.Publisher.GetDocumentProgress(ctx, gen)
 		if err != nil {
 			return fmt.Errorf("read contextual progress: %w", err)
@@ -420,7 +452,7 @@ func (w *ContextWorker) drainJournal(ctx context.Context, gen vector.GenerationI
 				if err := w.closeSnapshot(pageSnapshot); err != nil {
 					return err
 				}
-				processed, publishErr := w.publishPreparedScopes(ctx, gen, prepared, res)
+				processed, _, publishErr := w.publishPreparedScopes(ctx, gen, prepared, res, batchStart)
 				if processed > 0 {
 					cursor := encodeJournalCursor(change.Sequence, prepared[processed-1].key)
 					if err := w.deps.Publisher.SetDocumentJournalCursor(ctx, gen, cursor); err != nil {
@@ -467,6 +499,9 @@ func (w *ContextWorker) drainJournal(ctx context.Context, gen vector.GenerationI
 			scopes = scopes[first:]
 		}
 		for start := 0; start < len(scopes); start += w.deps.ChangeBatchSize {
+			if start > 0 {
+				batchStart = time.Now()
+			}
 			end := min(start+w.deps.ChangeBatchSize, len(scopes))
 			pageSnapshot, err := BeginSourceSnapshot(ctx, w.source)
 			if err != nil {
@@ -480,7 +515,7 @@ func (w *ContextWorker) drainJournal(ctx context.Context, gen vector.GenerationI
 			if err := w.closeSnapshot(pageSnapshot); err != nil {
 				return err
 			}
-			processed, publishErr := w.publishPreparedScopes(ctx, gen, prepared, res)
+			processed, _, publishErr := w.publishPreparedScopes(ctx, gen, prepared, res, batchStart)
 			if processed > 0 {
 				cursor := encodeJournalCursor(last, prepared[processed-1].key)
 				if err := w.deps.Publisher.SetDocumentJournalCursor(ctx, gen, cursor); err != nil {
@@ -517,6 +552,7 @@ func (w *ContextWorker) drainOrdinaryDiscovery(ctx context.Context, gen vector.G
 		}
 	}
 	for {
+		batchStart := time.Now()
 		pageAfter := after
 		ids, err := w.deps.Store.ScanForEmbeddingScoped(
 			ctx, int64(gen), after, w.deps.ChangeBatchSize,
@@ -539,7 +575,6 @@ func (w *ContextWorker) drainOrdinaryDiscovery(ctx context.Context, gen vector.G
 			}
 			return nil
 		}
-		res.Claimed += len(ids)
 		snapshot, err := BeginSourceSnapshot(ctx, w.source)
 		if err != nil {
 			return err
@@ -568,7 +603,12 @@ func (w *ContextWorker) drainOrdinaryDiscovery(ctx context.Context, gen vector.G
 			first := sort.Search(len(prepared), func(i int) bool { return prepared[i].key > resumeScope })
 			prepared = prepared[first:]
 		}
-		processed, publishErr := w.publishPreparedScopes(ctx, gen, prepared, res)
+		processed, admitted, publishErr := w.publishPreparedScopes(ctx, gen, prepared, res, batchStart)
+		// A pass attempts only the scopes publication admits. Scopes before the
+		// resume cursor belong to the pass that attempted them, and scopes past
+		// the run budget belong to a later pass. Claiming after publication
+		// also keeps checkpoints, which cannot decrease, below the final count.
+		res.Claimed += claimedInScopes(ids, prepared[:admitted])
 		if processed > 0 {
 			cursor := "discovery:" + strconv.FormatInt(pageAfter, 10) + "|" + prepared[processed-1].key
 			if err := w.deps.Publisher.SetDocumentReconcileCursor(ctx, gen, cursor); err != nil {
@@ -585,6 +625,25 @@ func (w *ContextWorker) drainOrdinaryDiscovery(ctx context.Context, gen vector.G
 			return fmt.Errorf("advance contextual ordinary discovery cursor: %w", err)
 		}
 	}
+}
+
+// claimedInScopes counts the claimed message ids that belong to scopes. A chat
+// scope can cover messages outside this discovery page, which were not claimed.
+func claimedInScopes(ids []int64, scopes []preparedScope) int {
+	claimed := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		claimed[id] = struct{}{}
+	}
+	count := 0
+	for _, scope := range scopes {
+		for _, version := range scope.liveVersions {
+			if _, ok := claimed[version.MessageID]; ok {
+				delete(claimed, version.MessageID)
+				count++
+			}
+		}
+	}
+	return count
 }
 
 func (w *ContextWorker) closeSnapshot(snapshot SourceSnapshot) error {
@@ -699,7 +758,19 @@ func (w *ContextWorker) selectorInBuildScope(
 	return found && scope.ContainsSource(sourceID), nil
 }
 
-func (w *ContextWorker) publishPreparedScopes(ctx context.Context, gen vector.GenerationID, scopes []preparedScope, res *RunResult) (int, error) {
+// publishPreparedScopes publishes and covers the scopes that fit the run
+// budget. It returns how many scopes it covered and how many the budget
+// admitted; scopes past admitted are left for a later pass, even on error.
+func (w *ContextWorker) publishPreparedScopes(ctx context.Context, gen vector.GenerationID, scopes []preparedScope, res *RunResult, batchStart time.Time) (_ int, admitted int, retErr error) {
+	diagnostics := diagnosticRun(ctx)
+	diagnostics.beginBatch(0, batchStart)
+	defer func() {
+		// Running out of the per-pass budget defers work; it is not a failure.
+		if !errors.Is(retErr, errContextRunBudgetExhausted) {
+			diagnostics.failure(retErr)
+		}
+		diagnostics.completeBatch()
+	}()
 	plans := make([]preparedScopePublication, 0, len(scopes))
 	inputs := make([]DocumentInput, 0)
 	targets := make([]preparedDocumentTarget, 0)
@@ -722,9 +793,10 @@ func (w *ContextWorker) publishPreparedScopes(ctx context.Context, gen vector.Ge
 			budgetExhausted = true
 			break
 		}
+		admitted++
 		existing, err := w.deps.Publisher.ListDocumentsForScope(ctx, gen, scope.key)
 		if err != nil {
-			return 0, fmt.Errorf("scope %q list published documents: %w", scope.key, err)
+			return 0, admitted, fmt.Errorf("scope %q list published documents: %w", scope.key, err)
 		}
 		plan.changed = !sameDocumentRevisions(existing, scope.docs)
 		plan.existing = existing
@@ -765,9 +837,15 @@ func (w *ContextWorker) publishPreparedScopes(ctx context.Context, gen vector.Ge
 		inputs = append(inputs, scopeInputs...)
 		targets = append(targets, scopeTargets...)
 	}
+	// Scopes deferred by the run budget are not attempted in this batch.
+	attempted := 0
+	for _, plan := range plans {
+		attempted += len(plan.scope.liveVersions)
+	}
+	diagnostics.setAttempted(attempted)
 	results, embedErr := w.embedDocuments(ctx, inputs)
 	if len(results) > len(targets) || (embedErr == nil && len(results) != len(targets)) {
-		return 0, fmt.Errorf("contextual batched vector document count mismatch: got %d, expected %d", len(results), len(targets))
+		return 0, admitted, fmt.Errorf("contextual batched vector document count mismatch: got %d, expected %d", len(results), len(targets))
 	}
 	for i, target := range targets {
 		if i >= len(results) {
@@ -815,7 +893,7 @@ func (w *ContextWorker) publishPreparedScopes(ctx context.Context, gen vector.Ge
 		documents, vectors, preserved := successfulPreparedDocuments(plan)
 		docs, chunks, err := buildDocumentPublication(documents, vectors, preserved)
 		if err != nil {
-			return 0, fmt.Errorf("scope %q: %w", plan.scope.key, err)
+			return 0, admitted, fmt.Errorf("scope %q: %w", plan.scope.key, err)
 		}
 		if planIndex == partialPlan {
 			var safe bool
@@ -827,7 +905,7 @@ func (w *ContextWorker) publishPreparedScopes(ctx context.Context, gen vector.Ge
 		}
 		if w.deps.Hooks.BeforePublish != nil {
 			if err := w.deps.Hooks.BeforePublish(); err != nil {
-				return 0, fmt.Errorf("scope %q: before index commit: %w", plan.scope.key, err)
+				return 0, admitted, fmt.Errorf("scope %q: before index commit: %w", plan.scope.key, err)
 			}
 		}
 		publications = append(publications, vector.DocumentScopePublication{
@@ -835,11 +913,14 @@ func (w *ContextWorker) publishPreparedScopes(ctx context.Context, gen vector.Ge
 		})
 	}
 	if len(publications) > 0 {
-		if err := w.deps.Publisher.PublishScopes(ctx, gen, publications); err != nil {
+		finishWrite := measureEmbeddingWrite(ctx)
+		publishErr := w.deps.Publisher.PublishScopes(ctx, gen, publications)
+		finishWrite(publishErr)
+		if err := publishErr; err != nil {
 			if errors.Is(err, vector.ErrGenerationRetired) {
-				return 0, errContextGenerationRetired
+				return 0, admitted, errContextGenerationRetired
 			}
-			return 0, fmt.Errorf("publish prepared scope page: %w", err)
+			return 0, admitted, fmt.Errorf("publish prepared scope page: %w", err)
 		}
 	}
 	processed := 0
@@ -848,27 +929,27 @@ func (w *ContextWorker) publishPreparedScopes(ctx context.Context, gen vector.Ge
 		if plan.changed {
 			if w.deps.Hooks.AfterPublish != nil {
 				if err := w.deps.Hooks.AfterPublish(); err != nil {
-					return processed, fmt.Errorf("scope %q: after index commit: %w", plan.scope.key, err)
+					return processed, admitted, fmt.Errorf("scope %q: after index commit: %w", plan.scope.key, err)
 				}
 			}
 		}
 		if err := w.coverPreparedScopePlan(ctx, gen, plan, res); err != nil {
-			return processed, fmt.Errorf("scope %q: %w", plan.scope.key, err)
+			return processed, admitted, fmt.Errorf("scope %q: %w", plan.scope.key, err)
 		}
 		processed++
 	}
 	if partialPublished && w.deps.Hooks.AfterPublish != nil {
 		if err := w.deps.Hooks.AfterPublish(); err != nil {
-			return processed, fmt.Errorf("scope %q: after partial index commit: %w", plans[partialPlan].scope.key, err)
+			return processed, admitted, fmt.Errorf("scope %q: after partial index commit: %w", plans[partialPlan].scope.key, err)
 		}
 	}
 	if embedErr != nil {
-		return processed, embedErr
+		return processed, admitted, embedErr
 	}
 	if budgetExhausted {
-		return processed, errContextRunBudgetExhausted
+		return processed, admitted, errContextRunBudgetExhausted
 	}
-	return processed, nil
+	return processed, admitted, nil
 }
 
 func preserveUnresolvedDocumentPublications(
@@ -940,13 +1021,16 @@ func (w *ContextWorker) coverPreparedScopePlan(ctx context.Context, gen vector.G
 	versions = append(versions, blankVersions...)
 	sort.Slice(versions, func(i, j int) bool { return versions[i].ID < versions[j].ID })
 	if len(versions) != 0 {
-		stamped, err := w.deps.Store.SetEmbedGenGroupIfUnchanged(ctx, versions, metadata, int64(gen))
+		finishWrite := measureEmbeddingWrite(ctx)
+		stamped, covered, err := w.deps.Store.SetEmbedGenGroupIfUnchanged(ctx, versions, metadata, int64(gen))
+		finishWrite(err)
 		if err != nil {
 			return fmt.Errorf("coverage CAS: %w", err)
 		}
 		if !stamped {
 			return errors.New("coverage CAS missed; source scope changed after assembly and remains uncovered")
 		}
+		diagnosticRun(ctx).completed(covered)
 		if w.deps.Hooks.AfterCoverage != nil {
 			if err := w.deps.Hooks.AfterCoverage(); err != nil {
 				return fmt.Errorf("after coverage CAS: %w", err)
@@ -961,6 +1045,7 @@ func (w *ContextWorker) coverPreparedScopePlan(ctx context.Context, gen vector.G
 		}
 		res.Succeeded += len(doc.Versions)
 	}
+	checkpointContextOperationPass(ctx, *res)
 	return nil
 }
 
@@ -1045,7 +1130,7 @@ func (w *ContextWorker) embedDocuments(ctx context.Context, inputs []DocumentInp
 	if len(inputs) == 0 {
 		return nil, nil
 	}
-	vectors, err := w.deps.Client.EmbedDocuments(ctx, inputs)
+	vectors, err := w.embedDocumentsMeasured(ctx, inputs)
 	if len(vectors) > len(inputs) || (err == nil && len(vectors) != len(inputs)) {
 		return nil, fmt.Errorf("contextual batched vector document count mismatch: got %d, expected %d", len(vectors), len(inputs))
 	}
@@ -1056,8 +1141,7 @@ func (w *ContextWorker) embedDocuments(ctx context.Context, inputs []DocumentInp
 	if err == nil {
 		return out, nil
 	}
-	var sizeErr *voyageSizeError
-	if !errors.Is(err, ErrDocumentTooLarge) && !errors.As(err, &sizeErr) {
+	if !isSizeRejection(err) {
 		return out, fmt.Errorf("embed contextual documents: %w", err)
 	}
 	if len(out) != 0 {
@@ -1086,6 +1170,13 @@ func (w *ContextWorker) embedDocuments(ctx context.Context, inputs []DocumentInp
 // forever. Truncation preserves the chunk count, so vectors still align with
 // the assembled chunk rows and the published revision (derived from source
 // content) converges normally.
+// isSizeRejection reports a document too large to embed as sent, which
+// embedDocuments recovers from by splitting or truncating it.
+func isSizeRejection(err error) bool {
+	_, rejected := errors.AsType[*voyageSizeError](err)
+	return rejected || errors.Is(err, ErrDocumentTooLarge)
+}
+
 func (w *ContextWorker) embedTruncatedDocument(ctx context.Context, input DocumentInput) ([]contextualDocumentEmbedding, error) {
 	budget := 0
 	for _, chunk := range input.Chunks {
@@ -1094,7 +1185,7 @@ func (w *ContextWorker) embedTruncatedDocument(ctx context.Context, input Docume
 	for budget/2 >= truncatedContextualDocumentFloorUTF8Bytes {
 		budget /= 2
 		truncated := truncateDocumentInput(input, budget)
-		vectors, err := w.deps.Client.EmbedDocuments(ctx, []DocumentInput{truncated})
+		vectors, err := w.embedDocumentsMeasured(ctx, []DocumentInput{truncated})
 		if err == nil {
 			if len(vectors) != 1 || len(vectors[0]) != len(input.Chunks) {
 				return nil, fmt.Errorf("contextual truncated document chunk count mismatch: got %d, expected %d",
@@ -1102,11 +1193,13 @@ func (w *ContextWorker) embedTruncatedDocument(ctx context.Context, input Docume
 			}
 			return []contextualDocumentEmbedding{{vectors: vectors[0], embeddedChunks: truncated.Chunks}}, nil
 		}
-		var sizeErr *voyageSizeError
-		if !errors.Is(err, ErrDocumentTooLarge) && !errors.As(err, &sizeErr) {
+		if !isSizeRejection(err) {
 			return nil, fmt.Errorf("embed truncated contextual document: %w", err)
 		}
 	}
+	// Recovered rejections are not recorded; one that recovery could not
+	// resolve leaves the document uncovered, so it is.
+	diagnosticRun(ctx).failure(fmt.Errorf("contextual document still too large after truncation: %w", ErrDocumentTooLarge))
 	return []contextualDocumentEmbedding{{tooLarge: true}}, nil
 }
 
@@ -1277,6 +1370,7 @@ func (w *ContextWorker) reconcile(ctx context.Context, gen vector.GenerationID, 
 			}
 		}
 		for {
+			batchStart := time.Now()
 			pageAfter := after
 			snapshot, err := BeginSourceSnapshot(ctx, w.source)
 			if err != nil {
@@ -1316,7 +1410,7 @@ func (w *ContextWorker) reconcile(ctx context.Context, gen vector.GenerationID, 
 					return fmt.Errorf("after contextual source page: %w", err)
 				}
 			}
-			processed, publishErr := w.publishPreparedScopes(ctx, gen, prepared, res)
+			processed, _, publishErr := w.publishPreparedScopes(ctx, gen, prepared, res, batchStart)
 			if processed > 0 {
 				partial := "source:" + strconv.FormatInt(pageAfter, 10) + "|" + prepared[processed-1].key
 				if err := w.deps.Publisher.SetDocumentReconcileCursor(ctx, gen, partial); err != nil {
@@ -1344,6 +1438,7 @@ func (w *ContextWorker) reconcile(ctx context.Context, gen vector.GenerationID, 
 	}
 	afterKey, pageEndKey, resumeScope := decodeOrphanReconcileCursor(cursor)
 	for {
+		batchStart := time.Now()
 		pageAfterKey := afterKey
 		records, err := w.deps.Publisher.ListDocumentsAfter(ctx, gen, afterKey, w.deps.ReconcileBatchSize)
 		if err != nil {
@@ -1391,7 +1486,7 @@ func (w *ContextWorker) reconcile(ctx context.Context, gen vector.GenerationID, 
 		if err := w.closeSnapshot(snapshot); err != nil {
 			return err
 		}
-		processed, publishErr := w.publishPreparedScopes(ctx, gen, prepared, res)
+		processed, _, publishErr := w.publishPreparedScopes(ctx, gen, prepared, res, batchStart)
 		if processed > 0 {
 			partial := encodeOrphanReconcileCursor(pageAfterKey, pageEndKey, prepared[processed-1].key)
 			if err := w.deps.Publisher.SetDocumentReconcileCursor(ctx, gen, partial); err != nil {

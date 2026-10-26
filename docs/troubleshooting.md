@@ -21,7 +21,7 @@ client_secrets = "C:/Users/you/Downloads/client_secret.json"
 client_secrets = 'C:\Users\you\Downloads\client_secret.json'
 ```
 
-See [Configuration: Windows paths](/configuration/#windows-paths) for more detail.
+See [Configuration: Windows paths](/docs/configuration/#windows-paths) for more detail.
 
 ## OAuth Errors
 
@@ -35,7 +35,7 @@ The Gmail scope isn't configured. Verify you added `gmail.modify` on the **Data 
 
 ### "Access blocked" or "app not approved" for Workspace accounts
 
-The Workspace organization restricts OAuth to apps created within their org. Create a separate Google Cloud project inside the org and configure it as a named OAuth app. See [OAuth Setup: Google Workspace Accounts](/guides/oauth-setup/#google-workspace-accounts).
+The Workspace organization restricts OAuth to apps created within their org. Create a separate Google Cloud project inside the org and configure it as a named OAuth app. See [OAuth Setup: Google Workspace Accounts](/docs/guides/oauth-setup/#google-workspace-accounts).
 
 ### "redirect_uri_mismatch"
 
@@ -68,7 +68,7 @@ you@gmail.com already has Gmail write access (https://www.googleapis.com/auth/gm
 To make the account read-only, remove its access and grant it again:
 
 1. Revoke msgvault at [myaccount.google.com/permissions](https://myaccount.google.com/permissions)
-2. `rm ~/.msgvault/tokens/you@gmail.com.json`
+2. Remove the token: with file storage, run `rm ~/.msgvault/tokens/you@gmail.com.json`; with command storage, delete its record from the configured store.
 3. `msgvault add-account you@gmail.com --readonly`
 
 Revoking clears every other Google scope for the account, so re-run whichever commands granted them — `add-calendar` for Calendar, `add-synctech-sms-drive` for Drive. Archived mail is unaffected. Confirm the result by reading the token's `scopes` array rather than the permissions page, which reports what msgvault is authorized to request.
@@ -98,6 +98,8 @@ Declining the prompt leaves both the token and the staged batch untouched. Accep
 
 ### General OAuth Issues
 
+For token-file storage:
+
 1. Remove old tokens: `rm ~/.msgvault/tokens/you@gmail.com.json`
 2. Re-add account: `msgvault add-account you@gmail.com`
 3. Revoke and retry: [myaccount.google.com/permissions](https://myaccount.google.com/permissions)
@@ -106,13 +108,15 @@ Declining the prompt leaves both the token and the staged batch untouched. Accep
 
 ### "No browser available"
 
-The standard OAuth flow requires a browser. For headless servers, use the copy-token workflow:
+The standard OAuth flow requires a browser. With token-file storage, use the copy-token workflow:
 
 1. Authorize on a machine with a browser: `msgvault add-account you@gmail.com`
 2. Copy the token file to your server: `scp ~/.msgvault/tokens/you@gmail.com.json user@server:~/.msgvault/tokens/`
 3. Register on the server: `msgvault add-account you@gmail.com`
 
 Run `msgvault add-account you@gmail.com --headless` to see detailed instructions with the exact paths for your configuration.
+
+For command storage, follow [credential configuration](https://github.com/kenn-io/msgvault/blob/main/docs/configuration.md#command-backed-google-credentials-and-tokens) and [export-token](https://github.com/kenn-io/msgvault/blob/main/docs/cli-reference.md#export-token). Use `--upload-only` for Calendar-only tokens, then register with `add-calendar` on the server.
 
 ### Token copied but "account not found"
 
@@ -165,7 +169,7 @@ docker logs msgvault
 Common causes:
 - Missing `config.toml` with `[oauth] client_secrets` and `[server] bind_addr = "0.0.0.0"` + `api_key`
 - Port 8080 already in use — change `api_port` in config or the port mapping in docker-compose.yml
-- Volume mount permissions — on Synology, add `user: root` to docker-compose.yml (see [Platform Notes](/guides/remote-deployment/#platform-notes))
+- Volume mount permissions — on Synology, add `user: root` to docker-compose.yml (see [Platform Notes](/docs/guides/remote-deployment/#platform-notes))
 
 ### `permission denied` on Synology
 
@@ -228,23 +232,36 @@ docker exec msgvault msgvault add-account you@gmail.com
 
 ## Rate Limiting
 
-If you hit Gmail API rate limits during large syncs:
+If you hit Gmail API rate limits during large syncs, the sync error names
+the refusal, for example `quota exceeded (403): rateLimitExceeded; Quota
+exceeded for quota metric 'Total Query Cost' and limit 'Units per minute per
+user'`. The Gmail client waits out each quota pause and retries up to five
+times. This applies to profile, labels, history, message listings, and raw
+downloads; draft writes are not replayed. Caller cancellation or an earlier
+deadline stops the wait. A failed full sync resumes from its checkpoint.
 
-1. Reduce `rate_limit_qps` in config (default: 5)
+1. Reduce [`rate_limit_qps`](configuration.md#sync) in config (default: `5`).
+   The local budget can exceed your project's Gmail quota. Lowering this
+   setting also slows Teams imports.
 2. Use `--limit` during initial testing
 3. Wait and retry. Rate limits reset over time
 
 ## Database Corruption
 
-If the database is corrupted:
+Do not delete a corrupt database. An archive can contain local imports and
+provider-deleted messages that a new sync cannot recover.
 
-1. Back up your database: `cp ~/.msgvault/msgvault.db ~/.msgvault/msgvault.db.bak`
-2. Delete and re-sync:
-   ```bash
-   rm ~/.msgvault/msgvault.db
-   msgvault init-db
-   msgvault sync-full you@gmail.com
-   ```
+1. Stop the daemon with `msgvault daemon stop` or stop its Docker/systemd
+   service.
+2. Preserve the complete data directory, including the database, WAL and SHM
+   files, attachments, configuration, and tokens.
+3. Restore a verified snapshot into an empty directory. Follow
+   [Restoring to a New Machine](/docs/usage/backup/#restoring-to-a-new-machine);
+   the same empty-target rule applies on the original machine.
+
+If no verified backup exists, keep the damaged directory unchanged and ask for
+recovery help before initializing another archive. Re-syncing is only a
+reconstruction option when every source record is still available upstream.
 
 ## Interrupted Syncs
 
@@ -269,6 +286,13 @@ If you get errors about missing C compiler:
 
 CGO is required for `mattn/go-sqlite3` (FTS5 support).
 
+If the build reaches the cgo step and fails with `fatal error: sqlite3.h: No
+such file or directory` (from `asg017/sqlite-vec-go-bindings`), you are missing
+the SQLite development headers that the default `sqlite_vec` build needs:
+
+- **Debian/Ubuntu**: `sudo apt install -y libsqlite3-dev`
+- **Fedora/RHEL**: `sudo dnf install -y sqlite-devel`
+
 ## TUI Not Showing Data
 
 If the TUI launches but shows no data:
@@ -281,21 +305,21 @@ If the TUI launches but shows no data:
 
 ### "api_key is required for non-loopback bind address"
 
-You set `bind_addr` to a non-loopback address (e.g., `0.0.0.0`) without configuring an API key. Either add an `api_key` to your `[server]` config, or set `allow_insecure = true` if you understand the security implications. See [Web UI & API Server: Security Model](/api-server/#security-model).
+You set `bind_addr` to a non-loopback address (e.g., `0.0.0.0`) without configuring an API key. Either add an `api_key` to your `[server]` config, or set `allow_insecure = true` if you understand the security implications. See [Web UI & API Server: Security Model](/docs/api-server/#security-model).
 
 ### The UI reports a missing, stale, or unavailable analytical cache
 
 Run `msgvault build-cache`, then restart a daemon that was already running. The
 Web UI preserves the reported cache state instead of silently switching some
-modalities to a different query engine. See [Web UI: Cache states](/web-ui/#cache-states)
-and [Configuration: analytics](/configuration/#analytics).
+modalities to a different query engine. See [Web UI: Cache states](/docs/web-ui/#cache-states)
+and [Configuration: analytics](/docs/configuration/#analytics).
 
 ### The UI warns that the session cookie is not secure
 
 The browser reached a remote daemon over plain HTTP. Prefer HTTPS at a reverse
 proxy and configure that proxy in `server.trusted_proxies`. Do not trust a whole
 client network merely to suppress the warning. See [Web UI: Remote access and
-HTTPS](/web-ui/#remote-access-and-https).
+HTTPS](/docs/web-ui/#remote-access-and-https).
 
 ### Port already in use
 
@@ -308,7 +332,11 @@ api_port = 9090
 
 ### HTTP 429 Too Many Requests
 
-The API server enforces a rate limit of 10 requests per second per client IP. If you are hitting this limit, space out your requests or check the `Retry-After` response header for the wait duration.
+The general API limit allows 10 requests per second per client IP with a burst
+of 20. Trusted loopback requests and local daemon discovery are exempt; see
+[Web UI & API Server: Rate Limiting](/docs/api-server/#rate-limiting). Some
+expensive endpoints have tighter limits. If you receive 429, space out requests
+and follow the `Retry-After` header.
 
 ## Using Logs for Troubleshooting
 
@@ -353,7 +381,7 @@ msgvault tui --log-sql-slow-ms 50
 msgvault tui --log-sql
 ```
 
-Log files are stored in `<data_dir>/logs/` by default. Run `msgvault logs --path` to print the selected daemon's directory. See [Configuration: Log](/configuration/#log) for all options.
+Log files are stored in `<data_dir>/logs/` by default. Run `msgvault logs --path` to print the selected daemon's directory. See [Configuration: Log](/docs/configuration/#log) for all options.
 
 ## Still Stuck?
 

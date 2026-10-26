@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 )
 
 func TestPersonTimelineReusesBaseSemanticSnapshotBeforeIdentityNarrowing(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	srv := newReviewSemanticServerWithHits(t, []vector.Hit{
@@ -49,6 +51,7 @@ func TestPersonTimelineReusesBaseSemanticSnapshotBeforeIdentityNarrowing(t *test
 }
 
 func TestIdentityRelatedFilesReuseBaseSemanticSnapshotBeforeIdentityNarrowing(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name       string
 		searchPath string
@@ -96,6 +99,7 @@ func TestIdentityRelatedFilesReuseBaseSemanticSnapshotBeforeIdentityNarrowing(t 
 }
 
 func TestIdentityScopeIntersectsSemanticCandidatesWithoutExpansion(t *testing.T) {
+	t.Parallel()
 	srv := newIdentityScopeSemanticServer(t)
 	for _, test := range []struct {
 		name, searchPath, timelinePath, filesPath string
@@ -136,6 +140,7 @@ func TestIdentityScopeIntersectsSemanticCandidatesWithoutExpansion(t *testing.T)
 }
 
 func TestIdentitySemanticSnapshotRejectsWrongPredicateAndExpiry(t *testing.T) {
+	t.Parallel()
 	now := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	srv := newReviewSemanticServerWithHits(t, []vector.Hit{{MessageID: 1, Score: .9, Rank: 1}})
 	baseStore, ok := srv.store.(*mockStore)
@@ -177,6 +182,7 @@ func TestIdentitySemanticSnapshotRejectsWrongPredicateAndExpiry(t *testing.T) {
 }
 
 func TestIdentityScopeIntersectsBasePredicateAndRejectsCrossIdentityCursor(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	srv := newReviewSemanticServerWithHits(t, []vector.Hit{
 		{MessageID: 1, Score: .9, Rank: 1},
@@ -235,6 +241,7 @@ func TestIdentityScopeIntersectsBasePredicateAndRejectsCrossIdentityCursor(t *te
 // A multi-value base participant filter AND-composes with the identity scope:
 // (1∨2) ∧ scope(1) leaves only person 1's own message in scope.
 func TestIdentityScopeIntersectsCompatibleMultiValueBaseFilter(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	srv := newIdentityScopeSemanticServer(t)
@@ -326,7 +333,11 @@ func newIdentityScopeDuckDBFixture(t *testing.T) *query.DuckDBEngine {
 			where = " WHERE false"
 		}
 		path := filepath.ToSlash(filepath.Join(dir, table.file))
-		_, err := db.Exec(fmt.Sprintf("COPY (SELECT * FROM (VALUES %s) AS t(%s)%s) TO '%s' (FORMAT PARQUET)", table.values, table.columns, where, path))
+		projection := "*"
+		if strings.HasPrefix(table.dir, "messages/") {
+			projection += ", false AS archive_only"
+		}
+		_, err := db.Exec(fmt.Sprintf("COPY (SELECT %s FROM (VALUES %s) AS t(%s)%s) TO '%s' (FORMAT PARQUET)", projection, table.values, table.columns, where, path))
 		require.NoError(t, err, "write %s", table.dir)
 	}
 	ensureIdentityCacheFixtureDatasets(t, db, analyticsDir)

@@ -4,7 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -21,9 +22,8 @@ import (
 )
 
 const (
-	codexPacketFilename           = "packet.json"
-	codexPreparedComponentCount   = 5
-	codexFixedUserInput           = "Read packet.json and return only JSON matching the supplied output schema."
+	codexPreparedComponentCount   = 6
+	codexFixedUserInput           = "Return only JSON matching the supplied output schema.\n\n"
 	codexModelListLimit           = 100
 	codexThreadIDReservationBytes = 128
 	codexDisableFlag              = "--disable"
@@ -31,9 +31,11 @@ const (
 )
 
 var codexReservedThreadID = strings.Repeat("t", codexThreadIDReservationBytes)
+var codexInitializedNotificationFrame = []byte("{\"method\":\"initialized\"}\n")
 
 var codexAppServerArgs = []string{
 	"app-server", "--stdio", "--strict-config",
+	codexDisableFlag, "shell_tool", codexDisableFlag, "unified_exec",
 	codexDisableFlag, "plugins", codexDisableFlag, "apps", codexDisableFlag, "enable_mcp_apps",
 	codexDisableFlag, "browser_use", codexDisableFlag, "computer_use", codexDisableFlag, "image_generation",
 	codexDisableFlag, "skill_search", codexDisableFlag, "hooks", codexDisableFlag, "memories",
@@ -55,28 +57,47 @@ type CodexModel struct {
 	SupportedEfforts       []string `json:"supported_efforts"`
 }
 
-// CodexAppServerTransport runs the attested Codex executable through the
+// CodexAppServerDriver runs the attested Codex executable through the
 // bounded App Server v2 stdio protocol.
-type CodexAppServerTransport struct {
-	Config    ProviderConfig
-	Commands  CommandStarter
-	Isolation CodexIsolationGate
+type CodexAppServerDriver struct {
+	Config   ProviderConfig
+	launcher CodexLauncher
+	authHome string
 }
 
-// NewCodexAppServerTransport validates the immutable launch dependencies. The
+// NewCodexAppServerDriver validates the immutable launch dependencies. The
 // release gate is checked again for each launch; constructing a transport does
 // not retain an attestation for later use.
-func NewCodexAppServerTransport(
+func NewCodexAppServerDriver(
 	cfg ProviderConfig,
 	commands CommandStarter,
 	isolation CodexIsolationGate,
-) (*CodexAppServerTransport, error) {
-	validation := Config{Enabled: true, Provider: cfg}
+) (*CodexAppServerDriver, error) {
+	return NewCodexAppServerDriverWithAuthHome(cfg, commands, isolation, "")
+}
+
+// NewCodexAppServerDriverWithAuthHome accepts only a daemon-selected credential
+// directory. An empty value runs without credentials; ambient CODEX_HOME is never
+// consulted. The launcher stages only auth.json into its disposable work root.
+func NewCodexAppServerDriverWithAuthHome(
+	cfg ProviderConfig,
+	commands CommandStarter,
+	isolation CodexIsolationGate,
+	authHome string,
+) (*CodexAppServerDriver, error) {
+	validation := Config{
+		Enabled: true, Provider: ProviderSelection{Name: "runtime"},
+		Providers: map[string]ProviderConfig{"runtime": cfg},
+	}
 	validation.ApplyDefaults()
 	if err := validation.Validate(); err != nil {
 		return nil, err
 	}
-	if validation.Provider.Kind != ProviderCodexAppServer {
+	_, provider, err := validation.ActiveProviderConfig()
+	if err != nil {
+		return nil, err
+	}
+	if provider.Protocol != ProtocolCodexAppServer {
 		return nil, errors.New("codex app-server transport requires codex_app_server configuration")
 	}
 	if commands == nil {
@@ -85,9 +106,11 @@ func NewCodexAppServerTransport(
 	if isolation == nil {
 		return nil, errors.New("codex app-server isolation gate is required")
 	}
-	return &CodexAppServerTransport{
-		Config: validation.Provider, Commands: commands, Isolation: isolation,
-	}, nil
+	launcher := codexBoundLauncher{gate: isolation, starter: commands}
+	if authHome != "" {
+		launcher.proxy = defaultCodexServiceProxy()
+	}
+	return &CodexAppServerDriver{Config: provider, launcher: launcher, authHome: authHome}, nil
 }
 
 type codexInitializeParams struct {
@@ -112,17 +135,11 @@ type codexReadOnlySandboxPolicy struct {
 }
 
 type codexThreadStartParams struct {
-	Model                   string                     `json:"model"`
-	Effort                  string                     `json:"effort"`
-	Ephemeral               bool                       `json:"ephemeral"`
-	CWD                     string                     `json:"cwd"`
-	RuntimeWorkspaceRoots   []string                   `json:"runtimeWorkspaceRoots"`
-	SelectedCapabilityRoots []string                   `json:"selectedCapabilityRoots"`
-	DynamicTools            []any                      `json:"dynamicTools"`
-	Environments            []any                      `json:"environments"`
-	ApprovalPolicy          string                     `json:"approvalPolicy"`
-	Sandbox                 string                     `json:"sandbox"`
-	SandboxPolicy           codexReadOnlySandboxPolicy `json:"sandboxPolicy"`
+	Model          string `json:"model"`
+	Ephemeral      bool   `json:"ephemeral"`
+	CWD            string `json:"cwd"`
+	ApprovalPolicy string `json:"approvalPolicy"`
+	Sandbox        string `json:"sandbox"`
 }
 
 type codexTurnStartParams struct {
@@ -132,9 +149,8 @@ type codexTurnStartParams struct {
 	Effort         string                     `json:"effort"`
 	CWD            string                     `json:"cwd"`
 	ApprovalPolicy string                     `json:"approvalPolicy"`
-	Sandbox        string                     `json:"sandbox"`
 	SandboxPolicy  codexReadOnlySandboxPolicy `json:"sandboxPolicy"`
-	OutputSchema   json.RawMessage            `json:"outputSchema"`
+	OutputSchema   jsontext.Value             `json:"outputSchema"`
 }
 
 type codexTextInput struct {
@@ -142,27 +158,25 @@ type codexTextInput struct {
 	Text string `json:"text"`
 }
 
-func codexInitializeRequest(id int64) codexRPCRequest {
+func codexInitializeRequest() codexRPCRequest {
 	params := codexInitializeParams{}
 	params.ClientInfo.Name = "msgvault"
 	params.ClientInfo.Title = "msgvault"
 	params.ClientInfo.Version = "1"
 	params.Capabilities.ExperimentalAPI = true
-	return codexRPCRequest{Method: "initialize", ID: id, Params: params}
+	return codexRPCRequest{Method: "initialize", ID: 1, Params: params}
 }
 
-func codexModelListRequest(id int64) codexRPCRequest {
-	return codexRPCRequest{Method: "model/list", ID: id, Params: codexModelListParams{
+func codexModelListRequest() codexRPCRequest {
+	return codexRPCRequest{Method: "model/list", ID: 2, Params: codexModelListParams{
 		Limit: codexModelListLimit, IncludeHidden: true,
 	}}
 }
 
 func codexThreadStartRequest(id int64, profile ProviderProfile) codexRPCRequest {
 	return codexRPCRequest{Method: "thread/start", ID: id, Params: codexThreadStartParams{
-		Model: profile.Model, Effort: profile.ReasoningEffort, Ephemeral: true, CWD: ".",
-		RuntimeWorkspaceRoots: []string{"."}, SelectedCapabilityRoots: []string{},
-		DynamicTools: []any{}, Environments: []any{}, ApprovalPolicy: "never", Sandbox: "read-only",
-		SandboxPolicy: codexReadOnlySandboxPolicy{Type: "readOnly", NetworkAccess: false},
+		Model: profile.Model, Ephemeral: true, CWD: "/work",
+		ApprovalPolicy: "never", Sandbox: "read-only",
 	}}
 }
 
@@ -174,17 +188,17 @@ func codexTurnStartRequest(
 ) codexRPCRequest {
 	return codexRPCRequest{Method: "turn/start", ID: id, Params: codexTurnStartParams{
 		ThreadID: threadID,
-		Input:    []codexTextInput{{Type: "text", Text: codexFixedUserInput}},
-		Model:    profile.Model, Effort: profile.ReasoningEffort, CWD: ".",
-		ApprovalPolicy: "never", Sandbox: "read-only",
-		SandboxPolicy: codexReadOnlySandboxPolicy{Type: "readOnly", NetworkAccess: false},
-		OutputSchema:  slices.Clone(request.JSONSchema),
+		Input:    []codexTextInput{{Type: "text", Text: codexFixedUserInput + request.InputText}},
+		Model:    profile.Model, Effort: profile.ReasoningEffort, CWD: "/work",
+		ApprovalPolicy: "never",
+		SandboxPolicy:  codexReadOnlySandboxPolicy{Type: "readOnly", NetworkAccess: false},
+		OutputSchema:   slices.Clone(request.JSONSchema),
 	}}
 }
 
-// PrepareJSON constructs the packet and four exact outbound request frames.
+// Prepare constructs the packet and five exact outbound protocol frames.
 // Each component is independently length-prefixed for unambiguous reservation.
-func (t *CodexAppServerTransport) PrepareJSON(
+func (t *CodexAppServerDriver) Prepare(
 	profile ProviderProfile,
 	request StructuredRequest,
 ) (PreparedStructuredRequest, error) {
@@ -192,19 +206,22 @@ func (t *CodexAppServerTransport) PrepareJSON(
 		return PreparedStructuredRequest{}, err
 	}
 	frames := []codexRPCRequest{
-		codexInitializeRequest(1),
-		codexModelListRequest(2),
+		codexInitializeRequest(),
+		codexModelListRequest(),
 		codexThreadStartRequest(3, profile),
 		codexTurnStartRequest(4, profile, request, codexReservedThreadID),
 	}
 	components := make([][]byte, 0, codexPreparedComponentCount)
 	components = append(components, []byte(request.InputText))
-	for _, frame := range frames {
-		encoded, err := json.Marshal(frame)
+	for index, frame := range frames {
+		encoded, err := json.Marshal(frame, json.Deterministic(true))
 		if err != nil {
 			return PreparedStructuredRequest{}, errors.New("encode codex app-server request")
 		}
 		components = append(components, append(encoded, '\n'))
+		if index == 0 {
+			components = append(components, slices.Clone(codexInitializedNotificationFrame))
+		}
 	}
 	wire, err := encodeCodexPreparedComponents(components)
 	if err != nil {
@@ -213,11 +230,11 @@ func (t *CodexAppServerTransport) PrepareJSON(
 	return NewPreparedStructuredRequest(request, wire)
 }
 
-func (t *CodexAppServerTransport) validateProfile(profile ProviderProfile) error {
+func (t *CodexAppServerDriver) validateProfile(profile ProviderProfile) error {
 	if err := profile.Validate(); err != nil {
 		return err
 	}
-	if profile.Kind != ProviderCodexAppServer ||
+	if profile.Protocol != ProtocolCodexAppServer ||
 		profile.Model != strings.TrimSpace(t.Config.Model) ||
 		profile.ReasoningEffort != strings.TrimSpace(t.Config.ReasoningEffort) ||
 		profile.ExecutionBoundary != t.Config.ExecutionBoundary {
@@ -262,124 +279,116 @@ func decodeCodexPreparedComponents(wire []byte) ([][]byte, error) {
 	return components, nil
 }
 
-// GeneratePreparedJSON launches the attested process and sends only the exact
+// GeneratePrepared launches the attested process and sends only the exact
 // prepared packet and frames covered by the caller's reservation.
-func (t *CodexAppServerTransport) GeneratePreparedJSON(
+func (t *CodexAppServerDriver) GeneratePrepared(
 	ctx context.Context,
 	profile ProviderProfile,
-	credential string,
+	credential Credential,
 	prepared PreparedStructuredRequest,
-) (response StructuredResponse, retErr error) {
-	if credential != "" {
-		return StructuredResponse{}, errors.New("codex app-server does not accept a forwarded credential")
+) (response DriverResponse, retErr error) {
+	if credential.hasValue() {
+		return DriverResponse{}, errors.New("codex app-server does not accept a forwarded credential")
 	}
 	if err := t.validateProfile(profile); err != nil {
-		return StructuredResponse{}, err
+		return DriverResponse{}, err
 	}
 	if err := prepared.validateWireHash(); err != nil {
-		return StructuredResponse{}, err
+		return DriverResponse{}, err
 	}
-	expected, err := t.PrepareJSON(profile, prepared.Request())
+	expected, err := t.Prepare(profile, prepared.Request())
 	if err != nil {
-		return StructuredResponse{}, fmt.Errorf("re-encode prepared codex app-server request: %w", err)
+		return DriverResponse{}, fmt.Errorf("re-encode prepared codex app-server request: %w", err)
 	}
 	if !bytes.Equal(expected.WireRequest(), prepared.WireRequest()) {
-		return StructuredResponse{}, errors.New("prepared codex app-server request does not match deterministic encoding")
+		return DriverResponse{}, errors.New("prepared codex app-server request does not match deterministic encoding")
 	}
 	components, err := decodeCodexPreparedComponents(prepared.WireRequest())
 	if err != nil {
-		return StructuredResponse{}, err
+		return DriverResponse{}, err
 	}
 	if !bytes.Equal(components[0], []byte(prepared.Request().InputText)) {
-		return StructuredResponse{}, errors.New("prepared codex app-server packet does not match request")
+		return DriverResponse{}, errors.New("prepared codex app-server packet does not match request")
 	}
+	releaseAuth, err := lockCodexAuthOperation(ctx, t.authHome)
+	if err != nil {
+		return DriverResponse{}, err
+	}
+	defer releaseAuth()
 
 	attestation, err := t.attest(ctx)
 	if err != nil {
-		return StructuredResponse{}, err
+		return DriverResponse{}, err
 	}
 	defer func() {
 		if closeErr := attestation.Close(); closeErr != nil && retErr == nil {
-			response = StructuredResponse{}
+			response = DriverResponse{}
 			retErr = closeErr
 		}
 	}()
-	packetRoot, err := os.MkdirTemp("", "msgvault-codex-packet-")
+	process, err := t.startAttested(ctx, attestation)
 	if err != nil {
-		return StructuredResponse{}, errors.New("create codex packet root")
-	}
-	defer func() {
-		if cleanupErr := os.RemoveAll(packetRoot); cleanupErr != nil && retErr == nil {
-			response = StructuredResponse{}
-			retErr = errors.New("remove codex packet root")
-		}
-	}()
-	packetPath := filepath.Join(packetRoot, codexPacketFilename)
-	if err := os.WriteFile(packetPath, components[0], 0o400); err != nil {
-		return StructuredResponse{}, errors.New("write codex packet")
-	}
-	if err := os.Chmod(packetPath, 0o400); err != nil {
-		return StructuredResponse{}, errors.New("protect codex packet")
-	}
-
-	process, err := t.startAttested(ctx, attestation, packetRoot)
-	if err != nil {
-		return StructuredResponse{}, err
+		return DriverResponse{}, err
 	}
 	client := &CodexRPCClient{Process: process}
 	defer func() {
 		cleanupErr := finishCodexProcess(ctx, process, client, retErr != nil)
-		if cleanupErr != nil && retErr == nil {
-			retErr = cleanupErr
+		if retErr != nil || cleanupErr != nil {
+			response.CandidateJSON = nil
 		}
+		retErr = errors.Join(retErr, cleanupErr)
 	}()
 
 	var initialized map[string]any
 	if err := client.callPrepared(ctx, components[1], &initialized); err != nil {
-		return StructuredResponse{}, err
+		return DriverResponse{}, err
+	}
+	if err := client.notifyPreparedInitialized(ctx, components[2]); err != nil {
+		return DriverResponse{}, err
 	}
 	var catalog codexModelListResult
-	if err := client.callPrepared(ctx, components[2], &catalog); err != nil {
-		return StructuredResponse{}, err
+	if err := client.callPrepared(ctx, components[3], &catalog); err != nil {
+		return DriverResponse{}, err
 	}
 	if catalog.NextCursor != nil || len(catalog.Data) > codexModelListLimit {
-		return StructuredResponse{}, fmt.Errorf("%w: Codex model catalog exceeds the bounded page", ErrInvalidStructuredOutput)
+		return DriverResponse{}, fmt.Errorf("%w: Codex model catalog exceeds the bounded page", ErrInvalidStructuredOutput)
 	}
 	selected, err := selectCodexModel(catalog.Data, profile.Model, profile.ReasoningEffort)
 	if err != nil {
-		return StructuredResponse{}, fmt.Errorf("%w: configured Codex model or effort is unavailable", ErrInvalidStructuredOutput)
+		return DriverResponse{}, fmt.Errorf("%w: configured Codex model or effort is unavailable", ErrInvalidStructuredOutput)
 	}
 
 	var threadResult codexThreadStartResult
-	if err := client.callPrepared(ctx, components[3], &threadResult); err != nil {
-		return StructuredResponse{}, err
+	if err := client.callPrepared(ctx, components[4], &threadResult); err != nil {
+		return DriverResponse{}, err
 	}
 	if !safeProviderMetadata(threadResult.Thread.ID) || !threadResult.Thread.Ephemeral {
-		return StructuredResponse{}, fmt.Errorf("%w: Codex returned an invalid ephemeral thread", ErrInvalidStructuredOutput)
+		return DriverResponse{}, fmt.Errorf("%w: Codex returned an invalid ephemeral thread", ErrInvalidStructuredOutput)
 	}
-	turnFrame, err := rewritePreparedTurnThreadID(components[4], threadResult.Thread.ID)
+	turnFrame, err := rewritePreparedTurnThreadID(components[5], threadResult.Thread.ID)
 	if err != nil {
-		return StructuredResponse{}, err
+		return DriverResponse{}, err
 	}
 	var turnResult codexTurnStartResult
 	if err := client.callPrepared(ctx, turnFrame, &turnResult); err != nil {
-		return StructuredResponse{}, err
+		return DriverResponse{}, err
 	}
 	if !safeProviderMetadata(turnResult.Turn.ID) {
-		return StructuredResponse{}, fmt.Errorf("%w: Codex returned an invalid turn", ErrInvalidStructuredOutput)
+		return DriverResponse{}, fmt.Errorf("%w: Codex returned an invalid turn", ErrInvalidStructuredOutput)
 	}
 
 	providerVersion, err := CanonicalCodexProviderVersion(attestation)
 	if err != nil {
-		return StructuredResponse{}, fmt.Errorf("%w: invalid Codex attestation identity", ErrInvalidStructuredOutput)
+		return DriverResponse{}, fmt.Errorf("%w: invalid Codex attestation identity", ErrInvalidStructuredOutput)
 	}
-	response = StructuredResponse{
+	response = DriverResponse{
 		ProviderRequestID: turnResult.Turn.ID,
 		ProviderVersion:   providerVersion,
 		ModelVersion:      selected.ID,
 	}
-	final, usage, err := readCodexFinal(ctx, client, threadResult.Thread.ID, turnResult.Turn.ID)
+	final, usage, usageKnown, err := readCodexFinal(ctx, client, threadResult.Thread.ID, turnResult.Turn.ID)
 	response.Usage = usage
+	response.UsageKnown = usageKnown
 	if err != nil {
 		return response, err
 	}
@@ -387,18 +396,20 @@ func (t *CodexAppServerTransport) GeneratePreparedJSON(
 	if err := validateCodexFinal(request, final); err != nil {
 		return response, err
 	}
-	response.Output = append(json.RawMessage(nil), final...)
+	response.CandidateJSON = append(jsontext.Value(nil), final...)
 	return response, nil
 }
+
+var _ StructuredDriver = (*CodexAppServerDriver)(nil)
 
 func rewritePreparedTurnThreadID(frame []byte, actual string) ([]byte, error) {
 	if !safeProviderMetadata(actual) || len(actual) > codexThreadIDReservationBytes {
 		return nil, fmt.Errorf("%w: Codex returned an invalid thread ID", ErrInvalidStructuredOutput)
 	}
 	var request struct {
-		Method string          `json:"method"`
-		ID     int64           `json:"id"`
-		Params json.RawMessage `json:"params"`
+		Method string         `json:"method"`
+		ID     int64          `json:"id"`
+		Params jsontext.Value `json:"params"`
 	}
 	if err := decodeSingleJSON(frame, &request); err != nil || request.Method != "turn/start" || request.ID != 4 {
 		return nil, errors.New("prepared codex turn frame is invalid")
@@ -410,11 +421,16 @@ func rewritePreparedTurnThreadID(frame []byte, actual string) ([]byte, error) {
 	if params.ThreadID != codexReservedThreadID {
 		return nil, errors.New("prepared codex turn thread-ID slot is invalid")
 	}
-	reserved := []byte(codexReservedThreadID)
-	if bytes.Count(frame, reserved) != 1 {
-		return nil, errors.New("prepared codex turn thread-ID slot is ambiguous")
+	preparedFrame, err := json.Marshal(codexRPCRequest{Method: "turn/start", ID: 4, Params: params}, json.Deterministic(true))
+	if err != nil || !bytes.Equal(frame, append(preparedFrame, '\n')) {
+		return nil, errors.New("prepared codex turn frame is not canonical")
 	}
-	actualFrame := bytes.Replace(frame, reserved, []byte(actual), 1)
+	params.ThreadID = actual
+	actualFrame, err := json.Marshal(codexRPCRequest{Method: "turn/start", ID: 4, Params: params}, json.Deterministic(true))
+	if err != nil {
+		return nil, errors.New("encode codex turn with actual thread ID")
+	}
+	actualFrame = append(actualFrame, '\n')
 	if len(actualFrame) > len(frame) {
 		return nil, errors.New("codex turn thread-ID substitution exceeds its reservation")
 	}
@@ -497,13 +513,14 @@ func readCodexFinal(
 	client *CodexRPCClient,
 	threadID string,
 	turnID string,
-) (json.RawMessage, TokenUsage, error) {
-	var final json.RawMessage
+) (jsontext.Value, TokenUsage, bool, error) {
+	var final jsontext.Value
 	usage := TokenUsage{}
+	usageKnown := false
 	for {
 		method, params, err := client.nextNotification(ctx)
 		if err != nil {
-			return nil, usage, err
+			return nil, usage, usageKnown, err
 		}
 		switch method {
 		case "item/completed":
@@ -517,14 +534,14 @@ func readCodexFinal(
 				} `json:"item"`
 			}
 			if decodeSingleJSON(params, &event) != nil {
-				return nil, usage, fmt.Errorf("%w: malformed Codex item event", ErrInvalidStructuredOutput)
+				return nil, usage, usageKnown, fmt.Errorf("%w: malformed Codex item event", ErrInvalidStructuredOutput)
 			}
 			if event.ThreadID == threadID && event.TurnID == turnID &&
 				event.Item.Type == "agentMessage" && event.Item.Phase == "final_answer" {
 				if len(final) != 0 || len(event.Item.Text) == 0 || len(event.Item.Text) > defaultCodexMaxFrameBytes {
-					return nil, usage, fmt.Errorf("%w: invalid Codex final assistant output", ErrInvalidStructuredOutput)
+					return nil, usage, usageKnown, fmt.Errorf("%w: invalid Codex final assistant output", ErrInvalidStructuredOutput)
 				}
-				final = json.RawMessage(append([]byte(nil), event.Item.Text...))
+				final = jsontext.Value(append([]byte(nil), event.Item.Text...))
 			}
 		case "thread/tokenUsage/updated":
 			var event struct {
@@ -534,7 +551,7 @@ func readCodexFinal(
 					Total *struct {
 						InputTokens  *int64 `json:"inputTokens"`
 						OutputTokens *int64 `json:"outputTokens"`
-					} `json:"totalTokenUsage"`
+					} `json:"total"`
 				} `json:"tokenUsage"`
 			}
 			if decodeSingleJSON(params, &event) != nil || event.ThreadID != threadID ||
@@ -543,12 +560,13 @@ func readCodexFinal(
 				*event.TokenUsage.Total.InputTokens < 0 || *event.TokenUsage.Total.OutputTokens < 0 ||
 				*event.TokenUsage.Total.InputTokens < usage.InputTokens ||
 				*event.TokenUsage.Total.OutputTokens < usage.OutputTokens {
-				return nil, usage, fmt.Errorf("%w: invalid Codex usage metadata", ErrInvalidStructuredOutput)
+				return nil, usage, usageKnown, fmt.Errorf("%w: invalid Codex usage metadata", ErrInvalidStructuredOutput)
 			}
 			usage = TokenUsage{
 				InputTokens:  *event.TokenUsage.Total.InputTokens,
 				OutputTokens: *event.TokenUsage.Total.OutputTokens,
 			}
+			usageKnown = true
 		case "turn/completed":
 			var event struct {
 				ThreadID string `json:"threadId"`
@@ -558,17 +576,17 @@ func readCodexFinal(
 				} `json:"turn"`
 			}
 			if decodeSingleJSON(params, &event) != nil || event.ThreadID != threadID || event.Turn.ID != turnID {
-				return nil, usage, fmt.Errorf("%w: malformed Codex turn completion", ErrInvalidStructuredOutput)
+				return nil, usage, usageKnown, fmt.Errorf("%w: malformed Codex turn completion", ErrInvalidStructuredOutput)
 			}
 			if event.Turn.Status != "completed" || len(final) == 0 {
-				return nil, usage, fmt.Errorf("%w: Codex turn did not return final structured output", ErrInvalidStructuredOutput)
+				return nil, usage, usageKnown, fmt.Errorf("%w: Codex turn did not return final structured output", ErrInvalidStructuredOutput)
 			}
-			return final, usage, nil
+			return final, usage, usageKnown, nil
 		}
 	}
 }
 
-func validateCodexFinal(request StructuredRequest, final json.RawMessage) error {
+func validateCodexFinal(request StructuredRequest, final jsontext.Value) error {
 	resolvedSchema, err := validateStructuredRequest(request, request.ProgramID == "provider-check")
 	if err != nil {
 		return err
@@ -585,15 +603,22 @@ func validateCodexFinal(request StructuredRequest, final json.RawMessage) error 
 
 // StartDeviceLogin keeps the app-server session alive until the device-code
 // flow completes. present receives only the bounded public ceremony fields.
-func (t *CodexAppServerTransport) StartDeviceLogin(
+// New credentials require the dedicated enrollment client. When credentials
+// were staged from authHome, cleanup permits only a refresh for the same account.
+func (t *CodexAppServerDriver) StartDeviceLogin(
 	ctx context.Context, present func(DeviceLogin) error,
 ) (retErr error) {
 	operationCtx, cancel := context.WithTimeout(ctx, t.Config.RequestTimeout)
 	defer cancel()
+	releaseAuth, err := lockCodexAuthOperation(operationCtx, t.authHome)
+	if err != nil {
+		return err
+	}
+	defer releaseAuth()
 	return t.withProcessDeviceLogin(operationCtx, present)
 }
 
-func (t *CodexAppServerTransport) withProcessDeviceLogin(
+func (t *CodexAppServerDriver) withProcessDeviceLogin(
 	ctx context.Context, present func(DeviceLogin) error,
 ) (retErr error) {
 	if present == nil {
@@ -605,8 +630,15 @@ func (t *CodexAppServerTransport) withProcessDeviceLogin(
 	}
 	client := &CodexRPCClient{Process: process}
 	defer func() { retErr = cleanup(client, retErr) }()
+	return runCodexDeviceLogin(ctx, client, present)
+}
+
+func runCodexDeviceLogin(ctx context.Context, client *CodexRPCClient, present func(DeviceLogin) error) error {
 	var initialized map[string]any
-	if err := client.Call(ctx, "initialize", codexInitializeRequest(1).Params, &initialized); err != nil {
+	if err := client.Call(ctx, "initialize", codexInitializeRequest().Params, &initialized); err != nil {
+		return err
+	}
+	if err := client.Notify(ctx, "initialized", nil); err != nil {
 		return err
 	}
 	var result struct {
@@ -679,10 +711,15 @@ func parseCodexDeviceExpiry(raw string, expiresIn int64, fallback time.Time) (ti
 
 // ListModels returns the bounded model IDs and effort choices supplied by the
 // attested App Server process.
-func (t *CodexAppServerTransport) ListModels(ctx context.Context) (models []CodexModel, retErr error) {
+func (t *CodexAppServerDriver) ListModels(ctx context.Context) (models []CodexModel, retErr error) {
 	operationCtx, cancel := context.WithTimeout(ctx, t.Config.RequestTimeout)
 	defer cancel()
 	ctx = operationCtx
+	releaseAuth, err := lockCodexAuthOperation(ctx, t.authHome)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseAuth()
 
 	process, cleanup, err := t.launchEmpty(ctx)
 	if err != nil {
@@ -691,11 +728,14 @@ func (t *CodexAppServerTransport) ListModels(ctx context.Context) (models []Code
 	client := &CodexRPCClient{Process: process}
 	defer func() { retErr = cleanup(client, retErr) }()
 	var initialized map[string]any
-	if err := client.Call(ctx, "initialize", codexInitializeRequest(1).Params, &initialized); err != nil {
+	if err := client.Call(ctx, "initialize", codexInitializeRequest().Params, &initialized); err != nil {
+		return nil, err
+	}
+	if err := client.Notify(ctx, "initialized", nil); err != nil {
 		return nil, err
 	}
 	var result codexModelListResult
-	if err := client.Call(ctx, "model/list", codexModelListRequest(2).Params, &result); err != nil {
+	if err := client.Call(ctx, "model/list", codexModelListRequest().Params, &result); err != nil {
 		return nil, err
 	}
 	if result.NextCursor != nil || len(result.Data) > codexModelListLimit {
@@ -712,8 +752,8 @@ func (t *CodexAppServerTransport) ListModels(ctx context.Context) (models []Code
 	return models, nil
 }
 
-func (t *CodexAppServerTransport) attest(ctx context.Context) (CodexAttestation, error) {
-	attestation, err := t.Isolation.Verify(ctx, t.Config.Executable, t.Config.ExecutionBoundary)
+func (t *CodexAppServerDriver) attest(ctx context.Context) (CodexAttestation, error) {
+	attestation, err := t.launcher.Verify(ctx, t.Config.Executable)
 	if err != nil {
 		_ = attestation.Close()
 		return CodexAttestation{}, fmt.Errorf("verify codex app-server isolation: %w", err)
@@ -730,56 +770,40 @@ func (t *CodexAppServerTransport) attest(ctx context.Context) (CodexAttestation,
 	return attestation, nil
 }
 
-func (t *CodexAppServerTransport) startAttested(
+func (t *CodexAppServerDriver) startAttested(
 	ctx context.Context,
 	attestation CodexAttestation,
-	dir string,
 ) (RPCProcess, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := t.Isolation.ReverifyForLaunch(attestation); err != nil {
-		return nil, fmt.Errorf("reverify codex app-server isolation: %w", err)
-	}
-	process, err := t.Commands.Start(
-		ctx, attestation.VerifiedExecutable(), slices.Clone(codexAppServerArgs), scrubCodexEnvironment(os.Environ()), dir,
-	)
+	process, err := t.launcher.Start(ctx, attestation, t.authHome)
 	if err != nil {
-		return nil, errors.New("start codex app-server process")
+		return nil, fmt.Errorf("start codex app-server process: %w", err)
 	}
 	return process, nil
 }
 
-func (t *CodexAppServerTransport) launchEmpty(
+func (t *CodexAppServerDriver) launchEmpty(
 	ctx context.Context,
 ) (RPCProcess, func(*CodexRPCClient, error) error, error) {
 	attestation, err := t.attest(ctx)
 	if err != nil {
 		return nil, nil, err
 	}
-	dir, err := os.MkdirTemp("", "msgvault-codex-operation-")
+	process, err := t.startAttested(ctx, attestation)
 	if err != nil {
-		_ = attestation.Close()
-		return nil, nil, errors.New("create codex operation root")
-	}
-	process, err := t.startAttested(ctx, attestation, dir)
-	if err != nil {
-		_ = os.RemoveAll(dir)
 		_ = attestation.Close()
 		return nil, nil, err
 	}
 	cleanup := func(client *CodexRPCClient, operationErr error) error {
 		processErr := finishCodexProcess(ctx, process, client, operationErr != nil)
-		removeErr := os.RemoveAll(dir)
 		attestationErr := attestation.Close()
 		if operationErr != nil {
-			return operationErr
+			return errors.Join(operationErr, processErr, attestationErr)
 		}
 		if processErr != nil {
 			return processErr
-		}
-		if removeErr != nil {
-			return errors.New("remove codex operation root")
 		}
 		if attestationErr != nil {
 			return attestationErr
@@ -800,13 +824,19 @@ func finishCodexProcess(
 	}
 	var closeErr error
 	if stdin := process.Stdin(); stdin != nil {
-		closeErr = stdin.Close()
+		if err := stdin.Close(); err != nil && !errors.Is(err, os.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) {
+			closeErr = err
+		}
 	}
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- process.Wait() }()
 	var waitErr error
 	var cleanupContextErr error
 	waited := false
+	var childExited <-chan struct{}
+	if owned, ok := process.(*codexOwnedProcess); ok {
+		childExited = owned.childExited
+	}
 	killAttempted := false
 	killSucceeded := false
 	killAlreadyFinished := false
@@ -827,6 +857,11 @@ func finishCodexProcess(
 		timer := time.NewTimer(codexProcessExitGrace)
 		select {
 		case waitErr = <-waitDone:
+			waited = true
+		case <-childExited:
+			// The child is gone. Allow the bounded credential copy-back to
+			// finish before cleanup; the process-exit grace no longer applies.
+			waitErr = <-waitDone
 			waited = true
 		case <-ctx.Done():
 			cleanupContextErr = ctx.Err()
@@ -866,12 +901,12 @@ func finishCodexProcess(
 		stderrJoined, stderrErr = client.waitForStderr(ctx, codexProcessExitGrace)
 	}
 	if stdout := process.Stdout(); stdout != nil {
-		if err := stdout.Close(); err != nil && closeErr == nil {
+		if err := stdout.Close(); err != nil && !errors.Is(err, os.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) && closeErr == nil {
 			closeErr = err
 		}
 	}
 	if stderr := process.Stderr(); stderr != nil {
-		if err := stderr.Close(); err != nil && closeErr == nil {
+		if err := stderr.Close(); err != nil && !errors.Is(err, os.ErrClosed) && !errors.Is(err, io.ErrClosedPipe) && closeErr == nil {
 			closeErr = err
 		}
 	}
@@ -885,7 +920,20 @@ func finishCodexProcess(
 	if killSucceeded && errors.Is(stderrErr, errCodexStderrRead) {
 		stderrErr = nil
 	}
+	if owned, ok := process.(*codexOwnedProcess); ok {
+		if err := owned.cleanup(); err != nil {
+			return errors.New("remove codex app-server work root")
+		}
+	}
+	for _, authErr := range []error{ErrCodexAuthAccountChanged, ErrCodexAuthSourceChanged, ErrCodexAuthRefreshUnsafe} {
+		if errors.Is(waitErr, authErr) {
+			return authErr
+		}
+	}
 	if forceKill {
+		if waitAbandoned {
+			return errors.New("codex app-server process termination failed")
+		}
 		return nil
 	}
 	if cleanupContextErr != nil {
@@ -933,11 +981,6 @@ func scrubCodexEnvironment(environment []string) []string {
 }
 
 type execCommandStarter struct{}
-
-// NewCodexCommandStarter returns the production os/exec-backed process
-// boundary. The isolation gate still controls which absolute executable may be
-// passed to it.
-func NewCodexCommandStarter() CommandStarter { return execCommandStarter{} }
 
 func (execCommandStarter) Start(
 	ctx context.Context,

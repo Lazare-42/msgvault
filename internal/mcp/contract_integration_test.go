@@ -15,7 +15,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/query/querytest"
-	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/savedview"
+	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 	"go.kenn.io/msgvault/internal/vector/hybrid"
 	"go.kenn.io/msgvault/pkg/client/generated"
@@ -23,12 +24,19 @@ import (
 
 var task5StableToolNames = []string{
 	ToolAggregate,
+	ToolCreateSavedView,
+	ToolDeleteSavedView,
 	ToolExportAttachment,
+	ToolExportEML,
 	ToolFindSimilarMessages,
 	ToolGetAttachment,
 	ToolGetMessage,
+	ToolGetSavedView,
 	ToolGetStats,
 	ToolListMessages,
+	ToolListSavedViews,
+	ToolListThread,
+	ToolRunSavedView,
 	ToolSearchByDomains,
 	ToolSearchInMessage,
 	ToolSearchMessageBodies,
@@ -37,6 +45,46 @@ var task5StableToolNames = []string{
 	ToolSearchPersonFiles,
 	ToolSemanticSearchMessages,
 	ToolStageDeletion,
+	ToolUpdateSavedView,
+}
+
+// task5OriginalEngine adds original-message export to the mock engine so
+// the export tools have a deterministic success path.
+type task5OriginalEngine struct {
+	*querytest.MockEngine
+
+	message *query.MessageDetail
+}
+
+func (e task5OriginalEngine) record() query.MessageRecord {
+	return query.MessageRecord{
+		MessageID: e.message.ID, SourceMessageID: e.message.SourceMessageID,
+		ConversationID: e.message.ConversationID, SourceConversationID: e.message.SourceConversationID,
+		SourceID: e.message.SourceID, Account: "alice@example.com", SourceType: "gmail",
+	}
+}
+
+func (e task5OriginalEngine) ReadOriginalMessage(_ context.Context, ref query.MessageRef, _ int64) (*query.OriginalMessage, error) {
+	if ref.ID != e.message.ID {
+		return nil, store.ErrMessageNotFound
+	}
+	return &query.OriginalMessage{
+		MessageRecord: e.record(),
+		MIME:          []byte("Subject: Deterministic archive note\r\n\r\nneedle appears\r\n"),
+	}, nil
+}
+
+func (e task5OriginalEngine) ListThread(_ context.Context, _ query.ThreadQuery) (*query.ThreadPage, error) {
+	sentAt := e.message.SentAt
+	return &query.ThreadPage{
+		MessageRecord: e.record(),
+		Total:         1,
+		Messages: []query.ThreadMessage{{
+			ID: e.message.ID, SourceMessageID: e.message.SourceMessageID, Subject: e.message.Subject,
+			SentAt: &sentAt, From: e.message.From, To: e.message.To, Cc: []query.Address{}, HasRaw: true,
+			AttachmentCount: len(e.message.Attachments),
+		}},
+	}, nil
 }
 
 type task5Fixture struct {
@@ -44,6 +92,66 @@ type task5Fixture struct {
 	exportDir       string
 	attachmentBytes []byte
 	saver           *captureDeletionManifestSaver
+}
+
+type task5SavedViewService struct {
+	view store.SavedView
+}
+
+func (r *task5SavedViewService) ListSavedViews(context.Context) ([]store.SavedView, error) {
+	return []store.SavedView{r.view}, nil
+}
+
+func (r *task5SavedViewService) GetSavedView(_ context.Context, id int64) (*store.SavedView, error) {
+	if id != r.view.ID {
+		return nil, store.ErrSavedViewNotFound
+	}
+	view := r.view
+	return &view, nil
+}
+
+func (r *task5SavedViewService) RunSavedView(
+	_ context.Context, id int64, _ int, _ string,
+) (*savedview.RunPage, error) {
+	if id != r.view.ID {
+		return nil, store.ErrSavedViewNotFound
+	}
+	messageID := int64(42)
+	return &savedview.RunPage{
+		View: r.view, ResultKind: savedview.ResultEntries,
+		Rows:          []query.EntryRow{{Key: "message:42", Kind: query.EntryEmail, AnchorMessageID: &messageID}},
+		CacheRevision: "fixture-cache",
+	}, nil
+}
+
+func (r *task5SavedViewService) CreateSavedView(
+	_ context.Context, input store.SavedViewInput,
+) (*store.SavedView, error) {
+	view := r.view
+	view.Name, view.Description = input.Name, input.Description
+	view.CanonicalState, view.SchemaVersion = input.CanonicalState, input.SchemaVersion
+	return &view, nil
+}
+
+func (r *task5SavedViewService) UpdateSavedView(
+	_ context.Context, id, _ int64, patch savedview.Patch,
+) (*store.SavedView, error) {
+	if id != r.view.ID {
+		return nil, store.ErrSavedViewNotFound
+	}
+	view := r.view
+	view.Revision++
+	if patch.Name != nil {
+		view.Name = *patch.Name
+	}
+	return &view, nil
+}
+
+func (r *task5SavedViewService) DeleteSavedView(_ context.Context, id, _ int64) error {
+	if id != r.view.ID {
+		return store.ErrSavedViewNotFound
+	}
+	return nil
 }
 
 func newTask5Fixture(t *testing.T, shape string) task5Fixture {
@@ -140,14 +248,11 @@ func newTask5Fixture(t *testing.T, shape string) task5Fixture {
 			Key: "example.com", Count: 2, TotalSize: 3072, AttachmentSize: int64(len(attachmentBytes)), AttachmentCount: 1, TotalUnique: 1,
 		}},
 		GmailIDs: []string{"source-message-42"},
-		SearchFastCountFunc: func(context.Context, *search.Query, query.MessageFilter) (int64, error) {
-			return 1, nil
-		},
 	}
 
 	saver := &captureDeletionManifestSaver{}
 	opts := ServeOptions{
-		Engine: engine,
+		Engine: task5OriginalEngine{MockEngine: engine, message: message},
 		AttachmentReader: attachmentReaderFunc(func(_ context.Context, contentHash string) ([]byte, error) {
 			if contentHash != attachment.ContentHash {
 				return nil, fmt.Errorf("attachment content hash = %q, want %q", contentHash, attachment.ContentHash)
@@ -156,6 +261,11 @@ func newTask5Fixture(t *testing.T, shape string) task5Fixture {
 		}),
 		ManifestSaver:      saver,
 		PersonFileSearcher: &recordingPersonFileSearcher{},
+		SavedViews: &task5SavedViewService{view: store.SavedView{
+			ID: 7, Name: "Archive notes", SchemaVersion: store.CurrentSavedViewSchemaVersion, Revision: 1,
+			CanonicalState: json.RawMessage(`{"query":"needle","search_mode":"full_text","presentation":"table"}`),
+			CreatedAt:      now, UpdatedAt: now,
+		}},
 	}
 
 	rrf, vectorScore := 0.45, 0.91
@@ -223,7 +333,8 @@ func newTask5Fixture(t *testing.T, shape string) task5Fixture {
 func task5ExpectedTools(shape string, allowWrites bool) []string {
 	want := make([]string, 0, len(task5StableToolNames))
 	for _, name := range task5StableToolNames {
-		if !allowWrites && (name == ToolExportAttachment || name == ToolStageDeletion) {
+		if !allowWrites && (name == ToolCreateSavedView || name == ToolDeleteSavedView ||
+			name == ToolExportAttachment || name == ToolStageDeletion || name == ToolUpdateSavedView) {
 			continue
 		}
 		if shape != "001" && shape != "101" && shape != "111" && name == ToolFindSimilarMessages {
@@ -236,6 +347,13 @@ func task5ExpectedTools(shape string, allowWrites bool) []string {
 
 func task5ToolArguments(name, shape, exportDir string) (map[string]any, bool) {
 	switch name {
+	case ToolCreateSavedView:
+		return map[string]any{
+			"name": "Created view", "schema_version": 1,
+			"canonical_state": map[string]any{"presentation": "table"},
+		}, true
+	case ToolDeleteSavedView:
+		return map[string]any{"id": 7, "revision": 1}, true
 	case ToolSearchMessages:
 		return map[string]any{"query": "needle", "limit": 1}, true
 	case ToolSearchMetadata:
@@ -251,18 +369,30 @@ func task5ToolArguments(name, shape, exportDir string) (map[string]any, bool) {
 		return map[string]any{"query": "needle", "mode": "vector", "limit": 1, "explain": true}, true
 	case ToolGetMessage:
 		return map[string]any{"id": 42, "max_chars": 80, "body_format": "text"}, true
+	case ToolGetSavedView:
+		return map[string]any{"id": 7}, true
 	case ToolGetAttachment:
 		return map[string]any{"attachment_id": 7}, true
+	case ToolExportEML:
+		return map[string]any{"id": 42, "length": 16}, true
+	case ToolListThread:
+		return map[string]any{"id": 42, "limit": 10}, true
 	case ToolExportAttachment:
 		return map[string]any{"attachment_id": 7, "destination": exportDir}, true
 	case ToolListMessages:
 		return map[string]any{"account": "alice@example.com", "limit": 1}, true
+	case ToolListSavedViews:
+		return map[string]any{}, true
+	case ToolRunSavedView:
+		return map[string]any{"id": 7, "limit": 1}, true
 	case ToolGetStats:
 		return map[string]any{}, true
 	case ToolAggregate:
 		return map[string]any{"group_by": "domain", "account": "alice@example.com", "limit": 1}, true
 	case ToolStageDeletion:
 		return map[string]any{"from": "alice@example.com"}, true
+	case ToolUpdateSavedView:
+		return map[string]any{"id": 7, "revision": 1, "name": "Updated view"}, true
 	case ToolSearchByDomains:
 		return map[string]any{"domains": "example.com", "limit": 1}, true
 	case ToolFindSimilarMessages:

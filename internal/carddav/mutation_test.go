@@ -10,17 +10,19 @@ import (
 )
 
 func TestPublicationVersionUsesV4OnlyWhenItIsTheOnlyAdvertisedVersion(t *testing.T) {
+	t.Parallel()
 	assert.Equal(t, vcard.Version30, publicationVersion(nil))
 	assert.Equal(t, vcard.Version30, publicationVersion([]string{"3.0", "4.0"}))
 	assert.Equal(t, vcard.Version40, publicationVersion([]string{"4.0"}))
 }
 
 func TestPublicationHrefBuildsEscapedDirectCollectionChild(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 
 	origin, err := url.Parse("https://contacts.example")
 	require.NoError(t, err)
-	service := &Service{client: &Client{origin: originURL(origin)}}
+	service := &Service{remote: &davRemote{client: &Client{origin: originURL(origin)}}}
 
 	href, err := service.publicationHref(
 		"https://contacts.example/books/personal?ignored=yes#fragment", "a/b?c#d",
@@ -33,9 +35,10 @@ func TestPublicationHrefBuildsEscapedDirectCollectionChild(t *testing.T) {
 }
 
 func TestPublicationHrefUsesCanonicalDefaultHTTPSPort(t *testing.T) {
+	t.Parallel()
 	origin, err := url.Parse("https://contacts.example")
 	require.NoError(t, err)
-	service := &Service{client: &Client{origin: originURL(origin)}}
+	service := &Service{remote: &davRemote{client: &Client{origin: originURL(origin)}}}
 
 	href, err := service.publicationHref("https://CONTACTS.example/books/personal/", "alice")
 
@@ -44,6 +47,7 @@ func TestPublicationHrefUsesCanonicalDefaultHTTPSPort(t *testing.T) {
 }
 
 func TestStripServerOwnedPropertiesRemovesOnlyNamedProperties(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 
 	body := []byte("BEGIN:VCARD\r\nVERSION:3.0\r\nUID:test\r\nFN:Test\r\nPRODID:server\r\nREV:one\r\nSOURCE:https://example.test\r\nCREATED:one\r\nLAST-MODIFIED:two\r\nX-KEEP:yes\r\nEND:VCARD\r\n")

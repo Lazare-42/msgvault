@@ -30,14 +30,14 @@
           assert pkgs.lib.versionAtLeast pkgs.sqlite.version minSQLiteVersion;
           pkgs.sqlite;
 
-        # Pin Go 1.27.0 until the locked nixpkgs revision ships it.
+        # Pin Go 1.27.3 until the locked nixpkgs revision ships it.
         # Scoped to msgvault only — do NOT export via overlay, that would
         # invalidate every Go derivation in the transitive closure.
         goPinned = pkgs.go_1_26.overrideAttrs (old: rec {
-          version = "1.27.0";
+          version = "1.27.3";
           src = pkgs.fetchurl {
             url = "https://go.dev/dl/go${version}.src.tar.gz";
-            hash = "sha256-cAJAPXzERSnvbSb2mkSBgmM5Xq18FsBaWAiuBH6+sOU=";
+            hash = "sha256-bndJA1zzYPBrJXXRYup535/ajvZxiJ5cN1+OUHd/Jrs=";
           };
           patches =
             builtins.filter (
@@ -94,25 +94,25 @@
         };
 
         bunPinned = pkgs.bun.overrideAttrs (old: rec {
-          version = "1.3.14";
+          version = "1.4.4";
           src = passthru.sources.${system};
           passthru = old.passthru // {
             sources = {
               aarch64-darwin = pkgs.fetchurl {
                 url = "https://github.com/oven-sh/bun/releases/download/bun-v${version}/bun-darwin-aarch64.zip";
-                hash = "sha256-2LliIYKK1vl6x6wKt+lYcjQa92MAHogD6CZ2UsJlJiA=";
+                hash = "sha256-wkDX8My5DCY6hJ/NsJt+5iYw2SE0jtaq/ahrnVd7xRA=";
               };
               aarch64-linux = pkgs.fetchurl {
                 url = "https://github.com/oven-sh/bun/releases/download/bun-v${version}/bun-linux-aarch64.zip";
-                hash = "sha256-on/7Y6gxA3WDbg1vZorhf6jY0YuIw3yCHGUzGXOhmjs=";
+                hash = "sha256-uqa7NvUdblhWHgK76oJQOKnfRU9nPW13bou/hvjHhQ4=";
               };
               x86_64-darwin = pkgs.fetchurl {
                 url = "https://github.com/oven-sh/bun/releases/download/bun-v${version}/bun-darwin-x64-baseline.zip";
-                hash = "sha256-PjWtb1OXGpg0v55nhuKt9ytfGSHMmpxf3gc9KXKUQHY=";
+                hash = "sha256-1KFVrfv9CRVes7oFyeOlRPOSl9emhhbTx3WfZ6tcR9w=";
               };
               x86_64-linux = pkgs.fetchurl {
                 url = "https://github.com/oven-sh/bun/releases/download/bun-v${version}/bun-linux-x64.zip";
-                hash = "sha256-lR7iruhV8IWVruxiJSJqKY0/6oOj3NZGXAnLzN9+hI8=";
+                hash = "sha256-v4zL+ysLgBWeD5ptFcVTF63YB3U028YTCj7bUvzLOVw=";
               };
             };
           };

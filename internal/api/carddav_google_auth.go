@@ -1,0 +1,175 @@
+package api
+
+import (
+	"errors"
+	"net/http"
+	"net/mail"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"go.kenn.io/msgvault/internal/carddav"
+	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/oauth"
+)
+
+type CardDAVGoogleAuthorizeRequest struct {
+	Connection  string `json:"connection,omitempty"`
+	Email       string `json:"email"`
+	OAuthApp    string `json:"oauth_app,omitempty"`
+	RedirectURI string `json:"redirect_uri"`
+}
+
+type CardDAVGoogleAuthorizeResponse struct {
+	Connection string `json:"connection,omitempty"`
+	URL        string `json:"url"`
+	State      string `json:"state"`
+}
+
+type CardDAVGoogleCallbackRequest struct {
+	State string `json:"state"`
+	Code  string `json:"code" writeOnly:"true"`
+}
+
+type cardDAVGoogleAuthorization struct {
+	connection string
+	email      string
+	oauthApp   string
+	flow       *oauth.WebAuthorization
+	expires    time.Time
+}
+
+func (s *Server) handleGoogleCardDAVAuthorize(w http.ResponseWriter, r *http.Request) {
+	if s.cardDAV == nil || s.cardDAV.cfg == nil {
+		writeError(w, http.StatusServiceUnavailable, "carddav_unavailable", "CardDAV settings are unavailable")
+		return
+	}
+	var req CardDAVGoogleAuthorizeRequest
+	if !decodeCardDAV(w, r, &req) {
+		return
+	}
+	if req.Connection == "" {
+		req.Connection = config.DefaultCardDAVConnection
+	}
+	if err := config.ValidateCardDAVConnectionName(req.Connection); err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "Invalid connection selector")
+		return
+	}
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+	address, err := mail.ParseAddress(req.Email)
+	redirect, redirectErr := url.Parse(req.RedirectURI)
+	if err != nil || address.Address != req.Email || redirectErr != nil ||
+		redirect.Scheme+"://"+redirect.Host != r.Header.Get("Origin") || redirect.Path != "/" || redirect.RawQuery != "" {
+		writeError(w, http.StatusBadRequest, "bad_request", "Provide an account email and this Web UI's root URL as the OAuth callback")
+		return
+	}
+	secrets, err := s.cardDAV.cfg.OAuth.CredentialsFor(req.OAuthApp)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "oauth_not_configured", "Configure the selected Google OAuth app's client_secrets before connecting")
+		return
+	}
+	mgr, err := carddav.NewGoogleOAuthManagerWithCredentials(r.Context(), secrets, s.cardDAV.cfg.TokensDir(), s.cardDAV.cfg.OAuth.Tokens, req.OAuthApp, req.Email, s.logger)
+	if err != nil {
+		if r.Context().Err() != nil {
+			return
+		}
+		if errors.Is(err, oauth.ErrClientConfig) {
+			writeError(w, http.StatusBadRequest, "oauth_not_configured", "Unable to load the selected Google OAuth app")
+			return
+		}
+		writeGoogleSignInUnavailable(w, 0)
+		return
+	}
+	flow, err := mgr.BeginWebAuthorization(r.Context(), req.Email, req.RedirectURI)
+	if r.Context().Err() != nil {
+		return
+	}
+	if unavailable, ok := errors.AsType[*oauth.AuthorizationUnavailableError](err); ok {
+		writeGoogleSignInUnavailable(w, unavailable.RetryAfter)
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "oauth_configuration", err.Error())
+		return
+	}
+	c := s.cardDAV
+	c.googleAuthMu.Lock()
+	defer c.googleAuthMu.Unlock()
+	if r.Context().Err() != nil {
+		return
+	}
+	if c.googleAuthorizations == nil {
+		c.googleAuthorizations = make(map[string]cardDAVGoogleAuthorization)
+	}
+	for state, pending := range c.googleAuthorizations {
+		if time.Now().After(pending.expires) {
+			delete(c.googleAuthorizations, state)
+		}
+	}
+	if len(c.googleAuthorizations) >= 16 {
+		writeError(w, http.StatusServiceUnavailable, "oauth_busy", "Too many pending sign-ins. Wait ten minutes and try again")
+		return
+	}
+	c.googleAuthorizations[flow.State] = cardDAVGoogleAuthorization{connection: req.Connection, email: req.Email, oauthApp: req.OAuthApp, flow: flow, expires: time.Now().Add(10 * time.Minute)}
+	writeJSON(w, http.StatusOK, CardDAVGoogleAuthorizeResponse{Connection: req.Connection, URL: flow.URL, State: flow.State})
+}
+
+func (c *CardDAVController) takeGoogleAuthorization(state string) (*oauth.WebAuthorization, error) {
+	entry, err := c.takeGoogleAuthorizationEntry(state)
+	return entry.flow, err
+}
+
+func (c *CardDAVController) takeGoogleAuthorizationEntry(state string) (cardDAVGoogleAuthorization, error) {
+	root := c.root()
+	root.googleAuthMu.Lock()
+	defer root.googleAuthMu.Unlock()
+	pending, ok := root.googleAuthorizations[state]
+	delete(root.googleAuthorizations, state)
+	if !ok || time.Now().After(pending.expires) {
+		return cardDAVGoogleAuthorization{}, errors.New("sign-in for Google Contacts expired or was already used; connect again")
+	}
+	return pending, nil
+}
+
+func (s *Server) handleGoogleCardDAVCallback(w http.ResponseWriter, r *http.Request) {
+	if s.cardDAV == nil {
+		writeError(w, http.StatusServiceUnavailable, "carddav_unavailable", "CardDAV settings are unavailable")
+		return
+	}
+	var req CardDAVGoogleCallbackRequest
+	if !decodeCardDAV(w, r, &req) {
+		return
+	}
+	entry, err := s.cardDAV.takeGoogleAuthorizationEntry(req.State)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "oauth_expired", err.Error())
+		return
+	}
+	if err := entry.flow.Complete(r.Context(), req.State, req.Code); err != nil {
+		if unavailable, ok := errors.AsType[*oauth.AuthorizationUnavailableError](err); ok {
+			writeGoogleSignInUnavailable(w, unavailable.RetryAfter)
+			return
+		}
+		if errors.Is(err, oauth.ErrTokenChanged) {
+			writeError(w, http.StatusBadRequest, "oauth_changed", oauth.ErrTokenChanged.Error())
+			return
+		}
+		writeError(w, http.StatusBadRequest, "oauth_failed", "Google authorization failed. Select the requested account and grant all requested permissions, then try again")
+		return
+	}
+	if err := s.cardDAV.reconcileGoogleSchedules(r.Context(), entry); err != nil {
+		s.logger.Error("reconcile CardDAV schedule after Google authorization", "error", err)
+		writeError(w, http.StatusServiceUnavailable, "carddav_schedule_failed", "Google Contacts authorized, but scheduling failed. Save the CardDAV account to retry")
+		return
+	}
+	writeJSON(w, http.StatusOK, StatusMessageResponse{Status: "ok", Message: "Google Contacts authorized"})
+}
+
+func writeGoogleSignInUnavailable(w http.ResponseWriter, retryAfter time.Duration) {
+	if retryAfter > 0 {
+		seconds := max(int64(1), int64((retryAfter+time.Second-1)/time.Second))
+		w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+	}
+	writeError(w, http.StatusServiceUnavailable, "oauth_unavailable", "Google authorization is temporarily unavailable. Start sign-in again to retry")
+}

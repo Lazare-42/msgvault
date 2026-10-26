@@ -3,7 +3,7 @@ package whatsapp
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"os"
@@ -49,6 +49,9 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 	}
 	if kind == databaseKindApple {
 		return imp.importApple(ctx, waDB, waDBPath, opts)
+	}
+	if !opts.After.IsZero() || !opts.Before.IsZero() {
+		return nil, errors.New("--after and --before are only supported for Apple ChatStorage.sqlite imports")
 	}
 
 	// Keep the detailed Android schema checks for compatibility with the
@@ -354,7 +357,7 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 				}
 
 				// Store raw JSON for re-parsing.
-				rawJSON, err := json.Marshal(waMsg)
+				rawJSON, err := json.Marshal(waMsg, json.Deterministic(true))
 				if err == nil {
 					_ = imp.store.UpsertMessageRawWithFormat(messageID, rawJSON, "whatsapp_json")
 				}
@@ -504,7 +507,10 @@ func (imp *Importer) Import(ctx context.Context, waDBPath string, opts ImportOpt
 					} else if waMsg.SenderUser.Valid {
 						senderAddr = normalizePhone(waMsg.SenderUser.String, waMsg.SenderServer.String)
 					}
-					_ = imp.store.UpsertFTS(messageID, "", bodyText.String, senderAddr, "", "")
+					if err := imp.store.UpsertFTS(messageID, "", bodyText.String, senderAddr, "", ""); err != nil {
+						summary.Errors++
+						imp.progress.OnError(fmt.Errorf("upsert FTS: %w", err))
+					}
 				}
 			}
 

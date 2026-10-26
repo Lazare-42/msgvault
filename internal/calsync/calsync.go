@@ -10,7 +10,7 @@ package calsync
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -18,6 +18,7 @@ import (
 	"strings"
 
 	"go.kenn.io/msgvault/internal/gcal"
+	"go.kenn.io/msgvault/internal/rederive"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -126,6 +127,10 @@ func (s *Syncer) Full(ctx context.Context) (Result, error) {
 			return result, err
 		}
 		if err := s.syncCalendarFull(ctx, cal, &result); err != nil {
+			if errors.Is(err, store.ErrSourceRetired) && !slices.Contains(s.opts.Calendars, cal.ID) {
+				s.logger.Info("skipping retired calendar source", "calendar", cal.ID)
+				continue
+			}
 			s.logger.Error("calendar full sync failed", "calendar", cal.ID, "error", err)
 			if firstErr == nil {
 				firstErr = err
@@ -198,42 +203,51 @@ func (s *Syncer) listCalendars(ctx context.Context) ([]gcal.Calendar, error) {
 // set. Bounded/limited runs deliberately do not checkpoint page tokens because
 // replaying that token under a later unbounded request can skip or corrupt the
 // traversal.
-func (s *Syncer) syncCalendarFull(ctx context.Context, cal gcal.Calendar, result *Result) error {
+func (s *Syncer) syncCalendarFull(
+	ctx context.Context, cal gcal.Calendar, result *Result,
+) (retErr error) {
 	src, err := s.getOrCreateCalendarSource(ctx, cal)
 	if err != nil {
 		return fmt.Errorf("get/create source: %w", err)
 	}
+	ownershipCtx := context.WithoutCancel(ctx)
+	execution, err := s.store.AcquireSyncExecutionContext(ownershipCtx, src.ID)
+	if err != nil {
+		return fmt.Errorf("acquire sync execution: %w", err)
+	}
+	defer func() {
+		retErr = errors.Join(retErr, execution.Release())
+	}()
 	if err := s.store.UpdateSourceSyncConfig(src.ID, s.sourceConfigJSON(cal)); err != nil {
 		return fmt.Errorf("write sync config: %w", err)
 	}
 	if err := s.updateCalendarSourceOAuthApp(src.ID, cal.ID); err != nil {
 		return err
 	}
+	// Heal events an older msgvault archived before its config and confirmed
+	// identity existed; the ledger makes this a no-op once done.
+	rederive.Heal(ctx, s.logger, s.store, src)
 
-	// Resume an interrupted run from its checkpoint, then ALWAYS StartSync. We do
-	// NOT reuse the prior run's id: StartSync is the only path that takes the
-	// source row's writer lock and supersedes other 'running' runs, so going
-	// through it serializes concurrent/overlapping full syncs (a manual run racing
-	// the daemon) instead of two callers sharing — and clobbering — one sync_run
-	// row. The prior run's counters are carried forward so a resumed run's stats
-	// stay accurate (UpdateSyncCheckpoint overwrites counters absolutely).
+	// Resume a stopped run from its checkpoint, then start a new run. StartSync
+	// rejects a running sync, so a live worker cannot be replaced. The prior
+	// run's counters are carried forward so resumed stats stay accurate.
 	var resumePageToken string
 	var priorProcessed, priorAdded, priorUpdated int64
 	resumeEligible := s.fullSyncResumeEligible()
 	if resumeEligible {
-		if active, _ := s.store.GetActiveSync(src.ID); active != nil && active.Status == store.SyncStatusRunning {
-			if pageToken, ok := decodeCalendarFullCheckpoint(active.CursorBefore); ok {
+		if prior, _ := s.store.GetLatestCheckpointedSyncByType(src.ID, "full"); prior != nil {
+			if pageToken, ok := decodeCalendarFullCheckpoint(prior.CursorBefore); ok {
 				resumePageToken = pageToken
-				priorProcessed = active.MessagesProcessed
-				priorAdded = active.MessagesAdded
-				priorUpdated = active.MessagesUpdated
+				priorProcessed = prior.MessagesProcessed
+				priorAdded = prior.MessagesAdded
+				priorUpdated = prior.MessagesUpdated
 				s.logger.Info("resuming interrupted calendar sync", "calendar", cal.ID, "page_token", resumePageToken)
 			} else {
 				s.logger.Info("ignoring legacy calendar sync checkpoint; restarting full sync", "calendar", cal.ID)
 			}
 		}
 	}
-	syncID, err := s.store.StartSync(src.ID, "full")
+	syncID, err := execution.StartSyncContext(ownershipCtx, "full", "")
 	if err != nil {
 		return fmt.Errorf("start sync: %w", err)
 	}
@@ -252,14 +266,8 @@ func (s *Syncer) syncCalendarFull(ctx context.Context, cal gcal.Calendar, result
 	ingested := 0
 	limitHit := false
 
-	// A cancelled sync (Ctrl-C, daemon shutdown, a scheduled sync yielding to
-	// a waiting operation) keeps status='running' with its saved checkpoint so
-	// the next full sync resumes; marking it failed would discard the
-	// checkpoint and restart from scratch.
 	fail := func(e error) error {
-		if !errors.Is(e, context.Canceled) && !errors.Is(e, context.DeadlineExceeded) {
-			_ = s.store.FailSync(syncID, e.Error())
-		}
+		_ = s.store.FailSync(syncID, e.Error())
 		return e
 	}
 
@@ -340,7 +348,7 @@ func (s *Syncer) syncCalendarFull(ctx context.Context, cal gcal.Calendar, result
 	if completeErr != nil {
 		return fail(fmt.Errorf("complete sync: %w", completeErr))
 	}
-	_ = s.store.CheckpointWAL()
+	_ = s.store.CheckpointWALPassive(ctx)
 	s.logger.Info("calendar full sync complete",
 		"calendar", cal.ID, "events_processed", cp.MessagesProcessed,
 		"events_added", cp.MessagesAdded, "events_cancelled", cp.MessagesUpdated)
@@ -363,7 +371,7 @@ func encodeCalendarFullCheckpoint(pageToken string) string {
 	b, err := json.Marshal(calendarFullCheckpoint{
 		Kind:      calendarFullCheckpointKind,
 		PageToken: pageToken,
-	})
+	}, json.Deterministic(true))
 	if err != nil {
 		return ""
 	}
@@ -494,9 +502,14 @@ func (s *Syncer) getOrCreateCalendarSource(
 
 	var source *store.Source
 	var migrate *store.Source
+	var retiredMatch bool
 	for _, src := range sources {
 		cfg := parseSourceConfig(src.SyncConfig)
 		if cfg.CalendarID != cal.ID {
+			continue
+		}
+		if src.MergedIntoSourceID != 0 {
+			retiredMatch = true
 			continue
 		}
 		if src.Identifier == identifier {
@@ -506,6 +519,9 @@ func (s *Syncer) getOrCreateCalendarSource(
 		if migrate == nil {
 			migrate = src
 		}
+	}
+	if source == nil && migrate == nil && retiredMatch {
+		return nil, fmt.Errorf("calendar source %q is retired: %w", identifier, store.ErrSourceRetired)
 	}
 	if source == nil && migrate != nil {
 		if err := s.store.UpdateSourceIdentifier(migrate.ID, identifier); err != nil {
@@ -524,6 +540,39 @@ func (s *Syncer) getOrCreateCalendarSource(
 		return nil, err
 	}
 	return source, nil
+}
+
+// ValidateWritableCalendars refuses archive writes to calendars whose only
+// matching source has been retired. It performs no source migration or other
+// archive mutation, so callers can run it before changing the provider.
+func (s *Syncer) ValidateWritableCalendars(ctx context.Context, calendarIDs []string) error {
+	sources, err := s.store.GetSourcesByTypeAndAccountContext(ctx, gcal.SourceType, s.opts.AccountEmail)
+	if err != nil {
+		return fmt.Errorf("find existing calendar sources: %w", err)
+	}
+	for _, calendarID := range calendarIDs {
+		if calendarID == "" {
+			continue
+		}
+		retiredMatch := false
+		liveMatch := false
+		for _, src := range sources {
+			if parseSourceConfig(src.SyncConfig).CalendarID != calendarID {
+				continue
+			}
+			if src.MergedIntoSourceID != 0 {
+				retiredMatch = true
+				continue
+			}
+			liveMatch = true
+			break
+		}
+		if !liveMatch && retiredMatch {
+			identifier := s.opts.AccountEmail + "/" + calendarID
+			return fmt.Errorf("calendar source %q is retired: %w", identifier, store.ErrSourceRetired)
+		}
+	}
+	return nil
 }
 
 func (s *Syncer) confirmCalendarSourceIdentity(ctx context.Context, source *store.Source) error {
@@ -558,6 +607,9 @@ func (s *Syncer) updateExistingCalendarSourceOAuthApps() error {
 		return fmt.Errorf("enumerate calendar sources: %w", err)
 	}
 	for _, src := range sources {
+		if src.MergedIntoSourceID != 0 {
+			continue
+		}
 		cfg := parseSourceConfig(src.SyncConfig)
 		if err := s.updateCalendarSourceOAuthApp(src.ID, cfg.CalendarID); err != nil {
 			return err

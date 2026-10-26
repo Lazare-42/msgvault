@@ -11,9 +11,13 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/kit/daemon"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/daemonclient"
 )
 
 func TestListAccountsUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	require := require.New(t)
 	assert := assert.New(t)
 	dataDir := t.TempDir()
@@ -33,11 +37,15 @@ func TestListAccountsUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
 		HomeDir: dataDir,
 		Data:    config.DataConfig{DataDir: dataDir},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	useLocal = true
+	invocationFromContext(testCtx).options.useLocal = true
 	listAccountsJSON = false
 
 	done := captureStdout(t)
 	cmd := &cobra.Command{Use: "list-accounts", RunE: listAccountsCmd.RunE}
+	cmd.SetContext(testCtx)
 
 	err := cmd.Execute()
 	out := done()
@@ -45,7 +53,11 @@ func TestListAccountsUsesLocalDaemonHTTPAndPreservesOutput(t *testing.T) {
 
 	assert.Equal(1, int(accountRequests.Load()), "accounts endpoint calls")
 	assert.Contains(out, "ID  ACCOUNT", "table header")
-	assert.Contains(out, "alice@example.com", "account row")
+	assert.Regexp(`ALIAS\s+STATE`, out, "source lifecycle columns")
+	assert.Regexp(`(?m)^7\s+alice@example\.com\s+gmail\s+Alice\s+1,234\s+2024-01-02 03:04\s+active$`, out,
+		"Gmail account and source type")
+	assert.Regexp(`(?m)^8\s+imaps://bob@imap\.example\.com:993\s+imap\s+Bob\s+42\s+-\s+active$`, out,
+		"IMAP account and source type")
 	assert.Contains(out, "Alice", "display name")
 	assert.Contains(out, "1,234", "message count formatting")
 	assert.Contains(out, "2024-01-02 03:04", "last sync formatting")
@@ -74,10 +86,31 @@ func accountsHTTPDaemon(t *testing.T) (*httptest.Server, *atomic.Int32) {
 				"display_name": "Alice",
 				"message_count": 1234,
 				"last_sync": "2024-01-02T03:04:05Z"
+			}, {
+				"id": 8,
+				"email": "imaps://bob@imap.example.com:993",
+				"type": "imap",
+				"display_name": "Bob",
+				"message_count": 42,
+				"last_sync": null
 			}]
 		}`))
 	})
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 	return server, requests
+}
+
+func TestListAccountsPendingCountsRemainExplicit(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	stats := daemonAccountsToStats([]daemonclient.CLIAccount{{ID: 7, Email: "counts@example.test", Type: "gmail"}}, true)
+	require.Len(stats, 1)
+	assert.Equal("pending", formatMessagesCell(stats[0]))
+	done := captureStdout(t)
+	require.NoError(outputAccountsJSON(stats))
+	output := done()
+	assert.Contains(output, `"counts_pending": true`)
+	assert.NotContains(output, "message_count", "unknown counts are omitted rather than zero")
+	assert.Equal("0", formatMessagesCell(accountStats{}), "known empty accounts still show zero")
 }

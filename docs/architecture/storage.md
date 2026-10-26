@@ -1,8 +1,13 @@
 ---
-last_edited: "2026-08-09"
+last_edited: "2026-10-08"
 title: Data Storage
 description: Database schema, Parquet analytics cache, content-addressed attachments, and token storage.
 ---
+
+The archive database preserves messages, source evidence, curated people, and
+durable operation state. Attachment bytes are stored separately and shared by
+content hash. Analytics and semantic indexes are derived from those records;
+back up the archive and attachments before relying on a rebuild or local purge.
 
 ## Storage Layers
 
@@ -10,13 +15,16 @@ description: Database schema, Parquet analytics cache, content-addressed attachm
 |---|---|---|
 | SQLite | Default system of record | `~/.msgvault/msgvault.db` |
 | PostgreSQL | Optional system of record | `[data].database_url` |
+| SQLite vector index | Optional, rebuildable semantic index | `[vector].db_path`, default `~/.msgvault/vectors.db` |
 | Parquet | Analytics cache | `~/.msgvault/analytics/` |
 | Attachments | Content-addressed loose files and sealed packs | `~/.msgvault/attachments/` |
-| Tokens | OAuth credentials | `~/.msgvault/tokens/` |
+| Tokens | OAuth tokens and provider credentials | `~/.msgvault/tokens/` |
 
 ## Archive Database
 
-All message data (metadata, labels, participants, and raw MIME) lives in the configured archive database. SQLite is the default and stores the archive at `~/.msgvault/msgvault.db`. PostgreSQL is opt-in through `[data].database_url` and is intended for new archives or fresh re-syncs.
+Message metadata, bodies, labels, participants, raw payloads, and curated
+profiles live in the configured archive database. Attachment bytes are stored
+separately. SQLite is the default and stores the archive at `~/.msgvault/msgvault.db`. PostgreSQL is opt-in through `[data].database_url` and is intended for new archives or fresh re-syncs.
 
 ### Core Tables
 
@@ -25,7 +33,7 @@ All message data (metadata, labels, participants, and raw MIME) lives in the con
 | Column | Type | Description |
 |---|---|---|
 | `id` | INTEGER PK | Auto-increment |
-| `source_type` | TEXT | Provider/import type, for example `gmail`, `imap`, `gcal`, `teams`, `discord`, `beeper`, `mbox`, `whatsapp`, `granola`, or `circleback` |
+| `source_type` | TEXT | Provider/import type, for example `gmail`, `imap`, `gcal`, `teams`, `discord`, `beeper`, `chatwoot`, `mbox`, `whatsapp`, `omi`, `granola`, `plaud`, `circleback`, `notion_meetings`, `muesli`, `twilio`, or `twenty` |
 | `identifier` | TEXT | Provider-stable identifier such as an email address, phone number, or Discord guild ID |
 | `display_name` | TEXT | Account display name |
 | `sync_cursor` | TEXT | Sync cursor (Gmail history ID for Gmail accounts) |
@@ -50,15 +58,42 @@ All message data (metadata, labels, participants, and raw MIME) lives in the con
 | `conversation_id` | INTEGER FK | References `conversations` |
 | `source_id` | INTEGER FK | References `sources` |
 | `source_message_id` | TEXT | Source-specific message ID |
-| `message_type` | TEXT | `email`, `calendar_event`, `meeting_transcript`, `beeper`, `teams`, `discord`, `sms`, `mms`, `whatsapp`, `imessage`, `fbmessenger`, `synctech_sms_call`, `google_voice_text`, `google_voice_call`, `google_voice_voicemail` |
+| `message_type` | TEXT | `email`, `calendar_event`, `meeting_transcript`, `beeper`, `chatwoot`, `teams`, `discord`, `sms`, `mms`, `whatsapp`, `imessage`, `fbmessenger`, `synctech_sms_call`, `google_voice_text`, `google_voice_call`, `google_voice_voicemail` |
 | `sent_at` | DATETIME | Send timestamp |
 | `sender_id` | INTEGER FK | References `participants` |
+| `account_address` | TEXT, nullable | The one confirmed address an email or calendar event belongs to; NULL when evidence conflicts or is missing |
+| `account_path` | TEXT, nullable | `inbound`, `sent` or `calendar`; NULL on email and calendar rows means attribution is still pending |
 | `subject` | TEXT | Message subject |
-| `body_text` | TEXT | Plain text content |
 | `snippet` | TEXT | Preview excerpt |
 | `size_estimate` | INTEGER | Approximate size in bytes |
 | `has_attachments` | BOOLEAN | Attachment flag |
-| `deleted_at` | DATETIME | Soft delete timestamp |
+| `deleted_at` | DATETIME | Soft-delete timestamp |
+| `deleted_from_source_at` | DATETIME | Records removal from the source; content may remain archived |
+
+The Store derives `account_address` and `account_path` in the same transaction
+as every message write that changes their inputs: raw MIME, recipients, and
+Sent or Drafts labels. A change to confirmed identities or the source
+identifier returns the affected rows to pending in its own transaction, then
+derives them in pages after it commits. Every sync or import first derives the
+source's pending rows, which a partial index on pending rows keeps cheap when
+there are none. Attribution never changes `source_id`.
+Rows other than email and calendar events keep both columns NULL. The
+[received-account design](https://github.com/kenn-io/msgvault/blob/main/docs/internal/received-as-identity-design.md) records
+the rules; [Searching](../usage/searching.md#find-mail-by-the-address-that-received-it)
+covers `received:` and `account:`.
+
+**message_delivery_addresses** -- Delivery-header addresses read from each
+email's stored MIME (`kind` is `original` or `delivered`, `address` is
+lowercased). The address-leading index lets an identity change re-derive only
+the messages that mention it. A derived row's addresses always match its stored
+MIME; messages without MIME have none.
+
+**message_bodies** -- Parsed content stored separately from message metadata.
+
+`message_id` is both the primary key and a reference to `messages`; `body_text`
+and `body_html` hold the parsed bodies. Keeping these large values separate
+allows metadata scans without reading message content. Search uses the full-text
+index; detail readers fetch bodies by message ID.
 
 **message_raw** -- Raw provider payload storage, compressed with zlib.
 
@@ -67,8 +102,50 @@ All message data (metadata, labels, participants, and raw MIME) lives in the con
 | `message_id` | INTEGER PK/FK | References `messages` |
 | `raw_data` | BLOB | Compressed MIME or provider JSON data |
 | `compression` | TEXT | `zlib` |
+| `raw_format` | TEXT | Format discriminator, such as `mime` or `notion_meeting_json` |
 
-**participants** -- Unified contacts.
+Native Notion meetings use raw format `notion_meeting_json`. The compressed
+envelope keeps provider discovery, structured blocks, page Markdown, minimized
+resolved users, canonical text used for safe transcript preservation, and
+hydration warnings. Integration tokens and authorization headers are never
+part of the envelope.
+
+**source_import_items** -- Durable import receipts.
+
+On unreleased `main`, Apple Mail imports keep two kinds of rows here:
+
+- `emlx-target` rows track one archived message, which several `.emlx` files
+  can share. The importer marks the row `pending` before it writes the message,
+  its attachments or its search entry, and `imported` once all of that work
+  succeeds. The completion records the attachment and search settings it used;
+  a later import with different settings finishes the message again from its
+  archived raw. A `pending` row also names the file being written, the
+  attachments it contributes, and a digest of the new raw. If the import stops
+  before that file's row is updated, the next import that finishes the message
+  credits those attachments to the file when the archived raw matches. The
+  file's own row names that message before the write starts, so a row that
+  names a different message is always the newer one.
+  A message archived before receipts existed is marked legacy. For it, a file
+  without its own attachment record only fills empty placeholders and records
+  what it holds; it can replace stored attachment content only after its own
+  cache changes.
+- `emlx-occurrence` rows track one `.emlx` file, keyed by a digest of the
+  import root plus the file's relative path. An `imported` row stores a
+  filesystem fingerprint of the file and its cached attachments, and a hash of
+  each attachment the file contributed. A `pending` row means the file still
+  has work to finish.
+
+A repeat import skips reading a file when its fingerprint matches and its
+message is complete. The attachment hashes stop a file from replacing an
+attachment that another file has since updated. Platforms without a supported
+fingerprint still record completed rows but always read the file.
+
+The rows reuse the existing table and the sync run's ownership check, without a
+schema migration. They are cache hints rather than integrity checks; see
+[repeat imports](../usage/importing.md#repeat-apple-mail-imports-unreleased).
+
+**participants** -- Observed addresses and handles from source data. These are
+separate from the curated `persons` table.
 
 | Column | Type | Description |
 |---|---|---|
@@ -86,7 +163,8 @@ All message data (metadata, labels, participants, and raw MIME) lives in the con
 | `participant_id` | INTEGER FK | References `participants` |
 | `recipient_type` | TEXT | `from`, `to`, `cc`, `bcc`, `mention`, or another provider-defined role |
 
-**labels / message_labels** -- Gmail labels (many-to-many).
+**labels / message_labels** -- Source labels and imported mailbox/folder labels
+(many-to-many).
 
 | Table | Key Columns |
 |---|---|
@@ -124,11 +202,30 @@ disappears before raw fetch, is recorded as `status = 'skipped'`.
 may not have a stable checksum. msgvault treats a null checksum as an empty
 string when checking already-imported source items.
 
+### People, evidence, and operation state
+
+| Table family | What it preserves |
+|---|---|
+| `persons`, `person_participants` | Durable profiles and their bindings to observed participants |
+| `attribute_definitions`, `person_attribute_values` | Typed profile fields, values, and history |
+| `organizations`, `employments`, `person_relationships` | Organization profiles, employment history, and dated relationships |
+| `person_fact_*` | Evidence, claims, resolutions, decisions, and pins |
+| `person_tracking`, `person_sweep_*` | Enrollment and progress for profile maintenance |
+| `person_briefs`, `person_brief_evidence`, `person_brief_enrollments` | Saved conversation briefs, citations, and per-person enrollment |
+| `person_inference_*`, `person_enrichment_*` | Provider profiles, checks, consent, external lookup state, and suppression |
+| `carddav_*` | Address books, retained resources, publication, conflicts, and sync runs |
+| `sync_runs` and worker run tables | Durable operation outcomes and progress behind Operations |
+
+The current SQL schemas in `internal/store/schema.sql` and `schema_pg.sql` own
+exact columns and constraints. [People guides](../usage/people.md) explain how
+curation, evidence, and provider consent interact. These durable records are
+not interchangeable with disposable analytics or semantic indexes.
+
 ### Full-Text Index
 
 SQLite uses an FTS5 virtual table named `messages_fts`. PostgreSQL uses a `search_fts` `tsvector` column on `messages` with a GIN index.
 
-Both power `msgvault search`, but the rankers differ. See [Search Ranking Across Backends](/architecture/search-ranking/).
+Both power `msgvault search`, but the rankers differ. See [Search Ranking Across Backends](/docs/architecture/search-ranking/).
 
 ### Relationships
 
@@ -146,22 +243,24 @@ PostgreSQL uses native types such as `BIGINT GENERATED ALWAYS AS IDENTITY`, `TIM
 
 For semantic search, pgvector stores index generations, pending embedding work, and embedding vectors in the same PostgreSQL database. There is no separate `vectors.db` on PostgreSQL.
 
-There is currently no SQLite to PostgreSQL migration command. Use PostgreSQL for a new archive or re-sync/import into an empty PostgreSQL database. See [PostgreSQL Backend](/architecture/postgresql/) for setup and operational notes.
+There is currently no SQLite to PostgreSQL migration command. Use PostgreSQL for a new archive or re-sync/import into an empty PostgreSQL database. See [PostgreSQL Backend](/docs/architecture/postgresql/) for setup and operational notes.
 
 ## Parquet (Analytics Cache)
 
 The Web UI and TUI need to aggregate across your entire archive and return
-results instantly as you group and drill down. SQLite JOINs across normalized
-tables cannot do this at interactive speeds on large archives. msgvault solves
-this on the default SQLite backend with denormalized Parquet files queried by
-an embedded DuckDB engine, delivering aggregate queries hundreds of times
-faster than SQLite.
+results instantly as you group and drill down. On the default SQLite backend, msgvault exports denormalized metadata to
+Parquet so DuckDB can group and filter it without repeatedly joining the
+normalized archive tables.
 
 Ungrouped Everything and Files listings page a scalar message or attachment
 population before resolving participant lists for the returned rows. Exact
 totals use separate narrow scans. This page-before-enrichment boundary keeps
 multi-million-message listings inside the daemon's interactive DuckDB memory
-budget without changing cache format or query semantics.
+budget without changing cache format or query semantics. Domain-filtered
+Everything listings share the filtered message population between page
+selection, participant enrichment, and total counting. This avoids repeating
+recipient and conversation-roster membership joins under the interactive
+memory limit. Listings without domain filters retain separate scalar scans.
 
 The Parquet cache is disposable and can be rebuilt at any time. The daemon
 starts HTTP health and API routing before analytics cache maintenance, and
@@ -188,13 +287,12 @@ cannot replace Parquet files underneath an active reader. `msgvault
 build-cache` builds or repairs the cache on demand. PostgreSQL archives use live
 SQL for aggregate views rather than this Parquet acceleration layer.
 
-Version 0.19.0 adds `relationship_activity`, `relationship_people`,
+The cache includes `relationship_activity`, `relationship_people`,
 `relationship_domains`, and `relationship_daily` datasets. These compact edges
 and rollups avoid expanding every message's participant list during people,
-domain, relationship, timeline, and file-group queries. Existing SQLite caches
-need one full rebuild after upgrading; automatic cache building performs it in
-the background during daemon startup, or run `msgvault build-cache --full-rebuild`
-explicitly.
+domain, relationship, timeline, and file-group queries. When a cache format changes, automatic cache building performs the required
+rebuild during daemon startup. Run `msgvault build-cache --full-rebuild` to
+request a full rebuild explicitly.
 
 ```bash
 # Manual build
@@ -226,7 +324,8 @@ analytics/
 └── _last_sync.json
 ```
 
-Messages are partitioned by year for efficient time-range queries. The entire analytics cache is typically a few MB even for hundreds of thousands of messages, compared to the much larger SQLite database with full message bodies.
+Messages are partitioned by year for efficient time-range queries. The cache omits full message bodies. Its size depends on message count,
+participants, attachments, and the derived datasets included in the build.
 
 ## Content-Addressed Attachments
 
@@ -258,7 +357,7 @@ Use `pack-attachments` to migrate the eligible loose backlog immediately,
 `unpack-attachments` to restore cataloged packed objects to loose files before
 downgrading. The last command is local-only and requires the daemon to be
 stopped because it removes production pack files. See the [CLI
-reference](/cli-reference/#pack-attachments) and [Backup](/usage/backup/) guide
+reference](/docs/cli-reference/#pack-attachments) and [Backup](/docs/usage/backup/) guide
 for maintenance and restore behavior.
 
 Set `[data].loose_attachments = true` when file-oriented backup or storage
@@ -269,7 +368,7 @@ not convert existing packs automatically. Stop the daemon and run
 
 ## Token Storage
 
-OAuth tokens are stored as JSON files per account:
+By default, OAuth tokens are stored as JSON files per account:
 
 ```
 tokens/
@@ -282,6 +381,11 @@ Token files are owner-only. Protect this directory: its credentials grant the
 configured provider access. Discord bot records may be shared by several guild
 sources through an optional binding label and are removed only after the last
 referencing source is deleted.
+
+Google credentials and tokens can use
+[configured commands](/docs/configuration/#command-backed-google-credentials-and-tokens).
+The external store owns the token JSON; the token directory holds coordination
+locks. Other providers retain their file storage.
 
 ## Compression
 

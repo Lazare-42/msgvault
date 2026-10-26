@@ -197,6 +197,11 @@ func (s *Store) IdentityRevision() (int64, error) {
 	return readIdentityRevision(s.db)
 }
 
+// IdentityRevisionContext is the request-aware form of IdentityRevision.
+func (s *Store) IdentityRevisionContext(ctx context.Context) (int64, error) {
+	return readArchiveMetadataRevisionContext(ctx, s.db, identityRevisionKey, "identity")
+}
+
 // currentIdentityRevisionTx reads the revision inside tx without bumping
 // it, for idempotent Link/Unlink calls that made no change.
 func (s *Store) currentIdentityRevisionTx(tx *loggedTx) (int64, error) {
@@ -263,6 +268,13 @@ func (s *Store) lockIdentityMutationTxContext(
 	ctx context.Context,
 	tx *loggedTx,
 ) error {
+	if tx.attribution != nil {
+		// The attribution entry already took the identity row before the fence.
+		if tx.attribution.exclusive {
+			return nil
+		}
+		return errAttributionLockUpgrade
+	}
 	if _, err := tx.ExecContext(ctx, s.dialect.InsertOrIgnore(
 		`INSERT OR IGNORE INTO archive_metadata (key, value) VALUES (?, '0')`),
 		identityRevisionKey); err != nil {
@@ -328,7 +340,7 @@ func (s *Store) linkParticipantsContextGuarded(
 	a, b int64,
 	guard func(context.Context, *loggedTx) error,
 ) (revision int64, linked bool, err error) {
-	return s.linkParticipantsContextGuardedOwned(ctx, a, b, 0, guard)
+	return s.linkParticipantsContextGuardedOwned(ctx, a, b, 0, guard, nil)
 }
 
 // linkParticipantsContextGuardedOwned is the guarded link transaction with an
@@ -340,6 +352,7 @@ func (s *Store) linkParticipantsContextGuardedOwned(
 	ctx context.Context,
 	a, b, ownerCandidateID int64,
 	guard func(context.Context, *loggedTx) error,
+	afterLink func(context.Context, *loggedTx) error,
 ) (revision int64, linked bool, err error) {
 	if a == b || a <= 0 || b <= 0 {
 		return 0, false, fmt.Errorf("link participants: ids must be distinct positive IDs (got %d, %d): %w",
@@ -385,11 +398,23 @@ func (s *Store) linkParticipantsContextGuardedOwned(
 					}
 					if changed > 0 {
 						revision, updateErr = s.bumpIdentityRevisionContext(ctx, tx)
-						return updateErr
+						if updateErr != nil {
+							return updateErr
+						}
+						if afterLink != nil {
+							return afterLink(ctx, tx)
+						}
+						return nil
 					}
 				}
 				revision, err = s.currentIdentityRevisionTxContext(ctx, tx)
-				return err
+				if err != nil {
+					return err
+				}
+				if afterLink != nil {
+					return afterLink(ctx, tx)
+				}
+				return nil
 			}
 		}
 		if _, connected := componentOf(lo, edges)[hi]; connected {
@@ -399,7 +424,13 @@ func (s *Store) linkParticipantsContextGuardedOwned(
 			// preserving ErrAlreadyLinked for ordinary manual link callers.
 			if ownerCandidateID > 0 {
 				revision, err = s.currentIdentityRevisionTxContext(ctx, tx)
-				return err
+				if err != nil {
+					return err
+				}
+				if afterLink != nil {
+					return afterLink(ctx, tx)
+				}
+				return nil
 			}
 			return ErrAlreadyLinked
 		}
@@ -447,6 +478,9 @@ func (s *Store) linkParticipantsContextGuardedOwned(
 					ctx, tx, []int64{personID},
 					peoplesweep.EvidenceEffectIdentityReassigned)
 			}
+		}
+		if err == nil && afterLink != nil {
+			err = afterLink(ctx, tx)
 		}
 		return err
 	})
@@ -815,7 +849,7 @@ func (s *Store) rejectAcceptedIdentityMatchCandidatesTx(
 	return nil
 }
 
-// rewriteLinksForMerge repoints link edges from loser to winner when a
+// rewriteLinksForMergeContext repoints link edges from loser to winner when a
 // participant merge (MergeParticipants, mergeParticipant) absorbs loser into
 // winner. Must run inside the merge's own transaction, before the final
 // `DELETE FROM participants WHERE id = ?`: participant_links has an ON
@@ -835,15 +869,6 @@ func (s *Store) rejectAcceptedIdentityMatchCandidatesTx(
 // touched any edge: a merge can change owner_participants even when it
 // touches no link edge, so there is no return value for them to condition
 // on.
-func (s *Store) rewriteLinksForMerge(tx *loggedTx, loser, winner int64) error {
-	return s.rewriteLinksForMergeContext(context.Background(), tx, loser, winner)
-}
-
-// rewriteLinksForMergeContext is the context-aware form of
-// rewriteLinksForMerge. The legacy phone-unique migration uses it: its merge
-// runs inside a maintenance transaction with the pool-wide statement_timeout
-// disabled, so on PostgreSQL nothing but ctx can cut short a statement here
-// that is waiting on a conflicting lock.
 func (s *Store) rewriteLinksForMergeContext(
 	ctx context.Context, tx *loggedTx, loser, winner int64,
 ) error {

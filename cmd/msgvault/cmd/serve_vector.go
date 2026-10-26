@@ -7,15 +7,18 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"go.kenn.io/docbank/document/voyage"
 	"log/slog"
-	"os"
+	"net/http"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"go.kenn.io/docbank/document/voyage"
+
+	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/providercredentials"
 	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
@@ -53,6 +56,9 @@ type embeddingRuntimeDeps struct {
 	PersonGate       vector.SemanticPersonEmbeddingGate
 	DocumentGate     embed.BeforeRequestFunc
 	QueryGate        embed.BeforeRequestFunc
+	// APIKey is the text embedding credential resolved once from the provider
+	// credential store (or its environment fallback) at runtime start.
+	APIKey string
 }
 
 type legacyConvergenceChecker struct {
@@ -242,15 +248,10 @@ func newEmbeddingRuntime(vectorCfg vector.Config, deps embeddingRuntimeDeps) (*e
 	if err != nil {
 		return nil, err
 	}
+	apiKey := deps.APIKey
 	switch vectorCfg.Embeddings.EffectiveAPIFormat() {
 	case vector.APIFormatOpenAI:
-		clientConfig := embed.Config{
-			Endpoint: vectorCfg.Embeddings.Endpoint, APIKey: vectorCfg.Embeddings.APIKey(),
-			Model: vectorCfg.Embeddings.Model, Dimension: vectorCfg.Embeddings.Dimension,
-			Timeout: vectorCfg.Embeddings.Timeout, MaxRetries: vectorCfg.Embeddings.MaxRetries,
-			DocumentPrefix: vectorCfg.Embeddings.DocumentPrefix,
-			QueryPrefix:    vectorCfg.Embeddings.QueryPrefix,
-		}
+		clientConfig := openAIEmbedConfig(vectorCfg, apiKey)
 		messageClient := embed.NewClient(clientConfig)
 		documentClientConfig := clientConfig
 		documentClientConfig.BeforeRequest = deps.DocumentGate
@@ -269,11 +270,14 @@ func newEmbeddingRuntime(vectorCfg vector.Config, deps embeddingRuntimeDeps) (*e
 			BatchSize:     vectorCfg.Embeddings.BatchSize, BuildScope: vectorCfg.Embed.Scope.BuildScope(),
 			Rebind: deps.Rebind, LastModifiedExpr: deps.LastModifiedExpr,
 			TotalPending: deps.TotalPending, Progress: deps.Progress, Log: deps.Log,
+			Recorder:    deps.Store,
+			Diagnostics: deps.Store,
 		})
 		personWorker := embed.NewPersonWorker(embed.PersonWorkerDeps{
 			Store: deps.Store, Backend: personBackend, Client: personClient,
 			Gate:      personGate,
 			BatchSize: vectorCfg.Embeddings.BatchSize, MaxInputChars: vectorCfg.Embeddings.MaxInputChars,
+			Recorder: deps.Store, Log: deps.Log,
 		})
 		worker := embed.NewGenerationWorker(messageWorker, personWorker)
 		return &embeddingRuntime{
@@ -282,23 +286,15 @@ func newEmbeddingRuntime(vectorCfg vector.Config, deps embeddingRuntimeDeps) (*e
 			QuerySemanticClient: queryClient,
 		}, nil
 	case vector.APIFormatVoyageContextual:
-		if vectorCfg.Embeddings.Model != "voyage-context-4" {
-			return nil, fmt.Errorf("vector.embeddings.model: api_format=%q requires %q, got %q",
-				vector.APIFormatVoyageContextual, "voyage-context-4", vectorCfg.Embeddings.Model)
+		clientConfig, err := voyageContextualEmbedConfig(vectorCfg, apiKey)
+		if err != nil {
+			return nil, err
 		}
 		publisher, ok := deps.Backend.(vector.DocumentPublisher)
 		if !ok {
 			return nil, errors.New("voyage contextual embeddings require a document publisher backend")
 		}
-		clientConfig := embed.VoyageConfig{
-			Endpoint: vectorCfg.Embeddings.Endpoint, APIKey: vectorCfg.Embeddings.APIKey(),
-			Model: vectorCfg.Embeddings.Model, Dimension: vectorCfg.Embeddings.Dimension,
-			Timeout: vectorCfg.Embeddings.Timeout, MaxRetries: vectorCfg.Embeddings.MaxRetries,
-			DocumentPrefix: vectorCfg.Embeddings.DocumentPrefix,
-			QueryPrefix:    vectorCfg.Embeddings.QueryPrefix,
-			Limits: embed.RequestLimits{MaxDocuments: vectorCfg.Embeddings.BatchSize,
-				MaxChunks: 16_000, MaxUTF8Bytes: contextualDocumentUTF8Limit},
-		}
+
 		messageClient := embed.NewVoyageClient(clientConfig)
 		documentClientConfig := clientConfig
 		documentClientConfig.BeforeRequest = deps.DocumentGate
@@ -323,11 +319,14 @@ func newEmbeddingRuntime(vectorCfg vector.Config, deps embeddingRuntimeDeps) (*e
 			ChangeBatchSize:         vectorCfg.Embeddings.BatchSize,
 			ReconcileBatchSize:      vectorCfg.Embeddings.BatchSize,
 			DocumentPrefixUTF8Bytes: len(vectorCfg.Embeddings.DocumentPrefix),
+			Recorder:                deps.Store, Log: deps.Log,
+			Diagnostics: deps.Store,
 		})
 		personWorker := embed.NewPersonWorker(embed.PersonWorkerDeps{
 			Store: deps.Store, Backend: personBackend, Client: personClient,
 			Gate:      personGate,
 			BatchSize: vectorCfg.Embeddings.BatchSize, MaxInputChars: vectorCfg.Embeddings.MaxInputChars,
+			Recorder: deps.Store, Log: deps.Log,
 		})
 		worker := embed.NewGenerationWorker(messageWorker, personWorker)
 		return &embeddingRuntime{
@@ -335,6 +334,62 @@ func newEmbeddingRuntime(vectorCfg vector.Config, deps embeddingRuntimeDeps) (*e
 			Convergence: checker, PersonGate: personGate, SemanticClient: documentClient,
 			QuerySemanticClient: queryClient,
 		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported embedding api format %q", vectorCfg.Embeddings.APIFormat)
+	}
+}
+
+// openAIEmbedConfig keeps indexing and query clients on the same settings.
+func openAIEmbedConfig(vectorCfg vector.Config, apiKey string) embed.Config {
+	return embed.Config{
+		Endpoint: vectorCfg.Embeddings.Endpoint, APIKey: apiKey,
+		Model: vectorCfg.Embeddings.Model, Dimension: vectorCfg.Embeddings.Dimension,
+		Timeout: vectorCfg.Embeddings.Timeout, MaxRetries: vectorCfg.Embeddings.MaxRetries,
+		DocumentPrefix:  vectorCfg.Embeddings.DocumentPrefix,
+		QueryPrefix:     vectorCfg.Embeddings.QueryPrefix,
+		RejectRedirects: true,
+	}
+}
+
+// voyageContextualEmbedConfig keeps indexing and query clients on the same settings.
+func voyageContextualEmbedConfig(vectorCfg vector.Config, apiKey string) (embed.VoyageConfig, error) {
+	if vectorCfg.Embeddings.Model != "voyage-context-4" {
+		return embed.VoyageConfig{}, fmt.Errorf("vector.embeddings.model: api_format=%q requires %q, got %q",
+			vector.APIFormatVoyageContextual, "voyage-context-4", vectorCfg.Embeddings.Model)
+	}
+	return embed.VoyageConfig{
+		Endpoint: vectorCfg.Embeddings.Endpoint, APIKey: apiKey,
+		Model: vectorCfg.Embeddings.Model, Dimension: vectorCfg.Embeddings.Dimension,
+		Timeout: vectorCfg.Embeddings.Timeout, MaxRetries: vectorCfg.Embeddings.MaxRetries,
+		DocumentPrefix:  vectorCfg.Embeddings.DocumentPrefix,
+		QueryPrefix:     vectorCfg.Embeddings.QueryPrefix,
+		RejectRedirects: true,
+		Limits: embed.RequestLimits{MaxDocuments: vectorCfg.Embeddings.BatchSize,
+			MaxChunks: 16_000, MaxUTF8Bytes: contextualDocumentUTF8Limit},
+	}, nil
+}
+
+// newQueryEmbeddingClient selects the query-time embedding client for the
+// configured vector.embeddings.api_format, using the same constructors
+// newEmbeddingRuntime uses for the indexing side.
+//
+// Query-only callers (search, eval) need this rather than newEmbeddingRuntime:
+// they never embed a document, so they must not require the document
+// publisher backend or build an embed worker. Constructing embed.NewClient
+// unconditionally here would send an OpenAI-compatible request body to
+// Voyage's /contextualizedembeddings endpoint under a config that indexed with
+// the contextual one — the wrong endpoint, the wrong request shape, and no
+// input_type=query role.
+func newQueryEmbeddingClient(vectorCfg vector.Config, apiKey string) (hybrid.EmbeddingClient, error) {
+	switch vectorCfg.Embeddings.EffectiveAPIFormat() {
+	case vector.APIFormatOpenAI:
+		return embed.NewClient(openAIEmbedConfig(vectorCfg, apiKey)), nil
+	case vector.APIFormatVoyageContextual:
+		clientConfig, err := voyageContextualEmbedConfig(vectorCfg, apiKey)
+		if err != nil {
+			return nil, err
+		}
+		return embed.NewVoyageClient(clientConfig), nil
 	default:
 		return nil, fmt.Errorf("unsupported embedding api format %q", vectorCfg.Embeddings.APIFormat)
 	}
@@ -376,7 +431,10 @@ func newConvergenceChecker(
 // pgvector tag, a SQLite path needs the sqlite_vec tag. Without this,
 // setupVectorFeatures would only discover the gap later inside the
 // background init goroutine.
-func precheckVectorFeatures(mainPath string) error {
+func precheckVectorFeatures(mainPath string, cfg *config.Config) error {
+	if cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
 	if !cfg.Vector.AnyLaneEnabled() {
 		return nil
 	}
@@ -432,6 +490,12 @@ func precheckVectorFeatures(mainPath string) error {
 // those writes); Migrate still runs there because it only touches the
 // separate vectors.db, which is read-write regardless.
 func setupVectorFeatures(ctx context.Context, mainStore *store.Store, mainPath string, readOnly bool, openers ...visual.StreamOpener) (*vectorFeatures, error) {
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil {
+		return nil, errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	logger := loggerFromContext(ctx)
 	if !cfg.Vector.AnyLaneEnabled() {
 		return nil, nil //nolint:nilnil // vector disabled: callers nil-check vf; (nil, nil) means "no features, no error"
 	}
@@ -446,9 +510,33 @@ func setupVectorFeatures(ctx context.Context, mainStore *store.Store, mainPath s
 	// config is a local copy: this runs on the daemon's background init
 	// goroutine while HTTP handlers may already be reading the global cfg,
 	// so the global must stay unmutated.
-	vecCfg, err := resolvedVectorConfig(mainStore)
+	vecCfg, err := resolvedVectorConfig(ctx, mainStore, cfg.Vector)
 	if err != nil {
 		return nil, fmt.Errorf("vector embed scope: %w", err)
+	}
+	credentialSnapshot, err := providercredentials.Read(cfg.TokensDir())
+	if err != nil {
+		return nil, fmt.Errorf("load provider credentials: %w", err)
+	}
+	var embeddingAPIKey string
+	if vecCfg.Enabled {
+		embeddingAPIKey, err = resolveProviderCredentialFromSnapshot(
+			credentialSnapshot, providercredentials.VectorEmbeddingsID,
+			vecCfg.Embeddings.Endpoint, vecCfg.Embeddings.APIKeyEnv,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("resolve text embedding credential: %w", err)
+		}
+	}
+	var multimodalAPIKey string
+	if vecCfg.Multimodal.Enabled {
+		multimodalAPIKey, err = resolveProviderCredentialFromSnapshot(
+			credentialSnapshot, providercredentials.VectorMultimodalID,
+			vecCfg.Multimodal.Endpoint, vecCfg.Multimodal.APIKeyEnv,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("resolve visual embedding credential: %w", err)
+		}
 	}
 	mainDB := mainStore.DB()
 
@@ -508,11 +596,14 @@ func setupVectorFeatures(ctx context.Context, mainStore *store.Store, mainPath s
 			vecPath = filepath.Join(cfg.Data.DataDir, "vectors.db")
 		}
 		sb, err := sqlitevec.Open(ctx, sqlitevec.Options{
-			Path:       vecPath,
-			MainPath:   mainPath,
-			Dimension:  vecCfg.Embeddings.Dimension,
-			MainDB:     mainDB,
-			BuildScope: vecCfg.Embed.Scope.BuildScope(),
+			Path:            vecPath,
+			MainPath:        mainPath,
+			Dimension:       vecCfg.Embeddings.Dimension,
+			MainDB:          mainDB,
+			BuildScope:      vecCfg.Embed.Scope.BuildScope(),
+			ANNOversample:   vecCfg.Search.ANNOversample,
+			ANNNProbe:       vecCfg.Search.ANNNProbe,
+			AcceleratorMode: vecCfg.Search.SQLiteAccelerator,
 			// Honor the read-only signal on SQLite too: when mainDB is a
 			// query-only handle (MCP), skip the embed_gen upgrade backfill,
 			// which would write through it. Migrate still runs (vectors.db
@@ -533,7 +624,7 @@ func setupVectorFeatures(ctx context.Context, mainStore *store.Store, mainPath s
 	}
 	if vecCfg.Enabled {
 		personGate := vector.NewPinnedExactSemanticPersonEmbeddingGate(
-			vecCfg, currentSemanticPersonVectorConfigSource(), mainStore,
+			vecCfg, currentSemanticPersonVectorConfigSource(state), mainStore,
 		)
 		runtime, err := newEmbeddingRuntime(vecCfg, embeddingRuntimeDeps{
 			Backend: backend, VectorsDB: vectorsDB, MainDB: mainDB, Store: mainStore,
@@ -541,6 +632,7 @@ func setupVectorFeatures(ctx context.Context, mainStore *store.Store, mainPath s
 			PersonGate:   personGate,
 			DocumentGate: documentVectorRequestGate(mainStore, vecCfg, "document_embedding"),
 			QueryGate:    documentVectorRequestGate(mainStore, vecCfg, "query_embedding"),
+			APIKey:       embeddingAPIKey,
 		})
 		if err != nil {
 			_ = closeFn()
@@ -626,7 +718,8 @@ func setupVectorFeatures(ctx context.Context, mainStore *store.Store, mainPath s
 			_ = closeFn()
 			return nil, errors.New("configure multimodal runtime: attachment content store is unavailable")
 		}
-		visualRuntime, err := newVisualRuntime(ctx, vecCfg, mainStore, backend, openers[0])
+		visualRuntime, err := newVisualRuntime(ctx, vecCfg, mainStore, backend, openers[0],
+			visualRuntimeCredential{APIKey: multimodalAPIKey})
 		switch {
 		case err != nil && !vecCfg.Enabled:
 			// Multimodal is the only configured lane: swallowing its
@@ -684,7 +777,24 @@ func documentVectorRequestGate(st *store.Store, vectorCfg vector.Config, purpose
 	}
 }
 
-func newVisualRuntime(ctx context.Context, vecCfg vector.Config, mainStore *store.Store, backend vector.Backend, opener visual.StreamOpener) (*visualFeatures, error) {
+type visualRuntimeCredential struct {
+	APIKey     string
+	HTTPClient *http.Client
+}
+
+func newVisualRuntime(
+	ctx context.Context,
+	vecCfg vector.Config,
+	mainStore *store.Store,
+	backend vector.Backend,
+	opener visual.StreamOpener,
+	credential visualRuntimeCredential,
+) (*visualFeatures, error) {
+	apiKey := credential.APIKey
+	httpClient := credential.HTTPClient
+	if httpClient == nil {
+		httpClient = http.DefaultClient
+	}
 	fingerprint := vecCfg.MultimodalGenerationFingerprint()
 	var visualBackend visual.Backend
 	switch typed := backend.(type) {
@@ -755,7 +865,7 @@ func newVisualRuntime(ctx context.Context, vecCfg vector.Config, mainStore *stor
 	if err != nil {
 		return nil, err
 	}
-	manifest, err := loadVisualCapabilityManifest(vecCfg.Multimodal.CapabilitiesFile)
+	providerConfig, err := visualVoyageConfig(vecCfg)
 	if err != nil {
 		return nil, err
 	}
@@ -768,14 +878,9 @@ func newVisualRuntime(ctx context.Context, vecCfg vector.Config, mainStore *stor
 	// input the search layer permits. Document eligibility (the reconciler's
 	// mediaPolicy) stays unchanged. Configs with images already enabled are
 	// identical, so no existing consent fingerprint moves.
-	providerMedia := mediaPolicy
-	if vecCfg.Multimodal.ImageQueriesEnabled() {
-		providerMedia.IncludeImages = true
-	}
-	provider, err := visual.NewVoyageProvider(visual.VoyageConfig{
-		APIKey: vecCfg.Multimodal.APIKey(), Model: vecCfg.Multimodal.Model,
-		Dimension: vecCfg.Multimodal.Dimension, Manifest: manifest, Media: providerMedia,
-	})
+	providerConfig.APIKey = apiKey
+	providerConfig.HTTPClient = providerHTTPClientWithoutRedirects(httpClient)
+	provider, err := visual.NewVoyageProvider(providerConfig)
 	if err != nil {
 		return nil, err
 	}
@@ -783,12 +888,6 @@ func newVisualRuntime(ctx context.Context, vecCfg vector.Config, mainStore *stor
 	// shapes this archive sends: the document capability always, and its
 	// interleaved twin because owning-message context accompanies media
 	// whenever the message has any.
-	// Every visual search embeds its text query through the same client;
-	// without probed text-query authority the lane would index (and bill)
-	// while rejecting every search. Fail initialization with the remedy.
-	if !slices.Contains(provider.AuthorizedCapabilities(), voyage.CapabilityQueryText) {
-		return nil, errors.New("the capability manifest does not authorize text queries; re-run `msgvault multimodal probe` and configure the new manifest")
-	}
 	mediaPolicy.AuthorizedCapabilities = eligibleVisualCapabilities(
 		provider.AuthorizedCapabilities(), vecCfg.Multimodal.MaxContextChars > 0)
 	consumerKey := "visual/" + fingerprint
@@ -844,8 +943,8 @@ func visualScopeCheck(s *store.Store, accounts []string, expected []int64) func(
 	}
 	want := slices.Clone(expected)
 	slices.Sort(want)
-	return func(context.Context) error {
-		ids, err := resolveEmbedAccountList(s, accounts, true)
+	return func(ctx context.Context) error {
+		ids, err := resolveEmbedAccountList(ctx, s, accounts, true)
 		if err != nil {
 			return fmt.Errorf("[vector.multimodal.scope] accounts: %w", err)
 		}
@@ -856,26 +955,6 @@ func visualScopeCheck(s *store.Store, accounts []string, expected []int64) func(
 		}
 		return nil
 	}
-}
-
-// loadVisualCapabilityManifest reads and strictly validates the operator's
-// probed Voyage capability manifest. The multimodal lane cannot run without
-// one: nothing has upload authority until a probe recorded it.
-func loadVisualCapabilityManifest(path string) (voyage.CapabilityManifest, error) {
-	if strings.TrimSpace(path) == "" {
-		return voyage.CapabilityManifest{}, errors.New(
-			"vector.multimodal.capabilities_file is not set; run `msgvault multimodal probe` and configure the manifest path")
-	}
-	file, err := os.Open(path)
-	if err != nil {
-		return voyage.CapabilityManifest{}, fmt.Errorf("open Voyage capability manifest: %w", err)
-	}
-	defer func() { _ = file.Close() }()
-	manifest, err := voyage.DecodeCapabilityManifest(file)
-	if err != nil {
-		return voyage.CapabilityManifest{}, fmt.Errorf("decode Voyage capability manifest %s: %w", path, err)
-	}
-	return manifest, nil
 }
 
 // eligibleVisualCapabilities filters probed document capabilities to those

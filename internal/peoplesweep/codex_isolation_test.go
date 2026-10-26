@@ -25,6 +25,15 @@ type isolationCountingStarter struct {
 	starts atomic.Int64
 }
 
+type syntheticCodexProxy struct {
+	attaches atomic.Int64
+}
+
+func (p *syntheticCodexProxy) Attach(context.Context, string) (CodexProxySession, error) {
+	p.attaches.Add(1)
+	return nil, ErrCodexProxyUnreleased
+}
+
 func (s *isolationCountingStarter) Start(
 	context.Context,
 	CodexExecutable,
@@ -137,7 +146,8 @@ func codexIsolationFixtureRegistry(contents []byte) map[CodexReleaseKey]CodexAtt
 
 func codexIsolationTransportConfig(executable string) ProviderConfig {
 	return ProviderConfig{
-		Kind: ProviderCodexAppServer, Model: "gpt-test", ReasoningEffort: "high",
+		Protocol: ProtocolCodexAppServer, Model: "gpt-test", ReasoningEffort: "high",
+		Auth: AuthNone, Credential: CredentialNone, OutputMode: OutputModeNativeJSONSchema,
 		RetentionPosture: "zero_data_retention", TrainingPosture: "no_training",
 		AllowedSources: []SourceClass{SourceConversationText}, SourceSince: "2025-01-01",
 		Executable: executable, ExecutionBoundary: CodexExecutionBoundaryV1,
@@ -275,7 +285,7 @@ func TestCodexStartExecutesReverifiedSnapshotAfterSourceSwap(t *testing.T) {
 		"#!/bin/sh\nprintf swapped > '"+swappedMarker+"'\n",
 	), 0o700))
 
-	process, err := NewCodexCommandStarter().Start(
+	process, err := execCommandStarter{}.Start(
 		t.Context(), attestation.VerifiedExecutable(), []string{"app-server"},
 		scrubCodexEnvironment(os.Environ()), t.TempDir(),
 	)
@@ -310,7 +320,7 @@ func TestCodexVersionTimeoutKillsHangingFixture(t *testing.T) {
 	checks.Less(time.Since(started), 900*time.Millisecond)
 	checks.NotContains(err.Error(), secret)
 	checks.NotContains(err.Error(), executable)
-	time.Sleep(700 * time.Millisecond)
+	time.Sleep(700 * time.Millisecond) //nolint:kennlint // waits past the fixture process's late write
 	checks.NoFileExists(lateMarker, "timed-out version process group must be terminated")
 }
 
@@ -334,7 +344,7 @@ func TestCodexVersionTimeoutClosesDescendantStdout(t *testing.T) {
 	must.Error(err)
 	checks.Less(time.Since(started), 900*time.Millisecond)
 	checks.NotContains(err.Error(), lateMarker)
-	time.Sleep(time.Second)
+	time.Sleep(time.Second) //nolint:kennlint // waits past the fixture process's late write
 	checks.NoFileExists(lateMarker, "stdout-holding descendant must be terminated")
 }
 
@@ -347,7 +357,7 @@ func TestCodexAppServerCleanupTerminatesDescendantProcess(t *testing.T) {
 	executable, _ := buildCodexIsolationExecutableFixture(t, codexIsolationExecutableFixture{
 		version: codexIsolationFixtureVersion, mode: "app-server-descendant", marker: lateMarker,
 	})
-	process, err := NewCodexCommandStarter().Start(
+	process, err := execCommandStarter{}.Start(
 		t.Context(), CodexExecutable{sourcePath: executable, verifiedPath: executable},
 		[]string{"app-server"}, scrubCodexEnvironment(os.Environ()), t.TempDir(),
 	)
@@ -364,12 +374,12 @@ func TestCodexAppServerCleanupTerminatesDescendantProcess(t *testing.T) {
 		if time.Now().After(deadline) {
 			must.FailNow("app-server fixture did not start its descendant")
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond) //nolint:kennlint // polls for the fixture process's ready file
 	}
 	started := time.Now()
 	must.NoError(finishCodexProcess(t.Context(), process, client, true))
 	checks.Less(time.Since(started), 900*time.Millisecond)
-	time.Sleep(1500 * time.Millisecond)
+	time.Sleep(1500 * time.Millisecond) //nolint:kennlint // waits past the fixture process's late write
 	checks.NoFileExists(lateMarker, "app-server cleanup must terminate stderr-holding descendants")
 }
 
@@ -391,17 +401,77 @@ func TestCodexReleasedFixtureRequiresExactVersion(t *testing.T) {
 // TestCodexFactoryFailsBeforeStartingProcess catches construction of an
 // unreleased Codex transport reaching the App Server process boundary.
 func TestCodexFactoryFailsBeforeStartingProcess(t *testing.T) {
+	assertChecks := assert.New(t)
+	requireChecks := require.New(t)
 	executable, _ := buildCodexIsolationExecutableFixture(t, codexIsolationExecutableFixture{
 		version: codexIsolationFixtureVersion,
 	})
 	starter := &isolationCountingStarter{}
 
-	transport, err := NewStructuredTransport(
-		codexIsolationTransportConfig(executable), nil, starter, NewReleasedCodexIsolationGate(),
-	)
-	require.ErrorIs(t, err, ErrCodexIsolationUnreleased)
-	assert.Nil(t, transport)
-	assert.Zero(t, starter.starts.Load())
+	registry, err := NewDriverRegistry(nil, starter, NewReleasedCodexIsolationGate())
+	requireChecks.NoError(err)
+	transport, err := registry.Driver(ProtocolCodexAppServer, codexIsolationTransportConfig(executable))
+	requireChecks.ErrorIs(err, ErrCodexIsolationUnreleased)
+	assertChecks.Nil(transport)
+	assertChecks.Zero(starter.starts.Load())
+}
+
+func TestCodexProxySeamDeniesBeforeProcessStart(t *testing.T) {
+	assertChecks := assert.New(t)
+	requireChecks := require.New(t)
+	executable, contents := buildCodexIsolationExecutableFixture(t, codexIsolationExecutableFixture{
+		version: codexIsolationFixtureVersion,
+	})
+	starter := &isolationCountingStarter{}
+	proxy := &syntheticCodexProxy{}
+	launcher := codexBoundLauncher{
+		gate:    injectedReleasedCodexGate{registry: codexIsolationFixtureRegistry(contents)},
+		starter: starter, proxy: proxy,
+	}
+	attestation, err := launcher.Verify(t.Context(), executable)
+	requireChecks.NoError(err)
+	defer func() { require.NoError(t, attestation.Close()) }()
+	process, err := launcher.Start(t.Context(), attestation, "")
+	requireChecks.ErrorIs(err, ErrCodexProxyUnreleased)
+	assertChecks.Nil(process)
+	assertChecks.Zero(starter.starts.Load())
+	assertChecks.Zero(proxy.attaches.Load())
+}
+
+func TestCodexLauncherRejectsUntrustedAuthHome(t *testing.T) {
+	assertChecks := assert.New(t)
+	requireChecks := require.New(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("codex auth home permission gates require Unix permission bits")
+	}
+	executable, contents := buildCodexIsolationExecutableFixture(t, codexIsolationExecutableFixture{
+		version: codexIsolationFixtureVersion,
+	})
+	starter := &isolationCountingStarter{}
+	launcher := codexBoundLauncher{
+		gate: injectedReleasedCodexGate{registry: codexIsolationFixtureRegistry(contents)}, starter: starter,
+	}
+	attestation, err := launcher.Verify(t.Context(), executable)
+	requireChecks.NoError(err)
+	defer func() { require.NoError(t, attestation.Close()) }()
+	privateHome := t.TempDir()
+	requireChecks.NoError(os.Chmod(privateHome, 0o700))
+	requireChecks.NoError(os.WriteFile(filepath.Join(privateHome, "auth.json"), []byte("SYNTHETIC"), 0o644))
+	// Keep this fixture non-private even when the caller uses umask 077.
+	requireChecks.NoError(os.Chmod(filepath.Join(privateHome, "auth.json"), 0o644))
+	_, err = launcher.Start(t.Context(), attestation, privateHome)
+	requireChecks.ErrorContains(err, "private regular file")
+	assertChecks.Zero(starter.starts.Load())
+	linkHome := filepath.Join(t.TempDir(), "linked-auth")
+	requireChecks.NoError(os.Symlink(privateHome, linkHome))
+	_, err = launcher.Start(t.Context(), attestation, linkHome)
+	requireChecks.ErrorContains(err, "private directory")
+	assertChecks.Zero(starter.starts.Load())
+	missingHome := filepath.Join(t.TempDir(), "SYNTHETIC_PRIVATE_AUTH_PATH")
+	_, err = launcher.Start(t.Context(), attestation, missingHome)
+	requireChecks.ErrorContains(err, "auth home is unavailable")
+	assertChecks.NotContains(err.Error(), "SYNTHETIC_PRIVATE_AUTH_PATH")
+	assertChecks.Zero(starter.starts.Load())
 }
 
 // TestCodexReverifyRejectsExecutableReplacement catches an executable being
@@ -416,12 +486,11 @@ func TestCodexReverifyRejectsExecutableReplacement(t *testing.T) {
 		bytes: []byte("#!/bin/sh\nprintf 'replacement 0.149.0\\n'\n"),
 	}
 	starter := &isolationCountingStarter{}
-	transport, err := NewCodexAppServerTransport(
+	transport, err := NewCodexAppServerDriver(
 		codexIsolationTransportConfig(executable), starter, gate,
 	)
 	must.NoError(err)
-	config := Config{Enabled: true, Provider: codexIsolationTransportConfig(executable)}
-	config.ApplyDefaults()
+	config := testConfigWithProvider(codexIsolationTransportConfig(executable))
 	profile, err := config.Profile()
 	must.NoError(err)
 	request := StructuredRequest{
@@ -431,9 +500,9 @@ func TestCodexReverifyRejectsExecutableReplacement(t *testing.T) {
 		JSONSchema:      []byte(`{"type":"object","properties":{},"additionalProperties":false}`),
 		MaxOutputTokens: 16,
 	}
-	prepared, err := transport.PrepareJSON(profile, request)
+	prepared, err := transport.Prepare(profile, request)
 	must.NoError(err)
-	_, err = transport.GeneratePreparedJSON(t.Context(), profile, "", prepared)
+	_, err = transport.GeneratePrepared(t.Context(), profile, Credential{}, prepared)
 	must.ErrorIs(err, ErrCodexIsolationUnreleased)
 	assert.Zero(t, starter.starts.Load(), "replacement must fail at reverify before Start")
 }

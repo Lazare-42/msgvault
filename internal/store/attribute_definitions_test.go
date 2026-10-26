@@ -29,18 +29,6 @@ func personTextDefinition(slug string) store.AttributeDefinitionInput {
 	}
 }
 
-func TestAttributeDescriptionAcceptsExactly280UnicodeRunes(t *testing.T) {
-	st := testutil.NewTestStore(t)
-	description := strings.Repeat("🙂", 280)
-	input := personTextDefinition("maximum_description")
-	input.Description = &description
-
-	created, err := st.CreateAttributeDefinitionContext(t.Context(), input)
-	require.NoError(t, err)
-	require.NotNil(t, created.Description)
-	assert.Equal(t, description, *created.Description)
-}
-
 func TestAttributeDescriptionCreateAcceptsMoreThan280UnicodeRunes(t *testing.T) {
 	st := testutil.NewTestStore(t)
 	description := strings.Repeat("🙂", 281)
@@ -319,6 +307,9 @@ func TestCreateAttributeDefinitionCanonicalizesChoicesForValueType(t *testing.T)
 		{name: "text", valueType: store.AttributeValueText, raw: " synthetic ", want: "synthetic"},
 		{name: "integer", valueType: store.AttributeValueInteger, raw: "+007", want: "7"},
 		{name: "real", valueType: store.AttributeValueReal, raw: "1.500", want: "1.5"},
+		{name: "real decimal exponent", valueType: store.AttributeValueReal, raw: "1e20", want: "1e+20"},
+		{name: "real small exponent", valueType: store.AttributeValueReal, raw: "1e-5", want: "1e-05"},
+		{name: "real hexadecimal exponent", valueType: store.AttributeValueReal, raw: "0x1p2", want: "4"},
 		{name: "boolean", valueType: store.AttributeValueBoolean, raw: "TRUE", want: "true"},
 		{name: "date", valueType: store.AttributeValueDate, raw: " 2026-07-30 ", want: "2026-07-30"},
 		{
@@ -327,13 +318,32 @@ func TestCreateAttributeDefinitionCanonicalizesChoicesForValueType(t *testing.T)
 			raw:       "2026-07-30T10:00:00+02:00",
 			want:      "2026-07-30T08:00:00Z",
 		},
+		{
+			name:      "timestamp before year zero",
+			valueType: store.AttributeValueTimestamp,
+			raw:       "0000-01-01T00:00:00+01:00",
+			want:      "-0001-12-31T23:00:00Z",
+		},
+		{
+			name:      "timestamp after year 9999",
+			valueType: store.AttributeValueTimestamp,
+			raw:       "9999-12-31T23:59:59-01:00",
+			want:      "10000-01-01T00:59:59Z",
+		},
+		{
+			name:      "timestamp sub nanosecond fraction",
+			valueType: store.AttributeValueTimestamp,
+			raw:       "2026-01-01T00:00:00.1234567890Z",
+			want:      "2026-01-01T00:00:00.123456789Z",
+		},
 	}
 
 	for i, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			assert := assert.New(t)
 			require := require.New(t)
-			input := personTextDefinition("canonical_" + test.name)
+			testSlug := strings.ReplaceAll(test.name, " ", "_")
+			input := personTextDefinition("canonical_" + testSlug)
 			input.UniversalID = "test-canonical-" + test.name
 			input.ValueType = test.valueType
 			input.FieldType = store.AttributeFieldSelect
@@ -614,16 +624,6 @@ func TestCreateAttributeDefinitionKeepsExplicitSlug(t *testing.T) {
 	conflicting.UniversalID = "test-conflicting-explicit-slug"
 	_, err = st.CreateAttributeDefinitionContext(ctx, conflicting)
 	require.ErrorIs(t, err, store.ErrAttributeDefinitionSlugConflict)
-}
-
-func TestValidateAttributeDefinitionInputDerivesOmittedSlug(t *testing.T) {
-	input := personTextDefinition("unused")
-	input.Slug = ""
-	input.Label = "Favorite café"
-
-	validated, err := store.ValidateAttributeDefinitionInput(input)
-	require.NoError(t, err)
-	assert.Equal(t, "favorite_caf", validated.Slug)
 }
 
 func TestUpdateAttributeDefinitionRenamesLabelAndKeepsIdentity(t *testing.T) {

@@ -5,6 +5,8 @@ import (
 	"errors"
 	"mime"
 	"net/http"
+	"slices"
+	"strings"
 
 	"github.com/danielgtaylor/huma/v2"
 	"go.kenn.io/msgvault/internal/meetingimport"
@@ -22,6 +24,8 @@ type MeetingImportResponse struct {
 	MessageID       int64                `json:"message_id"`
 	SourceMessageID string               `json:"source_message_id"`
 }
+
+const statusFieldName = "status"
 
 func (s *Server) registerMeetingImportRoute(api huma.API) {
 	op := rawAPIV1Operation(
@@ -56,6 +60,50 @@ func hardenMeetingImportSchemas(doc *huma.OpenAPI) {
 	meeting := doc.Components.Schemas.Map()["Meeting"]
 	if meeting == nil {
 		return
+	}
+	if actions := meeting.Properties["action_items"]; actions != nil {
+		actions.Nullable = false
+		maximum := 1000
+		actions.MaxItems = &maximum
+	}
+	action := doc.Components.Schemas.Map()["MeetingActionItem"]
+	if action != nil {
+		minimum := 1
+		for property, maximum := range map[string]int{
+			"title": 4096, "description": 65536, "source_id": 256,
+			"assignee_name": 256, statusFieldName: 128, "due_date": 256,
+		} {
+			if field := action.Properties[property]; field != nil {
+				limit := maximum
+				field.MaxLength = &limit
+				if property == "title" {
+					field.MinLength = &minimum
+				}
+			}
+		}
+		if email := action.Properties["assignee_email"]; email != nil {
+			email.Format = "email"
+		}
+	}
+	if person := doc.Components.Schemas.Map()["MeetingPerson"]; person != nil {
+		idLimit, phoneLimit := 200, 64
+		if id := person.Properties["id"]; id != nil {
+			id.MaxLength = &idLimit
+		}
+		if phone := person.Properties["phone"]; phone != nil {
+			phone.MaxLength = &phoneLimit
+		}
+		person.Required = slices.DeleteFunc(person.Required, func(field string) bool { return field == "email" })
+		person.AnyOf = []*huma.Schema{
+			{
+				Type: huma.TypeObject, Required: []string{"email"},
+				Properties: map[string]*huma.Schema{"email": {Type: huma.TypeString, Format: "email"}},
+			},
+			{
+				Type: huma.TypeObject, Required: []string{"phone"},
+				Properties: map[string]*huma.Schema{"phone": {Type: huma.TypeString, MaxLength: &phoneLimit}},
+			},
+		}
 	}
 	one := 1
 	contentRequired := []*huma.Schema{
@@ -124,8 +172,13 @@ func (s *Server) handleMeetingImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if _, err := req.Normalize(); err != nil {
-		writeError(w, http.StatusUnprocessableEntity, "validation_failed",
-			"Meeting import request failed validation")
+		// Validation messages name the field and the rule, never the value.
+		message := "Meeting import request failed validation"
+		if detail, ok := strings.CutPrefix(err.Error(), meetingimport.ErrValidation.Error()+": "); ok &&
+			errors.Is(err, meetingimport.ErrValidation) {
+			message += ": " + detail
+		}
+		writeError(w, http.StatusUnprocessableEntity, "validation_failed", message)
 		return
 	}
 
@@ -143,7 +196,7 @@ func (s *Server) handleMeetingImport(w http.ResponseWriter, r *http.Request) {
 		operationGateLabelFromPath(meetingImportEndpointPath),
 	)
 	if !ok {
-		writeOperationGateBusy(w, s.operationGate)
+		writeOperationGateBusy(w, r, s.operationGate)
 		return
 	}
 	defer done()

@@ -68,6 +68,8 @@ func seedGenWithEmbeddingsPG(t *testing.T, pgb *pgvector.Backend, ids ...int64) 
 // raw-SQL helper that only updated state, leaving the retired gen's vectors in
 // the shared HNSW graph.
 func TestRunEmbeddingsRetire_PG_DeletesEmbeddings(t *testing.T) {
+	cfg := testConfigValue()
+
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -85,13 +87,14 @@ func TestRunEmbeddingsRetire_PG_DeletesEmbeddings(t *testing.T) {
 		embeddingsRetireYes, embeddingsRetireForceActive = savedYes, savedForce
 	}()
 	cfg = &config.Config{}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
 	cfg.Data.DatabaseURL = dsn
 	cfg.Vector.Embeddings.Dimension = 4
 	embeddingsRetireYes = true
 	embeddingsRetireForceActive = true
 
 	cmd := &cobra.Command{}
-	cmd.SetContext(ctx)
+	cmd.SetContext(testCtx)
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	require.NoError(
@@ -111,6 +114,8 @@ func TestRunEmbeddingsRetire_PG_DeletesEmbeddings(t *testing.T) {
 // of cf-2: activating a new generation auto-retires the previously-active one,
 // and that auto-retire must delete the demoted generation's embeddings on PG.
 func TestRunEmbeddingsActivate_PG_AutoRetireDeletesPrevious(t *testing.T) {
+	cfg := testConfigValue()
+
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -133,6 +138,7 @@ func TestRunEmbeddingsActivate_PG_AutoRetireDeletesPrevious(t *testing.T) {
 		embeddingsActivateYes, embeddingsActivateForce = savedYes, savedForce
 	}()
 	cfg = &config.Config{}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
 	cfg.Data.DatabaseURL = dsn
 	cfg.Vector.Embeddings.Dimension = 4
 	cfg.Vector.Embeddings.Model = "test-model"
@@ -140,7 +146,7 @@ func TestRunEmbeddingsActivate_PG_AutoRetireDeletesPrevious(t *testing.T) {
 	embeddingsActivateForce = true // skip fingerprint/seeded gating in the run func
 
 	cmd := &cobra.Command{}
-	cmd.SetContext(ctx)
+	cmd.SetContext(testCtx)
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	require.NoError(
@@ -192,6 +198,57 @@ func openEmbedManagePGDB(t *testing.T) (*pgvector.Backend, func(string) string, 
 	return pgb, (&store.PostgreSQLDialect{}).Rebind, dsn
 }
 
+func TestFillFullCoveragePartitionsScopedLiveMessagesPG(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	pgb, _, dsn := openEmbedManagePGDB(t)
+	ctx := t.Context()
+	gen, err := pgb.CreateGeneration(ctx, "example-model", 4, "example-fingerprint")
+	require.NoError(err)
+
+	main, err := store.Open(dsn)
+	require.NoError(err)
+	t.Cleanup(func() { _ = main.Close() })
+	inScope, err := main.GetOrCreateSource("gmail", "coverage@example.test")
+	require.NoError(err)
+	outOfScope, err := main.GetOrCreateSource("gmail", "other@example.test")
+	require.NoError(err)
+	addMessage := func(sourceID int64, sourceMessageID string, stamped, embedded bool) int64 {
+		conversationID, err := main.EnsureConversation(sourceID, "thread-"+sourceMessageID, "Coverage")
+		require.NoError(err)
+		id, err := main.UpsertMessage(&store.Message{
+			SourceID: sourceID, ConversationID: conversationID,
+			SourceMessageID: sourceMessageID, MessageType: "email",
+		})
+		require.NoError(err)
+		if stamped {
+			_, err = main.DB().ExecContext(ctx, `UPDATE messages SET embed_gen = $1 WHERE id = $2`, int64(gen), id)
+			require.NoError(err)
+		}
+		if embedded {
+			require.NoError(pgb.Upsert(ctx, gen, []vector.Chunk{{MessageID: id, Vector: []float32{1, 0, 0, 0}}}))
+		}
+		return id
+	}
+	addMessage(inScope.ID, "embedded", true, true)
+	addMessage(inScope.ID, "blank", true, false)
+	addMessage(inScope.ID, "vector-before-stamp", false, true)
+	addMessage(inScope.ID, "missing", false, false)
+	deleted := addMessage(inScope.ID, "deleted-from-source", true, true)
+	_, err = main.DB().ExecContext(ctx, `UPDATE messages SET deleted_from_source_at = NOW() WHERE id = $1`, deleted)
+	require.NoError(err)
+	addMessage(outOfScope.ID, "out-of-scope", true, true)
+
+	row := embeddingGenerationRow{ID: gen}
+	scope := vector.BuildScope{SourceIDs: []int64{inScope.ID}}
+	require.NoError(fillFullCoverage(ctx, pgb, scope, &row))
+	assert.Equal(int64(4), row.LiveCount)
+	assert.Equal(int64(1), row.EmbeddedCount, "a vector without a stamp is not embedded coverage")
+	assert.Equal(int64(1), row.BlankCount)
+	assert.Equal(int64(2), row.MissingCount)
+	assert.Equal(row.LiveCount, row.EmbeddedCount+row.BlankCount+row.MissingCount)
+}
+
 // TestListEmbeddingGenerations_PG exercises listEmbeddingGenerations through
 // the PG rebind path against a live PostgreSQL database. Validates that the
 // PG placeholder rebind and boolean-placeholder behaviour work correctly.
@@ -232,6 +289,8 @@ func TestListEmbeddingGenerations_PG(t *testing.T) {
 // production query helpers can use. The cfg-global swap mirrors
 // TestSetupVectorFeatures_SucceedsOnPostgres.
 func TestOpenEmbeddingsMetadataDB_PG(t *testing.T) {
+	cfg := testConfigValue()
+
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -245,9 +304,10 @@ func TestOpenEmbeddingsMetadataDB_PG(t *testing.T) {
 	savedCfg := cfg
 	defer func() { cfg = savedCfg }()
 	cfg = &config.Config{}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
 	cfg.Data.DatabaseURL = dsn
 
-	mdb, rebind, closeDB, err := openEmbeddingsMetadataDB(ctx)
+	mdb, rebind, closeDB, err := openEmbeddingsMetadataDB(testCtx)
 	require.NoError(
 		err, "openEmbeddingsMetadataDB on a migrated PG schema must succeed")
 
@@ -271,6 +331,8 @@ func TestOpenEmbeddingsMetadataDB_PG(t *testing.T) {
 // friendly, build-pointing error rather than leaking a raw
 // `relation "index_generations" does not exist (SQLSTATE 42P01)`.
 func TestOpenEmbeddingsMetadataDB_PG_FriendlyErrorWhenUnmigrated(t *testing.T) {
+	cfg := testConfigValue()
+
 	// Use a search_path scoped to ONLY the fresh isolated schema (no
 	// "public") so to_regclass cannot resolve against tables that prior
 	// non-isolated test runs may have left in public — the schema genuinely
@@ -280,9 +342,10 @@ func TestOpenEmbeddingsMetadataDB_PG_FriendlyErrorWhenUnmigrated(t *testing.T) {
 	savedCfg := cfg
 	defer func() { cfg = savedCfg }()
 	cfg = &config.Config{}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
 	cfg.Data.DatabaseURL = dsn
 
-	_, _, closeDB, err := openEmbeddingsMetadataDB(context.Background())
+	_, _, closeDB, err := openEmbeddingsMetadataDB(testCtx)
 	if closeDB != nil {
 		closeDB()
 	}
@@ -328,4 +391,38 @@ func openEmptyPGSchemaSolo(t *testing.T) string {
 		sep = "&"
 	}
 	return url + sep + "search_path=" + schemaName
+}
+
+func TestEmbeddingsListUsesQueryOnlyPostgresHandles(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	pgb, _, dsn := openEmbedManagePGDB(t)
+	ctx := t.Context()
+	_, err := pgb.CreateGeneration(ctx, "example-model", 4, "example-fingerprint")
+	require.NoError(err)
+	cfg := config.NewDefaultConfig()
+	cfg.Data.DatabaseURL = dsn
+	cfg.Vector.Embeddings.Dimension = 4
+	ctx = testInvocationContext(ctx, cfg, invocationOptions{})
+	metadata, _, closeMetadata, err := openEmbeddingsMetadataDBWithMode(ctx, true)
+	require.NoError(err)
+	defer closeMetadata()
+	var readOnly string
+	require.NoError(metadata.QueryRowContext(ctx, "SHOW transaction_read_only").Scan(&readOnly))
+	assert.Equal("on", readOnly)
+	_, err = metadata.ExecContext(ctx, "UPDATE index_generations SET message_count=99")
+	require.Error(err)
+	backend, closeBackend, err := openEmbeddingsBackendWithMode(ctx, true)
+	require.NoError(err)
+	defer closeBackend()
+	pgBackend, ok := backend.(*pgvector.Backend)
+	require.True(ok)
+	_, err = pgBackend.DB().ExecContext(ctx, "UPDATE index_generations SET message_count=99")
+	require.Error(err)
+	cmd := &cobra.Command{Use: "list"}
+	cmd.SetContext(ctx)
+	var output bytes.Buffer
+	cmd.SetOut(&output)
+	require.NoError(runEmbeddingsList(cmd, nil))
+	assert.Contains(output.String(), "example-model")
 }

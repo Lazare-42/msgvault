@@ -11,7 +11,10 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
+	"go.kenn.io/msgvault/internal/operations"
+	"go.kenn.io/msgvault/internal/providercredentials"
 	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
@@ -21,10 +24,15 @@ import (
 )
 
 func runEmbed(cmd *cobra.Command) error {
+	state := invocationFromCommand(cmd)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
 	ctx := cmd.Context()
 	out := cmd.OutOrStdout()
 	errOut := cmd.ErrOrStderr()
-	release, err := acquireDirectSQLiteWriteLock(cfg)
+	release, err := acquireDirectSQLiteWriteLock(cfg, state)
 	if err != nil {
 		return err
 	}
@@ -50,7 +58,7 @@ func runEmbed(cmd *cobra.Command) error {
 	// --account/--collection flags (or [vector.embed.scope] accounts)
 	// become source IDs here, and unknown identifiers fail the run loudly
 	// rather than silently widening the embedded corpus.
-	if err := resolveEmbedScopeSourceIDs(s); err != nil {
+	if err := resolveEmbedScopeSourceIDs(s, state); err != nil {
 		return err
 	}
 
@@ -93,11 +101,14 @@ func runEmbed(cmd *cobra.Command) error {
 			vecPath = filepath.Join(cfg.Data.DataDir, "vectors.db")
 		}
 		sb, err := sqlitevec.Open(ctx, sqlitevec.Options{
-			Path:       vecPath,
-			MainPath:   cfg.DatabaseDSN(),
-			Dimension:  cfg.Vector.Embeddings.Dimension,
-			MainDB:     s.DB(),
-			BuildScope: cfg.Vector.Embed.Scope.BuildScope(),
+			Path:            vecPath,
+			MainPath:        cfg.DatabaseDSN(),
+			Dimension:       cfg.Vector.Embeddings.Dimension,
+			MainDB:          s.DB(),
+			BuildScope:      cfg.Vector.Embed.Scope.BuildScope(),
+			ANNOversample:   cfg.Vector.Search.ANNOversample,
+			ANNNProbe:       cfg.Vector.Search.ANNNProbe,
+			AcceleratorMode: cfg.Vector.Search.SQLiteAccelerator,
 		})
 		if err != nil {
 			return fmt.Errorf("open vectors.db: %w", err)
@@ -148,8 +159,19 @@ func runEmbed(cmd *cobra.Command) error {
 	}
 	totalPending := int(missing)
 	personGate := vector.NewPinnedExactSemanticPersonEmbeddingGate(
-		cfg.Vector, currentSemanticPersonVectorConfigSource(), s,
+		cfg.Vector, currentSemanticPersonVectorConfigSource(state), s,
 	)
+	credentialSnapshot, err := providercredentials.Read(cfg.TokensDir())
+	if err != nil {
+		return fmt.Errorf("load provider credentials: %w", err)
+	}
+	embeddingAPIKey, err := resolveProviderCredentialFromSnapshot(
+		credentialSnapshot, providercredentials.VectorEmbeddingsID,
+		cfg.Vector.Embeddings.Endpoint, cfg.Vector.Embeddings.APIKeyEnv,
+	)
+	if err != nil {
+		return fmt.Errorf("resolve text embedding credential: %w", err)
+	}
 
 	runtime, err := newEmbeddingRuntime(cfg.Vector, embeddingRuntimeDeps{
 		Backend: backend, VectorsDB: vectorsDB, MainDB: s.DB(), Store: s,
@@ -157,6 +179,7 @@ func runEmbed(cmd *cobra.Command) error {
 		TotalPending: totalPending,
 		Progress:     newProgressPrinter(errOut, totalPending, cfg.Vector.Embeddings.ETAWindow),
 		PersonGate:   personGate,
+		APIKey:       embeddingAPIKey,
 	})
 	if err != nil {
 		return fmt.Errorf("configure embedding runtime: %w", err)
@@ -200,10 +223,18 @@ func runEmbeddingPasses(
 	for {
 		var pass embed.RunResult
 		var err error
+		phase := "forward"
 		if first && backstop {
-			pass, err = runner.RunBackstop(ctx, gen)
+			phase = "backstop"
+		}
+		scope := operations.PassScope{
+			Key:     fmt.Sprintf("cli:%s:g:%d:%s", uuid.NewString(), gen, phase),
+			Trigger: operations.TriggerManual, StartedAt: time.Now().UTC(),
+		}
+		if first && backstop {
+			pass, err = runner.RunBackstop(ctx, gen, scope)
 		} else {
-			pass, err = runner.RunOnce(ctx, gen)
+			pass, err = runner.RunOnce(ctx, gen, scope)
 		}
 		if generationErr, ok := errors.AsType[*embed.GenerationRunError](err); ok {
 			if generationErr.Person != nil {
@@ -383,7 +414,7 @@ func newProgressPrinter(w io.Writer, total int, windowSize int) func(embed.Progr
 
 func newProgressPrinterWithMinInterval(w io.Writer, total int, windowSize int, minInterval time.Duration) func(embed.ProgressReport) {
 	var lastPrint time.Time
-	window := newRateWindow(windowSize)
+	window := vector.NewEmbeddingRateWindow(windowSize)
 	return func(p embed.ProgressReport) {
 		// Always feed the window — including events the throttle is
 		// about to suppress. Otherwise a fast downshift drain (where
@@ -426,22 +457,4 @@ func max1(n int) int {
 		return 1
 	}
 	return n
-}
-
-// formatETA renders a duration as h:mm:ss or m:ss, dropping leading
-// zero components so "3 hours" reads as "3h02m18s" and "45 seconds"
-// as "45s". Rounds to whole seconds.
-func formatETA(d time.Duration) string {
-	d = d.Round(time.Second)
-	h := int(d.Hours())
-	m := int(d.Minutes()) % 60
-	s := int(d.Seconds()) % 60
-	switch {
-	case h > 0:
-		return fmt.Sprintf("%dh%02dm%02ds", h, m, s)
-	case m > 0:
-		return fmt.Sprintf("%dm%02ds", m, s)
-	default:
-		return fmt.Sprintf("%ds", s)
-	}
 }

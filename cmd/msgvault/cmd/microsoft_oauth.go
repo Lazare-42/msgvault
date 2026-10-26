@@ -1,10 +1,15 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/spf13/cobra"
+	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/microsoft"
+	"go.kenn.io/msgvault/internal/teams"
 )
 
 // oauthPreflightedFlag marks that the frontend CLI already completed the
@@ -28,8 +33,8 @@ func oauthPreflighted(cmd *cobra.Command) (bool, error) {
 	return preflighted, nil
 }
 
-func requireMicrosoftOAuthConfig() error {
-	if cfg.Microsoft.ClientID == "" {
+func requireMicrosoftOAuthConfig(cfg *config.Config) error {
+	if cfg == nil || cfg.Microsoft.ClientID == "" {
 		return errors.New("microsoft OAuth not configured\n\n" +
 			"Add to your config.toml:\n\n" +
 			"  [microsoft]\n" +
@@ -39,11 +44,29 @@ func requireMicrosoftOAuthConfig() error {
 	return nil
 }
 
+// newTeamsClient builds a Graph client for email's persisted Teams token.
+func newTeamsClient(ctx context.Context, cfg *config.Config, logger *slog.Logger, email string) (*teams.Client, error) {
+	mgr := microsoft.NewGraphManager(cfg.Microsoft.ClientID, cfg.Microsoft.EffectiveTenantID(),
+		cfg.Microsoft.EffectiveRedirectURI(), cfg.TokensDir(), logger)
+	tokenFn, err := mgr.TokenSource(ctx, email)
+	if err != nil {
+		return nil, err
+	}
+	qps := float64(cfg.Sync.RateLimitQPS)
+	if qps <= 0 {
+		qps = 5
+	}
+	return teams.NewClient("https://graph.microsoft.com/v1.0", tokenFn, qps), nil
+}
+
 // microsoftTenantID resolves the tenant, letting a per-command flag
 // override the configured default.
-func microsoftTenantID(flagTenant string) string {
+func microsoftTenantID(flagTenant string, cfg *config.Config) string {
 	if flagTenant != "" {
 		return flagTenant
+	}
+	if cfg == nil {
+		return ""
 	}
 	return cfg.Microsoft.EffectiveTenantID()
 }

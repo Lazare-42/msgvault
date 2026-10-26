@@ -160,10 +160,6 @@ type ActivityEvent struct {
 	Persons                          []ActivityEventPerson
 }
 
-func (event ActivityEvent) Ref() string {
-	return string(event.RefKind) + ":" + strconv.FormatInt(event.MessageID, 10)
-}
-
 func (event ActivityEvent) Validate() error {
 	switch {
 	case event.MessageID <= 0:
@@ -701,6 +697,7 @@ func (err *ErrActivityProjectionStale) Error() string {
 // the authoritative write transaction.
 type ActivityProjectionToken struct {
 	MessageID               int64
+	Unsent                  bool
 	SourceID                int64
 	LastModified            time.Time
 	Queue                   ActivityQueueObservation
@@ -822,7 +819,7 @@ type ContactState struct {
 	LastContactAt       *time.Time      `json:"last_contact_at,omitempty"`
 	LastContactRef      string          `json:"last_contact_ref,omitempty"`
 	LastContactChannel  ActivityChannel `json:"last_contact_channel,omitempty"`
-	LastContactSourceID *int64          `json:"last_contact_source_id,omitempty"`
+	LastContactSourceID *int64          `json:"last_contact_source_id,omitzero" nullable:"false"`
 	LastContactOwner    string          `json:"last_contact_owner,omitempty"`
 	LastInboundAt       *time.Time      `json:"last_inbound_at,omitempty"`
 	LastInboundRef      string          `json:"last_inbound_ref,omitempty"`
@@ -1055,7 +1052,8 @@ func validateActivityProjectionBatch(
 				"%w: projection source id must be positive", ErrInvalidActivity)
 		case token.LastModified.IsZero():
 			return nil, ContactRevisions{}, fmt.Errorf(
-				"%w: projection last modified is required", ErrInvalidActivity)
+				"%w: projection last modified is required for message %d",
+				ErrInvalidActivity, token.MessageID)
 		case token.IdentityRevision < 0 || token.AccountIdentityRevision < 0:
 			return nil, ContactRevisions{}, fmt.Errorf(
 				"%w: projection revisions must be non-negative", ErrInvalidActivity)
@@ -1426,7 +1424,14 @@ func (s *Store) validateActivityMessageTx(
 	if err != nil {
 		return fmt.Errorf("lock activity message %d: %w", token.MessageID, err)
 	}
+	var unsent bool
+	if err := tx.QueryRowContext(ctx, `SELECT `+s.activityUnsentSQL()+`
+		FROM messages m LEFT JOIN sources src ON src.id = m.source_id
+		WHERE m.id = ?`, token.MessageID).Scan(&unsent); err != nil {
+		return fmt.Errorf("read activity unsent status for message %d: %w", token.MessageID, err)
+	}
 	if !lastModified.Valid ||
+		unsent != token.Unsent ||
 		sourceID != token.SourceID ||
 		messageType != token.MessageType ||
 		!lastModified.Time.Equal(token.LastModified) ||

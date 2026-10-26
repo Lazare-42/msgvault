@@ -74,6 +74,55 @@ function setup(
 }
 
 describe('ExploreLoader', () => {
+  it('consumes an empty search submission once and excludes grouping changes and retries', async ({ onTestFinished }) => {
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
+    const state = new ExploreState(window), onSearchAccepted = vi.fn();
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json(exploreResponse()));
+    const { loader, cleanup } = setup(fetchFn, state, { onSearchAccepted });
+    onTestFinished(() => { cleanup(); state.destroy(); });
+    await vi.waitFor(() => expect(loader.loading).toBe(false));
+    fetchFn.mockResolvedValueOnce(Response.json({
+      error: 'analytical_cache_unavailable', message: 'The analytical cache is being prepared',
+      readiness: 'building', recovery_action: ''
+    }, { status: 503 }));
+    loader.submitted = true;
+    state.commitSearch('missing', 'full_text'); flushSync();
+    await vi.waitFor(() => expect(loader.unavailable?.readiness).toBe('building'));
+    await vi.waitFor(() => expect(onSearchAccepted).toHaveBeenLastCalledWith('missing', 'full_text', expect.any(AbortSignal), 0), { timeout: 5000 });
+    onSearchAccepted.mockClear();
+    loader.retry(); flushSync();
+    await vi.waitFor(() => expect(onSearchAccepted).toHaveBeenCalledOnce());
+    expect(onSearchAccepted).toHaveBeenLastCalledWith('missing', 'full_text', expect.any(AbortSignal), undefined);
+    onSearchAccepted.mockClear();
+    state.commitGrouping('source'); flushSync();
+    await vi.waitFor(() => expect(onSearchAccepted).toHaveBeenCalledOnce());
+    expect(onSearchAccepted).toHaveBeenLastCalledWith('missing', 'full_text', expect.any(AbortSignal), undefined);
+  });
+
+  it('reports current successful results across retries', async ({ onTestFinished }) => {
+    window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything', query: 'needle' }))}`);
+    const onSearchAccepted = vi.fn(), state = new ExploreState(window);
+    let resolveStale!: (response: Response) => void;
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json(exploreResponse({ rows: [entry(1)] }))).mockResolvedValueOnce(Response.json(exploreResponse())).mockImplementationOnce(() => new Promise<Response>((resolve) => { resolveStale = resolve; })).mockResolvedValueOnce(Response.json({ error: 'archive unavailable' }, { status: 500 }));
+    const { loader, cleanup } = setup(fetchFn, state, { onSearchAccepted });
+    onTestFinished(() => { cleanup(); state.destroy(); });
+    await vi.waitFor(() => expect(onSearchAccepted.mock.calls).toEqual([['needle', 'full_text', expect.any(AbortSignal), undefined]]), { timeout: 5000 });
+    state.commitSearch('other', 'semantic'); flushSync();
+    await vi.waitFor(() => expect(fetchFn).toHaveBeenCalledTimes(2));
+    state.commitSearch('replacement', 'full_text'); flushSync();
+    await vi.waitFor(() => expect(loader.error).toBe('Exploration request failed (500)'));
+    expect(onSearchAccepted).toHaveBeenCalledTimes(1);
+    resolveStale(Response.json(exploreResponse({ rows: [entry(99)] })));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(loader.rows).toEqual([]);
+    expect(onSearchAccepted.mock.calls).toEqual([['needle', 'full_text', expect.any(AbortSignal), undefined]]);
+    expect(onSearchAccepted.mock.calls[0]![2].aborted).toBe(true);
+    loader.retry();
+    await vi.waitFor(() => expect(loader.rows).toHaveLength(1));
+    expect(onSearchAccepted.mock.calls).toEqual([['needle', 'full_text', expect.any(AbortSignal), undefined], ['replacement', 'full_text', expect.any(AbortSignal), undefined]]);
+    loader.retry();
+    await vi.waitFor(() => expect(onSearchAccepted.mock.calls).toEqual([['needle', 'full_text', expect.any(AbortSignal), undefined], ['replacement', 'full_text', expect.any(AbortSignal), undefined], ['replacement', 'full_text', expect.any(AbortSignal), undefined]]));
+  });
   it('issues exactly one fetch for one filter commit', async () => {
     window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything' }))}`);
     let exploreCount = 0;
@@ -527,4 +576,21 @@ describe('ExploreLoader', () => {
     cleanup();
     state.destroy();
   });
+});
+
+it('excludes an archive reader marker while restoring the actual active and scroll rows', async () => {
+  window.history.replaceState(null, '', `/?explore=${encodeURIComponent(JSON.stringify({ workspace: 'everything', selectedRow: 'archive-meeting:42', activeRow: 'message:2', scrollAnchor: { key: 'message:2', offset: 4 } }))}`);
+  const requests: string[] = [];
+  const fetchFn = vi.fn<typeof fetch>(async (input) => {
+    const request = input instanceof Request ? input : new Request(input);
+    const body = await request.clone().json(); requests.push(body.cursor ?? 'first');
+    if (!body.cursor) return Response.json(exploreResponse({ rows: [entry(1)], next_cursor: 'page-2', total_count: 3 }));
+    if (body.cursor === 'page-2') return Response.json(exploreResponse({ rows: [entry(2)], next_cursor: 'page-3', total_count: 3 }));
+    return Response.json(exploreResponse({ rows: [entry(3)], total_count: 3 }));
+  });
+  const state = new ExploreState(window); const { loader, cleanup } = setup(fetchFn, state);
+  await vi.waitFor(() => { expect(loader.loading).toBe(false); expect(loader.restoring).toBe(false); expect(loader.rows).toHaveLength(2); });
+  expect(requests).toEqual(['first', 'page-2']);
+  expect(state.current.selectedRow).toBe('archive-meeting:42');
+  cleanup(); state.destroy();
 });

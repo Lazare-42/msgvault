@@ -3,8 +3,7 @@ package gmail
 
 import (
 	"context"
-
-	"go.kenn.io/msgvault/internal/store"
+	"errors"
 )
 
 // AccountReader provides read access to account-level Gmail data.
@@ -40,7 +39,10 @@ type CompleteMessageSnapshotReader interface {
 	ListCompleteMessageSnapshot(ctx context.Context, pageToken string) (*MessageListResponse, error)
 }
 
-// MessageDeleter provides write operations for deleting Gmail messages.
+// ErrBatchUnsupported tells the executor to delete messages individually.
+var ErrBatchUnsupported = errors.New("batch deletion is unsupported")
+
+// MessageDeleter provides write operations for deleting source messages.
 type MessageDeleter interface {
 	// TrashMessage moves a message to trash (recoverable for 30 days).
 	TrashMessage(ctx context.Context, messageID string) error
@@ -49,23 +51,83 @@ type MessageDeleter interface {
 	DeleteMessage(ctx context.Context, messageID string) error
 
 	// BatchDeleteMessages permanently deletes multiple messages (max 1000).
+	// Clients without batch deletion return ErrBatchUnsupported.
 	BatchDeleteMessages(ctx context.Context, messageIDs []string) error
 }
 
-// DraftManager provides CRUD operations for Gmail drafts.
+// DraftAPI provides Gmail-native draft operations. It is separate from API
+// because IMAP clients implement the archive sync surface but cannot create a
+// Gmail draft.
+type DraftAPI interface {
+	CreateDraft(ctx context.Context, raw []byte, threadID string) (*Draft, error)
+	GetDraft(ctx context.Context, draftID string) (*Draft, error)
+	UpdateDraft(ctx context.Context, draftID string, raw []byte, threadID string) (*Draft, error)
+	DeleteDraft(ctx context.Context, draftID string) error
+	ListSendAs(ctx context.Context) ([]SendAs, error)
+	Close() error
+}
+
+// Draft is the Gmail draft receipt. Gmail keeps ID stable while replacing the
+// enclosed message.
+type Draft struct {
+	ID      string
+	Message RawMessage
+}
+
+// SendAs is one provider-listed sender identity.
+type SendAs struct {
+	Email              string
+	DisplayName        string
+	VerificationStatus string
+	Primary            bool
+	Default            bool
+}
+
+const (
+	DraftStateRejected      = "rejected"
+	DraftStateRemoteUnknown = "remote_unknown"
+	DraftStateCancelled     = "cancelled"
+)
+
+// DraftWriteError carries a stable client-facing result for a draft mutation.
+type DraftWriteError struct {
+	State string
+	Code  string
+	Err   error
+}
+
+func (e *DraftWriteError) Error() string {
+	if e.Code != "" {
+		return e.Code
+	}
+	return e.State
+}
+
+func (e *DraftWriteError) Unwrap() error { return e.Err }
+
+// StatusError is a typed HTTP failure from Gmail. Its text matches the
+// pre-existing client errors so callers that still match text keep working.
+type StatusError struct {
+	StatusCode int
+	msg        string
+}
+
+func (e *StatusError) Error() string { return e.msg }
+
+// DraftManager provides composed drafts and sending for live mail clients.
 type DraftManager interface {
 	// ListDrafts returns drafts matching the optional query.
-	ListDrafts(ctx context.Context, query string, maxResults int) ([]*Draft, error)
+	ListDrafts(ctx context.Context, query string, maxResults int) ([]*ComposedDraft, error)
 
 	// GetDraft returns a single draft by ID.
-	GetDraft(ctx context.Context, draftID string) (*Draft, error)
+	GetDraft(ctx context.Context, draftID string) (*ComposedDraft, error)
 
 	// CreateDraft creates a new draft. If threadID is non-empty, the draft
 	// is created as a reply within that thread.
-	CreateDraft(ctx context.Context, draft *DraftCompose) (*Draft, error)
+	CreateDraft(ctx context.Context, draft *DraftCompose) (*ComposedDraft, error)
 
 	// UpdateDraft replaces the content of an existing draft.
-	UpdateDraft(ctx context.Context, draftID string, draft *DraftCompose) (*Draft, error)
+	UpdateDraft(ctx context.Context, draftID string, draft *DraftCompose) (*ComposedDraft, error)
 
 	// DeleteDraft permanently deletes a draft.
 	DeleteDraft(ctx context.Context, draftID string) error
@@ -96,8 +158,6 @@ type API interface {
 	AccountReader
 	MessageReader
 	MessageDeleter
-	DraftManager
-	LabelManager
 
 	// Close releases any resources held by the client.
 	Close() error
@@ -121,15 +181,6 @@ type Label struct {
 	MessagesUnread        int64
 	MessageListVisibility string
 	LabelListVisibility   string
-}
-
-// SystemRoleForLabelID returns roles Gmail identifies canonically, never by
-// the localized label name returned to users.
-func SystemRoleForLabelID(sourceLabelID string) string {
-	if sourceLabelID == "SENT" {
-		return store.LabelSystemRoleSent
-	}
-	return ""
 }
 
 // MessageListResponse contains a page of message IDs.
@@ -165,6 +216,13 @@ type RawMessageBatchResult struct {
 	Message *RawMessage
 	Err     error
 }
+
+// ErrMessageGone reports that a message listed earlier in the run was gone from
+// the mailbox when the run tried to fetch it. It is an ordinary race with the
+// mail server, not a failure: the message was moved or deleted, and deletion
+// detection retires it. A batch result carrying this error is handled, not
+// failed.
+var ErrMessageGone = errors.New("message no longer present in the mailbox")
 
 // MessageLabelsBatchResult is one per-message result from a batch label fetch.
 // LabelIDs is nil when the fetch failed; Err preserves the per-message cause.
@@ -203,8 +261,18 @@ type HistoryLabelChange struct {
 	LabelIDs []string
 }
 
-// Draft represents a Gmail draft with its message content.
-type Draft struct {
+// MessageRelocationTarget retains the archived identity selected for adopting
+// a fetched snapshot after its previous IMAP location disappears.
+type MessageRelocationTarget struct {
+	InternalID         int64
+	SourceID           int64
+	SourceMessageID    string // Expected old archived composite ID.
+	RFC822MessageID    string
+	NewSourceMessageID string
+}
+
+// ComposedDraft represents a Gmail draft with its message content.
+type ComposedDraft struct {
 	ID      string // Draft ID (used for update/send/delete)
 	Message DraftMessage
 }
@@ -263,4 +331,11 @@ type SentMessage struct {
 	ID       string
 	ThreadID string
 	LabelIDs []string
+}
+
+// LiveAPI adds the fork mail-writing surface to archive access.
+type LiveAPI interface {
+	API
+	DraftManager
+	LabelManager
 }

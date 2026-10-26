@@ -1,17 +1,21 @@
 ---
+last_edited: "2026-10-02"
 title: Beeper
 description: Archive every chat network connected to Beeper Desktop via its local API.
 ---
 
-[Beeper Desktop](https://www.beeper.com) bridges many chat networks — WhatsApp,
-Signal, Telegram, Instagram, LinkedIn, X, Facebook Messenger, iMessage, and
-more — into one app. msgvault can archive all of them at once through Beeper
-Desktop's local API. Each connected network account becomes its own msgvault
-source, so a Signal thread and a Telegram thread stay separately filterable,
-while all Beeper-archived messages share `message_type = beeper` for search.
+Archive the chat networks you have connected to
+[Beeper Desktop](https://www.beeper.com) through its local API. Each network
+account becomes a separate msgvault source, so you can search them together
+or filter to one account.
 
-Beeper sync is strictly read-only: msgvault only calls read endpoints of the
-local API and never sends, edits, archives, or marks anything in Beeper.
+All messages imported this way use `message_type = beeper`. Sync only reads
+Beeper; it does not send or edit messages or mark conversations read.
+
+Separately, enable [Beeper chat drafts](../cli-reference.md#beeper-chat-drafts)
+per source to place text in Beeper's message box for review. msgvault never
+sends it. Writes stop if the box already contains unrelated text, but text
+typed between the check and write can still be lost.
 
 ## Prerequisites
 
@@ -19,6 +23,22 @@ local API and never sends, edits, archives, or marks anything in Beeper.
   daemon (the API listens on `localhost:23373` only).
 - A Beeper Desktop access token: in Beeper Desktop open **Settings →
   Developer** and create an access token.
+
+## Review identities across sources
+
+Beeper can expose the same person through several networks or through both a
+Beeper account and a native msgvault source. The importer compares stable
+provider and Beeper identifiers. Strong matching evidence can link identities
+automatically; matching display names alone do not.
+
+A same-service, same-scope username match can become a review candidate instead
+of an automatic link. Conflicting existing bindings remain conflicts. This is
+why two entries for the same person may stay separate after a sync.
+
+Open the Web [Directory review queues](/docs/web-ui/#directory-and-reviews) to inspect
+identity candidates and accept or reject the proposed match. Check the source
+and identifier evidence before linking. See [people and source identities](/docs/usage/people/)
+for the difference between an observed participant and a curated profile.
 
 ## Add Beeper
 
@@ -81,6 +101,27 @@ are only picked up by `--full` runs.
 | `--full` | `false` | Ignore stored cursors and re-fetch every message (repairs rows in place) |
 | `--no-media` | `false` | Skip attachment downloads for this run |
 
+### Failed chats
+
+A chat page or attachment that fails to download does not stop the sync. The
+account's summary reports an error count, followed by the chats behind it:
+
+```text
+  signal done in 2m14s: 812 chats, 5310 messages (402 added), 54 errors
+  Failed chats (49 errors in 2 chats):
+    Book Club (!abc:beeper.local): 36 attachment, 2 fetch errors; last: asset download timed out
+    !def:beeper.local: 11 fetch errors; last: connect to Beeper Desktop refused
+  5 other errors aren't listed by chat; re-run to retry.
+  Retry with the same global options (such as --local):
+    fetch errors: msgvault sync-beeper --account signal
+    attachment errors: msgvault backfill-beeper-media --account signal
+```
+
+Each chat line shows its title or Beeper chat ID, error count, failed steps,
+and newest error. Counts cover the whole run; up to 20 chats are shown.
+A separate line counts errors with no chat. Keep the same global options, such
+as `--local`, when retrying that account's failures.
+
 ## What is archived
 
 - Message text, sender, timestamps, and per-network conversation threads
@@ -89,15 +130,62 @@ are only picked up by `--full` runs.
   content that was archived before a deletion stays archived.
 - Voice-note transcriptions (when Beeper has them) are appended to the message
   body so they are searchable.
-- Attachments (photos, videos, voice notes, files) are downloaded during sync
-  into msgvault's content-addressed attachment store. Downloads that fail (or
-  exceed `max_media_mb`) leave a pending marker and the message is archived
-  anyway; retry them later with `msgvault backfill-beeper-media`. Use
-  `--no-media` or `media = false` to skip downloads — note that skipped-by-flag
-  downloads leave no pending markers, so `backfill-beeper-media` will not fetch
-  them later; re-enable media and run `sync-beeper --full` instead.
-- The verbatim Beeper API JSON for every message (`raw_format = beeper_json`),
-  so nothing is lost even where msgvault's relational model is narrower.
+- Attachment metadata and eligible downloaded photos, videos, voice notes,
+  and files.
+- The original Beeper message JSON (`raw_format = beeper_json`) for later
+  inspection and repair.
+
+### Media downloads and retries
+
+By default, Beeper media downloads include direct chats and groups with at most
+20 participants, with a 250 MiB limit per file. Larger rooms keep their message
+text and attachment metadata. Adjust the shared
+[media policy](/docs/configuration/#media-policy) to change those limits.
+
+| Download result | How to collect the file later |
+|---|---|
+| A download failed and remains pending | Run `msgvault backfill-beeper-media` |
+| Skipped by the size or participant cap | Change the applicable policy, then retry media backfill |
+| Deferred with `--no-media` | Run `msgvault backfill-beeper-media` |
+| Excluded by `media = false` | Re-enable media, then run `msgvault backfill-beeper-media` |
+| No longer available at the source | Not collectable; msgvault does not retry it |
+
+Policy skips record a reason such as `size_cap` or `participant_threshold`.
+A failed download does not stop the message from being archived. A one-run
+`--no-media` deferral leaves pending markers. A disabled media policy leaves
+excluded markers, which become eligible when the policy allows them.
+
+Some networks delete old media from their servers. WhatsApp, for example,
+reports `Media is no longer available`. msgvault requests such a file once,
+records it as `unavailable` with reason `source_unavailable`, and never retries
+it.
+
+Beeper can also report `Media not found`, `M_NOT_FOUND`, or
+`failed to download file: HTTP 404`, sometimes wrapped in an HTTP 502 response.
+A plain HTTP 404 that names none of these is an ordinary failed download.
+msgvault stops retrying a not-found download for the current run, but the
+marker stays pending: a not-found alone never ends retries for good. It only becomes
+terminal once the message is at least 30 days old and a separate, later sync
+or backfill run gets not-found again for the same attachment. Anything else
+in between resets this: a successful download clears the history, and a
+different kind of error means the next not-found starts the count over, not
+continues it. Recent media stays pending no matter how many times it
+repeats. Missing or future message timestamps also leave the download
+retryable.
+
+The age and repeat-on-a-separate-run requirement limit how many requests an
+old missing file ever gets. Neither proves the file is permanently gone: an
+old file that later returns stays skipped, including during
+`sync-beeper --full`, and two runs close enough together to both land
+inside one brief bridge outage can retire a file the bridge would otherwise
+have recovered. Sync and backfill summaries report newly terminal files as
+"media no longer available at source".
+
+A not-found costs one request per attachment per run. If a server error or
+throttling response comes before the not-found in the same run, msgvault
+records an ordinary failed download instead, and that starts the repeat count
+over. Other failed downloads get at most three attempts per attachment per run
+and stay pending for the next backfill.
 
 Because Beeper's API serves what Beeper Desktop has synced locally, archive
 depth equals your local Beeper history: a freshly added Beeper account may only
@@ -113,10 +201,9 @@ Message bodies, snippets, the search index, and attachment classification are
 derived from the API payload at import time, so improvements to how they are
 derived do not reach messages already archived.
 
-Nothing is needed to pick those up: each account re-derives itself once, on its
-next sync, from the verbatim JSON stored with every message. The sync reports
-how many rows it repaired. To repair on demand instead of waiting — or to finish
-an interrupted pass — run it directly:
+Each account automatically refreshes these fields once on its next sync when
+the derivation version changes. It uses the stored JSON and reports how many
+rows it repaired. To run that repair now or finish an interrupted pass:
 
 ```bash
 msgvault repair-derived --source-type beeper
@@ -131,20 +218,162 @@ cursors are untouched, so it is idempotent.
 
 Media that arrives as a forwarded link preview — an Instagram reel, an x.com
 post — is recorded with the URL it previews in `attachments.attachment_metadata`
-(`{"shared_url": "..."}`), while media a sender composed has none. This tells a
-photo a friend took apart from a public post they forwarded, which matters
-because forwarded previews can dominate an Instagram archive's bytes while
-remaining recoverable from the URL. Downloads are unaffected: everything is
-still archived. To see the split:
+(`{"shared_url": "..."}`). Voice note transcripts can also appear there under
+`source_transcript`. Use `shared_url` to distinguish a shared link preview
+from an original photo or file. Download eligibility still follows the
+configured media policy.
+
+The metadata copy of `source_transcript.text` is capped at 32
+KiB on a UTF-8 boundary. A clipped value includes `"truncated": true`; the
+field is omitted when the complete transcript fits. The full transcript stays
+in the searchable message body. To see the split:
 
 ```sql
-SELECT COALESCE(a.attachment_metadata IS NOT NULL, 0) AS is_share,
+SELECT CASE WHEN COALESCE(json_extract_string(a.attachment_metadata, '$.shared_url'), '') <> ''
+            THEN 1 ELSE 0 END AS is_share,
        COUNT(*), SUM(a.size)
 FROM attachments a
 JOIN messages m ON m.id = a.message_id
 WHERE m.message_type = 'beeper'
 GROUP BY is_share;
 ```
+
+## Mirror all attachments to Docbank (unreleased)
+
+Mirror stored attachments from all sources with [attachment upload consent](../configuration.md#mirror-stored-attachments-to-docbank-unreleased).
+
+## Send audio to Docbank
+
+The daemon can copy stored audio from any captured source, including messaging
+and email importers, to a separately running Docbank media service. Docbank
+keeps the recording and msgvault records which Docbank source and occurrence
+belong to each live message. Beeper's complete attachment transcript is
+imported as supplied evidence. Other sources use a configured ASR profile or
+remain unprocessed. Configure the destination in
+[`[integrations.docbank]`](/docs/configuration/#send-stored-audio-to-docbank).
+
+What you need:
+
+- A Docbank server with the media HTTP routes
+  ([docbank#346](https://github.com/kenn-io/docbank/pull/346)). The Docbank
+  library built into msgvault does not provide them.
+- `all_sources_upload_consent = true`. It allows audio from every captured
+  source to be sent to that URL. See the [consent settings](/docs/configuration/#send-stored-audio-to-docbank)
+  when upgrading from the Beeper-only route. Docbank's own processing consent
+  decides whether a supplied transcript or configured ASR profile is processed.
+- An optional `asr_profile = "asr"` requests that Docbank process stored audio
+  without usable source text. Leave it empty to retain the audio without a
+  processing request.
+- WAV or MP3 audio. msgvault checks the bytes and sends them as `audio/wav` or
+  `audio/mpeg`, whatever type the provider reported. Docbank accepts no other
+  codec, so OGG/Opus, M4A and other formats stay local. Attachments identified
+  as audio receive the `unsupported_media` code when full verification finds
+  an unsupported format. msgvault never converts audio or runs speech recognition.
+- The route consumes WAV or MP3 bytes from every captured source, including
+  Beeper, messaging providers, email importers and future providers. An
+  importer must have captured the bytes and a stable part identity first; this
+  route never downloads missing media or invents a placeholder hash.
+
+What happens:
+
+- Voice notes and ordinary audio qualify when they are stored, standalone
+  Beeper attachments. Other captured sources qualify when their stored row has
+  a stable source part, standalone or unknown role, and WAV or MP3 bytes.
+  Previews, stickers, other known inline roles and readable non-audio files
+  stay local.
+- msgvault reads Beeper's complete transcript from the archived raw message,
+  not the 32 KiB metadata copy. Other sources have no generic transcript
+  metadata contract, so they use only the configured ASR profile or remain
+  unprocessed. Authored message text and caption URLs are never transcript
+  evidence.
+- Audio without source text is retained and uses the configured ASR profile
+  when one is set. With an empty profile it remains `unprocessed`.
+- For sources other than Beeper, the occurrence timestamp comes from the
+  archived message's `sent_at`. The route does not read the raw message.
+- The job backfills existing audio in pages of up to 100 attachments. After
+  that first scan, it checks up to 100 attachment changes each minute. It
+  starts another full scan a day after the previous scan finishes, to catch
+  transcripts that arrive later. Unchanged mappings need no write transaction.
+- Each pass performs at most one upload, transcript import, processing request,
+  or status check. A status check can make up to three HTTP requests to read
+  the job, source, and processing receipt.
+- Discovery reads, parsing, and uploads run outside the daemon's operation
+  lock. The job takes the lock for individual mapping writes and progress
+  updates. If the lock stays busy, for example during a backup, the pass ends;
+  a later pass reuses the saved operation ID. Background media work does not
+  reset the daemon's idle timer. Shutdown cancels and drains an active pass.
+- Uploads use a temporary copy under `data_dir/tmp/beeper-media`, removed when
+  the attempt ends. The current Docbank inspector also reads the complete
+  recording into memory. The default Beeper download cap is 250 MiB, and this
+  route accepts sources up to 1 GiB; memory use includes the recording plus
+  inspection and allocation overhead. These file limits are not RAM limits.
+- The same recording in several messages gets one occurrence per message.
+  Docbank stores the bytes once. Supplied transcripts share a processing job
+  when the provider, exact text, language, and audio match. Audio without a
+  transcript shares an ASR job when the bytes and configured profile match,
+  including across providers. These are separate jobs: a Beeper transcript
+  does not suppress ASR for an email attachment containing the same recording.
+- A hidden, source-deleted, removed or replaced message loses its mapping
+  (`revoked`), including audio still waiting to be sent. Other messages
+  sharing the audio keep theirs. Reaction changes leave the mapping live.
+  If no live or pending occurrence can supply the recording, unprepared
+  processing stops waiting; restoring an occurrence reopens it. Prepared
+  requests keep their saved identity and retry even after revocation, since
+  Docbank may have accepted them before msgvault saved the receipt.
+  msgvault decides which occurrences are live; Docbank keeps the shared evidence.
+- Network errors, HTTP 429 and 5xx responses retry after five minutes with the
+  same operation ID. So does a request that runs out of time: each request
+  gets 30 seconds, and an audio upload gets one more second per 256 KiB.
+  Rejected credentials or requests stay `blocked` until the daemon restarts,
+  which also resumes checking a queued job. Unsupported codecs and other
+  local source problems stay `blocked` across restarts until the message
+  changes, and so does their transcript delivery, with the same code.
+  Missing or corrupt local bytes, or a temporary upload copy that can't be
+  written, wait as `source_unavailable` and retry after five minutes.
+  For other sources, an unreadable attachment needs an audio type or WAV/MP3
+  filename to enter that retry queue. Without those hints or a recognized
+  header, discovery leaves the attachment undecided and rechecks it in the
+  next daily full scan. It creates no media mapping or processing request.
+  Discovery reads only the header; upload preparation verifies the complete
+  audio before sending it.
+- A processed delivery reaches `done` only after Docbank reports coverage
+  for its own processing request, not for another transcript of the same
+  audio. A failed Docbank job or a failed processing request ends as `done`
+  with `operation_state` set to `failed`. A job marked `operator_required`
+  stays `blocked` without further polling. Resolve it in Docbank, then restart
+  the msgvault daemon to resume checking its state.
+
+Provider transcripts stay searchable through the normal message text. This
+route does not add search over Docbank's processed output yet. Check progress
+with a query:
+
+```sql
+SELECT retention_state, error_code, COUNT(*)
+FROM beeper_media_occurrences
+GROUP BY retention_state, error_code;
+
+SELECT phase, coverage_state, COUNT(*)
+FROM beeper_media_deliveries
+GROUP BY phase, coverage_state;
+```
+
+### Read transcripts in the Web reader
+
+Open a conversation in the Web reader and expand a message with audio. Each
+recording shows its filename, size and transcript state. A ready transcript
+says whether it came from the provider or was generated, and marks partial
+text. Supplied text requires Docbank to identify the exact input sent for this
+recording, using its [supplied-input attribution](https://github.com/kenn-io/docbank/pull/825).
+Older servers that omit the identity show it as unavailable. The same happens
+when Docbank serves another input for the same audio, including after an edit is reverted.
+Lines show their start time and speaker when Docbank recorded them.
+The Web reader is the only client for now. Person-scoped Media and Files,
+search, CLI, TUI and MCP readers are later work. msgvault reads the text from
+Docbank while the message stays open and does not store it. The view refreshes
+every 2 to 30 seconds while visible and immediately when you return to the tab.
+Turning Docbank off keeps archived audio visible with transcript unavailable.
+Unmapped captured audio stays unavailable until discovery records processing work.
+Audio whose bytes are missing still says so; capture policy exclusions read unavailable.
 
 ## Scheduled sync
 
@@ -155,6 +384,24 @@ Let the daemon run incremental syncs on a schedule:
 enabled = true
 schedule = "*/30 * * * *"
 ```
+
+A scheduled run keeps other sources on their cadence:
+
+- **Bounded runs.** One scheduled Beeper job works for at most 3 minutes
+  across all accounts. It also stops early when another scheduled source has
+  waited for it for a minute. It stops at a chat or history-page boundary,
+  completes the run, and the next run continues from the saved cursors.
+- **Account rotation.** After stopping within an account, the next run starts
+  with the following account. Each account retains its own progress.
+- **New messages first.** Chats with only new messages sync before chats
+  still backfilling history. Completed chats are skipped until the current
+  discovery cycle finishes, so later chats also get a turn.
+- **Fetch errors.** A transient page-fetch failure is retried twice. If it
+  still fails, the run completes with an error count and the scheduler reports
+  `partial Beeper sync: N fetch error(s)`. Healthy chats keep their progress,
+  and the failed chats are retried on the next run.
+
+Manual `msgvault sync-beeper` runs have no time budget.
 
 ## Configuration
 
@@ -167,8 +414,19 @@ accounts = []                      # accountID include filter (empty = all)
 exclude_accounts = []              # e.g. ["whatsapp"] — see below
 rate_limit_qps = 20                # request rate against the local API
 media = true                       # download attachment bytes
-max_media_mb = 100                 # per-attachment size cap
+media_scope = "all"                # all, direct, or none
+media_max_participants = 20        # skip media from larger rooms; 0 = no cap
+max_media_mb = 250                 # per-attachment size cap
+
+# [beeper.accounts_config.signal]   # per-account override, keyed by accountID
+# media = true
+# max_media_mb = 500
 ```
+
+See [Media policy](/docs/configuration/#media-policy) for how the scope, participant
+cap, size cap, and per-account overrides combine, and
+`msgvault purge-excluded-media` for removing media a changed policy would no
+longer collect.
 
 ### Overlap with native importers
 
@@ -188,7 +446,10 @@ resolving to the same person).
   chats) on every run; ordinary churn like deleting an anchored chat is
   tolerated, and only when no anchor survives are recently archived messages
   checked against the source. If the installation was rebuilt, the sync stops
-  with an error; remove and re-add the Beeper sources in that case.
+  with an error and marks the account. Scheduled runs then skip that account
+  with one warning instead of failing every run. After repairing Beeper
+  Desktop, run `msgvault sync-beeper --account <id>` to verify again and clear
+  the mark, or remove and re-add the Beeper source.
 - **Remote daemons**: the Beeper API is loopback-only, so the msgvault daemon
   must run on the same machine as Beeper Desktop.
 - **iMessage**: Beeper only carries iMessage on macOS, so archiving it this way

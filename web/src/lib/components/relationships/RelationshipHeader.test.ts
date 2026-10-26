@@ -1,9 +1,12 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/svelte';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/svelte';
+import { tick } from 'svelte';
 import { describe, expect, it, vi } from 'vitest';
 
 import { createAPIClient } from '../../api/client';
+import type { PersonAttributeGroup } from '../../api/generated/models';
 import type { DomainSummary, PersonSummary } from '../../explore/models';
 import type { LinkOutcome } from '../../relationships/controller.svelte';
+import type { ValidatedPersonMergeRequired } from '../../directory/person-merge';
 import { openTypeahead } from '../../../test/kit-ui';
 import RelationshipHeader from './RelationshipHeader.svelte';
 
@@ -99,6 +102,13 @@ function baseProps(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function attributeGroup(label: string, text: string): PersonAttributeGroup {
+  return {
+    definition: { universal_id: `u-${label}`, slug: label.toLowerCase(), label, is_sensitive: false, display_order: 0 },
+    current: [{ value: { type: 'text', text } }], history: []
+  } as unknown as PersonAttributeGroup;
+}
+
 /** Opens the "Same person…" dialog, searches for "Bob", selects the stubbed
  * search result (participant #99), and confirms. Exercises the real
  * LinkIdentityDialog end to end; its own search/select mechanics are
@@ -111,21 +121,143 @@ async function linkToSearchResult(): Promise<void> {
 }
 
 describe('RelationshipHeader', () => {
+  it('shows current attributes for a durable person and opens their editor in Directory', async () => {
+    const loadAttributes = vi.fn(async () => [attributeGroup('Pronouns', 'they/them')]);
+    const onOpenDirectoryPerson = vi.fn();
+    render(RelationshipHeader, baseProps({
+      detail: { ...person(), profile: { id: 7, revision: 1 } },
+      loadAttributes, onOpenDirectoryPerson
+    }));
+
+    const summary = await screen.findByRole('region', { name: 'Attributes summary' });
+    expect(summary.textContent).toContain('Pronouns');
+    expect(summary.textContent).toContain('they/them');
+    expect(loadAttributes).toHaveBeenCalledWith(7);
+    await fireEvent.click(screen.getByRole('button', { name: 'Edit attributes' }));
+    expect(onOpenDirectoryPerson).toHaveBeenCalledWith(7);
+  });
+
+  it('opens the durable Directory person without starting participant promotion', async () => {
+    const onOpenDirectory = vi.fn();
+    const onOpenDirectoryPerson = vi.fn();
+    render(RelationshipHeader, baseProps({
+      detail: { ...person(), profile: { id: 7, revision: 1 } },
+      onOpenDirectory, onOpenDirectoryPerson
+    }));
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Open in Directory' }));
+    expect(onOpenDirectoryPerson).toHaveBeenCalledWith(7);
+    expect(onOpenDirectory).not.toHaveBeenCalled();
+  });
+
+  it('ignores attributes that finish loading after selecting another person', async () => {
+    let finishFirst: ((groups: PersonAttributeGroup[]) => void) | undefined;
+    const loadAttributes = vi.fn((id: number) => id === 7
+      ? new Promise<PersonAttributeGroup[]>((resolve) => { finishFirst = resolve; })
+      : Promise.resolve([attributeGroup('Status', 'active')]));
+    const props = baseProps({ detail: { ...person(), profile: { id: 7, revision: 1 } }, loadAttributes });
+    const { rerender } = render(RelationshipHeader, props);
+
+    await rerender({ ...props, detail: { ...person(), id: 99, profile: { id: 9, revision: 1 } } });
+    expect((await screen.findByRole('region', { name: 'Attributes summary' })).textContent).toContain('active');
+    finishFirst?.([attributeGroup('Status', 'stale')]);
+    await Promise.resolve();
+    await tick();
+    expect(screen.getByRole('region', { name: 'Attributes summary' }).textContent).not.toContain('stale');
+  });
+
+  it.each([false, true])('retains attributes when the same profile reloads (loading gap: %s)', async (loadingGap) => {
+    const loadAttributes = vi.fn(async () => [attributeGroup('Status', 'active')]);
+    const props = baseProps({ detail: { ...person(), profile: { id: 7, revision: 1 } }, loadAttributes });
+    const { rerender } = render(RelationshipHeader, props);
+    await screen.findByRole('region', { name: 'Attributes summary' });
+
+    if (loadingGap) await rerender({ ...props, detail: null, loading: true });
+    await rerender({ ...props, detail: { ...person(), profile: { id: 7, revision: 1 } } });
+
+    expect(screen.getByRole('region', { name: 'Attributes summary' }).textContent).toContain('active');
+    expect(loadAttributes).toHaveBeenCalledTimes(1);
+  });
+
+  it('offers Messages and Files as explicit relationship views', async () => {
+    const onFilesToggle = vi.fn();
+    render(RelationshipHeader, baseProps({ onFilesToggle }));
+
+    expect(screen.getByRole('radio', { name: 'Messages' }).getAttribute('aria-checked')).toBe('true');
+    await fireEvent.click(screen.getByRole('radio', { name: 'Files 3' }));
+    expect(onFilesToggle).toHaveBeenCalledWith(true);
+  });
+
+  it('selects Files when restoring a file view and switches back to Messages', async () => {
+    const onFilesToggle = vi.fn();
+    render(RelationshipHeader, baseProps({ filesOpen: true, onFilesToggle }));
+
+    expect(screen.getByRole('radio', { name: 'Files 3' }).getAttribute('aria-checked')).toBe('true');
+    await fireEvent.click(screen.getByRole('radio', { name: 'Messages' }));
+    expect(onFilesToggle).toHaveBeenCalledWith(false);
+  });
+
+  it('collapses linked identities by default and opens them on request', async () => {
+    render(RelationshipHeader, baseProps());
+
+    const summary = screen.getByText('Identities (2)');
+    const disclosure = summary.closest('details');
+    expect(disclosure?.open).toBe(false);
+    await fireEvent.click(summary);
+    expect(disclosure?.open).toBe(true);
+    expect(screen.getByLabelText('Identity Alice')).toBeDefined();
+  });
+
+  it('collapses identities again when the selected person changes', async () => {
+    const props = baseProps();
+    const { rerender } = render(RelationshipHeader, props);
+    await fireEvent.click(screen.getByText('Identities (2)'));
+    expect(screen.getByText('Identities (2)').closest('details')?.open).toBe(true);
+
+    await rerender({ ...props, detail: { ...person(), id: 99 } });
+    expect(screen.getByText('Identities (2)').closest('details')?.open).toBe(false);
+  });
+
+  it('keeps identities open across a reload, then collapses them for another person', async () => {
+    const props = baseProps();
+    const { rerender } = render(RelationshipHeader, props);
+    await fireEvent.click(screen.getByText('Identities (2)'));
+    await fireEvent(screen.getByText('Identities (2)').closest('details')!, new Event('toggle'));
+
+    await rerender({ ...props, detail: null, loading: true });
+    await rerender({ ...props, detail: person() });
+    expect(screen.getByText('Identities (2)').closest('details')?.open).toBe(true);
+
+    await rerender({ ...props, detail: null, loading: true });
+    await rerender({ ...props, detail: { ...person(), id: 99 } });
+    expect(screen.getByText('Identities (2)').closest('details')?.open).toBe(false);
+  });
+
+  it('keeps identities visible during unlink confirmation', async () => {
+    render(RelationshipHeader, baseProps({ detail: clusteredPerson() }));
+    await fireEvent.click(screen.getByText('Identities (3)'));
+    await fireEvent.click(screen.getByRole('button', { name: 'Unlink +15550100002' }));
+
+    await fireEvent.click(screen.getByText('Identities (3)'));
+    await waitFor(() => expect(screen.getByText('Identities (3)').closest('details')?.open).toBe(true));
+    expect(screen.getByRole('group', { name: 'Confirm unlinking +15550100002' })).toBeDefined();
+  });
+
   it('shows a placeholder status when nothing is selected', () => {
     render(RelationshipHeader, baseProps({ detail: null }));
     expect(screen.getByRole('status').textContent).toContain('Select a person or domain');
   });
 
-  it('renders a person: display name, identity chips, item counts, and the Files toggle', async () => {
+  it('renders a person with identity details, item counts, and a file view', async () => {
     const onFilesToggle = vi.fn();
     render(RelationshipHeader, baseProps({ onFilesToggle }));
 
     expect(screen.getByRole('heading', { name: 'Alice Example' })).toBeDefined();
     expect(screen.getByText(/42 items/)).toBeDefined();
-    expect(screen.getByText(/3 files/)).toBeDefined();
+    expect(screen.getByText(/items · /).textContent).not.toMatch(/files/);
     expect(screen.getByText('Alice')).toBeDefined();
-    expect(screen.getByText('alice@example.com')).toBeDefined();
-    expect(screen.getByText('+15550100001')).toBeDefined();
+    expect(screen.getByText(/alice@example\.com/)).toBeDefined();
+    expect(screen.getByText(/\+15550100001/)).toBeDefined();
     // Evidence detail lives in the tooltip, phrased in human words — never
     // internal field names like participant_identifiers.
     const emailChip = screen.getByLabelText('Identity Alice');
@@ -134,8 +266,24 @@ describe('RelationshipHeader', () => {
     expect(phoneChip.getAttribute('title')).toBe('phone · secondary · stored identifier');
     expect(document.body.textContent).not.toContain('participant_identifiers');
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Files 3' }));
+    await fireEvent.click(screen.getByRole('radio', { name: 'Files 3' }));
     expect(onFilesToggle).toHaveBeenCalledWith(true);
+  });
+
+  it('hands the selected API participant ID to Directory and never offers domains', async () => {
+    const onOpenDirectory = vi.fn();
+    const { rerender } = render(RelationshipHeader, baseProps({ onOpenDirectory }));
+
+    await fireEvent.click(screen.getByRole('button', { name: 'Open in Directory' }));
+    expect(onOpenDirectory).toHaveBeenCalledWith(12);
+
+    onOpenDirectory.mockClear();
+    await rerender(baseProps({ detail: { ...person(), profile: { id: 7, revision: 1 } }, onOpenDirectory }));
+    await fireEvent.click(screen.getByRole('button', { name: 'Open in Directory' }));
+    expect(onOpenDirectory).toHaveBeenCalledWith(12);
+
+    await rerender(baseProps({ detail: domain(), onOpenDirectory }));
+    expect(screen.queryByRole('button', { name: 'Open in Directory' })).toBeNull();
   });
 
   it('hides the identities section entirely for a single identity with nothing linked', () => {
@@ -155,6 +303,30 @@ describe('RelationshipHeader', () => {
     expect(linked.textContent).toContain('linked');
   });
 
+  it('keeps person actions separate from the Messages and Files view switch', () => {
+    render(RelationshipHeader, baseProps({ onOpenDirectory: vi.fn() }));
+
+    const actions = screen.getByRole('group', { name: 'Person actions' });
+    expect(within(actions).getByRole('button', { name: 'Open in Directory' })).toBeTruthy();
+    expect(within(actions).getByRole('button', { name: 'Same person…' })).toBeTruthy();
+    expect(within(actions).queryByRole('radio', { name: 'Messages' })).toBeNull();
+    expect(screen.getByRole('radio', { name: 'Messages' })).toBeTruthy();
+    expect(screen.getByRole('radio', { name: 'Files 3' })).toBeTruthy();
+  });
+
+  it('formats the counts date range with the month spelled out', () => {
+    render(RelationshipHeader, baseProps());
+
+    expect(screen.getByText(/items · /).textContent).toMatch(/[A-Z][a-z]{2} \d{1,2}, \d{4} – [A-Z][a-z]{2} \d{1,2}, \d{4}/);
+  });
+
+  it('offers no person actions group for a domain but keeps the view switch', () => {
+    render(RelationshipHeader, baseProps({ detail: domain() }));
+
+    expect(screen.queryByRole('group', { name: 'Person actions' })).toBeNull();
+    expect(screen.getByRole('radio', { name: 'Messages' })).toBeTruthy();
+  });
+
   it('renders a domain by domain name and person count, without identity chips or a Same person button', () => {
     render(RelationshipHeader, baseProps({ detail: domain() }));
 
@@ -165,11 +337,11 @@ describe('RelationshipHeader', () => {
     expect(screen.queryByRole('button', { name: 'Same person…' })).toBeNull();
   });
 
-  it('toggles Files off when already open', async () => {
+  it('switches from Files back to Messages when Files are open', async () => {
     const onFilesToggle = vi.fn();
     render(RelationshipHeader, baseProps({ filesOpen: true, onFilesToggle }));
 
-    await fireEvent.click(screen.getByRole('button', { name: 'Files 3' }));
+    await fireEvent.click(screen.getByRole('radio', { name: 'Messages' }));
     expect(onFilesToggle).toHaveBeenCalledWith(false);
   });
 
@@ -181,6 +353,26 @@ describe('RelationshipHeader', () => {
 
     await fireEvent.keyDown(window, { key: 'Escape' });
     expect(screen.queryByRole('dialog', { name: /Link another identity/ })).toBeNull();
+  });
+
+  it('replaces the link dialog with the shared merge modal without replaying the link', async () => {
+    const conflict = {
+      error: 'person_merge_required', message: 'Choose a survivor', profiles: [
+        { etag: '"person-7-r4"', person: { id: 7, revision: 4, display_name: 'Synthetic One' } },
+        { etag: '"person-9-r2"', person: { id: 9, revision: 2, display_name: 'Synthetic Two' } }
+      ]
+    } as unknown as ValidatedPersonMergeRequired;
+    const onLinkParticipants = vi.fn(async (): Promise<LinkOutcome> => ({
+      ok: false, code: 'merge_required', message: conflict.message, conflict
+    }));
+    render(RelationshipHeader, baseProps({ onLinkParticipants }));
+
+    await linkToSearchResult();
+
+    expect(screen.queryByRole('dialog', { name: /Link another identity/ })).toBeNull();
+    expect(screen.getByRole('dialog', { name: 'Resolve person merge' })).toBeDefined();
+    expect(screen.getAllByRole('dialog')).toHaveLength(1);
+    expect(onLinkParticipants).toHaveBeenCalledOnce();
   });
 
   it('links against the open cluster member ID; an ok/ready outcome closes the dialog silently', async () => {
@@ -272,6 +464,125 @@ describe('RelationshipHeader', () => {
     await waitFor(() => expect(onUnlinkParticipants).toHaveBeenCalledWith(12, 78));
   });
 
+  it('names a linked member chip and its controls by its visible address', async () => {
+    const base = clusteredPersonWithBareMember();
+    render(RelationshipHeader, baseProps({ detail: {
+      ...base,
+      cluster: { ...base.cluster!, members: [{ participant_id: 78, email: 'bare@example.com' }] }
+    } }));
+
+    const chip = screen.getByLabelText('Linked profile bare@example.com');
+    expect(chip.textContent).toContain('bare@example.com');
+    expect(chip.textContent).not.toContain('no stored address');
+    await fireEvent.click(screen.getByRole('button', { name: 'Unlink profile bare@example.com' }));
+    expect(screen.getByRole('group', { name: 'Confirm unlinking profile bare@example.com' })).toBeDefined();
+  });
+
+  it('distinguishes member-only controls with identical display names', () => {
+    const base = clusteredPersonWithBareMember();
+    render(RelationshipHeader, baseProps({ detail: {
+      ...base,
+      identifiers: base.identifiers.filter((identifier) => identifier.participant_id !== 56),
+      cluster: { ...base.cluster!, members: [
+        { participant_id: 56, display_name: 'Shared Example' },
+        { participant_id: 78, display_name: 'Shared Example' }
+      ] }
+    } }));
+
+    expect(screen.getByRole('button', { name: 'Unlink profile Shared Example (56)' })).toBeDefined();
+    expect(screen.getByRole('button', { name: 'Unlink profile Shared Example (78)' })).toBeDefined();
+  });
+
+  it('falls back to the member ID for a chip whose member has no stored name or address', () => {
+    render(RelationshipHeader, baseProps({ detail: clusteredPersonWithBareMember() }));
+
+    expect(screen.getByLabelText('Linked profile 78').textContent).toContain('no stored address');
+  });
+
+  it('hides an opaque key on the chip and copies the full value', async () => {
+    let copied = '';
+    const originalClipboard = navigator.clipboard;
+    const originalExecCommand = document.execCommand;
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+    Object.defineProperty(document, 'execCommand', { configurable: true, value: vi.fn(() => {
+      copied = document.querySelector('textarea')?.value ?? '';
+      return true;
+    }) });
+    try {
+      const key = 'beeper:8:whatsapp:9:@user:x.y';
+      const base = person();
+      render(RelationshipHeader, baseProps({ detail: {
+        ...base,
+        identifiers: [...base.identifiers, {
+          type: 'beeper', value: key, display_value: key, is_primary: false,
+          participant_id: 12, provenance: 'participant_identifiers', service_label: 'WhatsApp',
+          participant_display_name: 'Alias Example', scope_kind: 'account', scope_value: 'local-whatsapp_ba_example'
+        }]
+      } }));
+
+      const copy = screen.getByRole('button', { name: 'Copy WhatsApp identifier for Alias Example (profile 12)' });
+      const chip = copy.closest('.chip');
+      expect(chip?.textContent).toContain('WhatsApp');
+      expect(chip?.textContent).not.toContain('local-whatsapp_ba_example');
+      expect(chip?.getAttribute('title')).toContain('account: local-whatsapp_ba_example');
+      expect(chip?.textContent).not.toContain(key);
+      expect(chip?.getAttribute('title')).toContain(key);
+      await fireEvent.click(copy);
+      await waitFor(() => expect(copied).toBe(key));
+    } finally {
+      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: originalClipboard });
+      Object.defineProperty(document, 'execCommand', { configurable: true, value: originalExecCommand });
+    }
+  });
+
+  it('shows every distinct origin incident to a linked member', () => {
+    const base = clusteredPerson();
+    render(RelationshipHeader, baseProps({ detail: {
+      ...base,
+      cluster: { ...base.cluster!, edges: [
+        { participant_a: 12, participant_b: 34, link_origin: { kind: 'manual' } },
+        { participant_a: 34, participant_b: 56,
+          link_origin: { kind: 'candidate', source: 'carddav_import', basis: 'email' } }
+      ] }
+    } }));
+
+    const chip = screen.getByLabelText('Identity +15550100002');
+    expect(chip.textContent).toContain('linked manually');
+    expect(chip.textContent).toContain('matched from CardDAV (email)');
+  });
+
+  it('does not describe other links on the viewed profile’s own identifier', () => {
+    const base = clusteredPerson();
+    render(RelationshipHeader, baseProps({ detail: {
+      ...base,
+      cluster: { ...base.cluster!, edges: [
+        { participant_a: 12, participant_b: 34, link_origin: { kind: 'manual' } }
+      ] }
+    } }));
+
+    expect(screen.getByLabelText('Identity Alice').textContent).toContain('this profile');
+    expect(screen.getByLabelText('Identity Alice').textContent).not.toContain('linked manually');
+    expect(screen.getByLabelText('Identity +15550100002').textContent).toContain('linked manually');
+  });
+
+  it('distinguishes opaque identity controls even when service and member names match', async () => {
+    const base = clusteredPerson();
+    render(RelationshipHeader, baseProps({ detail: {
+      ...base,
+      identifiers: [34, 56].map((id) => ({
+        type: 'beeper', value: `beeper-user-${id}`, participant_id: id,
+        is_primary: true, provenance: 'participant_identifiers',
+        service_label: 'WhatsApp', participant_display_name: 'Alias Example'
+      }))
+    } }));
+
+    expect(screen.getByRole('button', { name: 'Copy WhatsApp identifier for Alias Example (profile 34)' })).toBeDefined();
+    expect(screen.getByRole('button', { name: 'Copy WhatsApp identifier for Alias Example (profile 56)' })).toBeDefined();
+    expect(screen.getByRole('button', { name: 'Unlink WhatsApp identifier for Alias Example (profile 34)' })).toBeDefined();
+    await fireEvent.click(screen.getByRole('button', { name: 'Unlink WhatsApp identifier for Alias Example (profile 56)' }));
+    expect(screen.getByRole('group', { name: 'Confirm unlinking WhatsApp identifier for Alias Example (profile 56)' })).toBeDefined();
+  });
+
   it('confirming a cut-vertex member\'s unlink removes every edge incident to it, not just one', async () => {
     const onUnlinkParticipants = vi.fn(async (): Promise<LinkOutcome> => ({ ok: true, identityRevision: 4, cacheState: 'ready' }));
     render(RelationshipHeader, baseProps({ detail: clusteredPerson(), onUnlinkParticipants }));
@@ -317,10 +628,13 @@ describe('RelationshipHeader', () => {
     const onUnlinkParticipants = vi.fn(async (): Promise<LinkOutcome> => ({ ok: false, code: 'error', message: 'Request failed (500)' }));
     render(RelationshipHeader, baseProps({ detail: clusteredPerson(), onUnlinkParticipants }));
 
+    await fireEvent.click(screen.getByText('Identities (3)'));
     await fireEvent.click(screen.getByRole('button', { name: 'Unlink +15550100002' }));
     await fireEvent.click(screen.getByRole('button', { name: 'Unlink' }));
 
     expect((await screen.findByRole('alert')).textContent).toContain('Request failed (500)');
+    await fireEvent.click(screen.getByText('Identities (3)'));
+    await waitFor(() => expect(screen.getByText('Identities (3)').closest('details')?.open).toBe(true));
     expect(onUnlinkParticipants).toHaveBeenCalledTimes(1);
   });
 

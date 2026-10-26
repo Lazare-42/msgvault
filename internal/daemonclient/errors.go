@@ -2,14 +2,17 @@ package daemonclient
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
 	"reflect"
 	"slices"
+	"strings"
 
+	"github.com/cenkalti/backoff/v7"
 	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
 	"go.kenn.io/msgvault/internal/vector"
 	apiclient "go.kenn.io/msgvault/pkg/client"
@@ -56,6 +59,15 @@ func (e *APIError) Unwrap() error {
 	}
 }
 
+// CLIRunError marks a decoded daemon CLI refusal or stream error event.
+type CLIRunError struct {
+	err error
+}
+
+func (e *CLIRunError) Error() string { return e.err.Error() }
+
+func (e *CLIRunError) Unwrap() error { return e.err }
+
 // operationInProgressCode is the daemon's error code for "the operation gate
 // is held by other work"; clients wait and retry instead of failing.
 const operationInProgressCode = "operation_in_progress"
@@ -83,12 +95,6 @@ func operationInProgressFromBody(body []byte) error {
 // error that includes the HTTP status.
 func HandleErrorResponse(resp *http.Response) error {
 	return handleRawErrorResponse(resp, handleErrorBody)
-}
-
-// HandleCLIErrorResponse reads a CLI error response body and returns the
-// daemon's user-facing message when one is available.
-func HandleCLIErrorResponse(resp *http.Response) error {
-	return handleRawErrorResponse(resp, handleCLIErrorBody)
 }
 
 func handleRawErrorResponse(
@@ -131,6 +137,17 @@ func apiErrorMessage(body []byte) (message, code string, decoded bool) {
 	return string(body), "", false
 }
 
+func handleCLIRunErrorBody(status int, body []byte) error {
+	err := handleCLIErrorBody(status, body)
+	if _, busy := errors.AsType[*OperationInProgressError](err); busy {
+		return err
+	}
+	if _, _, decoded := apiErrorMessage(body); decoded {
+		return &CLIRunError{err: err}
+	}
+	return err
+}
+
 // APIResponseError maps generated non-CLI responses to daemonclient errors.
 func APIResponseError(resp any, err error) error {
 	return responseError(resp, err, []int{http.StatusOK}, handleErrorBody)
@@ -139,6 +156,17 @@ func APIResponseError(resp any, err error) error {
 // CLIResponseError maps generated CLI responses to user-facing errors.
 func CLIResponseError(resp any, err error) error {
 	return responseError(resp, err, []int{http.StatusOK}, handleCLIErrorBody)
+}
+
+// CLIResponseWithStatuses keeps CLI error wording while allowing an endpoint
+// to return an accepted asynchronous operation alongside ordinary results.
+func CLIResponseWithStatuses[R any](
+	c *Client, successStatuses []int,
+	request func(*apiclient.Client) (R, error),
+) (R, error) {
+	return generatedResponse(c, request, func(resp any, err error) error {
+		return responseError(resp, err, successStatuses, handleCLIErrorBody)
+	})
 }
 
 // APIResponse executes a generated request and validates its response.
@@ -185,7 +213,7 @@ func APIResponseWithNotFound[R any](
 	}
 	resp, err := request(client)
 	if meta, ok := responseMetadata(resp); ok &&
-		meta.Status == http.StatusNotFound && !responseDecodeError(err) {
+		meta.Status == http.StatusNotFound && !contractDecodeError(err, false) {
 		return zero, notFound(resp)
 	}
 	if err := APIResponseError(resp, err); err != nil {
@@ -213,21 +241,29 @@ func generatedResponse[R any](
 		return zero, err
 	}
 	waiter := &operationBusyWaiter{c: c}
-	for {
+	ctx := c.requestContext()
+	resp, err := backoff.Retry(ctx, func() (R, error) {
 		resp, err := request(client)
 		checkErr := checkResponse(resp, err)
 		if checkErr == nil {
 			return resp, nil
 		}
-		waitCtx := c.requestContext()
-		if waiter.wait(waitCtx, checkErr) {
-			continue
+		if err := ctx.Err(); err != nil {
+			return zero, backoff.Permanent(err)
 		}
-		if err := waitCtx.Err(); err != nil {
-			return zero, err
+		if _, busy := errors.AsType[*OperationInProgressError](checkErr); !busy {
+			return zero, backoff.Permanent(checkErr)
 		}
 		return zero, checkErr
+	}, backoff.WithBackOff(backoff.NewConstantBackOff(operationBusyRetryDelay)),
+		backoff.WithMaxTries(0), backoff.WithMaxElapsedTime(0), backoff.WithNotify(waiter.notify))
+	if err == nil {
+		return resp, nil
 	}
+	if ctx.Err() != nil {
+		return zero, ctx.Err()
+	}
+	return zero, backoff.AsRetryError(err).LastErr
 }
 
 func responseError(
@@ -249,10 +285,11 @@ func responseError(
 		}
 		return fmt.Errorf("unexpected generated response type %T", resp)
 	}
-	if responseDecodeError(err) {
+	expected := slices.Contains(expectedStatuses, meta.Status)
+	if contractDecodeError(err, expected) {
 		return fmt.Errorf("decode generated response: %w", err)
 	}
-	if !slices.Contains(expectedStatuses, meta.Status) {
+	if !expected {
 		return decodeErrorBody(meta.Status, meta.Body)
 	}
 	if err != nil {
@@ -312,9 +349,22 @@ func responseMetadata(resp any) (responseInfo, bool) {
 	return info, true
 }
 
-func responseDecodeError(err error) bool {
-	var decodeErr *runtime.ResponseDecodeError
-	return errors.As(err, &decodeErr)
+// contractDecodeError reports whether a generated decode failure breaks the
+// API contract. The generated client also decodes error bodies, so a proxy or
+// router error page in plain text fails to decode. Only a success response or
+// a body labelled as JSON is a contract failure; other error bodies go to the
+// raw error decoders.
+func contractDecodeError(err error, successStatus bool) bool {
+	decodeErr, ok := errors.AsType[*runtime.ResponseDecodeError](err)
+	if !ok {
+		return false
+	}
+	if successStatus {
+		return true
+	}
+	mediaType, _, parseErr := mime.ParseMediaType(decodeErr.ContentType)
+	return parseErr == nil &&
+		(mediaType == "application/json" || strings.HasSuffix(mediaType, "+json"))
 }
 
 // DecodeGeneratedSearchBody decodes a generated search response body into the

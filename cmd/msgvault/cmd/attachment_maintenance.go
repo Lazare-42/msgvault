@@ -5,20 +5,32 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
+	"time"
 
 	"go.kenn.io/kit/packstore"
 
 	"go.kenn.io/msgvault/internal/api"
 	"go.kenn.io/msgvault/internal/attachmentstore"
+	"go.kenn.io/msgvault/internal/export"
+	"go.kenn.io/msgvault/internal/jobctx"
 	"go.kenn.io/msgvault/internal/scheduler"
 	"go.kenn.io/msgvault/internal/store"
 )
 
 const (
-	automaticAttachmentBytes  = int64(256 << 20)
-	attachmentMaintenanceJob  = "attachment-maintenance"
-	attachmentMaintenanceCron = "17 3 * * *"
-	importMboxCommand         = "import-mbox"
+	automaticAttachmentBytes = int64(256 << 20)
+	// Kit's Pack and Repack cannot stop at a checkpoint on request, so the
+	// scheduled jobs are not preemptible. This limit alone returns the gate.
+	automaticAttachmentMaxRuntime = time.Minute
+	attachmentMaintenanceJob      = "attachment-maintenance"
+	attachmentMaintenanceCron     = "17 3 * * *"
+	// attachmentPackJob packs blobs that scheduled syncs left loose. A pass
+	// re-reads the whole pack catalog, so it runs a few times a day rather
+	// than after every sync. Bounded follow-ups drain any remaining backlog.
+	attachmentPackJob  = "attachment-pack"
+	attachmentPackCron = "41 */6 * * *"
+	importMboxCommand  = "import-mbox"
 )
 
 // attachmentMaintenance coordinates daemon-owned attachment maintenance. Its
@@ -31,6 +43,10 @@ type attachmentMaintenance struct {
 	blob                *attachmentstore.Store
 	logger              *slog.Logger
 	packCreationEnabled bool
+	attachmentsDir      string
+	// packPending records that a scheduled sync wrote loose blobs that no
+	// pack pass has drained yet. Startup requests one scan of existing blobs.
+	packPending atomic.Bool
 }
 
 func newAttachmentMaintenance(
@@ -59,6 +75,7 @@ func newAttachmentMaintenance(
 		blob:                attachmentstore.Wrap(maintainer.Store()),
 		logger:              logger,
 		packCreationEnabled: packCreationEnabled,
+		attachmentsDir:      attachmentsDir,
 	}, nil
 }
 
@@ -117,14 +134,24 @@ func (m *attachmentMaintenance) runAutomaticPack(ctx context.Context, emitWarnin
 		m.log().Debug("automatic attachment packing disabled")
 		return nil
 	}
+	start := time.Now()
 	stats, err := m.pack(ctx, automaticAttachmentBytes)
+	// Each counter is a committed change a later pass need not repeat.
+	// PacksQuarantined is not: a damaged pack stays in place and is counted
+	// again on every pass.
+	if stats.BlobsPacked > 0 || stats.PacksAdopted > 0 || stats.PacksRemoved > 0 ||
+		stats.MappingsPruned > 0 || stats.RecordsDropped > 0 || stats.LooseSwept > 0 ||
+		stats.LooseOrphansRemoved > 0 {
+		jobctx.RecordProgress(ctx)
+	}
+	duration := time.Since(start)
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			m.log().Info("automatic attachment maintenance canceled")
 			return err
 		}
 
-		m.logAutomaticPackSummary("automatic attachment maintenance progress", stats)
+		m.logAutomaticPackSummary("automatic attachment maintenance progress", stats, duration)
 		const retry = "run `msgvault pack-attachments` to retry"
 		m.log().Warn("automatic attachment maintenance failed",
 			"error", err,
@@ -139,12 +166,16 @@ func (m *attachmentMaintenance) runAutomaticPack(ctx context.Context, emitWarnin
 		return err
 	}
 
-	m.logAutomaticPackSummary("automatic attachment maintenance complete", stats)
+	m.logAutomaticPackSummary("automatic attachment maintenance complete", stats, duration)
+	if stats.BudgetExhausted {
+		m.markPackPending()
+	}
 	return nil
 }
 
-func (m *attachmentMaintenance) logAutomaticPackSummary(message string, stats packstore.PackStats) {
+func (m *attachmentMaintenance) logAutomaticPackSummary(message string, stats packstore.PackStats, duration time.Duration) {
 	m.log().Info(message,
+		"duration", duration.Round(time.Millisecond),
 		"max_bytes", automaticAttachmentBytes,
 		"packs_sealed", stats.PacksSealed,
 		"blobs_packed", stats.BlobsPacked,
@@ -169,13 +200,18 @@ func (m *attachmentMaintenance) runAutomaticRepack(ctx context.Context, emitWarn
 		m.log().Debug("automatic attachment repacking disabled")
 		return nil
 	}
+	start := time.Now()
 	stats, err := m.repack(ctx, automaticAttachmentBytes)
+	if stats.PacksRewritten > 0 || stats.PacksRemoved > 0 || stats.MappingsPruned > 0 {
+		jobctx.RecordProgress(ctx)
+	}
+	duration := time.Since(start)
 	if err != nil {
-		if errors.Is(err, context.Canceled) {
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			m.log().Info("automatic attachment repack canceled")
 			return err
 		}
-		m.logAutomaticRepackSummary("automatic attachment repack progress", stats)
+		m.logAutomaticRepackSummary("automatic attachment repack progress", stats, duration)
 		const retry = "run `msgvault repack-attachments` to retry"
 		m.log().Warn("automatic attachment repack failed", "error", err, "retry", retry)
 		if emitWarning != nil {
@@ -186,12 +222,13 @@ func (m *attachmentMaintenance) runAutomaticRepack(ctx context.Context, emitWarn
 		}
 		return err
 	}
-	m.logAutomaticRepackSummary("automatic attachment repack complete", stats)
+	m.logAutomaticRepackSummary("automatic attachment repack complete", stats, duration)
 	return nil
 }
 
-func (m *attachmentMaintenance) logAutomaticRepackSummary(message string, stats packstore.RepackStats) {
+func (m *attachmentMaintenance) logAutomaticRepackSummary(message string, stats packstore.RepackStats, duration time.Duration) {
 	m.log().Info(message,
+		"duration", duration.Round(time.Millisecond),
 		"max_bytes", automaticAttachmentBytes,
 		"mappings_pruned", stats.MappingsPruned,
 		"packs_selected", stats.PacksSelected,
@@ -204,14 +241,77 @@ func (m *attachmentMaintenance) logAutomaticRepackSummary(message string, stats 
 		"budget_exhausted", stats.BudgetExhausted)
 }
 
+// runScheduledPack bounds existing-blob verification as well as new pack bytes.
+func (m *attachmentMaintenance) runScheduledPack(ctx context.Context) error {
+	if !m.packCreationEnabled {
+		return nil
+	}
+	packCtx, pass, err := m.store.BeginPackVerification(ctx, 128, 32<<20)
+	if err != nil {
+		return err
+	}
+	if err := m.runAutomaticPack(packCtx, nil); err != nil {
+		return err
+	}
+	more, err := m.store.FinishPackVerification(ctx, pass)
+	if err != nil {
+		return err
+	}
+	if more {
+		// A completed verification cycle restarts on the next request. Only an
+		// unfinished window provides a resume point for a budgeted follow-up.
+		jobctx.RecordProgress(ctx)
+		m.markPackPending()
+	}
+	return nil
+}
+
 // daily runs the two bounded phases in order. A failed pack phase stops the
 // job so the scheduler records the failure instead of obscuring it with a
 // second maintenance result.
 func (m *attachmentMaintenance) daily(ctx context.Context) error {
-	if err := m.runAutomaticPack(ctx, nil); err != nil {
+	m.packPending.Store(false)
+	if err := m.runScheduledPack(ctx); err != nil {
+		m.markPackPending()
 		return err
 	}
+	if m.packPending.Load() {
+		return scheduler.ErrReschedule
+	}
 	return m.runAutomaticRepack(ctx, nil)
+}
+
+// markPackPending records that loose blobs await the next pack pass.
+func (m *attachmentMaintenance) markPackPending() {
+	if m != nil {
+		m.packPending.Store(true)
+	}
+}
+
+// runPendingPack runs one automatic pack pass when a scheduled sync left new
+// loose blobs since the last pass. A failed pass leaves the request pending;
+// an exhausted byte budget queues another pass behind waiting work.
+func (m *attachmentMaintenance) runPendingPack(ctx context.Context) error {
+	if m == nil || !m.packPending.Swap(false) {
+		return nil
+	}
+	if err := m.runScheduledPack(ctx); err != nil {
+		m.packPending.Store(true)
+		return err
+	}
+	if m.packPending.Load() {
+		return scheduler.ErrReschedule
+	}
+	return nil
+}
+
+// looseBlobWrites reports the in-process count of loose blobs created under
+// this maintenance's attachments directory.
+func (m *attachmentMaintenance) looseBlobWrites() int64 {
+	if m == nil || m.attachmentsDir == "" {
+		return 0
+	}
+	return export.LooseBlobWrites(m.attachmentsDir)
 }
 
 func (m *attachmentMaintenance) log() *slog.Logger {
@@ -269,11 +369,19 @@ func runWithAttachmentMutation(
 	if err != nil {
 		return fmt.Errorf("acquire attachment mutation lease: %w", err)
 	}
-	return errors.Join(run(ctx), lease.Release())
+	runErr := run(ctx)
+	if releaseErr := lease.Release(); releaseErr != nil {
+		return errors.Join(runErr, releaseErr)
+	}
+	// Keep a bare deferral unchanged when release succeeds; the scheduler compares it directly.
+	return runErr
 }
 
 // runScheduledSource distinguishes attachment-producing provider/SyncTech
 // sources from calendar-only sources while preserving one shared wrapper.
+// Packing never runs inline: a pack pass re-reads the whole pack catalog and
+// excludes every ingest while it runs, so a scheduled sync only records that
+// it wrote new loose blobs and the attachment-pack job packs them later.
 func runScheduledSource(
 	ctx context.Context,
 	maintenance *attachmentMaintenance,
@@ -283,16 +391,34 @@ func runScheduledSource(
 	if !attachmentProducing {
 		return run(ctx)
 	}
-	return runAfterSuccessfulAttachmentIngest(ctx, maintenance, run, nil)
+	before := maintenance.looseBlobWrites()
+	err := runWithAttachmentMutation(ctx, maintenance, run)
+	if maintenance != nil && maintenance.looseBlobWrites() != before {
+		maintenance.markPackPending()
+	}
+	return err
 }
 
 func registerAttachmentMaintenanceJob(sched *scheduler.Scheduler, maintenance *attachmentMaintenance) error {
 	return sched.AddJob(scheduler.Job{
-		Name:     attachmentMaintenanceJob,
-		Schedule: attachmentMaintenanceCron,
+		Name:       attachmentMaintenanceJob,
+		MaxRuntime: automaticAttachmentMaxRuntime,
+		Schedule:   attachmentMaintenanceCron,
 		Run: func(ctx context.Context) error {
 			return maintenance.daily(ctx)
 		},
+	})
+}
+
+func registerAttachmentPackJob(sched *scheduler.Scheduler, maintenance *attachmentMaintenance) error {
+	// Recheck the catalog on the first tick after startup. In-memory write
+	// counts cannot tell us what a previous daemon left loose.
+	maintenance.markPackPending()
+	return sched.AddJob(scheduler.Job{
+		Name:       attachmentPackJob,
+		MaxRuntime: automaticAttachmentMaxRuntime,
+		Schedule:   attachmentPackCron,
+		Run:        maintenance.runPendingPack,
 	})
 }
 
@@ -305,8 +431,9 @@ func registerScheduledBeeperJob(
 	// Every beeper store source (one per beeper AccountID) maps to this
 	// singleton job name via api.SchedulerJobNameForSource.
 	return sched.AddJob(scheduler.Job{
-		Name:     api.BeeperJobName,
-		Schedule: schedule,
+		Name:        api.BeeperJobName,
+		Schedule:    schedule,
+		Preemptible: true,
 		Run: func(ctx context.Context) error {
 			return runScheduledSource(ctx, maintenance, true, run)
 		},
@@ -320,24 +447,31 @@ func attachmentProducingCommand(args []string) bool {
 		return false
 	}
 	switch args[0] {
-	case "backfill-beeper-media",
+	case "archive-remote-images",
+		"backfill-beeper-media",
 		"backfill-discord-media",
 		"backfill-slack-media",
 		"backfill-teams-media",
 		"import",
+		"import-maildir",
+		"import-eml",
 		"import-emlx",
 		"import-gvoice",
+		"import-imazing-csv",
 		"import-imessage",
 		importMboxCommand,
 		"import-messenger",
 		"import-pst",
+		"import-slackdump",
 		"import-synctech-sms",
 		"import-whatsapp",
 		"sync-beeper",
+		"sync-chatwoot",
 		"sync-discord",
 		"sync-slack",
 		"sync-synctech-sms",
-		"sync-teams":
+		"sync-teams",
+		"sync-twilio":
 		return true
 	default:
 		return false

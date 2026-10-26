@@ -67,7 +67,7 @@ func newEnrichmentTriggerFixture(t *testing.T, profileCount int) enrichmentTrigg
 	return enrichmentTriggerFixture{store: f.Store, person: person, profiles: profiles, now: now}
 }
 
-func (f enrichmentTriggerFixture) grant(t *testing.T, index int) *store.PersonEnrichmentConsent {
+func (f enrichmentTriggerFixture) grant(t *testing.T, index int) *store.ProviderConsent {
 	t.Helper()
 	consent, created, err := f.store.GrantPersonEnrichmentConsent(
 		t.Context(), f.profiles[index].Fingerprint, "test")
@@ -173,7 +173,7 @@ func TestPersonEnrichmentManualRunCompletedIdempotencyRejectsDifferentPerson(t *
 	requirements.NoError(err)
 	requirements.True(created)
 	lease, err := f.store.ClaimWork(t.Context(), personenrichment.ClaimOptions{
-		RunID: run.ID, Owner: "manual-target-worker", ProviderName: f.profiles[0].Name,
+		RunID: run.ID, Owner: "manual-target-worker", ProviderName: f.profiles[0].Name, ProfileFingerprint: f.profiles[0].Fingerprint,
 		Now: f.now, LeaseDuration: time.Minute,
 	})
 	requirements.NoError(err)
@@ -323,7 +323,7 @@ func testPersonEnrichmentMissingPersonRevocation(t *testing.T, st *store.Store, 
 	select {
 	case <-trackingPersonLocked:
 		earlyPersonMutation = true
-	case <-time.After(250 * time.Millisecond):
+	case <-time.After(250 * time.Millisecond): //nolint:kennlint // absence check: the authority gate keeps tracking from locking the person
 	}
 	if manual && earlyPersonMutation {
 		select {
@@ -507,7 +507,7 @@ func TestPersonEnrichmentTriggerCoalescingKeepsSelectedKindAndGenerationPaired(t
 				})
 				require.NoError(err)
 				lease, err := f.store.ClaimWork(t.Context(), personenrichment.ClaimOptions{
-					RunID: run.ID, Owner: "pair-worker", ProviderName: f.profiles[0].Name,
+					RunID: run.ID, Owner: "pair-worker", ProviderName: f.profiles[0].Name, ProfileFingerprint: f.profiles[0].Fingerprint,
 					Now: f.now, LeaseDuration: time.Minute,
 				})
 				require.NoError(err)
@@ -645,6 +645,124 @@ func TestPersonEnrichmentCatchUpRepairsMissingTrackedWorkAndExcludesUntracked(t 
 	assert.Zero(count)
 }
 
+func TestPersonEnrichmentCatchUpDoesNotRepeatTerminalAttempts(t *testing.T) {
+	for _, kind := range []personenrichment.TriggerKind{
+		personenrichment.TriggerTracked, personenrichment.TriggerManual, personenrichment.TriggerExpiry,
+	} {
+		t.Run(string(kind), func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			f := newEnrichmentWorkFixture(t)
+			run := f.startRun(t, "terminal-catch-up")
+			trigger := personenrichment.Trigger{Kind: kind, Generation: "initial"}
+			if kind == personenrichment.TriggerExpiry {
+				claimID := insertProviderClaim(t, f.store, f.person.ID, f.profile.Fingerprint, "expired", f.now.Add(-time.Minute))
+				trigger.Generation = "claim:" + strconv.FormatInt(claimID, 10)
+			}
+			require.NoError(f.store.PutPersonEnrichmentWorkContext(t.Context(), store.PersonEnrichmentWorkInput{
+				PersonID: f.person.ID, ProfileFingerprint: f.profile.Fingerprint, Trigger: trigger, DueAt: f.now,
+			}))
+			lease := f.claim(t, run.ID, "worker")
+			start := testAttemptStart(&f, run.ID, "a")
+			start.Trigger = trigger
+			attempt, _, err := f.store.BeginAttempt(t.Context(), lease.Token, start)
+			require.NoError(err)
+			require.NoError(f.store.MarkTerminal(t.Context(), attempt.Token, personenrichment.SafeFailure{
+				Class: personenrichment.FailureInvalidOutput, Message: "invalid provider output",
+			}))
+			for range 2 {
+				count, err := f.store.EnqueueDuePersonEnrichmentContext(t.Context(), f.now, 200, []string{f.profile.Fingerprint})
+				require.NoError(err)
+				assert.Zero(count)
+				assert.Empty(f.work(t))
+			}
+
+			// A deliberate new operation must still be possible after failure.
+			require.NoError(f.store.EnqueuePersonEnrichmentContext(t.Context(), store.EnrichmentTriggerInput{
+				PersonID: f.person.ID, ProfileFingerprint: f.profile.Fingerprint,
+				Kind: personenrichment.TriggerManual, Generation: "manual:retry", DueAt: f.now,
+			}))
+			work := f.work(t)
+			require.Len(work, 1)
+			assert.Equal("manual:retry", work[0].TriggerGeneration)
+			require.NoError(clearEnrichmentWork(t, f.store, f.person.ID))
+
+			// Catch-up can repair work for a later person revision.
+			_, err = f.store.AddPersonContactPointContext(t.Context(), f.person.ID, store.PersonContactPointInput{
+				AddressKind: store.ContactAddressURL, OriginalValue: "https://profiles.example.test/updated-person",
+				Envelope: store.ValueEnvelopeInput{Source: store.ProvenanceUser},
+			})
+			require.NoError(err)
+			require.NoError(clearEnrichmentWork(t, f.store, f.person.ID))
+			count, err := f.store.EnqueueDuePersonEnrichmentContext(t.Context(), f.now, 200, []string{f.profile.Fingerprint})
+			require.NoError(err)
+			assert.Equal(1, count)
+		})
+	}
+}
+
+func TestPersonEnrichmentCatchUpConsumesExpiryWithHigherPriorityWork(t *testing.T) {
+	for _, kind := range []personenrichment.TriggerKind{personenrichment.TriggerManual, personenrichment.TriggerIdentity} {
+		t.Run(string(kind), func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+			f := newEnrichmentWorkFixture(t)
+			insertProviderClaim(t, f.store, f.person.ID, f.profile.Fingerprint, "coalesced-expiry", f.now.Add(-time.Minute))
+			run := f.startRun(t, "coalesced-expiry")
+			trigger := personenrichment.Trigger{Kind: kind, Generation: "higher-priority"}
+			require.NoError(f.store.EnqueuePersonEnrichmentContext(t.Context(), store.EnrichmentTriggerInput{
+				PersonID: f.person.ID, ProfileFingerprint: f.profile.Fingerprint,
+				Kind: kind, Generation: trigger.Generation, DueAt: f.now,
+			}))
+			count, err := f.store.EnqueueDuePersonEnrichmentContext(t.Context(), f.now, 200, []string{f.profile.Fingerprint})
+			require.NoError(err)
+			require.Equal(1, count)
+			work := f.work(t)
+			require.Len(work, 1)
+			require.NotZero(work[0].TriggerMask & 4)
+			lease := f.claim(t, run.ID, "worker")
+			require.Equal(trigger, lease.Trigger)
+			start := testAttemptStart(&f, run.ID, "a")
+			start.Trigger = lease.Trigger
+			attempt, _, err := f.store.BeginAttempt(t.Context(), lease.Token, start)
+			require.NoError(err)
+			require.NoError(f.store.MarkTerminal(t.Context(), attempt.Token, personenrichment.SafeFailure{
+				Class: personenrichment.FailureInvalidOutput, Message: "invalid provider output",
+			}))
+			require.Empty(f.work(t))
+			for range 2 {
+				count, err = f.store.EnqueueDuePersonEnrichmentContext(t.Context(), f.now, 200, []string{f.profile.Fingerprint})
+				require.NoError(err)
+				assert.Zero(count)
+				assert.Empty(f.work(t))
+			}
+		})
+	}
+}
+
+func TestPersonEnrichmentCatchUpDoesNotConsumeFutureExpiry(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	f := newEnrichmentWorkFixture(t)
+	expires := f.now.Add(time.Minute)
+	claimID := insertProviderClaim(t, f.store, f.person.ID, f.profile.Fingerprint, "future-expiry", expires)
+	run := f.startRun(t, "before-expiry")
+	f.enqueue(t)
+	lease := f.claim(t, run.ID, "worker")
+	attempt, _, err := f.store.BeginAttempt(t.Context(), lease.Token, testAttemptStart(&f, run.ID, "a"))
+	require.NoError(err)
+	require.NoError(f.store.MarkTerminal(t.Context(), attempt.Token, personenrichment.SafeFailure{
+		Class: personenrichment.FailureInvalidOutput, Message: "invalid provider output",
+	}))
+	f.setNow(expires.Add(time.Minute))
+	count, err := f.store.EnqueueDuePersonEnrichmentContext(t.Context(), f.now, 200, []string{f.profile.Fingerprint})
+	require.NoError(err)
+	assert.Equal(1, count)
+	work := f.work(t)
+	require.Len(work, 1)
+	assert.Equal("claim:"+strconv.FormatInt(claimID, 10), work[0].TriggerGeneration)
+}
+
 func TestPersonEnrichmentCatchUpSerializesWithConsentRevocation(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -686,7 +804,7 @@ func TestPersonEnrichmentCatchUpSerializesWithConsentRevocation(t *testing.T) {
 	select {
 	case revokeErr = <-revokeDone:
 		earlyRemoval = true
-	case <-time.After(250 * time.Millisecond):
+	case <-time.After(250 * time.Millisecond): //nolint:kennlint // absence check: the held catch-up keeps the revoke waiting
 	}
 	release()
 	require.NoError(<-catchUpDone)
@@ -698,7 +816,7 @@ func TestPersonEnrichmentCatchUpSerializesWithConsentRevocation(t *testing.T) {
 	assert.Empty(f.work(t, 0))
 }
 
-func TestPersonEnrichmentCatchUpDoesNotRecreateUnavailableProfileWork(t *testing.T) {
+func TestPersonEnrichmentCatchUpLeavesUnavailableProfileWorkQueued(t *testing.T) {
 	for _, expiredClaim := range []bool{false, true} {
 		t.Run("expired_claim="+strconv.FormatBool(expiredClaim), func(t *testing.T) {
 			requirements := require.New(t)
@@ -714,13 +832,13 @@ func TestPersonEnrichmentCatchUpDoesNotRecreateUnavailableProfileWork(t *testing
 			}
 			requirements.NoError(f.store.CancelPersonEnrichmentWorkOutsideProfilesContext(
 				t.Context(), []string{f.profiles[0].Fingerprint}))
-			checks.Empty(f.work(t, 1))
+			checks.Len(f.work(t, 1), 1)
 
 			count, err := f.store.EnqueueDuePersonEnrichmentContext(
 				t.Context(), f.now, 200, []string{f.profiles[0].Fingerprint})
 			requirements.NoError(err)
 			checks.Zero(count)
-			checks.Empty(f.work(t, 1))
+			checks.Len(f.work(t, 1), 1)
 		})
 	}
 }
@@ -799,7 +917,7 @@ func TestPersonEnrichmentTriggerConsentGrantAndRevocationCancelPendingWork(t *te
 	})
 	require.NoError(err)
 	lease, err := f.store.ClaimWork(t.Context(), personenrichment.ClaimOptions{
-		RunID: run.ID, Owner: "test-worker", ProviderName: f.profiles[0].Name,
+		RunID: run.ID, Owner: "test-worker", ProviderName: f.profiles[0].Name, ProfileFingerprint: f.profiles[0].Fingerprint,
 		Now: f.now, LeaseDuration: time.Minute,
 	})
 	require.NoError(err)
@@ -828,6 +946,12 @@ func TestPersonEnrichmentTriggerConsentGrantAndRevocationCancelPendingWork(t *te
 	stored, err := f.store.GetPersonEnrichmentAttemptContext(t.Context(), attempt.ID)
 	require.NoError(err)
 	assert.Equal("terminal", stored.State)
+
+	regrant := f.grant(t, 0)
+	assert.Greater(regrant.ID, consent.ID)
+	rows = f.work(t, 0)
+	require.Len(rows, 1)
+	assert.Equal("consent:"+formatEnrichmentTriggerID(regrant.ID), rows[0].TriggerGeneration)
 }
 
 func TestPersonEnrichmentMergeAndSplitInvalidateProviderIdentities(t *testing.T) {

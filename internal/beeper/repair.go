@@ -3,7 +3,9 @@ package beeper
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"time"
 
@@ -23,7 +25,10 @@ const rawArchiveFormat = "beeper_json"
 //	v2 — refresh snippets and the search index even when body text is current.
 //	v3 — exclude Matrix reply fallbacks from body text, snippets, and search.
 //	v4 — keep link-preview media out of standalone document processing.
-const rederiveVersion = "v4"
+//	v5 — preserve Beeper source transcript provenance on attachment metadata.
+//	v6 — retains HTML link targets outside Matrix reply fallbacks.
+//	v7 — includes attachment transcripts in retained HTML.
+const rederiveVersion = "v7"
 
 // repairBatchSize bounds how many archived messages are held in memory per
 // pass of the walk.
@@ -49,11 +54,49 @@ func init() {
 // index, and attachment metadata. Raw payloads, stored media, and sync cursors
 // are left alone, so the pass is idempotent and safe to re-run. It touches no
 // Beeper endpoint, so an Importer built with a nil client is valid.
-func (imp *Importer) RepairSource(ctx context.Context, sourceID int64, progress func(string)) (*rederive.Summary, error) {
+func (imp *Importer) RepairSource(ctx context.Context, sourceID int64, progress func(string)) (_ *rederive.Summary, err error) {
 	start := time.Now()
 	sum := &rederive.Summary{}
 
-	var afterID int64
+	src, err := imp.store.GetSourceByID(sourceID)
+	if err != nil {
+		return sum, err
+	}
+	var resume struct {
+		Version string                    `json:"repair_version,omitempty"`
+		AfterID int64                     `json:"repair_after_id,omitzero"`
+		Other   map[string]jsontext.Value `json:",embed"`
+	}
+	if src.SyncConfig.Valid {
+		if err := json.Unmarshal([]byte(src.SyncConfig.String), &resume); err != nil {
+			return sum, fmt.Errorf("read Beeper repair checkpoint: %w", err)
+		}
+	}
+	if resume.Version != rederiveVersion {
+		resume.Version, resume.AfterID = rederiveVersion, 0
+	}
+	afterID := resume.AfterID
+	checkpoint := func() error {
+		checkpoint := resume
+		checkpoint.AfterID = afterID
+		blob, err := json.Marshal(checkpoint)
+		if err != nil {
+			return err
+		}
+		if err := imp.store.UpdateSourceSyncConfig(sourceID, string(blob)); err != nil {
+			return err
+		}
+		resume = checkpoint
+		return nil
+	}
+	defer func() {
+		// A deadline can arrive within a batch. Persist only the last row whose
+		// derived writes succeeded so a retry neither skips a failed row nor
+		// repeats the successful prefix.
+		if err != nil && afterID > resume.AfterID {
+			err = errors.Join(err, checkpoint())
+		}
+	}()
 	for {
 		if err := ctx.Err(); err != nil {
 			return sum, err
@@ -65,19 +108,49 @@ func (imp *Importer) RepairSource(ctx context.Context, sourceID int64, progress 
 		if len(batch) == 0 {
 			break
 		}
+		rowFailed := false
 		for i := range batch {
 			if err := ctx.Err(); err != nil {
 				return sum, err
 			}
 			item := &batch[i]
-			afterID = item.MessageID
 			sum.MessagesScanned++
+			previousErrors := sum.Errors
 			imp.repairMessage(item, sourceID, sum)
+			if sum.Errors > previousErrors {
+				rowFailed = true
+				break
+			}
+			afterID = item.MessageID
+		}
+		if afterID > resume.AfterID {
+			if err := checkpoint(); err != nil {
+				return sum, err
+			}
 		}
 		if progress != nil {
 			progress(fmt.Sprintf("%d scanned, %d bodies rewritten, %d attachments tagged",
 				sum.MessagesScanned, sum.BodiesRewritten, sum.AttachmentsTagged))
 		}
+		if rowFailed {
+			if err := ctx.Err(); err != nil {
+				return sum, err
+			}
+			break
+		}
+	}
+	if sum.Errors > 0 {
+		// Keep the last safe cursor for the next pass; only a complete repair
+		// may clear the checkpoint and become eligible for the version ledger.
+		sum.Duration = time.Since(start)
+		return sum, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return sum, err
+	}
+	resume.Version, afterID = "", 0
+	if err := checkpoint(); err != nil {
+		return sum, err
 	}
 	sum.Duration = time.Since(start)
 	return sum, nil
@@ -106,10 +179,11 @@ func (imp *Importer) repairMessage(item *store.ArchivedRawMessage, sourceID int6
 	// Snippet and FTS state can drift independently, and the store commits all
 	// three fields atomically so a failure leaves the row retryable.
 	bodyChanged := item.BodyText != text
+	bodyHTML := MessageHTML(&m)
 	if err := imp.store.UpdateMessageDerivedText(
 		item.MessageID,
 		sql.NullString{String: text, Valid: text != ""},
-		sql.NullString{},
+		sql.NullString{String: bodyHTML, Valid: bodyHTML != ""},
 		msg.Snippet,
 		store.FTSDoc{Body: text, FromAddr: m.SenderName},
 	); err != nil {
@@ -120,11 +194,31 @@ func (imp *Importer) repairMessage(item *store.ArchivedRawMessage, sourceID int6
 		sum.BodiesRewritten++
 	}
 
-	if len(m.Attachments) == 0 {
-		return
+	classifications := make(map[string]store.BeeperAttachmentClassification, len(m.Attachments))
+	isPreview := sharedLink(&m) != ""
+	for i := range m.Attachments {
+		att := &m.Attachments[i]
+		ref := assetRef(att)
+		if ref == "" {
+			continue
+		}
+		classifications[beeperAttachmentID(ref)] = store.BeeperAttachmentClassification{
+			Metadata:  attachmentMetadataJSON(&m, att),
+			IsPreview: isPreview,
+			IsSticker: att.IsSticker,
+		}
 	}
-	metadata := shareMetadata(&m)
-	changed, err := imp.store.SetBeeperAttachmentClassification(item.MessageID, metadata, metadata != "")
+	if len(classifications) == 0 {
+		stored, err := imp.store.MessageBeeperAttachments(item.MessageID)
+		if err != nil {
+			sum.Errors++
+			return
+		}
+		if len(stored) == 0 {
+			return
+		}
+	}
+	changed, err := imp.store.SetBeeperAttachmentClassifications(item.MessageID, classifications)
 	if err != nil {
 		sum.Errors++
 		return

@@ -1,20 +1,26 @@
 <script lang="ts">
-  import { Button, KbdBadge, SearchInput } from '@kenn-io/kit-ui';
+  import { Button, SegmentedControl } from '@kenn-io/kit-ui';
   import { onDestroy, untrack } from 'svelte';
 
   import type { APIClient } from '../../api/client';
-  import type { components } from '../../api/generated/schema';
+  import { mediaReadiness } from '../../search/media-ready.svelte';
+  import { reportError } from '../../telemetry/actions';
+  import { ArchiveMessageLoader } from '../../archive/message-loader.svelte';
+  import { parseRecordingSelection } from '../../archive/recording-selection';
+  import type {
+    MeetingRef,
+    ExplorePreflightResponse as GeneratedExplorePreflightResponse,
+    ExploreSelection as GeneratedExploreSelection,
+  } from '../../api/generated/models';
   import type {
     EntryRow,
     AllMatchingExploreSelection,
     ExploreCacheUnavailable,
-    ExploreColumn,
-    ExploreFileFact,
     ExploreGroupDimension,
     ExploreGroupRow,
     ExploreSearchMode,
     ExploreURLState,
-    ExploreWorkspace
+    ExploreWorkspace,
   } from '../../explore/models';
   import { createExploreAPI } from '../../explore/api';
   import { filtersForGroup, parseGroupSelection } from '../../explore/group-context';
@@ -23,23 +29,28 @@
   import { groupingByDimension } from '../../grouping/catalog';
   import { canonicalFingerprint, createAllMatchingSelection, predicateFingerprint } from '../../explore/selection';
   import type { ExploreSelectionState, ExploreState } from '../../explore/state.svelte';
+  import ColumnsMenu from '../explore/ColumnsMenu.svelte';
   import ContextBar from '../explore/ContextBar.svelte';
   import EverythingTable from '../explore/EverythingTable.svelte';
-  import FilesPresentation from '../explore/FilesPresentation.svelte';
   import GroupTable from '../explore/GroupTable.svelte';
   import SelectionBar from '../explore/SelectionBar.svelte';
   import SplitPane from '../layout/SplitPane.svelte';
   import PersonTimeline from '../people/PersonTimeline.svelte';
   import SearchCoverage from '../search/SearchCoverage.svelte';
-  import SearchModeControl from '../search/SearchModeControl.svelte';
-  import ReadingPane, {
-    type ReadingPaneSelection,
-    type ReadingPaneStatus
-  } from '../reader/ReadingPane.svelte';
+  import TranscriptHits from '../search/TranscriptHits.svelte';
+  import ReadingPane, { type ReadingPaneSelection, type ReadingPaneStatus } from '../reader/ReadingPane.svelte';
   import type { SearchCoverageAction } from '../../search/modes';
+  import MeetingPanel from '../meetings/MeetingPanel.svelte';
+  import PageHeader from './PageHeader.svelte';
+  import {
+    exploreMeetingScope,
+    filtersToMeetingTranscripts,
+    isMeetingTranscript,
+    restrictsToMeetingTranscripts,
+  } from '../../meetings/scopes';
   import type { EverythingSessionState } from './EverythingSessionState.svelte';
 
-  type ExplorePreflight = components['schemas']['ExplorePreflightResponse'];
+  type ExplorePreflight = GeneratedExplorePreflightResponse;
 
   interface Props {
     client: APIClient;
@@ -51,22 +62,25 @@
     readingTargetKey: string | null;
     conversationAnchorId: number | undefined;
     sortNotice: string;
-    searchInput?: HTMLInputElement;
+    searchInput: HTMLInputElement | undefined;
     selectionPreflight: ExplorePreflight | undefined;
+    meetingSelection: GeneratedExploreSelection | undefined;
     exportSelection: () => void;
+    onReviewDeletion: (mode: 'explicit' | 'all_matching') => void;
     commitNavigation: (patch: Partial<ExploreURLState>) => void;
+    commitSearch: (query: string, mode: ExploreSearchMode) => void;
     commitWorkspace: (workspace: ExploreWorkspace) => void;
     commitGrouping: (dimension: ExploreGroupDimension) => void;
-    commitSearch: (query: string, mode: ExploreSearchMode) => void;
     fixedSortNotice: () => void;
     focusGrid: () => void;
     openRow: (row: EntryRow) => void;
+    onOpenRecording: (messageID: number) => void;
     drillGroup: (row: ExploreGroupRow) => void;
-    openFileItem: (entryKey: string) => void;
-    openContextualFile: (file: ExploreFileFact) => void;
     closeReadingPane: () => void;
     openRelationship: (participantID: number) => void;
     changeConversationAnchor: (anchorId: number) => void;
+    onOpenMeeting?: (meeting: MeetingRef) => void;
+    onSaveView: () => void;
   }
 
   let {
@@ -79,25 +93,88 @@
     readingTargetKey,
     conversationAnchorId,
     sortNotice,
-    searchInput = $bindable(undefined),
+    searchInput,
     selectionPreflight,
+    meetingSelection,
     exportSelection,
+    onReviewDeletion,
     commitNavigation,
+    commitSearch,
     commitWorkspace,
     commitGrouping,
-    commitSearch,
     fixedSortNotice,
     focusGrid,
     openRow,
+    onOpenRecording,
     drillGroup,
-    openFileItem,
-    openContextualFile,
     closeReadingPane,
     openRelationship,
-    changeConversationAnchor
+    changeConversationAnchor,
+    onOpenMeeting = undefined,
+    onSaveView,
   }: Props = $props();
 
   const api = createExploreAPI(untrack(() => client));
+  const recording = new ArchiveMessageLoader();
+  $effect(() => { if (recording.error) return reportError(() => client, () => 'message'); });
+  const readiness = mediaReadiness();
+  const recordingSelection = $derived(parseRecordingSelection(readingTargetKey));
+  const recordingParticipantID = $derived.by(() => {
+    const filters = exploreState.current.filters;
+    if (filters.length !== 1 || filters[0].dimension !== 'participant' || filters[0].values.length !== 1) return undefined;
+    const value = filters[0].values[0];
+    const id = Number(value);
+    return /^[1-9]\d*$/.test(value) && Number.isSafeInteger(id) ? id : undefined;
+  });
+  const recordingSearchSupported = $derived(exploreState.current.searchMode === 'full_text'
+    && (exploreState.current.filters.length === 0 || recordingParticipantID !== undefined)
+    && exploreState.current.groupingChain.length === 0);
+  const recordingSearchVisible = $derived.by(() => {
+    const query = exploreState.current.query.trim();
+    return Boolean(enabled && readiness?.ready && query && exploreState.current.presentation === 'table');
+  });
+
+  $effect(() => {
+    void readingDetailRetryRevision;
+    void recording.load(client, recordingSelection);
+    return () => recording.cancel();
+  });
+
+  const countLabel = $derived.by(() => {
+    const result = loader.result;
+    if (loader.loading) return 'Counting…';
+    if (!result || loader.error || loader.unavailable) return '';
+    if (result.candidatePoolSaturated) {
+      const shown = loader.rows.length;
+      return `${shown.toLocaleString()} ${shown === 1 ? 'result' : 'results'} shown`;
+    }
+    if (result.totalCount === undefined) return '';
+    const count = result.totalCount;
+    const [one, many] = exploreState.current.groupingChain.length > 0 ? ['group', 'groups'] : ['item', 'items'];
+    return `${count.toLocaleString()} ${count === 1 ? one : many}`;
+  });
+
+  function storedPreviewPosition(): 'below' | 'right' {
+    try {
+      return localStorage.getItem('msgvault.reading-pane.position') === 'right' ? 'right' : 'below';
+    } catch {
+      return 'below';
+    }
+  }
+
+  let previewPosition = $state(storedPreviewPosition());
+  let resultsWidth = $state(0);
+  const canPreviewRight = $derived(resultsWidth >= 960);
+  const previewRight = $derived(canPreviewRight && previewPosition === 'right');
+
+  function setPreviewPosition(value: string): void {
+    previewPosition = value === 'right' ? 'right' : 'below';
+    try {
+      localStorage.setItem('msgvault.reading-pane.position', previewPosition);
+    } catch {
+      // Keep the control usable when browser storage is unavailable.
+    }
+  }
 
   // coverage, coveragePollAttempts/coveragePollKey, visibleLexicalRowKeys,
   // lexicalCountCache/canonicalQueryHashes, and readingGroupDetail/
@@ -113,15 +190,18 @@
   let lexicalCountController: AbortController | undefined;
   let lexicalCountTimer: ReturnType<typeof setTimeout> | undefined;
   let lexicalCountRequestKey = '';
+  let readingDetailRetryRevision = $state(0);
   let readingDetailLoading = $state(false);
   let readingDetailError = $state('');
   let readingDetailUnavailable = $state<ExploreCacheUnavailable>();
   let readingDetailController: AbortController | undefined;
+  let readingDetailRequestIdentity = '';
 
   const allMatchingSelection = $derived.by((): AllMatchingExploreSelection | undefined => {
     if (!loader.result || loader.loading || loader.loadingMore) return undefined;
     const predicate = exploreState.predicate();
-    if (exploreState.current.presentation !== 'table' || exploreState.current.groupingChain.length > 0) return undefined;
+    if (exploreState.current.presentation !== 'table' || exploreState.current.groupingChain.length > 0)
+      return undefined;
     if (loader.resultFingerprint !== predicateFingerprint(predicate)) return undefined;
     // requestGeneration and resultGeneration are always equal while this
     // workspace is mounted: the loader syncs them together at request
@@ -133,51 +213,73 @@
   const readingSelection = $derived.by((): ReadingPaneSelection | undefined => {
     const selected = readingTargetKey;
     if (!selected) return undefined;
+    if (recordingSelection) return recording.detail ? { kind: 'archive', message: recording.detail } : undefined;
     const entry = loader.rows.find((row) => row.key === selected);
     if (entry) return { kind: 'entry', row: entry };
     const group = parseGroupSelection(selected);
-    return group && session.readingGroupDetail?.kind === 'group' &&
-      session.readingGroupDetail.dimension === group.dimension && session.readingGroupDetail.key === group.key
+    return group &&
+      session.readingGroupDetail?.kind === 'group' &&
+      session.readingGroupDetail.dimension === group.dimension &&
+      session.readingGroupDetail.key === group.key
       ? session.readingGroupDetail
       : undefined;
   });
 
-  const readingState = $derived.by((): {
-    status: ReadingPaneStatus;
-    message: string;
-    unavailable?: ExploreCacheUnavailable;
-  } => {
-    const selected = readingTargetKey;
-    if (!selected || readingSelection) return { status: 'ready', message: '' };
-    if (parseGroupSelection(selected)) {
-      if (readingDetailUnavailable) {
+  const readingState = $derived.by(
+    (): {
+      status: ReadingPaneStatus;
+      message: string;
+      unavailable?: ExploreCacheUnavailable;
+    } => {
+      const selected = readingTargetKey;
+      if (!selected || readingSelection) return { status: 'ready', message: '' };
+      if (recordingSelection) return { status: !recording.error ? 'loading' : recording.missing ? 'missing' : 'error', message: recording.missing ? 'This recording message is no longer available.' : 'Could not load this recording message.' };
+      if (parseGroupSelection(selected)) {
+        if (readingDetailUnavailable) {
+          return {
+            status: 'unavailable',
+            message: readingDetailUnavailable.message,
+            unavailable: readingDetailUnavailable,
+          };
+        }
+        if (readingDetailLoading || !readingDetailError) return { status: 'loading', message: '' };
         return {
-          status: 'unavailable',
-          message: readingDetailUnavailable.message,
-          unavailable: readingDetailUnavailable
+          status: 'missing',
+          message: readingDetailError,
         };
       }
-      if (readingDetailLoading || !readingDetailError) return { status: 'loading', message: '' };
+      if (loader.unavailable) {
+        return { status: 'unavailable', message: loader.unavailable.message, unavailable: loader.unavailable };
+      }
+      if (loader.loading || loader.restoring) return { status: 'loading', message: '' };
       return {
-        status: 'missing',
-        message: readingDetailError
+        status: loader.error ? 'error' : 'missing',
+        message: loader.error || 'The selected entry is no longer available in this context.',
       };
-    }
-    if (loader.unavailable) {
-      return { status: 'unavailable', message: loader.unavailable.message, unavailable: loader.unavailable };
-    }
-    if (loader.loading || loader.restoring) return { status: 'loading', message: '' };
-    return {
-      status: loader.error ? 'error' : 'missing',
-      message: loader.error || 'The selected entry is no longer available in this context.'
-    };
-  });
+    },
+  );
 
   const readingPredicateFingerprint = $derived(predicateFingerprint(exploreState.predicate()));
 
-  $effect(() => {
-    const target = parseGroupSelection(exploreState.current.selectedRow);
+  $effect.pre(() => {
+    const target = parseGroupSelection(readingTargetKey);
+    void readingDetailRetryRevision;
     const fingerprint = readingPredicateFingerprint;
+    const identity = `${fingerprint}|${readingTargetKey ?? ''}`;
+    if (identity !== readingDetailRequestIdentity) {
+      readingDetailRequestIdentity = identity;
+      // Cancel before waiting for the new outer result. A delayed old lookup
+      // must not publish group authority under the newly selected predicate.
+      session.readingDetailGeneration += 1;
+      readingDetailController?.abort();
+      readingDetailController = undefined;
+      const keepDetail = untrack(() => target && session.readingDetailFingerprint.startsWith(`${fingerprint}|`) &&
+        session.readingGroupDetail?.kind === 'group' && session.readingGroupDetail.dimension === target.dimension && session.readingGroupDetail.key === target.key);
+      if (!keepDetail) {
+        session.readingGroupDetail = undefined;
+        session.readingDetailFingerprint = '';
+      }
+    }
     // Tracked, not untracked like `predicate` below: a cache rebuild
     // invalidates a stale detail whether it happened before this mount
     // (`session` persisted the fingerprint across a prior workspace
@@ -189,14 +291,15 @@
     // "revision not yet known" (a fresh mount, before its own list request
     // has resolved even once) to whatever revision it turns out to be.
     const cacheRevision = loader.result?.cacheRevision;
+    const outerAuthority = canonicalFingerprint({ cacheRevision, searchProvenance: loader.result?.searchProvenance, candidateSnapshotId: loader.result?.candidateSnapshotId });
     const predicate = untrack(() => exploreState.predicate());
-    if (target && cacheRevision === undefined) {
+    if (target && (cacheRevision === undefined || loader.loading || loader.resultFingerprint !== fingerprint)) {
       readingDetailLoading = true;
       readingDetailError = '';
       readingDetailUnavailable = undefined;
       return;
     }
-    const loadedKey = target ? `${fingerprint}|${cacheRevision}|group:${target.dimension}:${target.key}` : '';
+    const loadedKey = target ? `${fingerprint}|${outerAuthority}|group:${target.dimension}:${target.key}` : '';
     // A workspace round-trip destroys and recreates this component, which
     // re-creates this effect and would otherwise unconditionally discard and
     // refetch the group detail below. If a previous mount already loaded
@@ -207,9 +310,9 @@
     // also writes `session.readingGroupDetail`/`readingDetailFingerprint`
     // below, and a tracked read of the same fields here would make the
     // effect re-trigger itself on every write.
-    const canReuse = untrack(() => Boolean(
-      target && loadedKey === session.readingDetailFingerprint && session.readingGroupDetail
-    ));
+    const canReuse = untrack(() =>
+      Boolean(target && loadedKey === session.readingDetailFingerprint && session.readingGroupDetail),
+    );
     if (canReuse) {
       readingDetailLoading = false;
       readingDetailError = '';
@@ -243,7 +346,7 @@
       candidate_snapshot_id: undefined,
       grouping: undefined,
       filters,
-      presentation: 'table' as const
+      presentation: 'table' as const,
     };
     // Filtering by target.key does not make it the top-ranked group: every
     // co-participant/co-domain of the matching entries forms a group too, so
@@ -266,7 +369,8 @@
           label: lookup.row.label,
           count: lookup.row.count,
           estimatedBytes: lookup.row.estimated_bytes,
-          latestAt: lookup.row.latest_at
+          latestAt: lookup.row.latest_at,
+          meetingScope: exploreMeetingScope(detailPredicate, lookup.authority).explore,
         };
         session.readingDetailFingerprint = loadedKey;
       })
@@ -278,6 +382,48 @@
         if (generation === session.readingDetailGeneration) readingDetailLoading = false;
       });
   });
+
+  // The meeting context API rejects any selection that contains a non-meeting row.
+  const canExportMeetings = $derived.by(() => {
+    if (selection.mode === 'all_matching') return restrictsToMeetingTranscripts(exploreState.predicate());
+    const selected = loader.rows.filter((row) => selection.isSelected(row.key));
+    return selected.length > 0 && selected.every(isMeetingTranscript);
+  });
+
+  let meetingReloadRequestedAt: number | undefined;
+  const meetingPredicateFingerprint = $derived(predicateFingerprint(exploreState.predicate()));
+  const meetingScope = $derived(session.meetingOverview?.fingerprint === meetingPredicateFingerprint
+    ? session.meetingOverview.scope : undefined);
+
+  $effect.pre(() => {
+    const fingerprint = meetingPredicateFingerprint;
+    const predicate = exploreState.predicate();
+    const result = loader.result;
+    const loading = loader.loading;
+    const generation = loader.resultGeneration;
+    const resultFingerprint = loader.resultFingerprint;
+    const isMeetingView = exploreState.current.workspace === 'everything' && filtersToMeetingTranscripts(predicate);
+    untrack(() => {
+      if (!isMeetingView || session.meetingOverview?.fingerprint !== fingerprint) session.meetingOverview = undefined;
+      if (!isMeetingView || !result || loading || resultFingerprint !== fingerprint) return;
+      const scope = exploreMeetingScope(predicate, result);
+      const explicitlyReloaded = meetingReloadRequestedAt !== undefined && generation !== meetingReloadRequestedAt;
+      if (explicitlyReloaded) meetingReloadRequestedAt = undefined;
+      if (!session.meetingOverview || explicitlyReloaded || canonicalFingerprint(scope) !== canonicalFingerprint(session.meetingOverview.scope)) {
+        session.meetingOverview = { fingerprint, scope, refreshKey: (session.meetingOverview?.refreshKey ?? 0) + (explicitlyReloaded ? 1 : 0) };
+      }
+    });
+  });
+
+  function reloadOverviewMeetings(): void {
+    meetingReloadRequestedAt = loader.resultGeneration;
+    loader.retry();
+  }
+
+  function reloadGroupMeetings(): void {
+    session.readingDetailFingerprint = '';
+    readingDetailRetryRevision += 1;
+  }
 
   const coverageFiltersFingerprint = $derived(canonicalFingerprint(exploreState.current.filters));
 
@@ -304,7 +450,8 @@
     }
     coverageController = new AbortController();
     const controller = coverageController;
-    void api.coverage(filters, controller.signal)
+    void api
+      .coverage(filters, controller.signal)
       .then((loaded) => {
         if (generation !== coverageRequestGeneration || controller.signal.aborted) return;
         session.coverage = loaded;
@@ -330,7 +477,7 @@
           cache_revision: session.coverage?.cache_revision ?? '',
           status: 'unavailable',
           detail: cause instanceof Error ? cause.message : 'Semantic coverage could not be loaded.',
-          actions: ['retry']
+          actions: ['retry'],
         };
       });
   });
@@ -343,9 +490,13 @@
       clearTimeout(lexicalCountTimer);
       lexicalCountTimer = undefined;
     }
-    if (!currentResult || exploreState.current.presentation === 'files' || !predicate.query ||
+    if (
+      !currentResult ||
+      !predicate.query ||
       (predicate.search_mode !== 'full_text' && predicate.search_mode !== 'hybrid') ||
-      loader.resultFingerprint !== predicateFingerprint(predicate) || rowKeys.length === 0) {
+      loader.resultFingerprint !== predicateFingerprint(predicate) ||
+      rowKeys.length === 0
+    ) {
       lexicalCountController?.abort();
       lexicalCountController = undefined;
       lexicalCountRequestKey = '';
@@ -363,7 +514,7 @@
       cacheRevision: currentResult.cacheRevision,
       lexicalRevision,
       predicateFingerprint: countPredicateFingerprint,
-      rowKeys
+      rowKeys,
     });
     const cached = canonicalQueryHash ? session.lexicalCountCache.get(cacheKey) : undefined;
     if (cached) {
@@ -379,18 +530,21 @@
     lexicalCountRequestKey = cacheKey;
     const countPredicate = {
       ...predicate,
-      ...(currentResult.candidateSnapshotId
-        ? { candidate_snapshot_id: currentResult.candidateSnapshotId }
-        : {})
+      ...(currentResult.candidateSnapshotId ? { candidate_snapshot_id: currentResult.candidateSnapshotId } : {}),
     };
     lexicalCountTimer = setTimeout(() => {
       lexicalCountTimer = undefined;
       const controller = new AbortController();
       lexicalCountController = controller;
-      void api.matchCounts(countPredicate, rowKeys, controller.signal)
+      void api
+        .matchCounts(countPredicate, rowKeys, controller.signal)
         .then((loaded) => {
-          if (controller.signal.aborted || loaded.cacheRevision !== currentResult.cacheRevision ||
-            loaded.lexicalRevision !== lexicalRevision) return;
+          if (
+            controller.signal.aborted ||
+            loaded.cacheRevision !== currentResult.cacheRevision ||
+            loaded.lexicalRevision !== lexicalRevision
+          )
+            return;
           if (predicateFingerprint(exploreState.predicate()) !== countPredicateFingerprint) return;
           session.canonicalQueryHashes.delete(canonicalHashKey);
           while (session.canonicalQueryHashes.size >= 128) {
@@ -400,9 +554,12 @@
           }
           session.canonicalQueryHashes.set(canonicalHashKey, loaded.canonicalQueryHash);
           const exactKey = session.lexicalCountCache.key({
-            query: predicate.query!, canonicalQueryHash: loaded.canonicalQueryHash,
-            cacheRevision: loaded.cacheRevision, lexicalRevision: loaded.lexicalRevision,
-            predicateFingerprint: countPredicateFingerprint, rowKeys
+            query: predicate.query!,
+            canonicalQueryHash: loaded.canonicalQueryHash,
+            cacheRevision: loaded.cacheRevision,
+            lexicalRevision: loaded.lexicalRevision,
+            predicateFingerprint: countPredicateFingerprint,
+            rowKeys,
           });
           session.lexicalCountCache.set(exactKey, loaded.counts, loaded.cacheRevision);
           applyLexicalCounts(loaded.counts);
@@ -426,10 +583,14 @@
     // `loader.rows` untracked keeps this effect from depending on the very
     // state it writes here, which would otherwise re-trigger itself forever.
     const rows = untrack(() => loader.rows);
-    loader.rows = rows.map((row) => counts[row.key] === undefined ? row : {
-      ...row,
-      match: { ...row.match, lexical_match_count: counts[row.key] }
-    });
+    loader.rows = rows.map((row) =>
+      counts[row.key] === undefined
+        ? row
+        : {
+            ...row,
+            match: { ...row.match, lexical_match_count: counts[row.key] },
+          },
+    );
   }
 
   async function handleCoverageAction(action: SearchCoverageAction): Promise<void> {
@@ -448,23 +609,20 @@
         cache_revision: session.coverage?.cache_revision ?? '',
         status: 'unavailable',
         detail: cause instanceof Error ? cause.message : 'The semantic index action failed.',
-        actions: ['retry']
+        actions: ['retry'],
       };
     }
   }
 
-  function submitSearch(event: SubmitEvent): void {
-    event.preventDefault();
-    commitSearch(exploreState.current.query.trim(), exploreState.current.searchMode);
-    focusGrid();
-  }
-
   function inspectGroup(row: ExploreGroupRow): void {
     const dimension = exploreState.current.groupingChain[0];
-    if (dimension) commitNavigation({ selectedRow: `group:${dimension}:${row.key}` });
+    if (dimension && groupingByDimension(dimension).drillable) {
+      commitNavigation({ selectedRow: `group:${dimension}:${row.key}` });
+    }
   }
 
   onDestroy(() => {
+    session.meetingOverview = undefined;
     coverageRequestGeneration += 1;
     coverageController?.abort();
     if (coveragePollTimer !== undefined) clearTimeout(coveragePollTimer);
@@ -476,44 +634,74 @@
 </script>
 
 <main class="everything-workspace" aria-label="Everything">
-  <header class="workspace-header">
-    <div>
-      <h1>Everything</h1>
-    </div>
-    <p class="result-count" aria-live="polite" data-mono>
-      {#if loader.result?.candidatePoolSaturated}
-        {loader.rows.length.toLocaleString()} {loader.rows.length === 1 ? 'result' : 'results'} shown
-      {:else if loader.result?.totalCount !== undefined}
-        {loader.result.totalCount.toLocaleString()} items
-      {:else}
-        Modality-neutral archive
-      {/if}
-    </p>
-  </header>
+  <PageHeader title="Everything">
+    {#snippet actions()}<Button surface="outline" label="Save view…" onclick={onSaveView} />{/snippet}
+  </PageHeader>
 
-  <form class="search-bar" role="search" aria-label="Search Everything" onsubmit={submitSearch}>
-    <div class="query-control">
-      <SearchInput
-        id="everything-search"
-        bind:inputEl={searchInput}
-        value={exploreState.current.query}
-        ariaLabel="Search everything"
-        placeholder="Search people, conversations, events, and files…"
-        block
-        oninput={(value) => exploreState.replaceSearchDraft(value, exploreState.current.searchMode)}
-      />
-    </div>
-    <SearchModeControl
-      requestedMode={exploreState.current.searchMode}
-      status={session.coverage?.status}
-      error={loader.error}
-      onchange={(mode: ExploreSearchMode) => exploreState.replaceSearchDraft(
-        exploreState.current.query,
-        mode
-      )}
-    />
-    <Button type="submit" label="Search" tone="info" surface="solid" />
-  </form>
+  <ContextBar
+    {client}
+    query={exploreState.current.query}
+    searchMode={exploreState.current.searchMode}
+    filters={exploreState.current.filters}
+    groupingChain={exploreState.current.groupingChain}
+    countLabel={recordingSearchVisible ? '' : countLabel}
+    sort={exploreState.current.groupingChain.length > 0 ? undefined : {
+      options: [{ value: 'newest', label: 'Newest first' }],
+      value: 'newest',
+      note: 'Other orders aren’t available yet',
+      onchange: fixedSortNotice,
+    }}
+    presentation={exploreState.current.presentation}
+    onPresentationChange={(presentation) =>
+      commitNavigation({
+        ...(presentation === 'files' ? { workspace: 'files' as const } : {}),
+        presentation,
+        activeRow: null,
+        selectedRow: null,
+        scrollAnchor: null,
+      })}
+    onAddGroup={(dimension) => commitGrouping(dimension)}
+    onRemoveGroup={(index) =>
+      commitNavigation({
+        groupingChain: exploreState.current.groupingChain.filter((_, position) => position !== index),
+        activeRow: null,
+        scrollAnchor: null,
+      })}
+    onClearFilters={() => commitNavigation({ filters: [], activeRow: null, scrollAnchor: null })}
+    onFiltersChange={(filters) =>
+      commitNavigation({
+        filters,
+        activeRow: null,
+        selectedRow: null,
+        scrollAnchor: null,
+      })}
+    onRemoveQuery={() => commitSearch('', exploreState.current.searchMode)}
+    onRemoveFilter={(index) =>
+      commitNavigation({
+        filters: exploreState.current.filters.filter((_, position) => position !== index),
+        activeRow: null,
+        selectedRow: null,
+        scrollAnchor: null,
+      })}
+  >
+    {#snippet extra()}
+      {#if exploreState.current.presentation === 'table' && exploreState.current.groupingChain.length === 0}
+        <ColumnsMenu
+          columns={exploreState.current.columns}
+          onchange={(columns) => exploreState.replaceTransient({ columns })}
+        />
+      {/if}
+      {#if canPreviewRight}
+        <SegmentedControl
+          ariaLabel="Preview position"
+          options={[{ value: 'below', label: 'Below' }, { value: 'right', label: 'Right' }]}
+          value={previewPosition}
+          onchange={setPreviewPosition}
+        />
+      {/if}
+    {/snippet}
+  </ContextBar>
+  <span class="kit-sr-only" role="status" aria-label="Sort status" aria-live="polite">{sortNotice}</span>
 
   {#if loader.result?.candidatePoolSaturated}
     <div class="search-limit" role="status">
@@ -521,12 +709,7 @@
         <span class="search-limit__title">More results may match.</span>
         Narrow with from:alice@example.com, after:2025-01-01, or label:important.
       </p>
-      <Button
-        label="Refine search"
-        size="sm"
-        surface="soft"
-        onclick={() => searchInput?.focus()}
-      />
+      <Button label="Refine search" size="sm" surface="soft" onclick={() => searchInput?.focus()} />
     </div>
   {/if}
 
@@ -538,234 +721,182 @@
     />
   {/if}
 
-  <ContextBar
-    {client}
-    query={exploreState.current.query}
-    searchMode={exploreState.current.searchMode}
-    filters={exploreState.current.filters}
-    groupingChain={exploreState.current.groupingChain}
-    totalCount={loader.result?.totalCount}
-    presentation={exploreState.current.presentation}
-    onPresentationChange={(presentation) => commitNavigation({
-      presentation, activeRow: null, selectedRow: null, scrollAnchor: null
-    })}
-    onAddGroup={(dimension) => commitGrouping(dimension)}
-    onRemoveGroup={(index) => commitNavigation({
-      groupingChain: exploreState.current.groupingChain.filter((_, position) => position !== index),
-      activeRow: null,
-      scrollAnchor: null
-    })}
-    onClearFilters={() => commitNavigation({ filters: [], activeRow: null, scrollAnchor: null })}
-    onFiltersChange={(filters) => commitNavigation({
-      filters, activeRow: null, selectedRow: null, scrollAnchor: null
-    })}
-    onSort={fixedSortNotice}
-  />
-  <span class="kit-sr-only" role="status" aria-label="Sort status" aria-live="polite">{sortNotice}</span>
-
   {#if loader.result?.searchDeletionScope === 'active'}
     <p class="scope-note" role="status">Semantic search covers active messages only.</p>
   {/if}
 
-  <div class="results-split">
+  {#if meetingScope}
+    <div class="meeting-overview" data-scroll>
+      <MeetingPanel {client} scope={meetingScope} refreshKey={String(session.meetingOverview?.refreshKey ?? 0)}
+        onReloadScope={reloadOverviewMeetings} {onOpenMeeting} />
+    </div>
+  {/if}
+
+  <div
+    class="results-split"
+    class:results-split--open={Boolean(readingTargetKey)}
+    class:results-split--right={previewRight}
+    bind:clientWidth={resultsWidth}
+  >
     <SplitPane
       ariaLabel="Resize reading pane"
-      storageKey="msgvault.reading-pane.size"
-      orientation="vertical"
-      initialFraction={0.55}
-      minPrimary={120}
-      minSecondary={160}
+      storageKey={previewRight ? 'msgvault.reading-pane.right-size' : 'msgvault.reading-pane.size'}
+      orientation={previewRight ? 'horizontal' : 'vertical'}
+      initialFraction={previewRight ? 0.45 : 0.55}
+      minPrimary={previewRight ? 360 : 120}
+      minSecondary={previewRight ? 400 : 160}
       collapsed={!readingTargetKey}
     >
-    {#snippet primary()}
-    <div class="results-primary">
-    {#if exploreState.current.groupingChain.length > 0}
-      <GroupTable
-      rows={loader.groupRows}
-      dimension={exploreState.current.groupingChain[0]!}
-      loading={loader.loading}
-      loadingMore={loader.loadingMore}
-      hasMore={Boolean(loader.nextCursor)}
-      totalCount={loader.result?.totalCount}
-      generation={loader.resultGeneration}
-      error={loader.error}
-      pageError={loader.pageError}
-      unavailable={loader.unavailable}
-      drillable={groupingByDimension(exploreState.current.groupingChain[0]!).requestable}
-      focusedKey={exploreState.current.activeRow}
-      inspectedKey={readingTargetKey}
-      scrollAnchor={exploreState.current.scrollAnchor}
-      restoring={loader.restoring}
-      onDrill={drillGroup}
-      onInspect={inspectGroup}
-      onLoadMore={loader.loadMore}
-      onLoadThroughEnd={loader.loadThroughEnd}
-      onActiveKey={(activeRow) => exploreState.replaceTransient({ activeRow })}
-      onScrollAnchor={(key, offset) => exploreState.replaceTransient({ scrollAnchor: { key, offset } })}
-      onRetry={loader.retry}
-      />
-    {:else if exploreState.current.presentation === 'files'}
-      <FilesPresentation
-        files={loader.fileFacts}
-        loading={loader.loading}
-        loadingMore={loader.loadingMore}
-        hasMore={Boolean(loader.nextCursor)}
-        totalCount={loader.result?.totalCount}
-        generation={loader.resultGeneration}
-        error={loader.error}
-        pageError={loader.pageError}
-        unavailable={loader.unavailable}
-        focusedKey={exploreState.current.activeRow}
-        scrollAnchor={exploreState.current.scrollAnchor}
-        restoring={loader.restoring}
-        onOpenFile={openContextualFile}
-        onOpenItem={openFileItem}
-        onActiveKey={(activeRow) => exploreState.replaceTransient({ activeRow })}
-        onScrollAnchor={(key, offset) => exploreState.replaceTransient({ scrollAnchor: { key, offset } })}
-        onLoadMore={loader.loadMore}
-        onRetry={loader.retry}
-      />
-    {:else}
-      <SelectionBar
-      {selection}
-      totalCount={loader.result?.totalCount}
-      allMatching={allMatchingSelection}
-      preflight={selectionPreflight}
-      onExport={exportSelection}
-    />
-      {#if exploreState.current.presentation === 'timeline'}
-        <PersonTimeline
-          rows={loader.rows}
-          {selection}
-          loading={loader.loading}
-          loadingMore={loader.loadingMore}
-          hasMore={Boolean(loader.nextCursor)}
-          totalCount={loader.result?.totalCount}
-          generation={loader.resultGeneration}
-          unavailable={loader.unavailable}
-          error={loader.error}
-          pageError={loader.pageError}
-          focusedKey={exploreState.current.activeRow}
-          inspectedKey={readingTargetKey}
-          scrollAnchor={exploreState.current.scrollAnchor}
-          restoring={loader.restoring}
-          onOpen={openRow}
-          onScrollAnchor={(key, offset) => exploreState.replaceTransient({ scrollAnchor: { key, offset } })}
-          onLoadMore={loader.loadMore}
-          onLoadThroughEnd={loader.loadThroughEnd}
-          onActiveKey={(activeRow) => exploreState.replaceTransient({ activeRow })}
-          onVisibleRows={(rowKeys) => { session.visibleLexicalRowKeys = rowKeys; }}
-          onRetry={loader.retry}
-        />
-      {:else}
-      <EverythingTable
-        rows={loader.rows}
-        {selection}
-        columns={exploreState.current.columns}
-        columnWidths={exploreState.current.columnWidths}
-        focusedKey={exploreState.current.activeRow}
-        inspectedKey={readingTargetKey}
-        scrollAnchor={exploreState.current.scrollAnchor}
-        restoring={loader.restoring}
-        loading={loader.loading}
-        loadingMore={loader.loadingMore}
-        hasMore={Boolean(loader.nextCursor)}
-        totalCount={loader.result?.totalCount}
-        generation={loader.resultGeneration}
-        unavailable={loader.unavailable}
-        error={loader.error}
-        pageError={loader.pageError}
-        onOpen={openRow}
-        onColumnsChange={(columns: ExploreColumn[]) => exploreState.replaceTransient({ columns })}
-        onScrollAnchor={(key, offset) => exploreState.replaceTransient({ scrollAnchor: { key, offset } })}
-        onLoadMore={loader.loadMore}
-        onLoadThroughEnd={loader.loadThroughEnd}
-        onActiveKey={(activeRow) => exploreState.replaceTransient({ activeRow })}
-        onVisibleRows={(rowKeys) => { session.visibleLexicalRowKeys = rowKeys; }}
-        onRetry={loader.retry}
-      />
-      {/if}
-    {/if}
-    </div>
-    {/snippet}
-    {#snippet secondary()}
-      {#if readingTargetKey}
-        <ReadingPane
-          {client}
-          selection={readingSelection}
-          targetKey={readingTargetKey}
-          status={readingState.status}
-          statusMessage={readingState.message}
-          unavailable={readingState.unavailable}
-          predicate={exploreState.predicate()}
-          onClose={closeReadingPane}
-          onOpenSettings={() => commitWorkspace('settings')}
-          onOpenRelationship={openRelationship}
-          {conversationAnchorId}
-          onConversationAnchorChange={changeConversationAnchor}
-        />
-      {/if}
-    {/snippet}
+      {#snippet primary()}
+        <div class="results-primary" class:results-primary--recordings={recordingSearchVisible}>
+          {#if recordingSearchVisible}
+            <TranscriptHits
+              {client}
+              participantID={recordingParticipantID}
+              missingMessageID={recording.missing ? recordingSelection : undefined}
+              query={exploreState.current.query}
+              supported={recordingSearchSupported}
+              selectedMessageID={recordingSelection}
+              onOpen={(hit) => onOpenRecording(hit.message_id)}
+            />
+            <h2 class="results-heading">Results <span class="count" aria-live="polite">{countLabel}</span></h2>
+          {/if}
+          {#if exploreState.current.groupingChain.length > 0}
+            <GroupTable
+              rows={loader.groupRows}
+              dimension={exploreState.current.groupingChain[0]!}
+              loading={loader.loading}
+              loadingMore={loader.loadingMore}
+              hasMore={Boolean(loader.nextCursor)}
+              totalCount={loader.result?.totalCount}
+              generation={loader.resultGeneration}
+              error={loader.error}
+              pageError={loader.pageError}
+              unavailable={loader.unavailable}
+              drillable={groupingByDimension(exploreState.current.groupingChain[0]!).drillable}
+              focusedKey={exploreState.current.activeRow}
+              inspectedKey={readingTargetKey}
+              scrollAnchor={exploreState.current.scrollAnchor}
+              restoring={loader.restoring}
+              onDrill={drillGroup}
+              onInspect={inspectGroup}
+              onLoadMore={loader.loadMore}
+              onLoadThroughEnd={loader.loadThroughEnd}
+              onActiveKey={(activeRow) => exploreState.replaceTransient({ activeRow })}
+              onScrollAnchor={(key, offset) => exploreState.replaceTransient({ scrollAnchor: { key, offset } })}
+              onRetry={loader.retry}
+            />
+          {:else}
+            {#if exploreState.current.presentation === 'timeline'}
+              <PersonTimeline
+                rows={loader.rows}
+                {selection}
+                loading={loader.loading}
+                loadingMore={loader.loadingMore}
+                hasMore={Boolean(loader.nextCursor)}
+                totalCount={loader.result?.totalCount}
+                generation={loader.resultGeneration}
+                unavailable={loader.unavailable}
+                error={loader.error}
+                pageError={loader.pageError}
+                focusedKey={exploreState.current.activeRow}
+                inspectedKey={readingTargetKey}
+                scrollAnchor={exploreState.current.scrollAnchor}
+                restoring={loader.restoring}
+                onOpen={openRow}
+                onScrollAnchor={(key, offset) => exploreState.replaceTransient({ scrollAnchor: { key, offset } })}
+                onLoadMore={loader.loadMore}
+                onLoadThroughEnd={loader.loadThroughEnd}
+                onActiveKey={(activeRow) => exploreState.replaceTransient({ activeRow })}
+                onVisibleRows={(rowKeys) => {
+                  session.visibleLexicalRowKeys = rowKeys;
+                }}
+                onRetry={loader.retry}
+              />
+            {:else}
+              <EverythingTable
+                rows={loader.rows}
+                {selection}
+                columns={exploreState.current.columns}
+                columnWidths={exploreState.current.columnWidths}
+                focusedKey={exploreState.current.activeRow}
+                inspectedKey={readingTargetKey}
+                scrollAnchor={exploreState.current.scrollAnchor}
+                restoring={loader.restoring}
+                loading={loader.loading}
+                loadingMore={loader.loadingMore}
+                hasMore={Boolean(loader.nextCursor)}
+                totalCount={loader.result?.totalCount}
+                generation={loader.resultGeneration}
+                unavailable={loader.unavailable}
+                error={loader.error}
+                pageError={loader.pageError}
+                onOpen={openRow}
+                onScrollAnchor={(key, offset) => exploreState.replaceTransient({ scrollAnchor: { key, offset } })}
+                onLoadMore={loader.loadMore}
+                onLoadThroughEnd={loader.loadThroughEnd}
+                onActiveKey={(activeRow) => exploreState.replaceTransient({ activeRow })}
+                onVisibleRows={(rowKeys) => {
+                  session.visibleLexicalRowKeys = rowKeys;
+                }}
+                onRetry={loader.retry}
+              />
+            {/if}
+            <SelectionBar
+              {selection}
+              totalCount={loader.result?.totalCount}
+              allMatching={allMatchingSelection}
+              preflight={selectionPreflight}
+              {client}
+              {meetingSelection}
+              {canExportMeetings}
+              onExport={exportSelection}
+              {onReviewDeletion}
+              onClear={focusGrid}
+            />
+          {/if}
+        </div>
+      {/snippet}
+      {#snippet secondary()}
+        {#if readingTargetKey}
+          <ReadingPane
+            {client}
+            selection={readingSelection}
+            targetKey={readingTargetKey}
+            status={readingState.status}
+            statusMessage={readingState.message}
+            onRetry={recordingSelection && !recording.missing ? () => readingDetailRetryRevision += 1 : undefined}
+            unavailable={readingState.unavailable}
+            predicate={exploreState.predicate()}
+            onClose={closeReadingPane}
+            {onOpenMeeting}
+            onReloadMeetings={reloadGroupMeetings}
+            onOpenSettings={() => commitWorkspace('settings')}
+            onOpenRelationship={openRelationship}
+            {conversationAnchorId}
+            onConversationAnchorChange={changeConversationAnchor}
+          />
+        {/if}
+      {/snippet}
     </SplitPane>
   </div>
 
-  <footer class="keyboard-help" aria-label="Keyboard shortcuts">
-    <span><KbdBadge keys={['J']} />/<KbdBadge keys={['K']} /> move</span>
-    <span><KbdBadge keys={['Enter']} /> open</span>
-    <span><KbdBadge keys={['Space']} /> select</span>
-    <span><KbdBadge keys={['Shift', 'Space']} /> range</span>
-    <span><KbdBadge keys={['A']} /> visible</span>
-    <span><KbdBadge keys={['X']} /> clear</span>
-    <span><KbdBadge keys={['/']} /> search</span>
-    <span><KbdBadge keys={['Esc']} /> back</span>
-  </footer>
 </main>
 
 <style>
   .everything-workspace {
     display: flex;
     width: 100%;
-    max-width: 1760px;
+    min-width: 0;
     min-height: 0;
     flex: 1;
     flex-direction: column;
     gap: var(--space-4);
-    margin-inline: auto;
-    padding: var(--space-6) var(--space-7) var(--space-4);
+    padding: var(--space-5) var(--page-gutter) var(--space-4);
+    overflow: hidden;
   }
 
-  .workspace-header {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: var(--space-6);
-  }
-
-  h1 {
-    margin: 0;
-    font-family: var(--font-sans);
-    font-size: var(--font-size-xl);
-    font-weight: 650;
-    line-height: 1.2;
-  }
-
-  .result-count {
-    margin: 0;
-    color: var(--text-muted);
-    font-size: var(--font-size-xs);
-    font-variant-numeric: tabular-nums;
-  }
-
-  .search-bar {
-    display: flex;
-    align-items: center;
-    gap: var(--space-4);
-  }
-
-  .query-control {
-    min-width: 240px;
-    flex: 1;
-  }
+  .meeting-overview { width: 100%; max-width: 100%; min-width: 0; max-height: 42vh; overflow-x: hidden; overflow-y: auto; flex: none; }
 
   .scope-note {
     margin: 0;
@@ -814,40 +945,38 @@
     height: 100%;
     flex-direction: column;
   }
+  .results-primary--recordings { container: results / size; min-height: 0; gap: var(--space-3); }
+  .results-heading { margin: 0; font-size: var(--font-size-sm); font-weight: var(--font-weight-semibold); }
+  .results-heading .count { color: var(--text-secondary); font-size: var(--font-size-xs); font-weight: var(--font-weight-normal); font-variant-numeric: tabular-nums; }
 
   /* The reading pane provides its own surface; the split's secondary pane
-   * only frames it with the hairline above the drag handle. */
+   * frames it on every edge except the one beside the drag handle. The
+   * handle is the divider, so neither frame draws a border on that edge. */
   .results-split :global([data-pane='secondary']) {
     border: 1px solid var(--border-default);
     border-top: 0;
     border-radius: 0 0 var(--radius-md) var(--radius-md);
   }
 
-  .keyboard-help {
-    display: flex;
-    min-height: 22px;
-    align-items: center;
-    gap: var(--space-5);
-    color: var(--text-muted);
-    font-size: var(--font-size-2xs);
+  .results-split--open:not(.results-split--right) :global(:is(.everything-table, .group-table)) {
+    border-bottom: 0;
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
   }
 
-  @media (max-width: 760px) {
-    .everything-workspace {
-      padding-inline: var(--space-4);
-    }
+  .results-split--open.results-split--right :global(:is(.everything-table, .group-table)) {
+    border-right: 0;
+    border-top-right-radius: 0;
+    border-bottom-right-radius: 0;
+  }
 
-    .search-bar {
-      align-items: stretch;
-      flex-wrap: wrap;
-    }
+  .results-split--right :global([data-pane]) {
+    overflow: hidden;
+  }
 
-    .query-control {
-      min-width: 100%;
-    }
-
-    .keyboard-help {
-      overflow-x: auto;
-    }
+  .results-split--right :global([data-pane='secondary']) {
+    border-top: 1px solid var(--border-default);
+    border-left: 0;
+    border-radius: 0 var(--radius-md) var(--radius-md) 0;
   }
 </style>

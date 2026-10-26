@@ -127,7 +127,8 @@ func (c *changeFeedConsumer) cursorID() int64 {
 }
 
 // pollInBackground polls until stop closes, recording the first failure for the
-// test's own goroutine to assert on. gap is how long it waits between polls.
+// test's own goroutine to assert on. gap controls the real-time interleaving
+// rate between polls.
 func (c *changeFeedConsumer) pollInBackground(st *store.Store, stop <-chan struct{}, gap func(int) time.Duration) {
 	for i := 0; ; i++ {
 		select {
@@ -139,7 +140,7 @@ func (c *changeFeedConsumer) pollInBackground(st *store.Store, stop <-chan struc
 			c.record(err)
 			return
 		}
-		time.Sleep(gap(i))
+		time.Sleep(gap(i)) //nolint:kennlint // paces polls against the database clock
 	}
 }
 
@@ -179,7 +180,24 @@ func (c *changeFeedConsumer) drain(t *testing.T, st *store.Store) store.ChangedM
 // feed is healthy: the failure these tests exist to catch is PERMANENT — a row
 // the cursor has stepped over never arrives, at any deadline — so the only
 // thing a short budget can add is a false alarm on a loaded machine.
-const changeFeedCatchUpBudget = time.Minute
+const (
+	changeFeedCatchUpBudget = time.Minute
+
+	// This is a real-time poll between observations of the database-owned feed.
+	changeFeedCatchUpPoll = 2 * time.Millisecond
+
+	// These budgets and the poll observe the database clock and commit bound.
+	databaseClockAdvanceBudget   = 10 * time.Second
+	feedCommitBoundAdvanceBudget = 30 * time.Second
+	databaseProgressPoll         = 200 * time.Microsecond
+
+	// These budgets observe PostgreSQL lock catalogs.
+	postgresLockWaiterBudget = 3 * time.Second
+	postgresLockWaiterPoll   = 10 * time.Millisecond
+
+	// This real-time window keeps a database-stamped write uncommitted.
+	pendingStampWindow = 3 * time.Millisecond
+)
 
 // drainUntil polls until done reports true or the budget runs out. The feed is
 // allowed to take a moment — CompleteThrough advances only once the write that
@@ -195,7 +213,7 @@ func (c *changeFeedConsumer) drainUntil(t *testing.T, st *store.Store, done func
 		if time.Now().After(deadline) {
 			return false
 		}
-		time.Sleep(2 * time.Millisecond)
+		time.Sleep(changeFeedCatchUpPoll) //nolint:kennlint // paces polls against the database clock
 	}
 }
 
@@ -305,7 +323,8 @@ func setSubject(t *testing.T, st *store.Store, id int64, subject string) {
 	require.NoError(t, writeSubject(st, id, subject))
 }
 
-// staggered spreads repeated background work over a range of microseconds
+// staggered generates pseudo-jitter for writer interleavings; it is not a wait.
+// It spreads repeated background work over a range of microseconds
 // without a random source: the point is only that the writers and the poller do
 // not fall into lockstep, and a fixed stride is reproducible where a seeded RNG
 // is merely repeatable.
@@ -586,10 +605,11 @@ func TestListChangedMessages_DeletionRunTombstonesAllArrive(t *testing.T) {
 
 	stop := make(chan struct{})
 	var workers sync.WaitGroup
-
-	workers.Go(func() {
-		consumer.pollInBackground(st, stop, func(int) time.Duration { return 500 * time.Microsecond })
+	stopWorkers := sync.OnceFunc(func() {
+		close(stop)
+		workers.Wait()
 	})
+	t.Cleanup(stopWorkers)
 
 	// Ordinary sync traffic arriving while the deletion run is open. On
 	// PostgreSQL these commit alongside it; on SQLite they queue behind it.
@@ -610,29 +630,40 @@ func TestListChangedMessages_DeletionRunTombstonesAllArrive(t *testing.T) {
 				consumer.record(fmt.Errorf("incoming sync traffic: %w", err))
 				return
 			}
-			time.Sleep(2 * time.Millisecond)
+			time.Sleep(2 * time.Millisecond) //nolint:kennlint // paces real writes against the database clock
 		}
 	})
 
-	// The deletion list streams in, which is why the transaction outlives the
-	// consumer's poll interval.
+	// The deletion list streams in. Keep its reader open after every doomed ID
+	// has been processed so the transaction is provably still uncommitted when
+	// the consumer reads the bound.
 	reader, writer := io.Pipe()
+	t.Cleanup(func() { _ = writer.Close() })
+	markDone := make(chan error, 1)
 	go func() {
-		for i := range doomedCount {
-			_, _ = fmt.Fprintf(writer, "doomed-%d\n", i)
-			time.Sleep(5 * time.Millisecond)
-		}
-		_ = writer.Close()
+		markDone <- st.MarkMessagesDeletedFromReader(src.ID, reader, 4)
 	}()
-	// Record complete_through on every page read while the deletion transaction
-	// is open. Everything it stamps is uncommitted for the whole of this call.
-	consumer.watchBounds(func() {
-		require.NoError(st.MarkMessagesDeletedFromReader(src.ID, reader, 4),
-			"MarkMessagesDeletedFromReader")
-	})
+	for i := range doomedCount {
+		_, err := fmt.Fprintf(writer, "doomed-%d\n", i)
+		require.NoError(err, "stream a doomed message ID")
+	}
+	// This partial token is read only after Scanner has returned and the store
+	// has flushed the preceding complete token. With no newline or EOF, the
+	// next Scan remains blocked here and keeps the transaction open.
+	_, err = io.WriteString(writer, "hold-open")
+	require.NoError(err, "hold the deletion stream open")
 
-	close(stop)
-	workers.Wait()
+	// Record a bound from a page that completed while the deletion transaction
+	// was still open. Recording until MarkMessagesDeletedFromReader returned
+	// also included polls that acquired SQLite's write lock just after COMMIT,
+	// which made the old test mistake a valid post-commit bound for a violation.
+	consumer.watchBounds(func() {
+		consumer.mustPoll(t, st)
+	})
+	require.NoError(writer.Close(), "finish the deletion stream")
+	require.NoError(<-markDone, "MarkMessagesDeletedFromReader")
+
+	stopWorkers()
 	require.NoError(consumer.failure, "a background worker failed")
 
 	missing := func() []int64 {
@@ -732,7 +763,7 @@ func TestListChangedMessages_BoundNeverEntersABatchesStampRange(t *testing.T) {
 					trafficErr = err
 					return
 				}
-				time.Sleep(time.Millisecond)
+				time.Sleep(time.Millisecond) //nolint:kennlint // paces real writes against the database clock
 			}
 		})
 	}
@@ -842,7 +873,7 @@ func TestListChangedMessages_ConcurrentTransactionalWritersLoseNothing(t *testin
 				return
 			}
 			record(id, value)
-			time.Sleep(staggered(i, 0, 90))
+			time.Sleep(staggered(i, 0, 90)) //nolint:kennlint // paces real writes against the database clock
 		}
 	})
 
@@ -854,10 +885,10 @@ func TestListChangedMessages_ConcurrentTransactionalWritersLoseNothing(t *testin
 		require.NoError(err, "begin batched write")
 		_, err = tx.Exec(st.Rebind(`UPDATE messages SET subject = ? WHERE id = ?`), value, id)
 		require.NoError(err, "batched write")
-		time.Sleep(3 * time.Millisecond) // stamped, not yet published
+		time.Sleep(pendingStampWindow) //nolint:kennlint // stamped, not yet published
 		require.NoError(tx.Commit(), "commit batched write")
 		record(id, value)
-		time.Sleep(staggered(round, 0, 900))
+		time.Sleep(staggered(round, 0, 900)) //nolint:kennlint // paces real writes against the database clock
 	}
 
 	close(stop)

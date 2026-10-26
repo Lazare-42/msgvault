@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"fmt"
 	"math"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -45,6 +46,86 @@ func TestFusedSearch_BothSignalsContribute(t *testing.T) {
 	require.Equalf(int64(2), hits[0].MessageID, "expected msg 2 at top, got %+v", hits)
 	assert.Falsef(math.IsNaN(hits[0].BM25Score), "top hit BM25Score should not be NaN: %+v", hits[0])
 	assert.Falsef(math.IsNaN(hits[0].VectorScore), "top hit VectorScore should not be NaN: %+v", hits[0])
+}
+
+func TestFusedSearch_ReadyAcceleratorFusesBothSignals(t *testing.T) {
+	b, ctx := newFusedBackendForTest(t)
+	generationID := seedAndEmbed(t, b, map[int64][]float32{
+		1: unitVec(768, 0),
+		2: unitVec(768, 1),
+		3: unitVec(768, 2),
+	})
+	installReadyFlatAccelerator(t, b, generationID, 768)
+	require.NoError(t, b.ActivateGeneration(ctx, generationID, true))
+
+	hits, metadata, err := b.FusedSearch(ctx, vector.FusedRequest{
+		FTSTerms: []string{"meeting"}, QueryVec: unitVec(768, 1),
+		Generation: generationID, KPerSignal: 2, Limit: 5, RRFK: 60,
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, hits)
+	assert.Equal(t, int64(2), hits[0].MessageID)
+	assert.False(t, math.IsNaN(hits[0].BM25Score))
+	assert.False(t, math.IsNaN(hits[0].VectorScore))
+	assert.True(t, metadata.PoolSaturated, "the vector K+1 probe should report the capped pool")
+	assert.Equal(t, acceleratorKind, metadata.Accelerator)
+}
+
+func TestFusedSearch_ReadyAcceleratorReportsUnderfilledWorkCeiling(t *testing.T) {
+	b, ctx := newFusedBackendForTest(t)
+	vectors := make(map[int64][]float32, 80)
+	for i := range 80 {
+		vectors[int64(i+1)] = []float32{1, float32(i) / 100, 0, 0}
+	}
+	generationID := seedAndEmbed(t, b, vectors)
+	installReadyFlatAccelerator(t, b, generationID, 4)
+	b.annWorkCeiling = 32
+	_, err := b.mainDB.Exec(`UPDATE messages SET deleted_at = CURRENT_TIMESTAMP WHERE id <= 40`)
+	require.NoError(t, err)
+
+	hits, metadata, err := b.FusedSearch(ctx, vector.FusedRequest{
+		QueryVec: unitVec(4, 0), Generation: generationID,
+		KPerSignal: 5, Limit: 5, RRFK: 60,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, hits)
+	assert.True(t, metadata.PoolSaturated)
+}
+
+func TestFusedSearchReportsExactRetrievalPaths(t *testing.T) {
+	for _, path := range []string{"exact", "exact-filter", "exact-fallback"} {
+		t.Run(path, func(t *testing.T) {
+			b, ctx := newFusedBackendForTest(t)
+			gen := seedAndEmbed(t, b, map[int64][]float32{
+				1: unitVec(4, 0), 2: unitVec(4, 1), 3: unitVec(4, 2),
+			})
+			req := vector.FusedRequest{
+				FTSTerms: []string{"meeting"}, QueryVec: unitVec(4, 1),
+				Generation: gen, KPerSignal: 2, Limit: 5, RRFK: 60,
+			}
+			if path != "exact" {
+				installReadyFlatAccelerator(t, b, gen, 4)
+			}
+			if path == "exact-filter" {
+				req.Filter.MessageIDs = []int64{1, 2, 3}
+			}
+			if path == "exact-fallback" {
+				_, err := b.db.Exec(`DROP TABLE ` + acceleratorTableName(gen))
+				require.NoError(t, err)
+				_, err = b.db.Exec(`CREATE TABLE ` + acceleratorTableName(gen) + ` (embedding BLOB)`)
+				require.NoError(t, err)
+			}
+
+			hits, metadata, err := b.FusedSearch(ctx, req)
+			require.NoError(t, err)
+			require.NotEmpty(t, hits)
+			assert.Equal(t, int64(2), hits[0].MessageID)
+			assert.False(t, math.IsNaN(hits[0].BM25Score))
+			assert.False(t, math.IsNaN(hits[0].VectorScore))
+			assert.Equal(t, path, metadata.Accelerator)
+			assert.True(t, metadata.PoolSaturated)
+		})
+	}
 }
 
 func TestFusedSearch_FTSOnly_VectorScoreIsNaN(t *testing.T) {
@@ -101,6 +182,53 @@ func TestFusedSearch_VectorOnly_BM25ScoreIsNaN(t *testing.T) {
 	assert.False(math.IsNaN(hits[0].VectorScore), "VectorScore should be present")
 }
 
+func TestNormalizeFusedMainDSNHandlesNetURLWindowsPath(t *testing.T) {
+	got, err := normalizeFusedMainDSN(
+		`file://C:%5CUsers%5Crunner%5Carchive.db?cache=shared`,
+	)
+
+	require.NoError(t, err)
+	assert.Equal(t, `file:///C:/Users/runner/archive.db?cache=shared`, got)
+}
+
+func TestFusedSearch_MainFileURIWithQuery(t *testing.T) {
+	require := require.New(t)
+	ctx := t.Context()
+	main, mainPath := openFusedMainDB(t)
+	uriPath := filepath.ToSlash(mainPath)
+	if filepath.VolumeName(mainPath) != "" && !strings.HasPrefix(uriPath, "/") {
+		uriPath = "/" + uriPath
+	}
+	mainDSN := (&url.URL{
+		Scheme:   "file",
+		Path:     uriPath,
+		RawQuery: "cache=shared",
+	}).String()
+	b, err := Open(ctx, Options{
+		Path:      filepath.Join(t.TempDir(), "vectors.db"),
+		MainPath:  mainDSN,
+		Dimension: 768,
+		MainDB:    main,
+	})
+	require.NoError(err, "Open backend")
+	t.Cleanup(func() { _ = b.Close() })
+
+	generation := seedAndEmbed(t, b, map[int64][]float32{
+		2: unitVec(768, 1),
+	})
+	require.NoError(b.ActivateGeneration(ctx, generation, true))
+	hits, _, err := b.FusedSearch(ctx, vector.FusedRequest{
+		FTSTerms:   []string{"meeting"},
+		Generation: generation,
+		KPerSignal: 10,
+		Limit:      5,
+		RRFK:       60,
+	})
+	require.NoError(err, "FusedSearch through file URI")
+	require.NotEmpty(hits)
+	assert.Equal(t, int64(2), hits[0].MessageID)
+}
+
 // TestFusedSearch_AnnSaturation_VectorOnly proves ANN-side saturation
 // is reported even when BM25 is silent. Regression for the bug where
 // the returned saturated flag was derived solely from the BM25 pool
@@ -125,9 +253,9 @@ func TestFusedSearch_AnnSaturation_VectorOnly(t *testing.T) {
 		Limit:      10,
 		RRFK:       60,
 	}
-	hits, saturated, err := b.FusedSearch(ctx, req)
+	hits, metadata, err := b.FusedSearch(ctx, req)
 	require.NoError(t, err, "FusedSearch")
-	assert.Truef(t, saturated, "saturated for ANN pool of 5 with KPerSignal=2 should be true (hits=%d)", len(hits))
+	assert.Truef(t, metadata.PoolSaturated, "saturated for ANN pool of 5 with KPerSignal=2 should be true (hits=%d)", len(hits))
 }
 
 // TestFusedSearch_AnnSaturation_BelowCap is the counter-test for
@@ -148,9 +276,9 @@ func TestFusedSearch_AnnSaturation_BelowCap(t *testing.T) {
 		Limit:      10,
 		RRFK:       60,
 	}
-	_, saturated, err := b.FusedSearch(ctx, req)
+	_, metadata, err := b.FusedSearch(ctx, req)
 	require.NoError(t, err, "FusedSearch")
-	assert.False(t, saturated, "saturated for ANN pool of 2 with KPerSignal=5 should be false")
+	assert.False(t, metadata.PoolSaturated, "saturated for ANN pool of 2 with KPerSignal=5 should be false")
 }
 
 func TestFusedSearch_NoSignals_Errors(t *testing.T) {
@@ -290,6 +418,7 @@ func openFusedMainWithSchema(t *testing.T, path string) *sql.DB {
 	CREATE TABLE messages (
 	    id INTEGER PRIMARY KEY,
 	    subject TEXT,
+	    list_id TEXT,
 	    message_type TEXT DEFAULT 'email',
 	    source_id INTEGER,
     sender_id INTEGER,
@@ -325,6 +454,7 @@ func openFusedMainWithoutMessageType(t *testing.T, path string) *sql.DB {
 	CREATE TABLE messages (
 	    id INTEGER PRIMARY KEY,
 	    subject TEXT,
+	    list_id TEXT,
 	    source_id INTEGER,
     sender_id INTEGER,
     has_attachments INTEGER DEFAULT 0,
@@ -399,7 +529,7 @@ func TestFusedSearch_PinnedPoolKeepsAttach(t *testing.T) {
 	// were unpinned AND vec.* actually missing, we wouldn't hang.
 	// With the pin it will timeout waiting for the tx's conn — which
 	// is exactly the intended serialisation, not a failure.
-	queryCtx, cancel := context.WithTimeout(ctx, 150*time.Millisecond)
+	queryCtx, cancel := context.WithTimeout(ctx, 150*time.Millisecond) //nolint:kennlint // the deadline is the expected result; the open transaction holds the pinned connection
 	defer cancel()
 	// This is a serialisation probe, not a data read: we only inspect
 	// secondErr to distinguish a deadlock-avoidance timeout from a
@@ -917,7 +1047,7 @@ func TestFusedSearch_EmptyFilteredSetReportsNotSaturated(t *testing.T) {
 	require.NoError(b.ActivateGeneration(ctx, gid, true), "ActivateGeneration")
 
 	yes := true
-	hits, saturated, err := b.FusedSearch(ctx, vector.FusedRequest{
+	hits, metadata, err := b.FusedSearch(ctx, vector.FusedRequest{
 		QueryVec:   unitVec(768, 0),
 		Generation: gid,
 		FTSTerms:   []string{"report"},
@@ -926,7 +1056,7 @@ func TestFusedSearch_EmptyFilteredSetReportsNotSaturated(t *testing.T) {
 	})
 	require.NoError(err, "FusedSearch")
 	require.Emptyf(hits, "want empty (filter excludes everything); got %+v", hits)
-	assert.False(t, saturated, "saturation requires overflow, which is impossible when no rows pass the filter")
+	assert.False(t, metadata.PoolSaturated, "saturation requires overflow, which is impossible when no rows pass the filter")
 }
 
 // TestFusedSearch_SubjectBoostOverFetchesBeyondLimit regresses the
@@ -1135,4 +1265,52 @@ func TestFusedSearch_DimensionMismatch(t *testing.T) {
 		KPerSignal: 10, Limit: 5, RRFK: 60,
 	})
 	assert.ErrorIs(t, err, vector.ErrDimensionMismatch)
+}
+
+func TestKitFusionOrderingMissingLegsBoostAndFilters(t *testing.T) {
+	b, ctx := newFusedBackendForTest(t)
+	_, err := b.mainDB.ExecContext(ctx, `DELETE FROM messages; DELETE FROM messages_fts;
+ INSERT INTO messages(id, subject) VALUES (3, 'ordinary'), (7, 'ordinary'), (9, 'Priority report');
+ INSERT INTO messages_fts(rowid, subject, body) VALUES (3, 'ordinary', 'needle'), (7, 'ordinary', 'needle'), (9, 'Priority report', 'other');`)
+	require.NoError(t, err)
+	generation := seedAndEmbed(t, b, map[int64][]float32{
+		3: {0.8, 0.6, 0, 0}, 7: {1, 0, 0, 0}, 9: {0, 0, 1, 0},
+	})
+	installReadyFlatAccelerator(t, b, generation, 4)
+	request := vector.FusedRequest{Generation: generation, FTSTerms: []string{"needle"}, QueryVec: []float32{1, 0, 0, 0}, KPerSignal: 10, Limit: 10, RRFK: 60}
+	hits, _, err := b.FusedSearch(ctx, request)
+	require.NoError(t, err)
+	require.Len(t, hits, 3)
+	assert.Equal(t, []int64{3, 7, 9}, []int64{hits[0].MessageID, hits[1].MessageID, hits[2].MessageID})
+	assert.InDelta(t, 1.0/61+1.0/62, hits[0].RRFScore, 1e-12)
+	assert.InDelta(t, hits[0].RRFScore, hits[1].RRFScore, 0)
+	assert.True(t, math.IsNaN(hits[2].BM25Score))
+	assert.False(t, math.IsNaN(hits[2].VectorScore))
+
+	request.SubjectBoost = 3
+	request.SubjectTerms = []string{"priority"}
+	request.Limit = 1
+	hits, _, err = b.FusedSearch(ctx, request)
+	require.NoError(t, err)
+	require.Len(t, hits, 1)
+	assert.Equal(t, int64(9), hits[0].MessageID)
+	assert.True(t, hits[0].SubjectBoosted)
+	assert.InDelta(t, 3.0/63, hits[0].RRFScore, 1e-12)
+
+	request.Filter.MessageIDs = []int64{7}
+	hits, _, err = b.FusedSearch(ctx, request)
+	require.NoError(t, err)
+	require.Len(t, hits, 1)
+	assert.Equal(t, int64(7), hits[0].MessageID)
+	assert.False(t, hits[0].SubjectBoosted)
+	assert.InDelta(t, 2.0/61, hits[0].RRFScore, 1e-12)
+
+	// An unindexed message contributes through the lexical leg alone.
+	require.NoError(t, b.Delete(ctx, generation, []int64{7}))
+	hits, _, err = b.FusedSearch(ctx, request)
+	require.NoError(t, err)
+	require.Len(t, hits, 1)
+	assert.Equal(t, int64(7), hits[0].MessageID)
+	assert.True(t, math.IsNaN(hits[0].VectorScore))
+	assert.False(t, math.IsNaN(hits[0].BM25Score))
 }

@@ -2,7 +2,8 @@ package cmd
 
 import (
 	"bytes"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"strconv"
@@ -107,7 +108,7 @@ func newPersonFactsCommand() *cobra.Command {
 				return errors.New("person fact evidence response was empty")
 			}
 			if options.jsonOutput {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(response.JSON200.Evidence)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), response.JSON200.Evidence, json.Deterministic(true))
 			}
 			writer := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 			_, _ = fmt.Fprintln(writer, "ID\tEVIDENCE KEY\tSOURCE\tSOURCE VERSION\tSUPPORTED\tRECORDED")
@@ -163,7 +164,7 @@ func newPersonFactsCommand() *cobra.Command {
 				return errors.New("person fact evidence status response was empty")
 			}
 			if options.jsonOutput {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(response.JSON200.Events)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), response.JSON200.Events, json.Deterministic(true))
 			}
 			writer := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 			_, _ = fmt.Fprintln(writer, "ID\tGENERATION\tEVIDENCE KEY\tSOURCE VERSION\tSUPPORTED\tREASON\tTIMESTAMP")
@@ -210,7 +211,7 @@ func newPersonFactsCommand() *cobra.Command {
 				return errors.New("person fact claims response was empty")
 			}
 			if options.jsonOutput {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(response.JSON200.Claims)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), response.JSON200.Claims, json.Deterministic(true))
 			}
 			writer := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 			_, _ = fmt.Fprintln(writer, "ID\tGENERATION\tTARGET\tRELATION\tORIGIN\tCLAIM KEY\tCREATED")
@@ -254,7 +255,7 @@ func newPersonFactsCommand() *cobra.Command {
 				return errors.New("person fact decisions response was empty")
 			}
 			if options.jsonOutput {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(response.JSON200.Decisions)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), response.JSON200.Decisions, json.Deterministic(true))
 			}
 			writer := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 			_, _ = fmt.Fprintln(writer, "ID\tRESOLUTION\tCLAIM KEY\tACTION\tREASON\tPROJECTION\tCREATED")
@@ -295,7 +296,7 @@ func newPersonFactsCommand() *cobra.Command {
 				return errors.New("person fact pins response was empty")
 			}
 			if options.jsonOutput {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(response.JSON200.Pins)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), response.JSON200.Pins, json.Deterministic(true))
 			}
 			writer := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 0, 2, ' ', 0)
 			_, _ = fmt.Fprintln(writer, "TARGET\tPINNED\tACTOR\tEVENT")
@@ -335,7 +336,7 @@ func newPersonFactPinCommand(options *personFactsCLIOptions, pinned bool) *cobra
 	}
 	return &cobra.Command{
 		Use:   action + " <person-id> <kind> <key>",
-		Short: action + " an automatic person fact target",
+		Short: strings.ToUpper(action[:1]) + action[1:] + " an automatic person fact target",
 		Args:  cobra.ExactArgs(3),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			personID, err := positivePersonCLIArg(cmd, args[0], personValue)

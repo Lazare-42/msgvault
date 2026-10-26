@@ -4,9 +4,11 @@ package googledocs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -40,6 +42,7 @@ type File struct {
 // Document is a plain-text export of a Google Doc plus metadata.
 type Document struct {
 	File
+
 	Text          string `json:"text"`
 	TextLength    int    `json:"text_length"`
 	TextTruncated bool   `json:"text_truncated"`
@@ -124,7 +127,7 @@ func NewClient(sources []SourceServices) (*LiveClient, error) {
 // ValidateSource checks the required fields for a Google Docs source.
 func ValidateSource(src config.GoogleDocsSource) error {
 	if strings.TrimSpace(src.Name) == "" {
-		return fmt.Errorf("google-docs source name is required")
+		return errors.New("google-docs source name is required")
 	}
 	if strings.TrimSpace(src.GoogleAccount) == "" {
 		return fmt.Errorf("google-docs source %q google_account is required", src.Name)
@@ -140,18 +143,18 @@ func ValidateSource(src config.GoogleDocsSource) error {
 
 func (c *LiveClient) resolveSource(sourceName string) (sourceRuntime, error) {
 	if c == nil || len(c.order) == 0 {
-		return sourceRuntime{}, fmt.Errorf("no Google Docs sources configured")
+		return sourceRuntime{}, errors.New("no Google Docs sources configured")
 	}
 	sourceName = strings.TrimSpace(sourceName)
 	if sourceName == "" {
 		if len(c.order) == 1 {
 			return c.sources[c.order[0]], nil
 		}
-		return sourceRuntime{}, fmt.Errorf("multiple Google Docs sources configured; specify source")
+		return sourceRuntime{}, errors.New("multiple Google Docs sources configured; specify source")
 	}
 	src, ok := c.sources[sourceName]
 	if !ok {
-		return sourceRuntime{}, fmt.Errorf("Google Docs source %q not configured or disabled", sourceName)
+		return sourceRuntime{}, fmt.Errorf("google docs source %q not configured or disabled", sourceName)
 	}
 	return src, nil
 }
@@ -238,7 +241,7 @@ func (c *LiveClient) AppendText(ctx context.Context, sourceName, documentID, tex
 		return nil, err
 	}
 	if text == "" {
-		return nil, fmt.Errorf("text is required")
+		return nil, errors.New("text is required")
 	}
 	_, err = src.docs.Documents.BatchUpdate(file.DocumentID, &docs.BatchUpdateDocumentRequest{
 		Requests: []*docs.Request{{
@@ -266,7 +269,7 @@ func (c *LiveClient) ReplaceText(ctx context.Context, sourceName, documentID, fi
 		return nil, err
 	}
 	if find == "" {
-		return nil, fmt.Errorf("find is required")
+		return nil, errors.New("find is required")
 	}
 	resp, err := src.docs.Documents.BatchUpdate(file.DocumentID, &docs.BatchUpdateDocumentRequest{
 		Requests: []*docs.Request{{
@@ -304,10 +307,10 @@ func (c *LiveClient) getDocFile(ctx context.Context, sourceName, documentID stri
 	}
 	documentID = strings.TrimSpace(documentID)
 	if documentID == "" {
-		return sourceRuntime{}, File{}, fmt.Errorf("document_id is required")
+		return sourceRuntime{}, File{}, errors.New("document_id is required")
 	}
 	if !driveIDPattern.MatchString(documentID) {
-		return sourceRuntime{}, File{}, fmt.Errorf("document_id is invalid")
+		return sourceRuntime{}, File{}, errors.New("document_id is invalid")
 	}
 	f, err := src.drive.Files.Get(documentID).
 		Context(ctx).
@@ -376,10 +379,5 @@ func truncateRunes(s string, maxChars int) string {
 }
 
 func containsString(values []string, target string) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(values, target)
 }

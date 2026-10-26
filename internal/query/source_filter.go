@@ -13,6 +13,10 @@ func appendSourceFilter(
 	conditions []string, args []any,
 	prefix string, singleID *int64, multiIDs []int64,
 ) ([]string, []any) {
+	return appendIDFilter(conditions, args, prefix+"source_id", singleID, multiIDs)
+}
+
+func appendIDFilter(conditions []string, args []any, column string, singleID *int64, multiIDs []int64) ([]string, []any) {
 	if multiIDs != nil && len(multiIDs) == 0 {
 		conditions = append(conditions, "1=0")
 		return conditions, args
@@ -24,14 +28,40 @@ func appendSourceFilter(
 			args = append(args, id)
 		}
 		conditions = append(conditions, fmt.Sprintf(
-			"%ssource_id IN (%s)",
-			prefix, strings.Join(placeholders, ","),
+			"%s IN (%s)",
+			column, strings.Join(placeholders, ","),
 		))
 		return conditions, args
 	}
 	if singleID != nil {
-		conditions = append(conditions, prefix+"source_id = ?")
+		conditions = append(conditions, column+" = ?")
 		args = append(args, *singleID)
 	}
+	return conditions, args
+}
+
+// appendConversationFilter applies OR semantics within a conversation scope:
+// a message may belong to any listed conversation. A nil slice means the
+// caller did not request conversation scoping; a non-nil empty slice is an
+// explicit match-nothing scope.
+func appendConversationFilter(
+	conditions []string, args []any, column string, conversationIDs []int64,
+) ([]string, []any) {
+	if conversationIDs != nil && len(conversationIDs) == 0 {
+		conditions = append(conditions, "1=0")
+		return conditions, args
+	}
+	if len(conversationIDs) == 0 {
+		return conditions, args
+	}
+
+	placeholders := make([]string, len(conversationIDs))
+	for i, id := range conversationIDs {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	conditions = append(conditions, fmt.Sprintf(
+		"%s IN (%s)", column, strings.Join(placeholders, ","),
+	))
 	return conditions, args
 }

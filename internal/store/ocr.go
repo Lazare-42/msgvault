@@ -75,9 +75,10 @@ type OCRSummary struct {
 }
 
 type OCRRuntimeStatus struct {
+	OCRSummary
+
 	Enabled     bool   `json:"enabled"`
 	Fingerprint string `json:"extractor_fingerprint"`
-	OCRSummary
 }
 
 func (s *Store) OCRSummary(ctx context.Context) (OCRSummary, error) {
@@ -85,7 +86,7 @@ func (s *Store) OCRSummary(ctx context.Context) (OCRSummary, error) {
 	if err != nil {
 		return OCRSummary{}, fmt.Errorf("summarize OCR: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out OCRSummary
 	for rows.Next() {
 		var status string
@@ -218,7 +219,7 @@ func (s *Store) ClaimOCRJob(ctx context.Context, fingerprint string, lease time.
 		ORDER BY o.priority DESC, o.created_at, o.content_hash
 		LIMIT 1`, fingerprint, now, now).Scan(&job.ContentHash, &job.Filename, &job.MIMEType, &job.Size, &job.Attempts)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, nil
+		return nil, nil //nolint:nilnil // An empty queue has no job to claim.
 	}
 	if err != nil {
 		return nil, fmt.Errorf("select OCR claim: %w", err)
@@ -234,7 +235,7 @@ func (s *Store) ClaimOCRJob(ctx context.Context, fingerprint string, lease time.
 	}
 	n, err := res.RowsAffected()
 	if err != nil || n != 1 {
-		return nil, fmt.Errorf("OCR claim lost")
+		return nil, errors.New("OCR claim lost")
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit OCR claim: %w", err)
@@ -345,7 +346,7 @@ func (s *Store) GetOCRResult(ctx context.Context, hash string, includePages bool
 	if err != nil {
 		return nil, fmt.Errorf("list OCR pages: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	for rows.Next() {
 		var page OCRPage
 		if err := rows.Scan(&page.PageNumber, &page.Method, &page.Text, &page.Confidence); err != nil {
@@ -400,7 +401,7 @@ func (s *Store) SearchOCR(ctx context.Context, query string, limit int) ([]OCRSe
 	if err != nil {
 		return nil, fmt.Errorf("search OCR text: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var hits []OCRSearchHit
 	for rows.Next() {
 		var hit OCRSearchHit

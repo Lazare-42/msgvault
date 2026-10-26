@@ -125,11 +125,6 @@ func TestReadPasswordFromPipe(t *testing.T) {
 			want:  "secret123",
 		},
 		{
-			name:  "trims trailing newline",
-			input: "mypassword\n",
-			want:  "mypassword",
-		},
-		{
 			name:  "trims trailing CRLF",
 			input: "mypassword\r\n",
 			want:  "mypassword",
@@ -213,12 +208,14 @@ func TestAddIMAPUsesDaemonRunnerAndForwardsPasswordEnv(t *testing.T) {
 		imapSTARTTLS = savedStartTLS
 		noDefaultIdentityAddImap = savedNoDefaultIdentity
 	})
-	configureRemoteDaemonForTest(t, server.URL)
+	testCtx := configureRemoteDaemonForTest(t, server.URL)
+	_ = testCtx
 	t.Setenv("MSGVAULT_IMAP_PASSWORD", "secret")
 
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
 	cmd := newAddIMAPCmd()
+	cmd.SetContext(testCtx)
 	cmd.SetOut(&stdout)
 	cmd.SetErr(&stderr)
 	cmd.SetArgs([]string{

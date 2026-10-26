@@ -3,11 +3,12 @@ package calsync
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 
 	"go.kenn.io/msgvault/internal/gcal"
+	"go.kenn.io/msgvault/internal/rederive"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -32,6 +33,22 @@ func (s *Syncer) Incremental(ctx context.Context) (Result, error) {
 			firstErr = err
 		}
 	}
+	selectedCalendars := make(map[string]struct{}, len(s.opts.Calendars))
+	for _, calendarID := range s.opts.Calendars {
+		selectedCalendars[calendarID] = struct{}{}
+	}
+	activeSources := make([]*store.Source, 0, len(sources))
+	for _, src := range sources {
+		if src.MergedIntoSourceID != 0 {
+			cfg := parseSourceConfig(src.SyncConfig)
+			if _, selected := selectedCalendars[cfg.CalendarID]; selected {
+				recordErr(fmt.Errorf("calendar %q source is retired: %w", cfg.CalendarID, store.ErrSourceRetired))
+			}
+			continue
+		}
+		activeSources = append(activeSources, src)
+	}
+	sources = activeSources
 
 	if s.shouldPersistOAuthApp() {
 		for _, src := range sources {
@@ -102,6 +119,7 @@ func (s *Syncer) Incremental(ctx context.Context) (Result, error) {
 // so the next sync re-delivers and retries the failed events rather than losing
 // them. A 410 surfaces as ErrSyncTokenExpired for the caller to self-heal.
 func (s *Syncer) incrementalCalendar(ctx context.Context, src *store.Source, cal gcal.Calendar, result *Result) error {
+	rederive.Heal(ctx, s.logger, s.store, src)
 	syncID, err := s.store.StartSync(src.ID, "incremental")
 	if err != nil {
 		return fmt.Errorf("start sync: %w", err)
@@ -198,7 +216,7 @@ func (s *Syncer) incrementalCalendar(ctx context.Context, src *store.Source, cal
 	if completeErr != nil {
 		return fail(fmt.Errorf("complete sync: %w", completeErr))
 	}
-	_ = s.store.CheckpointWAL()
+	_ = s.store.CheckpointWALPassive(ctx)
 	s.logger.Info("calendar incremental sync complete",
 		"calendar", cal.ID, "events_processed", cp.MessagesProcessed,
 		"events_added", cp.MessagesAdded, "events_cancelled", cp.MessagesUpdated,

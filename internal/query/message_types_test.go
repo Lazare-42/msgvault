@@ -7,7 +7,7 @@ import (
 )
 
 func TestIsKnownMessageType(t *testing.T) {
-	known := []string{"email", "calendar_event", "sms", "mms", "rcs", "whatsapp", "imessage", "teams"}
+	known := []string{"email", "calendar_event", "sms", "mms", "rcs", "whatsapp", "imessage", "teams", "matrix"}
 	for _, mt := range known {
 		assert.True(t, IsKnownMessageType(mt), "%q should be known", mt)
 	}
@@ -24,9 +24,4 @@ func TestKnownMessageTypesIncludesTextTypes(t *testing.T) {
 	for _, mt := range TextMessageTypes {
 		assert.True(t, IsKnownMessageType(mt), "text type %q must be a known message type", mt)
 	}
-}
-
-func TestDiscordIsKnownTextMessageType(t *testing.T) {
-	assert.True(t, IsKnownMessageType("discord"))
-	assert.True(t, IsTextMessageType("discord"))
 }

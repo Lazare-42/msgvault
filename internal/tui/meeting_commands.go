@@ -19,6 +19,7 @@ type meetingMessagesLoadedMsg struct {
 
 type meetingSearchLoadedMsg struct {
 	messages               []query.MessageSummary
+	query                  string
 	err                    error
 	requestID              uint64
 	offset                 int
@@ -99,7 +100,7 @@ func (m Model) loadMeetingSearch(queryString string, offset int, _ bool) tea.Cmd
 	presentationGeneration := m.presentationGeneration
 	return safeCmdWithPanic(
 		func() tea.Msg {
-			parsed := search.Parse(queryString)
+			parsed := search.ParseOR(queryString)
 			if err := parsed.Err(); err != nil {
 				return meetingSearchLoadedMsg{
 					err: err, requestID: requestID, offset: offset,
@@ -109,8 +110,8 @@ func (m Model) loadMeetingSearch(queryString string, offset int, _ bool) tea.Cmd
 			merged := query.MergeFilterIntoQuery(parsed, filter)
 			messages, err := engine.Search(context.Background(), merged, searchPageSize, offset)
 			return meetingSearchLoadedMsg{
-				messages: messages,
-				err:      err, requestID: requestID, offset: offset,
+				messages: messages, query: queryString,
+				err: err, requestID: requestID, offset: offset,
 				presentationGeneration: presentationGeneration,
 			}
 		},
@@ -150,6 +151,10 @@ func (m Model) handleMeetingSearchLoaded(msg meetingSearchLoadedMsg) (tea.Model,
 	}
 	m.meetingState.searchOffset = len(m.meetingState.messages)
 	m.meetingState.searchComplete = len(msg.messages) < searchPageSize
+	if active && msg.offset == 0 {
+		cmd := m.acceptedSearchAction(msg.query, searchModeFast, len(msg.messages))
+		return m, cmd
+	}
 	return m, nil
 }
 

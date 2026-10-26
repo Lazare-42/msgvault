@@ -29,6 +29,7 @@ import (
 	msgexport "go.kenn.io/msgvault/internal/export"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
 
 func TestPostRepackBlobReadsThroughAPIMCPAndExports(t *testing.T) {
@@ -69,10 +70,7 @@ func TestPackedRestoreReadsThroughAPIMCPAndExports(t *testing.T) {
 	require := require.New(t)
 	dataDir := t.TempDir()
 	dbPath := filepath.Join(dataDir, "msgvault.db")
-	st, err := store.OpenForTest(dbPath)
-	require.NoError(err)
-	t.Cleanup(func() { _ = st.Close() })
-	require.NoError(st.InitSchema())
+	st := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	source, err := st.GetOrCreateSource("gmail", "restore-reader@example.com")
 	require.NoError(err)
 	conversationID, err := st.EnsureConversation(source.ID, "restore-reader-thread", "Restore Reader")
@@ -157,11 +155,11 @@ func assertBlobReadSurfaces(
 		URL: httpServer.URL, AllowInsecure: true,
 	})
 	require.NoError(err)
-	configureRemoteDaemonForTest(t, httpServer.URL)
-	mcpOpts, err := daemonMCPServeOptions(context.Background(), client)
-	require.NoError(err)
+	testCtx := configureRemoteDaemonForTest(t, httpServer.URL)
+	_ = testCtx
+	mcpOpts := daemonMCPServeOptions(testCtx, client, invocationFromContext(testCtx))
 	require.NotNil(mcpOpts.AttachmentReader)
-	mcpData, err := mcpOpts.AttachmentReader.ReadAttachment(context.Background(), hash)
+	mcpData, err := mcpOpts.AttachmentReader.ReadAttachment(testCtx, hash)
 	require.NoError(err)
 	assert.Equal(content, mcpData, "daemon-backed MCP attachment reader follows packed authority")
 
@@ -177,14 +175,15 @@ func assertBlobReadSurfaces(
 	exportAttachmentBase64 = false
 	exportAttachmentOutput = filepath.Join(t.TempDir(), "single-export.bin")
 	cmd := &cobra.Command{Use: "export-attachment"}
-	cmd.SetContext(context.Background())
+	cmd.SetContext(testCtx)
+	cmd.SetContext(testCtx)
 	require.NoError(runExportAttachmentHTTP(cmd, hash))
 	single, err := os.ReadFile(exportAttachmentOutput)
 	require.NoError(err)
 	assert.Equal(content, single)
 
 	directory := t.TempDir()
-	dirResult := exportAttachmentsFromHTTP(context.Background(), client, directory,
+	dirResult := exportAttachmentsFromHTTP(testCtx, client, directory,
 		[]query.AttachmentInfo{{
 			Filename: filename, ContentHash: hash, Size: int64(len(content)),
 		}})

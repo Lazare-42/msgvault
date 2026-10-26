@@ -3,6 +3,7 @@ package importer
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"go.kenn.io/msgvault/internal/export"
 	"go.kenn.io/msgvault/internal/mime"
+	"go.kenn.io/msgvault/internal/remoteimage"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/textutil"
 )
@@ -34,7 +36,48 @@ func IngestRawMessage(
 	raw []byte, fallbackDate time.Time,
 	log *slog.Logger,
 ) error {
-	parsed, _ := mime.ParseWithRecovery(raw, "(MIME parse error)")
+	return ingestRawMessage(ctx, st, sourceID, identifier, attachmentsDir, labelIDs, sourceMsgID, rawHash, raw, fallbackDate, log, nil, "")
+}
+
+type rawMessageIngestFunc func(context.Context, *store.Store, int64, string, string, []int64, string, string, []byte, time.Time, *slog.Logger) error
+
+func rawMessageIngester(images *remoteimage.Fetcher) rawMessageIngestFunc {
+	return func(ctx context.Context, st *store.Store, sourceID int64, identifier, attachmentsDir string, labelIDs []int64, sourceMsgID, rawHash string, raw []byte, fallbackDate time.Time, log *slog.Logger) error {
+		return ingestRawMessage(ctx, st, sourceID, identifier, attachmentsDir, labelIDs, sourceMsgID, rawHash, raw, fallbackDate, log, images, "")
+	}
+}
+
+func ingestRawMessage(
+	ctx context.Context, st *store.Store,
+	sourceID int64, identifier, attachmentsDir string,
+	labelIDs []int64, sourceMsgID, rawHash string,
+	raw []byte, fallbackDate time.Time,
+	log *slog.Logger, images *remoteimage.Fetcher, threadID string,
+) error {
+	return ingestRawMessageWithCompletion(ctx, st, sourceID, identifier, attachmentsDir, labelIDs,
+		sourceMsgID, rawHash, raw, fallbackDate, log, images, threadID, false)
+}
+
+// ingestRawMessageWithCompletion reports, when strict, attachment storage and
+// search-index failures as retryable errors after the raw message commits.
+// Other importers retain the shared path's best-effort postcommit behavior.
+// Fatally malformed MIME is complete once its raw and salvaged headers are
+// archived: the same bytes always fail the same way.
+func ingestRawMessageWithCompletion(ctx context.Context, st *store.Store,
+	sourceID int64, identifier, attachmentsDir string, labelIDs []int64,
+	sourceMsgID, rawHash string, raw []byte, fallbackDate time.Time,
+	log *slog.Logger, images *remoteimage.Fetcher, threadID string, strict bool,
+) error {
+	parsed, parseErr := mime.ParseWithRecovery(raw, "(MIME parse error)")
+	if strict && parseErr != nil {
+		log.Warn("archived malformed MIME with salvaged headers", "source_msg", sourceMsgID, "error", parseErr)
+	}
+	var completionErr error
+	incomplete := func(err error) {
+		if strict {
+			completionErr = errors.Join(completionErr, err)
+		}
+	}
 
 	subject := textutil.EnsureUTF8(parsed.Subject)
 	bodyText := textutil.EnsureUTF8(parsed.GetBodyText())
@@ -80,7 +123,9 @@ func IngestRawMessage(
 		}
 	}
 
-	threadID := threadKey(parsed, rawHash)
+	if threadID == "" {
+		threadID = threadKey(parsed, rawHash)
+	}
 
 	convSubject := subject
 	if convSubject == "" {
@@ -117,14 +162,17 @@ func IngestRawMessage(
 		internalDate = sql.NullTime{Time: fallbackDate.UTC(), Valid: true}
 	}
 
-	snippet := snippetFromBody(bodyText)
+	snippet := textutil.SnippetFromBody(bodyText)
 	hasAttachments := len(parsed.Attachments) > 0
 	attachmentCount := len(parsed.Attachments)
 
+	rfcID := mime.NormalizeMessageID(parsed.MessageID)
 	rec := &store.Message{
 		ConversationID:  conversationID,
 		SourceID:        sourceID,
 		SourceMessageID: sourceMsgID,
+		RFC822MessageID: sql.NullString{String: rfcID, Valid: rfcID != ""},
+		ListID:          sql.NullString{String: parsed.ListID, Valid: parsed.ListID != ""},
 		MessageType:     "email",
 		SentAt:          sentAt,
 		InternalDate:    internalDate,
@@ -150,7 +198,7 @@ func IngestRawMessage(
 	}
 
 	// Persist atomically
-	messageID, err := st.PersistMessage(&store.MessagePersistData{
+	messageID, err := st.PersistMessageContext(ctx, &store.MessagePersistData{
 		Message:    rec,
 		BodyText:   sql.NullString{String: bodyText, Valid: bodyText != ""},
 		BodyHTML:   sql.NullString{String: bodyHTML, Valid: bodyHTML != ""},
@@ -169,8 +217,9 @@ func IngestRawMessage(
 	for i := range parsed.Attachments {
 		att := &parsed.Attachments[i]
 		if err := storeAttachment(
-			st, attachmentsDir, messageID, att,
+			st, attachmentsDir, messageID, att, strict,
 		); err != nil {
+			incomplete(fmt.Errorf("store attachment: %w", err))
 			log.Warn("failed to store attachment",
 				"message", messageID,
 				"filename", att.Filename,
@@ -186,15 +235,24 @@ func IngestRawMessage(
 			st.Rebind(`SELECT COUNT(*) FROM attachments WHERE message_id = ?`),
 			messageID,
 		).Scan(&storedCount); err != nil {
+			incomplete(fmt.Errorf("count attachments: %w", err))
 			log.Warn("failed to count stored attachments",
 				"message", messageID, "error", err,
 			)
 		} else if storedCount != attachmentCount {
 			if err := st.RecomputeMessageAttachmentStats(messageID); err != nil {
+				incomplete(fmt.Errorf("attachment metadata: %w", err))
 				log.Warn("failed to update attachment metadata",
 					"message", messageID, "error", err,
 				)
 			}
+		}
+	}
+
+	if images != nil {
+		result := images.Archive(ctx, st, attachmentsDir, messageID, bodyHTML)
+		for _, imageErr := range result.Errors {
+			log.Warn("failed to archive remote image", "message", messageID, "error", imageErr)
 		}
 	}
 
@@ -207,12 +265,20 @@ func IngestRawMessage(
 			messageID, subject, bodyText,
 			fromAddr, toAddrs, ccAddrs,
 		); err != nil {
+			incomplete(fmt.Errorf("index message: %w", err))
 			log.Warn("failed to upsert FTS",
 				"message", messageID, "error", err,
 			)
 		}
 	}
 
+	if err := st.RecordEmailHeadersContext(ctx, sourceID, messageID, "", parsed.InReplyTo); err != nil {
+		return fmt.Errorf("record email reply header: %w", err)
+	}
+
+	if strict {
+		return errors.Join(emlxRetryable(completionErr), ctx.Err())
+	}
 	return nil
 }
 
@@ -235,15 +301,6 @@ func threadKey(parsed *mime.Message, rawHash string) string {
 		return mid
 	}
 	return rawHash
-}
-
-func snippetFromBody(body string) string {
-	body = strings.TrimSpace(body)
-	if body == "" {
-		return ""
-	}
-	line := textutil.FirstLine(body)
-	return textutil.TruncateRunes(line, 200)
 }
 
 func joinEmails(addrs []mime.Address) string {
@@ -305,9 +362,13 @@ func buildRecipientSet(recipientType string, addresses []mime.Address, participa
 
 func storeAttachment(
 	st *store.Store, attachmentsDir string,
-	messageID int64, att *mime.Attachment,
+	messageID int64, att *mime.Attachment, includeEmpty bool,
 ) error {
-	storagePath, err := export.StoreAttachmentFile(attachmentsDir, att)
+	storeFile := export.StoreAttachmentFile
+	if includeEmpty && !att.IsApplePlaceholder {
+		storeFile = export.StoreAttachmentFileIncludingEmpty
+	}
+	storagePath, err := storeFile(attachmentsDir, att)
 	if err != nil || storagePath == "" {
 		return err
 	}

@@ -11,7 +11,9 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"go.kenn.io/kit/embedmodel"
 	"go.kenn.io/msgvault/internal/jobctx"
+	"go.kenn.io/msgvault/internal/operations"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
 )
@@ -45,7 +47,7 @@ type WorkStore interface {
 	// Returns the ids whose UPDATE matched 0 rows (the CAS misses) so the
 	// worker can log them and exclude them from its success accounting; the
 	// watermark still advances and the backstop recovers them.
-	SetEmbedGenIfUnchanged(ctx context.Context, items []store.EmbedGenStamp, target int64) (missed []int64, err error)
+	SetEmbedGenIfUnchanged(ctx context.Context, items []store.EmbedGenStamp, target int64) (missed []int64, covered int, err error)
 }
 
 // WorkerDeps bundles the collaborators a Worker needs. Backend, VectorsDB,
@@ -104,6 +106,9 @@ type WorkerDeps struct {
 	// the worker goroutine; rate-limit inside the callback if output is
 	// expensive.
 	Progress func(ProgressReport)
+	// Recorder owns archive-side public history for each bounded worker pass.
+	Recorder    operations.Recorder
+	Diagnostics vector.EmbeddingDiagnosticWriter
 }
 
 // ProgressReport captures RunOnce progress after a set of messages has
@@ -269,8 +274,10 @@ func (w *Worker) finalizeEmbedRun(ctx context.Context, runID int64, res RunResul
 // MaxConsecutiveFailures, so a persistently misconfigured embedder (bad
 // credentials, unreachable endpoint) surfaces quickly instead of looping
 // forever. A successful batch resets the failure counter.
-func (w *Worker) RunOnce(ctx context.Context, gen vector.GenerationID) (res RunResult, retErr error) {
-	return w.run(ctx, gen, false)
+func (w *Worker) RunOnce(
+	ctx context.Context, gen vector.GenerationID, scope operations.PassScope,
+) (res RunResult, retErr error) {
+	return w.runOperationPass(ctx, gen, scope, false)
 }
 
 // RunBackstop performs a full-scan pass that ignores the per-gen
@@ -281,11 +288,40 @@ func (w *Worker) RunOnce(ctx context.Context, gen vector.GenerationID) (res RunR
 // scan/embed/stamp path with the scan cursor pinned at 0. Idempotent:
 // already-covered rows are skipped by the scan predicate, so re-running it
 // is cheap once the corpus is embedded.
-func (w *Worker) RunBackstop(ctx context.Context, gen vector.GenerationID) (res RunResult, retErr error) {
-	return w.run(ctx, gen, true)
+func (w *Worker) RunBackstop(
+	ctx context.Context, gen vector.GenerationID, scope operations.PassScope,
+) (res RunResult, retErr error) {
+	return w.runOperationPass(ctx, gen, scope, true)
 }
 
-func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool) (res RunResult, retErr error) {
+func (w *Worker) runOperationPass(
+	ctx context.Context, gen vector.GenerationID, scope operations.PassScope, backstop bool,
+) (res RunResult, retErr error) {
+	pass, terminal, err := beginOperationPass(
+		ctx, w.deps.Recorder, operations.KindMessageEmbedding, scope, w.deps.Log,
+	)
+	if err != nil {
+		return res, err
+	}
+	if terminal != nil {
+		return runResultFromOperationRun(terminal)
+	}
+	outcomes := newMessagePassOutcomes(pass)
+	diagnostics := passDiagnostics(ctx, w.deps.Diagnostics, w.deps.Log, gen, w.deps.Backend, pass)
+	ctx = withEmbeddingDiagnostics(ctx, diagnostics)
+	defer func() {
+		retErr = operationRunError(retErr)
+		// Finish the snapshot while the run is still active, so status never
+		// sees a closed run with an unfinished snapshot.
+		diagnostics.finish(retErr)
+		pass.finish(ctx, outcomes.counters(true), retErr)
+	}()
+	return w.run(ctx, gen, backstop, outcomes)
+}
+
+func (w *Worker) run(
+	ctx context.Context, gen vector.GenerationID, backstop bool, outcomes *messagePassOutcomes,
+) (res RunResult, retErr error) {
 	consecutiveFailures := 0
 	var lastErr error
 	completedRows := 0
@@ -328,6 +364,8 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 			}
 			return res, fmt.Errorf("RunOnce: %w", err)
 		}
+		// Close the previous batch so this scan is not charged to it.
+		diagnosticRun(ctx).completeBatch()
 		batchStart := time.Now()
 		ids, err := w.scanForEmbedding(ctx, int64(gen), afterID)
 		if err != nil {
@@ -343,6 +381,8 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 			return res, nil
 		}
 		res.Claimed += len(ids)
+		diagnosticRun(ctx).beginBatch(len(ids), batchStart)
+		outcomes.attempt(ids)
 		// batchMax is the highest id in this scan slice; once the batch is
 		// stamped these rows drop out of the predicate, but advancing the
 		// cursor past them avoids re-scanning the covered prefix.
@@ -352,6 +392,11 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 		if err != nil {
 			if w.stopIfYielded(ctx, gen) {
 				return res, nil
+			}
+			// The downshift drain below recovers a rejected batch one message
+			// at a time, so only an error it cannot recover is recorded.
+			if !errors.Is(err, ErrPermanent4xx) {
+				diagnosticRun(ctx).failure(err)
 			}
 			consecutiveFailures++
 			lastErr = err
@@ -363,7 +408,9 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 				// unstamped (endpoint-wide failure can't be ruled out).
 				w.deps.Log.Info("embed: downshifting to BatchSize=1 to drain failing batch",
 					"gen", gen, "batch_size", len(ids))
-				embedded, embeddedOK, stamped, safeAdvanceID, drainErr := w.downshiftDrain(ctx, gen, ids, &res, &completedRows)
+				embedded, embeddedOK, stamped, safeAdvanceID, drainErr := w.downshiftDrain(
+					ctx, gen, ids, &res, &completedRows, outcomes,
+				)
 				if w.stopIfYielded(ctx, gen) {
 					return res, nil
 				}
@@ -409,9 +456,10 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 
 				if drainErr != nil {
 					lastErr = drainErr
-					// A retired generation is a benign drop, never a hard abort.
+					diagnosticRun(ctx).failure(drainErr)
+					// A retired generation cancels this pass rather than retrying it.
 					if errors.Is(drainErr, vector.ErrGenerationRetired) {
-						return res, nil
+						return res, drainErr
 					}
 					if !errors.Is(drainErr, ErrPermanent4xx) {
 						return res, fmt.Errorf("downshift drain: %w", drainErr)
@@ -443,6 +491,7 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 			continue
 		}
 		res.Truncated += eb.truncated
+		outcomes.addTruncated(eb.truncated)
 
 		// Skip-mark messages that produced no embeddable content (missing
 		// from the main DB, or empty after preprocess). Stamping embed_gen
@@ -457,7 +506,7 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 					w.deps.Log.Warn("messages missing from main DB", "gen", gen, "ids", eb.missing)
 				}
 				if len(eb.empty) > 0 {
-					w.deps.Log.Warn("messages empty after preprocess", "gen", gen, "ids", eb.empty)
+					w.deps.Log.Warn("messages have no embeddable text after preprocess", "gen", gen, "ids", eb.empty)
 				}
 				missed, serr := w.stampSkipped(ctx, gen, skipIDs, eb.lastModified)
 				if serr != nil {
@@ -477,6 +526,8 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 				w.logCASMisses(gen, missed)
 				// Count only rows actually stamped (a CAS miss was not stamped).
 				stampedRows := len(skipIDs) - len(missed)
+				outcomes.succeed(idsWithout(skipIDs, missed))
+				outcomes.checkpoint(ctx)
 				completedRows += stampedRows
 				w.reportProgress(completedRows, stampedRows, 0, time.Since(batchStart))
 			}
@@ -487,15 +538,15 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 		}
 
 		// Step 1: upsert embeddings (VectorsDB side).
-		if err := w.deps.Backend.Upsert(ctx, gen, eb.chunks); err != nil {
+		if err := w.upsertMeasured(ctx, gen, eb.chunks); err != nil {
 			if errors.Is(err, vector.ErrGenerationRetired) {
 				// The generation was retired out from under this worker. Per
 				// the ErrGenerationRetired contract this is a benign "stop"
 				// signal, not a hard failure: re-embedding would re-fail
 				// identically. Do NOT stamp embed_gen (the retired gen is
-				// going away) and end the run cleanly.
+				// going away); the operation boundary records cancellation.
 				w.deps.Log.Info("embed: generation retired mid-run; stopping", "gen", gen)
-				return res, nil
+				return res, err
 			}
 			if w.stopIfYielded(ctx, gen) {
 				return res, nil
@@ -534,6 +585,10 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 				}
 				continue
 			}
+			// The skip stamps are committed, so they succeed even if the
+			// coverage stamp below fails; later scans will not find them.
+			outcomes.succeed(idsWithout(skipIDs, skipMissed))
+			outcomes.checkpoint(ctx)
 		}
 
 		// Safe to stamp after the upsert: the upsert is idempotent, so a crash
@@ -557,12 +612,14 @@ func (w *Worker) run(ctx context.Context, gen vector.GenerationID, backstop bool
 		}
 		missed = append(missed, skipMissed...)
 		w.logCASMisses(gen, missed)
+		outcomes.succeed(idsWithout(append(append([]int64(nil), eb.embeddedIDs...), skipIDs...), missed))
+		outcomes.checkpoint(ctx)
 
 		if len(eb.missing) > 0 {
 			w.deps.Log.Warn("messages missing from main DB", "gen", gen, "ids", eb.missing)
 		}
 		if len(eb.empty) > 0 {
-			w.deps.Log.Warn("messages empty after preprocess", "gen", gen, "ids", eb.empty)
+			w.deps.Log.Warn("messages have no embeddable text after preprocess", "gen", gen, "ids", eb.empty)
 		}
 
 		// Only rows ACTUALLY stamped count as succeeded. A CAS miss (its
@@ -632,9 +689,9 @@ func (w *Worker) advanceWatermark(ctx context.Context, gen vector.GenerationID, 
 // embedBatchResult carries the output of embedBatch. chunks and
 // embeddedIDs are aligned by position and correspond to messages that
 // were actually fetched and embedded. missing lists ids from the
-// input that had no row in the messages table; empty lists ids whose
-// content preprocessed to empty and therefore should not be sent to
-// embedders that reject blank strings.
+// input that had no row in the messages table; empty lists ids with blank
+// preprocessed text or only blank retained chunk windows. These messages
+// should not be sent to embedders that reject blank strings.
 type embedBatchResult struct {
 	chunks      []vector.Chunk
 	embeddedIDs []int64
@@ -713,7 +770,7 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 		// embed in a later chunk.
 		txt, bodyTrunc := Preprocess(subject, body, 0, preprocessCfg)
 		fetched[id] = struct{}{}
-		if strings.TrimSpace(txt) == "" {
+		if embedmodel.BlankText(txt) {
 			empty = append(empty, id)
 			continue
 		}
@@ -757,10 +814,15 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 		//     soft break, in which case the per-chunk hard-cut flag
 		//     wouldn't fire).
 		msgTrunc := m.BodyTruncated || chunkTail
+		chunkIndex := 0
 		for j, sp := range spans {
+			// Match the client's blank-input rule while preserving source offsets.
+			if embedmodel.BlankText(sp.Text) {
+				continue
+			}
 			ic := inputChunk{
 				ID:         m.ID,
-				ChunkIndex: j,
+				ChunkIndex: chunkIndex,
 				Text:       sp.Text,
 				Chars:      sp.CharEnd - sp.CharStart,
 				CharStart:  sp.CharStart,
@@ -774,6 +836,10 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 			}
 			pieces = append(pieces, ic)
 			inputs = append(inputs, sp.Text)
+			chunkIndex++
+		}
+		if chunkIndex == 0 {
+			empty = append(empty, m.ID)
 		}
 	}
 
@@ -793,7 +859,19 @@ func (w *Worker) embedBatch(ctx context.Context, ids []int64) (embedBatchResult,
 	vecs := make([][]float32, 0, len(inputs))
 	for i := 0; i < len(inputs); i += embedSubBatchSize {
 		end := min(i+embedSubBatchSize, len(inputs))
+		finishProvider := measureEmbeddingProvider(ctx, inputs[i:end])
 		got, err := w.deps.Client.Embed(ctx, inputs[i:end])
+		accepted := 0
+		if err == nil {
+			accepted = len(got)
+		}
+		// Worker.run records a rejection only if the downshift drain cannot
+		// recover it.
+		recorded := err
+		if errors.Is(err, ErrPermanent4xx) {
+			recorded = nil
+		}
+		finishProvider(accepted, recorded)
 		if err != nil {
 			return embedBatchResult{
 				missing:      missing,
@@ -903,6 +981,7 @@ func (w *Worker) downshiftDrain(
 	ids []int64,
 	res *RunResult,
 	completedRows *int,
+	outcomes *messagePassOutcomes,
 ) (embedded int, embeddedOK int, stamped int, safeAdvanceID int64, err error) {
 	var deferredDrops []int64
 	var lastDeferredErr error
@@ -970,6 +1049,8 @@ func (w *Worker) downshiftDrain(
 				}
 				w.logCASMisses(gen, missed)
 				stampedSkip := len(skip) - len(missed)
+				outcomes.succeed(idsWithout(skip, missed))
+				outcomes.checkpoint(ctx)
 				stamped += stampedSkip
 				*completedRows += stampedSkip
 				w.reportProgress(*completedRows, stampedSkip, 0, time.Since(batchStart))
@@ -995,7 +1076,7 @@ func (w *Worker) downshiftDrain(
 			}
 			continue
 		}
-		if uerr := w.deps.Backend.Upsert(ctx, gen, eb.chunks); uerr != nil {
+		if uerr := w.upsertMeasured(ctx, gen, eb.chunks); uerr != nil {
 			if errors.Is(uerr, vector.ErrGenerationRetired) {
 				// Generation retired mid-drain. Stop draining and surface the
 				// benign sentinel; remaining singletons would observe the same
@@ -1024,6 +1105,9 @@ func (w *Worker) downshiftDrain(
 		// not count as embedded/stamped here.
 		stampedHere := len(eb.embeddedIDs) - len(missed)
 		res.Truncated += eb.truncated
+		outcomes.addTruncated(eb.truncated)
+		outcomes.succeed(idsWithout(eb.embeddedIDs, missed))
+		outcomes.checkpoint(ctx)
 		embedded += stampedHere
 		stamped += stampedHere
 		*completedRows += stampedHere
@@ -1086,6 +1170,13 @@ func (w *Worker) downshiftDrain(
 		}
 		w.logCASMisses(gen, missed)
 		stampedDrops := len(deferredDrops) - len(missed)
+		outcomes.fail(idsWithout(deferredDrops, missed))
+		// Dropped messages are not recovered, so their rejection is the batch's
+		// error. A drop whose stamp missed will be retried, so it is not.
+		if stampedDrops > 0 {
+			diagnosticRun(ctx).failure(lastDeferredErr)
+		}
+		outcomes.checkpoint(ctx)
 		stamped += stampedDrops
 		*completedRows += stampedDrops
 		w.reportProgress(*completedRows, stampedDrops, 0, time.Since(dropStart))
@@ -1124,6 +1215,8 @@ func (w *Worker) downshiftDrain(
 // recovers them. A missed CAS is NOT an error — only a real driver failure on
 // either path returns err, for the caller's consecutive-failure accounting.
 func (w *Worker) stampCovered(ctx context.Context, gen vector.GenerationID, ids []int64, lm map[int64]any) (missed []int64, err error) {
+	finish := measureEmbeddingWrite(ctx)
+	defer func() { finish(err) }()
 	var cas []store.EmbedGenStamp
 	var plain []int64
 	for _, id := range ids {
@@ -1134,13 +1227,15 @@ func (w *Worker) stampCovered(ctx context.Context, gen vector.GenerationID, ids 
 		}
 	}
 	if len(cas) > 0 {
-		m, err := w.deps.Store.SetEmbedGenIfUnchanged(ctx, cas, int64(gen))
+		m, covered, err := w.deps.Store.SetEmbedGenIfUnchanged(ctx, cas, int64(gen))
+		diagnosticRun(ctx).completed(covered)
+		missed = append(missed, m...)
 		if err != nil {
 			return missed, err
 		}
-		missed = append(missed, m...)
 	}
 	if len(plain) > 0 {
+		// Missing rows have no message to cover, so they are not counted.
 		if err := w.deps.Store.SetEmbedGen(ctx, plain, int64(gen)); err != nil {
 			return missed, err
 		}
@@ -1152,6 +1247,8 @@ func (w *Worker) stampSkipped(ctx context.Context, gen vector.GenerationID, ids 
 	if len(ids) == 0 {
 		return nil, nil
 	}
+	finish := measureEmbeddingWrite(ctx)
+	defer func() { finish(err) }()
 	if w.deps.beforeSkipStamp != nil {
 		w.deps.beforeSkipStamp(ctx, ids)
 	}
@@ -1163,6 +1260,7 @@ func (w *Worker) stampSkipped(ctx context.Context, gen vector.GenerationID, ids 
 	defer func() { _ = tx.Rollback() }()
 
 	deleteIDs := make([]int64, 0, len(ids))
+	covered := 0
 	for _, id := range ids {
 		if tok, ok := lm[id]; ok {
 			res, err := tx.ExecContext(ctx,
@@ -1179,6 +1277,7 @@ func (w *Worker) stampSkipped(ctx context.Context, gen vector.GenerationID, ids 
 				missed = append(missed, id)
 				continue
 			}
+			covered++
 			deleteIDs = append(deleteIDs, id)
 			continue
 		}
@@ -1199,6 +1298,7 @@ func (w *Worker) stampSkipped(ctx context.Context, gen vector.GenerationID, ids 
 	if err := tx.Commit(); err != nil {
 		return nil, fmt.Errorf("commit skip stamp tx: %w", err)
 	}
+	diagnosticRun(ctx).completed(covered)
 	return missed, nil
 }
 

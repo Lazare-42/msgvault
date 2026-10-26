@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -379,7 +380,7 @@ func (e *DuckDBEngine) TextAggregate(
 	// Search filter on key columns.
 	if opts.SearchQuery != "" {
 		searchConds, searchArgs := e.buildAggregateSearchConditions(
-			opts.SearchQuery, def.keyColumns...)
+			search.Parse(opts.SearchQuery), def.keyColumns...)
 		conditions = append(conditions, searchConds...)
 		args = append(args, searchArgs...)
 	}
@@ -542,7 +543,7 @@ func (e *DuckDBEngine) listConversationMessages(
 // chat timeline will show truncated previews for search results rather than
 // the complete message body.
 func (e *DuckDBEngine) TextSearch(
-	ctx context.Context, query string, limit, offset int,
+	ctx context.Context, query string, sourceID *int64, limit, offset int,
 ) ([]MessageSummary, error) {
 	if e.sqliteDB == nil {
 		return nil, nil
@@ -551,48 +552,7 @@ func (e *DuckDBEngine) TextSearch(
 	if match == "" {
 		return nil, nil
 	}
-	if limit == 0 {
-		limit = 50
-	}
-
-	// Use FTS5 MATCH on messages_fts, filtered to text message types.
-	sqlQuery := fmt.Sprintf(`
-		SELECT
-			m.id,
-			COALESCE(m.source_message_id, '') AS source_message_id,
-			COALESCE(m.conversation_id, 0) AS conversation_id,
-			'' AS source_conversation_id,
-			COALESCE(m.subject, '') AS subject,
-			COALESCE(m.snippet, '') AS snippet,
-			COALESCE(p.email_address, '') AS from_email,
-			COALESCE(p.display_name, '') AS from_name,
-			COALESCE(p.phone_number, '') AS from_phone,
-			m.sent_at,
-			COALESCE(m.size_estimate, 0) AS size_estimate,
-			COALESCE(m.has_attachments, 0) AS has_attachments,
-			0 AS attachment_count,
-			m.deleted_from_source_at,
-			COALESCE(m.message_type, '') AS message_type,
-			COALESCE(c.title, '') AS conv_title
-		FROM messages_fts fts
-		JOIN messages m ON m.id = fts.rowid
-		LEFT JOIN participants p ON p.id = m.sender_id
-		LEFT JOIN conversations c ON c.id = m.conversation_id
-		WHERE messages_fts MATCH ?
-		  AND %s
-		  AND %s
-		ORDER BY m.sent_at DESC
-		LIMIT ? OFFSET ?
-	`, textMsgTypeFilter(), store.LiveMessagesWhere("m", true))
-
-	rows, err := e.sqliteDB.QueryContext(ctx, sqlQuery,
-		match, limit, offset)
-	if err != nil {
-		return nil, fmt.Errorf("text search: %w", err)
-	}
-	defer func() { _ = rows.Close() }()
-
-	return scanMessageSummaries(rows)
+	return sqliteFTSTextSearch(ctx, e.sqliteDB, match, sourceID, limit, offset)
 }
 
 // GetTextStats returns aggregate stats for text messages.

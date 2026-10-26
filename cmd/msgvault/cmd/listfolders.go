@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"go.kenn.io/msgvault/internal/config"
 	imapclient "go.kenn.io/msgvault/internal/imap"
 	"go.kenn.io/msgvault/internal/microsoft"
 	"go.kenn.io/msgvault/internal/store"
@@ -19,8 +21,8 @@ func newListFoldersCmd() *cobra.Command {
 		Short: "List IMAP folders (mailboxes) available for an account",
 		Long: `List all IMAP folders (mailboxes) available for one or all
 IMAP accounts, along with message count. This helps you
-	choose which folders to include or exclude via --folder or
-	--skip-folder on the sync command.`,
+  choose which folders to include or exclude via --folder or
+  --skip-folder on the sync command.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !isDaemonCLISubprocess() {
@@ -33,7 +35,13 @@ IMAP accounts, along with message count. This helps you
 }
 
 func runListFoldersLocal(cmd *cobra.Command, args []string) error {
-	s, cleanup, err := openWritableStoreAndInit()
+	state := invocationFromCommand(cmd)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	logger := state.logger
+	s, cleanup, err := openWritableStoreAndInitForInvocation(state)
 	if err != nil {
 		return err
 	}
@@ -70,14 +78,14 @@ func runListFoldersLocal(cmd *cobra.Command, args []string) error {
 		if i > 0 {
 			fmt.Println()
 		}
-		if err := listFolders(ctx, src); err != nil {
+		if err := listFolders(ctx, src, cfg, logger); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func listFolders(ctx context.Context, src *store.Source) error {
+func listFolders(ctx context.Context, src *store.Source, cfg *config.Config, logger *slog.Logger) error {
 	if cfg == nil {
 		return errors.New("configuration not loaded")
 	}
@@ -87,7 +95,7 @@ func listFolders(ctx context.Context, src *store.Source) error {
 	}
 	fmt.Printf("Account: %s\n", displayID)
 
-	skip, err := imapSkipReason(src)
+	skip, err := imapSkipReason(src, cfg, logger)
 	if err != nil {
 		return err
 	}

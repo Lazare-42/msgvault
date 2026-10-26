@@ -2,7 +2,8 @@ package daemonclient
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"net/http"
@@ -429,7 +430,7 @@ func (b *PeopleBrowser) ListConversationMessages(
 		return nil, err
 	}
 	page := &peoplebrowser.ConversationMessagePage{
-		Rows:          queryMessageSummariesFromCLIGenerated(resp.JSON200.Messages),
+		Rows:          b.engine.store.queryMessageSummariesFromCLIGenerated(resp.JSON200.Messages),
 		Complete:      !resp.JSON200.HasMore,
 		CacheRevision: resp.JSON200.CacheRevision,
 	}
@@ -459,6 +460,7 @@ func (b *PeopleBrowser) ListMeetings(
 			return nil, fmt.Errorf("meeting timeline row %q has no anchor message", row.Key)
 		}
 		page.Rows[i] = meetingSummaryFromGenerated(row)
+		page.Rows[i].WebURL = b.engine.store.messageWebURL(page.Rows[i].ID)
 	}
 	return page, nil
 }
@@ -560,6 +562,9 @@ func personSummaryFromGenerated(person generated.PersonSummary) query.PersonSumm
 			Type: identifier.Type, Value: identifier.Value,
 			DisplayValue: stringValue(identifier.DisplayValue), IsPrimary: identifier.IsPrimary,
 			Provenance: identifier.Provenance, ParticipantID: identifier.ParticipantID,
+			ServiceSlug: stringValue(identifier.ServiceSlug), ServiceLabel: stringValue(identifier.ServiceLabel),
+			ScopeKind: stringValue(identifier.ScopeKind), ScopeValue: stringValue(identifier.ScopeValue),
+			ParticipantDisplayName: stringValue(identifier.ParticipantDisplayName),
 		}
 	}
 	counts := make([]query.SourceCount, len(person.SourceCounts))
@@ -583,11 +588,25 @@ func personSummaryFromGenerated(person generated.PersonSummary) query.PersonSumm
 			edges[i] = query.PersonClusterEdge{
 				ParticipantA: edge.ParticipantA, ParticipantB: edge.ParticipantB,
 			}
+			if edge.LinkOrigin != nil {
+				edges[i].LinkOrigin = &query.PersonClusterLinkOrigin{
+					Kind: edge.LinkOrigin.Kind, Source: stringValue(edge.LinkOrigin.Source),
+					Basis: stringValue(edge.LinkOrigin.Basis),
+				}
+			}
+		}
+		members := make([]query.PersonClusterMember, len(person.Cluster.Members))
+		for i, member := range person.Cluster.Members {
+			members[i] = query.PersonClusterMember{
+				ParticipantID: member.ParticipantID, DisplayName: stringValue(member.DisplayName),
+				Email: stringValue(member.Email), Phone: stringValue(member.Phone),
+			}
 		}
 		out.Cluster = &query.PersonCluster{
 			CanonicalID: person.Cluster.CanonicalID,
 			MemberIDs:   append([]int64(nil), person.Cluster.MemberIds...),
 			Edges:       edges,
+			Members:     members,
 		}
 	}
 	if person.Profile != nil {
@@ -660,12 +679,30 @@ func personFromGenerated(person *generated.Person) *store.Person {
 	if person == nil {
 		return nil
 	}
+	bindings := cardDAVBindingsFromGenerated(person.CarddavBindings)
+	var cardDAVBindings []store.CardDAVBinding
+	if len(bindings) > 0 {
+		cardDAVBindings = bindings
+	}
 	return &store.Person{
 		ID: person.ID, VCardUID: person.VcardUID,
 		DisplayName: copyString(person.DisplayName), Revision: person.Revision,
 		ParticipantIDs: append([]int64(nil), person.ParticipantIds...),
 		CreatedAt:      person.CreatedAt, UpdatedAt: person.UpdatedAt,
+		CardDAVBindings: cardDAVBindings,
 	}
+}
+
+func cardDAVBindingsFromGenerated(bindings []generated.CardDAVBinding) []store.CardDAVBinding {
+	converted := make([]store.CardDAVBinding, len(bindings))
+	for index, binding := range bindings {
+		converted[index] = store.CardDAVBinding{
+			Connection: binding.Connection, Book: binding.Book, Href: binding.Href,
+			RemoteUID:     binding.RemoteUID,
+			MappingStatus: store.CardDAVMappingStatus(binding.MappingStatus),
+		}
+	}
+	return converted
 }
 
 func attributeDefinitionFromGenerated(definition generated.AttributeDefinition) store.AttributeDefinition {
@@ -705,7 +742,7 @@ func attributeValueFromGenerated(value generated.AttributeValue) store.Attribute
 		Type: store.AttributeValueType(value.Type), Text: copyString(value.Text),
 		Integer: copyInt64(value.Integer), Real: copyFloat64(value.Real),
 		Boolean: copyBool(value.Boolean), Date: copyString(value.Date),
-		Timestamp: copyTime(value.Timestamp), JSON: append(json.RawMessage(nil), value.JSON...),
+		Timestamp: copyTime(value.Timestamp), JSON: append(jsontext.Value(nil), value.JSON...),
 		RecordType: copyString(value.RecordType), RecordID: copyInt64(value.RecordID),
 	}
 }
@@ -714,7 +751,7 @@ func attributeValueToGenerated(value store.AttributeValue) generated.AttributeVa
 	return generated.AttributeValue{
 		Type: string(value.Type), Text: copyString(value.Text), Integer: copyInt64(value.Integer),
 		Real: copyFloat64(value.Real), Boolean: copyBool(value.Boolean), Date: copyString(value.Date),
-		Timestamp: copyTime(value.Timestamp), JSON: append(json.RawMessage(nil), value.JSON...),
+		Timestamp: copyTime(value.Timestamp), JSON: append(jsontext.Value(nil), value.JSON...),
 		RecordType: copyString(value.RecordType), RecordID: copyInt64(value.RecordID),
 	}
 }

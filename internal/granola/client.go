@@ -2,7 +2,8 @@ package granola
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +16,8 @@ import (
 	"go.kenn.io/msgvault/internal/httpretry"
 	"golang.org/x/time/rate"
 )
+
+var ErrUnauthorized = errors.New("granola API rejected the key (401): check [[granola]] api_key in config.toml (a grn_… key from the desktop app's settings; requires a Business plan)")
 
 const (
 	maxRetries    = 8
@@ -77,7 +80,7 @@ func (c *Client) get(ctx context.Context, path string) ([]byte, error) {
 		case resp.StatusCode == http.StatusOK:
 			return body, nil
 		case resp.StatusCode == http.StatusUnauthorized:
-			return nil, errors.New("granola API rejected the key (401): check [[granola]] api_key in config.toml (a grn_… key from the desktop app's settings; requires a Business plan)")
+			return nil, ErrUnauthorized
 		case resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
 			wait := httpretry.RetryAfter(resp.Header.Get("Retry-After"), attempt, maxRetryAfter)
 			timer := time.NewTimer(wait)
@@ -152,6 +155,6 @@ func (c *Client) GetNote(ctx context.Context, noteID string) (*Note, error) {
 	if err := json.Unmarshal(body, &n); err != nil {
 		return nil, fmt.Errorf("granola get note %s: decode: %w", noteID, err)
 	}
-	n.Raw = json.RawMessage(body)
+	n.Raw = jsontext.Value(body)
 	return &n, nil
 }

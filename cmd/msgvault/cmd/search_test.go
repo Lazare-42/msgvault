@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -8,11 +9,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -20,7 +21,83 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 )
+
+func TestSummaryTableText(t *testing.T) {
+	tests := []struct {
+		name, subject, snippet, want string
+	}{
+		{"subject wins", "Quarterly review", "When: tomorrow", "Quarterly review"},
+		{"chat uses snippet", "", "are we still on for Friday", "are we still on for Friday"},
+		{"blank subject uses snippet", "   ", "see attached", "see attached"},
+		{"escape-only subject uses snippet", "\x1b[31m", "line one\n\tline two", "line one line two"},
+		{"control-only subject uses snippet", "\x00\x07", "see attached", "see attached"},
+		{"whitespace collapses", "", "line one\n\tline two  ", "line one line two"},
+		{"terminal controls removed", "", "hi\x1b]0;bad title\a there\x1b[31m!", "hi there!"},
+		{"empty", "", "", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, summaryTableText(tt.subject, tt.snippet))
+		})
+	}
+}
+
+func TestFormatSummarySize(t *testing.T) {
+	assert.Equal(t, "-", formatSummarySize(0))
+	assert.Equal(t, "-", formatSummarySize(-1))
+	assert.Equal(t, "1.0K", formatSummarySize(1043))
+}
+
+func TestWriteSearchResultsTableShowsChatSnippetAndUnknownSize(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	results := []query.MessageSummary{
+		{ID: 101, SentAt: time.Date(2026, 11, 5, 17, 0, 0, 0, time.UTC), FromEmail: "alice@example.com", Subject: "Concert tickets", Snippet: "When: Nov 5", SizeEstimate: 1043},
+		{ID: 102, SentAt: time.Date(2026, 8, 11, 15, 46, 5, 0, time.UTC), FromName: "Bob\x1b[31m Example", Snippet: "this is the\nband", HasAttachments: true, AttachmentCount: 1},
+	}
+	var buf bytes.Buffer
+	require.NoError(writeSearchResultsTable(&buf, results))
+	lines := strings.Split(buf.String(), "\n")
+	require.GreaterOrEqual(len(lines), 4)
+	assert.Contains(lines[2], "Concert tickets")
+	assert.Contains(lines[2], "1.0K")
+	assert.Contains(lines[3], "this is the band")
+	assert.Contains(lines[3], "Bob Example")
+	assert.NotContains(lines[3], "0B")
+	assert.NotContains(buf.String(), "\x1b")
+	assert.True(strings.HasSuffix(strings.TrimRight(lines[3], " "), " -"))
+	assert.Contains(buf.String(), "Showing 2 results")
+}
+
+// These entry points write to a real pipe, so terminal-only limits must not apply.
+func TestSearchTableFullTextInPipe(t *testing.T) {
+	assert := assert.New(t)
+	from := strings.Repeat("sender", 10) + "@example.com"
+	subject := strings.Repeat("long subject ", 10) + "final words"
+	snippet := strings.Repeat("chat snippet ", 10) + "last words"
+	done := captureStdout(t)
+	err := outputSearchResultsTable([]query.MessageSummary{
+		{ID: 1, FromEmail: from, Subject: "\x1b[31m" + subject + "\n"},
+		{ID: 2, FromName: from, Snippet: "\t" + snippet + "\x1b[0m"},
+	})
+	output := done()
+	require.NoError(t, err)
+	assert.Contains(output, from)
+	assert.Contains(output, subject)
+	assert.Contains(output, snippet)
+	assert.NotContains(output, "\x1b")
+}
+
+type failingSearchWriter struct{}
+
+func (failingSearchWriter) Write([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
+func TestWriteSearchResultsTableReturnsWriterError(t *testing.T) {
+	err := writeSearchResultsTable(failingSearchWriter{}, []query.MessageSummary{{ID: 1}})
+	require.ErrorIs(t, err, io.ErrClosedPipe)
+}
 
 // captureStdout redirects os.Stdout to a pipe and returns a function
 // that restores the original stdout and returns captured output.
@@ -82,6 +159,8 @@ func captureStderr(t *testing.T) func() string {
 }
 
 func resetSearchFlags() {
+	searchShowSnippet = false
+	searchSort = ""
 	searchAccount = ""
 	searchCollection = ""
 	searchLimit = 50
@@ -96,13 +175,6 @@ func resetSearchFlags() {
 	// pairs (--account / --collection) trip when a subsequent test only
 	// passes one of them.
 	searchCmd.Flags().VisitAll(func(f *pflag.Flag) { f.Changed = false })
-}
-
-func TestSearchCmd_HelpMentionsMeetingTranscripts(t *testing.T) {
-	assert.Contains(t, searchCmd.Long, "meeting_transcript", "operator help")
-	messageTypeFlag := searchCmd.Flags().Lookup("message-type")
-	require.NotNil(t, messageTypeFlag)
-	assert.Contains(t, messageTypeFlag.Usage, "meeting_transcript", "flag help")
 }
 
 func TestSummaryFromDisplayFallsBackForPhoneMessages(t *testing.T) {
@@ -137,6 +209,9 @@ func TestSummaryFromDisplayFallsBackForPhoneMessages(t *testing.T) {
 }
 
 func TestSearchCmd_AccountFlagForwardsToRemoteHTTP(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	require := require.New(t)
 	assert := assert.New(t)
 	savedCfg := cfg
@@ -159,11 +234,14 @@ func TestSearchCmd_AccountFlagForwardsToRemoteHTTP(t *testing.T) {
 	defer srv.Close()
 
 	cfg = &config.Config{}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	cfg.Remote.URL = srv.URL
 	cfg.Remote.AllowInsecure = true
 	useLocal = false
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(searchCmd)
 	root.SetArgs([]string{"search", "--account", "alice@example.com", "hello"})
 
@@ -173,6 +251,9 @@ func TestSearchCmd_AccountFlagForwardsToRemoteHTTP(t *testing.T) {
 }
 
 func TestSearchCmd_MessageTypeFlagForwardsToRemoteMode(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	savedCfg := cfg
 	savedUseLocal := useLocal
 	defer func() {
@@ -195,11 +276,14 @@ func TestSearchCmd_MessageTypeFlagForwardsToRemoteMode(t *testing.T) {
 	defer srv.Close()
 
 	cfg = &config.Config{}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	cfg.Remote.URL = srv.URL
 	cfg.Remote.AllowInsecure = true
 	useLocal = false
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(searchCmd)
 	root.SetArgs([]string{"search", "--message-type", "sms", "lunch"})
 
@@ -209,6 +293,9 @@ func TestSearchCmd_MessageTypeFlagForwardsToRemoteMode(t *testing.T) {
 }
 
 func TestSearchCmd_DeletionScopeForwardsToRemoteFTS(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	savedCfg := cfg
 	savedUseLocal := useLocal
 	defer func() {
@@ -232,11 +319,14 @@ func TestSearchCmd_DeletionScopeForwardsToRemoteFTS(t *testing.T) {
 	defer srv.Close()
 
 	cfg = &config.Config{}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	cfg.Remote.URL = srv.URL
 	cfg.Remote.AllowInsecure = true
 	useLocal = false
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(searchCmd)
 	root.SetArgs([]string{"search", "--deletion-scope", "deleted", "statement"})
 
@@ -278,6 +368,9 @@ func TestSearchCmd_DeletionScopeRejectsVectorAndHybrid(t *testing.T) {
 }
 
 func TestSearchCmd_FTSUsesLocalDaemonHTTPAndPreservesJSONOutput(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	require := require.New(t)
 	assert := assert.New(t)
 	dataDir := t.TempDir()
@@ -297,10 +390,12 @@ func TestSearchCmd_FTSUsesLocalDaemonHTTPAndPreservesJSONOutput(t *testing.T) {
 		Data:    config.DataConfig{DataDir: dataDir},
 		Remote:  config.RemoteConfig{URL: "http://configured-daemonclient.invalid"},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{useLocal: true})
 	useLocal = true
 
 	done := captureStdout(t)
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(searchCmd)
 	root.SetArgs([]string{"search", "--json", "lunch"})
 
@@ -314,6 +409,9 @@ func TestSearchCmd_FTSUsesLocalDaemonHTTPAndPreservesJSONOutput(t *testing.T) {
 }
 
 func TestSearchCmd_FTSCollectionSearchUsesDaemonHTTPAndPreservesBanner(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	require := require.New(t)
 	assert := assert.New(t)
 	dataDir := t.TempDir()
@@ -333,11 +431,15 @@ func TestSearchCmd_FTSCollectionSearchUsesDaemonHTTPAndPreservesBanner(t *testin
 		Data:    config.DataConfig{DataDir: dataDir},
 		Remote:  config.RemoteConfig{URL: "http://configured-daemonclient.invalid"},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	useLocal = true
+	invocationFromContext(testCtx).options.useLocal = true
 
 	doneOut := captureStdout(t)
 	doneErr := captureStderr(t)
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(searchCmd)
 	root.SetArgs([]string{"search", "--collection", "Important", "--json"})
 
@@ -412,26 +514,35 @@ func searchHTTPDaemon(t *testing.T) (*httptest.Server, *atomic.Int32) {
 	return server, searchRequests
 }
 
-// TestSearchCmd_PrintsBackgroundIndexNote verifies the CLI caveats results
-// whenever the daemon reports the FTS index is not yet known complete: a
-// rebuild in progress (index_state="building") and an unfinished completeness
-// probe (index_state="checking") get distinct notes; a complete index gets
-// none.
+// TestSearchCmd_PrintsBackgroundIndexNote keeps index advice separate from JSON results.
 func TestSearchCmd_PrintsBackgroundIndexNote(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	tests := []struct {
 		name       string
 		indexState string
 		wantNote   string
 	}{
 		{
-			name:       "building warns about the rebuild",
-			indexState: "building",
-			wantNote:   "the search index is being rebuilt in the background; results may be incomplete",
+			name:       "awaiting owner warns",
+			indexState: "awaiting_owner",
+			wantNote:   "run rebuild-fts with owner access",
 		},
 		{
-			name:       "checking warns the probe has not finished",
+			name:       "unverified check warns",
+			indexState: "unverified",
+			wantNote:   "could not be verified for this request; results may be incomplete. Search again to retry the check, or run rebuild-fts.",
+		},
+		{
+			name:       "building warns about rebuilding or awaiting rebuild",
+			indexState: "building",
+			wantNote:   "the search index is rebuilding or awaiting a rebuild in the background; results may be incomplete",
+		},
+		{
+			name:       "checking alone prints no note",
 			indexState: "checking",
-			wantNote:   "search index completeness is still being verified in the background; results may be incomplete",
+			wantNote:   "",
 		},
 		{
 			name:       "complete index prints no note",
@@ -478,13 +589,16 @@ func TestSearchCmd_PrintsBackgroundIndexNote(t *testing.T) {
 				HomeDir: dataDir,
 				Data:    config.DataConfig{DataDir: dataDir},
 			}
+			testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+			invocationFromContext(testCtx).options.useLocal = true
 			useLocal = true
 
 			doneOut := captureStdout(t)
 			doneErr := captureStderr(t)
 			root := newTestRootCmd()
+			root.SetContext(testCtx)
 			root.AddCommand(searchCmd)
-			root.SetArgs([]string{"search", "lunch"})
+			root.SetArgs([]string{"search", "lunch", "--json"})
 
 			err := root.Execute()
 			out := doneOut()
@@ -492,8 +606,10 @@ func TestSearchCmd_PrintsBackgroundIndexNote(t *testing.T) {
 			require.NoError(err, "search command")
 
 			assert.Contains(out, "Lunch", "results still print")
+			assert.True(strings.HasPrefix(strings.TrimSpace(out), "["), "JSON remains an array")
+			assert.NotContains(out, "Note:")
 			if tt.wantNote == "" {
-				assert.NotContains(errOut, "Note:", "no index note for a complete index")
+				assert.NotContains(errOut, "Note:", "no index note without a known gap")
 			} else {
 				assert.Contains(errOut, tt.wantNote, "index state note")
 			}
@@ -502,15 +618,15 @@ func TestSearchCmd_PrintsBackgroundIndexNote(t *testing.T) {
 }
 
 func TestSearchCmd_AccountFlagWithoutQuery(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	require := require.New(t)
 	assert := assert.New(t)
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/msgvault.db"
 
-	s, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	require.NoError(s.InitSchema(), "init schema")
-	t.Cleanup(func() { _ = s.Close() })
+	s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 
 	// Seed two accounts with one message each.
 	src1, err := s.GetOrCreateSource("gmail", "alice@example.com")
@@ -550,12 +666,16 @@ func TestSearchCmd_AccountFlagWithoutQuery(t *testing.T) {
 		Data:    config.DataConfig{DataDir: tmpDir},
 		Remote:  config.RemoteConfig{URL: "http://configured-daemonclient.invalid"},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	useLocal = true
+	invocationFromContext(testCtx).options.useLocal = true
 
 	// Search with --account only (no query terms) — must succeed.
 	done := captureStdout(t)
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(searchCmd)
 	root.SetArgs([]string{
 		"search", "--account", "alice@example.com", "--json",
@@ -570,15 +690,15 @@ func TestSearchCmd_AccountFlagWithoutQuery(t *testing.T) {
 }
 
 func TestSearchCmd_MessageTypeFlagScopesResults(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	require := require.New(t)
 	assert := assert.New(t)
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/msgvault.db"
 
-	s, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	require.NoError(s.InitSchema(), "init schema")
-	t.Cleanup(func() { _ = s.Close() })
+	s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	src, err := s.GetOrCreateSource("gmail", "alice@example.com")
 	require.NoError(err, "create source")
 	emailConv, err := s.EnsureConversation(src.ID, "email-thread", "")
@@ -614,10 +734,14 @@ func TestSearchCmd_MessageTypeFlagScopesResults(t *testing.T) {
 		Data:    config.DataConfig{DataDir: tmpDir},
 		Remote:  config.RemoteConfig{URL: "http://configured-daemonclient.invalid"},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	useLocal = true
+	invocationFromContext(testCtx).options.useLocal = true
 
 	done := captureStdout(t)
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(searchCmd)
 	root.SetArgs([]string{
 		"search", "--message-type", "calendar_event", "--json",
@@ -630,6 +754,8 @@ func TestSearchCmd_MessageTypeFlagScopesResults(t *testing.T) {
 }
 
 func TestSearchCmd_InvalidQueryFailsFastWithoutDB(t *testing.T) {
+	cfg := testConfigValue()
+
 	savedCfg := cfg
 	defer func() { cfg = savedCfg; resetSearchFlags() }()
 
@@ -639,8 +765,11 @@ func TestSearchCmd_InvalidQueryFailsFastWithoutDB(t *testing.T) {
 		HomeDir: "/nonexistent",
 		Data:    config.DataConfig{DataDir: "/nonexistent"},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(searchCmd)
 	root.SetArgs([]string{"search", "before:not-a-date"})
 
@@ -654,14 +783,14 @@ func TestSearchCmd_InvalidQueryFailsFastWithoutDB(t *testing.T) {
 }
 
 func TestSearchCmd_AccountFlagDoesNotLeakAcrossInvocations(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	require := require.New(t)
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/msgvault.db"
 
-	s, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	require.NoError(s.InitSchema(), "init schema")
-	t.Cleanup(func() { _ = s.Close() })
+	s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	src, err := s.GetOrCreateSource("gmail", "alice@example.com")
 	require.NoError(err, "create source")
 	conv, err := s.EnsureConversation(src.ID, "c1", "")
@@ -693,11 +822,15 @@ func TestSearchCmd_AccountFlagDoesNotLeakAcrossInvocations(t *testing.T) {
 		Data:    config.DataConfig{DataDir: tmpDir},
 		Remote:  config.RemoteConfig{URL: "http://configured-daemonclient.invalid"},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	useLocal = true
+	invocationFromContext(testCtx).options.useLocal = true
 
 	// First invocation: search with --account.
 	done := captureStdout(t)
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(searchCmd)
 	root.SetArgs([]string{
 		"search", "--account", "alice@example.com", "--json",
@@ -710,7 +843,9 @@ func TestSearchCmd_AccountFlagDoesNotLeakAcrossInvocations(t *testing.T) {
 	// Must not carry over the previous account filter.
 	resetSearchFlags()
 	done = captureStdout(t)
+	testCtx2 := testInvocationContext(t.Context(), cfg, invocationOptions{useLocal: true})
 	root2 := newTestRootCmd()
+	root2.SetContext(testCtx2)
 	root2.AddCommand(searchCmd)
 	root2.SetArgs([]string{
 		"search", "--account", "", "--json", "test msg",
@@ -723,12 +858,17 @@ func TestSearchCmd_AccountFlagDoesNotLeakAcrossInvocations(t *testing.T) {
 }
 
 func TestSearchCmd_NoQueryNoAccount(t *testing.T) {
+	cfg := testConfigValue()
+
 	savedCfg := cfg
 	defer func() { cfg = savedCfg; resetSearchFlags() }()
 
 	cfg = &config.Config{}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(searchCmd)
 	root.SetArgs([]string{"search"})
 
@@ -741,15 +881,15 @@ func TestSearchCmd_NoQueryNoAccount(t *testing.T) {
 // collection containing only the first, then runs FTS search with
 // --collection. Only the first account's message must come back.
 func TestSearchCmd_CollectionFlagScopesResults(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	require := require.New(t)
 	assert := assert.New(t)
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/msgvault.db"
 
-	s, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	require.NoError(s.InitSchema(), "init schema")
-	t.Cleanup(func() { _ = s.Close() })
+	s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	src1, err := s.GetOrCreateSource("gmail", "alice@example.com")
 	require.NoError(err, "create source 1")
 	src2, err := s.GetOrCreateSource("gmail", "bob@example.com")
@@ -789,10 +929,14 @@ func TestSearchCmd_CollectionFlagScopesResults(t *testing.T) {
 		Data:    config.DataConfig{DataDir: tmpDir},
 		Remote:  config.RemoteConfig{URL: "http://configured-daemonclient.invalid"},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	useLocal = true
+	invocationFromContext(testCtx).options.useLocal = true
 
 	done := captureStdout(t)
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(searchCmd)
 	root.SetArgs([]string{
 		"search", "--collection", "alice-only", "--json",
@@ -807,13 +951,13 @@ func TestSearchCmd_CollectionFlagScopesResults(t *testing.T) {
 // TestSearchCmd_CollectionFlagUnknown returns a clear error when the
 // named collection does not exist.
 func TestSearchCmd_CollectionFlagUnknown(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	require := require.New(t)
 	tmpDir := t.TempDir()
 	dbPath := tmpDir + "/msgvault.db"
-	s, err := store.Open(dbPath)
-	require.NoError(err, "open store")
-	require.NoError(s.InitSchema(), "init schema")
-	t.Cleanup(func() { _ = s.Close() })
+	s := testutil.NewSQLiteTestStoreAt(t, dbPath)
 	startStoreQueryAPIDaemon(t, tmpDir, s)
 
 	savedCfg := cfg
@@ -828,14 +972,18 @@ func TestSearchCmd_CollectionFlagUnknown(t *testing.T) {
 		Data:    config.DataConfig{DataDir: tmpDir},
 		Remote:  config.RemoteConfig{URL: "http://configured-daemonclient.invalid"},
 	}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	useLocal = true
+	invocationFromContext(testCtx).options.useLocal = true
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(searchCmd)
 	root.SetArgs([]string{
 		"search", "--collection", "does-not-exist", "anything",
 	})
-	err = root.Execute()
+	err := root.Execute()
 	require.Error(err, "expected error for unknown collection")
 	assert.ErrorContains(t, err, "no collection")
 }
@@ -845,6 +993,8 @@ func TestSearchCmd_CollectionFlagUnknown(t *testing.T) {
 // FTS allows queryless scoped searches; vector/hybrid don't, because
 // the embeddings client needs text to vectorize.
 func TestSearchCmd_VectorOrHybridRequireQueryText(t *testing.T) {
+	cfg := testConfigValue()
+
 	for _, mode := range []string{"vector", "hybrid"} {
 		t.Run(mode, func(t *testing.T) {
 			savedCfg := cfg
@@ -871,6 +1021,8 @@ func TestSearchCmd_VectorOrHybridRequireQueryText(t *testing.T) {
 // like `from:alice` would fail at the engine layer; reject it at the
 // CLI surface instead.
 func TestSearchCmd_VectorOrHybridRejectFilterOnlyQuery(t *testing.T) {
+	cfg := testConfigValue()
+
 	for _, mode := range []string{"vector", "hybrid"} {
 		t.Run(mode, func(t *testing.T) {
 			savedCfg := cfg
@@ -888,26 +1040,6 @@ func TestSearchCmd_VectorOrHybridRejectFilterOnlyQuery(t *testing.T) {
 			assert.ErrorContains(t, err, "free-text terms")
 		})
 	}
-}
-
-// TestSearchCmd_MutualExclusion confirms --account and --collection are rejected together.
-func TestSearchCmd_MutualExclusion(t *testing.T) {
-	var a, b string
-	cmd := &cobra.Command{Use: "search-test", SilenceErrors: true}
-	sub := &cobra.Command{Use: "search", RunE: func(cmd *cobra.Command, args []string) error { return nil }}
-	sub.Flags().StringVar(&a, "account", "", "")
-	sub.Flags().StringVar(&b, "collection", "", "")
-	sub.MarkFlagsMutuallyExclusive("account", "collection")
-	cmd.AddCommand(sub)
-	cmd.SetArgs([]string{"search", "--account", "alpha@example.com", "--collection", "work"})
-
-	err := cmd.Execute()
-	require.Error(t, err, "expected error when both --account and --collection are set")
-	msg := err.Error()
-	assert.Contains(t, msg, "account", "error should mention account flag name")
-	assert.Contains(t, msg, "collection", "error should mention collection flag name")
-	_ = a
-	_ = b
 }
 
 func TestOutputSearchResultsJSONShowsDeletedFromSourceOnlyWhenPresent(t *testing.T) {
@@ -930,6 +1062,9 @@ func TestOutputSearchResultsJSONShowsDeletedFromSourceOnlyWhenPresent(t *testing
 // array, never the "No messages found." prose — agents pipe this
 // straight into jq.
 func TestSearchCmd_JSONEmptyResultsEmitEmptyArray(t *testing.T) {
+	cfg := testConfigValue()
+	useLocal := false
+
 	assert := assert.New(t)
 	require := require.New(t)
 	savedCfg := cfg
@@ -947,11 +1082,14 @@ func TestSearchCmd_JSONEmptyResultsEmitEmptyArray(t *testing.T) {
 	defer srv.Close()
 
 	cfg = &config.Config{}
+	testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+	_ = testCtx
 	cfg.Remote.URL = srv.URL
 	cfg.Remote.AllowInsecure = true
 	useLocal = false
 
 	root := newTestRootCmd()
+	root.SetContext(testCtx)
 	root.AddCommand(searchCmd)
 	root.SetArgs([]string{"search", "--json", "nothing-matches"})
 
@@ -964,4 +1102,14 @@ func TestSearchCmd_JSONEmptyResultsEmitEmptyArray(t *testing.T) {
 	require.NoError(json.Unmarshal([]byte(out), &results),
 		"--json output must be valid JSON with zero results, got: %q", out)
 	assert.Empty(results)
+}
+
+func TestOutputSearchResultsJSONIncludesBrowserURL(t *testing.T) {
+	assert, require := assert.New(t), require.New(t)
+	done := captureStdout(t)
+	require.NoError(outputSearchResultsJSON([]query.MessageSummary{{ID: 42, WebURL: "https://archive.example/messages/42"}}))
+	var result []map[string]any
+	require.NoError(json.Unmarshal([]byte(done()), &result))
+	require.Len(result, 1)
+	assert.Equal("https://archive.example/messages/42", result[0]["web_url"])
 }

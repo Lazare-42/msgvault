@@ -1,0 +1,107 @@
+package api
+
+import (
+	"slices"
+
+	"go.kenn.io/msgvault/internal/agentgrant"
+)
+
+// CLIRunDraftReplyCommand names the daemon CLI command that the daemon runs
+// in-process instead of spawning a subprocess.
+const CLIRunDraftReplyCommand = "draft-reply"
+
+const CLIRunDraftComposeCommand = "draft-compose"
+
+const CLIRunDraftForwardCommand = "draft-forward"
+
+const (
+	CLIRunDraftGetCommand     = "draft-get"
+	CLIRunDraftEditCommand    = "draft-edit"
+	CLIRunDraftDeleteCommand  = "draft-delete"
+	CLIRunDraftRecoverCommand = "draft-recover"
+	CLIRunDraftSendAsCommand  = "draft-send-as"
+)
+
+// IsCLIRunDraftReply reports whether args invoke the in-process draft-reply
+// route.
+func IsCLIRunDraftReply(args []string) bool {
+	return len(args) > 0 && args[0] == CLIRunDraftReplyCommand
+}
+
+func IsCLIRunDraftCompose(args []string) bool {
+	return len(args) > 0 && args[0] == CLIRunDraftComposeCommand
+}
+
+// IsCLIRunDraftForward reports whether args invoke the in-process
+// draft-forward route.
+func IsCLIRunDraftForward(args []string) bool {
+	return len(args) > 0 && args[0] == CLIRunDraftForwardCommand
+}
+
+// IsCLIRunDraftCreate reports whether args create a managed draft.
+func IsCLIRunDraftCreate(args []string) bool {
+	return IsCLIRunDraftReply(args) || IsCLIRunDraftCompose(args) || IsCLIRunDraftForward(args)
+}
+
+// CLIRunDraftLifecyclePermissions lists the grant permissions that authorize a
+// delegated draft-get, draft-edit, or draft-delete. Any listed permission
+// admits the command; the daemon then requires it on the draft's source.
+func CLIRunDraftLifecyclePermissions(command string) []agentgrant.Permission {
+	switch command {
+	case CLIRunDraftGetCommand:
+		return []agentgrant.Permission{
+			agentgrant.PermissionDraftCreate,
+			agentgrant.PermissionDraftEdit,
+			agentgrant.PermissionDraftDelete,
+		}
+	case CLIRunDraftEditCommand:
+		return []agentgrant.Permission{agentgrant.PermissionDraftEdit}
+	case CLIRunDraftDeleteCommand:
+		return []agentgrant.Permission{agentgrant.PermissionDraftDelete}
+	default:
+		return nil
+	}
+}
+
+func delegatedCLIRunAdmitted(args []string, grant *agentgrant.Grant) bool {
+	if grant == nil || len(args) == 0 {
+		return false
+	}
+	if IsCLIRunDraftReply(args) || IsCLIRunDraftCompose(args) {
+		return grant.HasPermission(agentgrant.PermissionDraftCreate)
+	}
+	if args[0] == CLIRunDraftRecoverCommand {
+		return grant.HasPermission(agentgrant.PermissionDraftEdit) || grant.HasPermission(agentgrant.PermissionDraftDelete)
+	}
+	return slices.ContainsFunc(CLIRunDraftLifecyclePermissions(args[0]), grant.HasPermission)
+}
+
+// IsCLIRunDraftLifecycle reports whether args invoke one of the managed draft
+// lifecycle routes that the daemon executes in-process.
+func IsCLIRunDraftLifecycle(args []string) bool {
+	if len(args) == 0 {
+		return false
+	}
+	switch args[0] {
+	case CLIRunDraftGetCommand, CLIRunDraftEditCommand, CLIRunDraftDeleteCommand, CLIRunDraftRecoverCommand:
+		return true
+	default:
+		return false
+	}
+}
+
+// IsCLIRunDraftSendAs reports whether args invoke the owner-only send-as read.
+func IsCLIRunDraftSendAs(args []string) bool {
+	return len(args) > 0 && args[0] == CLIRunDraftSendAsCommand
+}
+
+// CLIRunCodedError carries a fixed code for the client and the underlying
+// cause for the daemon log. Clients only ever see Code.
+type CLIRunCodedError struct {
+	Code string
+	Err  error
+}
+
+func (e *CLIRunCodedError) Error() string { return e.Code }
+
+func (e *CLIRunCodedError) Unwrap() error { return e.Err }

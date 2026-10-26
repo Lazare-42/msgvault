@@ -105,7 +105,9 @@ func TestAddAccountIdentityUpdatesOnlyChangedMessageAttribution(t *testing.T) {
 		`SELECT COUNT(*) FROM message_update_audit WHERE message_id = ?`,
 		otherMessageID,
 	).Scan(&otherUpdates))
-	assert.Equal(1, ownerUpdates, "matching attribution must be updated")
+	// The identity flag, then the account attribution: returned to pending
+	// in the identity transaction and derived after it commits.
+	assert.Equal(3, ownerUpdates, "matching attribution must be updated")
 	assert.Zero(otherUpdates, "unchanged attribution must not rewrite the message")
 }
 
@@ -202,7 +204,7 @@ func TestAddAccountIdentity_Idempotent(t *testing.T) {
 	require.Len(ids1, 1, "after first insert")
 	first := ids1[0].ConfirmedAt
 
-	time.Sleep(2 * time.Millisecond)
+	time.Sleep(2 * time.Millisecond) //nolint:kennlint // lets the database CURRENT_TIMESTAMP advance
 
 	require.NoError(st.AddAccountIdentity(f.Source.ID, "me@example.com", "manual"), "AddAccountIdentity (2)")
 	ids2, err := st.ListAccountIdentities(f.Source.ID)
@@ -243,7 +245,7 @@ func TestAddAccountIdentity_AdditionalSignal(t *testing.T) {
 	rows1, err := st.ListAccountIdentities(f.Source.ID)
 	require.NoError(err, "ListAccountIdentities")
 	first := rows1[0].ConfirmedAt
-	time.Sleep(2 * time.Millisecond)
+	time.Sleep(2 * time.Millisecond) //nolint:kennlint // lets the database CURRENT_TIMESTAMP advance
 
 	require.NoError(st.AddAccountIdentity(f.Source.ID, "alice@example.com", "account-identifier"))
 	rows2, err := st.ListAccountIdentities(f.Source.ID)
@@ -499,28 +501,33 @@ func TestRemoveAccountIdentity_MissDoesNotBumpRevision(t *testing.T) {
 	assert.Equal(acctBefore, acctAfter, "removing a missing identity should not bump the account identity revision")
 }
 
-func TestRemoveAccountIdentity_Hit(t *testing.T) {
-	require := require.New(t)
+func TestRemoveAccountIdentity_SavesDefaultIdentityOptOutAfterLastRemoval(t *testing.T) {
 	assert := assert.New(t)
+	require := require.New(t)
 	f := storetest.New(t)
 	st := f.Store
 
-	require.NoError(st.AddAccountIdentity(f.Source.ID, "alice@example.com", "manual"), "add identity")
-	removed, err := st.RemoveAccountIdentity(f.Source.ID, "alice@example.com")
-	require.NoError(err, "RemoveAccountIdentity")
-	assert.Equal(int64(1), removed, "removed")
-	rows, err := st.ListAccountIdentities(f.Source.ID)
-	require.NoError(err, "ListAccountIdentities")
-	assert.Empty(rows)
-}
+	require.NoError(st.UpdateSourceSyncConfig(f.Source.ID,
+		`{"account_email":"owner@example.test","no_default_identity":false}`))
+	require.NoError(st.AddAccountIdentity(f.Source.ID, "owner@example.test", "account-identifier"))
+	require.NoError(st.AddAccountIdentity(f.Source.ID, "alias@example.test", "manual"))
 
-func TestRemoveAccountIdentity_Miss(t *testing.T) {
-	f := storetest.New(t)
-	st := f.Store
+	removed, err := st.RemoveAccountIdentity(f.Source.ID, "alias@example.test")
+	require.NoError(err)
+	require.EqualValues(1, removed)
+	source, err := st.GetSourceByID(f.Source.ID)
+	require.NoError(err)
+	require.JSONEq(`{"account_email":"owner@example.test","no_default_identity":false}`,
+		source.SyncConfig.String)
 
-	removed, err := st.RemoveAccountIdentity(f.Source.ID, "nope@example.com")
-	require.NoError(t, err, "RemoveAccountIdentity")
-	assert.Equal(t, int64(0), removed, "removed on miss")
+	removed, err = st.RemoveAccountIdentity(f.Source.ID, "owner@example.test")
+	require.NoError(err)
+	require.EqualValues(1, removed)
+	source, err = st.GetSourceByID(f.Source.ID)
+	require.NoError(err)
+	require.True(source.SyncConfig.Valid)
+	assert.JSONEq(`{"account_email":"owner@example.test","no_default_identity":true}`,
+		source.SyncConfig.String)
 }
 
 // TestRemoveAccountIdentity_EmailIsCaseInsensitive verifies that an

@@ -25,6 +25,11 @@ func newAddGoogleDocsDriveCmd() *cobra.Command {
 		Short: "Configure a Google Drive folder of Google Docs for MCP query and update",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			state := invocationFromCommand(cmd)
+			if state == nil || state.cfg == nil {
+				return errors.New("configuration is unavailable")
+			}
+			cfg := state.cfg
 			if opts.FolderID == "" {
 				return errors.New("--folder-id is required")
 			}
@@ -69,24 +74,34 @@ func newAddGoogleDocsDriveCmd() *cobra.Command {
 }
 
 func ensureGoogleDocsDriveToken(ctx context.Context, googleAccount, oauthApp string) error {
-	clientSecrets, err := cfg.OAuth.ClientSecretsFor(oauthApp)
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	clientSecrets, err := cfg.OAuth.CredentialsFor(oauthApp)
 	if err != nil {
 		return err
 	}
-	mgr, err := newGoogleDocsDriveOAuthManager(clientSecrets)
+	mgr, err := newGoogleDocsDriveOAuthManager(ctx, clientSecrets)
 	if err != nil {
 		return err
 	}
-	if googleDocsDriveTokenReady(mgr, googleAccount) {
+	if googleDocsDriveTokenReady(ctx, mgr, googleAccount) {
 		return nil
 	}
 	return mgr.Authorize(ctx, googleAccount)
 }
 
-func newGoogleDocsDriveOAuthManager(clientSecrets string) (*oauth.Manager, error) {
+func newGoogleDocsDriveOAuthManager(ctx context.Context, clientSecrets config.OAuthApp) (*oauth.Manager, error) {
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil {
+		return nil, errors.New("configuration is unavailable")
+	}
+	cfg, logger := state.cfg, state.logger
 	// The current OAuth manager validates account identity through Gmail's
 	// profile endpoint, so request a read-only Gmail scope alongside Docs/Drive.
-	return oauth.NewManagerWithScopes(clientSecrets, cfg.TokensDir(), logger, googleDocsDriveScopes())
+	return oauth.NewManagerWithCredentials(ctx, clientSecrets, cfg.TokensDir(), cfg.OAuth.Tokens, logger, googleDocsDriveScopes())
 }
 
 func googleDocsDriveScopes() []string {
@@ -97,12 +112,12 @@ func googleDocsDriveScopes() []string {
 	}
 }
 
-func googleDocsDriveTokenReady(mgr *oauth.Manager, googleAccount string) bool {
-	if !mgr.HasToken(googleAccount) {
+func googleDocsDriveTokenReady(ctx context.Context, mgr *oauth.Manager, googleAccount string) bool {
+	if !mgr.HasToken(ctx, googleAccount) {
 		return false
 	}
-	hasDriveRead := mgr.HasScope(googleAccount, drive.DriveReadonlyScope) || mgr.HasScope(googleAccount, drive.DriveScope)
-	return hasDriveRead && mgr.HasScope(googleAccount, docs.DocumentsScope)
+	hasDriveRead := mgr.HasScope(ctx, googleAccount, drive.DriveReadonlyScope) || mgr.HasScope(ctx, googleAccount, drive.DriveScope)
+	return hasDriveRead && mgr.HasScope(ctx, googleAccount, docs.DocumentsScope)
 }
 
 func init() {

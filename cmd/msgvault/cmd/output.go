@@ -1,8 +1,10 @@
 package cmd
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -10,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/textutil"
 )
 
 // Common flag variables used across aggregate commands.
@@ -83,7 +86,7 @@ func outputAggregateTable(
 
 	for _, row := range rows {
 		_, _ = fmt.Fprintf(w, "%s\t%d\t%s\t%s\n",
-			truncate(row.Key, 40),
+			truncate(textutil.SanitizeTerminal(row.Key), 40),
 			row.Count,
 			formatSize(row.TotalSize),
 			formatSize(row.AttachmentSize),
@@ -136,7 +139,10 @@ func formatSize(bytes int64) string {
 }
 
 func printJSON(v any) error {
-	enc := json.NewEncoder(os.Stdout)
-	enc.SetIndent("", "  ")
-	return enc.Encode(v)
+	return printJSONTo(os.Stdout, v)
+}
+
+func printJSONTo(w io.Writer, value any) error {
+	encoder := jsontext.NewEncoder(w, jsontext.WithIndentPrefix(""), jsontext.WithIndent("  "))
+	return json.MarshalEncode(encoder, value, json.Deterministic(true))
 }

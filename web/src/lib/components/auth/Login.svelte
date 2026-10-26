@@ -12,9 +12,9 @@
   }
 </script>
 
-<main class="login" aria-label="Authentication">
+<main class="boot-screen" aria-label="Authentication">
   <form aria-label="Log in" onsubmit={submit}>
-    <p class="eyebrow">msgvault</p>
+    <p class="boot-screen__brand">msgvault</p>
     <h1>Log in</h1>
     <p>Enter the API key configured for this daemon.</p>
 
@@ -42,3 +42,17 @@
     />
   </form>
 </main>
+
+<style>
+  form {
+    align-self: stretch;
+  }
+
+  form > :global(*) {
+    align-self: stretch;
+  }
+
+  form > :global(button) {
+    align-self: flex-start;
+  }
+</style>

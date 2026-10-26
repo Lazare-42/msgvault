@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"unsafe"
@@ -34,29 +35,35 @@ type windowsFileAttributeTagInfo struct {
 // FILE_WRITE_DATA | SYNCHRONIZE (see the FILE_RENAME_INFORMATION contract),
 // so a share-read-only pin would make the transaction's own MoveFileExW and
 // ReplaceFileW calls fail with a sharing violation. A transient share-read
-// probe still rejects directories that already have a write- or
-// delete-capable handle open when the pin is taken.
+// probe also rejects a config directory that already has a write-capable
+// handle open. Ancestors skip that probe: a writer there can only add
+// siblings, and shared ancestors such as the temp root often have one.
 func pinWindowsConfigParent(path string) (*windowsPathAuthority, error) {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return nil, fmt.Errorf("resolve Windows config path: %w", err)
 	}
-	parent := filepath.Dir(filepath.Clean(absolute))
+	return pinWindowsDirectoryChain(filepath.Dir(filepath.Clean(absolute)), true)
+}
+
+// pinWindowsDirectoryChain pins every component through parent, probing only
+// parent for writers, and only when parent is the config directory itself.
+func pinWindowsDirectoryChain(parent string, configDirectory bool) (*windowsPathAuthority, error) {
 	volume := filepath.VolumeName(parent)
 	root := volume + string(filepath.Separator)
 	relative := strings.TrimPrefix(parent, root)
 	authority := &windowsPathAuthority{}
 	prefix := root
-	for _, part := range strings.Split(relative, string(filepath.Separator)) {
+	for part := range strings.SplitSeq(relative, string(filepath.Separator)) {
 		if part == "" || part == "." {
 			continue
 		}
 		if part == ".." {
 			_ = authority.Release()
-			return nil, errors.Join(ErrUnsafeConfigTarget, errors.New("Windows config path escapes its volume root"))
+			return nil, errors.Join(ErrUnsafeConfigTarget, errors.New("windows config path escapes its volume root"))
 		}
 		prefix = filepath.Join(prefix, part)
-		handle, openErr := openWindowsAuthorityDirectory(prefix)
+		handle, openErr := openWindowsAuthorityDirectory(prefix, configDirectory && prefix == parent)
 		if openErr != nil {
 			_ = authority.Release()
 			return nil, openErr
@@ -80,7 +87,7 @@ func pinWindowsNearestExistingConfigAncestor(path string) (*windowsPathAuthority
 		if statErr == nil {
 			if !info.IsDir() {
 				return nil, "", "", errors.Join(ErrUnsafeConfigTarget,
-					fmt.Errorf("Windows config ancestor %s is not a directory", ancestor))
+					fmt.Errorf("windows config ancestor %s is not a directory", ancestor))
 			}
 			break
 		}
@@ -93,7 +100,7 @@ func pinWindowsNearestExistingConfigAncestor(path string) (*windowsPathAuthority
 		}
 		ancestor = parent
 	}
-	authority, err := pinWindowsConfigParent(filepath.Join(ancestor, ".config-ancestor-anchor"))
+	authority, err := pinWindowsDirectoryChain(ancestor, false)
 	if err != nil {
 		return nil, "", "", err
 	}
@@ -118,25 +125,31 @@ func pinWindowsNearestExistingConfigAncestor(path string) (*windowsPathAuthority
 	return authority, filepath.Clean(absolute), identity, nil
 }
 
-func openWindowsAuthorityDirectory(path string) (windows.Handle, error) {
+func openWindowsAuthorityDirectory(path string, rejectWriters bool) (windows.Handle, error) {
 	encoded, err := windows.UTF16PtrFromString(path)
 	if err != nil {
 		return 0, fmt.Errorf("encode Windows config directory: %w", err)
 	}
 	// The share-read probe fails while any existing handle holds write or
 	// delete access, so a transaction never starts under a concurrent
-	// directory writer.
-	probe, err := openWindowsDirectoryHandle(encoded, windows.FILE_SHARE_READ)
-	if err != nil {
-		return 0, fmt.Errorf("pin Windows config directory %s: %w", path, err)
+	// config directory writer.
+	probe := windows.InvalidHandle
+	if rejectWriters {
+		probe, err = openWindowsDirectoryHandle(encoded, windows.FILE_SHARE_READ)
+		if err != nil {
+			return 0, fmt.Errorf("pin Windows config directory %s: %w", path, err)
+		}
 	}
 	// The durable pin adds FILE_SHARE_WRITE because publishing renames open
 	// the target directory with FILE_WRITE_DATA. Excluding FILE_SHARE_DELETE
-	// still blocks rename, deletion, and replacement of the component. The
-	// probe closes only after the durable pin exists, so the directory is
-	// never unpinned in between.
+	// still blocks rename, deletion, and replacement of the component, and
+	// fails while another handle already holds delete access. The probe
+	// closes only after the durable pin exists, so the directory is never
+	// unpinned in between.
 	handle, err := openWindowsDirectoryHandle(encoded, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE)
-	_ = windows.CloseHandle(probe)
+	if probe != windows.InvalidHandle {
+		_ = windows.CloseHandle(probe)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("pin Windows config directory %s: %w", path, err)
 	}
@@ -144,6 +157,7 @@ func openWindowsAuthorityDirectory(path string) (windows.Handle, error) {
 	if err := windows.GetFileInformationByHandleEx(
 		handle,
 		windows.FileAttributeTagInfo,
+		// #nosec G103 -- Windows receives the live FILE_ATTRIBUTE_TAG_INFO value with its exact size during this call.
 		(*byte)(unsafe.Pointer(&attributes)),
 		uint32(unsafe.Sizeof(attributes)),
 	); err != nil {
@@ -154,13 +168,13 @@ func openWindowsAuthorityDirectory(path string) (windows.Handle, error) {
 		attributes.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
 		_ = windows.CloseHandle(handle)
 		return 0, errors.Join(ErrUnsafeConfigTarget,
-			fmt.Errorf("Windows config directory %s is not an ordinary directory", path))
+			fmt.Errorf("windows config directory %s is not an ordinary directory", path))
 	}
 	return handle, nil
 }
 
 func openWindowsDirectoryHandle(encoded *uint16, share uint32) (windows.Handle, error) {
-	return windows.CreateFile(
+	handle, err := windows.CreateFile(
 		encoded,
 		windows.FILE_TRAVERSE|windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL|windows.SYNCHRONIZE,
 		share,
@@ -169,6 +183,10 @@ func openWindowsDirectoryHandle(encoded *uint16, share uint32) (windows.Handle, 
 		windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS,
 		0,
 	)
+	if err != nil {
+		return handle, fmt.Errorf("open config directory handle: %w", err)
+	}
+	return handle, nil
 }
 
 func (authority *windowsPathAuthority) Release() error {
@@ -182,8 +200,8 @@ func (authority *windowsPathAuthority) Release() error {
 	}
 	authority.closed = true
 	var errs []error
-	for index := len(authority.handles) - 1; index >= 0; index-- {
-		if err := windows.CloseHandle(authority.handles[index]); err != nil {
+	for _, handle := range slices.Backward(authority.handles) {
+		if err := windows.CloseHandle(handle); err != nil {
 			errs = append(errs, fmt.Errorf("release Windows config directory authority: %w", err))
 		}
 	}

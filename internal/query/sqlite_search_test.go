@@ -14,6 +14,71 @@ import (
 	"go.kenn.io/msgvault/internal/testutil/ptr"
 )
 
+func TestSearchPipeOR(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	env := newTestEnv(t)
+	_, err := env.DB.Exec(`UPDATE message_bodies SET body_text = CASE message_id WHEN 1 THEN 'alpha beta' WHEN 2 THEN 'gamma' ELSE 'ordinary body' END`)
+	requirements.NoError(err)
+	env.EnableFTS()
+	t.Run("empty FTS term", func(t *testing.T) {
+		assertMessageIDs(t, env.MustSearch(search.ParseOR("!!! | subject:final"), 100, 0), []int64{5})
+	})
+	t.Run("parent AccountAddrs", func(t *testing.T) {
+		require := require.New(t)
+		db := dbtest.NewTestDB(t, "../store/schema.sql")
+		source := db.AddSource(dbtest.SourceOpts{Identifier: "test@example.com"})
+		conversation := db.AddConversation(dbtest.ConversationOpts{SourceID: source})
+		_, err := db.DB.Exec(`INSERT INTO messages (source_id, conversation_id, source_message_id, message_type, subject, account_address, account_path)
+			VALUES (?, ?, 'work@example.org', 'email', 'invoice', 'work@example.org', 'inbound'), (?, ?, 'other@example.org', 'email', 'invoice', 'other@example.org', 'inbound')`, source, conversation, source, conversation)
+		require.NoError(err)
+		q := search.ParseOR("account:other@example.org | subject:invoice")
+		q.AccountAddrs = []string{"work@example.org"}
+		rows, err := NewSQLiteEngine(db.DB).SearchFast(t.Context(), q, MessageFilter{}, 100, 0)
+		require.NoError(err)
+		require.Len(rows, 1)
+		assert.Equal(t, []string{"work@example.org"}, []string{rows[0].SourceMessageID})
+	})
+	q := search.ParseOR("alpha beta | gamma")
+	rows := env.MustSearch(q, 100, 0)
+	assertMessageIDs(t, rows, []int64{1, 2})
+	_, err = env.DB.Exec(`DELETE FROM messages_fts WHERE rowid = 3`)
+	requirements.NoError(err)
+	rows = env.MustSearch(search.ParseOR("from:alice@example.com | gamma"), 100, 0)
+	assertMessageIDs(t, rows, []int64{1, 2, 3})
+	q.AccountIDs = []int64{999}
+	assertions.Empty(env.MustSearch(q, 100, 0))
+	q.AccountIDs = []int64{1}
+	assertMessageIDs(t, env.MustSearch(q, 100, 0), []int64{1, 2})
+	env.MarkDeletedByID(2)
+	q.DeletionScope = search.DeletionScopeActive
+	assertMessageIDs(t, env.MustSearch(q, 100, 0), []int64{1})
+	q.DeletionScope = search.DeletionScopeDeleted
+	assertMessageIDs(t, env.MustSearch(q, 100, 0), []int64{2})
+	q.DeletionScope = search.DeletionScopeAny
+	targets, err := env.Engine.GetDeletionTargetsBySearch(env.Ctx, q, MessageFilter{}, DeletionSearchDeep)
+	requirements.NoError(err)
+	ids := make([]int64, len(targets))
+	for i, target := range targets {
+		ids[i] = target.MessageID
+	}
+	assertions.ElementsMatch([]int64{1}, ids)
+}
+
+func TestSearchPipeORDateOrder(t *testing.T) {
+	require := require.New(t)
+	db := dbtest.NewTestDB(t, "../store/schema.sql")
+	source := db.AddSource(dbtest.SourceOpts{Identifier: "work@example.org"})
+	conversation := db.AddConversation(dbtest.ConversationOpts{SourceID: source, Title: "Staging"})
+	_, err := db.DB.Exec(`INSERT INTO messages (source_id, conversation_id, source_message_id, message_type, subject, sent_at)
+		VALUES (?, ?, 'message-1', 'email', 'first', '2026-01-01'), (?, ?, 'message-2', 'email', 'second', '2026-01-02')`, source, conversation, source, conversation)
+	require.NoError(err)
+	rows, err := NewSQLiteEngine(db.DB).SearchFast(t.Context(), search.ParseOR("subject:first | subject:second"), MessageFilter{}, 100, 0)
+	require.NoError(err)
+	require.Len(rows, 2)
+	assert.Equal(t, []string{"message-2", "message-1"}, []string{rows[0].SourceMessageID, rows[1].SourceMessageID})
+}
+
 func TestSearch_Filters(t *testing.T) {
 	after := ptr.Date(2024, 2, 1)
 	before := ptr.Date(2024, 3, 1)
@@ -23,6 +88,7 @@ func TestSearch_Filters(t *testing.T) {
 		name      string
 		query     *search.Query
 		wantCount int
+		setup     func(*testEnv)
 		validator func(MessageSummary) bool
 		validDesc string
 	}{
@@ -71,6 +137,27 @@ func TestSearch_Filters(t *testing.T) {
 			wantCount: 1,
 		},
 		{
+			name:      "ConversationIDFilter",
+			query:     &search.Query{ConversationIDs: []int64{1, 104}},
+			wantCount: 4,
+			setup: func(env *testEnv) {
+				_, err := env.DB.Exec(`
+					INSERT INTO conversations (
+						id, source_id, source_conversation_id, conversation_type, title
+					) VALUES
+						(104, 1, 'thread104', 'email_thread', 'Included thread'),
+						(105, 1, 'thread105', 'email_thread', 'Excluded thread');
+					UPDATE messages SET conversation_id = 104 WHERE id = 4;
+					UPDATE messages SET conversation_id = 105 WHERE id = 5;
+				`)
+				require.NoError(t, err, "seed conversation filter scope")
+			},
+			validator: func(m MessageSummary) bool {
+				return m.ConversationID == 1 || m.ConversationID == 104
+			},
+			validDesc: "ConversationID is in requested scope",
+		},
+		{
 			name:      "SizeFilter",
 			query:     &search.Query{LargerThan: new(largerThan)},
 			wantCount: 1,
@@ -87,6 +174,9 @@ func TestSearch_Filters(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			env := newTestEnv(t)
+			if tc.setup != nil {
+				tc.setup(env)
+			}
 			results := assertSearchCount(t, env, tc.query, tc.wantCount)
 			if tc.validator != nil {
 				assertAllResults(t, results, tc.validDesc, tc.validator)
@@ -168,6 +258,65 @@ func TestSearch_MessageTypeFilter(t *testing.T) {
 	require.Len(results, 1, "message_type must scope FTS search")
 	assert.Equal(smsID, results[0].ID)
 	assert.Equal("sms", results[0].MessageType)
+}
+
+// TestSearch_ListIDFilters catches Search dropping list: predicates after FTS
+// candidate selection. It exercises case folding, literal LIKE escaping, and
+// repeated-operator AND semantics against real message rows.
+func TestSearch_ListIDFilters(t *testing.T) {
+	env := newTestEnv(t)
+	aliceID := env.MustLookupParticipant("alice@example.com")
+	bobID := env.MustLookupParticipant("bob@company.org")
+	matchingID := env.AddMessage(dbtest.MessageOpts{
+		Subject: "shared list announcement", SentAt: "2024-04-10 10:00:00", FromID: aliceID, ToIDs: []int64{bobID},
+	})
+	announceOnlyID := env.AddMessage(dbtest.MessageOpts{
+		Subject: "shared list digest", SentAt: "2024-04-11 10:00:00", FromID: aliceID, ToIDs: []int64{bobID},
+	})
+	literalID := env.AddMessage(dbtest.MessageOpts{
+		Subject: "literal list marker", SentAt: "2024-04-12 10:00:00", FromID: aliceID, ToIDs: []int64{bobID},
+	})
+	unicodeID := env.AddMessage(dbtest.MessageOpts{
+		Subject: "unicode list marker", SentAt: "2024-04-13 10:00:00", FromID: aliceID, ToIDs: []int64{bobID},
+	})
+	_, err := env.DB.Exec(`UPDATE messages SET list_id = CASE id
+		WHEN ? THEN '<Announce.Shared.example.org>'
+		WHEN ? THEN '<announce.example.net>'
+		WHEN ? THEN '<Ops%_Team\Archive.example.org>'
+		WHEN ? THEN '<ÉCOLE.example.org>'
+	END WHERE id IN (?, ?, ?, ?)`,
+		matchingID, announceOnlyID, literalID, unicodeID, matchingID, announceOnlyID, literalID, unicodeID)
+	require.NoError(t, err, "seed list ids")
+	env.EnableFTS()
+
+	assertIDs := func(q *search.Query, want ...int64) {
+		t.Helper()
+		results := env.MustSearch(q, 100, 0)
+		got := make([]int64, len(results))
+		for i, result := range results {
+			got[i] = result.ID
+		}
+		assert.ElementsMatch(t, want, got)
+	}
+
+	assertIDs(&search.Query{ListIDs: []string{"ANNOUNCE"}}, matchingID, announceOnlyID)
+	assertIDs(&search.Query{ListIDs: []string{"announce", "shared"}}, matchingID)
+	assertIDs(&search.Query{ListIDs: []string{"ops%_team"}}, literalID)
+	assertIDs(&search.Query{ListIDs: []string{"ops%_team\\archive"}}, literalID)
+	assertIDs(&search.Query{ListIDs: []string{"école"}}, unicodeID)
+
+	before := env.MustSearch(&search.Query{TextTerms: []string{"shared"}}, 100, 0)
+	after := env.MustSearch(&search.Query{TextTerms: []string{"shared"}, ListIDs: []string{"announce"}}, 100, 0)
+	beforeIDs := make([]int64, len(before))
+	afterIDs := make([]int64, len(after))
+	for i, result := range before {
+		beforeIDs[i] = result.ID
+	}
+	for i, result := range after {
+		afterIDs[i] = result.ID
+	}
+	assert.Equal(t, []int64{announceOnlyID, matchingID}, beforeIDs)
+	assert.Equal(t, beforeIDs, afterIDs, "List-Id narrowing preserves canonical search order")
 }
 
 // TestSearch_WithFTS_SpecialChars verifies that FTS5 special characters in
@@ -460,14 +609,32 @@ func TestMergeFilterIntoQuery(t *testing.T) {
 	}
 }
 
-func TestMergeFilterIntoQuery_DoesNotMutateOriginal(t *testing.T) {
-	q := &search.Query{FromAddrs: []string{"original@example.com"}}
-	filter := MessageFilter{Sender: "added@example.com"}
+func TestMergeFilterIntoQuery_ConversationID(t *testing.T) {
+	conversationID := int64(42)
+	original := &search.Query{ConversationIDs: []int64{7, 42}}
 
-	_ = MergeFilterIntoQuery(q, filter)
+	merged := MergeFilterIntoQuery(original, MessageFilter{ConversationID: &conversationID})
 
-	require.Len(t, q.FromAddrs, 1, "Original query was mutated")
-	assert.Equal(t, "original@example.com", q.FromAddrs[0], "Original query was mutated")
+	assert.Equal(t, []int64{42}, merged.ConversationIDs,
+		"drill-down conversation must scope the merged search")
+	assert.Equal(t, []int64{7, 42}, original.ConversationIDs,
+		"merge must not mutate the original query")
+}
+
+func TestMergeFilterIntoQuery_ConflictingConversationIDMatchesNothing(t *testing.T) {
+	conversationID := int64(42)
+	original := &search.Query{ConversationIDs: []int64{7, 8}}
+
+	merged := MergeFilterIntoQuery(original, MessageFilter{ConversationID: &conversationID})
+
+	require.NotNil(t, merged.ConversationIDs,
+		"a conflicting scope must remain distinguishable from no scope")
+	assert.Empty(t, merged.ConversationIDs, "conflicting scopes must match nothing")
+	conditions, _ := appendConversationFilter(
+		nil, nil, "m.conversation_id", merged.ConversationIDs,
+	)
+	assert.Equal(t, []string{"1=0"}, conditions,
+		"an explicit empty scope must become a match-nothing condition")
 }
 
 // TestMergeFilterIntoQuery_EmptySourceIDsClearsAccountScope verifies that
@@ -521,21 +688,60 @@ func TestSearchByDomains_HidesDeleted(t *testing.T) {
 	env := newTestEnv(t)
 	ctx := context.Background()
 
-	all, err := env.Engine.SearchByDomains(ctx, []string{"example.com"}, nil, nil, 100, 0)
+	all, err := env.Engine.SearchByDomains(ctx, []string{"example.com"}, nil, nil, 100, 0, nil)
 	require.NoError(err, "SearchByDomains baseline")
-	require.Len(all, 5, "baseline result count")
+	require.Len(all.Messages, 5, "baseline result count")
 
 	// Dedup-soft-delete one message — must always be hidden.
 	env.MarkDedupLoserByID(1)
 	// Source-delete another — also hidden by the full live-message predicate.
 	env.MarkDeletedByID(2)
 
-	results, err := env.Engine.SearchByDomains(ctx, []string{"example.com"}, nil, nil, 100, 0)
+	results, err := env.Engine.SearchByDomains(ctx, []string{"example.com"}, nil, nil, 100, 0, nil)
 	require.NoError(err, "SearchByDomains after deletes")
-	assert.Len(results, 3, "after deletes")
-	for _, r := range results {
+	assert.Len(results.Messages, 3, "after deletes")
+	for _, r := range results.Messages {
 		assert.NotEqual(int64(1), r.ID, "dedup-loser message 1 leaked into results")
 		assert.NotEqual(int64(2), r.ID, "source-deleted message 2 leaked into results")
+	}
+}
+
+func TestSearchByDomains_SourceFilter(t *testing.T) {
+	require := require.New(t)
+	env := newTestEnv(t)
+	ctx := context.Background()
+
+	own, err := env.Engine.SearchByDomains(ctx, []string{"example.com"}, nil, nil, 100, 0, []int64{1})
+	require.NoError(err)
+	require.Len(own.Messages, 5, "the fixture's own source keeps every match")
+	other, err := env.Engine.SearchByDomains(ctx, []string{"example.com"}, nil, nil, 100, 0, []int64{999})
+	require.NoError(err)
+	require.Empty(other.Messages, "another source filters every match out")
+}
+
+// TestSearchByDomains_HasMore verifies the engine probes one row past the
+// page, so a page that ends exactly on the last match reports no more.
+func TestSearchByDomains_HasMore(t *testing.T) {
+	env := newTestEnv(t)
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name          string
+		limit, offset int
+		wantLen       int
+		wantHasMore   bool
+	}{
+		{"partial page", 2, 0, 2, true},
+		{"exactly the remaining matches", 5, 0, 5, false},
+		{"exactly full last page", 2, 3, 2, false},
+		{"past the end", 2, 9, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := env.Engine.SearchByDomains(ctx, []string{"example.com"}, nil, nil, tc.limit, tc.offset, nil)
+			require.NoError(t, err)
+			assert.Len(t, got.Messages, tc.wantLen)
+			assert.Equal(t, tc.wantHasMore, got.HasMore)
+		})
 	}
 }
 
@@ -581,4 +787,16 @@ func TestSearch_DeletionScope(t *testing.T) {
 		"MergeFilterIntoQuery should set HideDeleted from HideDeletedFromSource")
 	results := env.MustSearch(merged, 100, 0)
 	require.Len(t, results, 3, "Search via merged query")
+}
+
+func TestSearchFilenameLiteralFilters(t *testing.T) {
+	env := newTestEnv(t)
+	id := env.AddMessage(dbtest.MessageOpts{Subject: "shared plan", SentAt: "2026-01-01 10:00:00"})
+	other := env.AddMessage(dbtest.MessageOpts{Subject: "shared plan", SentAt: "2026-02-01 10:00:00"})
+	_, err := env.DB.Exec(`INSERT INTO attachments(message_id,filename,mime_type,size,storage_path,content_hash) VALUES (?, 'Budget%_Plan.PDF','application/pdf',10,'synthetic',NULL),(?,'界.csv','text/csv',10,'synthetic',NULL),(?,'BudgetXXPlan.pdf','application/pdf',10,'synthetic',NULL),(?,'界.csv','text/csv',10,'synthetic',NULL)`, id, id, other, other)
+	require.NoError(t, err)
+	env.EnableFTS()
+	rows := env.MustSearch(search.Parse(`shared filename:budget%_ filename:界`), 1, 0)
+	require.Len(t, rows, 1)
+	assert.Equal(t, id, rows[0].ID)
 }

@@ -3,6 +3,7 @@ package query
 import (
 	"context"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -31,6 +32,87 @@ func TestExploreGroupsAggregatesCompleteLogicalPopulation(t *testing.T) {
 	assertions.Equal(int64(2), result.Rows[0].Count)
 	assertions.Equal(int64(300), result.Rows[0].EstimatedBytes)
 	assertions.NotEmpty(result.CacheRevision)
+}
+
+func TestExploreAttachmentByteEstimates(t *testing.T) {
+	for _, tt := range []struct {
+		name, sourceType, messageType string
+		sizeEstimate, wantBytes       int64
+	}{
+		{"beeper includes attachments", "beeper", "whatsapp", 12, 12},
+		{"slack includes attachments", "slack", "slack", 12, 12},
+		{"teams includes attachments", "teams", "teams", 12, 12},
+		{"known attachments bound incomplete estimates", "teams", "teams", 0, 7},
+		{"body-only chat adds attachments", "imessage", "imessage", 5, 12},
+		{"email accounting is unchanged", "gmail", "email", 100, 107},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			requirements := require.New(t)
+			assertions := assert.New(t)
+			b := NewTestDataBuilder(t)
+			source := b.AddSourceWithType("archive@example.com", tt.sourceType)
+			message := b.AddMessage(MessageOpt{
+				SourceID: source, MessageType: tt.messageType,
+				SizeEstimate: tt.sizeEstimate, HasAttachments: true,
+			})
+			b.AddAttachment(message, 7, "image.png")
+			engine := b.BuildEngine()
+
+			groups, err := engine.ExploreGroups(t.Context(), ExploreGroupRequest{
+				Dimension: "source", Page: PageSpec{Limit: 10},
+			})
+			requirements.NoError(err)
+			requirements.Len(groups.Rows, 1)
+			assertions.Equal(tt.wantBytes, groups.Rows[0].EstimatedBytes)
+
+			selection, err := engine.ExploreSelectionStats(t.Context(), ExploreSelectionRequest{})
+			requirements.NoError(err)
+			assertions.Equal(tt.wantBytes, selection.EstimatedBytes)
+		})
+	}
+}
+
+// TestExploreGroupsMailingListsPreserveAggregateDrillPopulation catches a
+// mailing-list dimension that drops empty values, splits case variants into
+// separate rows, or applies a broader-than-exact drill predicate.
+func TestExploreGroupsMailingListsPreserveAggregateDrillPopulation(t *testing.T) {
+	requirements := require.New(t)
+	assertions := assert.New(t)
+	b := NewTestDataBuilder(t)
+	b.AddSource("archive@example.com")
+	upper := "<Dev_1@Example.Test>"
+	lower := "<dev_1@example.test>"
+	digest := "<digest@example.test>"
+	empty := ""
+	b.AddMessage(MessageOpt{Subject: "Upper", ListID: &upper, SizeEstimate: 100})
+	b.AddMessage(MessageOpt{Subject: "Lower", ListID: &lower, SizeEstimate: 200})
+	b.AddMessage(MessageOpt{Subject: "Digest", ListID: &digest, SizeEstimate: 50})
+	b.AddMessage(MessageOpt{Subject: "Empty", ListID: &empty, SizeEstimate: 400})
+	b.AddMessage(MessageOpt{Subject: "Missing", SizeEstimate: 800})
+	engine := b.BuildEngine()
+
+	grouped, err := engine.ExploreGroups(context.Background(), ExploreGroupRequest{
+		Explore: ExploreRequest{}, Dimension: "mailing_list",
+		Sort: SortSpec{Field: "count", Direction: "desc"}, Page: PageSpec{Limit: 10},
+	})
+	requirements.NoError(err)
+	requirements.Len(grouped.Rows, 2, "NULL and empty List-Ids must not form groups")
+	assertions.Equal(int64(2), grouped.TotalCount)
+	assertions.Equal(upper, grouped.Rows[0].Key)
+	assertions.Equal(upper, grouped.Rows[0].Label)
+	assertions.Equal(int64(2), grouped.Rows[0].Count, "case variants must share one group")
+	assertions.Equal(int64(300), grouped.Rows[0].EstimatedBytes)
+
+	drilledFast, drilledLegacy := runExploreBothPaths(t, engine, ExploreRequest{
+		Context: Context{MailingLists: []string{strings.ToUpper(grouped.Rows[0].Key)}},
+		Page:    PageSpec{Limit: 10},
+	})
+	assertions.Equal(drilledLegacy, drilledFast)
+	assertions.Equal(grouped.Rows[0].Count, drilledFast.TotalCount,
+		"exact case-insensitive drill must reproduce the aggregate population")
+	assertions.ElementsMatch([]string{"Upper", "Lower"}, []string{
+		drilledFast.Rows[0].Title, drilledFast.Rows[1].Title,
+	})
 }
 
 // TestExploreGroupsMessageTypeCollapsesLegacyRowsIntoEmail pins the grouping
@@ -234,6 +316,55 @@ func TestExploreGroupsMergesLinkedParticipantIdentities(t *testing.T) {
 	}, result.Rows)
 }
 
+func TestExploreGroupsPreservesFilteredChatAndRosterMembership(t *testing.T) {
+	b := NewTestDataBuilder(t)
+	b.AddSource("archive@example.test")
+	alice := b.AddParticipant("alice@alpha.example.test", "alpha.example.test", "Alice")
+	alias := b.AddParticipant("alice@beta.example.test", "beta.example.test", "Alice alias")
+	bob := b.AddParticipant("bob@alpha.example.test", "alpha.example.test", "Bob")
+	roster := b.AddParticipant("roster@roster.example.test", "roster.example.test", "Roster")
+	excluded := b.AddParticipant("excluded@outside.example.test", "outside.example.test", "Excluded")
+	b.LinkCluster(alice, alias)
+	base := time.Date(2026, 7, 1, 10, 0, 0, 0, time.UTC)
+	email := b.AddMessage(MessageOpt{ConversationID: 800, SenderID: &alice, SizeEstimate: 100, SentAt: base})
+	b.AddTo(email, alias, "")
+	b.AddCc(email, bob, "")
+	b.AddConversationParticipant(800, roster)
+	b.AddMessage(MessageOpt{MessageType: "imessage", ConversationType: "group_chat",
+		ConversationID: 900, SenderID: &alice, SizeEstimate: 20, SentAt: base.Add(time.Hour)})
+	b.AddMessage(MessageOpt{MessageType: "imessage", ConversationType: "group_chat",
+		ConversationID: 900, SenderID: &alias, SizeEstimate: 30, SentAt: base.Add(2 * time.Hour)})
+	b.AddMessage(MessageOpt{MessageType: "imessage", ConversationType: "group_chat",
+		ConversationID: 900, SenderID: &excluded, SizeEstimate: 80, SentAt: base.Add(4 * time.Hour)})
+	b.AddConversationParticipant(900, roster)
+	engine := b.BuildEngine()
+	before := base.Add(3 * time.Hour)
+	for _, tc := range []struct {
+		dimension string
+		want      []ExploreGroupRow
+	}{
+		{"participant", []ExploreGroupRow{
+			{Key: "1", Label: "Alice", Count: 2, EstimatedBytes: 150, LatestAt: base.Add(2 * time.Hour)},
+			{Key: "3", Label: "Bob", Count: 1, EstimatedBytes: 100, LatestAt: base},
+			{Key: "4", Label: "Roster", Count: 1, EstimatedBytes: 50, LatestAt: base.Add(2 * time.Hour)},
+		}},
+		{"domain", []ExploreGroupRow{
+			{Key: "alpha.example.test", Label: "alpha.example.test", Count: 2, EstimatedBytes: 150, LatestAt: base.Add(2 * time.Hour)},
+			{Key: "beta.example.test", Label: "beta.example.test", Count: 2, EstimatedBytes: 150, LatestAt: base.Add(2 * time.Hour)},
+			{Key: "roster.example.test", Label: "roster.example.test", Count: 2, EstimatedBytes: 150, LatestAt: base.Add(2 * time.Hour)},
+		}},
+	} {
+		t.Run(tc.dimension, func(t *testing.T) {
+			result, err := engine.ExploreGroups(t.Context(), ExploreGroupRequest{
+				Explore: ExploreRequest{Context: Context{Before: &before}}, Dimension: tc.dimension,
+				Sort: SortSpec{Field: "key", Direction: "asc"}, Page: PageSpec{Limit: 10},
+			})
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, result.Rows)
+		})
+	}
+}
+
 func TestExploreParticipantFilterMatchesLinkedAliases(t *testing.T) {
 	requirements := require.New(t)
 	assertions := assert.New(t)
@@ -314,6 +445,58 @@ func TestExploreSelectionStatsCanResolveExactDeletableMessageIDs(t *testing.T) {
 	assertions.Equal(int64(1), result.Count)
 	assertions.Equal([]int64{second}, result.DeletableMessageIDs)
 	assertions.NotContains(result.DeletableMessageIDs, first)
+}
+
+// Gmail and Graph mail can be deleted at the source. IMAP mail cannot.
+func TestDeletionCoversGmailAndMSMailOnly(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	b := NewTestDataBuilder(t)
+	gmailMsg := b.AddMessage(MessageOpt{SourceID: b.AddSource("g@example.com"), Subject: "One"})
+	msmailMsg := b.AddMessage(MessageOpt{SourceID: b.AddSourceWithType("m@example.com", "msmail"), Subject: "Two"})
+	b.AddMessage(MessageOpt{SourceID: b.AddSourceWithType("i@example.com", "imap"), Subject: "Three"})
+	engine := b.BuildEngine()
+
+	result, err := engine.ExploreSelectionStats(context.Background(), ExploreSelectionRequest{
+		IncludeDeletableMessageIDs: true,
+	})
+	requirements.NoError(err)
+	assertions.ElementsMatch([]int64{gmailMsg, msmailMsg}, result.DeletableMessageIDs)
+
+	targets, err := engine.GetDeletionTargetsByFilter(context.Background(), MessageFilter{})
+	requirements.NoError(err)
+	ids, err := deletionTargetSourceMessageIDs(targets, nil)
+	requirements.NoError(err)
+	assertions.ElementsMatch([]string{"msg1", "msg2"}, ids)
+}
+
+func TestExploreSelectionStatsExcludesDedupHiddenDeletionTargets(t *testing.T) {
+	for _, deletion := range []DeletionFilter{DeletionAny, DeletionActive} {
+		t.Run(string(deletion), func(t *testing.T) {
+			assertions := assert.New(t)
+			requirements := require.New(t)
+			b := NewTestDataBuilder(t)
+			source := b.AddSource("archive@example.com")
+			live := b.AddMessage(MessageOpt{SourceID: source, Subject: "Live message"})
+			hiddenAt := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+			b.AddMessage(MessageOpt{SourceID: source, Subject: "Hidden duplicate", InternalDeletedAt: &hiddenAt})
+			engine := b.BuildEngine()
+
+			stats, err := engine.ExploreSelectionStats(context.Background(), ExploreSelectionRequest{
+				Explore:                    ExploreRequest{Context: Context{Deletion: deletion}},
+				IncludeDeletableMessageIDs: true,
+			})
+			requirements.NoError(err)
+			assertions.Equal(int64(2), stats.Count, "the selection still includes both matching entries")
+			assertions.Equal(int64(1), stats.DeletableCount, "only the live message can be staged")
+			assertions.Equal([]int64{live}, stats.DeletableMessageIDs)
+
+			targets, err := engine.GetDeletionTargetsByMessageIDs(context.Background(), stats.DeletableMessageIDs)
+			requirements.NoError(err)
+			requirements.Len(targets, 1)
+			assertions.Equal(stats.DeletableCount, int64(len(targets)), "preflight and staging resolve the same subset")
+		})
+	}
 }
 
 func TestExploreSelectionStatsCanResolveExactRawExportMessageID(t *testing.T) {

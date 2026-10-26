@@ -3,7 +3,8 @@ package cmd
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"go.kenn.io/kit/atomicfile"
 	"go.kenn.io/msgvault/internal/mime"
 	"go.kenn.io/msgvault/internal/store"
 )
@@ -76,7 +78,12 @@ func runRepairDatesLocal(
 	now time.Time,
 ) (runErr error) {
 	ctx := cmd.Context()
-	st, cleanup, err := openWritableStoreAndInit()
+	state := invocationFromCommand(cmd)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	st, cleanup, err := openWritableStoreAndInitForInvocation(state)
 	if err != nil {
 		return err
 	}
@@ -499,31 +506,17 @@ func writeDateRepairLedger(path string, ledger *dateRepairLedger) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create repairs directory: %w", err)
 	}
-	file, err := os.CreateTemp(dir, ".dates-*.tmp")
+	file, err := atomicfile.Create(path)
 	if err != nil {
 		return fmt.Errorf("create temporary ledger: %w", err)
 	}
-	tempPath := file.Name()
-	defer func() { _ = os.Remove(tempPath) }()
+	defer func() { _ = file.Abort() }()
+	encoder := jsontext.NewEncoder(file, jsontext.WithIndentPrefix(""), jsontext.WithIndent("  "))
 
-	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("set ledger permissions: %w", err)
-	}
-	encoder := json.NewEncoder(file)
-	encoder.SetIndent("", "  ")
-	if err := encoder.Encode(ledger); err != nil {
-		_ = file.Close()
+	if err := json.MarshalEncode(encoder, ledger, json.Deterministic(true)); err != nil {
 		return fmt.Errorf("encode ledger: %w", err)
 	}
-	if err := file.Sync(); err != nil {
-		_ = file.Close()
-		return fmt.Errorf("sync ledger: %w", err)
-	}
-	if err := file.Close(); err != nil {
-		return fmt.Errorf("close ledger: %w", err)
-	}
-	if err := replaceOutputFile(tempPath, path); err != nil {
+	if err := file.Commit(); err != nil {
 		return fmt.Errorf("publish ledger: %w", err)
 	}
 	return nil

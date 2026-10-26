@@ -8,6 +8,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,11 +20,13 @@ import (
 	"time"
 
 	_ "github.com/duckdb/duckdb-go/v2"
+	"github.com/gofrs/flock"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/identityindex"
 	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/search"
 )
 
 func TestDaemonBuildCacheChildUsesQuietConsolePolicy(t *testing.T) {
@@ -41,6 +45,33 @@ func TestRunBuildCacheSubprocessCommandStreamsStderrOnSuccess(t *testing.T) {
 	assert.Equal(t, "cache build warning\n", stderr.String())
 }
 
+func TestBuildCacheAcceptsSQLiteFileURI(t *testing.T) {
+	tmpDir := setupTestSQLite(t)
+	dbPath := filepath.Join(tmpDir, "test.db")
+	dbURI := (&url.URL{Scheme: "file", Path: filepath.ToSlash(dbPath)}).String()
+
+	result, err := buildCache(dbURI, filepath.Join(tmpDir, "analytics"), true)
+
+	require.NoError(t, err, "buildCache with file URI")
+	assert.NotNil(t, result)
+}
+
+// TestBuildCacheLockedAcceptsSQLiteFileURI guards the callers that hold the
+// build lock themselves (repair-dates, repair-encoding, remove-account) and
+// pass the configured DSN straight to buildCacheLocked.
+func TestBuildCacheLockedAcceptsSQLiteFileURI(t *testing.T) {
+	tmpDir := setupTestSQLite(t)
+	dbPath := filepath.Join(tmpDir, "test.db")
+	dbURI := (&url.URL{Scheme: "file", Path: filepath.ToSlash(dbPath)}).String()
+
+	result, err := buildCacheLocked(
+		dbURI, filepath.Join(tmpDir, "analytics"), true, false, acquirePublishLock,
+	)
+
+	require.NoError(t, err, "buildCacheLocked with file URI")
+	assert.NotNil(t, result)
+}
+
 // setupTestSQLite creates a test SQLite database with realistic email data.
 func setupTestSQLite(t *testing.T) string {
 	t.Helper()
@@ -54,6 +85,7 @@ func setupTestSQLite(t *testing.T) string {
 
 	// Create schema
 	schema := `
+		CREATE TABLE source_merge_archive_only_messages (message_id INTEGER PRIMARY KEY);
 		CREATE TABLE sources (
 			id INTEGER PRIMARY KEY,
 			source_type TEXT NOT NULL DEFAULT 'gmail',
@@ -65,6 +97,7 @@ func setupTestSQLite(t *testing.T) string {
 			id INTEGER PRIMARY KEY,
 			source_id INTEGER NOT NULL REFERENCES sources(id),
 			source_message_id TEXT NOT NULL,
+			rfc822_message_id TEXT,
 			conversation_id INTEGER,
 			subject TEXT,
 			snippet TEXT,
@@ -74,6 +107,7 @@ func setupTestSQLite(t *testing.T) string {
 			has_attachments BOOLEAN DEFAULT FALSE,
 			attachment_count INTEGER DEFAULT 0,
 			deleted_from_source_at TIMESTAMP,
+			list_id TEXT,
 			sender_id INTEGER,
 			message_type TEXT NOT NULL DEFAULT 'email',
 			is_from_me BOOLEAN DEFAULT FALSE,
@@ -290,10 +324,12 @@ func enableSQLiteWAL(t *testing.T, dbPath string) {
 // account_identities before that ingest's confirmDefaultIdentity would
 // suppress the source's own address.
 func TestRunBuildCacheLocalSkipsDeferredIdentityMigration(t *testing.T) {
+	cfg := testConfigValue()
+
 	require := require.New(t)
 	assert := assert.New(t)
 	c, s := openTestDaemonAnalyticsStore(t)
-	withTUIConfig(t, c)
+	testCtx := withTUIConfig(t, c)
 	cfg.Identity.Addresses = []string{"legacy@example.com"}
 	_, err := s.DB().Exec(`
 		INSERT INTO sources (id, source_type, identifier) VALUES (1, 'gmail', 'user@example.com');
@@ -304,7 +340,10 @@ func TestRunBuildCacheLocalSkipsDeferredIdentityMigration(t *testing.T) {
 	`)
 	require.NoError(err, "insert test data")
 
-	require.NoError(runBuildCacheLocal(false, false), "runBuildCacheLocal")
+	require.NoError(
+		runBuildCacheLocal(false, false, invocationFromContext(testCtx)),
+		"runBuildCacheLocal",
+	)
 
 	var identities int
 	require.NoError(s.DB().QueryRow("SELECT COUNT(*) FROM account_identities").Scan(&identities))
@@ -620,7 +659,7 @@ func TestBuildCacheFailedStateWriteLeavesIncrementalDrift(t *testing.T) {
 		return errors.New("simulated state write failure")
 	}
 	_, err = buildCache(dbPath, analyticsDir, false)
-	buildCacheWriteStateFile = os.WriteFile
+	buildCacheWriteStateFile = writeCacheStateFile
 	require.ErrorContains(err, "simulated state write failure",
 		"incremental build must fail when the sync state cannot be persisted")
 
@@ -656,7 +695,7 @@ func TestBuildCacheFailedStateWriteLeavesFullRebuildDrift(t *testing.T) {
 		return errors.New("simulated state write failure")
 	}
 	_, err = buildCache(dbPath, analyticsDir, true)
-	buildCacheWriteStateFile = os.WriteFile
+	buildCacheWriteStateFile = writeCacheStateFile
 	require.ErrorContains(err, "simulated state write failure",
 		"full rebuild must fail when the sync state cannot be persisted")
 
@@ -843,78 +882,53 @@ func TestBuildCacheScheduledReevaluatesIntervalUnderLock(t *testing.T) {
 		"the lock-held recheck must build after the interval elapses")
 }
 
-// TestBuildCache_WaitsForCrossProcessBuildLock verifies buildCache blocks on
-// the inter-process build lock: buildCacheMu only serializes one process,
-// while daemon-owned CLI children rebuild the cache in their own processes.
-// The test holds the lock through an independent file handle, which conflicts
-// exactly like another process's holder would.
-func TestBuildCache_WaitsForCrossProcessBuildLock(t *testing.T) {
-	require := require.New(t)
-	tmpDir := setupTestSQLite(t)
-	dbPath := filepath.Join(tmpDir, "test.db")
-	analyticsDir := filepath.Join(tmpDir, "analytics")
-
-	held, err := cacheBuildFileLock(analyticsDir)
-	require.NoError(err, "cacheBuildFileLock")
-	locked, err := held.TryLock()
-	require.NoError(err, "hold build lock")
-	require.True(locked, "hold build lock")
-
-	done := make(chan error, 1)
-	go func() {
-		_, err := buildCache(dbPath, analyticsDir, false)
-		done <- err
-	}()
-
-	select {
-	case <-done:
-		require.FailNow("buildCache must wait for the cross-process build lock")
-	case <-time.After(150 * time.Millisecond):
+// TestBuildCache_WaitsForCacheLockHolders verifies buildCache blocks on the
+// inter-process cache lock. An exclusive holder stands in for another
+// process's build, since buildCacheMu only serializes one process. A shared
+// holder stands in for a running query, whose Parquet files a build must not
+// delete. Each holder uses an independent file handle, which conflicts exactly
+// like another process's holder would.
+func TestBuildCache_WaitsForCacheLockHolders(t *testing.T) {
+	tests := []struct {
+		name string
+		hold func(*flock.Flock) (bool, error)
+	}{
+		{name: "exclusive build", hold: (*flock.Flock).TryLock},
+		{name: "shared reader", hold: (*flock.Flock).TryRLock},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			require := require.New(t)
+			tmpDir := setupTestSQLite(t)
+			dbPath := filepath.Join(tmpDir, "test.db")
+			analyticsDir := filepath.Join(tmpDir, "analytics")
 
-	require.NoError(held.Unlock(), "release build lock")
-	select {
-	case err := <-done:
-		require.NoError(err, "buildCache after lock release")
-	case <-time.After(30 * time.Second):
-		require.FailNow("buildCache did not finish after the lock was released")
-	}
-}
+			holder, err := cacheBuildFileLock(analyticsDir)
+			require.NoError(err, "cacheBuildFileLock")
+			locked, err := tt.hold(holder)
+			require.NoError(err, "hold cache lock")
+			require.True(locked, "hold cache lock")
 
-// TestBuildCache_WaitsForCacheReaders verifies the writer side of the
-// reader/writer protocol: a build's exclusive lock must wait for a query's
-// shared hold to release, so it cannot delete Parquet files out from under a
-// running query.
-func TestBuildCache_WaitsForCacheReaders(t *testing.T) {
-	require := require.New(t)
-	tmpDir := setupTestSQLite(t)
-	dbPath := filepath.Join(tmpDir, "test.db")
-	analyticsDir := filepath.Join(tmpDir, "analytics")
+			done := make(chan error, 1)
+			go func() {
+				_, err := buildCache(dbPath, analyticsDir, false)
+				done <- err
+			}()
 
-	reader, err := cacheBuildFileLock(analyticsDir)
-	require.NoError(err, "cacheBuildFileLock")
-	locked, err := reader.TryRLock()
-	require.NoError(err, "hold shared reader lock")
-	require.True(locked, "hold shared reader lock")
+			select {
+			case <-done:
+				require.FailNow("buildCache must wait for the cache lock holder")
+			case <-time.After(150 * time.Millisecond): //nolint:kennlint // absence check: the held cache lock keeps buildCache waiting
+			}
 
-	done := make(chan error, 1)
-	go func() {
-		_, err := buildCache(dbPath, analyticsDir, false)
-		done <- err
-	}()
-
-	select {
-	case <-done:
-		require.FailNow("buildCache must wait for shared reader locks")
-	case <-time.After(150 * time.Millisecond):
-	}
-
-	require.NoError(reader.Unlock(), "release reader lock")
-	select {
-	case err := <-done:
-		require.NoError(err, "buildCache after reader release")
-	case <-time.After(30 * time.Second):
-		require.FailNow("buildCache did not finish after the reader released")
+			require.NoError(holder.Unlock(), "release cache lock")
+			select {
+			case err := <-done:
+				require.NoError(err, "buildCache after lock release")
+			case <-time.After(30 * time.Second):
+				require.FailNow("buildCache did not finish after the lock was released")
+			}
+		})
 	}
 }
 
@@ -977,41 +991,135 @@ func TestBuildCache_PublishesConversationParticipants(t *testing.T) {
 	assert.Equal(t, int64(9), count)
 }
 
-// TestBuildCache_ExportsRecipientEnvelopeAddress verifies the envelope
-// address snapshot reaches the message_recipients Parquet dataset (cache
-// schema v17): identity filters compare against it, so an export that drops
-// the column would silently degrade every filter to participant matching.
+// TestBuildCache_ExportsRecipientEnvelopeAddress verifies both address
+// columns of the message_recipients Parquet dataset (cache schema v26).
+// envelope_address is the header address exactly as the store recorded it and
+// stays NULL for rows that never recorded one: identity filters compare
+// against it, so an export that drops the column would silently degrade every
+// filter to participant matching, and one that coerces absence to an empty
+// string would make "no address recorded" indistinguishable from a recorded
+// but empty value. email_address is the resolved address, so a row without a
+// header address still carries its participant's current address and ad-hoc
+// address filters find pre-upgrade mail.
+// Both snapshot readers are covered because they build the address columns
+// from separate SQL: the sqlite_scanner path resolves them inside the Parquet
+// COPY and the CSV fallback carries the raw column through the \N null
+// sentinel first.
 func TestBuildCache_ExportsRecipientEnvelopeAddress(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	tmpDir := setupTestSQLite(t)
-	dbPath := filepath.Join(tmpDir, "test.db")
-	analyticsDir := filepath.Join(tmpDir, "analytics")
+	for _, tc := range []struct {
+		name     string
+		forceCSV bool
+	}{
+		{name: "sqlite scanner"},
+		{name: "CSV snapshot", forceCSV: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			if tc.forceCSV {
+				t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", "1")
+			}
+			tmpDir := setupTestSQLite(t)
+			dbPath := filepath.Join(tmpDir, "test.db")
+			analyticsDir := filepath.Join(tmpDir, "analytics")
 
-	_, err := buildCache(dbPath, analyticsDir, false)
-	require.NoError(err)
+			_, err := buildCache(dbPath, analyticsDir, false)
+			require.NoError(err)
 
-	duckdb, err := sql.Open("duckdb", "")
-	require.NoError(err)
-	defer func() { _ = duckdb.Close() }()
-	glob := filepath.Join(analyticsDir, "message_recipients", "*.parquet")
+			duckdb, err := sql.Open("duckdb", "")
+			require.NoError(err)
+			defer func() { _ = duckdb.Close() }()
+			glob := filepath.Join(analyticsDir, "message_recipients", "*.parquet")
 
-	var envelope string
-	err = duckdb.QueryRow(
-		`SELECT email_address FROM read_parquet(?)
-		 WHERE message_id = 1 AND recipient_type = 'from'`, glob,
-	).Scan(&envelope)
-	require.NoError(err, "exported message_recipients must carry email_address")
-	assert.Equal("alice-envelope@example.com", envelope)
+			var envelope, resolved string
+			err = duckdb.QueryRow(
+				`SELECT envelope_address, email_address FROM read_parquet(?)
+				 WHERE message_id = 1 AND recipient_type = 'from'`, glob,
+			).Scan(&envelope, &resolved)
+			require.NoError(err, "exported message_recipients must carry both address columns")
+			assert.Equal("alice-envelope@example.com", envelope)
+			assert.Equal("alice-envelope@example.com", resolved,
+				"a recorded header address is also the resolved address")
 
-	var withoutSnapshot int64
-	err = duckdb.QueryRow(
-		`SELECT COUNT(*) FROM read_parquet(?)
-		 WHERE COALESCE(email_address, '') = ''`, glob,
-	).Scan(&withoutSnapshot)
-	require.NoError(err)
-	assert.Equal(int64(11), withoutSnapshot,
-		"rows without a snapshot export as empty, keeping the participant fallback")
+			var withoutSnapshot int64
+			err = duckdb.QueryRow(
+				`SELECT COUNT(*) FROM read_parquet(?)
+				 WHERE envelope_address IS NULL`, glob,
+			).Scan(&withoutSnapshot)
+			require.NoError(err)
+			assert.Equal(int64(11), withoutSnapshot,
+				"rows without a snapshot export a NULL envelope so readers can tell absence from an empty value")
+
+			// Message 4's from row recorded no header address, so it resolves
+			// to the sending participant's current address.
+			var resolvedFallback string
+			err = duckdb.QueryRow(
+				`SELECT email_address FROM read_parquet(?)
+				 WHERE message_id = 4 AND recipient_type = 'from'`, glob,
+			).Scan(&resolvedFallback)
+			require.NoError(err)
+			assert.Equal("bob@company.org", resolvedFallback,
+				"a row without a header address resolves to its participant's address")
+
+			var unresolved int64
+			err = duckdb.QueryRow(
+				`SELECT COUNT(*) FROM read_parquet(?)
+				 WHERE email_address IS NULL`, glob,
+			).Scan(&unresolved)
+			require.NoError(err)
+			assert.Equal(int64(0), unresolved,
+				"every fixture participant carries an email address, so every row resolves")
+
+			var emptyString int64
+			err = duckdb.QueryRow(
+				`SELECT COUNT(*) FROM read_parquet(?)
+				 WHERE envelope_address = '' OR email_address = ''`, glob,
+			).Scan(&emptyString)
+			require.NoError(err)
+			assert.Equal(int64(0), emptyString, "no row exports an empty-string address")
+		})
+	}
+}
+
+// TestBuildCache_ExportsListID proves the cache retains the scalar List-Id
+// value exactly as SQLite stored it, including its RFC-style brackets.
+func TestBuildCache_ExportsListID(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		forceCSV bool
+	}{
+		{name: "sqlite scanner"},
+		{name: "CSV snapshot", forceCSV: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			if tc.forceCSV {
+				t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", "1")
+			}
+			tmpDir := setupTestSQLite(t)
+			dbPath := filepath.Join(tmpDir, "test.db")
+			analyticsDir := filepath.Join(tmpDir, "analytics")
+
+			db, err := sql.Open("sqlite3", dbPath)
+			require.NoError(err)
+			_, err = db.Exec(`UPDATE messages SET list_id = '<announce.example.test>' WHERE id = 1`)
+			require.NoError(err)
+			require.NoError(db.Close())
+
+			_, err = buildCache(dbPath, analyticsDir, false)
+			require.NoError(err)
+
+			duckdb, err := sql.Open("duckdb", "")
+			require.NoError(err)
+			defer func() { _ = duckdb.Close() }()
+			var listID string
+			err = duckdb.QueryRow(`SELECT list_id FROM read_parquet(?) WHERE id = 1`,
+				filepath.Join(analyticsDir, "messages", "**", "*.parquet")).Scan(&listID)
+			require.NoError(err)
+			assert.Equal("<announce.example.test>", listID)
+		})
+	}
 }
 
 // TestBuildCache_DataIntegrity verifies the exported Parquet data matches SQLite.
@@ -1358,8 +1466,8 @@ func runBuildCacheSQLiteMutation(t *testing.T, dbPath, operation string) {
 	require.NoErrorf(t, err, "run concurrent SQLite mutation\noutput:\n%s", output)
 }
 
-func TestBuildCache_RejectsTerminalAdditionDuringExport(t *testing.T) {
-	for _, terminalStatus := range []string{"completed", "failed"} {
+func TestBuildCache_PublishesSnapshotWhenTerminalAdditionLandsDuringExport(t *testing.T) {
+	for _, terminalStatus := range []string{"completed", "failed", "cancelled"} {
 		t.Run(terminalStatus, func(t *testing.T) {
 			require := require.New(t)
 			assert := assert.New(t)
@@ -1423,19 +1531,52 @@ func TestBuildCache_RejectsTerminalAdditionDuringExport(t *testing.T) {
 			t.Cleanup(func() { buildCacheBeforeStateWriteHook = nil })
 
 			_, err = buildCache(dbPath, analyticsDir, false)
-			require.Error(err)
-			assert.Contains(err.Error(), "sync counters changed during cache export")
+			require.NoError(err, "a counter change during export publishes the snapshot")
 			buildCacheBeforeStateWriteHook = nil
 			stateAfter, readErr := os.ReadFile(query.CacheStatePath(analyticsDir))
 			require.NoError(readErr)
-			assert.Equal(stateBefore, stateAfter, "counter mismatch preserves committed state")
-			assert.Equal(filesBefore, snapshotCacheParquet(t, analyticsDir),
-				"counter mismatch preserves committed Parquet")
+			assert.NotEqual(stateBefore, stateAfter, "snapshot publication replaces committed state")
+			assert.NotEqual(filesBefore, snapshotCacheParquet(t, analyticsDir),
+				"snapshot publication includes the parent message")
+			published, readErr := query.ReadCacheSyncState(analyticsDir)
+			require.NoError(readErr)
+			assert.True(published.FullRebuildRequired, "partial snapshot forces the next build to be full")
+			stale := cacheNeedsBuild(dbPath, analyticsDir)
+			require.True(stale.NeedsBuild, "partial snapshot is stale: %+v", stale)
+			require.True(stale.FullRebuild, "partial snapshot needs a full rebuild: %+v", stale)
+
+			// A sync that overlaps this build also queues another automatic
+			// refresh. It must wait even though the next build must be full.
+			deferred, err := buildCacheScheduled(dbPath, analyticsDir, 6*time.Hour, func() time.Time {
+				return published.PublishedAt.Add(time.Hour)
+			})
+			require.NoError(err)
+			assert.True(deferred.Skipped, "partial publication must honor the rebuild interval")
+
+			// A newer message arriving first must not turn the repair into an
+			// incremental build above the parent, which would skip its children.
+			db, err = sql.Open("sqlite3", dbPath)
+			require.NoError(err)
+			_, err = db.Exec(`
+				INSERT INTO messages (
+					id, source_id, source_message_id, conversation_id,
+					subject, snippet, sent_at, size_estimate, message_type
+				) VALUES (
+					7, 1, 'meeting-later', 105,
+					'Later Meeting', 'Arrived after the partial snapshot',
+					'2026-07-13 10:00:00', 500, 'meeting_transcript'
+				);
+			`)
+			require.NoError(err)
+			require.NoError(db.Close())
 
 			_, err = buildCache(dbPath, analyticsDir, false)
 			require.NoError(err)
 			fresh := cacheNeedsBuild(dbPath, analyticsDir)
 			require.False(fresh.NeedsBuild, "retry must capture the terminal addition: %+v", fresh)
+			repaired, err := query.ReadCacheSyncState(analyticsDir)
+			require.NoError(err)
+			assert.Equal(int64(1), repaired.LastCacheAdditionCount)
 
 			duckdb, err := sql.Open("duckdb", "")
 			require.NoError(err)
@@ -1455,63 +1596,66 @@ func TestBuildCache_RejectsTerminalAdditionDuringExport(t *testing.T) {
 	}
 }
 
-func TestBuildCache_RejectsZeroCounterFailedRunDuringExport(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	tmpDir := setupTestSQLite(t)
-	dbPath := filepath.Join(tmpDir, "test.db")
-	analyticsDir := filepath.Join(tmpDir, "analytics")
+func TestBuildCache_PublishesSnapshotWhenZeroCounterRunInterruptedDuringExport(t *testing.T) {
+	for _, terminalStatus := range []string{"failed", "cancelled"} {
+		t.Run(terminalStatus, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			tmpDir := setupTestSQLite(t)
+			dbPath := filepath.Join(tmpDir, "test.db")
+			analyticsDir := filepath.Join(tmpDir, "analytics")
 
-	db, err := sql.Open("sqlite3", dbPath)
-	require.NoError(err)
-	_, err = db.Exec(`
-		CREATE TABLE sync_runs (
-			id INTEGER PRIMARY KEY,
-			source_id INTEGER,
-			started_at DATETIME,
-			completed_at DATETIME,
-			status TEXT,
-			messages_processed INTEGER,
-			messages_added INTEGER,
-			messages_updated INTEGER,
-			errors_count INTEGER
-		);
-		INSERT INTO sync_runs (
-			id, source_id, started_at, status,
-			messages_processed, messages_added, messages_updated, errors_count
-		) VALUES (1, 1, datetime('now'), 'running', 0, 0, 0, 0);
-	`)
-	require.NoError(err)
-	require.NoError(db.Close())
+			db, err := sql.Open("sqlite3", dbPath)
+			require.NoError(err)
+			_, err = db.Exec(`
+				CREATE TABLE sync_runs (
+					id INTEGER PRIMARY KEY,
+					source_id INTEGER,
+					started_at DATETIME,
+					completed_at DATETIME,
+					status TEXT,
+					messages_processed INTEGER,
+					messages_added INTEGER,
+					messages_updated INTEGER,
+					errors_count INTEGER
+				);
+				INSERT INTO sync_runs (
+					id, source_id, started_at, status,
+					messages_processed, messages_added, messages_updated, errors_count
+				) VALUES (1, 1, datetime('now'), 'running', 0, 0, 0, 0);
+			`)
+			require.NoError(err)
+			require.NoError(db.Close())
 
-	_, err = buildCache(dbPath, analyticsDir, false)
-	require.NoError(err)
-	stateBefore, err := os.ReadFile(query.CacheStatePath(analyticsDir))
-	require.NoError(err)
-	filesBefore := snapshotCacheParquet(t, analyticsDir)
+			_, err = buildCache(dbPath, analyticsDir, false)
+			require.NoError(err)
+			stateBefore, err := os.ReadFile(query.CacheStatePath(analyticsDir))
+			require.NoError(err)
 
-	buildCacheBeforeStateWriteHook = func() {
-		hookDB, hookErr := sql.Open("sqlite3", dbPath)
-		require.NoError(hookErr)
-		defer func() { require.NoError(hookDB.Close()) }()
-		_, hookErr = hookDB.Exec(`
-			UPDATE sync_runs
-			SET status = 'failed', completed_at = datetime('now')
-			WHERE id = 1
-		`)
-		require.NoError(hookErr)
+			buildCacheBeforeStateWriteHook = func() {
+				hookDB, hookErr := sql.Open("sqlite3", dbPath)
+				require.NoError(hookErr)
+				defer func() { require.NoError(hookDB.Close()) }()
+				_, hookErr = hookDB.Exec(`
+					UPDATE sync_runs
+					SET status = ?, completed_at = datetime('now')
+					WHERE id = 1
+				`, terminalStatus)
+				require.NoError(hookErr)
+			}
+			t.Cleanup(func() { buildCacheBeforeStateWriteHook = nil })
+
+			_, err = buildCache(dbPath, analyticsDir, true)
+			require.NoError(err, "a counter change during export publishes the snapshot")
+			buildCacheBeforeStateWriteHook = nil
+			stateAfter, readErr := os.ReadFile(query.CacheStatePath(analyticsDir))
+			require.NoError(readErr)
+			assert.NotEqual(stateBefore, stateAfter, "snapshot publication replaces committed state")
+			stale := cacheNeedsBuild(dbPath, analyticsDir)
+			assert.True(stale.NeedsBuild, "run interrupted during export leaves the cache stale: %+v", stale)
+			assert.True(stale.FullRebuild, "partial snapshot needs a full rebuild: %+v", stale)
+		})
 	}
-	t.Cleanup(func() { buildCacheBeforeStateWriteHook = nil })
-
-	_, err = buildCache(dbPath, analyticsDir, true)
-	require.Error(err)
-	assert.Contains(err.Error(), "sync counters changed during cache export")
-	buildCacheBeforeStateWriteHook = nil
-	stateAfter, readErr := os.ReadFile(query.CacheStatePath(analyticsDir))
-	require.NoError(readErr)
-	assert.Equal(stateBefore, stateAfter, "counter mismatch preserves committed state")
-	assert.Equal(filesBefore, snapshotCacheParquet(t, analyticsDir),
-		"counter mismatch preserves committed Parquet")
 }
 
 func TestCacheNeedsBuild_DetectsOlderRunFailingAfterNewerFailure(t *testing.T) {
@@ -1561,10 +1705,10 @@ func TestCacheNeedsBuild_DetectsOlderRunFailingAfterNewerFailure(t *testing.T) {
 	staleness := cacheNeedsBuild(dbPath, analyticsDir)
 	assert.True(staleness.NeedsBuild, "every newly failed run must invalidate cache: %+v", staleness)
 	assert.True(staleness.FullRebuild, "failed-run progress requires a full rebuild: %+v", staleness)
-	assert.Contains(staleness.Reason, "failed sync")
+	assert.Contains(staleness.Reason, "interrupted sync")
 }
 
-func TestBuildCache_RejectsOlderRunFailingDuringExport(t *testing.T) {
+func TestBuildCache_PublishesSnapshotWhenOlderRunFailsDuringExport(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 	tmpDir := setupTestSQLite(t)
@@ -1612,8 +1756,16 @@ func TestBuildCache_RejectsOlderRunFailingDuringExport(t *testing.T) {
 	t.Cleanup(func() { buildCacheBeforeStateWriteHook = nil })
 
 	_, err = buildCache(dbPath, analyticsDir, true)
-	require.Error(err)
-	assert.Contains(err.Error(), "sync counters changed during cache export")
+	require.NoError(err, "a counter change during export publishes the snapshot")
+	buildCacheBeforeStateWriteHook = nil
+	stale := cacheNeedsBuild(dbPath, analyticsDir)
+	assert.True(stale.NeedsBuild, "older run failing during export leaves the cache stale: %+v", stale)
+	assert.True(stale.FullRebuild, "partial snapshot needs a full rebuild: %+v", stale)
+
+	_, err = buildCache(dbPath, analyticsDir, false)
+	require.NoError(err)
+	fresh := cacheNeedsBuild(dbPath, analyticsDir)
+	assert.False(fresh.NeedsBuild, "full follow-up build converges: %+v", fresh)
 }
 
 func TestCacheNeedsBuild_AddOnlySyncUsesIncrementalBuild(t *testing.T) {
@@ -2159,6 +2311,595 @@ func TestBuildCache_UTF8Handling(t *testing.T) {
 	assert.Equal("Test émoji 🎉 and unicode", subject, "unicode should be preserved")
 }
 
+func TestBuildCacheCSVInvalidUTF8IsRepairedWithWarning(t *testing.T) {
+	for _, tc := range []struct{ name, setup, check string }{
+		{"attachment filename", `UPDATE attachments SET filename = CAST(X'80' AS TEXT) WHERE id = 1`, "SELECT filename FROM read_parquet('%s/attachments/*.parquet') WHERE attachment_id = 1"},
+		{"row past CSV sample", `INSERT INTO messages (source_id, source_message_id, sent_at)
+   WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < 30000)
+   SELECT 1, 'bulk-' || i, datetime('2024-04-01', '+' || i || ' minutes') FROM seq;
+   UPDATE messages SET subject = CAST(X'80' AS TEXT) WHERE id = (SELECT MAX(id) FROM messages)`,
+			"SELECT subject FROM read_parquet('%s/messages/**/*.parquet', hive_partitioning=true) ORDER BY id DESC LIMIT 1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", "1")
+			tmpDir := setupTestSQLite(t)
+			dbPath, analyticsDir := filepath.Join(tmpDir, "test.db"), filepath.Join(tmpDir, "analytics")
+			db, err := sql.Open("sqlite3", dbPath)
+			require.NoError(err)
+			_, err = db.Exec(tc.setup)
+			require.NoError(err)
+			require.NoError(db.Close())
+			var buildErr error
+			stderr := captureStderrDuring(t, func() { _, buildErr = buildCache(dbPath, analyticsDir, true) })
+			require.NoError(buildErr)
+			assert.Contains(stderr, "msgvault repair-encoding")
+			duckDB, err := sql.Open("duckdb", "")
+			require.NoError(err)
+			defer func() { _ = duckDB.Close() }()
+			var got string
+			require.NoError(duckDB.QueryRow(fmt.Sprintf(tc.check, filepath.ToSlash(analyticsDir))).Scan(&got))
+			assert.Equal("�", got)
+		})
+	}
+}
+
+func TestBuildCacheSQLiteScannerInvalidUTF8KeepsFastSearchWorking(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	oldGOOS := cacheSnapshotGOOS
+	cacheSnapshotGOOS = "linux"
+	t.Cleanup(func() { cacheSnapshotGOOS = oldGOOS })
+	t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", "")
+	probe, err := sql.Open("duckdb", "")
+	require.NoError(err)
+	requireSQLiteScanner(t, probe)
+	require.NoError(probe.Close())
+	tmpDir := setupTestSQLite(t)
+	dbPath, analyticsDir := filepath.Join(tmpDir, "test.db"), filepath.Join(tmpDir, "analytics")
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(err)
+	_, err = db.Exec(`UPDATE messages SET snippet = CAST(X'43616c656e6461723a206c756e636820f09f' AS TEXT) WHERE id = 1`)
+	require.NoError(err)
+	require.NoError(db.Close())
+	var buildErr error
+	stderr := captureStderrDuring(t, func() { _, buildErr = buildCache(dbPath, analyticsDir, true) })
+	require.NoError(buildErr)
+	assert.NotContains(stderr, "using CSV fallback")
+	assert.Contains(stderr, "msgvault repair-encoding")
+	engine, err := query.NewDuckDBEngine(analyticsDir, "", nil)
+	require.NoError(err)
+	defer func() { _ = engine.Close() }()
+	q := search.Parse("from:alice@example.com")
+	result, err := engine.SearchFastWithStats(context.Background(), q, "from:alice@example.com", query.MessageFilter{}, query.ViewSenders, 50, 0)
+	require.NoError(err)
+	var snippet string
+	for _, m := range result.Messages {
+		if m.ID == 1 {
+			snippet = m.Snippet
+		}
+	}
+	assert.Equal("Calendar: lunch ��", snippet)
+}
+
+func TestBuildCacheInvalidUTF8IdentityKeysNeverMatch(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		forceCSV bool
+	}{
+		{name: "sqlite scanner"},
+		{name: "CSV fallback", forceCSV: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			oldGOOS := cacheSnapshotGOOS
+			cacheSnapshotGOOS = "linux"
+			t.Cleanup(func() { cacheSnapshotGOOS = oldGOOS })
+			if tc.forceCSV {
+				t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", "1")
+			} else {
+				t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", "")
+				probe, err := sql.Open("duckdb", "")
+				require.NoError(err)
+				requireSQLiteScanner(t, probe)
+				require.NoError(probe.Close())
+			}
+
+			tmpDir := setupTestSQLite(t)
+			dbPath, analyticsDir := filepath.Join(tmpDir, "test.db"), filepath.Join(tmpDir, "analytics")
+			db, err := sql.Open("sqlite3", dbPath)
+			require.NoError(err)
+
+			// Byte-identical invalid keys plus distinct invalid bytes that a
+			// U+FFFD repair would collapse onto one key: neither may attribute.
+			for _, address := range []string{
+				"envelope\x80@example.com", "primary\x80@example.com",
+				"identifier\x80@example.com", "handle\x80",
+				"a\x80@example.com",
+			} {
+				_, err = db.Exec(`INSERT INTO account_identities (source_id, address) VALUES (1, CAST(? AS TEXT))`, []byte(address))
+				require.NoError(err)
+			}
+			_, err = db.Exec(`UPDATE message_recipients SET email_address = CAST(? AS TEXT)
+			WHERE message_id = 1 AND recipient_type = 'from'`, []byte("envelope\x80@example.com"))
+			require.NoError(err)
+			// a\x81 and a\x80 sanitize to the same U+FFFD string; the
+			// envelope-equality path must not match them.
+			_, err = db.Exec(`UPDATE message_recipients SET email_address = CAST(? AS TEXT)
+			WHERE message_id = 2 AND recipient_type = 'from'`, []byte("a\x81@example.com"))
+			require.NoError(err)
+			_, err = db.Exec(`UPDATE participants SET email_address = CAST(? AS TEXT) WHERE id = 4`, []byte("primary\x80@example.com"))
+			require.NoError(err)
+			_, err = db.Exec(`UPDATE participants SET email_address = '' WHERE id = 2`)
+			require.NoError(err)
+			_, err = db.Exec(`UPDATE participant_identifiers SET identifier_value = CAST(? AS TEXT)
+			WHERE participant_id = 2`, []byte("identifier\x80@example.com"))
+			require.NoError(err)
+			_, err = db.Exec(`INSERT INTO participant_identifiers (participant_id, identifier_type, identifier_value)
+			VALUES (3, 'handle', CAST(? AS TEXT))`, []byte("handle\x80"))
+			require.NoError(err)
+			// Distinct invalid bytes against the a\x80 identity exercise the
+			// primary-email and non-email identifier paths.
+			_, err = db.Exec(`INSERT INTO participants (id, email_address, domain)
+			VALUES (5, CAST(? AS TEXT), 'example.com')`, []byte("a\x81@example.com"))
+			require.NoError(err)
+			_, err = db.Exec(`INSERT INTO participant_identifiers (participant_id, identifier_type, identifier_value)
+			VALUES (5, 'handle', CAST(? AS TEXT))`, []byte("a\x81@example.com"))
+			require.NoError(err)
+			_, err = db.Exec(`UPDATE messages SET sender_id = CASE id WHEN 3 THEN 3 WHEN 4 THEN 4 WHEN 5 THEN 2 END
+			WHERE id IN (3, 4, 5)`)
+			require.NoError(err)
+			// Reviewer scenario: the From envelope exists but its bytes are
+			// invalid, while the sender participant carries a VALID primary
+			// address that byte-equals a valid account identity. The recorded
+			// envelope is authoritative, so the participant fallback must not
+			// reclassify the message as sent by the owner.
+			_, err = db.Exec(`INSERT INTO participants (id, email_address, domain)
+			VALUES (6, 'owner@example.com', 'example.com')`)
+			require.NoError(err)
+			_, err = db.Exec(`INSERT INTO account_identities (source_id, address) VALUES (1, 'owner@example.com')`)
+			require.NoError(err)
+			// A nonblank primary address must suppress email-alias fallback,
+			// even when its invalid bytes cannot be used as a matching key.
+			_, err = db.Exec(`INSERT INTO participant_identifiers (participant_id, identifier_type, identifier_value)
+			VALUES (4, 'email', 'owner@example.com')`)
+			require.NoError(err)
+			_, err = db.Exec(`INSERT INTO messages (id, source_id, source_message_id, conversation_id, subject, snippet, sent_at, size_estimate, sender_id)
+			VALUES (6, 1, 'msg6', 101, 'Damaged envelope', 'Preview 6', '2024-03-05 09:00:00', 400, 6)`)
+			require.NoError(err)
+			_, err = db.Exec(`INSERT INTO message_recipients (message_id, participant_id, recipient_type, display_name, email_address) VALUES
+			(6, 6, 'from', 'Owner Account', CAST(? AS TEXT))`, []byte("owner-damaged\x80@example.com"))
+			require.NoError(err)
+			// Control: the same sender without any recorded envelope still
+			// attributes through the participant fallback with valid keys.
+			_, err = db.Exec(`INSERT INTO messages (id, source_id, source_message_id, conversation_id, subject, snippet, sent_at, size_estimate, sender_id)
+			VALUES (7, 1, 'msg7', 101, 'No envelope', 'Preview 7', '2024-03-06 09:00:00', 400, 6)`)
+			require.NoError(err)
+			_, err = db.Exec(`INSERT INTO message_recipients (message_id, participant_id, recipient_type, display_name) VALUES
+			(7, 6, 'from', 'Owner Account')`)
+			require.NoError(err)
+			messageIDs := []struct {
+				raw  string
+				want sql.NullString
+			}{
+				{"broken-\xff@example.test", sql.NullString{}},
+				{"broken-\xfe@example.test", sql.NullString{}},
+				{"broken-\uFFFD@example.test", sql.NullString{String: "broken-\uFFFD@example.test", Valid: true}},
+			}
+			for i, messageID := range messageIDs {
+				_, err = db.Exec(`UPDATE messages SET rfc822_message_id = ? WHERE id = ?`, messageID.raw, i+1)
+				require.NoError(err)
+			}
+			require.NoError(db.Close())
+
+			_, err = buildCache(dbPath, analyticsDir, true)
+			require.NoError(err)
+
+			duckDB, err := sql.Open("duckdb", "")
+			require.NoError(err)
+			defer func() { _ = duckDB.Close() }()
+			rows, err := duckDB.Query(`SELECT id, is_from_me, owner_participant_id
+				FROM read_parquet(?, hive_partitioning=true) ORDER BY id`, filepath.Join(analyticsDir, "messages", "**", "*.parquet"))
+			require.NoError(err)
+			defer func() { _ = rows.Close() }()
+			type attribution struct {
+				fromMe bool
+				owner  sql.NullInt64
+			}
+			got := make(map[int]attribution)
+			for rows.Next() {
+				var id int
+				var a attribution
+				require.NoError(rows.Scan(&id, &a.fromMe, &a.owner))
+				got[id] = a
+			}
+			require.NoError(rows.Err())
+			// The fixture messages carry no source_is_from_me and default
+			// is_from_me to false, so attribution can only come from the
+			// invalid keys above. owner_participant_id still follows the
+			// export's COALESCE fallback: sender_id first, else the single
+			// from-recipient.
+			assert.Equal(attribution{false, sql.NullInt64{Int64: 1, Valid: true}}, got[1], "invalid envelope key never matches")
+			assert.Equal(attribution{false, sql.NullInt64{Int64: 1, Valid: true}}, got[2], "distinct invalid envelope bytes never match")
+			assert.Equal(attribution{false, sql.NullInt64{Int64: 3, Valid: true}}, got[3], "invalid non-email identifier key never matches")
+			assert.Equal(attribution{false, sql.NullInt64{Int64: 4, Valid: true}}, got[4],
+				"an invalid nonblank primary email still blocks a valid matching email alias")
+			assert.Equal(attribution{false, sql.NullInt64{Int64: 2, Valid: true}}, got[5], "invalid email identifier key never matches")
+			assert.Equal(attribution{false, sql.NullInt64{Int64: 6, Valid: true}}, got[6],
+				"a present-but-invalid envelope is authoritative: the participant fallback must not attribute the owner's address")
+			assert.Equal(attribution{true, sql.NullInt64{Int64: 6, Valid: true}}, got[7],
+				"an absent envelope with valid keys still attributes via the participant fallback")
+			for i, messageID := range messageIDs {
+				var gotID sql.NullString
+				err = duckDB.QueryRow(`SELECT rfc822_message_id FROM read_parquet(?, hive_partitioning=true) WHERE id = ?`,
+					filepath.Join(analyticsDir, "messages", "**", "*.parquet"), i+1).Scan(&gotID)
+				require.NoError(err)
+				assert.Equal(messageID.want, gotID, "invalid IDs must not collapse onto a valid replacement-character ID")
+			}
+
+			// The damaged from-row exports no address at all: substituting the
+			// participant's current address would mis-attribute the message.
+			var resolvedAddr, envelopeAddr sql.NullString
+			err = duckDB.QueryRow(`SELECT email_address, envelope_address FROM read_parquet(?)
+				WHERE message_id = 6 AND recipient_type = 'from'`,
+				filepath.Join(analyticsDir, "message_recipients", "*.parquet")).Scan(&resolvedAddr, &envelopeAddr)
+			require.NoError(err)
+			assert.False(resolvedAddr.Valid, "a present-but-invalid envelope must not resolve to the participant address")
+			assert.False(envelopeAddr.Valid, "a present-but-invalid envelope exports NULL")
+
+			ownerRows, err := duckDB.Query(`SELECT participant_id FROM read_parquet(?) WHERE source_id = 1 ORDER BY participant_id`,
+				filepath.Join(analyticsDir, "owner_participants", "*.parquet"))
+			require.NoError(err)
+			defer func() { _ = ownerRows.Close() }()
+			var owners []int64
+			for ownerRows.Next() {
+				var id int64
+				require.NoError(ownerRows.Scan(&id))
+				owners = append(owners, id)
+			}
+			require.NoError(ownerRows.Err())
+			assert.Equal([]int64{6}, owners,
+				"only the valid identity's participant is an owner candidate; invalid identity keys never populate owner_participants")
+		})
+	}
+}
+
+func TestBuildCacheInvalidIdentifiersDoNotMatchValidKeys(t *testing.T) {
+	for _, tc := range []struct{ name, forceCSV string }{{"sqlite scanner", ""}, {"CSV fallback", "1"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			oldGOOS := cacheSnapshotGOOS
+			cacheSnapshotGOOS = "linux"
+			t.Cleanup(func() { cacheSnapshotGOOS = oldGOOS })
+			t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", tc.forceCSV)
+			if tc.forceCSV == "" {
+				probe, err := sql.Open("duckdb", "")
+				require.NoError(err)
+				requireSQLiteScanner(t, probe)
+				require.NoError(probe.Close())
+			}
+			tmpDir := setupTestSQLite(t)
+			dbPath, analyticsDir := filepath.Join(tmpDir, "test.db"), filepath.Join(tmpDir, "analytics")
+			db, err := sql.Open("sqlite3", dbPath)
+			require.NoError(err)
+			_, err = db.Exec(`
+				UPDATE messages SET source_message_id = CAST(X'80' AS TEXT) WHERE id = 1;
+				UPDATE messages SET source_message_id = CAST(X'81' AS TEXT) WHERE id = 2;
+				UPDATE messages SET source_message_id = '�' WHERE id = 3;
+				UPDATE messages SET list_id = CAST(X'80' AS TEXT) WHERE id = 1;
+				UPDATE messages SET list_id = CAST(X'81' AS TEXT) WHERE id = 2;
+				UPDATE messages SET list_id = '�' WHERE id = 3;
+				UPDATE conversations SET source_conversation_id = CAST(X'80' AS TEXT) WHERE id = 101;
+				UPDATE conversations SET source_conversation_id = CAST(X'81' AS TEXT) WHERE id = 102;
+				UPDATE conversations SET source_conversation_id = '�' WHERE id = 103;
+				UPDATE sources SET identifier = CAST(X'80' AS TEXT) WHERE id = 1;
+				INSERT INTO sources (id, identifier) VALUES (2, CAST(X'81' AS TEXT)), (3, '�');
+			`)
+			require.NoError(err)
+			require.NoError(db.Close())
+			var buildErr error
+			stderr := captureStderrDuring(t, func() { _, buildErr = buildCache(dbPath, analyticsDir, true) })
+			require.NoError(buildErr)
+			assert.Contains(stderr, "8 identity value(s) exported as unknown")
+			assert.NotContains(stderr, "repair(s) applied")
+
+			engine, err := query.NewDuckDBEngine(analyticsDir, "", nil)
+			require.NoError(err)
+			defer func() { _ = engine.Close() }()
+			for _, key := range []struct {
+				table, column, ids string
+				validID            int64
+				want               [][]any
+			}{
+				{"messages", "source_message_id", "1,2,3", 3, [][]any{{int64(1), ""}, {int64(2), ""}, {int64(3), "�"}}},
+				{"messages", "list_id", "1,2,3", 3, [][]any{{int64(1), nil}, {int64(2), nil}, {int64(3), "�"}}},
+				{"conversations", "source_conversation_id", "101,102,103", 103, [][]any{{int64(101), ""}, {int64(102), ""}, {int64(103), "�"}}},
+				{"sources", "account_email", "1,2,3", 3, [][]any{{int64(1), ""}, {int64(2), ""}, {int64(3), "�"}}},
+			} {
+				got, err := engine.QuerySQL(t.Context(), fmt.Sprintf(
+					"SELECT id, %s FROM %s WHERE id IN (%s) ORDER BY id", key.column, key.table, key.ids))
+				require.NoError(err)
+				assert.Equal(key.want, got.Rows, key.table)
+				matches, err := engine.QuerySQL(t.Context(), fmt.Sprintf(
+					"SELECT id FROM %s WHERE %s = '�' ORDER BY id", key.table, key.column))
+				require.NoError(err)
+				assert.Equal([][]any{{key.validID}}, matches.Rows, key.table+" must not add false identifier matches")
+			}
+			messages, err := engine.ListMessages(t.Context(), query.MessageFilter{ListID: "�"})
+			require.NoError(err)
+			require.Len(messages, 1, "damaged List-IDs must not match a valid mailing list")
+			assert.Equal(int64(3), messages[0].ID)
+		})
+	}
+}
+
+func TestBuildCacheCountsOnlyRepairedExportValues(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		forceCSV bool
+	}{
+		{name: "sqlite scanner"},
+		{name: "CSV fallback", forceCSV: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			oldGOOS := cacheSnapshotGOOS
+			cacheSnapshotGOOS = "linux"
+			t.Cleanup(func() { cacheSnapshotGOOS = oldGOOS })
+			if tc.forceCSV {
+				t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", "1")
+			} else {
+				t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", "")
+				probe, err := sql.Open("duckdb", "")
+				require.NoError(err)
+				requireSQLiteScanner(t, probe)
+				require.NoError(probe.Close())
+			}
+
+			tmpDir := setupTestSQLite(t)
+			dbPath, analyticsDir := filepath.Join(tmpDir, "test.db"), filepath.Join(tmpDir, "analytics")
+			db, err := sql.Open("sqlite3", dbPath)
+			require.NoError(err)
+			_, err = db.Exec(`INSERT INTO participants (id, email_address, domain, display_name)
+				VALUES (6, CAST(? AS TEXT), 'example.com', CAST(? AS TEXT))`,
+				[]byte("primary\x80@example.com"), []byte("Display\x80Name"))
+			require.NoError(err)
+			_, err = db.Exec(`UPDATE messages SET sender_id = 6 WHERE id = 4`)
+			require.NoError(err)
+			_, err = db.Exec(`INSERT INTO account_identities (source_id, address) VALUES (1, ?), (1, CAST(? AS TEXT))`,
+				"primary�@example.com", []byte("unmatched\x80@example.com"))
+			require.NoError(err)
+			// One envelope contributes two unknown output columns. One person
+			// name is exported once for each of its two linked participants.
+			_, err = db.Exec(`UPDATE message_recipients SET email_address = CAST(X'80' AS TEXT)
+				WHERE message_id = 1 AND recipient_type = 'from'`)
+			require.NoError(err)
+			_, err = db.Exec(`INSERT INTO persons (id, vcard_uid, display_name)
+				VALUES (1, '00000000-0000-0000-0000-000000000001', CAST(X'80' AS TEXT));
+				INSERT INTO person_participants (person_id, participant_id) VALUES (1, 1), (1, 2)`)
+			require.NoError(err)
+			require.NoError(db.Close())
+
+			var buildErr error
+			stderr := captureStderrDuring(t, func() { _, buildErr = buildCache(dbPath, analyticsDir, true) })
+			require.NoError(buildErr)
+			assert.Contains(stderr, "Warning: 3 invalid UTF-8 repair(s) applied while building the analytics cache",
+				"count each exported display value, including the two joined person-name rows")
+			assert.Contains(stderr, "3 identity value(s) exported as unknown")
+
+			duckDB, err := sql.Open("duckdb", "")
+			require.NoError(err)
+			defer func() { _ = duckDB.Close() }()
+			var fromMe bool
+			err = duckDB.QueryRow(`SELECT is_from_me FROM read_parquet(?, hive_partitioning=true) WHERE id = 4`,
+				filepath.Join(analyticsDir, "messages", "**", "*.parquet")).Scan(&fromMe)
+			require.NoError(err)
+			assert.False(fromMe, "a sanitized-literal identity must not match an invalid participant email")
+			var emailAddress, displayName string
+			err = duckDB.QueryRow(`SELECT email_address, display_name FROM read_parquet(?) WHERE id = 6`,
+				filepath.Join(analyticsDir, "participants", "*.parquet")).Scan(&emailAddress, &displayName)
+			require.NoError(err)
+			assert.Empty(emailAddress, "invalid identity text exports as unknown, not as a repair")
+			assert.Equal("Display\uFFFDName", displayName, "invalid display text is repaired")
+		})
+	}
+}
+
+func corruptEveryExportedTextColumn(t *testing.T, dbPath string) {
+	t.Helper()
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	defer func() { _ = db.Close() }()
+	bad := func(col string) string {
+		return col + " = CAST(CAST(COALESCE(" + col + ", '') AS BLOB) || X'80' AS TEXT)"
+	}
+	// Identity keys are corrupted too: on both snapshot paths they export as
+	// NULL (or '' where the schema forbids NULL) instead of being repaired,
+	// so no cached string may be invalid UTF-8 regardless.
+	stmts := []string{
+		`UPDATE messages SET ` + bad("source_message_id") + `, ` + bad("rfc822_message_id") + `, ` + bad("subject") + `, ` + bad("snippet") + `, ` + bad("list_id") + ` WHERE id = 5`,
+		`UPDATE message_recipients SET ` + bad("display_name") + `, ` + bad("recipient_type") + `, ` + bad("email_address") + ` WHERE message_id = 1 AND recipient_type = 'from'`,
+		`UPDATE attachments SET ` + bad("filename") + `, ` + bad("mime_type") + ` WHERE id = 1`,
+		`UPDATE participants SET ` + bad("email_address") + `, ` + bad("domain") + `, ` + bad("display_name") + `, ` + bad("phone_number") + ` WHERE id = 4`,
+		`UPDATE participant_identifiers SET ` + bad("identifier_type") + `, ` + bad("identifier_value") + `, ` + bad("display_value") + ` WHERE participant_id = 2`,
+		`UPDATE labels SET ` + bad("name") + ` WHERE id = 2`,
+		`UPDATE sources SET ` + bad("identifier") + ` WHERE id = 1`,
+		`UPDATE conversations SET ` + bad("source_conversation_id") + `, ` + bad("title") + ` WHERE id = 101`,
+		`INSERT INTO persons (id, vcard_uid, display_name) VALUES (1, 'uid-utf8', CAST(X'426f6280' AS TEXT))`,
+		`INSERT INTO person_participants (person_id, participant_id) VALUES (1, 2)`,
+	}
+	for _, stmt := range stmts {
+		_, err := db.Exec(stmt)
+		require.NoError(t, err, stmt)
+	}
+}
+
+func requireEveryCachedStringDecodes(t *testing.T, analyticsDir string) {
+	t.Helper()
+	duckDB, err := sql.Open("duckdb", "")
+	require.NoError(t, err)
+	defer func() { _ = duckDB.Close() }()
+	dirs, err := os.ReadDir(analyticsDir)
+	require.NoError(t, err)
+	checked := 0
+	for _, dir := range dirs {
+		if !dir.IsDir() {
+			continue
+		}
+		root := filepath.Join(analyticsDir, dir.Name())
+		hasParquet := false
+		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			if err == nil && !d.IsDir() && strings.HasSuffix(path, ".parquet") {
+				hasParquet = true
+				return fs.SkipAll
+			}
+			return nil
+		})
+		if !hasParquet {
+			continue
+		}
+		glob := filepath.ToSlash(filepath.Join(root, "**", "*.parquet"))
+		source := fmt.Sprintf("read_parquet('%s', hive_partitioning=true, union_by_name=true)", glob)
+		cols := func() []string {
+			rows, err := duckDB.Query("SELECT column_name FROM (DESCRIBE SELECT * FROM " + source + ") WHERE column_type = 'VARCHAR'")
+			require.NoError(t, err, dir.Name())
+			defer func() { require.NoError(t, rows.Close()) }()
+			var cols []string
+			for rows.Next() {
+				var c string
+				require.NoError(t, rows.Scan(&c))
+				cols = append(cols, c)
+			}
+			require.NoError(t, rows.Err())
+			return cols
+		}()
+		for _, c := range cols {
+			var n sql.NullInt64
+			require.NoError(t, duckDB.QueryRow(fmt.Sprintf(`SELECT max(length("%s")) FROM %s`, c, source)).Scan(&n), "%s.%s must decode", dir.Name(), c)
+			checked++
+		}
+	}
+	require.Positive(t, checked)
+}
+
+func TestBuildCacheExportsValidUTF8InEveryTextColumn(t *testing.T) {
+	for _, tc := range []struct{ name, forceCSV string }{{"sqlite scanner", ""}, {"CSV fallback", "1"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			oldGOOS := cacheSnapshotGOOS
+			cacheSnapshotGOOS = "linux"
+			t.Cleanup(func() { cacheSnapshotGOOS = oldGOOS })
+			t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", tc.forceCSV)
+			if tc.forceCSV == "" {
+				probe, err := sql.Open("duckdb", "")
+				require.NoError(err)
+				requireSQLiteScanner(t, probe)
+				require.NoError(probe.Close())
+			}
+			tmpDir := setupTestSQLite(t)
+			dbPath, analyticsDir := filepath.Join(tmpDir, "test.db"), filepath.Join(tmpDir, "analytics")
+			corruptEveryExportedTextColumn(t, dbPath)
+			var buildErr error
+			stderr := captureStderrDuring(t, func() { _, buildErr = buildCache(dbPath, analyticsDir, true) })
+			require.NoError(buildErr)
+			assert.Contains(stderr, "invalid UTF-8")
+			assert.Contains(stderr, "msgvault repair-encoding")
+			requireEveryCachedStringDecodes(t, analyticsDir)
+			if tc.forceCSV != "" {
+				duckDB, err := sql.Open("duckdb", "")
+				require.NoError(err)
+				defer func() { _ = duckDB.Close() }()
+				// Identity columns export unknown rather than repaired: NULL
+				// where the column allows it, '' where the schema keeps its
+				// no-NULL contract.
+				for _, check := range []struct {
+					dataset, column, where string
+					want                   sql.NullString
+				}{
+					{"participants", "email_address", "id = 4", sql.NullString{String: "", Valid: true}},
+					{"participant_identifiers", "identifier_type", "participant_id = 2", sql.NullString{String: "", Valid: true}},
+					{"participant_identifiers", "identifier_value", "participant_id = 2", sql.NullString{String: "", Valid: true}},
+					{"message_recipients", "envelope_address", "message_id = 1 AND participant_id = 1", sql.NullString{}},
+				} {
+					var got sql.NullString
+					path := filepath.ToSlash(filepath.Join(analyticsDir, check.dataset, "*.parquet"))
+					err := duckDB.QueryRow(fmt.Sprintf("SELECT %s FROM read_parquet('%s') WHERE %s", check.column, path, check.where)).Scan(&got)
+					require.NoError(err)
+					assert.Equal(check.want, got)
+				}
+			}
+		})
+	}
+}
+
+func TestBuildCacheCSVQuotedFieldPastSniffSampleRoundTrips(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", "1")
+	tmpDir := setupTestSQLite(t)
+	dbPath := filepath.Join(tmpDir, "test.db")
+	analyticsDir := filepath.Join(tmpDir, "analytics")
+
+	// encoding/csv only quotes a field when it must, and DuckDB's sniffer
+	// only looks at the first 20,480 rows to guess the quote character. Put
+	// the first field that needs quoting well past that window so a rebuild
+	// that trusts the sniffer sees quote=(empty) and splits the row.
+	const bulkRows = 30000
+	quotedName := "Example \"Co\", LLC\nAttn: Sales"
+
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(err)
+	_, err = db.Exec(`
+		INSERT INTO messages (id, source_id, source_message_id, sent_at)
+		WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < ?)
+		SELECT 1000 + i, 1, 'bulk-' || i, datetime('2024-04-01', '+' || i || ' minutes') FROM seq;
+	`, bulkRows)
+	require.NoError(err)
+	_, err = db.Exec(`
+		INSERT INTO message_recipients (message_id, participant_id, recipient_type, display_name)
+		WITH RECURSIVE seq(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM seq WHERE i < ?)
+		SELECT 1000 + i, 1, 'to', 'Recipient ' || i FROM seq;
+	`, bulkRows)
+	require.NoError(err)
+	_, err = db.Exec(`
+		INSERT INTO messages (id, source_id, source_message_id, sent_at)
+		VALUES (?, 1, 'quoted', '2024-05-01 12:00:00')
+	`, 1000+bulkRows+1)
+	require.NoError(err)
+	_, err = db.Exec(`
+		INSERT INTO message_recipients (message_id, participant_id, recipient_type, display_name)
+		VALUES (?, 2, 'from', ?)
+	`, 1000+bulkRows+1, quotedName)
+	require.NoError(err)
+	require.NoError(db.Close())
+
+	_, err = buildCache(dbPath, analyticsDir, true)
+	require.NoError(err, "a quoted CSV field past the sniffer sample must not break the rebuild")
+
+	duckdb, err := sql.Open("duckdb", "")
+	require.NoError(err)
+	defer func() { _ = duckdb.Close() }()
+	glob := filepath.Join(analyticsDir, "message_recipients", "*.parquet")
+
+	var got string
+	err = duckdb.QueryRow(
+		`SELECT display_name FROM read_parquet(?) WHERE message_id = ? AND recipient_type = 'from'`,
+		glob, 1000+bulkRows+1,
+	).Scan(&got)
+	require.NoError(err)
+	assert.Equal(quotedName, got, "commas, embedded quotes, and newlines must round-trip through the CSV snapshot")
+
+	var total int64
+	err = duckdb.QueryRow(`SELECT COUNT(*) FROM read_parquet(?)`, glob).Scan(&total)
+	require.NoError(err)
+	assert.Equal(int64(12+bulkRows+1), total, "every fixture, bulk, and quoted recipient row is exported")
+}
+
 func TestBuildCacheExportsAttachmentMetadataForRawQuery(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -2185,6 +2926,8 @@ func TestBuildCacheExportsAttachmentMetadataForRawQuery(t *testing.T) {
 			require.NoError(err, "add attachment metadata column")
 			_, err = db.Exec(`UPDATE attachments SET attachment_metadata = '{"shared_url":"https://example.com/post"}' WHERE id = 1`)
 			require.NoError(err, "set link-preview metadata")
+			_, err = db.Exec(`UPDATE attachments SET attachment_metadata = '{"source_transcript":{"provider":"beeper","text":"voice note"}}' WHERE id = 2`)
+			require.NoError(err, "set transcript metadata")
 			_, err = db.Exec(`UPDATE messages SET message_type = 'beeper' WHERE id = 2`)
 			require.NoError(err, "mark fixture message as Beeper")
 			require.NoError(db.Close(), "close SQLite fixture")
@@ -2196,14 +2939,14 @@ func TestBuildCacheExportsAttachmentMetadataForRawQuery(t *testing.T) {
 			defer func() { _ = engine.Close() }()
 
 			result, err := engine.QuerySQL(context.Background(), `
-				SELECT COALESCE(a.attachment_metadata IS NOT NULL, 0) AS is_share,
+				SELECT CASE WHEN COALESCE(json_extract_string(a.attachment_metadata, '$.shared_url'), '') <> '' THEN 1 ELSE 0 END AS is_share,
 				       COUNT(*), SUM(a.size)
 				FROM attachments a
 				JOIN messages m ON m.id = a.message_id
 				WHERE m.message_type = 'beeper'
 				GROUP BY is_share
 				ORDER BY is_share`)
-			require.NoError(err, "run documented link-preview query")
+			require.NoError(err, "run documented shared URL query")
 			assert.Equal([]string{"is_share", "count_star()", "sum(a.size)"}, result.Columns)
 			require.Len(result.Rows, 2)
 			assert.Equal("0", fmt.Sprint(result.Rows[0][0]))
@@ -2228,8 +2971,9 @@ func TestBuildCache_EmptyDatabase(t *testing.T) {
 	// Create empty database with schema
 	db, _ := sql.Open("sqlite3", dbPath)
 	_, _ = db.Exec(`
+		CREATE TABLE source_merge_archive_only_messages (message_id INTEGER PRIMARY KEY);
 		CREATE TABLE sources (id INTEGER PRIMARY KEY, source_type TEXT NOT NULL DEFAULT 'gmail', identifier TEXT);
-		CREATE TABLE messages (id INTEGER PRIMARY KEY, source_id INTEGER, source_message_id TEXT, sent_at TIMESTAMP, size_estimate INTEGER, has_attachments BOOLEAN, subject TEXT, snippet TEXT, conversation_id INTEGER, deleted_from_source_at TIMESTAMP, attachment_count INTEGER DEFAULT 0, sender_id INTEGER, message_type TEXT NOT NULL DEFAULT 'email', is_from_me BOOLEAN DEFAULT FALSE, deleted_at DATETIME);
+		CREATE TABLE messages (id INTEGER PRIMARY KEY, source_id INTEGER, source_message_id TEXT, rfc822_message_id TEXT, sent_at TIMESTAMP, size_estimate INTEGER, has_attachments BOOLEAN, subject TEXT, snippet TEXT, conversation_id INTEGER, deleted_from_source_at TIMESTAMP, attachment_count INTEGER DEFAULT 0, list_id TEXT, sender_id INTEGER, message_type TEXT NOT NULL DEFAULT 'email', is_from_me BOOLEAN DEFAULT FALSE, deleted_at DATETIME);
 		CREATE TABLE participants (id INTEGER PRIMARY KEY, email_address TEXT, domain TEXT, display_name TEXT, phone_number TEXT);
 		CREATE TABLE participant_identifiers (participant_id INTEGER, identifier_type TEXT, identifier_value TEXT, display_value TEXT, is_primary BOOLEAN);
 		CREATE TABLE message_recipients (message_id INTEGER, participant_id INTEGER, recipient_type TEXT, display_name TEXT);
@@ -2241,6 +2985,20 @@ func TestBuildCache_EmptyDatabase(t *testing.T) {
 		CREATE TABLE archive_metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 		CREATE TABLE account_identities (source_id INTEGER, address TEXT, source_signal TEXT NOT NULL DEFAULT '', confirmed_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (source_id, address));
 		CREATE TABLE participant_links (participant_a INTEGER, participant_b INTEGER, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (participant_a, participant_b));
+		CREATE TABLE persons (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			vcard_uid TEXT NOT NULL UNIQUE,
+			display_name TEXT,
+			revision INTEGER NOT NULL DEFAULT 1,
+			created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+		);
+		CREATE TABLE person_participants (
+			person_id INTEGER NOT NULL REFERENCES persons(id) ON DELETE CASCADE,
+			participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+			PRIMARY KEY (person_id, participant_id),
+			UNIQUE(participant_id)
+		);
 	`)
 	_ = db.Close()
 
@@ -2297,7 +3055,7 @@ func TestCSVFallbackPath(t *testing.T) {
 
 	for _, tbl := range tables {
 		csvPath := filepath.Join(csvDir, tbl.name+".csv")
-		if err := exportToCSV(sqliteDB, tbl.query, csvPath); err != nil {
+		if err := exportToCSV(sqliteDB, tbl.query, csvPath, nil); err != nil {
 			_ = sqliteDB.Close()
 			require.NoError(err, "exportToCSV %s", tbl.name)
 		}
@@ -2414,7 +3172,7 @@ func BenchmarkBuildCache(b *testing.B) {
 	// Create schema
 	_, _ = db.Exec(`
 		CREATE TABLE sources (id INTEGER PRIMARY KEY, identifier TEXT);
-		CREATE TABLE messages (id INTEGER PRIMARY KEY, source_id INTEGER, source_message_id TEXT, sent_at TIMESTAMP, size_estimate INTEGER, has_attachments BOOLEAN, subject TEXT, snippet TEXT, conversation_id INTEGER, deleted_from_source_at TIMESTAMP, attachment_count INTEGER DEFAULT 0, sender_id INTEGER, message_type TEXT NOT NULL DEFAULT 'email', deleted_at DATETIME);
+		CREATE TABLE messages (id INTEGER PRIMARY KEY, source_id INTEGER, source_message_id TEXT, rfc822_message_id TEXT, sent_at TIMESTAMP, size_estimate INTEGER, has_attachments BOOLEAN, subject TEXT, snippet TEXT, conversation_id INTEGER, deleted_from_source_at TIMESTAMP, attachment_count INTEGER DEFAULT 0, list_id TEXT, sender_id INTEGER, message_type TEXT NOT NULL DEFAULT 'email', deleted_at DATETIME);
 		CREATE TABLE participants (id INTEGER PRIMARY KEY, email_address TEXT UNIQUE, domain TEXT, display_name TEXT, phone_number TEXT);
 		CREATE TABLE participant_identifiers (participant_id INTEGER, identifier_type TEXT, identifier_value TEXT, display_value TEXT, is_primary BOOLEAN);
 		CREATE TABLE message_recipients (message_id INTEGER, participant_id INTEGER, recipient_type TEXT, display_name TEXT);
@@ -2482,6 +3240,7 @@ func setupTestSQLiteEmpty(t *testing.T) string {
 	defer func() { _ = db.Close() }()
 
 	schema := `
+		CREATE TABLE source_merge_archive_only_messages (message_id INTEGER PRIMARY KEY);
 		CREATE TABLE sources (
 			id INTEGER PRIMARY KEY,
 			source_type TEXT NOT NULL DEFAULT 'gmail',
@@ -2492,6 +3251,7 @@ func setupTestSQLiteEmpty(t *testing.T) string {
 			id INTEGER PRIMARY KEY,
 			source_id INTEGER NOT NULL REFERENCES sources(id),
 			source_message_id TEXT NOT NULL,
+			rfc822_message_id TEXT,
 			conversation_id INTEGER,
 			subject TEXT,
 			snippet TEXT,
@@ -2501,6 +3261,7 @@ func setupTestSQLiteEmpty(t *testing.T) string {
 			has_attachments BOOLEAN DEFAULT FALSE,
 			attachment_count INTEGER DEFAULT 0,
 			deleted_from_source_at TIMESTAMP,
+			list_id TEXT,
 			sender_id INTEGER,
 			message_type TEXT NOT NULL DEFAULT 'email',
 			is_from_me BOOLEAN DEFAULT FALSE,
@@ -2694,6 +3455,169 @@ func TestBuildCacheCSVSnapshotFallback(t *testing.T) {
 		result, err := buildCache(filepath.Join(tmpDir, "test.db"), filepath.Join(tmpDir, "analytics"), true)
 		require.NoError(t, err)
 		assert.Equal(t, int64(0), result.ExportedCount)
+	})
+}
+
+func TestOpenCacheSourceSnapshotPlatformPolicy(t *testing.T) {
+	newRequire := require.New
+	newAssert := assert.New
+	openSnapshot := func(t *testing.T, goos, forceCSV string) (*cacheSourceSnapshot, string) {
+		t.Helper()
+		require := newRequire(t)
+		oldGOOS := cacheSnapshotGOOS
+		cacheSnapshotGOOS = goos
+		t.Cleanup(func() { cacheSnapshotGOOS = oldGOOS })
+		t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", forceCSV)
+
+		tmpDir := setupTestSQLite(t)
+		dbPath := filepath.Join(tmpDir, "test.db")
+		duckDB, err := sql.Open("duckdb", "")
+		require.NoError(err, "open duckdb")
+		require.NoError(duckDB.Close(), "close duckdb before snapshot open")
+
+		var snapshot *cacheSourceSnapshot
+		var snapshotErr error
+		stderr := captureStderrDuring(t, func() {
+			snapshot, snapshotErr = openCacheSourceSnapshot(duckDB, dbPath)
+		})
+		require.NoError(snapshotErr, "open cache source snapshot")
+		require.NotNil(snapshot)
+		t.Cleanup(func() { _ = snapshot.Close() })
+		return snapshot, stderr
+	}
+
+	readMessageCount := func(t *testing.T, snapshot *cacheSourceSnapshot) int64 {
+		t.Helper()
+		require := newRequire(t)
+		var count int64
+		require.NoError(snapshot.QueryRow("SELECT COUNT(*) FROM messages").Scan(&count))
+		return count
+	}
+
+	t.Run("darwin", func(t *testing.T) {
+		require := newRequire(t)
+		assert := newAssert(t)
+		snapshot, stderr := openSnapshot(t, "darwin", "")
+		assert.Empty(stderr)
+		assert.Equal(int64(5), readMessageCount(t, snapshot))
+
+		tmpDir := snapshot.tmpDir
+		require.NotEmpty(tmpDir)
+		require.NoError(snapshot.Close())
+		_, err := os.Stat(tmpDir)
+		assert.True(os.IsNotExist(err), "CSV snapshot directory should be removed after Close")
+	})
+
+	t.Run("linux", func(t *testing.T) {
+		require := newRequire(t)
+		assert := newAssert(t)
+		snapshot, stderr := openSnapshot(t, "linux", "")
+		assert.Contains(stderr, "sqlite_scanner unavailable, using CSV fallback")
+		assert.Equal(int64(5), readMessageCount(t, snapshot))
+		require.NoError(snapshot.Close())
+	})
+
+	t.Run("force_nonempty", func(t *testing.T) {
+		require := newRequire(t)
+		assert := newAssert(t)
+		snapshot, stderr := openSnapshot(t, "linux", "0")
+		assert.Empty(stderr)
+		assert.Equal(int64(5), readMessageCount(t, snapshot))
+		require.NoError(snapshot.Close())
+	})
+
+	t.Run("darwin parity with forced CSV", func(t *testing.T) {
+		assert := newAssert(t)
+		oldGOOS := cacheSnapshotGOOS
+		cacheSnapshotGOOS = "darwin"
+		t.Cleanup(func() { cacheSnapshotGOOS = oldGOOS })
+
+		type cachedMessage struct {
+			id              int64
+			sourceID        int64
+			sourceMessageID string
+			subject         string
+			snippet         string
+			sentAt          string
+			sizeEstimate    int64
+			hasAttachments  bool
+			attachmentCount int64
+		}
+
+		readCache := func(t *testing.T, analyticsDir string) ([]cachedMessage, map[string]int64) {
+			t.Helper()
+			require := newRequire(t)
+			duckDB, err := sql.Open("duckdb", "")
+			require.NoError(err, "open duckdb for cache parity")
+			defer func() { require.NoError(duckDB.Close()) }()
+
+			messagePattern := filepath.ToSlash(filepath.Join(
+				analyticsDir, tableMessages, "**", "*.parquet"))
+			rows, err := duckDB.Query(`
+				SELECT id, source_id, source_message_id, subject, snippet,
+					CAST(sent_at AS VARCHAR), size_estimate, has_attachments,
+					attachment_count
+				FROM read_parquet(?, hive_partitioning=true)
+				ORDER BY id`, messagePattern)
+			require.NoError(err, "query cached messages")
+			defer func() { require.NoError(rows.Close()) }()
+			var messages []cachedMessage
+			for rows.Next() {
+				var message cachedMessage
+				require.NoError(rows.Scan(
+					&message.id, &message.sourceID, &message.sourceMessageID,
+					&message.subject, &message.snippet, &message.sentAt,
+					&message.sizeEstimate, &message.hasAttachments,
+					&message.attachmentCount,
+				))
+				messages = append(messages, message)
+			}
+			require.NoError(rows.Err())
+
+			counts := make(map[string]int64, len(query.RequiredParquetDirs))
+			for _, dataset := range query.RequiredParquetDirs {
+				var count int64
+				err := filepath.Walk(filepath.Join(analyticsDir, dataset),
+					func(path string, info os.FileInfo, walkErr error) error {
+						if walkErr != nil {
+							return walkErr
+						}
+						if info.IsDir() || !strings.EqualFold(filepath.Ext(info.Name()), ".parquet") {
+							return nil
+						}
+						var fileCount int64
+						if err := duckDB.QueryRow(
+							"SELECT COUNT(*) FROM read_parquet(?)",
+							filepath.ToSlash(path),
+						).Scan(&fileCount); err != nil {
+							return err
+						}
+						count += fileCount
+						return nil
+					})
+				require.NoError(err, "count %s rows", dataset)
+				counts[dataset] = count
+			}
+			return messages, counts
+		}
+
+		build := func(t *testing.T, forceCSV string) ([]cachedMessage, map[string]int64) {
+			t.Helper()
+			require := newRequire(t)
+			assert := newAssert(t)
+			t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", forceCSV)
+			tmpDir := setupTestSQLite(t)
+			analyticsDir := filepath.Join(tmpDir, "analytics")
+			result, err := buildCache(filepath.Join(tmpDir, "test.db"), analyticsDir, true)
+			require.NoError(err, "build cache for parity")
+			assert.Equal(int64(5), result.ExportedCount)
+			return readCache(t, analyticsDir)
+		}
+
+		darwinMessages, darwinCounts := build(t, "")
+		forcedMessages, forcedCounts := build(t, "1")
+		assert.Equal(forcedMessages, darwinMessages)
+		assert.Equal(forcedCounts, darwinCounts)
 	})
 }
 
@@ -3455,7 +4379,7 @@ func TestCacheNeedsBuild_IgnoresAlreadyProcessedUpdatedSyncRun(t *testing.T) {
 // schema version other than the current one now forces a full rebuild.
 func TestCacheNeedsBuild_SchemaVersionMismatch(t *testing.T) {
 	require := require.New(t)
-	require.Equal(24, cacheSchemaVersion, "relationship temperatures require cache v24")
+	require.Equal(query.CacheSchemaVersion, cacheSchemaVersion, "cache schema version must mirror query")
 	tmpDir := setupTestSQLiteEmpty(t)
 
 	dbPath := filepath.Join(tmpDir, "test.db")
@@ -3627,7 +4551,7 @@ func BenchmarkBuildCacheIncremental(b *testing.B) {
 	// Create schema and initial data (10000 messages)
 	_, _ = db.Exec(`
 		CREATE TABLE sources (id INTEGER PRIMARY KEY, identifier TEXT);
-		CREATE TABLE messages (id INTEGER PRIMARY KEY, source_id INTEGER, source_message_id TEXT, sent_at TIMESTAMP, size_estimate INTEGER, has_attachments BOOLEAN, subject TEXT, snippet TEXT, conversation_id INTEGER, deleted_from_source_at TIMESTAMP, attachment_count INTEGER DEFAULT 0, sender_id INTEGER, message_type TEXT NOT NULL DEFAULT 'email', deleted_at DATETIME);
+		CREATE TABLE messages (id INTEGER PRIMARY KEY, source_id INTEGER, source_message_id TEXT, rfc822_message_id TEXT, sent_at TIMESTAMP, size_estimate INTEGER, has_attachments BOOLEAN, subject TEXT, snippet TEXT, conversation_id INTEGER, deleted_from_source_at TIMESTAMP, attachment_count INTEGER DEFAULT 0, list_id TEXT, sender_id INTEGER, message_type TEXT NOT NULL DEFAULT 'email', deleted_at DATETIME);
 		CREATE TABLE participants (id INTEGER PRIMARY KEY, email_address TEXT UNIQUE, domain TEXT, display_name TEXT, phone_number TEXT);
 		CREATE TABLE participant_identifiers (participant_id INTEGER, identifier_type TEXT, identifier_value TEXT, display_value TEXT, is_primary BOOLEAN);
 		CREATE TABLE message_recipients (message_id INTEGER, participant_id INTEGER, recipient_type TEXT, display_name TEXT);
@@ -3691,14 +4615,6 @@ func BenchmarkBuildCacheIncremental(b *testing.B) {
 // config resolution are forwarded to the build-cache subprocess so it
 // loads identical configuration to the daemon that spawned it.
 func TestGlobalConfigFlagArgs(t *testing.T) {
-	// Save and restore the package globals these flags bind to.
-	origCfg, origHome, origLocal := cfgFile, homeDir, useLocal
-	origLevel, origVerbose, origSQL, origSlow := logLevel, verbose, logSQL, logSQLSlow
-	t.Cleanup(func() {
-		cfgFile, homeDir, useLocal = origCfg, origHome, origLocal
-		logLevel, verbose, logSQL, logSQLSlow = origLevel, origVerbose, origSQL, origSlow
-	})
-
 	tests := []struct {
 		name       string
 		cfgFile    string
@@ -3736,9 +4652,12 @@ func TestGlobalConfigFlagArgs(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfgFile, homeDir, useLocal = tt.cfgFile, tt.homeDir, tt.local
-			logLevel, verbose, logSQL, logSQLSlow = tt.logLevel, tt.verbose, tt.logSQL, tt.logSQLSlow
-			assert.Equal(t, tt.want, globalConfigFlagArgs())
+			options := invocationOptions{
+				cfgFile: tt.cfgFile, homeDir: tt.homeDir, useLocal: tt.local,
+				logLevel: tt.logLevel, verbose: tt.verbose, logSQL: tt.logSQL,
+				logSQLSlow: tt.logSQLSlow,
+			}
+			assert.Equal(t, tt.want, globalConfigFlagArgs(options))
 		})
 	}
 }
@@ -3752,4 +4671,97 @@ func TestBuildCacheDaemonChildEnvMarksSubprocess(t *testing.T) {
 	assert.Contains(t, got, "OTHER=value", "preserves existing environment")
 	assert.Contains(t, got, buildCacheDaemonSubprocessEnv+"=4242", "marks daemon-owned subprocess")
 	assert.NotContains(t, got, buildCacheDaemonSubprocessEnv+"=0", "replaces stale marker")
+}
+
+func TestBuildCacheWarningExportScope(t *testing.T) {
+	for _, csv := range []bool{false, true} {
+		name := "scanner"
+		if csv {
+			name = "csv"
+		}
+		for _, mode := range []string{"identity", "incremental", "derived", "derived damaged"} {
+			t.Run(name+"/"+mode, func(t *testing.T) {
+				require := require.New(t)
+				assert := assert.New(t)
+				old := cacheSnapshotGOOS
+				cacheSnapshotGOOS = "linux"
+				t.Cleanup(func() { cacheSnapshotGOOS = old })
+				value := ""
+				if csv {
+					value = "1"
+				}
+				t.Setenv("MSGVAULT_FORCE_CSV_SNAPSHOT", value)
+				if !csv {
+					probe, err := sql.Open("duckdb", "")
+					require.NoError(err)
+					requireSQLiteScanner(t, probe)
+					require.NoError(probe.Close())
+				}
+				dir := setupTestSQLite(t)
+				dbPath := filepath.Join(dir, "test.db")
+				cache := filepath.Join(dir, "analytics")
+				db, err := sql.Open("sqlite3", dbPath)
+				require.NoError(err)
+				defer func() { _ = db.Close() }()
+				statement := `UPDATE messages SET subject=CAST(X'80' AS TEXT), rfc822_message_id=CAST(X'80' AS TEXT) WHERE id=1`
+				if mode == "identity" {
+					statement = `UPDATE messages SET rfc822_message_id=CAST(X'80' AS TEXT) WHERE id=1`
+				}
+				_, err = db.Exec(statement)
+				require.NoError(err)
+				var result *buildResult
+				stderr := captureStderrDuring(t, func() { result, err = buildCache(dbPath, cache, true) })
+				require.NoError(err)
+				if mode == "identity" {
+					duck, err := sql.Open("duckdb", "")
+					require.NoError(err)
+					defer func() { _ = duck.Close() }()
+					var got sql.NullString
+					require.NoError(duck.QueryRow(`SELECT rfc822_message_id FROM read_parquet(?, hive_partitioning=true) WHERE id=1`, filepath.Join(cache, "messages", "**", "*.parquet")).Scan(&got))
+					assert.False(got.Valid)
+					assert.Contains(stderr, "1 identity value(s) exported as unknown")
+					t.Logf("invalid identity exported NULL; warning=%q", stderr)
+					return
+				}
+				shards, err := filepath.Glob(filepath.Join(cache, "messages", "year=*", "*.parquet"))
+				require.NoError(err)
+				require.NotEmpty(shards)
+				original, err := os.ReadFile(shards[0])
+				require.NoError(err)
+				if mode == "incremental" {
+					_, err = db.Exec(`INSERT INTO messages(id,source_id,source_message_id,conversation_id,subject,sent_at) VALUES(6,1,'probe-clean',101,'clean','2025-01-01')`)
+					require.NoError(err)
+					stderr = captureStderrDuring(t, func() { result, err = buildCache(dbPath, cache, false) })
+					require.NoError(err)
+					assert.Equal(int64(6), result.ExportedCount)
+					after, err := os.ReadFile(shards[0])
+					require.NoError(err)
+					assert.Equal(original, after)
+				} else {
+					title := "changed clean title"
+					if mode == "derived damaged" {
+						title = "changed\x80title"
+					}
+					_, err = db.Exec(`UPDATE conversations SET title=CAST(? AS TEXT) WHERE id=101`, []byte(title))
+					require.NoError(err)
+					stderr = captureStderrDuring(t, func() {
+						result, err = refreshDerivedDatasetsOnly(context.Background(), dbPath, cache, acquirePublishLock, false)
+					})
+					require.NoError(err)
+					assert.True(result.IdentityOnly)
+					assert.False(result.Skipped)
+					after, err := os.ReadFile(shards[0])
+					require.NoError(err)
+					assert.Equal(original, after)
+				}
+				if mode == "derived damaged" {
+					assert.Contains(stderr, "Warning: 1 invalid UTF-8 repair(s)")
+					assert.NotContains(stderr, "identity value(s)")
+				} else {
+					assert.NotContains(stderr, "Warning:")
+				}
+				t.Logf("mode=%s exported=%d identityOnly=%v warning=%q", mode, result.ExportedCount, result.IdentityOnly, strings.TrimSpace(stderr))
+			})
+		}
+	}
 }

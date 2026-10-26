@@ -141,6 +141,16 @@ func TestExploreListingFastPathMatchesLegacy(t *testing.T) {
 		{name: "source filter", request: ExploreRequest{
 			Context: Context{SourceIDs: []int64{ids.chatSource}}, Page: PageSpec{Limit: 50},
 		}},
+		{name: "domain sender recipient and roster membership", request: ExploreRequest{
+			Context: Context{Domains: []string{"example.com"}}, Page: PageSpec{Limit: 50},
+		}},
+		{name: "domain intersection", request: ExploreRequest{
+			Context: Context{Domains: []string{"example.com"}, AdditionalDomainGroups: [][]string{{"corp.example"}}},
+			Page:    PageSpec{Limit: 50},
+		}},
+		{name: "domain page beyond end", request: ExploreRequest{
+			Context: Context{Domains: []string{"example.com"}}, Page: PageSpec{Limit: 3, Offset: 500},
+		}},
 		{name: "message type filter", request: ExploreRequest{
 			Context: Context{MessageTypes: []string{"email"}}, Page: PageSpec{Limit: 50},
 		}},
@@ -170,6 +180,15 @@ func TestExploreListingFastPathMatchesLegacy(t *testing.T) {
 				CandidateMessageIDs: []int64{}, LexicalIndexRevision: "fts5:test",
 			},
 			Page: PageSpec{Limit: 50},
+		}},
+		{name: "domain filter with ranked semantic candidates", request: ExploreRequest{
+			Context: Context{Domains: []string{"example.com"}},
+			Search: SearchSpec{
+				Mode: SearchSemantic, Query: "photos",
+				CandidateMessageIDs: []int64{ids.group1, ids.email2, ids.email1},
+				VectorGeneration:    &generation,
+			},
+			Page: PageSpec{Limit: 2, Offset: 1},
 		}},
 		{name: "semantic strongest match inside chat group", request: ExploreRequest{
 			Search: SearchSpec{
@@ -320,7 +339,7 @@ func TestExploreParticipantContextKeepsLegacyPath(t *testing.T) {
 	assert.True(exploreConditionsTouchParticipantLists(ExploreRequest{
 		Context: Context{ParticipantIDs: []int64{7}},
 	}))
-	assert.True(exploreConditionsTouchParticipantLists(ExploreRequest{
+	assert.False(exploreConditionsTouchParticipantLists(ExploreRequest{
 		Context: Context{Domains: []string{"example.com"}},
 	}))
 }

@@ -2,12 +2,14 @@ package circleback
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/cenkalti/backoff/v7"
 	"github.com/modelcontextprotocol/go-sdk/auth"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"golang.org/x/time/rate"
@@ -29,7 +31,7 @@ type Session struct {
 type ToolInfo struct {
 	Name        string
 	Description string
-	InputSchema json.RawMessage
+	InputSchema jsontext.Value
 }
 
 // ErrContract identifies a Circleback result that cannot be interpreted
@@ -104,7 +106,7 @@ func (s *Session) ToolInventory(ctx context.Context) ([]ToolInfo, error) {
 			return nil, fmt.Errorf("list circleback tools: %w", err)
 		}
 		for _, tool := range res.Tools {
-			schema, err := json.Marshal(tool.InputSchema)
+			schema, err := json.Marshal(tool.InputSchema, json.Deterministic(true))
 			if err != nil {
 				return nil, fmt.Errorf("marshal input schema for circleback tool %s: %w", tool.Name, err)
 			}
@@ -129,32 +131,33 @@ func (s *Session) ToolInventory(ctx context.Context) ([]ToolInfo, error) {
 // text content (which Circleback uses to carry JSON).
 // A provider rate-limit rejection is retried with exponential backoff; every
 // other error returns immediately.
-func (s *Session) CallToolJSON(ctx context.Context, name string, args map[string]any) (json.RawMessage, error) {
-	delay := s.rateLimitDelay
-	var lastErr error
-	for attempt := 1; attempt <= rateLimitAttempts; attempt++ {
+func (s *Session) CallToolJSON(ctx context.Context, name string, args map[string]any) (jsontext.Value, error) {
+	policy := backoff.NewExponentialBackOff()
+	policy.InitialInterval = s.rateLimitDelay
+	policy.MaxInterval = rateLimitMaxDelay
+	policy.Multiplier = 2
+	payload, err := backoff.Retry(ctx, func() (jsontext.Value, error) {
 		payload, err := s.callToolOnce(ctx, name, args)
-		if err == nil {
-			return payload, nil
+		if err != nil && !errors.Is(err, errRateLimited) {
+			return nil, backoff.Permanent(err)
 		}
-		if !errors.Is(err, errRateLimited) {
-			return nil, err
-		}
-		lastErr = err
-		if attempt == rateLimitAttempts {
-			break
-		}
-		if err := sleepContext(ctx, delay); err != nil {
-			return nil, fmt.Errorf("circleback tool %s: %w", name, err)
-		}
-		delay = min(delay*2, rateLimitMaxDelay)
+		return payload, err
+	}, backoff.WithBackOff(policy), backoff.WithMaxTries(rateLimitAttempts), backoff.WithMaxElapsedTime(0))
+	if err == nil {
+		return payload, nil
 	}
-	// lastErr already names the tool, so this does not repeat it.
-	return nil, fmt.Errorf("still rate limited after %d attempts: %w", rateLimitAttempts, lastErr)
+	retryErr := backoff.AsRetryError(err)
+	if errors.Is(retryErr.Cause, backoff.ErrPermanent) {
+		return nil, retryErr.LastErr
+	}
+	if !errors.Is(retryErr.Cause, backoff.ErrExhausted) {
+		return nil, fmt.Errorf("circleback tool %s: %w", name, ctx.Err())
+	}
+	return nil, fmt.Errorf("still rate limited after %d attempts: %w", rateLimitAttempts, retryErr.LastErr)
 }
 
 // callToolOnce performs one paced tool call.
-func (s *Session) callToolOnce(ctx context.Context, name string, args map[string]any) (json.RawMessage, error) {
+func (s *Session) callToolOnce(ctx context.Context, name string, args map[string]any) (jsontext.Value, error) {
 	if err := s.limiter.Wait(ctx); err != nil {
 		return nil, fmt.Errorf("wait for circleback rate limit: %w", err)
 	}
@@ -169,22 +172,6 @@ func (s *Session) callToolOnce(ctx context.Context, name string, args map[string
 		return nil, fmt.Errorf("circleback tool %s: %w", name, err)
 	}
 	return payload, nil
-}
-
-// sleepContext waits for d, returning early if ctx is cancelled. A
-// non-positive duration returns immediately.
-func sleepContext(ctx context.Context, d time.Duration) error {
-	if d <= 0 {
-		return ctx.Err()
-	}
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
 }
 
 // isRateLimitMessage reports whether a tool-result error text is a provider
@@ -203,7 +190,7 @@ func isRateLimitMessage(message string) bool {
 }
 
 // toolResultJSON extracts the JSON payload from a tool result.
-func toolResultJSON(res *mcp.CallToolResult) (json.RawMessage, error) {
+func toolResultJSON(res *mcp.CallToolResult) (jsontext.Value, error) {
 	var text strings.Builder
 	for _, c := range res.Content {
 		if tc, ok := c.(*mcp.TextContent); ok {
@@ -218,7 +205,7 @@ func toolResultJSON(res *mcp.CallToolResult) (json.RawMessage, error) {
 		return nil, fmt.Errorf("server returned an error: %s", message)
 	}
 	if res.StructuredContent != nil {
-		b, err := json.Marshal(res.StructuredContent)
+		b, err := json.Marshal(res.StructuredContent, json.Deterministic(true))
 		if err != nil {
 			return nil, fmt.Errorf("re-marshal structured content: %w", err)
 		}
@@ -228,7 +215,7 @@ func toolResultJSON(res *mcp.CallToolResult) (json.RawMessage, error) {
 	if body == "" {
 		return nil, errors.New("empty tool result")
 	}
-	return json.RawMessage(body), nil
+	return jsontext.Value(body), nil
 }
 
 // SearchMeetings finds one zero-based page of meetings in [start, end). Empty
@@ -296,7 +283,7 @@ func (s *Session) GetTranscripts(ctx context.Context, ids []string) (map[string]
 	return out, nil
 }
 
-func decodeTranscript(item json.RawMessage) (*Transcript, error) {
+func decodeTranscript(item jsontext.Value) (*Transcript, error) {
 	var tr Transcript
 	if err := json.Unmarshal(item, &tr); err != nil {
 		return nil, fmt.Errorf("%w: decode transcript: %w", ErrContract, err)
@@ -312,7 +299,7 @@ func decodeTranscript(item json.RawMessage) (*Transcript, error) {
 }
 
 // decodeMeetings unmarshals meeting items, preserving each verbatim payload.
-func decodeMeetings(items []json.RawMessage) ([]Meeting, error) {
+func decodeMeetings(items []jsontext.Value) ([]Meeting, error) {
 	out := make([]Meeting, 0, len(items))
 	for _, item := range items {
 		var m Meeting
@@ -328,19 +315,19 @@ func decodeMeetings(items []json.RawMessage) ([]Meeting, error) {
 // decodeItems accepts the envelope shapes tool results come in: a bare JSON
 // array, an object with the named list key (or "items"/"results"), or a
 // single object (treated as a one-item list).
-func decodeItems(raw json.RawMessage, listKey string) ([]json.RawMessage, error) {
+func decodeItems(raw jsontext.Value, listKey string) ([]jsontext.Value, error) {
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "" || trimmed == "null" {
 		return nil, nil
 	}
 	if strings.HasPrefix(trimmed, "[") {
-		var items []json.RawMessage
+		var items []jsontext.Value
 		if err := json.Unmarshal(raw, &items); err != nil {
 			return nil, err
 		}
 		return items, nil
 	}
-	var envelope map[string]json.RawMessage
+	var envelope map[string]jsontext.Value
 	if err := json.Unmarshal(raw, &envelope); err != nil {
 		return nil, err
 	}
@@ -349,11 +336,11 @@ func decodeItems(raw json.RawMessage, listKey string) ([]json.RawMessage, error)
 		if !ok {
 			continue
 		}
-		var items []json.RawMessage
+		var items []jsontext.Value
 		if err := json.Unmarshal(inner, &items); err == nil {
 			return items, nil
 		}
 	}
 	// A single object: treat the envelope itself as one item.
-	return []json.RawMessage{raw}, nil
+	return []jsontext.Value{raw}, nil
 }

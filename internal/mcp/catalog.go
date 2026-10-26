@@ -2,13 +2,17 @@ package mcp
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"fmt"
 	"slices"
 	"sort"
+	"sync"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	legacymcp "github.com/mark3labs/mcp-go/mcp"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector/visual"
@@ -16,6 +20,7 @@ import (
 )
 
 const (
+	schemaTypeArray    = "array"
 	schema202012       = "https://json-schema.org/draft/2020-12/schema"
 	maxJSONSafeInteger = float64(9007199254740991)
 )
@@ -26,15 +31,36 @@ const (
 	toolSecurityRead toolSecurityClass = iota
 	toolSecurityWrite
 	toolSecurityProfileWrite
+	toolSecurityIdentityDecision
+	toolSecurityIdentityScoring
+	toolSecurityPersonMerge
+	toolSecurityCardDAVWrite
+	toolSecurityCalendarWrite
+	toolSecurityKataWrite
 )
 
 type catalogCapabilities struct {
+	sqlQuery        bool
 	semanticSearch  bool
 	vectorInMessage bool
 	similarMessages bool
 	documentSearch  bool
+	mediaSearch     bool
 	people          bool
+	directoryPeople bool
+	chatDiscovery   bool
 	visualSearch    bool
+	embeddingStatus bool
+	savedViews      bool
+	meetings        bool
+	personAgenda    bool
+	kata            bool
+	kataLookup      bool
+	kataDocbank     bool
+	contactRoutes   bool
+	identityReview  bool
+	personCardDAV   bool
+	messageTags     bool
 }
 
 func visualSearchAvailable(capabilities catalogCapabilities) bool {
@@ -55,7 +81,7 @@ func searchVisualAttachmentsDefinition() toolDefinition {
 			toolArgPersonID:      safeIDSchema("Only attachments related to this durable person ID"),
 			toolArgParticipantID: safeIDSchema("Only attachments related to this observed participant, translated through its durable person when bound"),
 			"directions": {
-				Type: "array", Description: "Optional union of from_person, to_person, and group; requires a person reference",
+				Type: schemaTypeArray, Description: "Optional union of from_person, to_person, and group; requires a person reference",
 				Items: direction,
 			},
 			"source_id":      safeIDSchema("Only attachments from this source ID"),
@@ -104,135 +130,146 @@ func (d toolDefinition) bind(h *handlers) func(context.Context, toolRequest) (*t
 
 func capabilitiesFor(opts ServeOptions) catalogCapabilities {
 	return catalogCapabilities{
+		sqlQuery:        opts.ArchiveSQLQuerier != nil,
 		semanticSearch:  opts.HybridEngine != nil || opts.HybridSearcher != nil,
 		vectorInMessage: opts.HybridEngine != nil && opts.Backend != nil,
 		similarMessages: opts.Backend != nil || opts.SimilarSearcher != nil,
 		documentSearch:  opts.DocumentSearcher != nil,
+		mediaSearch:     opts.MediaSearcher != nil,
 		people:          opts.PeopleBackend != nil,
+		directoryPeople: opts.DirectoryBackend != nil,
+		chatDiscovery:   opts.ChatDiscoveryBackend != nil,
 		visualSearch:    opts.VisualSearcher != nil,
+		embeddingStatus: opts.EmbeddingStatus != nil,
+		savedViews:      opts.SavedViews != nil,
+		meetings:        opts.Meetings != nil,
+		personAgenda:    opts.PersonAgendaBackend != nil,
+		kata:            opts.Kata != nil,
+		kataLookup:      opts.Kata != nil && opts.KataLookup,
+		kataDocbank:     opts.Kata != nil && opts.KataDocbank,
+		contactRoutes:   opts.ContactRoutesBackend != nil,
+		identityReview:  opts.IdentityReview != nil,
+		personCardDAV:   opts.PersonCardDAV != nil,
+		messageTags:     opts.MessageTags != nil,
 	}
 }
 
 // stableOperationCatalogs owns the immutable schemas registered with the SDK.
-// The SDK v1.7 schema cache keys explicit schemas by pointer identity, so a
-// stateless server must reuse these roots instead of rebuilding them per HTTP
-// request. There are only sixty-four possible capability keys, which also keeps
-// the shared SDK cache boundary fixed.
-var stableOperationCatalogs = buildOperationCatalogs()
+// The SDK schema cache keys explicit schemas by pointer identity, so reuse the
+// catalog roots for capabilities that are actually served. Build each catalog
+// only when used so unused combinations do not delay startup or retain schemas.
+var stableOperationCatalogs operationCatalogCache
 
-func buildOperationCatalogs() map[catalogCapabilities][]toolDefinition {
-	catalogs := make(map[catalogCapabilities][]toolDefinition, 64)
-	for mask := range 64 {
-		capabilities := catalogCapabilities{
-			semanticSearch:  mask&0b100000 != 0,
-			vectorInMessage: mask&0b010000 != 0,
-			similarMessages: mask&0b001000 != 0,
-			documentSearch:  mask&0b000100 != 0,
-			people:          mask&0b000010 != 0,
-			visualSearch:    mask&0b000001 != 0,
-		}
-		catalogs[capabilities] = buildOperationCatalog(capabilities)
-	}
-	return catalogs
+type operationCatalogCache struct {
+	catalogs sync.Map // map[catalogCapabilities][]toolDefinition
 }
 
-func operationCatalog(opts ServeOptions, _ *handlers) []toolDefinition {
-	definitions := slices.Clone(stableOperationCatalogs[capabilitiesFor(opts)])
-	if opts.OCR != nil {
-		definitions = append(definitions, ocrOperationDefinitions...)
+func (c *operationCatalogCache) get(capabilities catalogCapabilities) []toolDefinition {
+	if definitions, ok := c.catalogs.Load(capabilities); ok {
+		if cached, ok := definitions.([]toolDefinition); ok {
+			return cached
+		}
 	}
-	if opts.GmailFactory != nil {
-		definitions = append(definitions, gmailOperationDefinitions...)
+	definitions := buildOperationCatalog(capabilities)
+	actual, _ := c.catalogs.LoadOrStore(capabilities, definitions)
+	if cached, ok := actual.([]toolDefinition); ok {
+		return cached
 	}
-	if opts.WhatsAppFactory != nil {
-		definitions = append(definitions, whatsAppOperationDefinitions...)
-	}
-	if opts.WhatsAppArchive != nil {
-		definitions = append(definitions, whatsAppArchiveOperationDefinitions...)
-	}
-	if opts.GoogleDocsFactory != nil {
-		definitions = append(definitions, googleDocsOperationDefinitions...)
-	}
-	sort.Slice(definitions, func(i, j int) bool {
-		return definitions[i].name < definitions[j].name
-	})
 	return definitions
 }
 
-var (
-	ocrOperationDefinitions = []toolDefinition{
-		legacyDefinition(getOCRStatusTool(), toolSecurityRead, (*handlers).getOCRStatus),
-		legacyDefinition(searchAttachmentTextTool(), toolSecurityRead, (*handlers).searchAttachmentText),
-		legacyDefinition(getAttachmentTextTool(), toolSecurityRead, (*handlers).getAttachmentText),
-		legacyDefinition(requestAttachmentTextTool(), toolSecurityWrite, (*handlers).requestAttachmentText),
+func operationCatalog(opts ServeOptions, _ *handlers) []toolDefinition {
+	definitions := []toolDefinition{}
+	if !opts.DelegatedOnly {
+		definitions = slices.Clone(stableOperationCatalogs.get(capabilitiesFor(opts)))
+		if opts.IdentityScoring != nil {
+			definitions = append(definitions, stableIdentityScoringDefinitions...)
+		}
 	}
-	gmailOperationDefinitions = []toolDefinition{
-		legacyDefinition(listDraftsTool(), toolSecurityRead, (*handlers).listDrafts),
-		legacyDefinition(getDraftTool(), toolSecurityRead, (*handlers).getDraft),
-		legacyDefinition(createDraftTool(), toolSecurityWrite, (*handlers).createDraft),
-		legacyDefinition(updateDraftTool(), toolSecurityWrite, (*handlers).updateDraft),
-		legacyDefinition(deleteDraftTool(), toolSecurityWrite, (*handlers).deleteDraft),
-		legacyDefinition(sendDraftTool(), toolSecurityWrite, (*handlers).sendDraft),
-		legacyDefinition(modifyLabelsTool(), toolSecurityWrite, (*handlers).modifyLabels),
-		legacyDefinition(createLabelTool(), toolSecurityWrite, (*handlers).createLabel),
-		legacyDefinition(deleteLabelTool(), toolSecurityWrite, (*handlers).deleteLabel),
-		legacyDefinition(listGmailLabelsTool(), toolSecurityRead, (*handlers).listGmailLabels),
+	if opts.DelegatedOnly && opts.Engine != nil {
+		for _, definition := range stableOperationCatalogs.get(capabilitiesFor(opts)) {
+			if permission, ok := agentReadToolPermission(definition.name); ok && slices.Contains(opts.GrantPermissions, string(permission)) {
+				definitions = append(definitions, definition)
+			}
+		}
 	}
-	whatsAppOperationDefinitions = []toolDefinition{
-		legacyDefinition(whatsAppStatusTool(), toolSecurityRead, (*handlers).whatsAppStatus),
-		legacyDefinition(whatsAppStartLoginTool(), toolSecurityWrite, (*handlers).whatsAppStartLogin),
-		legacyDefinition(whatsAppLoginStatusTool(), toolSecurityRead, (*handlers).whatsAppLoginStatus),
-		legacyDefinition(whatsAppLogoutTool(), toolSecurityWrite, (*handlers).whatsAppLogout),
-		legacyDefinition(sendWhatsAppMessageTool(), toolSecurityWrite, (*handlers).sendWhatsAppMessage),
-		legacyDefinition(sendWhatsAppReactionTool(), toolSecurityWrite, (*handlers).sendWhatsAppReaction),
-		legacyDefinition(whatsAppRequestHistorySyncTool(), toolSecurityWrite, (*handlers).whatsAppRequestHistorySync),
+	if !opts.DelegatedOnly {
+		if opts.OCR != nil {
+			definitions = append(definitions, ocrOperationDefinitions...)
+		}
+		if opts.GmailFactory != nil {
+			definitions = append(definitions, gmailOperationDefinitions...)
+		}
+		if opts.WhatsAppFactory != nil {
+			definitions = append(definitions, whatsAppOperationDefinitions...)
+		}
+		if opts.WhatsAppArchive != nil {
+			definitions = append(definitions, whatsAppArchiveOperationDefinitions...)
+		}
+		if opts.GoogleDocsFactory != nil {
+			definitions = append(definitions, googleDocsOperationDefinitions...)
+		}
 	}
-	whatsAppArchiveOperationDefinitions = []toolDefinition{
-		listWhatsAppChatsDefinition(),
-		listWhatsAppMessagesDefinition(),
+	if opts.Calendar != nil {
+		definitions = append(definitions, stableCalendarTools()...)
 	}
-	googleDocsOperationDefinitions = []toolDefinition{
-		legacyDefinition(listGoogleDocsTool(), toolSecurityRead, (*handlers).listGoogleDocs),
-		legacyDefinition(searchGoogleDocsTool(), toolSecurityRead, (*handlers).searchGoogleDocs),
-		legacyDefinition(getGoogleDocTool(), toolSecurityRead, (*handlers).getGoogleDoc),
-		legacyDefinition(appendGoogleDocTextTool(), toolSecurityWrite, (*handlers).appendGoogleDocText),
-		legacyDefinition(replaceGoogleDocTextTool(), toolSecurityWrite, (*handlers).replaceGoogleDocText),
+	if opts.Drafts != nil {
+		for _, command := range opts.DraftCommands {
+			if definition, ok := stableDraftDefinitions[command]; ok {
+				definitions = append(definitions, definition)
+			}
+		}
 	}
-)
-
-func legacyDefinition(tool legacymcp.Tool, security toolSecurityClass, handler catalogToolHandler) toolDefinition {
-	encoded, err := json.Marshal(tool.InputSchema)
-	if err != nil {
-		panic(err)
+	if _, supported := opts.PeopleBackend.(NamedPersonPromoter); supported && !opts.legacyHTTP {
+		for i := range definitions {
+			if definitions[i].name == ToolPromotePerson {
+				definitions[i] = namedPromotionDefinition()
+			}
+		}
 	}
-	input := &jsonschema.Schema{}
-	if err := json.Unmarshal(encoded, input); err != nil {
-		panic(err)
-	}
-	input.Schema = schema202012
-	return toolDefinition{
-		name: tool.Name, description: tool.Description,
-		annotations:  toolAnnotations(security == toolSecurityRead),
-		availability: alwaysAvailable, security: security,
-		inputSchema:  input,
-		outputSchema: &jsonschema.Schema{Schema: schema202012, Type: "object"},
-		handler:      handler,
-	}
+	sort.Slice(definitions, func(i, j int) bool { return definitions[i].name < definitions[j].name })
+	return definitions
 }
 
 func buildOperationCatalog(capabilities catalogCapabilities) []toolDefinition {
 	definitions := []toolDefinition{
 		aggregateDefinition(nil),
+		createSavedViewDefinition(nil),
+		deleteSavedViewDefinition(nil),
 		exportAttachmentDefinition(nil),
+		exportEMLDefinition(),
 		findSimilarMessagesDefinition(nil),
 		getAttachmentDefinition(nil),
 		getMessageDefinition(nil),
+		messageTagDefinition(false),
+		messageTagDefinition(true),
+		getIdentityMatchDefinition(),
+		getPersonMergeContextDefinition(),
+		getCardDAVPublicationDefinition(),
+		previewCardDAVPublicationDefinition(),
+		getCardDAVSyncStatusDefinition(),
+		getMeetingContextDefinition(nil),
+		getMeetingMetricsDefinition(nil),
 		getPersonNotesDefinition(nil),
+		getPersonProfileDefinition(nil),
 		getPersonRelationshipDefinition(nil),
+		getPersonAgendaDefinition(),
+		findContactCandidatesDefinition(),
+		getPersonMessagingRoutesDefinition(),
+		getSavedViewDefinition(nil),
 		getStatsDefinition(nil),
 		listMessagesDefinition(nil),
+		listThreadDefinition(),
+		listIdentityMatchesDefinition(),
+		listMeetingActionItemsDefinition(nil),
+		listDirectoryPeopleDefinition(nil),
+		findChatDefinition(),
+		listSavedViewsDefinition(nil),
+		querySQLDefinition(),
+		runSavedViewDefinition(nil),
 		searchByDomainsDefinition(nil),
 		searchDocumentsDefinition(nil),
+		searchMediaDefinition(),
 		searchInMessageDefinition(nil, capabilities.vectorInMessage),
 		searchMessageBodiesDefinition(nil),
 		searchMessagesDefinition(nil, capabilities.semanticSearch),
@@ -240,11 +277,19 @@ func buildOperationCatalog(capabilities catalogCapabilities) []toolDefinition {
 		searchPeopleDefinition(nil),
 		searchPersonFilesDefinition(nil),
 		searchVisualAttachmentsDefinition(),
+		embeddingStatusDefinition(),
 		semanticSearchMessagesDefinition(nil, capabilities.semanticSearch),
 		stageDeletionDefinition(nil),
 		promotePersonDefinition(nil),
+		acceptIdentityMatchDefinition(),
+		mergePersonDefinition(),
+		approveCardDAVPublicationDefinition(),
+		syncCardDAVDefinition(),
+		rejectIdentityMatchDefinition(),
 		updatePersonNotesDefinition(nil),
+		updateSavedViewDefinition(nil),
 	}
+	definitions = append(definitions, kataDefinitions(capabilities.kataDocbank)...)
 
 	available := definitions[:0]
 	for _, definition := range definitions {
@@ -256,6 +301,25 @@ func buildOperationCatalog(capabilities catalogCapabilities) []toolDefinition {
 		return available[i].name < available[j].name
 	})
 	return available
+}
+
+func querySQLDefinition() toolDefinition {
+	result := outputSchemaFor[query.QueryResult]()
+	result.Schema = ""
+	accepted := outputSchemaFor[daemonclient.CacheBuildAccepted]()
+	accepted.Schema = ""
+	definition := readDefinition(
+		ToolQuerySQL,
+		"Run read-only SQL against the analytics cache. Files outside the cache and network access are unavailable. Set fresh to request a coalesced background refresh; an accepted build returns a job ID instead of rows.",
+		closedObject(map[string]*jsonschema.Schema{
+			"sql":   stringSchema("One read-only SQL statement"),
+			"fresh": booleanSchema("Request a background cache check including writes committed before this request"),
+		}, "sql"),
+		&jsonschema.Schema{Schema: schema202012, Type: "object", OneOf: []*jsonschema.Schema{result, accepted}},
+		(*handlers).querySQL,
+	)
+	definition.availability = func(capabilities catalogCapabilities) bool { return capabilities.sqlQuery }
+	return definition
 }
 
 func readDefinition(
@@ -302,6 +366,28 @@ func profileWriteDefinition(
 	return definition
 }
 
+func destructiveWriteDefinition(
+	name, description string,
+	inputSchema, outputSchema *jsonschema.Schema,
+	handler catalogToolHandler,
+) toolDefinition {
+	definition := writeDefinition(name, description, inputSchema, outputSchema, handler)
+	trueValue := true
+	definition.annotations.DestructiveHint = &trueValue
+	return definition
+}
+
+func explicitlyConfirmedWriteDefinition(
+	name, description string,
+	inputSchema, outputSchema *jsonschema.Schema,
+	handler catalogToolHandler,
+	security toolSecurityClass,
+) toolDefinition {
+	definition := destructiveWriteDefinition(name, description, inputSchema, outputSchema, handler)
+	definition.security = security
+	return definition
+}
+
 func alwaysAvailable(catalogCapabilities) bool { return true }
 
 func similarMessagesAvailable(c catalogCapabilities) bool { return c.similarMessages }
@@ -309,6 +395,14 @@ func similarMessagesAvailable(c catalogCapabilities) bool { return c.similarMess
 func documentSearchAvailable(c catalogCapabilities) bool { return c.documentSearch }
 
 func peopleAvailable(c catalogCapabilities) bool { return c.people }
+
+func directoryPeopleAvailable(c catalogCapabilities) bool { return c.directoryPeople }
+
+func savedViewsAvailable(c catalogCapabilities) bool { return c.savedViews }
+
+func meetingsAvailable(c catalogCapabilities) bool { return c.meetings }
+
+func personAgendaAvailable(c catalogCapabilities) bool { return c.personAgenda }
 
 func toolAnnotations(readOnly bool) *sdkmcp.ToolAnnotations {
 	falseValue := false
@@ -354,13 +448,13 @@ func safeIDSchema(description string) *jsonschema.Schema {
 
 func nonNegativeIntegerSchema(description string, defaultValue int) *jsonschema.Schema {
 	schema := boundedIntegerSchema(description, 0, maxJSONSafeInteger)
-	schema.Default = json.RawMessage([]byte(json.Number(defaultValueString(defaultValue))))
+	schema.Default = jsontext.Value([]byte(jsontext.Value(defaultValueString(defaultValue))))
 	return schema
 }
 
 func signedSafeIntegerSchema(description string, defaultValue int) *jsonschema.Schema {
 	schema := boundedIntegerSchema(description, -maxJSONSafeInteger, maxJSONSafeInteger)
-	schema.Default = json.RawMessage([]byte(json.Number(defaultValueString(defaultValue))))
+	schema.Default = jsontext.Value([]byte(jsontext.Value(defaultValueString(defaultValue))))
 	return schema
 }
 
@@ -380,12 +474,12 @@ func scoreSchema(description string) *jsonschema.Schema {
 		Description: description,
 		Minimum:     &minimum,
 		Maximum:     &maximum,
-		Default:     json.RawMessage("0"),
+		Default:     jsontext.Value("0"),
 	}
 }
 
 func defaultValueString(value int) string {
-	data, err := json.Marshal(value)
+	data, err := json.Marshal(value, json.Deterministic(true))
 	if err != nil {
 		panic(err)
 	}
@@ -414,7 +508,7 @@ func searchMessagesOutputSchema() *jsonschema.Schema {
 }
 
 func accountProperty() *jsonschema.Schema {
-	return stringSchema("Filter by account email address (use get_stats to list available accounts)")
+	return stringSchema("Filter by account: a source email or display name in any letter case (the whole source), a virtual account key from get_stats (identity:... or unattributed:...), or another confirmed address (mail attributed to it on every source)")
 }
 
 func afterProperty() *jsonschema.Schema {
@@ -434,10 +528,14 @@ func offsetProperty() *jsonschema.Schema {
 }
 
 const (
-	searchMetadataOperatorDoc = "Supported operators: from:, to:, cc:, bcc:, subject:, label: (or l:), has:attachment, " +
-		"before:/after: (YYYY-MM-DD), older_than:/newer_than: (e.g. 7d, 2w, 1m, 1y), larger:/smaller: (e.g. 5M). " +
-		"Bare domains on from:/to: match any address at that domain. Multiple terms are ANDed. " +
-		"Not supported: negation (-), OR, or parentheses grouping."
+	searchOperatorDoc = "Supported operators: from:, to:, cc:, bcc:, subject:, label: (or l:), filename: (attachment name substring), has:attachment, " +
+		"before:/after: (YYYY-MM-DD), older_than:/newer_than: (e.g. 7d, 2w, 1m, 1y), larger:/smaller: (e.g. 5M), " +
+		"account:, received: (exact addresses; received: excludes sent mail and calendar events). " +
+		"Bare domains on from:/to: match any address at that domain. Different operators are ANDed; " +
+		"repeated account: or received: values are ORed. " +
+		"Not supported: negation (-) or parentheses grouping."
+	searchMetadataOperatorDoc = searchOperatorDoc + " " +
+		"Full-text message search accepts a standalone unquoted | between complete alternatives for OR; other modes read pipes as text."
 	searchMetadataFreeTextDoc = "Free text matches subject, snippet, and sender/recipient metadata only (not bodies). " +
 		"Use search_message_bodies for body keywords or semantic_search_messages for vector/hybrid search."
 	searchMetadataPaginationDoc = "Results are ordered newest-first (by sent date); there is no sort parameter — " +
@@ -501,19 +599,20 @@ func searchMessageBodiesDefinition(_ *handlers) toolDefinition {
 		"Filter-only queries such as from:alice are rejected — use search_metadata for filter-only queries. " +
 		"Unrecognized word:value tokens (e.g. RXD2:V2) are treated as literal body text, not filters. " +
 		"Query syntax: space-separated words are ANDed (each must appear somewhere in the body); " +
-		"a double-quoted phrase is one exact phrase (e.g. \"RXD2 V2\"); OR and NOT are not supported. " +
-		searchMetadataOperatorDoc + " "
+		"a double-quoted phrase is one exact phrase (e.g. \"RXD2 V2\"); pipe OR and NOT are not supported in body-only search. " +
+		searchOperatorDoc + " "
 	queryDesc := "Body search query with at least one free-text term (bare word or quoted phrase). " +
 		"Gmail operators (from:, subject:, etc.) are metadata filters, not body search — " +
 		"subject:test alone is rejected; combine with body terms (from:alice budget) or use search_metadata for filter-only queries. " +
 		"Unrecognized word:value tokens (RXD2:V2) are literal text. " +
-		"Space-separated words are ANDed; double quotes match an exact phrase; OR/NOT unsupported."
+		"Space-separated words are ANDed; double quotes match an exact phrase; pipe OR/NOT unsupported in body-only search."
 	return readDefinition(
 		ToolSearchMessageBodies,
 		searchIntro+
 			"Results are ordered newest-first (by sent date). "+
 			"Paginate with offset/limit (default limit 20, max 50). Response: data, returned, offset, has_more. "+
-			"Body search does not return a total; use has_more to detect more pages.",
+			"Body search does not return a total; use has_more to detect more pages. "+
+			"Delegated body search requires one selected account; pass account when the grant covers several accounts.",
 		closedObject(map[string]*jsonschema.Schema{
 			toolArgQuery:   stringSchema(queryDesc),
 			toolArgAccount: accountProperty(),
@@ -544,11 +643,12 @@ func semanticSearchMessagesDefinition(_ *handlers, vectorAvailable bool) toolDef
 		"min_score filters chunk excerpts only; it does not remove or reorder ranked messages. " +
 		"Requires at least one free-text term (used to embed); filter-only queries must use search_metadata. " +
 		"Known Gmail operators (from:, subject:, label:, etc.) apply as metadata filters only. " +
-		searchMetadataOperatorDoc + " "
-	queryDesc := "Free-text query to embed (requires at least one free-text term). " +
+		"Vector and hybrid modes read pipes as text. " +
+		searchOperatorDoc + " "
+	queryDesc := "Free-text query to embed (requires at least one free-text term). Vector and hybrid modes read pipes as text. " +
 		"Gmail operators are metadata filters, not body search; combine with body terms or use search_metadata for filter-only queries."
 	mode := stringSchema("Search mode: vector (semantic only) or hybrid (BM25 + vector fused via RRF). Defaults to hybrid when omitted.", searchModeVector, searchModeHybrid)
-	mode.Default = json.RawMessage(`"hybrid"`)
+	mode.Default = jsontext.Value(`"hybrid"`)
 	return readDefinition(
 		ToolSemanticSearchMessages,
 		searchIntro+
@@ -571,7 +671,7 @@ func semanticSearchMessagesDefinition(_ *handlers, vectorAvailable bool) toolDef
 
 func getMessageDefinition(_ *handlers) toolDefinition {
 	bodyFormat := stringSchema("Which body representation to page: auto (default, plain text when available, HTML fallback), text, or html.", bodyFormatAuto, bodyFormatText, bodyFormatHTML)
-	bodyFormat.Default = json.RawMessage(`"auto"`)
+	bodyFormat.Default = jsontext.Value(`"auto"`)
 	return readDefinition(
 		ToolGetMessage,
 		"Get message details including recipients, labels, attachments, and a slice of the message body. "+
@@ -593,12 +693,83 @@ func getMessageDefinition(_ *handlers) toolDefinition {
 	)
 }
 
+func chunkInputSchemas(object string) (offset, length *jsonschema.Schema) {
+	offset = nonNegativeIntegerSchema("Byte offset of the "+object+" to start this chunk at (default 0). Request offset += length until complete is true.", 0)
+	length = boundedIntegerSchema(fmt.Sprintf("Maximum bytes in this chunk (1-%d, default %d)", maxChunkBytes, defaultChunkBytes), 1, maxChunkBytes)
+	length.Default = jsontext.Value(defaultValueString(defaultChunkBytes))
+	return offset, length
+}
+
+const chunkDownloadDescription = " Start at offset 0, then pass the returned sha256 with every nonzero offset and keep the same identifier and account. " +
+	"Downloads retain a snapshot for 5 minutes, with at most 8 snapshots and 256 MiB total per server (256 MiB per object). " +
+	"If the snapshot expires or is evicted, restart at offset 0 without sha256."
+
+func exportEMLDefinition() toolDefinition {
+	offset, length := chunkInputSchemas("message")
+	return readDefinition(
+		ToolExportEML,
+		"Export one archived email as its original .eml bytes, exactly as the provider delivered them, in base64 chunks. "+
+			"Pass exactly one of id (msgvault message ID) or source_message_id (provider ID, such as a Gmail message ID); "+
+			"add account when a provider ID exists in more than one account. "+
+			"Call from offset 0, then offset += length until complete is true; concatenate the decoded chunks and verify them against size and sha256 (of the whole message). "+
+			"last_sync_at is the account's latest sync activity: provider messages newer than it may not be archived yet. "+
+			"Messages without stored original MIME (chat and calendar sources, some imports) return raw_mime_unavailable. "+
+			"Gmail, IMAP (including Outlook over IMAP), and mbox/eml/emlx/maildir imports hold the bytes msgvault received; "+
+			"PST imports hold MIME rebuilt from Outlook data (source_type pst)."+chunkDownloadDescription,
+		closedObject(map[string]*jsonschema.Schema{
+			"id":               safeIDSchema("msgvault message ID"),
+			toolArgSourceMsgID: stringSchema("Provider message ID"),
+			toolArgAccount:     stringSchema("Account identifier (email address) that narrows a source_message_id lookup"),
+			toolArgOffset:      offset,
+			toolArgLength:      length,
+			"sha256":           stringSchema("Whole-object sha256 returned by the first chunk; required for offset greater than zero"),
+		}),
+		outputSchemaFor[exportEMLResponse](),
+		(*handlers).exportEML,
+	)
+}
+
+func listThreadDefinition() toolDefinition {
+	limit := boundedIntegerSchema(fmt.Sprintf("Messages per page (1-%d, default %d)", query.ThreadMaxLimit, query.ThreadDefaultLimit), 1, query.ThreadMaxLimit)
+	limit.Default = jsontext.Value(defaultValueString(query.ThreadDefaultLimit))
+	return readDefinition(
+		ToolListThread,
+		"List visible archived messages in one conversation in chronological order (sent_at, undated last, then id). "+
+			"Pass exactly one of id or source_message_id (any message in the thread) or thread_id (provider conversation ID, such as a Gmail threadId); "+
+			"add account when a provider ID exists in more than one account. "+
+			"Page with offset until has_more is false; total counts the whole conversation. "+
+			"has_raw marks messages whose original .eml can be fetched with export_eml. "+
+			"Messages deleted from the provider stay listed with deleted_from_source_at. "+
+			"last_sync_at is the account's latest sync activity: newer replies may not be archived yet. "+
+			"Hidden duplicates are excluded; last_sync_at does not establish conversation completeness.",
+		closedObject(map[string]*jsonschema.Schema{
+			"id":               safeIDSchema("msgvault ID of any message in the conversation"),
+			toolArgSourceMsgID: stringSchema("Provider ID of any message in the conversation"),
+			toolArgThreadID:    stringSchema("Provider conversation ID"),
+			toolArgAccount:     stringSchema("Account identifier (email address) that narrows a provider-ID lookup"),
+			toolArgOffset:      nonNegativeIntegerSchema("Messages to skip (default 0)", 0),
+			toolArgLimit:       limit,
+		}),
+		outputSchemaFor[query.ThreadPage](),
+		(*handlers).listThread,
+	)
+}
+
 func getAttachmentDefinition(_ *handlers) toolDefinition {
+	// No defaults here: the SDK applies schema defaults to arguments, and
+	// either argument being present selects chunk mode.
+	offset, length := chunkInputSchemas("attachment")
+	offset.Default, length.Default = nil, nil
 	return readDefinition(
 		ToolGetAttachment,
-		"Get attachment content by attachment ID. Returns metadata as text and the file content as an embedded resource blob. Use get_message first to find attachment IDs.",
+		"Get attachment content by attachment ID. Returns metadata as text and the file content as an embedded resource blob. Use get_message first to find attachment IDs. "+
+			"Pass offset or length to download in base64 chunks instead (no embedded resource): call from offset 0, then offset += length until complete is true, "+
+			"and verify the decoded concatenation against size and sha256. Full embedded responses are limited to 50 MiB."+chunkDownloadDescription,
 		closedObject(map[string]*jsonschema.Schema{
 			toolArgAttachmentID: safeIDSchema("Attachment ID (from get_message response)"),
+			toolArgOffset:       offset,
+			toolArgLength:       length,
+			"sha256":            stringSchema("Whole-object sha256 returned by the first chunk; required for offset greater than zero"),
 		}, toolArgAttachmentID),
 		outputSchemaFor[getAttachmentResponse](),
 		(*handlers).getAttachment,
@@ -634,7 +805,7 @@ func searchInMessageDefinition(_ *handlers, vectorAvailable bool) toolDefinition
 			"Keyword matches include raw-body char_offset and line. Vector matches always include snippet and score; char_offset and line may be omitted after preprocessing. " +
 			"Use a present char_offset with get_message center_at to read a larger window around the match."
 		mode := stringSchema("Search mode: keyword (default, literal term) or vector (semantic chunk scoring)", searchModeKeyword, searchModeVector)
-		mode.Default = json.RawMessage(`"keyword"`)
+		mode.Default = jsontext.Value(`"keyword"`)
 		properties[toolArgMode] = mode
 		properties[toolArgMinScore] = scoreSchema("Minimum chunk similarity score (0–1) when mode=vector (default 0)")
 	}
@@ -685,10 +856,10 @@ func getStatsDefinition(_ *handlers) toolDefinition {
 func aggregateDefinition(_ *handlers) toolDefinition {
 	return readDefinition(
 		ToolAggregate,
-		"Get grouped statistics (top senders, recipients, domains, labels, or message volume by calendar year). "+
+		"Get grouped statistics (top senders, recipients, domains, labels, mailing lists, or message volume by calendar year). "+
 			"Returns an object with a data array containing objects with fields Key, Count, TotalSize, AttachmentSize, AttachmentCount, and TotalUnique.",
 		closedObject(map[string]*jsonschema.Schema{
-			toolArgGroupBy: stringSchema("Dimension to group by. When 'time', buckets are by calendar year only (Key is a year string like \"2024\").", toolArgSender, "recipient", "domain", "label", "time"),
+			toolArgGroupBy: stringSchema("Dimension to group by. When 'time', buckets are by calendar year only (Key is a year string like \"2024\").", toolArgSender, "recipient", "domain", "label", toolArgList, "time"),
 			toolArgAccount: accountProperty(),
 			toolArgLimit:   nonNegativeIntegerSchema("Maximum results to return (default 50)", 50),
 			toolArgAfter:   afterProperty(),
@@ -702,11 +873,11 @@ func aggregateDefinition(_ *handlers) toolDefinition {
 func searchByDomainsDefinition(_ *handlers) toolDefinition {
 	return readDefinition(
 		ToolSearchByDomains,
-		"Find messages where any participant (from, to, or cc) belongs to one of the given domains. "+
-			"Useful for finding all communication with a company regardless of direction. Returns an object with a data array of matching message summaries.",
+		"Find messages where any participant (from, to, or cc) belongs to one of the given domains. Searches all accounts available to this session. "+
+			"Useful for finding all communication with a company regardless of direction. Returns data, returned, offset, has_more, and total (always -1); page with offset while has_more is true.",
 		closedObject(map[string]*jsonschema.Schema{
 			toolArgDomains: stringSchema("Comma-separated domain names (e.g. 'gobright.com,ascentae.com')"),
-			toolArgLimit:   nonNegativeIntegerSchema("Maximum results to return (default 100)", 100),
+			toolArgLimit:   nonNegativeIntegerSchema("Maximum results to return (default 100, max 500)", 100),
 			toolArgOffset:  offsetProperty(),
 			toolArgAfter:   afterProperty(),
 			toolArgBefore:  beforeProperty(),
@@ -719,7 +890,7 @@ func searchByDomainsDefinition(_ *handlers) toolDefinition {
 func stageDeletionDefinition(_ *handlers) toolDefinition {
 	return writeDefinition(
 		ToolStageDeletion,
-		"Stage messages for deletion. Use EITHER 'query' (Gmail-style search) OR structured filters (from, domain, label, etc.), not both. Does NOT delete immediately - run 'msgvault delete-staged' CLI command to execute staged deletions.",
+		"Stage messages for deletion. Use EITHER 'query' (Gmail-style search) OR structured filters (from, domain, label, etc.), not both. Does NOT delete immediately. To execute, set '[deletion] remote_enabled = true' in the invoking CLI's config.toml for durable consent, then run 'msgvault delete-staged'. One-command alternative: MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged.",
 		closedObject(map[string]*jsonschema.Schema{
 			toolArgAccount:   accountProperty(),
 			toolArgQuery:     stringSchema("Gmail-style search query (e.g. 'from:linkedin subject:job alert'). Cannot be combined with structured filters."),
@@ -757,10 +928,10 @@ func findSimilarMessagesDefinition(_ *handlers) toolDefinition {
 
 func searchDocumentsDefinition(_ *handlers) toolDefinition {
 	limit := boundedIntegerSchema("Maximum results to return (default 20, max 100)", 1, 100)
-	limit.Default = json.RawMessage("20")
+	limit.Default = jsontext.Value("20")
 	mode := stringSchema("Search mode: lexical (default and auto); semantic/hybrid send the query to the embedding provider",
 		"auto", "lexical", "semantic", "hybrid")
-	mode.Default = json.RawMessage(`"lexical"`)
+	mode.Default = jsontext.Value(`"lexical"`)
 	direction := stringSchema("How the owning message relates to the person",
 		"from_person", "to_person", "group")
 	definition := readDefinition(
@@ -769,11 +940,11 @@ func searchDocumentsDefinition(_ *handlers) toolDefinition {
 		closedObject(map[string]*jsonschema.Schema{
 			toolArgQuery: stringSchema("Document content or filename query; terms are ANDed"),
 			"source_ids": {
-				Type: "array", Description: "Optional source ID scope",
+				Type: schemaTypeArray, Description: "Optional source ID scope",
 				Items: safeIDSchema("Source ID"),
 			},
 			"message_types": {
-				Type: "array", Description: "Optional containing message type scope",
+				Type: schemaTypeArray, Description: "Optional containing message type scope",
 				Items: stringSchema("Containing message type"),
 			},
 			toolArgAttachmentID:  safeIDSchema("Optional exact attachment occurrence ID"),
@@ -781,7 +952,7 @@ func searchDocumentsDefinition(_ *handlers) toolDefinition {
 			toolArgPersonID:      safeIDSchema("Optional durable person ID"),
 			toolArgParticipantID: safeIDSchema("Optional observed participant ID; translated through its durable person when bound"),
 			"directions": {
-				Type: "array", Description: "Optional union of from_person, to_person, and group; requires a person reference",
+				Type: schemaTypeArray, Description: "Optional union of from_person, to_person, and group; requires a person reference",
 				Items: direction,
 			},
 			toolArgAfter:      stringSchema("Only messages on or after YYYY-MM-DD"),
@@ -800,7 +971,7 @@ func searchDocumentsDefinition(_ *handlers) toolDefinition {
 
 func searchPersonFilesDefinition(_ *handlers) toolDefinition {
 	limit := boundedIntegerSchema("Maximum metadata results to return (default 100, max 100)", 1, 100)
-	limit.Default = json.RawMessage("100")
+	limit.Default = jsontext.Value("100")
 	direction := stringSchema("How the owning message relates to the person",
 		"from_person", "to_person", "group")
 	mimeFamily := stringSchema("Stable MIME family",
@@ -811,14 +982,14 @@ func searchPersonFilesDefinition(_ *handlers) toolDefinition {
 		closedObject(map[string]*jsonschema.Schema{
 			toolArgPersonID: safeIDSchema("Durable person ID"),
 			"directions": {
-				Type: "array", Description: "Optional union of from_person, to_person, and group",
+				Type: schemaTypeArray, Description: "Optional union of from_person, to_person, and group",
 				Items: direction,
 			},
 			toolArgAfter:  stringSchema("Only messages on or after YYYY-MM-DD"),
 			toolArgBefore: stringSchema("Only messages before YYYY-MM-DD"),
 			"filename":    stringSchema("Case-insensitive filename substring filter"),
 			"mime_families": {
-				Type: "array", Description: "Optional stable MIME-family filter",
+				Type: schemaTypeArray, Description: "Optional stable MIME-family filter",
 				Items: mimeFamily,
 			},
 			toolArgLimit:  limit,
@@ -831,20 +1002,29 @@ func searchPersonFilesDefinition(_ *handlers) toolDefinition {
 
 // The following named response types make every catalog output schema visible
 // without changing existing JSON field names.
-type searchMetadataResponse paginatedResponse[query.MessageSummary]
+type searchMetadataResponse struct {
+	paginatedResponse[query.MessageSummary]
+
+	IndexState string `json:"index_state,omitempty"`
+}
 type searchInMessageResponse paginatedResponse[messageMatch]
 type listMessagesResponse paginatedResponse[query.MessageSummary]
 type aggregateResponse struct {
 	Data []query.AggregateRow `json:"data"`
 }
-type searchByDomainsResponse struct {
-	Data []query.MessageSummary `json:"data"`
-}
+type searchByDomainsResponse paginatedResponse[query.MessageSummary]
 
 type getAttachmentResponse struct {
-	Filename string `json:"filename"`
-	MIMEType string `json:"mime_type"`
-	Size     int64  `json:"size"`
+	Docbank  []store.DocbankAttachmentRef `json:"docbank,omitempty"`
+	Filename string                       `json:"filename"`
+	MIMEType string                       `json:"mime_type"`
+	Size     int64                        `json:"size"`
+	// Chunk fields are present only when the call passed offset or length.
+	Offset     *int64  `json:"offset,omitzero"`
+	Length     *int64  `json:"length,omitzero"`
+	SHA256     *string `json:"sha256,omitzero"`
+	Complete   *bool   `json:"complete,omitzero"`
+	DataBase64 *string `json:"data_base64,omitzero"`
 }
 
 type exportAttachmentResponse struct {
@@ -858,4 +1038,65 @@ type stageDeletionResponse struct {
 	MessageCount int    `json:"message_count"`
 	Status       string `json:"status"`
 	NextStep     string `json:"next_step"`
+}
+
+var (
+	ocrOperationDefinitions = []toolDefinition{
+		legacyDefinition(getOCRStatusTool(), toolSecurityRead, (*handlers).getOCRStatus),
+		legacyDefinition(searchAttachmentTextTool(), toolSecurityRead, (*handlers).searchAttachmentText),
+		legacyDefinition(getAttachmentTextTool(), toolSecurityRead, (*handlers).getAttachmentText),
+		legacyDefinition(requestAttachmentTextTool(), toolSecurityWrite, (*handlers).requestAttachmentText),
+	}
+	gmailOperationDefinitions = []toolDefinition{
+		legacyDefinition(listDraftsTool(), toolSecurityRead, (*handlers).listDrafts),
+		legacyDefinition(getDraftTool(), toolSecurityRead, (*handlers).getDraft),
+		legacyDefinition(createDraftTool(), toolSecurityWrite, (*handlers).createDraft),
+		legacyDefinition(updateDraftTool(), toolSecurityWrite, (*handlers).updateDraft),
+		legacyDefinition(deleteDraftTool(), toolSecurityWrite, (*handlers).deleteDraft),
+		legacyDefinition(sendDraftTool(), toolSecurityWrite, (*handlers).sendDraft),
+		legacyDefinition(modifyLabelsTool(), toolSecurityWrite, (*handlers).modifyLabels),
+		legacyDefinition(createLabelTool(), toolSecurityWrite, (*handlers).createLabel),
+		legacyDefinition(deleteLabelTool(), toolSecurityWrite, (*handlers).deleteLabel),
+		legacyDefinition(listGmailLabelsTool(), toolSecurityRead, (*handlers).listGmailLabels),
+	}
+	whatsAppOperationDefinitions = []toolDefinition{
+		legacyDefinition(whatsAppStatusTool(), toolSecurityRead, (*handlers).whatsAppStatus),
+		legacyDefinition(whatsAppStartLoginTool(), toolSecurityWrite, (*handlers).whatsAppStartLogin),
+		legacyDefinition(whatsAppLoginStatusTool(), toolSecurityRead, (*handlers).whatsAppLoginStatus),
+		legacyDefinition(whatsAppLogoutTool(), toolSecurityWrite, (*handlers).whatsAppLogout),
+		legacyDefinition(sendWhatsAppMessageTool(), toolSecurityWrite, (*handlers).sendWhatsAppMessage),
+		legacyDefinition(sendWhatsAppReactionTool(), toolSecurityWrite, (*handlers).sendWhatsAppReaction),
+		legacyDefinition(whatsAppRequestHistorySyncTool(), toolSecurityWrite, (*handlers).whatsAppRequestHistorySync),
+	}
+	whatsAppArchiveOperationDefinitions = []toolDefinition{
+		listWhatsAppChatsDefinition(),
+		listWhatsAppMessagesDefinition(),
+	}
+	googleDocsOperationDefinitions = []toolDefinition{
+		legacyDefinition(listGoogleDocsTool(), toolSecurityRead, (*handlers).listGoogleDocs),
+		legacyDefinition(searchGoogleDocsTool(), toolSecurityRead, (*handlers).searchGoogleDocs),
+		legacyDefinition(getGoogleDocTool(), toolSecurityRead, (*handlers).getGoogleDoc),
+		legacyDefinition(appendGoogleDocTextTool(), toolSecurityWrite, (*handlers).appendGoogleDocText),
+		legacyDefinition(replaceGoogleDocTextTool(), toolSecurityWrite, (*handlers).replaceGoogleDocText),
+	}
+)
+
+func legacyDefinition(tool legacymcp.Tool, security toolSecurityClass, handler catalogToolHandler) toolDefinition {
+	encoded, err := json.Marshal(tool.InputSchema)
+	if err != nil {
+		panic(err)
+	}
+	input := &jsonschema.Schema{}
+	if err := json.Unmarshal(encoded, input); err != nil {
+		panic(err)
+	}
+	input.Schema = schema202012
+	return toolDefinition{
+		name: tool.Name, description: tool.Description,
+		annotations:  toolAnnotations(security == toolSecurityRead),
+		availability: alwaysAvailable, security: security,
+		inputSchema:  input,
+		outputSchema: &jsonschema.Schema{Schema: schema202012, Type: "object"},
+		handler:      handler,
+	}
 }

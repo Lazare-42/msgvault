@@ -11,16 +11,17 @@ export const COMMAND_DEFINITIONS = [
   command('last-row', 'Move to last row', ['End'], ['end'], 'Navigate'),
   command('open-row', 'Open or drill into focused row', ['Enter'], ['enter'], 'Navigate'),
   command('close-layer', 'Close current layer or restore context', ['Esc'], ['escape'], 'Navigate'),
-  command('focus-search', 'Focus search', ['/'], ['/'], 'Navigate'),
+  command('focus-search', 'Focus search', ['/'], ['/'], 'Navigate', false, ['root', 'deletions']),
   command('toggle-selection', 'Toggle focused row selection', ['Space'], ['space'], 'Selection'),
-  command('select-visible', 'Select all visible rows', ['A'], ['shift+a'], 'Selection'),
+  command('extend-selection', 'Extend selection to focused row', ['Shift', 'Space'], ['shift+space'], 'Selection'),
+  command('select-visible', 'Select all visible rows', ['A'], ['a', 'shift+a'], 'Selection'),
   command('clear-selection', 'Clear selection', ['x'], ['x'], 'Selection'),
   command('review-delete-selected', 'Review selected messages for deletion', ['d'], ['d'], 'Safety', true),
   command('review-delete-matching', 'Review all matching messages for deletion', ['D'], ['shift+d'], 'Safety', true),
   command('open-filters', 'Open filters', ['F'], ['f'], 'Analyze'),
   command('open-grouping', 'Open grouping controls', ['G'], ['g'], 'Analyze'),
   command('change-sort', 'Change sort', ['S'], ['s'], 'Analyze'),
-  command('reverse-sort', 'Reverse sort direction', ['R'], ['r'], 'Analyze'),
+  command('reverse-sort', 'Show sort order', ['R'], ['r'], 'Analyze'),
   command('open-keyboard-help', 'Open searchable keyboard help', ['?'], ['shift+/'], 'Help'),
   command('open-command-palette', 'Open command palette', ['Mod', 'K'], ['mod+k'], 'Help')
 ] as const;
@@ -33,6 +34,7 @@ export interface CommandDefinition {
   label: string;
   keys: readonly string[];
   combos: readonly string[];
+  scopes: readonly string[];
   section: string;
   keywords: string;
   destructive: boolean;
@@ -58,13 +60,15 @@ function command<ID extends string>(
   keys: readonly string[],
   combos: readonly string[],
   section: string,
-  destructive = false
+  destructive = false,
+  scopes: readonly string[] = ['root']
 ) {
   return {
     id,
     label,
     keys,
     combos,
+    scopes,
     section,
     keywords: `${section} ${label} ${keys.join(' ')}`,
     destructive,

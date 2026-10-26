@@ -1,8 +1,10 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"os"
 
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/store"
@@ -17,7 +19,7 @@ import (
 //
 // The lock is taken non-blocking, so there is no context parameter: a writer
 // either claims the free SQLite archive immediately or is told who holds it.
-func acquireDirectSQLiteWriteLock(cfg *config.Config) (func(), error) {
+func acquireDirectSQLiteWriteLock(cfg *config.Config, state *invocation) (func(), error) {
 	if cfg == nil {
 		return nil, errors.New("nil config")
 	}
@@ -36,7 +38,8 @@ func acquireDirectSQLiteWriteLock(cfg *config.Config) (func(), error) {
 	}
 	return func() {
 		if cerr := lock.Close(); cerr != nil {
-			logger.Warn("release write-owner lock", "error", cerr)
+			_, currentLogger := invocationConfigLogger(state)
+			currentLogger.Warn("release write-owner lock", "error", cerr)
 		}
 	}, nil
 }
@@ -102,13 +105,12 @@ func daemonAutostartPreflight(cfg *config.Config) error {
 	return nil
 }
 
-// openStoreAndInitWith opens the local archive and initializes schema while the
-// caller owns the direct-writer lock. store.Open + InitSchema create the
-// database file on first use, which is the right behavior for a
-// freshly-installed CLI; init-db remains the explicit setup command for users
-// who want to pre-create the DB.
-func openStoreAndInitWith(migrate func(*store.Store) error) (*store.Store, error) {
-	dbPath := cfg.DatabaseDSN()
+func openStoreAndInitWithInvocation(state *invocation, migrate func(*store.Store) error) (*store.Store, error) {
+	currentCfg, _ := invocationConfigLogger(state)
+	if currentCfg == nil {
+		return nil, errors.New("configuration is unavailable")
+	}
+	dbPath := currentCfg.DatabaseDSN()
 	st, err := store.Open(dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
@@ -124,21 +126,56 @@ func openStoreAndInitWith(migrate func(*store.Store) error) (*store.Store, error
 	return st, nil
 }
 
-func openWritableStoreAndInit() (*store.Store, func(), error) {
-	return openWritableStoreAndInitWith(runStartupMigrations)
+// openInitializedStoreForInvocation opens an archive that setup already
+// initialized. It never creates the SQLite file and runs no schema DDL or
+// startup migrations; an archive at another schema version is refused.
+func openInitializedStoreForInvocation(ctx context.Context, state *invocation) (*store.Store, func(), error) {
+	currentCfg, _ := invocationConfigLogger(state)
+	if currentCfg == nil {
+		return nil, nil, errors.New("configuration is unavailable")
+	}
+	dsn := currentCfg.DatabaseDSN()
+	if !store.IsPostgresURL(dsn) {
+		path, err := currentCfg.DatabasePath()
+		if err != nil {
+			return nil, nil, err
+		}
+		if _, err := os.Stat(path); err != nil {
+			return nil, nil, fmt.Errorf("open initialized archive: %w", err)
+		}
+	}
+	st, err := store.OpenContext(ctx, dsn)
+	if err != nil {
+		return nil, nil, fmt.Errorf("open database: %w", err)
+	}
+	if err := st.ValidateSchemaContext(ctx); err != nil {
+		_ = st.Close()
+		return nil, nil, fmt.Errorf("validate archive schema: %w", err)
+	}
+	return st, func() { _ = st.Close() }, nil
 }
 
-func openWritableStoreAndInitForIngest() (*store.Store, func(), error) {
-	return openWritableStoreAndInitWith(runStartupMigrationsForIngest)
+func openWritableStoreAndInitForInvocation(state *invocation) (*store.Store, func(), error) {
+	return openWritableStoreAndInitWithInvocation(state, func(s *store.Store) error {
+		return runStartupMigrationsContext(context.Background(), s, state)
+	})
 }
 
-func openWritableStoreAndInitWith(migrate func(*store.Store) error) (*store.Store, func(), error) {
-	release, err := acquireDirectSQLiteWriteLock(cfg)
+func openWritableStoreAndInitForIngestInvocation(state *invocation) (*store.Store, func(), error) {
+	return openWritableStoreAndInitWithInvocation(state, runStartupMigrationsForIngest)
+}
+
+func openWritableStoreAndInitWithInvocation(state *invocation, migrate func(*store.Store) error) (*store.Store, func(), error) {
+	currentCfg, _ := invocationConfigLogger(state)
+	if currentCfg == nil {
+		return nil, nil, errors.New("configuration is unavailable")
+	}
+	release, err := acquireDirectSQLiteWriteLock(currentCfg, state)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	st, err := openStoreAndInitWith(migrate)
+	st, err := openStoreAndInitWithInvocation(state, migrate)
 	if err != nil {
 		release()
 		return nil, nil, err

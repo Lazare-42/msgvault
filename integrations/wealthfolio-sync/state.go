@@ -1,11 +1,14 @@
 package main
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
 	"time"
+
+	"go.kenn.io/kit/atomicfile"
 )
 
 type syncState struct {
@@ -58,7 +61,7 @@ func saveState(path string, st *syncState) error {
 		st.Attachments = make(map[string]seenAttachment)
 	}
 
-	data, err := json.MarshalIndent(st, "", "  ")
+	data, err := json.Marshal(st, jsontext.WithIndent("  "))
 	if err != nil {
 		return fmt.Errorf("marshal state: %w", err)
 	}
@@ -78,7 +81,7 @@ func saveState(path string, st *syncState) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("close temp state file: %w", err)
 	}
-	if err := os.Rename(tmpName, path); err != nil {
+	if err := atomicfile.Replace(tmpName, path); err != nil {
 		return fmt.Errorf("replace state file: %w", err)
 	}
 	return nil

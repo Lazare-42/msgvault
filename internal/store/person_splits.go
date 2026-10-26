@@ -5,7 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"reflect"
@@ -113,6 +113,10 @@ func (s *Store) splitPersonMergeOnce(
 			return ErrPersonSplitRevision
 		}
 
+		inferenceBefore, err := s.captureInferenceExportPeopleTx(ctx, tx, request.SourcePersonID)
+		if err != nil {
+			return err
+		}
 		merge, snapshot, err := s.loadPersonSplitMergeTx(ctx, tx, request.MergeID)
 		if err != nil {
 			return err
@@ -170,6 +174,11 @@ func (s *Store) splitPersonMergeOnce(
 		var displayName any
 		if selection.restoresAbsorbed && absorbedRoot.DisplayName != nil {
 			displayName = *absorbedRoot.DisplayName
+		}
+		displayOwnerRows := snapshot.Rows
+		displayOwnerPerson := absorbedRoot.ID
+		if !selection.restoresAbsorbed {
+			displayOwnerRows = nil
 		}
 		var newPersonID int64
 		if err := tx.QueryRowContext(ctx,
@@ -239,6 +248,11 @@ func (s *Store) splitPersonMergeOnce(
 					*ancestor.absorbedRoot.DisplayName, newPersonID); err != nil {
 					return fmt.Errorf("restore ancestor split display name: %w", err)
 				}
+				if displayName == nil {
+					displayName = *ancestor.absorbedRoot.DisplayName
+					displayOwnerRows = ancestor.snapshot.Rows
+					displayOwnerPerson = ancestor.absorbedRoot.ID
+				}
 			}
 			if _, err := tx.ExecContext(ctx, `UPDATE person_merge_review_candidates SET
 				state = 'rejected', reviewed_by = ?, reviewed_at = `+s.dialect.Now()+`
@@ -257,6 +271,22 @@ func (s *Store) splitPersonMergeOnce(
 				return fmt.Errorf("%w: ancestor absorbed UID alias is not owned by source",
 					ErrPersonSplitParticipants)
 			}
+		}
+		var ownershipQuery strings.Builder
+		ownershipQuery.WriteString(`UPDATE carddav_resources SET owns_display_name = FALSE WHERE person_id = ?`)
+		ownershipArgs := []any{newPersonID}
+		for _, row := range displayOwnerRows {
+			if row.TableName != "carddav_resources" || personSplitSnapshotRowInteger(row, "person_id") != displayOwnerPerson {
+				continue
+			}
+			owner := personSplitSnapshotColumnsByName(row.Columns)["owns_display_name"]
+			if owner.Boolean != nil && *owner.Boolean {
+				ownershipQuery.WriteString(" AND id <> ?")
+				ownershipArgs = append(ownershipArgs, row.RowID)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, ownershipQuery.String(), ownershipArgs...); err != nil {
+			return fmt.Errorf("retain split scalar source ownership: %w", err)
 		}
 		if selection.restoresAbsorbed {
 			if _, err := tx.ExecContext(ctx, `UPDATE person_merge_review_candidates SET
@@ -342,6 +372,10 @@ func (s *Store) splitPersonMergeOnce(
 		); err != nil {
 			return err
 		}
+		inferenceBefore[newPersonID] = personInferenceExportProjection{}
+		if err := s.invalidateInferenceExportChangesTx(ctx, tx, inferenceBefore); err != nil {
+			return err
+		}
 		exactReversal := selection.exact && len(unrestored) == 0
 		if _, err := tx.ExecContext(ctx, `UPDATE person_splits
 			SET is_exact_reversal = ? WHERE id = ?`, exactReversal, splitID); err != nil {
@@ -366,7 +400,7 @@ func (s *Store) splitPersonMergeOnce(
 			AmbiguousRows: ambiguous, UnrestoredRows: unrestored,
 			IdentityRevision: identityRevision,
 		}
-		resultJSON, err := json.Marshal(result)
+		resultJSON, err := json.Marshal(result, json.Deterministic(true))
 		if err != nil {
 			return fmt.Errorf("encode person split idempotency result: %w", err)
 		}
@@ -436,7 +470,7 @@ func personSplitRequestHash(request PersonSplitRequest) (string, error) {
 		ExpectedSourceRevision int64   `json:"expected_source_revision"`
 		Actor                  string  `json:"actor"`
 	}{request.SourcePersonID, request.MergeID, request.ParticipantIDs,
-		request.ExpectedSourceRevision, request.Actor})
+		request.ExpectedSourceRevision, request.Actor}, json.Deterministic(true))
 	if err != nil {
 		return "", fmt.Errorf("encode person split request: %w", err)
 	}
@@ -888,7 +922,7 @@ func (s *Store) restorePersonSplitRowsTx(
 			}
 			continue
 		}
-		replaced, err := s.personSplitTrackingRowReplacedTx(ctx, tx, row)
+		replaced, err := s.personSplitPresenceRowReplacedTx(ctx, tx, row)
 		if err != nil {
 			return nil, err
 		}
@@ -1614,7 +1648,7 @@ func rebasePersonMergePostRowReferences(
 		return sql.NullString{}, false, err
 	}
 	post.RowKey = rowKey
-	rebased, err := json.Marshal(post)
+	rebased, err := json.Marshal(post, json.Deterministic(true))
 	if err != nil {
 		return sql.NullString{}, false, fmt.Errorf("encode rebased %s post-merge row: %w",
 			spec.TableName, err)
@@ -1975,24 +2009,34 @@ func (s *Store) rebasePriorPersonMergeRowsAfterSplitTx(
 	return nil
 }
 
-func (s *Store) personSplitTrackingRowReplacedTx(
+// personSplitPresenceRowColumns names the row-presence opt-in tables and the
+// columns that identify one grant. A grant whose columns differ from the
+// post-merge state was replaced after the merge, so an exact split inserts the
+// snapshot row for the new person instead of moving the live grant back.
+var personSplitPresenceRowColumns = map[string][]string{
+	"person_tracking":          {"tracked_at"},
+	"person_brief_enrollments": {"enabled_at", "actor"},
+}
+
+func (s *Store) personSplitPresenceRowReplacedTx(
 	ctx context.Context, tx *loggedTx, journal personSplitJournalRow,
 ) (bool, error) {
-	if journal.tableName != "person_tracking" || !journal.postMergeJSON.Valid {
+	columns, presence := personSplitPresenceRowColumns[journal.tableName]
+	if !presence || !journal.postMergeJSON.Valid {
 		return false, nil
 	}
 	var post personMergeSnapshotRow
 	if err := json.Unmarshal([]byte(journal.postMergeJSON.String), &post); err != nil {
-		return false, fmt.Errorf("%w: decode tracking post-merge row: %w",
-			ErrPersonMergeSnapshotCorrupt, err)
+		return false, fmt.Errorf("%w: decode %s post-merge row: %w",
+			ErrPersonMergeSnapshotCorrupt, journal.tableName, err)
 	}
-	spec := personMergeTableRegistry["person_tracking"]
+	spec := personMergeTableRegistry[journal.tableName]
 	where, args, err := personSplitCurrentRowWhere(spec, journal)
 	if err != nil {
 		return false, err
 	}
 	current, err := s.capturePersonMergeQueryTx(ctx, tx, spec,
-		`SELECT * FROM person_tracking WHERE `+where, args, 0)
+		`SELECT * FROM `+personSplitIdentifier(journal.tableName)+` WHERE `+where, args, 0)
 	if err != nil {
 		return false, err
 	}
@@ -2000,12 +2044,17 @@ func (s *Store) personSplitTrackingRowReplacedTx(
 		return false, nil
 	}
 	if len(current) != 1 {
-		return false, fmt.Errorf("%w: current person_tracking row is ambiguous",
-			ErrPersonSplitParticipants)
+		return false, fmt.Errorf("%w: current %s row is ambiguous",
+			ErrPersonSplitParticipants, journal.tableName)
 	}
 	currentColumns := personSplitSnapshotColumnsByName(current[0].Columns)
 	postColumns := personSplitSnapshotColumnsByName(post.Columns)
-	return !reflect.DeepEqual(currentColumns["tracked_at"], postColumns["tracked_at"]), nil
+	for _, column := range columns {
+		if !reflect.DeepEqual(currentColumns[column], postColumns[column]) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *Store) personSplitRestoredRowLocatorTx(

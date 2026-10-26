@@ -4,16 +4,19 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
 
+	"go.kenn.io/msgvault/internal/jsonexact"
+	"go.kenn.io/msgvault/internal/meetingarchive"
 	"go.kenn.io/msgvault/internal/meetingidentity"
 	"go.kenn.io/msgvault/internal/store"
 )
@@ -34,7 +37,7 @@ const (
 	unknownTranscriptRetrySpan = 48 * time.Hour
 	// Bump after a released canonical format changes so archived rows receive
 	// one repair refresh under the new rules.
-	circlebackSnapshotVersion = 1
+	circlebackSnapshotVersion = 2
 )
 
 // meetingSource is the narrow client surface the importer needs (satisfied
@@ -107,7 +110,7 @@ func (s syncState) marshal() string {
 	sort.Slice(s.PendingTranscripts, func(i, j int) bool {
 		return s.PendingTranscripts[i].MeetingID < s.PendingTranscripts[j].MeetingID
 	})
-	b, err := json.Marshal(s)
+	b, err := json.Marshal(s, json.Deterministic(true))
 	if err != nil {
 		return "{}"
 	}
@@ -475,20 +478,21 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 						if cancelIfDone(1) {
 							return err
 						}
-						added, changed, ingErr := imp.ingestMeeting(
-							src.ID, opts.Identifier, accountIdentities, m, nil, transcriptStateUnavailable, opts.Full,
+						result, ingErr := imp.ingestMeeting(
+							context.WithoutCancel(ctx), src.ID, opts, accountIdentities, m, nil,
+							transcriptStateUnavailable,
 						)
+						if result.Created {
+							sum.MeetingsAdded++
+						} else if result.Changed {
+							sum.MeetingsUpdated++
+						}
 						if ingErr != nil {
 							hardErr := fmt.Errorf("meeting %s: ingest unavailable refresh failed: %w", m.ID, ingErr)
 							sum.Errors++
 							hardErrors = append(hardErrors, hardErr)
 							progress(hardErr.Error())
 							continue
-						}
-						if added {
-							sum.MeetingsAdded++
-						} else if changed {
-							sum.MeetingsUpdated++
 						}
 						if ct := m.CreatedTime(); ct.After(maxCreated) {
 							maxCreated = ct
@@ -555,20 +559,21 @@ func (imp *Importer) Import(ctx context.Context, opts ImportOptions) (*ImportSum
 					if cancelIfDone(1) {
 						return err
 					}
-					added, changed, ingErr := imp.ingestMeeting(
-						src.ID, opts.Identifier, accountIdentities, m, tr, desiredState, opts.Full,
+					result, ingErr := imp.ingestMeeting(
+						context.WithoutCancel(ctx), src.ID, opts, accountIdentities, m, tr,
+						desiredState,
 					)
+					if result.Created {
+						sum.MeetingsAdded++
+					} else if result.Changed {
+						sum.MeetingsUpdated++
+					}
 					if ingErr != nil {
 						hardErr := fmt.Errorf("meeting %s: ingest failed: %w", m.ID, ingErr)
 						sum.Errors++
 						hardErrors = append(hardErrors, hardErr)
 						progress(hardErr.Error())
 						continue
-					}
-					if added {
-						sum.MeetingsAdded++
-					} else if changed {
-						sum.MeetingsUpdated++
 					}
 					if ct := m.CreatedTime(); ct.After(maxCreated) {
 						maxCreated = ct
@@ -786,7 +791,7 @@ func (imp *Importer) recoverArchivedTranscript(msgID int64) (Transcript, bool, e
 	if err != nil {
 		return Transcript{}, false, fmt.Errorf("read composed raw: %w", err)
 	}
-	var composed map[string]json.RawMessage
+	var composed map[string]jsontext.Value
 	if err := json.Unmarshal(raw, &composed); err != nil {
 		return Transcript{}, false, fmt.Errorf("decode composed raw: %w", err)
 	}
@@ -819,16 +824,17 @@ type meetingMetadata struct {
 	CreatedAt          string              `json:"created_at,omitempty"`
 	Start              string              `json:"scheduled_start,omitempty"`
 	End                string              `json:"scheduled_end,omitempty"`
-	DurationSeconds    int64               `json:"duration_seconds,omitempty"`
+	DurationSeconds    int64               `json:"duration_seconds,omitzero"`
 	OrganizerEmail     string              `json:"organizer_email,omitempty"`
 	MeetingURL         string              `json:"meeting_url,omitempty"`
+	JoinURL            string              `json:"join_url,omitempty"`
 	RecordingURL       string              `json:"recording_url,omitempty"`
 	RecordingFetchedAt string              `json:"recording_url_fetched_at,omitempty"`
 	Tags               []string            `json:"tags,omitempty"`
 	ActionItems        []metaActionItem    `json:"action_items,omitempty"`
 	Insights           []map[string]string `json:"insights,omitempty"`
 	TranscriptState    transcriptState     `json:"transcript_state"`
-	TranscriptSegments int                 `json:"transcript_segments,omitempty"`
+	TranscriptSegments int                 `json:"transcript_segments,omitzero"`
 	AccountID          string              `json:"account_identifier,omitempty"`
 	SnapshotHash       string              `json:"snapshot_hash,omitempty"`
 }
@@ -851,7 +857,7 @@ func circlebackSnapshotHash(
 	if err != nil {
 		return "", fmt.Errorf("canonicalize meeting: %w", err)
 	}
-	var transcriptJSON json.RawMessage
+	var transcriptJSON jsontext.Value
 	if tr != nil {
 		transcriptJSON, err = canonicalProviderJSON(tr.Raw, tr)
 		if err != nil {
@@ -860,8 +866,8 @@ func circlebackSnapshotHash(
 	}
 	payload, err := json.Marshal(struct {
 		Version         int             `json:"version"`
-		Meeting         json.RawMessage `json:"meeting"`
-		Transcript      json.RawMessage `json:"transcript,omitempty"`
+		Meeting         jsontext.Value  `json:"meeting"`
+		Transcript      jsontext.Value  `json:"transcript,omitzero"`
 		TranscriptState transcriptState `json:"transcript_state"`
 		AccountID       string          `json:"account_identifier,omitempty"`
 		IsFromMe        bool            `json:"is_from_me"`
@@ -872,7 +878,7 @@ func circlebackSnapshotHash(
 		TranscriptState: state,
 		AccountID:       identifier,
 		IsFromMe:        fromMe,
-	})
+	}, json.Deterministic(true))
 	if err != nil {
 		return "", err
 	}
@@ -880,175 +886,102 @@ func circlebackSnapshotHash(
 	return hex.EncodeToString(sum[:]), nil
 }
 
-func canonicalProviderJSON(raw json.RawMessage, fallback any) (json.RawMessage, error) {
+func canonicalProviderJSON(raw jsontext.Value, fallback any) (jsontext.Value, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
-		return json.Marshal(fallback)
+		return json.Marshal(fallback, json.Deterministic(true))
 	}
-	decoder := json.NewDecoder(bytes.NewReader(raw))
-	decoder.UseNumber()
+	decoder := jsontext.NewDecoder(bytes.NewReader(raw), jsonexact.PreserveNumbers)
+
 	var decoded any
-	if err := decoder.Decode(&decoded); err != nil {
+	if err := json.UnmarshalDecode(decoder, &decoded); err != nil {
 		return nil, err
 	}
 	var trailing any
-	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+	if err := json.UnmarshalDecode(decoder, &trailing); !errors.Is(err, io.EOF) {
 		if err == nil {
 			return nil, errors.New("provider JSON contains multiple values")
 		}
 		return nil, err
 	}
-	return json.Marshal(decoded)
+	return json.Marshal(decoded, json.Deterministic(true))
 }
 
-// ingestMeeting persists one meeting through the canonical write path.
-// Idempotent via UpsertMessage's ON CONFLICT(source_id, source_message_id).
-// Returns whether the message row was newly inserted and whether the
-// persisted archive changed. Existing rows with an identical stable snapshot
-// are left untouched so no-op overlap reads do not invalidate derived caches.
+// ingestMeeting archives one meeting through meetingarchive. An archived row
+// whose snapshot hash matches is left untouched, so no-op overlap reads don't
+// invalidate derived caches; --full skips that check and forces a rewrite.
+// Any meeting that reaches Upsert must be written, so Upsert is always forced
+// rather than re-reading the stored raw snapshot to decide again.
 func (imp *Importer) ingestMeeting(
+	ctx context.Context,
 	sourceID int64,
-	identifier string,
+	opts ImportOptions,
 	accountIdentities meetingidentity.Set,
 	m *Meeting,
 	tr *Transcript,
 	desiredTranscriptState transcriptState,
-	force bool,
-) (bool, bool, error) {
+) (meetingarchive.Result, error) {
 	if string(m.ID) == "" {
-		return false, false, errors.New("meeting has no id")
+		return meetingarchive.Result{}, errors.New("meeting has no id")
 	}
 	smid := "meeting:" + string(m.ID)
 
-	existing, err := imp.store.MessageExistsBatch(sourceID, []string{smid})
+	existing, err := imp.store.MessageMetadataBatch(sourceID, []string{smid})
 	if err != nil {
-		return false, false, fmt.Errorf("lookup existing meeting: %w", err)
+		return meetingarchive.Result{}, fmt.Errorf("lookup existing meeting: %w", err)
 	}
-	existingID, existed := existing[smid]
 
 	organizerEmail, organizerName := "", ""
 	if m.Organizer != nil {
-		organizerEmail = normalizeEmail(m.Organizer.Email)
+		organizerEmail = meetingidentity.Normalize(m.Organizer.Email)
 		organizerName = m.Organizer.Name
 	}
 	fromMe := organizerEmail != "" && accountIdentities.Contains(organizerEmail)
 	snapshotHash, err := circlebackSnapshotHash(
-		m, tr, identifier, fromMe, desiredTranscriptState,
+		m, tr, opts.Identifier, fromMe, desiredTranscriptState,
 	)
 	if err != nil {
-		return false, false, fmt.Errorf("hash meeting snapshot: %w", err)
+		return meetingarchive.Result{}, fmt.Errorf("hash meeting snapshot: %w", err)
 	}
-	if existed && !force {
-		metadata, metadataErr := imp.store.GetMessageMetadata(existingID)
-		if metadataErr != nil {
-			return false, false, fmt.Errorf("read existing meeting metadata: %w", metadataErr)
+	if archived, ok := existing[smid]; ok && !opts.Full {
+		var meta meetingMetadata
+		decodeErr := json.Unmarshal([]byte(archived.Metadata.String), &meta)
+		if archived.Metadata.Valid && decodeErr == nil && meta.SnapshotHash == snapshotHash {
+			return meetingarchive.Result{MessageID: archived.ID}, nil
 		}
-		var archived meetingMetadata
-		if metadata.Valid && json.Unmarshal([]byte(metadata.String), &archived) == nil &&
-			archived.SnapshotHash == snapshotHash {
-			return false, false, nil
-		}
-	}
-
-	var senderID int64
-	if organizerEmail != "" {
-		id, err := imp.store.EnsureParticipant(organizerEmail, organizerName, emailDomain(organizerEmail))
-		if err != nil {
-			return false, false, fmt.Errorf("organizer participant: %w", err)
-		}
-		senderID = id
-	}
-
-	// Attendees WITH an email become participants/recipients; name-only
-	// attendees appear in the body's Attendees line only, so we don't mint
-	// phantom address-less participant rows.
-	var attendeeIDs []int64
-	var attendeeNames []string
-	var attendeeEmails []string
-	for _, a := range m.Attendees {
-		email := normalizeEmail(a.Email)
-		if email == "" {
-			continue
-		}
-		pid, err := imp.store.EnsureParticipant(email, a.Name, emailDomain(email))
-		if err != nil {
-			return false, false, fmt.Errorf("attendee participant: %w", err)
-		}
-		attendeeIDs = append(attendeeIDs, pid)
-		attendeeNames = append(attendeeNames, a.Name)
-		attendeeEmails = append(attendeeEmails, email)
-	}
-
-	title := meetingTitle(m)
-	participants := make([]store.ConversationParticipantRef, 0, len(attendeeIDs))
-	for _, participantID := range attendeeIDs {
-		participants = append(participants, store.ConversationParticipantRef{ParticipantID: participantID, Role: "member"})
-	}
-
-	body := buildBody(m, tr)
-	sentAt := m.StartedAt().UTC()
-
-	message := &store.Message{
-		SourceID:                sourceID,
-		SourceMessageID:         smid,
-		MessageType:             MessageType,
-		SentAt:                  sql.NullTime{Time: sentAt, Valid: !sentAt.IsZero()},
-		SenderID:                sql.NullInt64{Int64: senderID, Valid: senderID != 0},
-		IsFromMe:                fromMe,
-		IdentityDerivedIsFromMe: fromMe,
-		Subject:                 sql.NullString{String: title, Valid: title != ""},
-		Snippet:                 sql.NullString{String: snippet(body), Valid: body != ""},
-		SizeEstimate:            int64(len(body)),
 	}
 
 	metaJSON, err := json.Marshal(imp.buildMetadata(
-		m, tr, identifier, organizerEmail, desiredTranscriptState, snapshotHash,
-	))
+		m, tr, opts.Identifier, organizerEmail, desiredTranscriptState, snapshotHash,
+	), json.Deterministic(true))
 	if err != nil {
-		return false, false, fmt.Errorf("marshal metadata: %w", err)
+		return meetingarchive.Result{}, fmt.Errorf("marshal metadata: %w", err)
 	}
-	metadata := sql.NullString{String: string(metaJSON), Valid: true}
-
 	raw, err := composeRaw(m, tr)
 	if err != nil {
-		return false, false, fmt.Errorf("compose raw: %w", err)
+		return meetingarchive.Result{}, fmt.Errorf("compose raw: %w", err)
 	}
-	// Replace recipients unconditionally so re-syncs clear stale rows
-	// (calsync precedent).
-	var fromIDs []int64
-	var fromNames []string
-	if senderID != 0 {
-		fromIDs = []int64{senderID}
-		fromNames = []string{organizerName}
+	// Name-only attendees stay in the body's Attendees line; Upsert drops
+	// people without an address.
+	attendees := make([]meetingarchive.Person, 0, len(m.Attendees))
+	for _, a := range m.Attendees {
+		attendees = append(attendees, meetingarchive.Person{Name: a.Name, Email: a.Email})
 	}
-	fts := &store.FTSDoc{
-		Subject:  title,
-		Body:     body,
-		FromAddr: organizerEmail,
-		ToAddrs:  strings.Join(attendeeEmails, " "),
-	}
-	if _, err := imp.store.PersistMessage(&store.MessagePersistData{
-		Message: message,
-		Conversation: &store.ConversationPersistData{
-			SourceConversationID: smid,
-			ConversationType:     ConversationType,
-			Title:                title,
-			Participants:         participants,
-		},
-		Metadata:  &metadata,
-		BodyText:  sql.NullString{String: body, Valid: body != ""},
-		RawMIME:   raw,
-		RawFormat: RawFormat,
-		Recipients: []store.RecipientSet{
-			{Type: "from", ParticipantIDs: fromIDs, DisplayNames: fromNames},
-			{Type: "to", ParticipantIDs: attendeeIDs, DisplayNames: attendeeNames},
-		},
-		PreserveLabels: true,
-		FTS:            fts,
-	}); err != nil {
-		return false, false, fmt.Errorf("persist meeting: %w", err)
-	}
-
-	return !existed, true, nil
+	body := buildBody(m, tr)
+	return meetingarchive.New(imp.store).Upsert(ctx, meetingarchive.Snapshot{
+		SourceID:             sourceID,
+		AccountEmail:         opts.AccountEmail,
+		SourceMessageID:      smid,
+		SourceConversationID: smid,
+		Title:                meetingTitle(m),
+		StartedAt:            m.StartedAt().UTC(),
+		Body:                 body,
+		Snippet:              meetingarchive.Snippet(body),
+		Metadata:             metaJSON,
+		Raw:                  raw,
+		RawFormat:            RawFormat,
+		Organizer:            &meetingarchive.Person{Name: organizerName, Email: organizerEmail},
+		Attendees:            attendees,
+	}, meetingarchive.UpsertOptions{Force: true})
 }
 
 func (imp *Importer) buildMetadata(
@@ -1068,6 +1001,7 @@ func (imp *Importer) buildMetadata(
 		DurationSeconds: m.DurationSecs(),
 		OrganizerEmail:  organizerEmail,
 		MeetingURL:      m.PlatformURL(),
+		JoinURL:         knownJoinURL(m.MeetingURL),
 		RecordingURL:    m.RecordingURL,
 		Tags:            m.Tags,
 		TranscriptState: desiredTranscriptState,
@@ -1104,11 +1038,31 @@ func (imp *Importer) buildMetadata(
 	return meta
 }
 
+// knownJoinURL preserves the usable provider URL, including passcodes and
+// context parameters. Join-key normalization belongs to the link projection.
+func knownJoinURL(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	u, err := url.Parse(trimmed)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") {
+		return ""
+	}
+	host := strings.ToLower(u.Hostname())
+	switch {
+	case host == "meet.google.com",
+		host == "teams.microsoft.com", host == "teams.live.com",
+		strings.HasSuffix(host, ".teams.microsoft.us"),
+		host == "zoom.us", strings.HasSuffix(host, ".zoom.us"),
+		host == "zoomgov.com", strings.HasSuffix(host, ".zoomgov.com"):
+		return trimmed
+	}
+	return ""
+}
+
 // composeRaw archives both tool payloads verbatim in one JSON object.
 func composeRaw(m *Meeting, tr *Transcript) ([]byte, error) {
-	payload := map[string]json.RawMessage{"meeting": m.Raw}
+	payload := map[string]jsontext.Value{"meeting": m.Raw}
 	if len(m.Raw) == 0 {
-		b, err := json.Marshal(m)
+		b, err := json.Marshal(m, json.Deterministic(true))
 		if err != nil {
 			return nil, err
 		}
@@ -1117,7 +1071,7 @@ func composeRaw(m *Meeting, tr *Transcript) ([]byte, error) {
 	if tr != nil && len(tr.Raw) > 0 {
 		payload["transcript"] = tr.Raw
 	}
-	return json.Marshal(payload)
+	return json.Marshal(payload, json.Deterministic(true))
 }
 
 func firstNonEmpty(values ...string) string {
@@ -1125,17 +1079,6 @@ func firstNonEmpty(values ...string) string {
 		if v != "" {
 			return v
 		}
-	}
-	return ""
-}
-
-func normalizeEmail(email string) string {
-	return strings.ToLower(strings.TrimSpace(email))
-}
-
-func emailDomain(email string) string {
-	if i := strings.LastIndex(email, "@"); i >= 0 {
-		return email[i+1:]
 	}
 	return ""
 }

@@ -34,6 +34,8 @@ type pgEngine struct {
 }
 
 var _ MessageBodySearcher = (*pgEngine)(nil)
+var _ DeletionTargetSearchResolver = (*pgEngine)(nil)
+var _ DeletionTargetAggregateSearchResolver = (*pgEngine)(nil)
 
 type deletionTargetsByMessageIDsResolver interface {
 	GetDeletionTargetsByMessageIDs(ctx context.Context, ids []int64) ([]DeletionTarget, error)
@@ -47,13 +49,40 @@ func (e *pgEngine) GetDeletionTargetsByMessageIDs(ctx context.Context, ids []int
 	return resolver.GetDeletionTargetsByMessageIDs(ctx, ids)
 }
 
+func (e *pgEngine) GetDeletionTargetsBySearch(
+	ctx context.Context,
+	searchQuery *search.Query,
+	filter MessageFilter,
+	mode DeletionSearchMode,
+) ([]DeletionTarget, error) {
+	resolver, ok := e.Engine.(DeletionTargetSearchResolver)
+	if !ok {
+		return nil, ErrNotImplemented
+	}
+	return resolver.GetDeletionTargetsBySearch(ctx, searchQuery, filter, mode)
+}
+
+func (e *pgEngine) GetDeletionTargetsByAggregateSearch(
+	ctx context.Context,
+	searchQuery string,
+	filter MessageFilter,
+	groupBy ViewType,
+	key string,
+) ([]DeletionTarget, error) {
+	resolver, ok := e.Engine.(DeletionTargetAggregateSearchResolver)
+	if !ok {
+		return nil, ErrNotImplemented
+	}
+	return resolver.GetDeletionTargetsByAggregateSearch(ctx, searchQuery, filter, groupBy, key)
+}
+
 // SearchMessageBodies forwards exact body-only search through the PostgreSQL
 // wrapper. pgEngine hides optional SQLite-only capabilities by default, so
 // capabilities implemented with PostgreSQL-safe SQL must be promoted
 // explicitly.
 func (e *pgEngine) SearchMessageBodies(
 	ctx context.Context, q *search.Query, limit, offset int,
-) ([]MessageSummary, error) {
+) (*SearchFastResult, error) {
 	bodySearcher, ok := e.Engine.(MessageBodySearcher)
 	if !ok {
 		return nil, ErrMessageBodySearchUnavailable
@@ -84,4 +113,34 @@ func NewEngine(db *sql.DB, isPostgres bool) Engine {
 		return NewPostgreSQLEngine(db)
 	}
 	return NewSQLiteEngine(db)
+}
+
+var _ OriginalMessageReader = (*pgEngine)(nil)
+
+// ReadOriginalMessage forwards to the dialect-parameterized engine; its SQL
+// is portable across SQLite and PostgreSQL.
+func (e *pgEngine) ReadOriginalMessage(ctx context.Context, ref MessageRef, maxBytes int64) (*OriginalMessage, error) {
+	reader, ok := e.Engine.(OriginalMessageReader)
+	if !ok {
+		return nil, ErrOriginalExportUnsupported
+	}
+	return reader.ReadOriginalMessage(ctx, ref, maxBytes)
+}
+
+// ResolveMessageID forwards to the dialect-parameterized engine.
+func (e *pgEngine) ResolveMessageID(ctx context.Context, ref string) (int64, string, error) {
+	resolver, ok := e.Engine.(MessageIDResolver)
+	if !ok {
+		return 0, "", ErrOriginalExportUnsupported
+	}
+	return resolver.ResolveMessageID(ctx, ref)
+}
+
+// ListThread forwards to the dialect-parameterized engine.
+func (e *pgEngine) ListThread(ctx context.Context, q ThreadQuery) (*ThreadPage, error) {
+	reader, ok := e.Engine.(OriginalMessageReader)
+	if !ok {
+		return nil, ErrOriginalExportUnsupported
+	}
+	return reader.ListThread(ctx, q)
 }

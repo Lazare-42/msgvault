@@ -3,9 +3,10 @@ package cmd
 import (
 	"context"
 	"crypto/subtle"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -197,9 +198,7 @@ func (h *whatsappLiveAPIHandler) sendMessage(w http.ResponseWriter, r *http.Requ
 	}
 
 	var req whatsappAPISendRequest
-	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024*1024))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&req); err != nil {
+	if err := json.UnmarshalRead(http.MaxBytesReader(w, r.Body, 1024*1024), &req, json.RejectUnknownMembers(true)); err != nil {
 		http.Error(w, fmt.Sprintf("invalid JSON: %v", err), http.StatusBadRequest)
 		return
 	}
@@ -227,5 +226,7 @@ func (h *whatsappLiveAPIHandler) sendMessage(w http.ResponseWriter, r *http.Requ
 
 func writeAPIJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(v)
+	if err := json.MarshalWrite(w, v); err != nil {
+		slog.Warn("encode whatsapp API response", "err", err)
+	}
 }

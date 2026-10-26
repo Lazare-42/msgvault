@@ -157,9 +157,11 @@ func TestStoreAttachmentFileDurableStoresEmptyContent(t *testing.T) {
 	emptyHash := hex.EncodeToString(emptySum[:])
 	att := &mime.Attachment{ContentHash: emptyHash}
 
-	storagePath, err := StoreAttachmentFileDurable(dir, att)
+	receipt, err := StoreAttachmentFileDurable(dir, att)
 	require.NoError(err)
+	storagePath := receipt.StoragePath
 	assert.Equal(path.Join(emptyHash[:2], emptyHash), storagePath)
+	assert.True(receipt.Created)
 	assert.Equal(emptyHash, att.ContentHash)
 	info, err := os.Lstat(filepath.Join(dir, filepath.FromSlash(storagePath)))
 	require.NoError(err)
@@ -167,6 +169,27 @@ func TestStoreAttachmentFileDurableStoresEmptyContent(t *testing.T) {
 	assert.Zero(info.Size())
 
 	skipped, err := StoreAttachmentFile(t.TempDir(), &mime.Attachment{ContentHash: emptyHash})
+	require.NoError(err)
+	assert.Empty(skipped, "ordinary ingest must keep its empty-content skip semantics")
+}
+
+func TestStoreAttachmentFileIncludingEmptyStoresPresentEmptyContent(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	dir := t.TempDir()
+	const emptySHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	att := &mime.Attachment{Content: []byte{}}
+
+	storagePath, err := StoreAttachmentFileIncludingEmpty(dir, att)
+	require.NoError(err)
+	assert.Equal(path.Join(emptySHA256[:2], emptySHA256), storagePath)
+	assert.Equal(emptySHA256, att.ContentHash)
+	info, err := os.Lstat(filepath.Join(dir, filepath.FromSlash(storagePath)))
+	require.NoError(err)
+	assert.True(info.Mode().IsRegular())
+	assert.Zero(info.Size())
+
+	skipped, err := StoreAttachmentFile(t.TempDir(), &mime.Attachment{Content: []byte{}})
 	require.NoError(err)
 	assert.Empty(skipped, "ordinary ingest must keep its empty-content skip semantics")
 }
@@ -196,9 +219,10 @@ func TestStoreAttachmentFileDurableSurfacesParentSyncFailure(t *testing.T) {
 	require.ErrorIs(err, syncErr)
 
 	pack.SyncDir = originalSyncDir
-	storagePath, err := StoreAttachmentFileDurable(dir, att)
+	receipt, err := StoreAttachmentFileDurable(dir, att)
 	require.NoError(err, "retry must validate and durably reuse loose residue")
-	require.FileExists(filepath.Join(dir, filepath.FromSlash(storagePath)))
+	assert.False(t, receipt.Created)
+	require.FileExists(filepath.Join(dir, filepath.FromSlash(receipt.StoragePath)))
 }
 
 func TestStoreAttachmentFileDurableRejectsCanonicalSymlink(t *testing.T) {

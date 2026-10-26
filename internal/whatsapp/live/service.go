@@ -3,7 +3,7 @@ package live
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -216,20 +216,20 @@ func (s *Service) LoginState(ctx context.Context) (LoginState, error) {
 	}, nil
 }
 
-func (s *Service) requireReady(ctx context.Context) (Status, error) {
+func (s *Service) requireReady(ctx context.Context) error {
 	status, err := s.Status(ctx)
 	if err != nil {
-		return Status{}, err
+		return err
 	}
 	if !status.IsReady() {
-		return status, fmt.Errorf(
+		return fmt.Errorf(
 			"whatsapp is not ready: paired=%t connected=%t logged_in=%t; run whatsapp_start_login and wait for ready=true before sending",
 			status.Paired,
 			status.Connected,
 			status.LoggedIn,
 		)
 	}
-	return status, nil
+	return nil
 }
 
 func (s *Service) SendMessage(ctx context.Context, req SendMessageRequest) (SendResult, error) {
@@ -244,7 +244,7 @@ func (s *Service) SendMessage(ctx context.Context, req SendMessageRequest) (Send
 	if req.LocalRequestID == "" {
 		req.LocalRequestID = uuid.NewString()
 	}
-	if _, err := s.requireReady(ctx); err != nil {
+	if err := s.requireReady(ctx); err != nil {
 		return SendResult{}, err
 	}
 
@@ -301,7 +301,7 @@ func (s *Service) SendMessage(ctx context.Context, req SendMessageRequest) (Send
 		remote.Timestamp = s.now()
 	}
 
-	raw, _ := json.Marshal(map[string]any{
+	raw, marshalErr := json.Marshal(map[string]any{
 		"direction":         "outbound",
 		"local_request_id":  req.LocalRequestID,
 		"chat_jid":          remote.ChatJID,
@@ -309,6 +309,9 @@ func (s *Service) SendMessage(ctx context.Context, req SendMessageRequest) (Send
 		"body":              req.Body,
 		"sent_at":           remote.Timestamp,
 	})
+	if marshalErr != nil {
+		s.logger.Warn("encode sent whatsapp message", "err", marshalErr)
+	}
 	messageID, archiveErr := s.ArchiveInbound(ctx, InboundMessage{
 		Account:   source.Identifier,
 		ChatJID:   remote.ChatJID,
@@ -379,7 +382,7 @@ func (s *Service) SendReaction(ctx context.Context, req SendReactionRequest) (Se
 	if req.LocalRequestID == "" {
 		req.LocalRequestID = uuid.NewString()
 	}
-	if _, err := s.requireReady(ctx); err != nil {
+	if err := s.requireReady(ctx); err != nil {
 		return SendResult{}, err
 	}
 
@@ -482,7 +485,7 @@ func (s *Service) RequestHistorySync(ctx context.Context, req RequestHistorySync
 	if req.ChatID == "" {
 		return RequestHistorySyncResult{}, errors.New("chat_id is required")
 	}
-	if _, err := s.requireReady(ctx); err != nil {
+	if err := s.requireReady(ctx); err != nil {
 		return RequestHistorySyncResult{}, err
 	}
 	syncer, ok := s.transport.(HistorySyncTransport)
@@ -656,7 +659,11 @@ func (s *Service) archiveInbound(ctx context.Context, msg InboundMessage, recomp
 	}
 	raw := msg.RawJSON
 	if len(raw) == 0 {
-		raw, _ = json.Marshal(msg)
+		var err error
+		raw, err = json.Marshal(msg)
+		if err != nil {
+			return 0, fmt.Errorf("encode whatsapp archive message: %w", err)
+		}
 	}
 	if len(raw) > 0 {
 		if err := s.store.UpsertMessageRawWithFormat(messageID, raw, store.WhatsAppRawFormat); err != nil {

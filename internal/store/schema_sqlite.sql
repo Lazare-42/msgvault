@@ -9,9 +9,11 @@ CREATE TABLE IF NOT EXISTS archive_metadata (
 -- lives in schema.sql's carddav_address_book_urls table so canonical and alias
 -- URLs cannot collide across columns.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_carddav_one_write_target
-    ON carddav_address_books(account_id) WHERE is_write_target = TRUE;
+    ON carddav_address_books((1)) WHERE is_write_target = TRUE;
 CREATE INDEX IF NOT EXISTS idx_carddav_resources_person
     ON carddav_resources(person_id) WHERE person_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_carddav_resources_remote_uid
+    ON carddav_resources(remote_uid) WHERE remote_uid IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_carddav_publications_pending
     ON carddav_publications(pending_operation, person_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_carddav_one_unresolved_conflict
@@ -32,12 +34,6 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     tokenize='unicode61 remove_diacritics 1'
 );
 
-CREATE VIRTUAL TABLE IF NOT EXISTS attachment_ocr_fts USING fts5(
-    content_hash UNINDEXED,
-    page_number UNINDEXED,
-    text,
-    tokenize='unicode61 remove_diacritics 1'
-);
 -- Document chunks keep canonical text in document_chunks. This external-
 -- content index is a rebuildable derivative and never owns excerpts.
 CREATE VIRTUAL TABLE IF NOT EXISTS document_chunks_fts USING fts5(
@@ -64,3 +60,9 @@ AFTER UPDATE OF text ON document_chunks BEGIN
     VALUES ('delete', old.id, old.text);
     INSERT INTO document_chunks_fts(rowid, text) VALUES (new.id, new.text);
 END;
+CREATE VIRTUAL TABLE IF NOT EXISTS attachment_ocr_fts USING fts5(
+    content_hash UNINDEXED,
+    page_number UNINDEXED,
+    text,
+    tokenize='unicode61 remove_diacritics 1'
+);

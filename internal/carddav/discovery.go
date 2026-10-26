@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 
+	"go.kenn.io/msgvault/internal/netguard"
 	"go.kenn.io/msgvault/internal/store"
 )
 
@@ -53,6 +54,12 @@ func Discover(ctx context.Context, client *Client, enteredURL string) (Discovery
 	}
 	operationCtx, cancel := context.WithTimeout(ctx, client.operationTimeout)
 	defer cancel()
+	return discoverWithBudget(operationCtx, client, enteredURL, &Budget{remaining: client.operationBytes})
+}
+
+func discoverWithBudget(
+	operationCtx context.Context, client *Client, enteredURL string, budget *Budget,
+) (Discovery, error) {
 	entered, err := url.Parse(enteredURL)
 	if err != nil {
 		return Discovery{}, fmt.Errorf("parse CardDAV base URL: %w", ErrUnsafeTarget)
@@ -60,7 +67,6 @@ func Discover(ctx context.Context, client *Client, enteredURL string) (Discovery
 	if _, err := client.validateTarget(operationCtx, entered); err != nil {
 		return Discovery{}, err
 	}
-	budget := &operationBudget{remaining: client.operationBytes}
 
 	principal, directErr := discoverHref(operationCtx, client, entered, CurrentUserPrincipalProperty, budget)
 	if directErr != nil || principal == nil {
@@ -110,16 +116,16 @@ func Discover(ctx context.Context, client *Client, enteredURL string) (Discovery
 
 // DiscoverConnection validates the configured connection without persisting it.
 func (s *Service) DiscoverConnection(ctx context.Context, baseURL string) (Discovery, error) {
-	if s == nil || s.client == nil {
+	if s == nil || s.remote == nil {
 		return Discovery{}, errors.New("CardDAV service is not configured")
 	}
-	return Discover(ctx, s.client, baseURL)
+	return s.remote.Discover(ctx, baseURL)
 }
 
 // DiscoverAndPersist validates the configured connection and atomically
 // replaces the durable discovery snapshot through the shared service.
 func (s *Service) DiscoverAndPersist(ctx context.Context, baseURL, username string) (Discovery, error) {
-	if s == nil || s.store == nil || s.client == nil {
+	if s == nil || s.store == nil || s.remote == nil {
 		return Discovery{}, errors.New("CardDAV service is not configured")
 	}
 	discovery, err := s.DiscoverConnection(ctx, baseURL)
@@ -146,7 +152,8 @@ func (s *Service) PersistDiscovery(
 	}
 	homeURLs := discoveryHomeURLStrings(discovery)
 	input := store.CardDAVDiscoveryInput{
-		BaseURL: baseURL, Username: username, CredentialsChanged: credentialsChanged,
+		ConnectionName: s.ConnectionName(),
+		BaseURL:        baseURL, Username: username, CredentialsChanged: credentialsChanged,
 		PrincipalURL: discovery.PrincipalURL.String(), HomeURL: discovery.HomeURL.String(), HomeURLs: homeURLs,
 		Books: make([]store.CardDAVDiscoveredBook, 0, len(discovery.Books)),
 	}
@@ -196,7 +203,7 @@ func urlString(value *url.URL) string {
 }
 
 func discoverHref(
-	ctx context.Context, client *Client, target *url.URL, property PropertyName, budget *operationBudget,
+	ctx context.Context, client *Client, target *url.URL, property PropertyName, budget *Budget,
 ) (*url.URL, error) {
 	hrefs, err := discoverHrefs(ctx, client, target, property, budget)
 	if err != nil {
@@ -212,7 +219,7 @@ func discoverHref(
 }
 
 func discoverHrefs(
-	ctx context.Context, client *Client, target *url.URL, property PropertyName, budget *operationBudget,
+	ctx context.Context, client *Client, target *url.URL, property PropertyName, budget *Budget,
 ) ([]*url.URL, error) {
 	body, err := PropfindBody([]PropertyName{property})
 	if err != nil {
@@ -277,7 +284,7 @@ func discoverHrefs(
 }
 
 func discoverBooks(
-	ctx context.Context, client *Client, home *url.URL, budget *operationBudget,
+	ctx context.Context, client *Client, home *url.URL, budget *Budget,
 ) ([]DiscoveredBook, error) {
 	body, err := PropfindBody([]PropertyName{
 		ResourceTypeProperty,
@@ -383,6 +390,12 @@ func mergeSuccessfulProperties(propStats []PropStat) Properties {
 			continue
 		}
 		properties := propStat.Properties
+		if properties.SyncToken != "" {
+			merged.SyncToken = properties.SyncToken
+		}
+		if properties.CurrentUserPrincipal != "" {
+			merged.CurrentUserPrincipal = properties.CurrentUserPrincipal
+		}
 		if properties.DisplayName != "" {
 			merged.DisplayName = properties.DisplayName
 		}
@@ -472,7 +485,7 @@ func sameCollectionURL(left, right *url.URL) bool {
 func canonicalDAVURLIdentity(value *url.URL) string {
 	clone := *value
 	clone.Scheme = strings.ToLower(clone.Scheme)
-	clone.Host = net.JoinHostPort(strings.ToLower(clone.Hostname()), originPort(&clone))
+	clone.Host = net.JoinHostPort(strings.ToLower(clone.Hostname()), netguard.EffectivePort(&clone))
 	clone.Fragment = ""
 	return clone.String()
 }
@@ -480,7 +493,7 @@ func canonicalDAVURLIdentity(value *url.URL) string {
 func canonicalCollectionURL(value *url.URL) string {
 	clone := *value
 	clone.Scheme = strings.ToLower(clone.Scheme)
-	clone.Host = net.JoinHostPort(strings.ToLower(clone.Hostname()), originPort(&clone))
+	clone.Host = net.JoinHostPort(strings.ToLower(clone.Hostname()), netguard.EffectivePort(&clone))
 	clone.Fragment = ""
 	clone.Path = path.Clean(clone.Path)
 	if !strings.HasSuffix(clone.Path, "/") {

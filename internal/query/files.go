@@ -2,11 +2,12 @@ package query
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"strings"
 	"time"
 
+	"go.kenn.io/msgvault/internal/filemeta"
 	"go.kenn.io/msgvault/internal/identityindex"
 	"go.kenn.io/msgvault/internal/personscope"
 )
@@ -107,7 +108,7 @@ type FileRow struct {
 	ParticipantIDs     []int64               `json:"participant_ids,omitempty"`
 	ParticipantLabels  []string              `json:"participant_labels,omitempty"`
 	ParticipantDomains []string              `json:"participant_domains,omitempty"`
-	PersonProvenance   *PersonFileProvenance `json:"person_provenance,omitempty"`
+	PersonProvenance   *PersonFileProvenance `json:"person_provenance,omitzero" nullable:"false"`
 }
 
 type FileSearchResponse struct {
@@ -282,7 +283,7 @@ func (e *DuckDBEngine) GroupFiles(ctx context.Context, request FileGroupRequest)
 	if err := validateFileMIMEFamilies(request.MIMEFamilies); err != nil {
 		return nil, err
 	}
-	spec, err := fileGroupExpressions(request.Dimension, e.identityActivityPath(),
+	spec, err := fileGroupExpressions(request.Dimension,
 		e.parquetPath(identityindex.DatasetPeople), e.parquetPath(datasetParticipants))
 	if err != nil {
 		return nil, err
@@ -564,7 +565,7 @@ func buildFileConditions(filenameQuery string, mimeFamilies []FileMIMEFamily) (s
 // rows but still receives file attributions here — so a base-participants
 // lookup backstops the people-dataset label before the constant fallback.
 func fileGroupExpressions(
-	dimension, activityGlob, peopleGlob, participantsGlob string,
+	dimension, peopleGlob, participantsGlob string,
 ) (groupExpressions, error) {
 	simple := func(key string) groupExpressions {
 		return groupExpressions{key: key, label: key, groupBy: key, source: "file_population"}
@@ -582,8 +583,7 @@ func fileGroupExpressions(
 , participant_files AS (
 	SELECT DISTINCT f.attachment_id, a.canonical_id AS person_id, f.occurred_at, f.size
 	FROM file_population f
-	JOIN read_parquet('` + activityGlob + `',
-		hive_partitioning=true, union_by_name=true) a ON a.message_id = f.message_id
+	JOIN relationship_activity_expanded a ON a.message_id = f.message_id
 	WHERE a.canonical_id IS NOT NULL
 	  AND (a.is_direct OR a.is_conversation_member)
 ), participant_file_labels AS (
@@ -603,14 +603,18 @@ func fileGroupExpressions(
 , domain_files AS (
 	SELECT DISTINCT f.attachment_id, a.participant_domain AS group_value, f.occurred_at, f.size
 	FROM file_population f
-	JOIN read_parquet('` + activityGlob + `',
-		hive_partitioning=true, union_by_name=true) a ON a.message_id = f.message_id
+	JOIN relationship_activity_expanded a ON a.message_id = f.message_id
 	WHERE a.participant_domain <> ''
 )`,
 			source: "domain_files",
 		}, nil
 	case messageTypeDimension:
 		return simple(sqlMessageTypeGroupExpr()), nil
+	case "mailing_list":
+		return groupExpressions{
+			key: "MIN(list_id)", label: "MIN(list_id)", groupBy: "LOWER(list_id)",
+			source: "file_population", whereSuffix: " WHERE list_id IS NOT NULL AND list_id <> ''",
+		}, nil
 	case "kind":
 		return simple("'file'"), nil
 	case "year":
@@ -646,20 +650,7 @@ func fileSearchOrder(sort SortSpec) (string, error) {
 // mapping for attachment alias a. Shared by the population
 // CTE and the fast-path count scan so classifications cannot drift.
 func sqlFileMIMEFamilyExpr() string {
-	mime := "lower(a.mime_type)"
-	return `CASE
-			WHEN ` + mime + ` LIKE 'image/%' THEN 'image'
-			WHEN ` + mime + ` = 'application/pdf' THEN 'pdf'
-			WHEN ` + mime + ` LIKE 'audio/%' THEN 'audio'
-			WHEN ` + mime + ` LIKE 'video/%' THEN 'video'
-			WHEN ` + mime + ` LIKE 'text/%' THEN 'text'
-			WHEN ` + mime + ` IN ('application/msword', 'application/rtf',
-				'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-				'application/vnd.oasis.opendocument.text') THEN 'document'
-			WHEN ` + mime + ` IN ('application/zip', 'application/gzip', 'application/x-tar',
-				'application/x-7z-compressed', 'application/x-rar-compressed') THEN 'archive'
-			ELSE 'other'
-		END`
+	return filemeta.MIMEFamilySQL("a.mime_type")
 }
 
 // fileFilteredCTE renders the selected → classified → filtered CTE chain

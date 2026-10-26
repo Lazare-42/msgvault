@@ -10,10 +10,12 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
-	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
+
+	"go.kenn.io/msgvault/internal/envutil"
 )
 
 // EmbeddingAPIFormat selects the request and response contract used by the
@@ -74,8 +76,6 @@ const (
 	// manifest whose probe authorized them.
 	multimodalAnimatedGIFDefault = false
 )
-
-var environmentVariableName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // Config is the top-level vector-search configuration, loaded from the
 // [vector] TOML table.
@@ -173,16 +173,6 @@ func (m MultimodalConfig) ImageQueriesEnabled() bool {
 	return m.Enabled && m.configuredImageQueries()
 }
 
-// APIKey resolves the configured key without making its presence an
-// enablement signal. Callers must pass the independent enablement and consent
-// gates before using the returned value.
-func (m MultimodalConfig) APIKey() string {
-	if m.APIKeyEnv == "" {
-		return ""
-	}
-	return lookupEnv(m.APIKeyEnv)
-}
-
 // EmbeddingsConfig configures the external embedding endpoint used to convert
 // message text into vectors.
 type EmbeddingsConfig struct {
@@ -228,7 +218,16 @@ func (e EmbeddingsConfig) Validate() error {
 	}
 	u, err := url.Parse(e.Endpoint)
 	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
-		return fmt.Errorf("vector.embeddings.endpoint: must be an http or https URL with a host (got %q)", e.Endpoint)
+		return errors.New("vector.embeddings.endpoint: must be an http or https URL with a host")
+	}
+	if u.User != nil {
+		return errors.New("vector.embeddings.endpoint: must not contain credentials")
+	}
+	if u.RawQuery != "" {
+		return errors.New("vector.embeddings.endpoint: must not contain a query")
+	}
+	if u.Fragment != "" {
+		return errors.New("vector.embeddings.endpoint: must not contain a fragment")
 	}
 	if e.Model == "" {
 		return fmt.Errorf("vector.embeddings.model: required (the index generation fingerprint is %q, which is ambiguous without a model name)", e.Fingerprint())
@@ -369,7 +368,22 @@ type SearchConfig struct {
 	KPerSignal        int     `toml:"k_per_signal"`
 	SubjectBoost      float64 `toml:"subject_boost"`
 	MaxPageSizeHybrid *int    `toml:"max_page_size_hybrid"`
+	SQLiteAccelerator string  `toml:"sqlite_accelerator"`
+	ANNNProbe         int     `toml:"ann_nprobe"`
+	ANNOversample     int     `toml:"ann_oversample"`
+	ANNThreads        int     `toml:"ann_threads"`
 }
+
+// DefaultMaxPageSizeHybrid is the hybrid page cap applied when config.toml
+// omits max_page_size_hybrid. Settings suggests the same value when the cap
+// is switched back on, so the two cannot drift apart.
+const (
+	DefaultMaxPageSizeHybrid = 50
+	DefaultSQLiteAccelerator = "auto"
+	DefaultANNNProbe         = 8
+	DefaultANNOversample     = 8
+	MaxANNThreads            = 128
+)
 
 // MaxPageSizeHybridClamp returns the effective per-request limit
 // clamp: zero means "no clamp", a positive value means "clamp to N".
@@ -562,6 +576,21 @@ func (c *Config) Validate() error {
 			return err
 		}
 	}
+	switch c.Search.SQLiteAccelerator {
+	case "", "auto", "exact":
+	default:
+		return fmt.Errorf("vector.search.sqlite_accelerator: must be %q or %q, got %q",
+			"auto", "exact", c.Search.SQLiteAccelerator)
+	}
+	if c.Search.ANNNProbe < 0 || c.Search.ANNNProbe > 65_536 {
+		return fmt.Errorf("vector.search.ann_nprobe: zero selects the default; otherwise must be between 1 and 65536, got %d", c.Search.ANNNProbe)
+	}
+	if c.Search.ANNOversample < 0 || c.Search.ANNOversample > 128 {
+		return fmt.Errorf("vector.search.ann_oversample: zero selects the default; otherwise must be between 1 and 128, got %d", c.Search.ANNOversample)
+	}
+	if c.Search.ANNThreads < 0 || c.Search.ANNThreads > MaxANNThreads {
+		return fmt.Errorf("vector.search.ann_threads: zero selects the default; otherwise must be between 1 and %d, got %d", MaxANNThreads, c.Search.ANNThreads)
+	}
 	return nil
 }
 
@@ -586,7 +615,7 @@ func (m MultimodalConfig) validate() error {
 		return fmt.Errorf("vector.multimodal.endpoint: only the pinned provider endpoint %s is supported (got %q)",
 			defaultMultimodalEndpoint, m.Endpoint)
 	}
-	if m.APIKeyEnv == "" || !environmentVariableName.MatchString(m.APIKeyEnv) {
+	if !envutil.ValidName(m.APIKeyEnv) {
 		return fmt.Errorf("vector.multimodal.api_key_env: must be a valid environment variable name, got %q", m.APIKeyEnv)
 	}
 	if m.Model != "voyage-multimodal-3.5" {
@@ -659,8 +688,20 @@ func (c *Config) ApplyDefaults() {
 		c.Search.SubjectBoost = 2.0
 	}
 	if c.Search.MaxPageSizeHybrid == nil {
-		v := 50
+		v := DefaultMaxPageSizeHybrid
 		c.Search.MaxPageSizeHybrid = &v
+	}
+	if c.Search.SQLiteAccelerator == "" {
+		c.Search.SQLiteAccelerator = DefaultSQLiteAccelerator
+	}
+	if c.Search.ANNNProbe == 0 {
+		c.Search.ANNNProbe = DefaultANNNProbe
+	}
+	if c.Search.ANNOversample == 0 {
+		c.Search.ANNOversample = DefaultANNOversample
+	}
+	if c.Search.ANNThreads == 0 {
+		c.Search.ANNThreads = min(runtime.GOMAXPROCS(0), MaxANNThreads)
 	}
 	c.Multimodal.Provider = strings.ToLower(strings.TrimSpace(c.Multimodal.Provider))
 	if c.Multimodal.Provider == "" {
@@ -689,13 +730,4 @@ func (c *Config) ApplyDefaults() {
 	// without overwriting an explicit false from the config file. The
 	// StripQuotesEnabled / StripSignaturesEnabled helpers resolve the
 	// effective value.
-}
-
-// APIKey resolves the API key from the env var named in APIKeyEnv.
-// Returns "" if APIKeyEnv is empty or the variable is unset.
-func (e EmbeddingsConfig) APIKey() string {
-	if e.APIKeyEnv == "" {
-		return ""
-	}
-	return lookupEnv(e.APIKeyEnv)
 }

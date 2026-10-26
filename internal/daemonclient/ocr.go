@@ -42,11 +42,9 @@ func (c *Client) OCRStatus(ctx context.Context) (*store.OCRRuntimeStatus, error)
 	}
 	return &store.OCRRuntimeStatus{
 		Enabled: resp.JSON200.Enabled, Fingerprint: resp.JSON200.ExtractorFingerprint,
-		OCRSummary: store.OCRSummary{
-			Pending: resp.JSON200.Pending, Running: resp.JSON200.Running,
-			Ready: resp.JSON200.Ready, Failed: resp.JSON200.Failed,
-			Exhausted: resp.JSON200.Exhausted, Unsupported: resp.JSON200.Unsupported,
-		},
+		Pending: resp.JSON200.Pending, Running: resp.JSON200.Running,
+		Ready: resp.JSON200.Ready, Failed: resp.JSON200.Failed,
+		Exhausted: resp.JSON200.Exhausted, Unsupported: resp.JSON200.Unsupported,
 	}, nil
 }
 

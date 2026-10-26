@@ -24,6 +24,31 @@ func captureAttachmentQueryLogs(t *testing.T) *bytes.Buffer {
 	return &logs
 }
 
+func TestMessageMIMEAttachmentsContextIncludesOccurrenceState(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	st := testutil.NewTestStore(t)
+	source, err := st.GetOrCreateSource("imap", "attachment-refs@example.test")
+	requirements.NoError(err)
+	conversationID, err := st.EnsureConversation(source.ID, "attachment-refs", "Attachment refs")
+	requirements.NoError(err)
+	messageID := insertStoreTestMessage(t, st, source.ID, conversationID, "attachment-refs-message")
+	hash := strings.Repeat("a", 64)
+	requirements.NoError(st.UpsertAttachmentRecord(t.Context(), messageID, store.AttachmentWrite{
+		Filename: "report.txt", MIMEType: "text/plain", StoragePath: "aa/" + hash,
+		ContentHash: hash, Size: 12, SourcePartKey: "mime:1", ContentID: "part@example.test",
+		Role: store.AttachmentRoleInline, RoleSource: store.AttachmentRoleSourceMIMEDisposition,
+		State: attachmentpolicy.StateStored,
+	}))
+	refs, err := st.MessageMIMEAttachmentsContext(t.Context(), messageID)
+	requirements.NoError(err)
+	requirements.Len(refs, 1)
+	assertions.Equal("report.txt", refs[0].Filename)
+	assertions.Equal("mime:1", refs[0].SourcePartKey)
+	assertions.Equal(attachmentpolicy.StateStored, refs[0].State)
+	assertions.Equal("part@example.test", refs[0].ContentID)
+}
+
 func persistedProviderRef(ref store.AttachmentRef) store.AttachmentRef {
 	if ref.Role == "" {
 		ref.Role = store.AttachmentRoleUnknown
@@ -109,8 +134,8 @@ func TestListDiscordPendingAttachmentMessagesGroupsScopesAndOrders(t *testing.T)
 	pending, err := st.ListDiscordPendingAttachmentMessages(source.ID)
 	require.NoError(err)
 	assert.Equal([]store.DiscordPendingAttachmentMessage{
-		{MessageID: firstPendingID, SourceMessageID: "pending-first", ChatID: "channel-target"},
-		{MessageID: mixedPendingID, SourceMessageID: "pending-mixed", ChatID: "channel-target"},
+		{MessageID: firstPendingID, ConversationID: conversationID, SourceMessageID: "pending-first", ChatID: "channel-target"},
+		{MessageID: mixedPendingID, ConversationID: conversationID, SourceMessageID: "pending-mixed", ChatID: "channel-target"},
 	}, pending)
 }
 
@@ -151,8 +176,8 @@ func TestListDiscordAttachmentMessagesIncludesCompletedAndPendingInOneQuery(t *t
 	items, err := st.ListDiscordAttachmentMessages(source.ID)
 	require.NoError(err)
 	assert.Equal([]store.DiscordPendingAttachmentMessage{
-		{MessageID: completedID, SourceMessageID: "completed", ChatID: "channel-all", ConversationType: "channel", ParticipantCount: 12},
-		{MessageID: pendingID, SourceMessageID: "pending", ChatID: "channel-all", ConversationType: "channel", ParticipantCount: 12},
+		{MessageID: completedID, ConversationID: conversationID, SourceMessageID: "completed", ChatID: "channel-all", ConversationType: "channel", ParticipantCount: 12},
+		{MessageID: pendingID, ConversationID: conversationID, SourceMessageID: "pending", ChatID: "channel-all", ConversationType: "channel", ParticipantCount: 12},
 	}, items)
 	assert.Equal(1, strings.Count(logs.String(), `"kind":"query"`), "all-attachment scan must use one query")
 }
@@ -247,7 +272,7 @@ func TestReplaceMessageDiscordAttachmentsPersistsEmptyURLMarker(t *testing.T) {
 	pending, err := st.ListDiscordPendingAttachmentMessages(source.ID)
 	require.NoError(err)
 	assert.Equal([]store.DiscordPendingAttachmentMessage{{
-		MessageID: messageID, SourceMessageID: "345678901234567890", ChatID: "234567890123456789",
+		MessageID: messageID, ConversationID: conversationID, SourceMessageID: "345678901234567890", ChatID: "234567890123456789",
 	}}, pending)
 }
 
@@ -290,7 +315,7 @@ func TestBeeperHashlessLocalPathRemainsPending(t *testing.T) {
 	pending, err := st.ListBeeperPendingAttachmentMessages(source.ID)
 	require.NoError(err)
 	assert.Equal([]store.BeeperPendingAttachmentMessage{{
-		MessageID: messageID, SourceMessageID: "message-1", ChatID: "chat-1",
+		MessageID: messageID, ConversationID: conversationID, SourceMessageID: "message-1", ChatID: "chat-1",
 	}}, pending)
 
 	refs, err := st.MessageBeeperAttachments(messageID)
@@ -300,6 +325,39 @@ func TestBeeperHashlessLocalPathRemainsPending(t *testing.T) {
 	require.NoError(err)
 	require.Len(message.Attachments, 1)
 	assert.Empty(message.Attachments[0].ContentHash)
+}
+
+func TestBeeperUnavailableAttachmentIsNeverRetried(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+	source, err := st.GetOrCreateSource("beeper", "synthetic-account")
+	require.NoError(err)
+	conversationID, err := st.EnsureConversationWithType(source.ID, "chat-1", "direct_chat", "synthetic chat")
+	require.NoError(err)
+	messageID := insertStoreTestMessage(t, st, source.ID, conversationID, "message-1")
+	require.NoError(st.ReplaceMessageBeeperAttachments(messageID, []store.AttachmentRef{{
+		StoragePath: "mxc://example.test/expired", SourceAttachmentID: "beeper:mxc://example.test/expired",
+		State: attachmentpolicy.StateUnavailable, SkipReason: attachmentpolicy.SkipSourceUnavailable,
+	}}))
+
+	retryable, err := st.ListBeeperRetryableAttachmentMessages(source.ID, attachmentpolicy.Policy{})
+	require.NoError(err)
+	assert.Empty(retryable)
+	pending, err := st.ListBeeperPendingAttachmentMessages(source.ID)
+	require.NoError(err)
+	assert.Empty(pending)
+
+	result, err := st.ApplyBeeperRetryableAttachmentPolicy(
+		t.Context(), source.ID, attachmentpolicy.Policy{Scope: attachmentpolicy.ScopeNone})
+	require.NoError(err)
+	assert.Zero(result.NewlySkipped)
+	assert.False(result.HasExcluded)
+	refs, err := st.MessageBeeperAttachments(messageID)
+	require.NoError(err)
+	ref := refs["beeper:mxc://example.test/expired"]
+	assert.Equal(attachmentpolicy.StateUnavailable, ref.State)
+	assert.Equal(attachmentpolicy.SkipSourceUnavailable, ref.SkipReason)
 }
 
 func TestSlackAliasRowsServeHashesThroughMessageAPI(t *testing.T) {
@@ -451,6 +509,7 @@ func TestListDiscordPendingAttachmentMessages(t *testing.T) {
 	require.NoError(err)
 	assert.Equal([]store.DiscordPendingAttachmentMessage{{
 		MessageID:       pendingMessageID,
+		ConversationID:  conversationID,
 		SourceMessageID: "345678901234567890",
 		ChatID:          "234567890123456789",
 	}}, items)
@@ -459,7 +518,79 @@ func TestListDiscordPendingAttachmentMessages(t *testing.T) {
 	require.NoError(err)
 	assert.Equal([]store.BeeperPendingAttachmentMessage{{
 		MessageID:       downloadedMessageID,
+		ConversationID:  conversationID,
 		SourceMessageID: "345678901234567891",
 		ChatID:          "234567890123456789",
 	}}, beeperItems)
+}
+
+func TestSetDiscordAttachmentMetadataPreservesMediaState(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st := testutil.NewTestStore(t)
+	source, err := st.GetOrCreateSource("discord", "metadata-source")
+	require.NoError(err)
+	conversationID, err := st.EnsureConversationWithType(source.ID, "metadata-channel", "channel", "metadata")
+	require.NoError(err)
+	messageID := insertStoreTestMessage(t, st, source.ID, conversationID, "metadata-message")
+	hash := strings.Repeat("a", 64)
+	require.NoError(st.ReplaceMessageDiscordAttachments(messageID, []store.AttachmentRef{
+		{
+			Filename: "voice.ogg", MimeType: "audio/ogg", StoragePath: hash[:2] + "/" + hash,
+			ContentHash: hash, Size: 42, SourceAttachmentID: "discord:keep",
+		},
+		{SourceAttachmentID: "discord:stale", StoragePath: "discord:pending:stale"},
+	}))
+	_, err = st.DB().Exec(st.Rebind(`
+		UPDATE attachments
+		SET attachment_role = ?, role_source = ?, attachment_state = ?,
+		    attachment_skip_reason = ?, source_part_key = ?
+		WHERE message_id = ? AND source_attachment_id = ?
+	`), string(store.AttachmentRoleStandalone), string(store.AttachmentRoleSourceProviderExplicit),
+		string(attachmentpolicy.StateStored), "", "part-keep", messageID, "discord:keep")
+	require.NoError(err)
+	_, err = st.SetDiscordAttachmentMetadata(messageID, map[string]string{
+		"discord:keep":  `{"discord":{"waveform":"old"}}`,
+		"discord:stale": `{"discord":{}}`,
+	})
+	require.NoError(err)
+
+	type snapshot struct {
+		storagePath, contentHash, role, roleSource, state, skipReason, sourcePartKey, metadata string
+		size                                                                                   int64
+	}
+	read := func(id string) snapshot {
+		var got snapshot
+		require.NoError(st.DB().QueryRow(st.Rebind(`
+			SELECT storage_path, COALESCE(content_hash, ''), size, attachment_role,
+			       role_source, COALESCE(attachment_state, ''), COALESCE(attachment_skip_reason, ''),
+			       COALESCE(source_part_key, ''), COALESCE(CAST(attachment_metadata AS TEXT), '')
+			FROM attachments WHERE message_id = ? AND source_attachment_id = ?
+		`), messageID, id).Scan(&got.storagePath, &got.contentHash, &got.size, &got.role,
+			&got.roleSource, &got.state, &got.skipReason, &got.sourcePartKey, &got.metadata))
+		return got
+	}
+	before := read("discord:keep")
+	changed, err := st.SetDiscordAttachmentMetadata(messageID, map[string]string{
+		"discord:keep": `{"discord":{"waveform":"new"}}`,
+	})
+	require.NoError(err)
+	assert.Equal(int64(2), changed)
+	after := read("discord:keep")
+	assert.Equal(before.storagePath, after.storagePath)
+	assert.Equal(before.contentHash, after.contentHash)
+	assert.Equal(before.size, after.size)
+	assert.Equal(before.role, after.role)
+	assert.Equal(before.roleSource, after.roleSource)
+	assert.Equal(before.state, after.state)
+	assert.Equal(before.skipReason, after.skipReason)
+	assert.Equal(before.sourcePartKey, after.sourcePartKey)
+	assert.JSONEq(`{"discord":{"waveform":"new"}}`, after.metadata)
+	assert.Empty(read("discord:stale").metadata)
+
+	changed, err = st.SetDiscordAttachmentMetadata(messageID, map[string]string{
+		"discord:keep": `{"discord":{"waveform":"new"}}`,
+	})
+	require.NoError(err)
+	assert.Equal(int64(0), changed)
 }

@@ -165,8 +165,8 @@ func TestMergePersons_CardDAVState(t *testing.T) {
 		var resourceID int64
 		require.NoError(st.DB().QueryRowContext(ctx, st.Rebind(`INSERT INTO carddav_resources (
 			address_book_id, href, remote_etag, remote_body, remote_semantic_hash,
-			local_hash, mapping_status, governance, person_id, person_revision_at_bind
-		) VALUES (?, ?, ?, ?, ?, ?, 'mapped', 'local', ?, ?) RETURNING id`),
+			local_hash, mapping_status, governance, person_id, person_revision_at_bind, owns_display_name
+		) VALUES (?, ?, ?, ?, ?, ?, 'mapped', 'remote', ?, ?, TRUE) RETURNING id`),
 			book.ID, book.CanonicalURL+"absorbed.vcf", `"etag"`, []byte("card"),
 			"remote-hash", "local-hash", absorbed.ID, absorbed.Revision,
 		).Scan(&resourceID))
@@ -179,9 +179,11 @@ func TestMergePersons_CardDAVState(t *testing.T) {
 		})
 		require.NoError(err)
 		var ownerID int64
+		var ownsDisplayName bool
 		require.NoError(st.DB().QueryRowContext(ctx, st.Rebind(
-			`SELECT person_id FROM carddav_resources WHERE id = ?`), resourceID).Scan(&ownerID))
+			`SELECT person_id, owns_display_name FROM carddav_resources WHERE id = ?`), resourceID).Scan(&ownerID, &ownsDisplayName))
 		assert.Equal(survivor.ID, ownerID)
+		assert.False(ownsDisplayName)
 
 		split, err := st.SplitPersonMergeContext(ctx, store.PersonSplitRequest{
 			SourcePersonID: merged.Person.ID, MergeID: merged.Merge.ID,
@@ -191,8 +193,9 @@ func TestMergePersons_CardDAVState(t *testing.T) {
 		})
 		require.NoError(err)
 		require.NoError(st.DB().QueryRowContext(ctx, st.Rebind(
-			`SELECT person_id FROM carddav_resources WHERE id = ?`), resourceID).Scan(&ownerID))
+			`SELECT person_id, owns_display_name FROM carddav_resources WHERE id = ?`), resourceID).Scan(&ownerID, &ownsDisplayName))
 		assert.Equal(split.NewPerson.ID, ownerID)
+		assert.True(ownsDisplayName)
 	})
 
 	t.Run("publication blocks merge", func(t *testing.T) {
@@ -2374,7 +2377,7 @@ func TestPostgresMergePersonsFencesConcurrentReferenceSupersede(t *testing.T) {
 		release()
 		require.FailNow("reference supersede did not wait for merge identity lock",
 			"result=%v err=%v", early.write, early.err)
-	case <-time.After(500 * time.Millisecond):
+	case <-time.After(500 * time.Millisecond): //nolint:kennlint // absence check: the held merge identity lock keeps the supersede waiting
 	}
 	release()
 	merged := <-mergeDone
@@ -2453,4 +2456,56 @@ func assertForeignKeyTarget(t *testing.T, st *store.Store, table, column, target
 	require.NoError(t, st.DB().QueryRowContext(context.Background(), st.Rebind(query), args...).Scan(&got),
 		"foreign key %s.%s", table, column)
 	assert.Equal(t, target, got, "foreign key target for %s.%s", table, column)
+}
+
+func TestMergePersons_MovesBriefEnrollmentToSurvivor(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		enrollSurvivor bool
+		wantAction     string
+	}{
+		{name: "absorbed-only", wantAction: "moved"},
+		{name: "both-enrolled", enrollSurvivor: true, wantAction: "deduplicated"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			ctx := t.Context()
+			st := testutil.NewTestStore(t)
+			survivor := mustPromotedPerson(t, st,
+				"brief-survivor-"+test.name+"@example.com", "Survivor")
+			absorbed := mustPromotedPerson(t, st,
+				"brief-absorbed-"+test.name+"@example.com", "Absorbed")
+			if test.enrollSurvivor {
+				_, err := st.SetPersonBriefEnrollmentContext(ctx, survivor.ID, true, "owner", true)
+				require.NoError(err)
+			}
+			_, err := st.SetPersonBriefEnrollmentContext(ctx, absorbed.ID, true, "owner", true)
+			require.NoError(err)
+
+			merged, err := st.MergePersonsContext(ctx, store.PersonMergeRequest{
+				SurvivorID: survivor.ID, AbsorbedID: absorbed.ID,
+				ExpectedSurvivorRevision: survivor.Revision,
+				ExpectedAbsorbedRevision: absorbed.Revision,
+				IdempotencyKey:           "brief-enrollment-merge-" + test.name, Actor: "test",
+			})
+			require.NoError(err)
+
+			enrollment, err := st.GetPersonBriefEnrollmentContext(ctx, merged.Person.ID)
+			require.NoError(err)
+			assert.True(enrollment.Enrolled,
+				"the survivor keeps the enrollment the merge consumed")
+			tracking, err := st.GetPersonTrackingContext(ctx, merged.Person.ID)
+			require.NoError(err)
+			assert.True(tracking.Tracked,
+				"an enrolled survivor must still have the tracking row enrollment requires")
+
+			var action string
+			require.NoError(st.DB().QueryRowContext(ctx, st.Rebind(`
+				SELECT action FROM person_merge_rows
+				WHERE merge_id = ? AND table_name = 'person_brief_enrollments'`),
+				merged.Merge.ID).Scan(&action))
+			assert.Equal(test.wantAction, action)
+		})
+	}
 }

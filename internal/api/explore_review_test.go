@@ -29,15 +29,18 @@ import (
 )
 
 func TestExploreRelativeDateRevisionIgnoresParseClock(t *testing.T) {
+	t.Parallel()
 	firstNow := time.Date(2026, 7, 19, 12, 0, 0, 0, time.UTC)
 	secondNow := firstNow.Add(time.Minute)
-	first := (&search.Parser{Now: func() time.Time { return firstNow }}).Parse("alpha newer_than:1d")
-	second := (&search.Parser{Now: func() time.Time { return secondNow }}).Parse("alpha newer_than:1d")
-
-	assert.Equal(t, canonicalParsedExploreQuery(first), canonicalParsedExploreQuery(second))
+	for _, input := range []string{"alpha newer_than:1d", "newer_than:7d foo | bar"} {
+		first := (&search.Parser{Now: func() time.Time { return firstNow }}).ParseOR(input)
+		second := (&search.Parser{Now: func() time.Time { return secondNow }}).ParseOR(input)
+		assert.Equal(t, canonicalParsedExploreQuery(first), canonicalParsedExploreQuery(second), input)
+	}
 }
 
 func TestExploreIdentityFilterRequiresMatchingSingleSource(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	tests := []struct {
@@ -123,6 +126,7 @@ func TestExploreIdentityFilterRequiresMatchingSingleSource(t *testing.T) {
 }
 
 func TestExploreIdentityFilterEmptyDirectionNormalizesToAny(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	request := ExploreHTTPRequest{Filters: []ExploreFilter{
@@ -143,6 +147,7 @@ func TestExploreIdentityFilterEmptyDirectionNormalizesToAny(t *testing.T) {
 }
 
 func TestExploreIdentityFilterResolvesConfirmedEmailCaseInsensitively(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	st := testutil.NewSQLiteTestStore(t)
@@ -179,9 +184,10 @@ func TestExploreIdentityFilterResolvesConfirmedEmailCaseInsensitively(t *testing
 // TestExploreIdentityFilterConfirmedUnseenEmailIdentityKeepsEnvelopePredicate
 // covers the merge edge where a confirmed email address no longer resolves to
 // any participant: the filter must still carry the envelope predicate (the
-// address may survive in message_recipients.email_address snapshots) instead
-// of short-circuiting to match-none.
+// address may survive in message_recipients.envelope_address, the raw header
+// snapshot) instead of short-circuiting to match-none.
 func TestExploreIdentityFilterConfirmedUnseenEmailIdentityKeepsEnvelopePredicate(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	st := testutil.NewSQLiteTestStore(t)
@@ -220,6 +226,7 @@ func TestExploreIdentityFilterConfirmedUnseenEmailIdentityKeepsEnvelopePredicate
 // surface: a confirmed phone identity with no participant evidence has
 // nothing left to match.
 func TestExploreIdentityFilterAcceptsConfirmedUnseenPhoneIdentityAsMatchNone(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	st := testutil.NewSQLiteTestStore(t)
@@ -252,6 +259,7 @@ func TestExploreIdentityFilterAcceptsConfirmedUnseenPhoneIdentityAsMatchNone(t *
 }
 
 func TestExploreIdentityFilterRejectsInvalidAndUnconfirmedIdentitiesWithoutLoggingAddress(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	st := testutil.NewSQLiteTestStore(t)
 	sourceA, err := st.GetOrCreateSource("gmail", "archive-a@example.com")
@@ -343,6 +351,7 @@ func TestExploreIdentityFilterRejectsInvalidAndUnconfirmedIdentitiesWithoutLoggi
 }
 
 func TestExploreIdentityFilterPreservesResolverContextErrors(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	st := testutil.NewSQLiteTestStore(t)
@@ -385,6 +394,7 @@ func (s *identityResolveErrorStore) ResolveAccountIdentityContext(
 }
 
 func TestExploreFullTextResolverBoundsCandidateTransfer(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	require := require.New(t)
 	require.Equal(10_000, query.MaxExploreCandidateMessageIDs)
@@ -415,12 +425,9 @@ func TestExploreFullTextResolverBoundsCandidateTransfer(t *testing.T) {
 	require.NoError(json.Unmarshal(response.Body.Bytes(), &body))
 	assertions.True(body.CandidatePoolSaturated)
 	assertions.Nil(body.TotalCount, "a bounded lexical candidate set must not publish an exact total")
-	require.NotEmpty(store.searchMessagesQueryLimits)
-	for _, limit := range store.searchMessagesQueryLimits {
-		require.LessOrEqual(limit, exploreMaxLimit)
-	}
-	require.Equal(10_000, store.searchMessagesQueryTransferred)
-	require.Len(engine.request.Search.CandidateMessageIDs, 10_000)
+	assertions.Equal([]int{query.MaxExploreCandidateMessageIDs}, store.searchMessagesQueryLimits)
+	assertions.Equal(10_000, store.searchMessagesQueryTransferred)
+	assertions.Len(engine.request.Search.CandidateMessageIDs, 10_000)
 	preflight := postExploreJSON(t, srv, "/api/v1/explore/preflight", fmt.Sprintf(`{
 		"selection":{"mode":"all_matching","predicate":{"query":"alpha","search_mode":"full_text"},
 		"exclusions":[],"cache_revision":%q,"search_provenance":{"lexical_index_revision":%q}}
@@ -453,6 +460,7 @@ func filteredCandidateMockSearch(allIDs, filteredIDs []int64, sourceID int64) fu
 }
 
 func TestExploreFullTextAppliesFiltersBeforeCandidateCap(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	allIDs := make([]int64, query.MaxExploreCandidateMessageIDs+50)
@@ -490,6 +498,7 @@ func TestExploreFullTextAppliesFiltersBeforeCandidateCap(t *testing.T) {
 }
 
 func TestExploreHybridLexicalBranchResolvesWithFilters(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	allIDs := make([]int64, query.MaxExploreCandidateMessageIDs+1)
@@ -540,13 +549,14 @@ type fakeFusingBackend struct {
 	fusedLast  *vector.FusedRequest
 }
 
-func (f *fakeFusingBackend) FusedSearch(_ context.Context, req vector.FusedRequest) ([]vector.FusedHit, bool, error) {
+func (f *fakeFusingBackend) FusedSearch(_ context.Context, req vector.FusedRequest) ([]vector.FusedHit, vector.SearchMetadata, error) {
 	f.fusedCalls++
 	f.fusedLast = &req
-	return f.fusedHits, false, nil
+	return f.fusedHits, vector.SearchMetadata{}, nil
 }
 
 func TestExploreHybridLowercasesSubjectTermsForBoost(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	backend := &fakeFusingBackend{
@@ -574,6 +584,7 @@ func TestExploreHybridLowercasesSubjectTermsForBoost(t *testing.T) {
 }
 
 func TestExploreFullTextSourceFilterFindsMatchesBeyondUnfilteredCap(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	st := testutil.NewSQLiteTestStore(t)
@@ -636,7 +647,73 @@ func TestExploreFullTextSourceFilterFindsMatchesBeyondUnfilteredCap(t *testing.T
 	assertions.Equal(int64(1), *body.TotalCount)
 }
 
+func TestExploreFullTextMailingListFiltersFindMatchesBeyondUnfilteredCap(t *testing.T) {
+	t.Parallel()
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	st := testutil.NewSQLiteTestStore(t)
+	source, err := st.GetOrCreateSource("gmail", "archive@example.com")
+	requirements.NoError(err)
+	conversationID, err := st.EnsureConversation(source.ID, "thread", "Thread")
+	requirements.NoError(err)
+
+	messages := []struct {
+		sourceMessageID string
+		listID          string
+		sentAt          time.Time
+	}{
+		{"m1", "<target.example.test>", time.Date(2026, 7, 18, 9, 0, 0, 0, time.UTC)},
+		{"m2", "<primary.example.test>", time.Date(2026, 7, 18, 10, 0, 0, 0, time.UTC)},
+		{"m3", "<other.example.test>", time.Date(2026, 7, 18, 11, 0, 0, 0, time.UTC)},
+	}
+	const sharedBody = "alpha shared message body"
+	for i, message := range messages {
+		messageID, err := st.UpsertMessage(&store.Message{
+			ConversationID: conversationID, SourceID: source.ID,
+			SourceMessageID: message.sourceMessageID, MessageType: "email",
+			SentAt:  sql.NullTime{Time: message.sentAt, Valid: true},
+			Subject: sql.NullString{String: sharedBody, Valid: true},
+			ListID:  sql.NullString{String: message.listID, Valid: true}, SizeEstimate: 100,
+		})
+		requirements.NoError(err)
+		requirements.Equal(int64(i+1), messageID, "fixture IDs must align with committed analytical facts")
+		requirements.NoError(st.UpsertMessageBody(messageID,
+			sql.NullString{String: sharedBody, Valid: true}, sql.NullString{}))
+	}
+	_, err = st.BackfillFTS(nil)
+	requirements.NoError(err)
+
+	engine, _ := newExploreDuckDBFixtureWithMessages(t,
+		`(1::BIGINT, 1::BIGINT, 'm1', 101::BIGINT, 'Target', 'alpha', TIMESTAMP '2026-07-18 09:00:00', 100::BIGINT, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', '<target.example.test>', false, 2026, 7),
+		(2::BIGINT, 1::BIGINT, 'm2', 102::BIGINT, 'Primary only', 'alpha', TIMESTAMP '2026-07-18 10:00:00', 100::BIGINT, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', '<primary.example.test>', false, 2026, 7),
+		(3::BIGINT, 1::BIGINT, 'm3', 103::BIGINT, 'Other', 'alpha', TIMESTAMP '2026-07-18 11:00:00', 100::BIGINT, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', '<other.example.test>', false, 2026, 7)`,
+		3)
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}}, Store: st,
+		Engine: engine, Logger: testLogger(),
+	})
+	srv.lexicalCandidateCap = 2
+
+	response := postExploreJSON(t, srv, "/api/v1/explore", `{
+		"query":"alpha","search_mode":"full_text",
+		"filters":[
+			{"dimension":"mailing_list","values":["<target.example.test>","<primary.example.test>"]},
+			{"dimension":"mailing_list","values":["<target.example.test>","<secondary.example.test>"]}
+		]
+	}`)
+	requirements.Equal(http.StatusOK, response.Code, response.Body.String())
+	var body ExploreHTTPResponse
+	requirements.NoError(json.Unmarshal(response.Body.Bytes(), &body))
+	assertions.False(body.CandidatePoolSaturated, "the exact filtered population fits the cap")
+	requirements.Len(body.Rows, 1, "the matching list message ranked beyond the unfiltered cap must be found")
+	requirements.NotNil(body.Rows[0].AnchorMessageID)
+	assertions.Equal(int64(1), *body.Rows[0].AnchorMessageID)
+	requirements.NotNil(body.TotalCount)
+	assertions.Equal(int64(1), *body.TotalCount)
+}
+
 func TestApplyLexicalFilterPushdown(t *testing.T) {
+	t.Parallel()
 	afterFilter := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	beforeFilter := time.Date(2026, 7, 1, 0, 0, 0, 0, time.UTC)
 	afterQuery := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
@@ -696,6 +773,22 @@ func TestApplyLexicalFilterPushdown(t *testing.T) {
 			want:      search.Query{AfterDate: &afterFilter, BeforeDate: &beforeFilter},
 		},
 		{
+			name:   "mailing list filters preserve exact repeated groups",
+			parsed: search.Query{ListIDs: []string{"target"}},
+			filters: query.Context{
+				MailingLists:                []string{"<target.example.test>", "<primary.example.test>"},
+				AdditionalMailingListGroups: [][]string{{"<target.example.test>", "<secondary.example.test>"}},
+			},
+			matchable: true,
+			want: search.Query{
+				ListIDs: []string{"target"},
+				ListIDExactGroups: [][]string{
+					{"<target.example.test>", "<primary.example.test>"},
+					{"<target.example.test>", "<secondary.example.test>"},
+				},
+			},
+		},
+		{
 			name:      "participant and domain filters stay analytical",
 			filters:   query.Context{ParticipantIDs: []int64{5}, Domains: []string{"example.com"}, Deletion: query.DeletionDeleted},
 			matchable: true,
@@ -720,6 +813,7 @@ func TestApplyLexicalFilterPushdown(t *testing.T) {
 // tighten, so a filter can never broaden the candidate predicate beyond
 // what the query text alone would match.
 func TestExploreSemanticVectorFilterMergeMirrorsLexicalPushdown(t *testing.T) {
+	t.Parallel()
 	utcDate := func(month, day int) *time.Time {
 		bound := time.Date(2026, time.Month(month), day, 0, 0, 0, 0, time.UTC)
 		return &bound
@@ -729,6 +823,7 @@ func TestExploreSemanticVectorFilterMergeMirrorsLexicalPushdown(t *testing.T) {
 		body             string
 		wantSourceIDs    []int64
 		wantMessageTypes []string
+		wantListIDGroups [][]string
 		wantAfter        *time.Time
 		wantBefore       *time.Time
 	}{
@@ -760,6 +855,16 @@ func TestExploreSemanticVectorFilterMergeMirrorsLexicalPushdown(t *testing.T) {
 				{"dimension":"after","values":["2026-01-01T00:00:00Z"]}]}`,
 			wantAfter: utcDate(1, 1),
 		},
+		{
+			name: "mailing list filters preserve exact repeated groups",
+			body: `{"query":"alpha","search_mode":"semantic","filters":[
+				{"dimension":"mailing_list","values":["<target.example.test>","<primary.example.test>"]},
+				{"dimension":"mailing_list","values":["<target.example.test>","<secondary.example.test>"]}]}`,
+			wantListIDGroups: [][]string{
+				{"<primary.example.test>", "<target.example.test>"},
+				{"<secondary.example.test>", "<target.example.test>"},
+			},
+		},
 	}
 	assertBound := func(t *testing.T, want, got *time.Time, bound string) {
 		t.Helper()
@@ -789,6 +894,7 @@ func TestExploreSemanticVectorFilterMergeMirrorsLexicalPushdown(t *testing.T) {
 			requirements.Equal(http.StatusOK, response.Code, response.Body.String())
 			assertions.Equal(tt.wantSourceIDs, backend.searchFilter.SourceIDs, "SourceIDs")
 			assertions.Equal(tt.wantMessageTypes, backend.searchFilter.MessageTypes, "MessageTypes")
+			assertions.Equal(tt.wantListIDGroups, backend.searchFilter.ListIDExactGroups, "ListIDExactGroups")
 			assertBound(t, tt.wantAfter, backend.searchFilter.After, "After")
 			assertBound(t, tt.wantBefore, backend.searchFilter.Before, "Before")
 		})
@@ -796,6 +902,7 @@ func TestExploreSemanticVectorFilterMergeMirrorsLexicalPushdown(t *testing.T) {
 }
 
 func TestExploreSemanticDisjointFilterShortCircuitsToEmptyCandidates(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	backend := &fakeVectorBackend{
@@ -826,6 +933,7 @@ func TestExploreSemanticDisjointFilterShortCircuitsToEmptyCandidates(t *testing.
 }
 
 func TestExploreHybridDisjointFilterShortCircuitsToEmptyCandidates(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	backend := &fakeFusingBackend{
@@ -856,6 +964,7 @@ func TestExploreHybridDisjointFilterShortCircuitsToEmptyCandidates(t *testing.T)
 }
 
 func TestApplySemanticDeletionScope(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name         string
 		searchMode   string
@@ -881,6 +990,7 @@ func TestApplySemanticDeletionScope(t *testing.T) {
 }
 
 func TestLexicalDeletionScope(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	assertions.Equal(search.DeletionScopeAny, lexicalDeletionScope(query.DeletionAny),
 		"an absent deletion filter is unrestricted, not active-only")
@@ -891,6 +1001,7 @@ func TestLexicalDeletionScope(t *testing.T) {
 }
 
 func TestWithActiveDeletionFilterPinsHybridLexicalScope(t *testing.T) {
+	t.Parallel()
 	pinned := withActiveDeletionFilter([]ExploreFilter{
 		{Dimension: "source", Values: []string{"1"}},
 		{Dimension: exploreFilterDeletion, Values: []string{"any"}},
@@ -904,6 +1015,7 @@ func TestWithActiveDeletionFilterPinsHybridLexicalScope(t *testing.T) {
 }
 
 func TestExploreSemanticRejectsDeletedOnlyFilter(t *testing.T) {
+	t.Parallel()
 	srv := newReviewSemanticServer(t)
 	response := postExploreJSON(t, srv, "/api/v1/explore", `{
 		"query":"alpha","search_mode":"semantic",
@@ -915,6 +1027,7 @@ func TestExploreSemanticRejectsDeletedOnlyFilter(t *testing.T) {
 }
 
 func TestExploreSemanticNarrowsUnrestrictedDeletionToActive(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	base := newExploreDuckDBFixture(t)
@@ -949,6 +1062,12 @@ func TestExploreSemanticNarrowsUnrestrictedDeletionToActive(t *testing.T) {
 	var groupsBody ExploreGroupsHTTPResponse
 	requirements.NoError(json.Unmarshal(groups.Body.Bytes(), &groupsBody))
 	assertions.Equal("active", groupsBody.SearchDeletionScope)
+
+	files := postExploreJSON(t, srv, "/api/v1/explore/files", `{"predicate":{"query":"alpha","search_mode":"semantic"}}`)
+	requirements.Equal(http.StatusOK, files.Code, files.Body.String())
+	var filesBody ExploreFilesHTTPResponse
+	requirements.NoError(json.Unmarshal(files.Body.Bytes(), &filesBody))
+	assertions.Equal("active", filesBody.SearchDeletionScope, "file pages declare the narrowing like entries and groups")
 }
 
 type recordingExploreEngine struct {
@@ -986,6 +1105,7 @@ func newReviewSemanticIntersectionServer(t *testing.T) (*Server, *fakeVectorBack
 }
 
 func TestExploreSemanticParticipantAndDomainFiltersNarrowRankedCandidates(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name   string
 		filter string
@@ -1018,6 +1138,7 @@ func TestExploreSemanticParticipantAndDomainFiltersNarrowRankedCandidates(t *tes
 }
 
 func TestExploreSemanticGroupsAndPreflightAcceptParticipantFilter(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	srv, _ := newReviewSemanticIntersectionServer(t)
@@ -1058,6 +1179,7 @@ func TestExploreSemanticGroupsAndPreflightAcceptParticipantFilter(t *testing.T) 
 }
 
 func TestExploreHybridParticipantFilterNarrowsFusedCandidates(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	backend := &fakeFusingBackend{
@@ -1091,6 +1213,7 @@ func TestExploreHybridParticipantFilterNarrowsFusedCandidates(t *testing.T) {
 }
 
 func TestExploreHybridMatchCountsUseCompleteLexicalMembership(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	srv := newReviewSemanticServerWithHits(t, []vector.Hit{{MessageID: 1, Score: .9, Rank: 1}})
 	request := ExploreHTTPRequest{Query: "alpha", SearchMode: exploreSearchModeHybrid}
@@ -1110,6 +1233,7 @@ func TestExploreHybridMatchCountsUseCompleteLexicalMembership(t *testing.T) {
 }
 
 func TestExploreSnapshotPreservesResolvedEmptyLexicalMembership(t *testing.T) {
+	t.Parallel()
 	state := newExploreServerState(time.Now)
 	request := ExploreHTTPRequest{Query: "alpha", SearchMode: exploreSearchModeHybrid}
 	token := state.issueSnapshot(exploreCandidateSnapshot{
@@ -1125,6 +1249,7 @@ func TestExploreSnapshotPreservesResolvedEmptyLexicalMembership(t *testing.T) {
 }
 
 func TestApplyIdentityScopeAcceptsCaseEquivalentDomain(t *testing.T) {
+	t.Parallel()
 	context := query.Context{Domains: []string{"EXAMPLE.COM"}}
 	err := applyIdentityScope(&context, ExploreFilter{Dimension: exploreFilterDomain, Values: []string{"example.com"}})
 	require.NoError(t, err)
@@ -1138,6 +1263,7 @@ func TestApplyIdentityScopeAcceptsCaseEquivalentDomain(t *testing.T) {
 // (see exploreContext), so a base group naming a different person yields the
 // intersection rather than identity_scope_conflict.
 func TestApplyIdentityScopeIsConjunctiveWithBaseParticipantFilter(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -1168,6 +1294,7 @@ func TestApplyIdentityScopeIsConjunctiveWithBaseParticipantFilter(t *testing.T) 
 // analogue: a context filtered to domain A can open domain B's scoped
 // endpoints and see A∩B instead of identity_scope_conflict.
 func TestApplyIdentityScopeIsConjunctiveWithBaseDomainFilter(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -1188,6 +1315,7 @@ func TestApplyIdentityScopeIsConjunctiveWithBaseDomainFilter(t *testing.T) {
 // against the first, primary group) instead of being rejected or replacing
 // it — the fix for drill-downs widening an existing filter.
 func TestExploreContextRepeatedParticipantFilterIsConjunctive(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -1203,6 +1331,7 @@ func TestExploreContextRepeatedParticipantFilterIsConjunctive(t *testing.T) {
 // TestExploreContextRepeatedDomainFilterIsConjunctive is the domain analogue
 // of TestExploreContextRepeatedParticipantFilterIsConjunctive.
 func TestExploreContextRepeatedDomainFilterIsConjunctive(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -1219,6 +1348,7 @@ func TestExploreContextRepeatedDomainFilterIsConjunctive(t *testing.T) {
 // with no conjunctive meaning (source, message_type, after, before,
 // deletion) still reject a repeat, unlike participant/domain.
 func TestExploreContextRejectsRepeatedSingleValuedFilters(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name    string
 		filters []ExploreFilter
@@ -1245,6 +1375,7 @@ func TestExploreContextRejectsRepeatedSingleValuedFilters(t *testing.T) {
 }
 
 func TestExploreRejectsTamperedCursorsOnEveryPaginatedSurface(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name      string
 		path      string
@@ -1298,6 +1429,7 @@ func TestExploreRejectsTamperedCursorsOnEveryPaginatedSurface(t *testing.T) {
 }
 
 func TestExploreGroupsValidatesCompletePredicateBeforeQuerying(t *testing.T) {
+	t.Parallel()
 	srv := newTestServerWithEngine(t, newExploreDuckDBFixture(t))
 	tests := []struct {
 		name string
@@ -1320,6 +1452,7 @@ func TestExploreGroupsValidatesCompletePredicateBeforeQuerying(t *testing.T) {
 }
 
 func TestExploreGroupsPaginatesCompletePopulation(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	assertions := assert.New(t)
 	srv := newTestServerWithEngine(t, newExploreDuckDBFixture(t))
@@ -1342,6 +1475,7 @@ func TestExploreGroupsPaginatesCompletePopulation(t *testing.T) {
 }
 
 func TestExploreSemanticUsesStrongestConversationHitInsteadOfChronologicalAnchor(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	engine := newExploreSemanticChatDuckDBFixture(t)
@@ -1382,6 +1516,7 @@ func TestExploreSemanticUsesStrongestConversationHitInsteadOfChronologicalAnchor
 }
 
 func TestExploreMapsEveryCommittedCacheFailureToStructuredUnavailable(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name      string
 		readiness query.CacheReadiness
@@ -1457,6 +1592,7 @@ func TestExploreMapsEveryCommittedCacheFailureToStructuredUnavailable(t *testing
 }
 
 func TestExploreCanonicalizesParsedFullTextQueryForRevisionAndCountCache(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	engine := newExploreDuckDBFixture(t)
@@ -1514,6 +1650,7 @@ func TestExploreCanonicalizesParsedFullTextQueryForRevisionAndCountCache(t *test
 }
 
 func TestExploreSemanticSnapshotExpiresAndReportsCandidatePoolSaturation(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	hits := make([]vector.Hit, exploreMaxLimit)
@@ -1540,6 +1677,7 @@ func TestExploreSemanticSnapshotExpiresAndReportsCandidatePoolSaturation(t *test
 }
 
 func TestExploreRequiresAuthenticatedCSRFSafeRemoteMutation(t *testing.T) {
+	t.Parallel()
 	srv := NewServerWithOptions(ServerOptions{
 		Config: &config.Config{Server: config.ServerConfig{APIKey: testSessionAPIKey}},
 		Store:  &mockStore{stats: &StoreStats{}}, Engine: newExploreDuckDBFixture(t), Logger: testLogger(),
@@ -1557,6 +1695,7 @@ func TestExploreRequiresAuthenticatedCSRFSafeRemoteMutation(t *testing.T) {
 }
 
 func TestExploreFullTextUsesRealSQLiteFTS5Candidates(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	st := testutil.NewSQLiteTestStore(t)
@@ -1646,7 +1785,11 @@ func newExploreSemanticChatDuckDBFixture(t *testing.T) *query.DuckDBEngine {
 			where = " WHERE false"
 		}
 		path := filepath.ToSlash(filepath.Join(dir, table.file))
-		_, err := db.Exec(fmt.Sprintf("COPY (SELECT * FROM (VALUES %s) AS t(%s)%s) TO '%s' (FORMAT PARQUET)", table.values, table.columns, where, path))
+		projection := "*"
+		if strings.HasPrefix(table.dir, "messages/") {
+			projection += ", false AS archive_only"
+		}
+		_, err := db.Exec(fmt.Sprintf("COPY (SELECT %s FROM (VALUES %s) AS t(%s)%s) TO '%s' (FORMAT PARQUET)", projection, table.values, table.columns, where, path))
 		require.NoError(t, err, "write %s", table.dir)
 	}
 	ensureIdentityCacheFixtureDatasets(t, db, analyticsDir)
@@ -1722,4 +1865,91 @@ func addExploreCursor(t *testing.T, body, cursor string) string {
 	data, err := json.Marshal(object)
 	require.NoError(t, err)
 	return string(data)
+}
+
+func TestExploreSemanticAndHybridPipeLiteral(t *testing.T) {
+	for _, mode := range []string{"semantic", "hybrid"} {
+		t.Run(mode, func(t *testing.T) {
+			parsed, failure := validateExploreSearchDefinition(ExploreHTTPRequest{Query: "alpha | gamma", SearchMode: mode}, query.Context{})
+			require.Nil(t, failure)
+			assert.Equal(t, search.Parse("alpha | gamma"), parsed)
+		})
+	}
+}
+
+func TestExplorePipeORPlainHashUnchanged(t *testing.T) {
+	q := search.Parse("alpha from:a@example.org")
+	assert.Equal(t, hashCanonicalValue(q, false), canonicalParsedExploreQuery(search.ParseOR("alpha from:a@example.org")))
+}
+
+func newExploreSearchFixture(t *testing.T, subjects []string) (*store.Store, *query.DuckDBEngine) {
+	t.Helper()
+	require := require.New(t)
+	st := testutil.NewSQLiteTestStore(t)
+	source, err := st.GetOrCreateSource("gmail", "archive@example.org")
+	require.NoError(err)
+	conversation, err := st.EnsureConversation(source.ID, "explore", "Explore")
+	require.NoError(err)
+	var messages strings.Builder
+	for i, subject := range subjects {
+		sentAt := time.Date(2026, 7, 18, 10+i, 0, 0, 0, time.UTC)
+		id, err := st.UpsertMessage(&store.Message{SourceID: source.ID, ConversationID: conversation,
+			SourceMessageID: fmt.Sprintf("m%d", i+1), MessageType: "email", Subject: sql.NullString{String: subject, Valid: true},
+			Snippet: sql.NullString{String: subject, Valid: true}, SentAt: sql.NullTime{Time: sentAt, Valid: true}})
+		require.NoError(err)
+		require.Equal(int64(i+1), id)
+		require.NoError(st.UpsertMessageBody(id, sql.NullString{String: subject, Valid: true}, sql.NullString{}))
+		if i > 0 {
+			messages.WriteByte(',')
+		}
+		fmt.Fprintf(&messages, `(%d::BIGINT, %d::BIGINT, 'm%d', %d::BIGINT, '%s', '%s', TIMESTAMP '%s', 0::BIGINT, false, 0::INTEGER, NULL::TIMESTAMP, NULL::BIGINT, NULL::BIGINT, 'email', NULL::VARCHAR, false, 2026, 7)`, id, source.ID, i+1, conversation, subject, subject, sentAt.Format("2006-01-02 15:04:05"))
+	}
+	_, err = st.BackfillFTS(nil)
+	require.NoError(err)
+	engine, _ := newExploreDuckDBFixtureWithMessages(t, messages.String(), int64(len(subjects)))
+	return st, engine
+}
+
+func TestExplorePipeORCountsAndPagination(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	st, engine := newExploreSearchFixture(t, []string{"alpha beta", "gamma", "ordinary"})
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Server: config.ServerConfig{APIPort: 8080}}, Store: st,
+		Engine: engine, Logger: testLogger(),
+	})
+	state := `{"query":"alpha beta | gamma","search_mode":"full_text","limit":1}`
+	first := postExploreJSON(t, srv, "/api/v1/explore", state)
+	require.Equal(http.StatusOK, first.Code, first.Body.String())
+	var page ExploreHTTPResponse
+	require.NoError(json.Unmarshal(first.Body.Bytes(), &page))
+	require.NotNil(page.TotalCount)
+	assert.Equal(int64(2), *page.TotalCount)
+	require.Len(page.Rows, 1)
+	assert.Equal("gamma", page.Rows[0].Title)
+	assert.Equal("gamma", page.Rows[0].Preview)
+	require.NotNil(page.Rows[0].AnchorMessageID)
+	assert.Equal(int64(2), *page.Rows[0].AnchorMessageID)
+	require.NotEmpty(page.NextCursor)
+	counts := postExploreJSON(t, srv, "/api/v1/explore/match-counts", fmt.Sprintf(`{"predicate":%s,"row_keys":[%q]}`, state, page.Rows[0].Key))
+	require.Equal(http.StatusOK, counts.Code, counts.Body.String())
+	var countPage ExploreMatchCountsResponse
+	require.NoError(json.Unmarshal(counts.Body.Bytes(), &countPage))
+	require.Len(countPage.Counts, 1)
+	assert.Equal(page.Rows[0].Key, countPage.Counts[0].RowKey)
+	assert.Equal(int64(1), countPage.Counts[0].Count)
+	firstKey := page.Rows[0].Key
+	second := postExploreJSON(t, srv, "/api/v1/explore", addExploreCursor(t, state, page.NextCursor))
+	require.Equal(http.StatusOK, second.Code, second.Body.String())
+	page = ExploreHTTPResponse{}
+	require.NoError(json.Unmarshal(second.Body.Bytes(), &page))
+	require.NotNil(page.TotalCount)
+	assert.Equal(int64(2), *page.TotalCount)
+	require.Len(page.Rows, 1)
+	assert.Equal("alpha beta", page.Rows[0].Title)
+	assert.Equal("alpha beta", page.Rows[0].Preview)
+	require.NotNil(page.Rows[0].AnchorMessageID)
+	assert.Equal(int64(1), *page.Rows[0].AnchorMessageID)
+	assert.NotEqual(firstKey, page.Rows[0].Key)
+	assert.Empty(page.NextCursor)
 }

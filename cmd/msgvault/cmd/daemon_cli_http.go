@@ -1,14 +1,17 @@
 package cmd
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"go.kenn.io/msgvault/internal/api"
 	"go.kenn.io/msgvault/internal/daemonclient"
 )
 
@@ -79,28 +82,43 @@ func runDaemonCLICommandHTTPWithEnv(
 	if err != nil {
 		return err
 	}
+	if api.IsCLIRunDraftCreate(args) || api.IsCLIRunDraftLifecycle(args) || api.IsCLIRunDraftSendAs(args) {
+		cwd = ""
+	}
 
+	var draftFailureReported, paused bool
+	stderr := &childStderr{w: cmd.ErrOrStderr()}
 	runErr := st.RunCLICommand(cmd.Context(), daemonclient.CLIRunRequest{
 		Args: args, Env: env, Cwd: cwd, GrantDecided: grantDecided,
 	}, func(stream, data string) error {
 		switch stream {
+		case "outcome":
+			paused = paused || data == "paused"
 		case cliStreamStdout:
 			if _, err := fmt.Fprint(cmd.OutOrStdout(), data); err != nil {
 				return fmt.Errorf("write CLI stdout: %w", err)
 			}
 		case cliStreamStderr:
-			if _, err := fmt.Fprint(cmd.ErrOrStderr(), data); err != nil {
+			if _, err := fmt.Fprint(stderr, data); err != nil {
 				return fmt.Errorf("write CLI stderr: %w", err)
 			}
+			draftFailureReported = (api.IsCLIRunDraftCreate(args) || api.IsCLIRunDraftLifecycle(args) || api.IsCLIRunDraftSendAs(args)) && data != ""
 		}
 		return nil
 	})
+	if runErr != nil && draftFailureReported {
+		// Draft stderr already contains the failure result or fixed code.
+		cmd.SilenceErrors = true
+	}
 	if runErr != nil && strings.Contains(runErr.Error(), cliSubprocessExitSentinel) {
 		// The daemon subprocess already streamed its real error to our
 		// stderr and exited non-zero. Propagate a non-zero exit without
 		// letting cobra print a second, redundant error line.
 		cmd.SilenceErrors = true
-		return errCLISubprocessProxied
+		return proxiedChildError{stderr: stderr}
+	}
+	if runErr == nil && !paused && manualSyncCLICommand(args) {
+		reportCLISyncFinished(cmd, st)
 	}
 	return runErr
 }
@@ -110,10 +128,44 @@ func runDaemonCLICommandHTTPWithEnv(
 // callers exit non-zero without printing anything further.
 var errCLISubprocessProxied = errors.New("cli subprocess failed")
 
+// childStderrTail bounds the proxied child stderr kept in memory. The child
+// prints its final error last, so the tail holds it.
+const childStderrTail = 64 << 10
+
+// childStderr forwards a proxied child's stderr and keeps its tail.
+type childStderr struct {
+	w    io.Writer
+	tail []byte
+}
+
+func (s *childStderr) Write(p []byte) (int, error) {
+	s.tail = append(s.tail, p...)
+	if over := len(s.tail) - childStderrTail; over > 0 {
+		s.tail = s.tail[over:]
+	}
+	return s.w.Write(p)
+}
+
+// proxiedChildError is errCLISubprocessProxied plus the stderr the child
+// streamed, so the parent can tell which errors the child already showed.
+type proxiedChildError struct{ stderr *childStderr }
+
+func (e proxiedChildError) Error() string { return errCLISubprocessProxied.Error() }
+
+func (e proxiedChildError) Unwrap() error { return errCLISubprocessProxied }
+
+// reported reports whether the child's streamed stderr named err's setting.
+// It matches only the text before the first ": ", which names the setting,
+// because an older daemon's child may word the cause differently.
+func (e proxiedChildError) reported(err error) bool {
+	setting, _, _ := strings.Cut(err.Error(), ": ")
+	return bytes.Contains(e.stderr.tail, []byte(setting))
+}
+
 func daemonCLIRunCwd(info HTTPStoreInfo, requiresLocalFiles bool) (string, error) {
 	if info.Kind != HTTPStoreLocalDaemon {
 		if requiresLocalFiles {
-			return "", errors.New("this command uses a local capability manifest and cannot run through a configured remote daemon; run it on the daemon host with --local")
+			return "", errors.New("this command uses local files and cannot run through a configured remote daemon; run it on the daemon host with --local")
 		}
 		return "", nil
 	}

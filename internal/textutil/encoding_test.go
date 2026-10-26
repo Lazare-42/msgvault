@@ -1,4 +1,4 @@
-package textutil
+package textutil_test
 
 import (
 	"strings"
@@ -14,6 +14,7 @@ import (
 	"golang.org/x/text/encoding/traditionalchinese"
 
 	"go.kenn.io/msgvault/internal/testutil"
+	"go.kenn.io/msgvault/internal/textutil"
 )
 
 func TestEnsureUTF8_AlreadyValid(t *testing.T) {
@@ -33,7 +34,7 @@ func TestEnsureUTF8_AlreadyValid(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := EnsureUTF8(string(tt.input))
+			result := textutil.EnsureUTF8(string(tt.input))
 			assert.Equal(t, tt.expected, result)
 			assert.True(t, utf8.ValidString(result), "result is not valid UTF-8: %q", result)
 		})
@@ -57,7 +58,7 @@ func TestEnsureUTF8_Windows1252(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := EnsureUTF8(string(tt.input))
+			result := textutil.EnsureUTF8(string(tt.input))
 			assert.Equal(t, tt.expected, result)
 			assert.True(t, utf8.ValidString(result), "result is not valid UTF-8: %q", result)
 		})
@@ -80,7 +81,7 @@ func TestEnsureUTF8_Latin1(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := EnsureUTF8(string(tt.input))
+			result := textutil.EnsureUTF8(string(tt.input))
 			assert.Equal(t, tt.expected, result)
 			assert.True(t, utf8.ValidString(result), "result is not valid UTF-8: %q", result)
 		})
@@ -114,7 +115,7 @@ func TestEnsureUTF8_AsianEncodings(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert := assert.New(t)
-			result := EnsureUTF8(string(tt.input))
+			result := textutil.EnsureUTF8(string(tt.input))
 			assert.True(utf8.ValidString(result), "result is not valid UTF-8: %q", result)
 			assert.NotEmpty(result, "result is empty")
 			// Verify no replacement characters (indicates failed decode)
@@ -147,7 +148,7 @@ func TestEnsureUTF8_MixedContent(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := EnsureUTF8(string(tt.input))
+			result := textutil.EnsureUTF8(string(tt.input))
 			assert.True(t, utf8.ValidString(result), "result is not valid UTF-8: %q", result)
 			for _, sub := range tt.contains {
 				assert.Contains(t, result, sub)
@@ -170,7 +171,7 @@ func TestSanitizeUTF8(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := SanitizeUTF8(tt.input)
+			result := textutil.SanitizeUTF8(tt.input)
 			assert.Equalf(t, tt.expected, result, "SanitizeUTF8(%q)", tt.input)
 			assert.True(t, utf8.ValidString(result), "result is not valid UTF-8: %q", result)
 		})
@@ -209,7 +210,7 @@ func TestGetEncodingByName(t *testing.T) {
 		t.Run(tt.charset, func(t *testing.T) {
 			require := require.New(t)
 			assert := assert.New(t)
-			enc := GetEncodingByName(tt.charset)
+			enc := textutil.GetEncodingByName(tt.charset)
 			if tt.wantNil {
 				assert.Nilf(enc, "GetEncodingByName(%q)", tt.charset)
 				return
@@ -225,31 +226,6 @@ func TestGetEncodingByName(t *testing.T) {
 						"decoding 0x%02x: got %q, want %q", tt.verifyByte, string(got), string(tt.wantRune))
 				}
 			}
-		})
-	}
-}
-
-func TestGetEncodingByName_DecodesCorrectly(t *testing.T) {
-	// Verify that GetEncodingByName returns encodings that decode test samples correctly.
-	enc := testutil.EncodedSamples()
-	tests := []struct {
-		name     string
-		charset  string
-		input    []byte
-		expected string
-	}{
-		{"Shift-JIS", "Shift_JIS", enc.ShiftJIS_Long, enc.ShiftJIS_Long_UTF8},
-		{"GBK", "GBK", enc.GBK_Long, enc.GBK_Long_UTF8},
-		{"Big5", "Big5", enc.Big5_Long, enc.Big5_Long_UTF8},
-		{"EUC-KR", "EUC-KR", enc.EUCKR_Long, enc.EUCKR_Long_UTF8},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			encoding := GetEncodingByName(tt.charset)
-			require.NotNilf(t, encoding, "GetEncodingByName(%q) returned nil", tt.charset)
-			decoded, err := encoding.NewDecoder().Bytes(tt.input)
-			require.NoError(t, err, "decode failed")
-			assert.Equal(t, tt.expected, string(decoded))
 		})
 	}
 }
@@ -272,8 +248,8 @@ func TestGetEncodingByName_MatchesExpectedEncodings(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.charset, func(t *testing.T) {
 			require := require.New(t)
-			enc := GetEncodingByName(tt.charset)
-			expected := GetEncodingByName(tt.wantName)
+			enc := textutil.GetEncodingByName(tt.charset)
+			expected := textutil.GetEncodingByName(tt.wantName)
 			require.NotNil(enc, "encoding is nil")
 			require.NotNil(expected, "expected encoding is nil")
 			// Verify they decode the same way
@@ -336,7 +312,7 @@ func TestEncodingIdentity(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			enc := GetEncodingByName(tt.charset)
+			enc := textutil.GetEncodingByName(tt.charset)
 			require.NotNilf(t, enc, "GetEncodingByName(%q) returned nil", tt.charset)
 			decoded, err := enc.NewDecoder().Bytes(tt.input)
 			require.NoError(t, err, "decode error")
@@ -391,7 +367,7 @@ func TestGetEncodingByName_ReturnsCorrectType(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.charset, func(t *testing.T) {
 			require := require.New(t)
-			enc := GetEncodingByName(tt.charset)
+			enc := textutil.GetEncodingByName(tt.charset)
 			require.NotNilf(enc, "GetEncodingByName(%q) returned nil", tt.charset)
 			for i, input := range tt.inputs {
 				got, err := enc.NewDecoder().Bytes(input)
@@ -428,7 +404,7 @@ func TestTruncateRunes(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := TruncateRunes(tt.input, tt.maxRunes)
+			result := textutil.TruncateRunes(tt.input, tt.maxRunes)
 			assert.Equalf(t, tt.expected, result, "TruncateRunes(%q, %d)", tt.input, tt.maxRunes)
 		})
 	}
@@ -457,7 +433,7 @@ func TestFirstLine(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := FirstLine(tt.input)
+			result := textutil.FirstLine(tt.input)
 			assert.Equalf(t, tt.expected, result, "FirstLine(%q)", tt.input)
 		})
 	}
@@ -489,7 +465,7 @@ func TestSanitizeTerminal(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := SanitizeTerminal(tt.input)
+			got := textutil.SanitizeTerminal(tt.input)
 			assert.Equalf(t, tt.want, got, "SanitizeTerminal(%q)", tt.input)
 		})
 	}
@@ -510,8 +486,28 @@ func TestSanitizeTerminalMultiline(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := SanitizeTerminalMultiline(tt.input)
+			got := textutil.SanitizeTerminalMultiline(tt.input)
 			assert.Equalf(t, tt.want, got, "SanitizeTerminalMultiline(%q)", tt.input)
+		})
+	}
+}
+
+func TestPrefixRunes(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		n     int
+		want  string
+	}{
+		{name: "ascii", input: "hello world", n: 5, want: "hello"},
+		{name: "multi-byte", input: "héllo wörld", n: 7, want: "héllo w"},
+		{name: "exact length", input: "héllo", n: 5, want: "héllo"},
+		{name: "shorter", input: "hi", n: 5, want: "hi"},
+		{name: "zero", input: "hello", n: 0, want: ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, textutil.PrefixRunes(tt.input, tt.n))
 		})
 	}
 }

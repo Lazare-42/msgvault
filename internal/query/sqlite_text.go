@@ -5,7 +5,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"hash"
@@ -241,10 +241,10 @@ func textSnapshotFilterIdentity(scope TextSnapshotScope) ([]byte, error) {
 		filter.Before = &value
 	}
 	// The identity is private cache metadata, not an external JSON contract.
-	identity, err := json.Marshal(struct { //nolint:musttag
+	identity, err := json.Marshal(struct {
 		ConversationID *int64
 		Filter         TextFilter
-	}{ConversationID: scope.ConversationID, Filter: filter})
+	}{ConversationID: scope.ConversationID, Filter: filter}, json.Deterministic(true))
 	if err != nil {
 		return nil, fmt.Errorf("encode text snapshot scope: %w", err)
 	}
@@ -775,21 +775,18 @@ func sanitizeTextSearchMatch(query string) string {
 	return (&store.SQLiteDialect{}).BuildFTSArg(strings.Fields(query))
 }
 
-// TextSearch performs plain full-text search over text messages.
-// Uses FTS5 if available; otherwise returns empty results.
-func (e *SQLiteEngine) TextSearch(
-	ctx context.Context, query string, limit, offset int,
+// sqliteFTSTextSearch runs the messages_fts text search both engines share.
+func sqliteFTSTextSearch(
+	ctx context.Context, db *sql.DB, match string, sourceID *int64, limit, offset int,
 ) ([]MessageSummary, error) {
-	match := sanitizeTextSearchMatch(query)
-	if match == "" {
-		return nil, nil
-	}
-	if !e.hasFTSTable(ctx) {
-		return nil, nil
-	}
 	if limit == 0 {
 		limit = 50
 	}
+
+	conditions, args := appendSourceFilter(
+		[]string{"fts.messages_fts MATCH ?", textMsgTypeFilter(), store.LiveMessagesWhere("m", true)},
+		[]any{match}, "m.", sourceID, nil,
+	)
 
 	sqlQuery := fmt.Sprintf(`
 		SELECT
@@ -813,20 +810,33 @@ func (e *SQLiteEngine) TextSearch(
 		JOIN messages m ON m.id = fts.rowid
 		LEFT JOIN participants p ON p.id = m.sender_id
 		LEFT JOIN conversations c ON c.id = m.conversation_id
-		WHERE fts.messages_fts MATCH ?
-		  AND %s
-		  AND %s
+		WHERE %s
 		ORDER BY m.sent_at DESC
 		LIMIT ? OFFSET ?
-	`, textMsgTypeFilter(), store.LiveMessagesWhere("m", true))
+	`, strings.Join(conditions, " AND "))
 
-	rows, err := e.db.QueryContext(ctx, sqlQuery, match, limit, offset)
+	rows, err := db.QueryContext(ctx, sqlQuery, append(args, limit, offset)...)
 	if err != nil {
 		return nil, fmt.Errorf("text search: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
 	return scanMessageSummaries(rows)
+}
+
+// TextSearch performs plain full-text search over text messages.
+// Uses FTS5 if available; otherwise returns empty results.
+func (e *SQLiteEngine) TextSearch(
+	ctx context.Context, query string, sourceID *int64, limit, offset int,
+) ([]MessageSummary, error) {
+	match := sanitizeTextSearchMatch(query)
+	if match == "" {
+		return nil, nil
+	}
+	if !e.hasFTSTable(ctx) {
+		return nil, nil
+	}
+	return sqliteFTSTextSearch(ctx, e.db, match, sourceID, limit, offset)
 }
 
 // GetTextStats returns aggregate stats for text messages.

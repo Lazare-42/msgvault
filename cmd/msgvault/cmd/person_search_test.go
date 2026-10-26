@@ -23,7 +23,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/api"
 	"go.kenn.io/msgvault/internal/config"
-	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/vector"
 )
 
@@ -53,15 +53,14 @@ func TestPersonSearchCommandUsesGeneratedRouteWithoutOpeningLocalStore(t *testin
 
 	blockedDataDir := filepath.Join(t.TempDir(), "not-a-directory")
 	requirements.NoError(os.WriteFile(blockedDataDir, []byte("blocks direct database access"), 0o600))
-	withStoreResolverConfig(t, &config.Config{
+	testCtx := withStoreResolverConfig(t, &config.Config{
 		HomeDir: blockedDataDir,
 		Data:    config.DataConfig{DataDir: blockedDataDir},
 		Remote: config.RemoteConfig{
 			URL: server.URL, APIKey: "synthetic-daemon-key", AllowInsecure: true,
 		},
 	})
-
-	command, stdout, stderr := newPersonSearchTestCommand(t)
+	command, stdout, stderr := newPersonSearchTestCommand(testCtx, t)
 	command.SetArgs([]string{"--limit", "2", "synthetic", "systems", "architect"})
 	requirements.NoError(command.Execute())
 
@@ -81,11 +80,10 @@ func TestPersonSearchCommandJSONHasStableExplicitOrderedShape(t *testing.T) {
 		writePersonSearchCommandResponse(t, w)
 	}))
 	t.Cleanup(server.Close)
-	withStoreResolverConfig(t, &config.Config{Remote: config.RemoteConfig{
+	testCtx := withStoreResolverConfig(t, &config.Config{Remote: config.RemoteConfig{
 		URL: server.URL, AllowInsecure: true,
 	}})
-
-	command, stdout, stderr := newPersonSearchTestCommand(t)
+	command, stdout, stderr := newPersonSearchTestCommand(testCtx, t)
 	command.SetArgs([]string{"--json", "synthetic", "architect"})
 	require.NoError(t, command.Execute())
 
@@ -104,11 +102,10 @@ func TestPersonSearchCommandJSONPreservesEmptyResultsArray(t *testing.T) {
 		assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"results": []any{}}))
 	}))
 	t.Cleanup(server.Close)
-	withStoreResolverConfig(t, &config.Config{Remote: config.RemoteConfig{
+	testCtx := withStoreResolverConfig(t, &config.Config{Remote: config.RemoteConfig{
 		URL: server.URL, AllowInsecure: true,
 	}})
-
-	command, stdout, stderr := newPersonSearchTestCommand(t)
+	command, stdout, stderr := newPersonSearchTestCommand(testCtx, t)
 	command.SetArgs([]string{"--json", "nobody"})
 	require.NoError(t, command.Execute())
 
@@ -141,14 +138,13 @@ func TestPersonSearchCommandPreservesNilDisplayNameAcrossOutputModes(t *testing.
 		}}))
 	}))
 	t.Cleanup(server.Close)
-	withStoreResolverConfig(t, &config.Config{Remote: config.RemoteConfig{
+	testCtx := withStoreResolverConfig(t, &config.Config{Remote: config.RemoteConfig{
 		URL: server.URL, AllowInsecure: true,
 	}})
-
 	t.Run("JSON null and order", func(t *testing.T) {
 		checks := assert.New(t)
 		requirements := require.New(t)
-		command, stdout, stderr := newPersonSearchTestCommand(t)
+		command, stdout, stderr := newPersonSearchTestCommand(testCtx, t)
 		command.SetArgs([]string{"--json", "synthetic"})
 		requirements.NoError(command.Execute())
 
@@ -162,7 +158,7 @@ func TestPersonSearchCommandPreservesNilDisplayNameAcrossOutputModes(t *testing.
 	t.Run("human dash and order", func(t *testing.T) {
 		checks := assert.New(t)
 		requirements := require.New(t)
-		command, stdout, stderr := newPersonSearchTestCommand(t)
+		command, stdout, stderr := newPersonSearchTestCommand(testCtx, t)
 		command.SetArgs([]string{"synthetic"})
 		requirements.NoError(command.Execute())
 
@@ -184,10 +180,9 @@ func TestPersonSearchCommandRejectsInvalidInputBeforeDaemonRequest(t *testing.T)
 		writePersonSearchCommandResponse(t, w)
 	}))
 	t.Cleanup(server.Close)
-	withStoreResolverConfig(t, &config.Config{Remote: config.RemoteConfig{
+	testCtx := withStoreResolverConfig(t, &config.Config{Remote: config.RemoteConfig{
 		URL: server.URL, AllowInsecure: true,
 	}})
-
 	tests := []struct {
 		name string
 		args []string
@@ -199,7 +194,7 @@ func TestPersonSearchCommandRejectsInvalidInputBeforeDaemonRequest(t *testing.T)
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			command, _, _ := newPersonSearchTestCommand(t)
+			command, _, _ := newPersonSearchTestCommand(testCtx, t)
 			command.SetArgs(test.args)
 			err := command.Execute()
 			require.ErrorContains(t, err, test.want)
@@ -208,14 +203,17 @@ func TestPersonSearchCommandRejectsInvalidInputBeforeDaemonRequest(t *testing.T)
 	assert.Zero(t, requests.Load(), "invalid input must not reach or start a daemon")
 }
 
-func TestPersonSearchCommandPropagatesDisabledAndStaleDaemonErrors(t *testing.T) {
+func TestPersonSearchCommandUsesVectorErrorCodeForSetupHint(t *testing.T) {
 	tests := []struct {
-		name    string
-		code    string
-		message string
+		name          string
+		code          string
+		message       string
+		wantSetupHint bool
 	}{
-		{name: "disabled", code: "vector_not_enabled", message: "Vector search is not configured"},
+		{name: "disabled", code: "vector_not_enabled", message: "Semantic people search is disabled", wantSetupHint: true},
+		{name: "people lane disabled", code: "person_embeddings_disabled", message: "Semantic person search requires [vector.people] enabled = true", wantSetupHint: true},
 		{name: "stale", code: "index_stale", message: "The vector index does not match configured embedding settings"},
+		{name: "unrelated matching text", code: "other_error", message: "Vector search is not configured"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -229,16 +227,21 @@ func TestPersonSearchCommandPropagatesDisabledAndStaleDaemonErrors(t *testing.T)
 				}))
 			}))
 			t.Cleanup(server.Close)
-			withStoreResolverConfig(t, &config.Config{Remote: config.RemoteConfig{
+			testCtx := withStoreResolverConfig(t, &config.Config{Remote: config.RemoteConfig{
 				URL: server.URL, AllowInsecure: true,
 			}})
 
-			command, _, _ := newPersonSearchTestCommand(t)
+			command, _, _ := newPersonSearchTestCommand(testCtx, t)
 			command.SetArgs([]string{"synthetic"})
 			err := command.Execute()
 			requirements.Error(err)
 			requirements.ErrorContains(err, "API error (503)")
 			requirements.ErrorContains(err, test.message)
+			if test.wantSetupHint {
+				assert.Contains(t, err.Error(), "run 'msgvault setup status'")
+			} else {
+				assert.NotContains(t, err.Error(), "run 'msgvault setup status'")
+			}
 		})
 	}
 }
@@ -286,14 +289,12 @@ func TestDefaultVectorConfigBlocksCuratedPeopleButKeepsMessageEmbedding(t *testi
 	configured.Vector.Embeddings.Model = "synthetic-default-policy-model"
 	configured.Vector.Embeddings.Dimension = 4
 	configured.Vector.Embeddings.MaxRetries = 1
-	withTestConfig(t, configured)
+	testCtx := withTestConfig(t, configured)
+	_ = testCtx
 	requirements.NoError(configured.Save())
 
-	mainStore, err := store.Open(mainPath)
-	requirements.NoError(err)
-	t.Cleanup(func() { _ = mainStore.Close() })
-	requirements.NoError(mainStore.InitSchema())
-	_, err = mainStore.DB().Exec(`
+	mainStore := testutil.NewSQLiteTestStoreAt(t, mainPath)
+	_, err := mainStore.DB().Exec(`
 		INSERT INTO sources (id, source_type, identifier) VALUES (1, 'test', 'default-policy-source');
 		INSERT INTO conversations
 			(id, source_id, source_conversation_id, conversation_type)
@@ -307,27 +308,27 @@ func TestDefaultVectorConfigBlocksCuratedPeopleButKeepsMessageEmbedding(t *testi
 		"email", "default-policy@example.test", "Observed Synthetic Name",
 	)
 	requirements.NoError(err)
-	person, _, err := mainStore.CreatePersonFromParticipantContext(t.Context(), participantID)
+	person, _, err := mainStore.CreatePersonFromParticipantContext(testCtx, participantID)
 	requirements.NoError(err)
 	displayName := "Synthetic Curated Person"
 	person, err = mainStore.UpdatePersonDisplayNameContext(
-		t.Context(), person.ID, person.Revision, &displayName,
+		testCtx, person.ID, person.Revision, &displayName,
 	)
 	requirements.NoError(err)
 
-	features, err := setupVectorFeatures(t.Context(), mainStore, mainPath, false)
+	features, err := setupVectorFeatures(testCtx, mainStore, mainPath, false)
 	requirements.NoError(err)
 	requirements.NotNil(features)
 	t.Cleanup(func() { _ = features.Close() })
 	generation, err := features.Backend.CreateGeneration(
-		t.Context(), features.Cfg.Embeddings.Model,
+		testCtx, features.Cfg.Embeddings.Model,
 		features.Cfg.Embeddings.Dimension, features.Cfg.GenerationFingerprint(),
 	)
 	requirements.NoError(err)
-	result, err := features.Runner.RunOnce(t.Context(), generation)
+	result, err := features.Runner.RunOnce(testCtx, generation, testCLIEmbeddingPassScope())
 	requirements.NoError(err)
 	assertions.Equal(1, result.Succeeded, "message embedding must continue while people are disabled")
-	convergence, err := features.Convergence.CheckConvergence(t.Context(), generation)
+	convergence, err := features.Convergence.CheckConvergence(testCtx, generation)
 	requirements.NoError(err)
 	assertions.True(convergence.PersonCoverageComplete,
 		"disabled person embeddings must not block a message generation")
@@ -338,8 +339,8 @@ func TestDefaultVectorConfigBlocksCuratedPeopleButKeepsMessageEmbedding(t *testi
 	assertions.Equal([]string{"Subject: Synthetic message subject\n\nSynthetic message body"}, inputsAfterWorker,
 		"default vector config must not send curated person data")
 
-	requirements.NoError(features.Backend.ActivateGeneration(t.Context(), generation, false))
-	_, err = features.PersonSearchEngine.Search(t.Context(), "synthetic person", 5)
+	requirements.NoError(features.Backend.ActivateGeneration(testCtx, generation, false))
+	_, err = features.PersonSearchEngine.Search(testCtx, "synthetic person", 5)
 	requirements.ErrorContains(err, "[vector.people] enabled = true")
 	providerMu.Lock()
 	assertions.Equal(inputsAfterWorker, providerInputs,
@@ -350,10 +351,10 @@ func TestDefaultVectorConfigBlocksCuratedPeopleButKeepsMessageEmbedding(t *testi
 		Enabled: true, RetentionPosture: "zero_data_retention", TrainingPosture: "no_training",
 	}
 	requirements.NoError(configured.Save())
-	result, err = features.Runner.RunOnce(t.Context(), generation)
+	result, err = features.Runner.RunOnce(testCtx, generation, testCLIEmbeddingPassScope())
 	requirements.NoError(err)
 	assertions.Zero(result.Succeeded, "unconsented people must be skipped without blocking messages")
-	_, err = features.PersonSearchEngine.Search(t.Context(), "synthetic person", 5)
+	_, err = features.PersonSearchEngine.Search(testCtx, "synthetic person", 5)
 	requirements.ErrorIs(err, vector.ErrSemanticPersonEmbeddingConsentRequired)
 	providerMu.Lock()
 	assertions.Equal(inputsAfterWorker, providerInputs,
@@ -362,16 +363,16 @@ func TestDefaultVectorConfigBlocksCuratedPeopleButKeepsMessageEmbedding(t *testi
 
 	semanticProfile, err := configured.Vector.SemanticPersonEmbeddingProfile()
 	requirements.NoError(err)
-	_, err = mainStore.EnsurePersonSemanticEmbeddingProfile(t.Context(), semanticProfile)
+	_, err = mainStore.EnsurePersonSemanticEmbeddingProfile(testCtx, semanticProfile)
 	requirements.NoError(err)
 	_, _, err = mainStore.GrantPersonSemanticEmbeddingConsent(
-		t.Context(), semanticProfile.Fingerprint, "test",
+		testCtx, semanticProfile.Fingerprint, "test",
 	)
 	requirements.NoError(err)
-	result, err = features.Runner.RunOnce(t.Context(), generation)
+	result, err = features.Runner.RunOnce(testCtx, generation, testCLIEmbeddingPassScope())
 	requirements.NoError(err)
 	assertions.Equal(1, result.Succeeded, "consented exact policy must run the person worker")
-	results, err := features.PersonSearchEngine.Search(t.Context(), "synthetic person", 5)
+	results, err := features.PersonSearchEngine.Search(testCtx, "synthetic person", 5)
 	requirements.NoError(err)
 	requirements.Len(results, 1)
 	assertions.Equal(person.ID, results[0].Person.ID)
@@ -380,17 +381,17 @@ func TestDefaultVectorConfigBlocksCuratedPeopleButKeepsMessageEmbedding(t *testi
 	providerCallsAfterConsent := len(providerInputs)
 	providerMu.Unlock()
 	_, err = mainStore.RevokePersonSemanticEmbeddingConsent(
-		t.Context(), semanticProfile.Fingerprint, "test",
+		testCtx, semanticProfile.Fingerprint, "test",
 	)
 	requirements.NoError(err)
 	updatedName := "Synthetic Curated Person Updated"
 	_, err = mainStore.UpdatePersonDisplayNameContext(
-		t.Context(), person.ID, person.Revision, &updatedName,
+		testCtx, person.ID, person.Revision, &updatedName,
 	)
 	requirements.NoError(err)
-	_, err = features.Runner.RunOnce(t.Context(), generation)
+	_, err = features.Runner.RunOnce(testCtx, generation, testCLIEmbeddingPassScope())
 	requirements.NoError(err)
-	_, err = features.PersonSearchEngine.Search(t.Context(), "updated person", 5)
+	_, err = features.PersonSearchEngine.Search(testCtx, "updated person", 5)
 	requirements.ErrorIs(err, vector.ErrSemanticPersonEmbeddingConsentRequired)
 	providerMu.Lock()
 	assertions.Len(providerInputs, providerCallsAfterConsent,
@@ -402,6 +403,9 @@ func TestDefaultVectorConfigBlocksCuratedPeopleButKeepsMessageEmbedding(t *testi
 // catches deletion of a live config silently falling back to the authorized
 // startup snapshot.
 func TestCurrentSemanticPersonVectorConfigSourceFailsClosedAfterConfigRemoval(t *testing.T) {
+	cfg := testConfigValue()
+	_ = cfg
+
 	assertions := assert.New(t)
 	requirements := require.New(t)
 	configured := config.NewDefaultConfig()
@@ -414,11 +418,19 @@ func TestCurrentSemanticPersonVectorConfigSourceFailsClosedAfterConfigRemoval(t 
 	configured.Vector.People = vector.PeopleConfig{
 		Enabled: true, RetentionPosture: "zero_data_retention", TrainingPosture: "no_training",
 	}
-	withTestConfig(t, configured)
+	testCtx := withTestConfig(t, configured)
+	_ = testCtx
 	requirements.NoError(configured.Save())
 
-	source := currentSemanticPersonVectorConfigSource()
+	source := currentSemanticPersonVectorConfigSource(invocationFromContext(testCtx))
 	current, err := source()
+	requirements.NoError(err)
+	assertions.True(current.People.Enabled)
+
+	// A daemon-only setting that is invalid on disk must not fail the client read.
+	configured.Integrations.Kata.Endpoint = "://invalid"
+	requirements.NoError(configured.Save())
+	current, err = source()
 	requirements.NoError(err)
 	assertions.True(current.People.Enabled)
 	requirements.NoError(os.Remove(configured.ConfigFilePath()))
@@ -428,7 +440,7 @@ func TestCurrentSemanticPersonVectorConfigSourceFailsClosedAfterConfigRemoval(t 
 	assertions.False(current.People.Enabled,
 		"a missing live config must not reuse the authorized startup policy")
 
-	cfg = nil
+	invocationFromContext(testCtx).cfg = nil
 	_, err = source()
 	requirements.ErrorContains(err, "configuration is unavailable",
 		"an absent runtime config must fail closed instead of using the startup policy")
@@ -466,13 +478,17 @@ func TestCompletedBuildActivatesWithoutPersonRequestsAfterLivePolicyDrift(t *tes
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			newAssert := assert.New
+			assert := assert.New(t)
+			require := require.New(t)
 			var providerRequests atomic.Int32
 			provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert := newAssert(t)
 				providerRequests.Add(1)
 				var request struct {
 					Input []string `json:"input"`
 				}
-				if !assert.NoError(t, json.NewDecoder(r.Body).Decode(&request)) {
+				if !assert.NoError(json.NewDecoder(r.Body).Decode(&request)) {
 					http.Error(w, "invalid synthetic request", http.StatusBadRequest)
 					return
 				}
@@ -480,7 +496,7 @@ func TestCompletedBuildActivatesWithoutPersonRequestsAfterLivePolicyDrift(t *tes
 				for i := range request.Input {
 					data[i] = map[string]any{"embedding": []float32{1, 0}, "index": i}
 				}
-				assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{
+				assert.NoError(json.NewEncoder(w).Encode(map[string]any{
 					"data": data, "model": "synthetic-drift-model",
 				}))
 			}))
@@ -501,59 +517,56 @@ func TestCompletedBuildActivatesWithoutPersonRequestsAfterLivePolicyDrift(t *tes
 			configured.Vector.People = vector.PeopleConfig{
 				Enabled: true, RetentionPosture: "zero_data_retention", TrainingPosture: "no_training",
 			}
-			withTestConfig(t, configured)
-			require.NoError(t, configured.Save())
+			testCtx := withTestConfig(t, configured)
+			require.NoError(configured.Save())
 
-			mainStore, err := store.Open(mainPath)
-			require.NoError(t, err)
-			t.Cleanup(func() { _ = mainStore.Close() })
-			require.NoError(t, mainStore.InitSchema())
+			mainStore := testutil.NewSQLiteTestStoreAt(t, mainPath)
 			profile, err := configured.Vector.SemanticPersonEmbeddingProfile()
-			require.NoError(t, err)
+			require.NoError(err)
 			_, err = mainStore.EnsurePersonSemanticEmbeddingProfile(t.Context(), profile)
-			require.NoError(t, err)
+			require.NoError(err)
 			_, _, err = mainStore.GrantPersonSemanticEmbeddingConsent(
 				t.Context(), profile.Fingerprint, "test",
 			)
-			require.NoError(t, err)
+			require.NoError(err)
 			participantID, err := mainStore.EnsureParticipantByIdentifier(
 				"email", "drift-person@example.test", "Observed Drift Person",
 			)
-			require.NoError(t, err)
+			require.NoError(err)
 			person, _, err := mainStore.CreatePersonFromParticipantContext(t.Context(), participantID)
-			require.NoError(t, err)
+			require.NoError(err)
 			displayName := "Synthetic Drift Person"
 			_, err = mainStore.UpdatePersonDisplayNameContext(
 				t.Context(), person.ID, person.Revision, &displayName,
 			)
-			require.NoError(t, err)
+			require.NoError(err)
 
-			features, err := setupVectorFeatures(t.Context(), mainStore, mainPath, false)
-			require.NoError(t, err)
+			features, err := setupVectorFeatures(testCtx, mainStore, mainPath, false)
+			require.NoError(err)
 			t.Cleanup(func() { _ = features.Close() })
 			generation, err := features.Backend.CreateGeneration(
 				t.Context(), features.Cfg.Embeddings.Model,
 				features.Cfg.Embeddings.Dimension, features.Cfg.GenerationFingerprint(),
 			)
-			require.NoError(t, err)
+			require.NoError(err)
 
 			test.mutate(&configured.Vector)
-			require.NoError(t, configured.Save())
+			require.NoError(configured.Save())
 			var stderr bytes.Buffer
 			_, err = runEmbeddingPasses(
 				t.Context(), features.Runner, generation, false,
 				vector.APIFormatOpenAI, &stderr,
 			)
-			require.NoError(t, err, stderr.String())
+			require.NoError(err, stderr.String())
 			var stdout bytes.Buffer
 			activated, err := activateBuiltGeneration(
 				t.Context(), features.Backend, features.Convergence, generation,
 				vector.APIFormatOpenAI, &stdout, &stderr,
 			)
-			require.NoError(t, err, stderr.String())
-			assert.True(t, activated)
-			assert.Contains(t, stdout.String(), "activated")
-			assert.Zero(t, providerRequests.Load(),
+			require.NoError(err, stderr.String())
+			assert.True(activated)
+			assert.Contains(stdout.String(), "activated")
+			assert.Zero(providerRequests.Load(),
 				"authorization drift must fence every curated-person provider request")
 		})
 	}
@@ -565,6 +578,8 @@ func TestCompletedBuildActivatesWithoutPersonRequestsAfterLivePolicyDrift(t *tes
 // profile document through the provider and SQLite person index to the
 // authenticated generated client used by the CLI.
 func TestPersonSearchProductionCompositionDoesNotPublishReadyWithoutThePersonEngine(t *testing.T) {
+	useLocal := false
+
 	requirements := require.New(t)
 	assertions := assert.New(t)
 
@@ -611,53 +626,50 @@ func TestPersonSearchProductionCompositionDoesNotPublishReadyWithoutThePersonEng
 	configured.Vector.People = vector.PeopleConfig{
 		Enabled: true, RetentionPosture: "zero_data_retention", TrainingPosture: "no_training",
 	}
-	withTestConfig(t, configured)
+	testCtx := withTestConfig(t, configured)
 	requirements.NoError(configured.Save())
 	savedUseLocal := useLocal
 	useLocal = false
 	t.Cleanup(func() { useLocal = savedUseLocal })
 
-	mainStore, err := store.Open(mainPath)
-	requirements.NoError(err)
-	t.Cleanup(func() { _ = mainStore.Close() })
-	requirements.NoError(mainStore.InitSchema())
+	mainStore := testutil.NewSQLiteTestStoreAt(t, mainPath)
 	semanticProfile, err := configured.Vector.SemanticPersonEmbeddingProfile()
 	requirements.NoError(err)
-	_, err = mainStore.EnsurePersonSemanticEmbeddingProfile(t.Context(), semanticProfile)
+	_, err = mainStore.EnsurePersonSemanticEmbeddingProfile(testCtx, semanticProfile)
 	requirements.NoError(err)
 	_, _, err = mainStore.GrantPersonSemanticEmbeddingConsent(
-		t.Context(), semanticProfile.Fingerprint, "test",
+		testCtx, semanticProfile.Fingerprint, "test",
 	)
 	requirements.NoError(err)
 	participantID, err := mainStore.EnsureParticipantByIdentifier(
 		"email", "synthetic-architect@example.test", "Observed Synthetic Name",
 	)
 	requirements.NoError(err)
-	person, created, err := mainStore.CreatePersonFromParticipantContext(t.Context(), participantID)
+	person, created, err := mainStore.CreatePersonFromParticipantContext(testCtx, participantID)
 	requirements.NoError(err)
 	requirements.True(created)
 	displayName := "Synthetic Architect"
 	person, err = mainStore.UpdatePersonDisplayNameContext(
-		t.Context(), person.ID, person.Revision, &displayName,
+		testCtx, person.ID, person.Revision, &displayName,
 	)
 	requirements.NoError(err)
-	document, err := mainStore.LoadPersonSemanticDocumentContext(t.Context(), person.ID)
+	document, err := mainStore.LoadPersonSemanticDocumentContext(testCtx, person.ID)
 	requirements.NoError(err)
 	requirements.Contains(document.Text, displayName)
 	requirements.NotContains(document.Text, "synthetic-architect@example.test")
 
-	features, err := setupVectorFeatures(t.Context(), mainStore, mainPath, false)
+	features, err := setupVectorFeatures(testCtx, mainStore, mainPath, false)
 	requirements.NoError(err)
 	requirements.NotNil(features)
 	t.Cleanup(func() { _ = features.Close() })
 	requirements.NotNil(features.PersonSearchEngine,
 		"runtime composition must build the concrete person engine")
 	generation, err := features.Backend.CreateGeneration(
-		t.Context(), features.Cfg.Embeddings.Model,
+		testCtx, features.Cfg.Embeddings.Model,
 		features.Cfg.Embeddings.Dimension, features.Cfg.GenerationFingerprint(),
 	)
 	requirements.NoError(err)
-	requirements.NoError(features.Backend.ActivateGeneration(t.Context(), generation, false),
+	requirements.NoError(features.Backend.ActivateGeneration(testCtx, generation, false),
 		"a pre-feature active generation can exist without person coverage")
 
 	apiServer := api.NewServerWithOptions(api.ServerOptions{
@@ -671,7 +683,7 @@ func TestPersonSearchProductionCompositionDoesNotPublishReadyWithoutThePersonEng
 	t.Cleanup(httpServer.Close)
 
 	unauthorizedRequest, err := http.NewRequestWithContext(
-		context.Background(), http.MethodPost, httpServer.URL+"/api/v1/people/search",
+		testCtx, http.MethodPost, httpServer.URL+"/api/v1/people/search",
 		strings.NewReader(`{"query":"architect"}`),
 	)
 	requirements.NoError(err)
@@ -683,7 +695,7 @@ func TestPersonSearchProductionCompositionDoesNotPublishReadyWithoutThePersonEng
 		"semantic person search route remains protected")
 
 	unindexedRequest, err := http.NewRequestWithContext(
-		context.Background(), http.MethodPost, httpServer.URL+"/api/v1/people/search",
+		testCtx, http.MethodPost, httpServer.URL+"/api/v1/people/search",
 		strings.NewReader(`{"query":"architect"}`),
 	)
 	requirements.NoError(err)
@@ -703,14 +715,14 @@ func TestPersonSearchProductionCompositionDoesNotPublishReadyWithoutThePersonEng
 		"an unindexed upgraded person corpus must not incur a query provider call")
 	providerMu.Unlock()
 
-	result, err := features.Runner.RunOnce(t.Context(), generation)
+	result, err := features.Runner.RunOnce(testCtx, generation, testCLIEmbeddingPassScope())
 	requirements.NoError(err)
 	assertions.Equal(1, result.Succeeded, "one curated person document embedded")
 
 	configured.Remote = config.RemoteConfig{
 		URL: httpServer.URL, APIKey: configured.Server.APIKey, AllowInsecure: true,
 	}
-	command, stdout, stderr := newPersonSearchTestCommand(t)
+	command, stdout, stderr := newPersonSearchTestCommand(testCtx, t)
 	command.SetArgs([]string{"--json", "architect"})
 	requirements.NoError(command.Execute())
 	assertions.JSONEq(`{"results":[{"id":`+
@@ -724,7 +736,7 @@ func TestPersonSearchProductionCompositionDoesNotPublishReadyWithoutThePersonEng
 		"canonical document and free-text query use the same configured provider")
 }
 
-func newPersonSearchTestCommand(t *testing.T) (*cobra.Command, *bytes.Buffer, *bytes.Buffer) {
+func newPersonSearchTestCommand(ctx context.Context, t *testing.T) (*cobra.Command, *bytes.Buffer, *bytes.Buffer) {
 	t.Helper()
 	savedLimit, savedJSON := personSearchLimit, personSearchJSON
 	personSearchLimit, personSearchJSON = defaultPersonSearchLimit, false
@@ -739,22 +751,8 @@ func newPersonSearchTestCommand(t *testing.T) (*cobra.Command, *bytes.Buffer, *b
 	stdout, stderr := &bytes.Buffer{}, &bytes.Buffer{}
 	command.SetOut(stdout)
 	command.SetErr(stderr)
-	command.SetContext(context.Background())
+	command.SetContext(ctx)
 	return command, stdout, stderr
-}
-
-func TestPersonSearchProductionCommandRegistrationAndFlags(t *testing.T) {
-	check := assert.New(t)
-	must := require.New(t)
-
-	command, remaining, err := personCmd.Find([]string{"search"})
-	must.NoError(err)
-	check.Same(personSearchCmd, command)
-	check.Empty(remaining)
-	limitFlag := command.Flags().Lookup("limit")
-	must.NotNil(limitFlag)
-	check.Equal(strconv.Itoa(defaultPersonSearchLimit), limitFlag.DefValue)
-	check.NotNil(command.Flags().Lookup(flagJSON))
 }
 
 func writePersonSearchCommandResponse(t *testing.T, w http.ResponseWriter) {

@@ -4,7 +4,7 @@ package document
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"strings"
 
@@ -62,12 +62,12 @@ func ParseSearchMode(value string) (SearchMode, error) {
 }
 
 // EmbeddingRecipe returns the shared raw preparation recipe used by this PR.
-func EmbeddingRecipe(cfg vector.Config) (docembedding.Recipe, error) {
-	recipe, err := docembedding.NewRecipe(docembedding.RecipeConfig{
-		Mode: docembedding.RepresentationRaw, MaxInputRunes: cfg.Embeddings.MaxInputChars,
+func EmbeddingRecipe(cfg vector.Config) (Recipe, error) {
+	recipe, err := NewRecipe(RecipeConfig{
+		Mode: RepresentationRaw, MaxInputRunes: cfg.Embeddings.MaxInputChars,
 	})
 	if err != nil {
-		return docembedding.Recipe{}, fmt.Errorf(
+		return Recipe{}, fmt.Errorf(
 			"construct document embedding recipe from vector.embeddings.max_input_chars=%d: %w",
 			cfg.Embeddings.MaxInputChars, err,
 		)
@@ -118,7 +118,7 @@ func Fingerprint(extractionProfileID string, cfg vector.Config) (string, error) 
 		RecipeFingerprint: recipe.Fingerprint(), VectorSpace: spaceFingerprint,
 		TaskPrefixFingerprint: cfg.Embeddings.TaskPrefixFingerprint(),
 	}
-	encoded, err := json.Marshal(payload)
+	encoded, err := json.Marshal(payload, json.Deterministic(true))
 	if err != nil {
 		return "", fmt.Errorf("marshal document vector fingerprint: %w", err)
 	}
@@ -158,7 +158,7 @@ func egressFingerprint(extractionProfileID string, purpose docembedding.EgressPu
 		Version: 1, GenerationFingerprint: generationFingerprint,
 		DestinationFingerprint: destination,
 	}
-	encoded, err := json.Marshal(payload)
+	encoded, err := json.Marshal(payload, json.Deterministic(true))
 	if err != nil {
 		return "", fmt.Errorf("marshal document egress consent identity: %w", err)
 	}

@@ -27,11 +27,11 @@ type CreateCommunicationServiceRequest struct {
 	DisplayLabel         string   `json:"display_label"`
 	Aliases              []string `json:"aliases,omitempty"`
 	ScopePolicy          string   `json:"scope_policy" enum:"none,optional,required"`
-	DefaultScopeKind     *string  `json:"default_scope_kind,omitempty"`
+	DefaultScopeKind     *string  `json:"default_scope_kind,omitzero" nullable:"false"`
 	Normalization        string   `json:"normalization" enum:"none,lower,email,phone_e164,strip_at_lower,by_address_kind"`
-	NormalizationVersion int      `json:"normalization_version,omitempty"`
-	URIScheme            *string  `json:"uri_scheme,omitempty"`
-	ProfileURLTemplate   *string  `json:"profile_url_template,omitempty"`
+	NormalizationVersion int      `json:"normalization_version,omitzero"`
+	URIScheme            *string  `json:"uri_scheme,omitzero" nullable:"false"`
+	ProfileURLTemplate   *string  `json:"profile_url_template,omitzero" nullable:"false"`
 }
 
 func (s *Server) registerCommunicationServiceRoutes(api huma.API) {
@@ -41,7 +41,7 @@ func (s *Server) registerCommunicationServiceRoutes(api huma.API) {
 	)
 	list.Description = "Lists the small open service catalog without pagination, including aliases and normalization policy."
 	list.Parameters = append(list.Parameters, &huma.Param{
-		Name: "include_inactive", In: "query",
+		Name: "include_inactive", In: queryParamLocation,
 		Description: "Include inactive catalog entries",
 		Schema:      &huma.Schema{Type: huma.TypeBoolean, Default: false},
 	})

@@ -3,7 +3,8 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"strings"
@@ -42,10 +43,11 @@ func (s *Store) ConversationExists(conversationID int64) (bool, error) {
 
 // ConversationExistsContext is the context-aware existence check.
 func (s *Store) ConversationExistsContext(ctx context.Context, conversationID int64) (bool, error) {
+	scope, scopeArgs := sourceScopeClause(ctx, "source_id")
 	var exists bool
-	err := s.db.QueryRowContext(ctx, s.dialect.Rebind(`
-		SELECT EXISTS (SELECT 1 FROM conversations WHERE id = ?)
-	`), conversationID).Scan(&exists)
+	err := s.db.QueryRowContext(ctx, s.dialect.Rebind(
+		`SELECT EXISTS (SELECT 1 FROM conversations WHERE id = ?`+scope+`)`,
+	), append([]any{conversationID}, scopeArgs...)...).Scan(&exists)
 	if err != nil {
 		return false, fmt.Errorf("check conversation: %w", err)
 	}
@@ -77,14 +79,15 @@ func conversationRangeClause(start, end *time.Time) (clause string, args []any) 
 func (s *Store) anchorTimestampInRangeContext(
 	ctx context.Context, conversationID, anchorID int64, start, end *time.Time,
 ) (inRange, exists bool, err error) {
+	scope, scopeArgs := sourceScopeClause(ctx, "m.source_id")
 	query := fmt.Sprintf(`
 		SELECT COALESCE(m.sent_at, m.received_at, m.internal_date)
 		FROM messages m
-		WHERE m.conversation_id = ? AND m.id = ? AND %s
-	`, LiveMessagesWhere("m", false))
+		WHERE m.conversation_id = ? AND m.id = ? AND %s%s
+	`, LiveMessagesWhere("m", false), scope)
 
 	var ts nullableTimestamp
-	scanErr := s.db.QueryRowContext(ctx, s.dialect.Rebind(query), conversationID, anchorID).Scan(&ts)
+	scanErr := s.db.QueryRowContext(ctx, s.dialect.Rebind(query), append([]any{conversationID, anchorID}, scopeArgs...)...).Scan(&ts)
 	if errors.Is(scanErr, sql.ErrNoRows) {
 		return false, false, nil
 	}
@@ -135,6 +138,9 @@ func (s *Store) GetConversationWindowContext(
 	}
 
 	rangeClause, rangeArgs := conversationRangeClause(start, end)
+	scope, scopeArgs := sourceScopeClause(ctx, "m.source_id")
+	rangeClause += scope
+	rangeArgs = append(rangeArgs, scopeArgs...)
 	query := fmt.Sprintf(`
 		WITH ordered AS (
 			SELECT
@@ -170,7 +176,8 @@ func (s *Store) GetConversationWindowContext(
 			COALESCE(LENGTH(mb.body_text), 0) + COALESCE(LENGTH(mb.body_html), 0),
 			selected.position,
 			selected.total_count,
-			selected.anchor_position
+			selected.anchor_position,
+			CASE WHEN m.message_type IN ('chatwoot', 'meeting_transcript') THEN m.metadata ELSE NULL END
 		FROM selected
 		JOIN messages m ON m.id = selected.id
 		LEFT JOIN message_recipients mr ON mr.id = (
@@ -202,6 +209,7 @@ func (s *Store) GetConversationWindowContext(
 		var message APIMessage
 		var sentAt, deletedAt nullableTimestamp
 		var isFromMe sql.NullBool
+		var metadata sql.NullString
 		var position, bodySize int64
 		if err := rows.Scan(
 			&message.ID,
@@ -225,9 +233,11 @@ func (s *Store) GetConversationWindowContext(
 			&position,
 			&window.Total,
 			&window.AnchorPosition,
+			&metadata,
 		); err != nil {
 			return nil, fmt.Errorf("scan conversation message: %w", err)
 		}
+		message.RelatedMessageID = RelatedMessageCandidate(message.ID, message.MessageType, metadata.String)
 		message.IsFromMe = isFromMe.Bool
 		if sentAt.Valid {
 			message.SentAt = sentAt.Time
@@ -246,6 +256,12 @@ func (s *Store) GetConversationWindowContext(
 	}
 	if len(ids) == 0 {
 		return window, nil
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close conversation messages: %w", err)
+	}
+	if err := s.populateRelatedMessages(ctx, window.Messages); err != nil {
+		return nil, err
 	}
 	inlineIDs := applyConversationBodyBudget(window.Messages, bodySizes, anchorID)
 	if err := s.batchPopulateBodies(ctx, window.Messages, inlineIDs); err != nil {
@@ -356,7 +372,7 @@ func (s *Store) batchPopulateAttachments(ctx context.Context, messages []APIMess
 	}
 	rows, err := s.db.QueryContext(ctx, s.dialect.Rebind(fmt.Sprintf(`
 		SELECT message_id, id, COALESCE(filename, ''), COALESCE(mime_type, ''),
-			COALESCE(size, 0), COALESCE(content_hash, ''), COALESCE(storage_path, '')
+			COALESCE(size, 0), COALESCE(content_hash, ''), COALESCE(storage_path, ''), COALESCE(source_attachment_id, '')
 		FROM attachments
 		WHERE message_id IN (%s)
 		ORDER BY message_id, id
@@ -365,29 +381,53 @@ func (s *Store) batchPopulateAttachments(ctx context.Context, messages []APIMess
 		return fmt.Errorf("get conversation attachments: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
+	var hashes []string
+	var located [][2]int
 	for rows.Next() {
 		var messageID int64
 		var attachment APIAttachment
 		var storagePath sql.NullString
+		var sourceAttachmentID string
 		if err := rows.Scan(&messageID, &attachment.ID, &attachment.Filename, &attachment.MimeType,
-			&attachment.Size, &attachment.ContentHash, &storagePath); err != nil {
+			&attachment.Size, &attachment.ContentHash, &storagePath, &sourceAttachmentID); err != nil {
 			return fmt.Errorf("scan conversation attachment: %w", err)
 		}
-		if storagePath.Valid && (strings.HasPrefix(storagePath.String, "http://") || strings.HasPrefix(storagePath.String, "https://")) {
+		receiptHash := AttachmentReceiptHash(attachment.ContentHash, storagePath.String, sourceAttachmentID)
+		if IsURLStoragePath(storagePath.String) {
 			attachment.ContentHash = ""
 			attachment.URL = storagePath.String
 		}
 		if index, ok := indexByID[messageID]; ok {
 			messages[index].Attachments = append(messages[index].Attachments, attachment)
+			located = append(located, [2]int{index, len(messages[index].Attachments) - 1})
+			hashes = append(hashes, receiptHash)
 		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	refs, err := LoadDocbankAttachmentRefs(ctx, ReadDBContext(ctx, s.db.DB), s.Rebind, "", hashes)
+	if err != nil {
+		return err
+	}
+	for i, at := range located {
+		messages[at[0]].Attachments[at[1]].Docbank = refs[strings.ToLower(hashes[i])]
+	}
+	return nil
 }
 
 // SetConversationMetadata writes the conversations.metadata JSON/JSONB column.
 // Passing an invalid sql.NullString clears the column.
 func (s *Store) SetConversationMetadata(conversationID int64, metadata sql.NullString) error {
-	err := s.withSyncConversationWriteContext(context.Background(), conversationID, func(q querier) error {
+	return s.SetConversationMetadataContext(context.Background(), conversationID, metadata)
+}
+
+// SetConversationMetadataContext honors cancellation during SetConversationMetadata.
+func (s *Store) SetConversationMetadataContext(ctx context.Context, conversationID int64, metadata sql.NullString) error {
+	err := s.withSyncConversationWriteContext(ctx, conversationID, func(q querier) error {
 		_, err := q.Exec(fmt.Sprintf(`
 			UPDATE conversations
 			SET metadata = %s
@@ -403,8 +443,13 @@ func (s *Store) SetConversationMetadata(conversationID int64, metadata sql.NullS
 
 // GetConversationMetadata reads the conversations.metadata JSON/JSONB column.
 func (s *Store) GetConversationMetadata(conversationID int64) (sql.NullString, error) {
+	return s.GetConversationMetadataContext(context.Background(), conversationID)
+}
+
+// GetConversationMetadataContext honors cancellation during GetConversationMetadata.
+func (s *Store) GetConversationMetadataContext(ctx context.Context, conversationID int64) (sql.NullString, error) {
 	var metadata sql.NullString
-	if err := s.db.QueryRow(
+	if err := s.db.QueryRowContext(ctx,
 		`SELECT metadata FROM conversations WHERE id = ?`, conversationID,
 	).Scan(&metadata); err != nil {
 		return sql.NullString{}, fmt.Errorf("get conversation metadata (id=%d): %w", conversationID, err)
@@ -417,17 +462,22 @@ func (s *Store) GetConversationMetadata(conversationID int64) (sql.NullString, e
 // evaluates this record rather than the participant rows, which accumulate
 // every member ever seen and so can only ever raise the count.
 func (s *Store) SetConversationMemberCount(conversationID int64, count int) error {
-	metadata, err := s.conversationMetadataObject(conversationID)
+	return s.SetConversationMemberCountContext(context.Background(), conversationID, count)
+}
+
+// SetConversationMemberCountContext honors cancellation during SetConversationMemberCount.
+func (s *Store) SetConversationMemberCountContext(ctx context.Context, conversationID int64, count int) error {
+	metadata, err := s.conversationMetadataObjectContext(ctx, conversationID)
 	if err != nil {
 		return err
 	}
-	encoded, err := json.Marshal(count)
+	encoded, err := json.Marshal(count, json.Deterministic(true))
 	if err != nil {
 		return fmt.Errorf("encode conversation member count: %w", err)
 	}
 	metadata["member_count"] = encoded
 	delete(metadata, "member_count_unknown")
-	return s.writeConversationMetadataObject(conversationID, metadata)
+	return s.writeConversationMetadataObjectContext(ctx, conversationID, metadata)
 }
 
 // MarkConversationMemberCountUnknown records that a provider could not read a
@@ -439,22 +489,30 @@ func (s *Store) SetConversationMemberCount(conversationID int64, count int) erro
 // purge that trusted the stale count instead could download or delete media
 // against the membership the conversation has now.
 func (s *Store) MarkConversationMemberCountUnknown(conversationID int64) error {
-	metadata, err := s.conversationMetadataObject(conversationID)
+	return s.MarkConversationMemberCountUnknownContext(context.Background(), conversationID)
+}
+
+// MarkConversationMemberCountUnknownContext honors cancellation during MarkConversationMemberCountUnknown.
+func (s *Store) MarkConversationMemberCountUnknownContext(ctx context.Context, conversationID int64) error {
+	metadata, err := s.conversationMetadataObjectContext(ctx, conversationID)
 	if err != nil {
 		return err
 	}
-	metadata["member_count_unknown"] = json.RawMessage("true")
-	return s.writeConversationMetadataObject(conversationID, metadata)
+	if err := invalidateMessagingRouteMembership(metadata, ""); err != nil {
+		return err
+	}
+	metadata["member_count_unknown"] = jsontext.Value("true")
+	return s.writeConversationMetadataObjectContext(ctx, conversationID, metadata)
 }
 
-// conversationMetadataObject reads the metadata column as a mutable JSON
+// conversationMetadataObjectContext reads the metadata column as a mutable JSON
 // object, so a provider can revise one key without disturbing the others.
-func (s *Store) conversationMetadataObject(conversationID int64) (map[string]json.RawMessage, error) {
-	stored, err := s.GetConversationMetadata(conversationID)
+func (s *Store) conversationMetadataObjectContext(ctx context.Context, conversationID int64) (map[string]jsontext.Value, error) {
+	stored, err := s.GetConversationMetadataContext(ctx, conversationID)
 	if err != nil {
 		return nil, err
 	}
-	metadata := make(map[string]json.RawMessage)
+	metadata := make(map[string]jsontext.Value)
 	if !stored.Valid || strings.TrimSpace(stored.String) == "" {
 		return metadata, nil
 	}
@@ -464,14 +522,14 @@ func (s *Store) conversationMetadataObject(conversationID int64) (map[string]jso
 	return metadata, nil
 }
 
-func (s *Store) writeConversationMetadataObject(
-	conversationID int64, metadata map[string]json.RawMessage,
+func (s *Store) writeConversationMetadataObjectContext(ctx context.Context,
+	conversationID int64, metadata map[string]jsontext.Value,
 ) error {
-	encoded, err := json.Marshal(metadata)
+	encoded, err := json.Marshal(metadata, json.Deterministic(true))
 	if err != nil {
 		return fmt.Errorf("encode conversation metadata (id=%d): %w", conversationID, err)
 	}
-	return s.SetConversationMetadata(conversationID, sql.NullString{
+	return s.SetConversationMetadataContext(ctx, conversationID, sql.NullString{
 		String: string(encoded), Valid: len(metadata) != 0,
 	})
 }
@@ -479,7 +537,12 @@ func (s *Store) writeConversationMetadataObject(
 // ListConversationIDs returns the IDs of every conversation archived under
 // sourceID, in ID order.
 func (s *Store) ListConversationIDs(sourceID int64) ([]int64, error) {
-	rows, err := s.db.Query(`SELECT id FROM conversations WHERE source_id = ? ORDER BY id`, sourceID)
+	return s.ListConversationIDsContext(context.Background(), sourceID)
+}
+
+// ListConversationIDsContext honors cancellation during ListConversationIDs.
+func (s *Store) ListConversationIDsContext(ctx context.Context, sourceID int64) ([]int64, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM conversations WHERE source_id = ? ORDER BY id`, sourceID)
 	if err != nil {
 		return nil, fmt.Errorf("list conversations for source %d: %w", sourceID, err)
 	}
@@ -498,6 +561,31 @@ func (s *Store) ListConversationIDs(sourceID int64) ([]int64, error) {
 	return ids, nil
 }
 
+// ListSourceConversationIDsContext returns nonempty provider conversation IDs
+// archived under sourceID, including conversations without messages.
+func (s *Store) ListSourceConversationIDsContext(ctx context.Context, sourceID int64) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, s.dialect.Rebind(`
+		SELECT source_conversation_id FROM conversations
+		WHERE source_id = ? AND source_conversation_id <> '' ORDER BY id
+	`), sourceID)
+	if err != nil {
+		return nil, fmt.Errorf("list provider conversations for source %d: %w", sourceID, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan provider conversation id for source %d: %w", sourceID, err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list provider conversations for source %d: %w", sourceID, err)
+	}
+	return ids, nil
+}
+
 // ConversationMetadataBatch returns provider metadata keyed by source
 // conversation ID for the requested conversations that exist under sourceID.
 // Existing conversations with SQL NULL metadata remain present with an invalid
@@ -505,12 +593,19 @@ func (s *Store) ListConversationIDs(sourceID int64) ([]int64, error) {
 func (s *Store) ConversationMetadataBatch(
 	sourceID int64, sourceConversationIDs []string,
 ) (map[string]sql.NullString, error) {
+	return s.ConversationMetadataBatchContext(context.Background(), sourceID, sourceConversationIDs)
+}
+
+// ConversationMetadataBatchContext honors cancellation during ConversationMetadataBatch.
+func (s *Store) ConversationMetadataBatchContext(ctx context.Context,
+	sourceID int64, sourceConversationIDs []string,
+) (map[string]sql.NullString, error) {
 	if len(sourceConversationIDs) == 0 {
 		return make(map[string]sql.NullString), nil
 	}
 
 	metadata := make(map[string]sql.NullString)
-	err := queryInChunks(s.db, sourceConversationIDs, []any{sourceID},
+	err := queryInChunksContext(ctx, s.db, sourceConversationIDs, []any{sourceID},
 		`SELECT source_conversation_id, metadata
 		 FROM conversations
 		 WHERE source_id = ? AND source_conversation_id IN (%s)`,
@@ -527,4 +622,24 @@ func (s *Store) ConversationMetadataBatch(
 		return nil, fmt.Errorf("load conversation metadata batch: %w", err)
 	}
 	return metadata, nil
+}
+
+// ConversationTitlesBatchContext loads archived titles by source conversation ID.
+func (s *Store) ConversationTitlesBatchContext(ctx context.Context, sourceID int64, ids []string) (map[string]string, error) {
+	titles := make(map[string]string)
+	err := queryInChunksContext(ctx, s.db, ids, []any{sourceID},
+		`SELECT source_conversation_id, COALESCE(title, '') FROM conversations
+		 WHERE source_id = ? AND source_conversation_id IN (%s)`,
+		func(rows *loggedRows) error {
+			var id, title string
+			if err := rows.Scan(&id, &title); err != nil {
+				return err
+			}
+			titles[id] = title
+			return nil
+		})
+	if err != nil {
+		return nil, fmt.Errorf("load conversation titles batch: %w", err)
+	}
+	return titles, nil
 }

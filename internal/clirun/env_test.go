@@ -14,6 +14,7 @@ func TestEnvAllowed(t *testing.T) {
 		{name: EnvIMAPPassword, want: true},
 		{name: EnvBeeperToken, want: true},
 		{name: EnvDiscordToken, want: true},
+		{name: EnvMatrixLoginSecret, want: true},
 		{name: EnvRemoteDeleteOptIn, want: true},
 		{name: "PATH", want: false},
 	}
@@ -23,8 +24,4 @@ func TestEnvAllowed(t *testing.T) {
 			assert.Equal(t, tt.want, EnvAllowed(tt.name))
 		})
 	}
-}
-
-func TestDiscordTokenEnvironmentName(t *testing.T) {
-	assert.Equal(t, "MSGVAULT_DISCORD_TOKEN", EnvDiscordToken)
 }

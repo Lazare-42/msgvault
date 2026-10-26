@@ -84,7 +84,7 @@ func runAddO365App(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("app-only IMAP verification failed for %s: %w", mailbox, err)
 	}
 
-	s, cleanup, err := openWritableStoreAndInitForIngest()
+	s, cleanup, err := openWritableStoreAndInitForIngestInvocation(invocationFromCommand(cmd))
 	if err != nil {
 		return err
 	}
@@ -124,7 +124,7 @@ func runAddO365App(cmd *cobra.Command, args []string) error {
 	if err := s.UpdateSourceDisplayName(source.ID, mailbox); err != nil {
 		return fmt.Errorf("set display name: %w", err)
 	}
-	if err := runPostSourceCreateMigrations(s); err != nil {
+	if err := runPostSourceCreateMigrationsForInvocation(s, invocationFromCommand(cmd)); err != nil {
 		return fmt.Errorf("post-source-create migrations: %w", err)
 	}
 

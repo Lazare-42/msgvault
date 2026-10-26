@@ -3,7 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"strconv"
@@ -38,11 +38,11 @@ type PersonEnrichmentWork struct {
 	TriggerMask        int64      `json:"trigger_mask"`
 	TriggerGeneration  string     `json:"trigger_generation"`
 	DueAt              time.Time  `json:"due_at"`
-	LeaseOwner         *string    `json:"lease_owner,omitempty"`
+	LeaseOwner         *string    `json:"lease_owner,omitzero" nullable:"false"`
 	LeaseFence         int64      `json:"lease_fence"`
 	LeaseUntil         *time.Time `json:"lease_until,omitempty"`
-	RunID              *int64     `json:"run_id,omitempty"`
-	ActiveAttemptID    *int64     `json:"active_attempt_id,omitempty"`
+	RunID              *int64     `json:"run_id,omitzero" nullable:"false"`
+	ActiveAttemptID    *int64     `json:"active_attempt_id,omitzero" nullable:"false"`
 	HasFreshTrigger    bool       `json:"has_fresh_trigger"`
 }
 
@@ -64,23 +64,23 @@ type PersonEnrichmentAttempt struct {
 	PayloadHash           string     `json:"payload_hash"`
 	RequestHash           string     `json:"request_hash"`
 	State                 string     `json:"state"`
-	ProviderRequestID     *string    `json:"provider_request_id,omitempty"`
-	ProviderJobID         *string    `json:"provider_job_id,omitempty"`
-	AdapterVersion        *string    `json:"adapter_version,omitempty"`
-	SchemaVersion         *string    `json:"schema_version,omitempty"`
+	ProviderRequestID     *string    `json:"provider_request_id,omitzero" nullable:"false"`
+	ProviderJobID         *string    `json:"provider_job_id,omitzero" nullable:"false"`
+	AdapterVersion        *string    `json:"adapter_version,omitzero" nullable:"false"`
+	SchemaVersion         *string    `json:"schema_version,omitzero" nullable:"false"`
 	GeneratedSchema       bool       `json:"generated_schema"`
-	GeneratedSchemaHash   *string    `json:"generated_schema_hash,omitempty"`
-	ProgramFingerprint    *string    `json:"program_fingerprint,omitempty"`
-	FactGenerationKey     *string    `json:"fact_generation_key,omitempty"`
-	LeaseOwner            *string    `json:"lease_owner,omitempty"`
+	GeneratedSchemaHash   *string    `json:"generated_schema_hash,omitzero" nullable:"false"`
+	ProgramFingerprint    *string    `json:"program_fingerprint,omitzero" nullable:"false"`
+	FactGenerationKey     *string    `json:"fact_generation_key,omitzero" nullable:"false"`
+	LeaseOwner            *string    `json:"lease_owner,omitzero" nullable:"false"`
 	LeaseFence            int64      `json:"lease_fence"`
 	LeaseUntil            *time.Time `json:"lease_until,omitempty"`
 	NextActionAt          *time.Time `json:"next_action_at,omitempty"`
 	AttemptCount          int64      `json:"attempt_count"`
 	HardCostCapEnforced   bool       `json:"hard_cost_cap_enforced"`
 	ReservedCostUSDMicros int64      `json:"reserved_cost_usd_micros"`
-	ActualCostUSDMicros   *int64     `json:"actual_cost_usd_micros,omitempty"`
-	FailureClass          *string    `json:"failure_class,omitempty"`
+	ActualCostUSDMicros   *int64     `json:"actual_cost_usd_micros,omitzero" nullable:"false"`
+	FailureClass          *string    `json:"failure_class,omitzero" nullable:"false"`
 	CreatedAt             time.Time  `json:"created_at"`
 	ProviderStartedAt     *time.Time `json:"provider_started_at,omitempty"`
 	CompletedAt           *time.Time `json:"completed_at,omitempty"`
@@ -206,7 +206,8 @@ func (s *Store) PutPersonEnrichmentWorkContext(
 }
 
 // CancelPersonEnrichmentWorkOutsideProfilesContext terminalizes active
-// attempts and removes work whose immutable profile is no longer configured.
+// attempts for unavailable profiles, retaining queued work until that exact
+// profile is configured again. Claims select only configured fingerprints.
 func (s *Store) CancelPersonEnrichmentWorkOutsideProfilesContext(
 	ctx context.Context, activeFingerprints []string,
 ) error {
@@ -273,7 +274,7 @@ func (s *Store) CancelPersonEnrichmentWorkOutsideProfilesContext(
 					SET state = 'terminal', failure_class = ?, completed_at = ?, next_action_at = NULL,
 					    lease_owner = NULL, lease_until = NULL
 					WHERE id = ? AND state IN ('queued','starting','pending','retry_wait','uncertain_start')`,
-					personenrichment.FailurePolicy, completedAt, item.activeAttempt.Int64)
+					personenrichment.FailureProfileUnavailable, completedAt, item.activeAttempt.Int64)
 				if err != nil {
 					return fmt.Errorf("terminalize unavailable person enrichment attempt: %w", err)
 				}
@@ -281,10 +282,18 @@ func (s *Store) CancelPersonEnrichmentWorkOutsideProfilesContext(
 					return err
 				}
 			}
-			result, err := tx.ExecContext(ctx, `DELETE FROM person_enrichment_work
-				WHERE person_id = ? AND profile_fingerprint = ?`, item.personID, item.fingerprint)
+			result, err := tx.ExecContext(ctx, `UPDATE person_enrichment_work
+				SET trigger_mask = CASE WHEN active_attempt_id IS NOT NULL AND NOT has_fresh_trigger
+				        THEN 1 ELSE trigger_mask END,
+				    trigger_generation = CASE WHEN active_attempt_id IS NOT NULL AND NOT has_fresh_trigger
+				        THEN 'profile:' || CAST(active_attempt_id AS TEXT) ELSE trigger_generation END,
+				    due_at = CASE WHEN active_attempt_id IS NOT NULL AND NOT has_fresh_trigger
+				        THEN ? ELSE due_at END,
+				    lease_owner = NULL, lease_until = NULL, run_id = NULL,
+				    active_attempt_id = NULL, has_fresh_trigger = FALSE
+				WHERE person_id = ? AND profile_fingerprint = ?`, completedAt, item.personID, item.fingerprint)
 			if err != nil {
-				return fmt.Errorf("delete unavailable person enrichment work: %w", err)
+				return fmt.Errorf("retain unavailable person enrichment work: %w", err)
 			}
 			if err := requireOneLeaseRow(result); err != nil {
 				return err
@@ -317,10 +326,18 @@ func (s *Store) ClaimWork(
 	options.Owner = strings.TrimSpace(options.Owner)
 	options.ProviderName = strings.TrimSpace(options.ProviderName)
 	if options.RunID <= 0 || options.Owner == "" || options.ProviderName == "" ||
-		options.Now.IsZero() || options.LeaseDuration <= 0 {
+		!validLowerSHA256(options.ProfileFingerprint) || options.Now.IsZero() || options.LeaseDuration <= 0 {
 		return nil, errors.New("person enrichment claim options are invalid")
 	}
 	options.Now = options.Now.UTC()
+	return retryContendedWrite(ctx, s, "claim person enrichment work", func() (*personenrichment.WorkLease, error) {
+		return s.claimWorkOnce(ctx, options)
+	})
+}
+
+func (s *Store) claimWorkOnce(
+	ctx context.Context, options personenrichment.ClaimOptions,
+) (*personenrichment.WorkLease, error) {
 	leaseUntil := options.Now.Add(options.LeaseDuration)
 	var lease *personenrichment.WorkLease
 	err := s.withTxContext(ctx, func(tx *loggedTx) error {
@@ -332,7 +349,7 @@ func (s *Store) ClaimWork(
 		if s.personEnrichmentRunBarrier != nil {
 			s.personEnrichmentRunBarrier("claim_run_locked")
 		}
-		if runState != "running" {
+		if runState != personEnrichmentStateRunning {
 			return errors.New("person enrichment claim requires a running run")
 		}
 		lock := ""
@@ -343,7 +360,7 @@ func (s *Store) ClaimWork(
 			SELECT w.person_id, w.profile_fingerprint
 			FROM person_enrichment_work w
 			JOIN person_enrichment_profiles p ON p.fingerprint = w.profile_fingerprint
-			WHERE p.provider_name = ?
+			WHERE p.provider_name = ? AND w.profile_fingerprint = ?
 			  AND (w.run_id = ? OR w.run_id IS NULL)
 			  AND w.due_at <= ?
 			  AND (w.lease_owner IS NULL OR w.lease_until <= ?)
@@ -366,7 +383,7 @@ func (s *Store) ClaimWork(
 			until                               nullableTimestamp
 		)
 		err := tx.QueryRowContext(ctx, query,
-			options.ProviderName, options.RunID, options.Now, options.Now, options.RunID,
+			options.ProviderName, options.ProfileFingerprint, options.RunID, options.Now, options.Now, options.RunID,
 			options.RunID, options.Owner, leaseUntil).Scan(
 			&personID, &fingerprint, &triggerMask, &generation, &runID, &activeID, &fence, &until)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -1028,8 +1045,7 @@ func (s *Store) AuthorizeAttemptPoll(
 		var active bool
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
 			SELECT 1 FROM person_tracking tracked
-			JOIN person_enrichment_consents consent
-			  ON consent.profile_fingerprint = ? AND consent.revoked_at IS NULL
+			JOIN `+activeConsentsSQL(ConsentPersonEnrichment)+` consent ON consent.fingerprint = ?
 			WHERE tracked.person_id = ?)`, token.ProfileFingerprint,
 			token.WorkPersonID).Scan(&active); err != nil {
 			return fmt.Errorf("check person enrichment poll authority: %w", err)
@@ -1096,8 +1112,7 @@ func (s *Store) AuthorizeAttemptDispatch(
 		var active bool
 		if err := tx.QueryRowContext(ctx, `SELECT EXISTS (
 			SELECT 1 FROM person_tracking tracked
-			JOIN person_enrichment_consents consent
-			  ON consent.profile_fingerprint = ? AND consent.revoked_at IS NULL
+			JOIN `+activeConsentsSQL(ConsentPersonEnrichment)+` consent ON consent.fingerprint = ?
 			WHERE tracked.person_id = ?)`, token.ProfileFingerprint,
 			token.WorkPersonID).Scan(&active); err != nil {
 			return fmt.Errorf("check person enrichment dispatch authority: %w", err)
@@ -1290,7 +1305,7 @@ func (s *Store) MarkTerminal(
 		state = "identity_rejected"
 	case personenrichment.FailureSuppressed:
 		state = "suppressed"
-	case personenrichment.FailurePolicy, personenrichment.FailureRateLimited,
+	case personenrichment.FailurePolicy, personenrichment.FailureProfileUnavailable, personenrichment.FailureRateLimited,
 		personenrichment.FailureTransient, personenrichment.FailureInvalidOutput,
 		personenrichment.FailureTerminal, personenrichment.FailureUncertainStart:
 		// The default terminal state is correct for every other safe failure.
@@ -1371,7 +1386,7 @@ func (s *Store) completePersonEnrichmentAttemptTx(
 	ctx context.Context, tx *loggedTx, token personenrichment.LeaseToken,
 	completion personEnrichmentAttemptCompletion,
 ) (bool, error) {
-	if completion.State != "succeeded" {
+	if completion.State != personEnrichmentStateSucceeded {
 		return false, errors.New("successful person enrichment completion requires succeeded state")
 	}
 	if !completion.ActualCostMissing {
@@ -1403,7 +1418,7 @@ func (s *Store) completePersonEnrichmentAttemptTx(
 			return false, err
 		}
 	}
-	state := "succeeded"
+	state := personEnrichmentStateSucceeded
 	var failureClass any
 	if costViolation {
 		state = "terminal"
@@ -1485,7 +1500,7 @@ func (s *Store) ListPersonEnrichmentAttemptsContext(
 
 func validPersonEnrichmentAttemptState(state string) bool {
 	switch state {
-	case "queued", "starting", "pending", "retry_wait", "succeeded", "terminal",
+	case "queued", "starting", "pending", "retry_wait", personEnrichmentStateSucceeded, "terminal",
 		"suppressed", "identity_rejected", "uncertain_start":
 		return true
 	default:
@@ -1905,7 +1920,7 @@ func validateSafeFailure(failure personenrichment.SafeFailure) error {
 
 func validPersonEnrichmentFailureClass(class personenrichment.FailureClass) bool {
 	switch class {
-	case personenrichment.FailurePolicy, personenrichment.FailureSuppressed,
+	case personenrichment.FailurePolicy, personenrichment.FailureProfileUnavailable, personenrichment.FailureSuppressed,
 		personenrichment.FailureRateLimited, personenrichment.FailureTransient,
 		personenrichment.FailureInvalidOutput, personenrichment.FailureIdentityRejected,
 		personenrichment.FailureTerminal, personenrichment.FailureUncertainStart:

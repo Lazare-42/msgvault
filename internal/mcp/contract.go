@@ -1,13 +1,23 @@
 package mcp
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
+
+	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 type toolRequest struct {
-	arguments map[string]any
+	arguments                     map[string]any
+	session                       *sdkmcp.ServerSession
+	inputResponses                sdkmcp.InputResponseMap
+	toolName                      string
+	requestState                  string
+	confirmations                 *confirmationChallenges
+	confirmationSessionKey        string
+	requireConfirmationSessionKey bool
 }
 
 func (r toolRequest) GetArguments() map[string]any {
@@ -22,8 +32,10 @@ type embeddedResource struct {
 
 type toolResult struct {
 	text              string
-	structuredContent json.RawMessage
+	structuredContent jsontext.Value
 	embeddedResource  *embeddedResource
+	inputRequests     sdkmcp.InputRequestMap
+	requestState      string
 	isError           bool
 }
 
@@ -48,7 +60,7 @@ func newInternalError(operation string, err error) error {
 }
 
 func jsonResult(v any) (*toolResult, error) {
-	data, err := json.Marshal(v)
+	data, err := json.Marshal(v, json.Deterministic(true))
 	if err != nil {
 		return nil, &internalError{
 			operation: "marshal tool result",
@@ -56,21 +68,21 @@ func jsonResult(v any) (*toolResult, error) {
 		}
 	}
 
-	raw := json.RawMessage(data)
+	raw := jsontext.Value(data)
 	return &toolResult{
 		text:              string(raw),
 		structuredContent: raw,
 	}, nil
 }
 
-// jsonArrayResult preserves the legacy text payload while presenting the
-// object-shaped structured output required by the official MCP SDK.
+// jsonArrayResult keeps the text array while returning the object-shaped
+// structured content required by MCP.
 func jsonArrayResult(field string, v any) (*toolResult, error) {
-	text, err := json.Marshal(v)
+	text, err := json.Marshal(v, json.Deterministic(true))
 	if err != nil {
 		return nil, newInternalError("marshal tool result", err)
 	}
-	structured, err := json.Marshal(map[string]any{field: v})
+	structured, err := json.Marshal(map[string]any{field: v}, json.Deterministic(true))
 	if err != nil {
 		return nil, newInternalError("marshal structured tool result", err)
 	}

@@ -30,6 +30,7 @@ type textAggregateLoadedMsg struct {
 // textMessagesLoadedMsg is sent when text conversation messages are loaded.
 type textMessagesLoadedMsg struct {
 	messages               []query.MessageSummary
+	query                  string
 	err                    error
 	requestID              uint64
 	presentationGeneration uint64
@@ -47,6 +48,7 @@ type textMessageLoadedMsg struct {
 // textSearchResultMsg is sent when text search results are loaded.
 type textSearchResultMsg struct {
 	messages               []query.MessageSummary
+	query                  string
 	err                    error
 	requestID              uint64
 	presentationGeneration uint64
@@ -67,6 +69,7 @@ func (m *Model) nextTextRequestID() uint64 {
 func (m *Model) loadTextConversations() tea.Cmd {
 	te := m.textEngine
 	filter := m.textState.filter
+	filter.SourceID = m.textState.sourceID
 	requestID := m.nextTextRequestID()
 	presentationGeneration := m.presentationGeneration
 	return safeCmdWithPanic(
@@ -101,6 +104,7 @@ func (m *Model) loadTextAggregate() tea.Cmd {
 	te := m.textEngine
 	vt := m.textState.viewType
 	filter := m.textState.filter
+	filter.SourceID = m.textState.sourceID
 	requestID := m.nextTextRequestID()
 	presentationGeneration := m.presentationGeneration
 	return safeCmdWithPanic(
@@ -143,6 +147,7 @@ func (m *Model) loadTextMessages() tea.Cmd {
 	te := m.textEngine
 	convID := m.textState.selectedConvID
 	filter := m.textState.filter
+	filter.SourceID = m.textState.sourceID
 	requestID := m.nextTextRequestID()
 	presentationGeneration := m.presentationGeneration
 	return safeCmdWithPanic(
@@ -151,7 +156,7 @@ func (m *Model) loadTextMessages() tea.Cmd {
 				context.Background(), convID, filter,
 			)
 			return textMessagesLoadedMsg{
-				messages: msgs, err: err, requestID: requestID,
+				messages: msgs, query: filter.SearchQuery, err: err, requestID: requestID,
 				presentationGeneration: presentationGeneration,
 			}
 		},
@@ -219,15 +224,16 @@ func (m Model) handleTextMessageLoaded(msg textMessageLoadedMsg) (tea.Model, tea
 // loadTextSearch executes a text message search.
 func (m *Model) loadTextSearch(searchQuery string) tea.Cmd {
 	te := m.textEngine
+	sourceID := m.textState.sourceID
 	requestID := m.nextTextRequestID()
 	presentationGeneration := m.presentationGeneration
 	return safeCmdWithPanic(
 		func() tea.Msg {
 			msgs, err := te.TextSearch(
-				context.Background(), searchQuery, 100, 0,
+				context.Background(), searchQuery, sourceID, 100, 0,
 			)
 			return textSearchResultMsg{
-				messages: msgs, err: err, requestID: requestID,
+				messages: msgs, query: searchQuery, err: err, requestID: requestID,
 				presentationGeneration: presentationGeneration,
 			}
 		},
@@ -255,5 +261,19 @@ func (m *Model) loadTextData() tea.Cmd {
 		return nil
 	default:
 		return m.loadTextAggregate()
+	}
+}
+
+func (m *Model) textPresentationLoadCmd() tea.Cmd {
+	switch {
+	case m.textState.level == textLevelDetail:
+		if m.messageDetail == nil && m.textState.selectedMessageID > 0 {
+			return m.loadTextMessage(m.textState.selectedMessageID)
+		}
+		return nil
+	case m.textState.level == textLevelTimeline && m.textState.globalSearchTimeline:
+		return nil
+	default:
+		return m.loadTextData()
 	}
 }

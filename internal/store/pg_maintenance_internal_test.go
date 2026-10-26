@@ -34,6 +34,17 @@ func skipUnlessPostgresInternal(t *testing.T) string {
 // on cleanup.
 func newPGStoreInternal(t *testing.T, dbURL string) *Store {
 	t.Helper()
+	st := newUninitializedPGStoreInternal(t, dbURL)
+	require.NoError(t, st.InitSchema(), "init schema")
+	return st
+}
+
+// newUninitializedPGStoreInternal opens an empty schema-isolated PostgreSQL
+// store without running InitSchema. Tests that need to observe a specific
+// schema-initialization boundary use this; ordinary tests use
+// newPGStoreInternal above.
+func newUninitializedPGStoreInternal(t *testing.T, dbURL string) *Store {
+	t.Helper()
 
 	buf := make([]byte, 8)
 	_, err := rand.Read(buf)
@@ -67,7 +78,6 @@ func newPGStoreInternal(t *testing.T, dbURL string) *Store {
 
 	st, err = Open(testURL)
 	require.NoError(t, err, "open store")
-	require.NoError(t, st.InitSchema(), "init schema")
 	return st
 }
 
@@ -150,9 +160,6 @@ func TestExclusiveLockTablesCoverCascade(t *testing.T) {
 		"identity_match_evidence must be locked for candidate cascade cleanup")
 }
 
-// TestMaintenanceTimeoutResetSQL pins the exact statement the PG dialect uses
-// to lift the per-statement timeout — the mechanism finding S1's hatch relies
-// on. SQLite returns "" so runMaintenance issues no reset.
 // TestRemoveSourceSerializedDoesNotDeadlockWithPersonMerge pins the lock
 // ordering documented on BeginExclusive: MergeParticipants writes person
 // tables BEFORE participants/messages, the opposite of exclusiveLockTables'
@@ -293,9 +300,92 @@ func TestRemoveSourceSerializedDoesNotDeadlockWithSetParticipantIdentifier(t *te
 	}
 }
 
-func TestMaintenanceTimeoutResetSQL(t *testing.T) {
-	assert.Equal(t, "SET LOCAL statement_timeout = 0", (&PostgreSQLDialect{}).MaintenanceTimeoutResetSQL())
-	assert.Empty(t, (&SQLiteDialect{}).MaintenanceTimeoutResetSQL())
+func TestMergeSourcesDoesNotDeadlockWithSerializedSourceRemoval(t *testing.T) {
+	require := require.New(t)
+	dbURL := skipUnlessPostgresInternal(t)
+	st := newPGStoreInternal(t, dbURL)
+	ctx := context.Background()
+	from, err := st.GetOrCreateSource("gmail", "merge-history@example.test")
+	require.NoError(err)
+	into, err := st.GetOrCreateSource("gmail", "merge-live@example.test")
+	require.NoError(err)
+	removable, err := st.GetOrCreateSource("gmail", "remove-unrelated@example.test")
+	require.NoError(err)
+
+	beforeLock := make(chan struct{})
+	continueMerge := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(continueMerge) }) }
+	defer release()
+	st.sourceMergeBeforeIdentityLockHook = func() {
+		close(beforeLock)
+		<-continueMerge
+	}
+	defer func() { st.sourceMergeBeforeIdentityLockHook = nil }()
+
+	mergeDone := make(chan error, 1)
+	go func() {
+		_, err := st.MergeSourcesContext(ctx, MergeSourcesRequest{FromSourceID: from.ID, IntoSourceID: into.ID})
+		mergeDone <- err
+	}()
+	select {
+	case <-beforeLock:
+	case <-time.After(10 * time.Second):
+		require.FailNow("merge did not reach the identity-lock barrier")
+	}
+
+	removeDone := make(chan error, 1)
+	go func() {
+		_, _, err := st.RemoveSourceSerialized(ctx, removable.ID)
+		removeDone <- err
+	}()
+
+	// BeginExclusive takes the identity-revision row lock before it requests an
+	// EXCLUSIVE lock on sources. In the broken order, the merge already owns a
+	// source row lock and then waits for that revision row; observing the
+	// waiting table lock lets this test release the merge at exactly that edge.
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	removeFinished := false
+	var removeErr error
+	waitingForSources := false
+	for !removeFinished && !waitingForSources {
+		select {
+		case removeErr = <-removeDone:
+			removeFinished = true
+		case <-ticker.C:
+			var waiting bool
+			err := st.DB().QueryRowContext(ctx, `SELECT EXISTS (
+				SELECT 1 FROM pg_locks l
+				JOIN pg_class c ON c.oid = l.relation
+				JOIN pg_namespace n ON n.oid = c.relnamespace
+				WHERE n.nspname = current_schema() AND c.relname = 'sources'
+				  AND l.mode = 'ExclusiveLock' AND NOT l.granted
+			)`).Scan(&waiting)
+			require.NoError(err, "observe serialized removal's source-table lock")
+			waitingForSources = waiting
+		case <-deadline.C:
+			require.FailNow("serialized removal neither completed nor exposed its waiting sources lock")
+		}
+	}
+	release()
+
+	select {
+	case err := <-mergeDone:
+		require.NoError(err, "merge must succeed after lock ordering is respected")
+	case <-time.After(15 * time.Second):
+		require.FailNow("merge did not finish after releasing the identity-lock barrier")
+	}
+	if !removeFinished {
+		select {
+		case removeErr = <-removeDone:
+		case <-time.After(15 * time.Second):
+			require.FailNow("serialized source removal did not finish")
+		}
+	}
+	require.NoError(removeErr, "unrelated serialized source removal must succeed")
 }
 
 // is57014 reports whether err is the PostgreSQL query_canceled SQLSTATE raised

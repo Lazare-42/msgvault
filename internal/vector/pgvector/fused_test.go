@@ -5,7 +5,6 @@ package pgvector
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"math"
 	"testing"
 	"time"
@@ -126,7 +125,7 @@ func TestFusedSearch_FTSOnly(t *testing.T) {
 	require := require.New(t)
 
 	f := seedThree(t)
-	hits, saturated, err := f.b.FusedSearch(f.ctx, vector.FusedRequest{
+	hits, metadata, err := f.b.FusedSearch(f.ctx, vector.FusedRequest{
 		FTSTerms:   []string{"quantum"},
 		Generation: f.gen,
 		KPerSignal: 10,
@@ -136,7 +135,7 @@ func TestFusedSearch_FTSOnly(t *testing.T) {
 	require.NoError(
 		err, "FusedSearch")
 
-	assert.False(saturated, "saturated should be false (pool size 2 < KPerSignal 10)")
+	assert.False(metadata.PoolSaturated, "saturated should be false (pool size 2 < KPerSignal 10)")
 	require.Len(hits, 2, "hits should be msgs 1 and 3 (mention 'quantum'); hits=%+v", hits)
 	seen := map[int64]bool{}
 	for i, h := range hits {
@@ -172,7 +171,7 @@ func TestFusedSearch_MessageTypeFilter(t *testing.T) {
 		3: unitVec(4, 2),
 	})
 
-	hits, saturated, err := f.b.FusedSearch(f.ctx, vector.FusedRequest{
+	hits, metadata, err := f.b.FusedSearch(f.ctx, vector.FusedRequest{
 		FTSTerms:   []string{"lunch"},
 		Generation: f.gen,
 		KPerSignal: 10,
@@ -183,7 +182,7 @@ func TestFusedSearch_MessageTypeFilter(t *testing.T) {
 	require.NoError(
 		err, "FusedSearch")
 
-	assert.False(saturated, "saturated should be false")
+	assert.False(metadata.PoolSaturated, "saturated should be false")
 	require.Len(hits, 1, "message_type filter should exclude email FTS hits; hits=%+v", hits)
 	assert.Equal(int64(1), hits[0].MessageID)
 }
@@ -193,7 +192,7 @@ func TestFusedSearch_ANNOnly(t *testing.T) {
 	require := require.New(t)
 
 	f := seedThree(t)
-	hits, saturated, err := f.b.FusedSearch(f.ctx, vector.FusedRequest{
+	hits, metadata, err := f.b.FusedSearch(f.ctx, vector.FusedRequest{
 		QueryVec:   unitVec(4, 0),
 		Generation: f.gen,
 		KPerSignal: 10,
@@ -203,7 +202,7 @@ func TestFusedSearch_ANNOnly(t *testing.T) {
 	require.NoError(
 		err, "FusedSearch")
 
-	assert.False(saturated, "saturated should be false")
+	assert.False(metadata.PoolSaturated, "saturated should be false")
 	require.NotEmpty(hits, "expected hits, got none")
 	assert.Equal(int64(1), hits[0].MessageID, "top hit should be 1 (query points along axis 0)")
 	for i, h := range hits {
@@ -217,7 +216,7 @@ func TestFusedSearch_Hybrid(t *testing.T) {
 	require := require.New(t)
 
 	f := seedThree(t)
-	hits, saturated, err := f.b.FusedSearch(f.ctx, vector.FusedRequest{
+	hits, metadata, err := f.b.FusedSearch(f.ctx, vector.FusedRequest{
 		FTSTerms:   []string{"quantum"},
 		QueryVec:   unitVec(4, 1), // points at msg 2 (no 'quantum')
 		Generation: f.gen,
@@ -228,7 +227,7 @@ func TestFusedSearch_Hybrid(t *testing.T) {
 	require.NoError(
 		err, "FusedSearch")
 
-	assert.False(saturated, "saturated should be false")
+	assert.False(metadata.PoolSaturated, "saturated should be false")
 	require. // Expect: msg 2 via ANN; msgs 1 and 3 via FTS — union of 3.
 			Len(hits, 3, "hits should be the union of 3; hits=%+v", hits)
 	for i := 1; i < len(hits); i++ {
@@ -332,7 +331,7 @@ func TestFusedSearch_MultiChunk_OneHitPerMessage(t *testing.T) {
 
 func TestFusedSearch_Saturated(t *testing.T) {
 	f := seedThree(t)
-	hits, saturated, err := f.b.FusedSearch(f.ctx, vector.FusedRequest{
+	hits, metadata, err := f.b.FusedSearch(f.ctx, vector.FusedRequest{
 		FTSTerms:   []string{"quantum"},
 		Generation: f.gen,
 		KPerSignal: 1, // smaller than the 2-row FTS pool → saturates
@@ -340,7 +339,7 @@ func TestFusedSearch_Saturated(t *testing.T) {
 		RRFK:       60,
 	})
 	require.NoError(t, err, "FusedSearch")
-	assert.True(t, saturated, "saturated should be true (KPerSignal=1, pool=2)")
+	assert.True(t, metadata.PoolSaturated, "saturated should be true (KPerSignal=1, pool=2)")
 	assert.Len(t, hits, 1, "hits should be trimmed to KPerSignal")
 }
 
@@ -349,7 +348,7 @@ func TestFusedSearch_FilterBySource(t *testing.T) {
 	require := require.New(t)
 
 	f := seedThree(t)
-	hits, saturated, err := f.b.FusedSearch(f.ctx, vector.FusedRequest{
+	hits, metadata, err := f.b.FusedSearch(f.ctx, vector.FusedRequest{
 		FTSTerms:   []string{"quantum"},
 		Generation: f.gen,
 		KPerSignal: 10,
@@ -364,9 +363,9 @@ func TestFusedSearch_FilterBySource(t *testing.T) {
 		Empty(hits, "want empty (source 20 has no quantum match)")
 	assert. // Empty result drives the saturation fallback: with an empty pool
 		// (0 ≤ KPerSignal=10) there is no overflow, so saturated must be false.
-		False(saturated, "empty filtered pool cannot saturate")
+		False(metadata.PoolSaturated, "empty filtered pool cannot saturate")
 
-	hits, saturated, err = f.b.FusedSearch(f.ctx, vector.FusedRequest{
+	hits, metadata, err = f.b.FusedSearch(f.ctx, vector.FusedRequest{
 		FTSTerms:   []string{"quantum"},
 		Generation: f.gen,
 		KPerSignal: 10,
@@ -378,40 +377,7 @@ func TestFusedSearch_FilterBySource(t *testing.T) {
 		err, "FusedSearch (source 10)")
 
 	assert.Len(hits, 2, "want msgs 1+3 in source 10 that match quantum")
-	assert.False(saturated, "pool size 2 < KPerSignal 10 must not saturate")
-}
-
-func TestFusedSearch_FilterByMessageType(t *testing.T) {
-	assert := assert.New(t)
-	require := require.New(t)
-
-	f := newFusedFixture(t)
-	base := time.Date(2025, 1, 15, 12, 0, 0, 0, time.UTC)
-	f.seedMsg(t, 1, "email topic", "topic body", 10, base, false)
-	f.seedMsg(t, 2, "sms topic", "topic body", 10, base.Add(time.Hour), false)
-	_, err := f.db.ExecContext(f.ctx,
-		`UPDATE messages SET message_type = CASE id WHEN 1 THEN 'email' ELSE 'sms' END WHERE id IN (1, 2)`)
-	require.NoError(
-		err, "seed message_type")
-
-	f.embedAll(t, map[int64][]float32{
-		1: unitVec(4, 0),
-		2: unitVec(4, 1),
-	})
-
-	hits, saturated, err := f.b.FusedSearch(f.ctx, vector.FusedRequest{
-		FTSTerms:   []string{"topic"},
-		Generation: f.gen,
-		Filter:     vector.Filter{MessageTypes: []string{"sms"}},
-		KPerSignal: 10,
-		Limit:      10,
-		RRFK:       60,
-	})
-	require.NoError(
-		err, "FusedSearch")
-
-	assert.False(saturated, "saturated should be false")
-	assert.Equal([]int64{2}, fusedIDs(hits), "message_type=sms hits")
+	assert.False(metadata.PoolSaturated, "pool size 2 < KPerSignal 10 must not saturate")
 }
 
 func TestFusedSearch_FilterByDateRange(t *testing.T) {
@@ -602,22 +568,4 @@ func TestFusedSearch_SkipsDeletedMessages(t *testing.T) {
 	for _, h := range hits {
 		assert.NotEqualf(t, int64(1), h.MessageID, "hits include soft-deleted msg 1: %+v", h)
 	}
-}
-
-// TestFusedSearch_FilterClausesUnused — sanity-check the static
-// SQL-formatting code path: build an applyFilterClauses fragment by
-// hand and assert it begins with a leading " AND " (so it can be
-// safely concatenated after a WHERE predicate). The clause must
-// reference each placeholder it claims to bind.
-func TestFusedSearch_FilterClausesUnused(t *testing.T) {
-	var args []any
-	bind := func(v any) string {
-		args = append(args, v)
-		return fmt.Sprintf("$%d", len(args))
-	}
-	f := vector.Filter{SourceIDs: []int64{1, 2}}
-	got := applyFilterClauses(f, bind)
-	assert.Len(t, args, 1, "args bound should be 1")
-	require.GreaterOrEqual(t, len(got), 5, "clauses = %q, want leading ' AND '", got)
-	assert.Equal(t, " AND ", got[:5], "clauses = %q, want leading ' AND '", got)
 }

@@ -121,7 +121,7 @@ func (h *handlers) listWhatsAppChats(ctx context.Context, req toolRequest) (*too
 	if token := trimmedStringArg(args, toolArgCursor); token != "" {
 		cursor, err := store.DecodeWhatsAppChatCursor(filter, token)
 		if err != nil {
-			return toolErrorResult("invalid_cursor: cursor is malformed or was issued for a different account, query, or order"), nil
+			return toolErrorResult("invalid_cursor: cursor is malformed or was issued for a different account, query, or order"), nil //nolint:nilerr // Invalid input is an MCP tool error, not a transport error.
 		}
 		filter.After = &cursor
 	}

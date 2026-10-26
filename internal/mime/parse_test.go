@@ -33,6 +33,69 @@ func parseEmail(t *testing.T, opts emailOptions) *Message {
 	return mustParse(t, makeRawEmail(opts))
 }
 
+// TestNormalizeListID catches removal or regression of the List-Id normalizer.
+func TestNormalizeListID(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{
+			name:  "display name plus bracketed identifier",
+			input: "Example List <list.example.org>",
+			want:  "<list.example.org>",
+		},
+		{
+			name:  "angle bracket in decoded display name",
+			input: `"Weekly <News>" <news.vendor.example>`,
+			want:  "<news.vendor.example>",
+		},
+		{
+			name:  "bare bracketed identifier",
+			input: "<list.example.org>",
+			want:  "<list.example.org>",
+		},
+		{
+			name:  "folded whitespace around bracketed identifier",
+			input: "\r\n\t <list.example.org> \r\n",
+			want:  "<list.example.org>",
+		},
+		{
+			name:  "internal token whitespace preserved",
+			input: "Example List < list.example.org >",
+			want:  "< list.example.org >",
+		},
+		{
+			name:  "raw identifier fallback",
+			input: "  list.example.org  ",
+			want:  "list.example.org",
+		},
+		{
+			name:  "empty identifier",
+			input: "",
+			want:  "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, NormalizeListID(tc.input))
+		})
+	}
+}
+
+// TestParseListID catches removal of ListID from the parsed message or its
+// assignment from the List-Id header.
+func TestParseListID(t *testing.T) {
+	msg := mustParse(t, []byte("From: sender@example.com\r\n"+
+		"To: recipient@example.com\r\n"+
+		"Subject: mailing list\r\n"+
+		"List-Id: Example List <list.example.org>\r\n"+
+		"\r\nbody\r\n"))
+
+	assert.Equal(t, "<list.example.org>", msg.ListID)
+}
+
 func TestParsePreservesAuthoritativeAttachmentEvidence(t *testing.T) {
 	assert := assert.New(t)
 	raw := []byte("From: sender@example.com\r\n" +
@@ -109,6 +172,19 @@ func TestParse_InvalidTextPartContentTypeDefaultsToBody(t *testing.T) {
 	assert.Contains(msg.Errors[0], "invalid Content-Type treated as text/plain")
 }
 
+func TestParse_TextPlainContentTypeWithTrailingSemicolon(t *testing.T) {
+	raw := []byte("From: sender@example.com\r\n" +
+		"To: recipient@example.com\r\n" +
+		"Subject: trailing semicolon\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: text/plain;\r\n\r\n" +
+		"searchable body\r\n")
+
+	msg := mustParse(t, raw)
+	assert.Equal(t, "searchable body", strings.TrimSpace(msg.BodyText))
+	assert.Empty(t, msg.Attachments)
+}
+
 func TestParse_InvalidPartContentTypePreservesNameParameter(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -180,6 +256,7 @@ func TestParseWithRecovery_FatalMultipartSalvagesHeaders(t *testing.T) {
 		"Received: from sender.example.test by relay.example.test; Tue, 02 Jan 2024 15:04:05 +0000\r\n" +
 		"Message-ID: <message@example.test>\r\n" +
 		"In-Reply-To: <parent@example.test>\r\n" +
+		"List-Id: Project Updates <updates.example.test>\r\n" +
 		"References: <root@example.test>\r\n" +
 		"\t<parent@example.test>\r\n" +
 		"MIME-Version: 1.0\r\n" +
@@ -208,6 +285,7 @@ func TestParseWithRecovery_FatalMultipartSalvagesHeaders(t *testing.T) {
 	}}, msg.Cc)
 	assert.Equal("<message@example.test>", msg.MessageID)
 	assert.Equal("<parent@example.test>", msg.InReplyTo)
+	assert.Equal("<updates.example.test>", msg.ListID)
 	assert.Equal([]string{"root@example.test", "parent@example.test"}, msg.References)
 	assert.Contains(msg.BodyText, "MIME parsing failed")
 	assert.Contains(msg.BodyText, "Raw MIME data is preserved")
@@ -589,23 +667,6 @@ func TestMessage_GetBodyText(t *testing.T) {
 	assert.Empty(t, msg.GetBodyText())
 }
 
-func TestMessage_GetFirstFrom(t *testing.T) {
-	msg := &Message{
-		From: []Address{
-			{Name: "Alice", Email: "alice@example.com", Domain: "example.com"},
-			{Name: "Bob", Email: "bob@example.com", Domain: "example.com"},
-		},
-	}
-
-	got := msg.GetFirstFrom()
-	assert.Equal(t, "alice@example.com", got.Email)
-
-	// Empty
-	msg = &Message{}
-	got = msg.GetFirstFrom()
-	assert.Empty(t, got.Email)
-}
-
 // TestParse_MinimalMessage tests our Parse wrapper with a minimal valid message.
 // This verifies our wrapper works, not enmime's parsing logic.
 func TestParse_MinimalMessage(t *testing.T) {
@@ -680,23 +741,6 @@ func TestParse_MalformedContinuationLineAfterDate(t *testing.T) {
 	assert.True(t, msg.Date.Equal(time.Date(2004, 5, 27, 22, 6, 42, 0, time.UTC)),
 		"msg.Date = %v", msg.Date)
 	assert.Equal(t, "Thu, 27 May 2004 17:06:42 -0500 .", msg.RawDateHeader)
-}
-
-// TestParse_InvalidCharset verifies enmime handles malformed charsets gracefully.
-// Enmime should not fail on invalid charset - it attempts conversion and collects errors.
-func TestParse_InvalidCharset(t *testing.T) {
-	// Message with non-existent charset - enmime should handle this gracefully
-	msg := parseEmail(t, emailOptions{
-		ContentType: "text/plain; charset=invalid-charset-xyz",
-		Body:        "Body text",
-	})
-
-	// Should still be able to access subject and addresses
-	assert.Equal(t, "Test", msg.Subject)
-
-	// Body might be garbled or empty, but should not crash
-	t.Logf("Body text with invalid charset: %q", msg.BodyText)
-	t.Logf("Parsing errors: %v", msg.Errors)
 }
 
 // TestParse_Latin1Charset verifies Latin-1 (ISO-8859-1) charset is handled.

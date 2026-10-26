@@ -24,7 +24,7 @@ func (*workerTestStore) EnqueueOCRBacklog(context.Context, string, int) (int64, 
 }
 
 func (*workerTestStore) ClaimOCRJob(context.Context, string, time.Duration) (*store.OCRJob, error) {
-	return nil, nil
+	return nil, nil //nolint:nilnil // An empty OCR queue is represented by nil without an error.
 }
 
 func (s *workerTestStore) CompleteOCR(context.Context, string, string, int, string, []store.OCRPage) error {

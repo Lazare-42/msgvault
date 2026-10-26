@@ -3,9 +3,16 @@ package cmd
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,7 +38,7 @@ func TestExportMessagesCommandWritesContractOrderAndCounts(t *testing.T) {
 	)
 
 	cmd := newExportMessagesLocalCmd(exportMessagesDeps{
-		openStore: func() (*store.Store, func(), error) {
+		openStore: func(context.Context) (*store.Store, func(), error) {
 			return st, func() {}, nil
 		},
 	})
@@ -53,6 +60,7 @@ func TestExportMessagesCommandWritesContractOrderAndCounts(t *testing.T) {
 	}, exportMessageRecordTypes(records))
 
 	assert.Equal(messageExportSchema, records[0]["schema"])
+	assert.NotContains(records[0]["filters"], "person_id")
 	assert.Equal(Version, records[0]["msgvault_version"])
 	window, ok := records[0]["window"].(map[string]any)
 	require.True(ok)
@@ -90,7 +98,7 @@ func TestExportMessagesCommandNormalizesFilters(t *testing.T) {
 	require.NoError(err)
 
 	cmd := newExportMessagesLocalCmd(exportMessagesDeps{
-		openStore: func() (*store.Store, func(), error) {
+		openStore: func(context.Context) (*store.Store, func(), error) {
 			return st, func() {}, nil
 		},
 	})
@@ -171,7 +179,7 @@ func TestExportMessagesCommandRejectsPreflightErrorsWithoutOutput(t *testing.T) 
 			require := require.New(t)
 			st := testutil.NewTestStore(t)
 			cmd := newExportMessagesLocalCmd(exportMessagesDeps{
-				openStore: func() (*store.Store, func(), error) {
+				openStore: func(context.Context) (*store.Store, func(), error) {
 					return st, func() {}, nil
 				},
 			})
@@ -213,7 +221,7 @@ func TestExportMessagesCommandOmitsCompletionAfterStreamFailure(t *testing.T) {
 	)
 
 	cmd := newExportMessagesLocalCmd(exportMessagesDeps{
-		openStore: func() (*store.Store, func(), error) {
+		openStore: func(context.Context) (*store.Store, func(), error) {
 			return st, func() {}, nil
 		},
 	})
@@ -229,6 +237,11 @@ func TestExportMessagesCommandOmitsCompletionAfterStreamFailure(t *testing.T) {
 	require.NotContains(writer.output.String(), `"record_type":"complete"`)
 }
 
+// exportCompleteEvents is the daemon CLI stream of an export that wrote one
+// complete record.
+const exportCompleteEvents = "{\"type\":\"stdout\",\"data\":\"{\\\"record_type\\\":\\\"complete\\\"}\\n\"}\n" +
+	"{\"type\":\"complete\"}"
+
 func TestExportMessagesCommandRoutesThroughDaemon(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
@@ -243,13 +256,14 @@ func TestExportMessagesCommandRoutesThroughDaemon(t *testing.T) {
 				"--start=2026-07-20T00:00:00Z",
 			}, req.Args)
 		},
-		"{\"type\":\"stdout\",\"data\":\"{\\\"record_type\\\":\\\"complete\\\"}\\n\"}\n"+
-			"{\"type\":\"complete\"}\n",
+		exportCompleteEvents,
 	)
-	configureRemoteDaemonForTest(t, server.URL)
+	testCtx := configureRemoteDaemonForTest(t, server.URL)
+	_ = testCtx
 	t.Setenv(daemonCLISubprocessEnv, "")
 
 	cmd := newExportMessagesCmd(exportMessagesDeps{})
+	cmd.SetContext(testCtx)
 	var output bytes.Buffer
 	cmd.SetOut(&output)
 	cmd.SetErr(io.Discard)
@@ -329,4 +343,117 @@ func insertExportMessagesMessage(
 		INSERT INTO message_bodies (message_id, body_text) VALUES (?, ?)
 	`), messageID, body)
 	require.NoError(err)
+}
+
+func TestExportMessagesCommandPersonScopeUsesBoundParticipants(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	st := testutil.NewTestStore(t)
+	source, err := st.GetOrCreateSource("text", "archive")
+	requirements.NoError(err)
+	alice, err := st.EnsureParticipant("alice@example.com", "Alice Observed", "example.com")
+	requirements.NoError(err)
+	bob, err := st.EnsureParticipant("bob@example.com", "Bob Observed", "example.com")
+	requirements.NoError(err)
+	person, _, err := st.CreatePersonFromParticipant(alice)
+	requirements.NoError(err)
+	_, err = st.LinkParticipants(alice, bob)
+	requirements.NoError(err)
+	// Persist the permitted linked-but-unbound state independently of link-time binding.
+	_, err = st.DB().Exec(st.Rebind(`DELETE FROM person_participants WHERE participant_id = ?`), bob)
+	requirements.NoError(err)
+	live, err := st.GetPerson(person.ID)
+	requirements.NoError(err)
+	assertions.Equal([]int64{alice}, live.ParticipantIDs)
+	name := "Alice Curated"
+	_, err = st.UpdatePersonDisplayName(live.ID, live.Revision, &name)
+	requirements.NoError(err)
+	start := time.Date(2026, 7, 20, 0, 0, 0, 0, time.UTC)
+	for i, id := range []int64{alice, bob} {
+		key := strconv.Itoa(i)
+		conv := insertExportMessagesConversation(t, st, source.ID, key, "Test Conversation")
+		insertExportMessagesMessage(t, st, source.ID, conv, key, start, "body")
+		_, err = st.DB().Exec(st.Rebind(`UPDATE messages SET sender_id = ? WHERE source_id = ? AND source_message_id = ?`), id, source.ID, key)
+		requirements.NoError(err)
+	}
+	personIDText := strconv.FormatInt(person.ID, 10)
+	for _, selector := range []string{personIDText, "0", "-1", "999999", ""} {
+		t.Run(selector, func(t *testing.T) {
+			assertions := assert.New(t)
+			requirements := require.New(t)
+			cmd := newExportMessagesLocalCmd(exportMessagesDeps{openStore: func(context.Context) (*store.Store, func(), error) { return st, func() {}, nil }})
+			var output bytes.Buffer
+			cmd.SetOut(&output)
+			cmd.SetErr(io.Discard)
+			cmd.SetArgs([]string{"--start", start.Format(time.RFC3339), "--end", start.Add(time.Hour).Format(time.RFC3339), "--source", "text:archive", "--person-id", selector})
+			err := cmd.Execute()
+			if selector != personIDText {
+				requirements.Error(err)
+				assertions.Empty(output.String())
+				return
+			}
+			requirements.NoError(err)
+			rows := decodeExportMessageRecords(t, output.Bytes())
+			requirements.Len(rows, 5)
+			assertions.Equal("0", rows[2]["id"])
+			assertions.Equal("0", rows[3]["id"])
+			assertions.Equal(map[string]any{"display_name": name, "address": "alice@example.com"}, rows[3]["author"])
+			filters, ok := rows[0]["filters"].(map[string]any)
+			requirements.True(ok)
+			assertions.InDelta(float64(person.ID), filters["person_id"], 0)
+			t.Logf("bound=%v linked sibling=%d exported message=%v", live.ParticipantIDs, bob, rows[3]["id"])
+		})
+	}
+}
+
+func TestExportMessagesRequiredBoundsBeforeDaemonAccess(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		args    []string
+		missing string
+	}{
+		{"none", nil, `required flag(s) "end", "start" not set`},
+		{"start only", []string{"--start", "2026-09-01T00:00:00Z"}, `required flag(s) "end" not set`},
+		{"end only", []string{"--end", "2026-10-01T00:00:00Z"}, `required flag(s) "start" not set`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
+
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				requests.Add(1)
+				w.WriteHeader(http.StatusInternalServerError)
+			}))
+			t.Cleanup(server.Close)
+			home := t.TempDir()
+			configPath := filepath.Join(home, "config.toml")
+			require.NoError(os.WriteFile(configPath, []byte("[remote]\nurl = \""+server.URL+"\"\nallow_insecure = true\n"), 0o600))
+			root := newRootCommand()
+			root.AddCommand(newExportMessagesCmd(defaultExportMessagesDeps()))
+			var output bytes.Buffer
+			root.SetOut(&output)
+			root.SetErr(&output)
+			args := append([]string{"--home", home, "--config", configPath, "export-messages"}, test.args...)
+			root.SetArgs(args)
+			require.ErrorContains(executeRootContext(t.Context(), root), test.missing)
+			assert.Contains(output.String(), "Usage:")
+			assert.NotContains(output.String(), "Starting local msgvault daemon")
+			assert.Zero(requests.Load(), "missing bounds must not contact the daemon")
+			for _, name := range []string{"daemon.json", "msgvault.db", "serve.log"} {
+				_, err := os.Stat(filepath.Join(home, name))
+				require.ErrorIs(err, os.ErrNotExist)
+			}
+			opened := false
+			local := newExportMessagesLocalCmd(exportMessagesDeps{openStore: func(context.Context) (*store.Store, func(), error) {
+				opened = true
+				return nil, nil, errors.New("unexpected store access")
+			}})
+			local.SetOut(io.Discard)
+			local.SetErr(io.Discard)
+			local.SetArgs(append([]string{}, test.args...))
+			require.ErrorContains(local.Execute(), test.missing)
+			assert.False(opened)
+		})
+	}
 }

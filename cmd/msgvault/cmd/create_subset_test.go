@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 	"go.kenn.io/msgvault/internal/vcard"
 )
 
@@ -26,12 +27,11 @@ func TestCreateSubsetVCardResourcesRequireFlag(t *testing.T) {
 
 	dataDir := t.TempDir()
 	testCfg := lifecycleTestConfig(dataDir)
-	withStoreResolverConfig(t, testCfg)
+	testCtx := withStoreResolverConfig(t, testCfg)
+	_ = testCtx
 	t.Setenv(daemonCLISubprocessEnv, strconv.Itoa(os.Getppid()))
 
-	st, err := store.Open(testCfg.DatabaseDSN())
-	require.NoError(err, "open test archive")
-	require.NoError(st.InitSchema(), "init test archive")
+	st := testutil.NewSQLiteTestStoreAt(t, testCfg.DatabaseDSN())
 	src, err := st.GetOrCreateSource("gmail", "owner@example.com")
 	require.NoError(err)
 	senderID, err := st.EnsureParticipant("bob@example.com", "Bob", "example.com")
@@ -91,7 +91,9 @@ func TestCreateSubsetVCardResourcesRequireFlag(t *testing.T) {
 	subsetOutput = filepath.Join(t.TempDir(), "profiles")
 	subsetIncludeProfiles, subsetIncludeVCardResources = true, false
 	profilesStderr := captureStderrDuring(t, func() {
-		require.NoError(runCreateSubset(&cobra.Command{Use: "create-subset"}, nil))
+		cmd := &cobra.Command{Use: "create-subset"}
+		cmd.SetContext(testCtx)
+		require.NoError(runCreateSubset(cmd, nil))
 	})
 	assert.NotContains(profilesStderr, "--include-vcard-resources",
 		"an unset opt-in must not warn about vCard bodies")
@@ -108,7 +110,9 @@ func TestCreateSubsetVCardResourcesRequireFlag(t *testing.T) {
 	subsetOutput = filepath.Join(t.TempDir(), "orphan-resources")
 	subsetIncludeProfiles, subsetIncludeVCardResources = false, true
 	orphanStderr := captureStderrDuring(t, func() {
-		err := runCreateSubset(&cobra.Command{Use: "create-subset"}, nil)
+		cmd := &cobra.Command{Use: "create-subset"}
+		cmd.SetContext(testCtx)
+		err := runCreateSubset(cmd, nil)
 		require.ErrorContains(err, "--include-vcard-resources requires --include-profiles")
 	})
 	assert.NotContains(orphanStderr, "WARNING: --include-vcard-resources",
@@ -119,7 +123,9 @@ func TestCreateSubsetVCardResourcesRequireFlag(t *testing.T) {
 	subsetOutput = filepath.Join(t.TempDir(), "resources")
 	subsetIncludeProfiles, subsetIncludeVCardResources = true, true
 	resourcesStderr := captureStderrDuring(t, func() {
-		require.NoError(runCreateSubset(&cobra.Command{Use: "create-subset"}, nil))
+		cmd := &cobra.Command{Use: "create-subset"}
+		cmd.SetContext(testCtx)
+		require.NoError(runCreateSubset(cmd, nil))
 	})
 	assert.Contains(resourcesStderr, "WARNING: --include-vcard-resources",
 		"the opt-in must state what it exposes before copying it")

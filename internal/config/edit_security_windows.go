@@ -9,6 +9,7 @@ import (
 	"os"
 	"unsafe"
 
+	"go.kenn.io/msgvault/internal/fileutil"
 	"golang.org/x/sys/windows"
 )
 
@@ -26,12 +27,6 @@ func openConfigDirectoryForSync(string) (syncDirectoryHandle, error) {
 
 func (windowsDirectoryDurabilityBoundary) Sync() error  { return nil }
 func (windowsDirectoryDurabilityBoundary) Close() error { return nil }
-
-// configFileAllAccess is FILE_ALL_ACCESS. When an ACE granting GENERIC_ALL is
-// stored on a file object (via SeAssignSecurity at creation or SetSecurityInfo
-// afterwards), Windows maps the generic right to this object-specific mask, so
-// read-back verification observes FILE_ALL_ACCESS rather than GENERIC_ALL.
-const configFileAllAccess = windows.STANDARD_RIGHTS_REQUIRED | windows.SYNCHRONIZE | 0x1FF
 
 // verifyConfigOwnerSID accepts the current user as the file owner. It also
 // accepts BUILTIN\Administrators when the process token is a member of that
@@ -105,7 +100,7 @@ func ownerOnlyConfigACL(user *windows.SID) (*windows.ACL, error) {
 func verifyConfigOwnerOnly(path string) error {
 	path16, err := windows.UTF16PtrFromString(path)
 	if err != nil {
-		return err
+		return fmt.Errorf("encode config path: %w", err)
 	}
 	handle, err := windows.CreateFile(
 		path16,
@@ -117,12 +112,12 @@ func verifyConfigOwnerOnly(path string) error {
 		0,
 	)
 	if err != nil {
-		return err
+		return fmt.Errorf("open config owner handle: %w", err)
 	}
-	defer windows.CloseHandle(handle)
+	defer func() { _ = windows.CloseHandle(handle) }()
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
 	if err != nil {
-		return err
+		return fmt.Errorf("read current user SID for config: %w", err)
 	}
 	return verifyConfigHandleOwnerOnly(handle, user.User.Sid)
 }
@@ -130,7 +125,7 @@ func verifyConfigOwnerOnly(path string) error {
 func validateOpenedConfigSecurity(file *os.File) error {
 	user, err := windows.GetCurrentProcessToken().GetTokenUser()
 	if err != nil {
-		return err
+		return fmt.Errorf("read current user SID for open config: %w", err)
 	}
 	return ensureConfigHandleOwnerOnly(windows.Handle(file.Fd()), user.User.Sid)
 }
@@ -191,14 +186,7 @@ func verifyConfigHandleOwnerOnly(handle windows.Handle, user *windows.SID) error
 	if err != nil || dacl == nil {
 		return fmt.Errorf("read config DACL entries: %w", err)
 	}
-	type aclHeader struct {
-		Revision byte
-		Sbz1     byte
-		Size     uint16
-		AceCount uint16
-		Sbz2     uint16
-	}
-	if (*aclHeader)(unsafe.Pointer(dacl)).AceCount != 1 {
+	if dacl.AceCount != 1 {
 		return errors.New("config DACL must contain exactly one access entry")
 	}
 	var ace *windows.ACCESS_ALLOWED_ACE
@@ -206,12 +194,13 @@ func verifyConfigHandleOwnerOnly(handle windows.Handle, user *windows.SID) error
 		return fmt.Errorf("read config owner ACE: %w", err)
 	}
 	if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE ||
-		(ace.Mask != windows.GENERIC_ALL && ace.Mask != configFileAllAccess) {
+		(ace.Mask != windows.GENERIC_ALL && ace.Mask != fileutil.FileAllAccess) {
 		return errors.New("config DACL does not grant exactly full control")
 	}
 	if ace.Header.AceFlags&windows.INHERITED_ACE != 0 {
 		return errors.New("config DACL contains inherited access")
 	}
+	// #nosec G103 -- GetAce supplies an access-allowed ACE whose SidStart is the first word of its contiguous SID.
 	aceSID := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
 	if !aceSID.Equals(user) {
 		return errors.New("config DACL grants a principal other than the current user")

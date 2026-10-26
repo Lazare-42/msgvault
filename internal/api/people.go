@@ -23,7 +23,7 @@ type IdentitySearchHTTPRequest struct {
 	IdentityQuery string             `json:"identity_query,omitempty"`
 	Sort          IdentitySearchSort `json:"sort"`
 	Cursor        string             `json:"cursor,omitempty"`
-	Limit         int                `json:"limit,omitempty" minimum:"0" maximum:"500"`
+	Limit         int                `json:"limit,omitzero" minimum:"0" maximum:"500"`
 }
 
 type ParticipantSearchHTTPResponse struct {
@@ -218,24 +218,8 @@ func (s *Server) prepareIdentitySearch(w http.ResponseWriter, r *http.Request, r
 	if !ok {
 		return identitySearchPrepared{}, false
 	}
-	var cursor exploreCursor
-	searchRequest := prepared.request
-	if request.Cursor != "" {
-		cursor, _ = s.decodeExploreCursor(request.Cursor)
-		if searchRequest.SearchMode == exploreSearchModeSemantic || searchRequest.SearchMode == exploreSearchModeHybrid {
-			if cursor.Snapshot == "" {
-				writeError(w, http.StatusBadRequest, "invalid_cursor", "semantic cursor is missing its candidate snapshot")
-				return identitySearchPrepared{}, false
-			}
-			searchRequest.CandidateSnapshotID = cursor.Snapshot
-		}
-	}
-	searchSpec, snapshotID, ok := s.resolveExploreSearch(r.Context(), w, searchRequest)
-	if !ok || !requireCompleteCandidatePool(w, searchSpec) {
-		return identitySearchPrepared{}, false
-	}
-	if request.Cursor != "" && cursor.SearchRevision != exploreResolvedSearchRevision(searchSpec) {
-		writeError(w, http.StatusConflict, "search_revision_changed", "The resolved search index revision changed; restart pagination")
+	cursor, searchSpec, snapshotID, ok := s.resolvePagedExploreSearch(r.Context(), w, request.Cursor, prepared.request)
+	if !ok {
 		return identitySearchPrepared{}, false
 	}
 	return identitySearchPrepared{predicate: prepared, sort: query.SortSpec{Field: request.Sort.Field, Direction: request.Sort.Direction},
@@ -263,6 +247,18 @@ func (s *Server) handleGetParticipant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.attachPersonCluster(person, id, members)
+	if identityStore, ok := s.store.(ParticipantIdentityContextStore); ok {
+		identityIDs := members
+		if len(identityIDs) == 0 {
+			identityIDs = []int64{id}
+		}
+		details, err := identityStore.GetParticipantIdentityContext(r.Context(), identityIDs)
+		if err != nil {
+			s.logger.Warn("participant identity context lookup failed", "error", err, "participant_id", id)
+		} else {
+			enrichIdentityContext(person, details)
+		}
+	}
 	s.attachPersonProfile(r.Context(), person, id, members)
 	writeJSON(w, http.StatusOK, person)
 }

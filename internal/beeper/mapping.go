@@ -3,6 +3,7 @@ package beeper
 import (
 	"database/sql"
 	"html"
+	"math"
 	"regexp"
 	"strings"
 
@@ -33,6 +34,23 @@ var mxReplyFallbackRe = regexp.MustCompile(`(?is)<mx-reply(?:\s[^<>]*)?>.*?</mx-
 // so plain messages like "Help & About" are never rewritten.
 var htmlEntityRe = regexp.MustCompile(`&(amp|lt|gt|quot|apos|nbsp|#\d+|#x[0-9a-fA-F]+);`)
 
+// MessageHTML retains message links and escaped transcripts outside quoted replies.
+func MessageHTML(m *Message) string {
+	text := mxReplyFallbackRe.ReplaceAllString(m.Text, "")
+	if !htmlElementRe.MatchString(text) {
+		return ""
+	}
+	var body strings.Builder
+	body.WriteString(text)
+	for _, att := range m.Attachments {
+		if transcript := sourceTranscript(&att); transcript != "" {
+			body.WriteString("<br>🎤 transcript: ")
+			body.WriteString(strings.ReplaceAll(html.EscapeString(transcript), "\n", "<br>"))
+		}
+	}
+	return body.String()
+}
+
 // plainText renders a Beeper message's text as plain text.
 //
 // The API's `text` field is HTML for a large minority of messages (formatted
@@ -56,14 +74,6 @@ func plainText(s string) string {
 		text = s
 	}
 	return textutil.SanitizeTerminalMultiline(text)
-}
-
-func snippet(text string) string {
-	r := []rune(text)
-	if len(r) > 100 {
-		return string(r[:100])
-	}
-	return text
 }
 
 // typeImage is the Beeper message type for a photo — including the link
@@ -98,6 +108,13 @@ func placeholderBody(m *Message) string {
 	}
 }
 
+func sourceTranscript(att *Attachment) string {
+	if att == nil || att.Transcription == nil {
+		return ""
+	}
+	return strings.TrimSpace(att.Transcription.Transcription)
+}
+
 // bodyText renders the plain-text body: the message text (or a placeholder
 // for text-less media), plus any voice-note transcriptions so they are
 // visible to FTS and embeddings.
@@ -109,8 +126,8 @@ func bodyText(m *Message) string {
 		parts = append(parts, ph)
 	}
 	for _, att := range m.Attachments {
-		if att.Transcription != nil && strings.TrimSpace(att.Transcription.Transcription) != "" {
-			parts = append(parts, "🎤 transcript: "+strings.TrimSpace(att.Transcription.Transcription))
+		if transcript := sourceTranscript(&att); transcript != "" {
+			parts = append(parts, "🎤 transcript: "+transcript)
 		}
 	}
 	return strings.Join(parts, "\n")
@@ -154,11 +171,23 @@ func mapMessage(m *Message, conversationID, sourceID int64) (store.Message, stri
 		SentAt:          sql.NullTime{Time: m.Timestamp, Valid: !m.Timestamp.IsZero()},
 		ReceivedAt:      sql.NullTime{Time: m.Timestamp, Valid: !m.Timestamp.IsZero()},
 		IsFromMe:        m.IsSender,
-		Snippet:         sql.NullString{String: snippet(text), Valid: text != ""},
+		Snippet:         sql.NullString{String: textutil.PrefixRunes(text, 100), Valid: text != ""},
+		SizeEstimate:    messageSizeEstimate(m, text),
 		HasAttachments:  len(m.Attachments) > 0,
 		AttachmentCount: len(m.Attachments),
 	}
 	return msg, text
+}
+
+func messageSizeEstimate(m *Message, body string) int64 {
+	size := int64(len(body))
+	for i := range m.Attachments {
+		n := int64(declaredSize(&m.Attachments[i]))
+		if n > 0 && n <= math.MaxInt64-size {
+			size += n
+		}
+	}
+	return size
 }
 
 // chatTypeSingle is the Beeper chat type for direct messages (vs "group").

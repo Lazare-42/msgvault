@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -19,6 +20,7 @@ import (
 )
 
 func TestDiscoveryCollectionComparisonNormalizesOriginAndPath(t *testing.T) {
+	t.Parallel()
 	left, err := url.Parse("https://contacts.example/book/")
 	require.NoError(t, err)
 	right, err := url.Parse("HTTPS://CONTACTS.example:443/book")
@@ -28,6 +30,7 @@ func TestDiscoveryCollectionComparisonNormalizesOriginAndPath(t *testing.T) {
 }
 
 func TestDAVWritePrivilegeDoesNotGrantCollectionMembershipChanges(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 
 	capabilities := capabilitiesFrom(Properties{
@@ -44,6 +47,7 @@ func TestDAVWritePrivilegeDoesNotGrantCollectionMembershipChanges(t *testing.T) 
 }
 
 func TestDiscoverUsesDirectPrincipalAndEnumeratesCapabilities(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -112,6 +116,7 @@ func TestDiscoverUsesDirectPrincipalAndEnumeratesCapabilities(t *testing.T) {
 }
 
 func TestDiscoverEnumeratesAllHomeCollectionsAndDeduplicatesBooks(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -164,6 +169,7 @@ func TestDiscoverEnumeratesAllHomeCollectionsAndDeduplicatesBooks(t *testing.T) 
 }
 
 func TestDiscoverSharesTransferBudgetAcrossRequests(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	direct := []byte(`<?xml version="1.0"?><D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav"><D:response><D:href>/dav</D:href><D:propstat><D:prop><D:current-user-principal><D:href>/principal/</D:href></D:current-user-principal></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>`)
 	principal := []byte(`<?xml version="1.0"?><D:multistatus xmlns:D="DAV:" xmlns:C="urn:ietf:params:xml:ns:carddav"><D:response><D:href>/principal/</D:href><D:propstat><D:prop><C:addressbook-home-set><D:href>/books/</D:href></C:addressbook-home-set></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response></D:multistatus>`)
@@ -190,34 +196,40 @@ func TestDiscoverSharesTransferBudgetAcrossRequests(t *testing.T) {
 }
 
 func TestDiscoverSharesDeadlineAcrossRequests(t *testing.T) {
-	require := require.New(t)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		time.Sleep(200 * time.Millisecond)
-		w.Header().Set("Content-Type", "application/xml")
-		switch r.URL.Path {
-		case "/dav":
-			writeMultiStatus(t, w, `<D:response><D:href>/dav</D:href><D:propstat><D:prop>
+	t.Parallel()
+	synctest.Test(t, func(t *testing.T) {
+		require := require.New(t)
+		server := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(200 * time.Millisecond)
+			w.Header().Set("Content-Type", "application/xml")
+			switch r.URL.Path {
+			case "/dav":
+				writeMultiStatus(t, w, `<D:response><D:href>/dav</D:href><D:propstat><D:prop>
 				<D:current-user-principal><D:href>/principal/</D:href></D:current-user-principal>
 			</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`)
-		case "/principal/":
-			writeMultiStatus(t, w, `<D:response><D:href>/principal/</D:href><D:propstat><D:prop>
+			case "/principal/":
+				writeMultiStatus(t, w, `<D:response><D:href>/principal/</D:href><D:propstat><D:prop>
 				<C:addressbook-home-set><D:href>/books/</D:href></C:addressbook-home-set>
 			</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`)
-		default:
-			http.NotFound(w, r)
-		}
-	}))
-	t.Cleanup(server.Close)
-	client := newFixtureClient(t, server.URL, "alice", "secret")
-	client.operationTimeout = 300 * time.Millisecond
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		transport, ok := server.Client().Transport.(*http.Transport)
+		require.True(ok)
+		client := newFixtureClient(t, "http://127.0.0.1", "alice", "secret")
+		client.dialContext = transport.DialContext
+		client.operationTimeout = 300 * time.Millisecond
 
-	started := time.Now()
-	_, err := Discover(t.Context(), client, server.URL+"/dav")
-	require.ErrorIs(err, context.DeadlineExceeded)
-	assert.Less(t, time.Since(started), 500*time.Millisecond, "requests must share one operation deadline")
+		started := time.Now()
+		_, err := Discover(t.Context(), client, "http://127.0.0.1/dav")
+		require.ErrorIs(err, context.DeadlineExceeded)
+		assert.Less(t, time.Since(started), 500*time.Millisecond, "requests must share one operation deadline")
+	})
 }
 
 func TestDiscoverFallsBackToWellKnownAndKeepsMissingPrivilegesUnknown(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -262,6 +274,7 @@ func TestDiscoverFallsBackToWellKnownAndKeepsMissingPrivilegesUnknown(t *testing
 }
 
 func TestDiscoverDoesNotMaskDirectTransientOrParsingFailures(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name       string
 		direct     func(http.ResponseWriter)
@@ -292,6 +305,7 @@ func TestDiscoverDoesNotMaskDirectTransientOrParsingFailures(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			assert := assert.New(t)
 			var paths []string
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -320,6 +334,7 @@ func TestDiscoverDoesNotMaskDirectTransientOrParsingFailures(t *testing.T) {
 }
 
 func TestDiscoverDoesNotRetryNetworkFailureThroughWellKnown(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	origin, err := url.Parse("https://contacts.example")
@@ -344,6 +359,7 @@ func TestDiscoverDoesNotRetryNetworkFailureThroughWellKnown(t *testing.T) {
 }
 
 func TestDiscoverSkipsNonHomeResponseWithoutSuccessfulResourceType(t *testing.T) {
+	t.Parallel()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/xml")
 		switch r.URL.Path {
@@ -379,6 +395,7 @@ func TestDiscoverSkipsNonHomeResponseWithoutSuccessfulResourceType(t *testing.T)
 }
 
 func TestDiscoverSkipsUnavailableNonHomeResponse(t *testing.T) {
+	t.Parallel()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/xml")
 		switch r.URL.Path {
@@ -412,6 +429,7 @@ func TestDiscoverSkipsUnavailableNonHomeResponse(t *testing.T) {
 }
 
 func TestDiscoverRejectsUnavailableHomeResponse(t *testing.T) {
+	t.Parallel()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/xml")
 		switch r.URL.Path {
@@ -438,6 +456,7 @@ func TestDiscoverRejectsUnavailableHomeResponse(t *testing.T) {
 }
 
 func TestDiscoverPreservesRedirectedBookAlias(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 
@@ -477,6 +496,7 @@ func TestDiscoverPreservesRedirectedBookAlias(t *testing.T) {
 }
 
 func TestDiscoverRejectsCrossOriginDiscoveryResponseHrefWithoutFallback(t *testing.T) {
+	t.Parallel()
 	requests := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++

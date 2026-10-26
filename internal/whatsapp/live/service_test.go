@@ -3,16 +3,15 @@ package live
 import (
 	"context"
 	"database/sql"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.kenn.io/msgvault/internal/export"
+	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/testutil"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
-
-	assertpkg "github.com/stretchr/testify/assert"
-	requirepkg "github.com/stretchr/testify/require"
-	"go.kenn.io/msgvault/internal/export"
-	"go.kenn.io/msgvault/internal/store"
-	"go.kenn.io/msgvault/internal/testutil"
 )
 
 type mockTransport struct {
@@ -90,6 +89,8 @@ func (m *minimalTransport) SendReaction(context.Context, TransportSendReactionRe
 }
 
 func TestServiceSendMessageArchivesAndOutbox(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	ctx := context.Background()
 	st := testutil.NewTestStore(t)
 	sentAt := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
@@ -103,8 +104,8 @@ func TestServiceSendMessageArchivesAndOutbox(t *testing.T) {
 		},
 		sendMessage: func(_ context.Context, req TransportSendMessageRequest) (TransportSendResult, error) {
 			sendCalls++
-			assertpkg.Equal(t, "15557654321@s.whatsapp.net", req.ChatID)
-			assertpkg.Equal(t, "hello", req.Body)
+			assert.Equal("15557654321@s.whatsapp.net", req.ChatID)
+			assert.Equal("hello", req.Body)
 			return TransportSendResult{
 				RemoteMessageID: "remote-1",
 				ChatJID:         req.ChatID,
@@ -117,49 +118,51 @@ func TestServiceSendMessageArchivesAndOutbox(t *testing.T) {
 		Transport: transport,
 		Now:       func() time.Time { return sentAt },
 	})
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 
 	result, err := svc.SendMessage(ctx, SendMessageRequest{
 		ChatID:         "15557654321@s.whatsapp.net",
 		Body:           "hello",
 		LocalRequestID: "req-1",
 	})
-	requirepkg.NoError(t, err)
-	assertpkg.Equal(t, store.WhatsAppOutboxSent, result.Status)
-	assertpkg.Equal(t, "remote-1", result.RemoteMessageID)
-	assertpkg.NotZero(t, result.MessageID)
+	require.NoError(err)
+	assert.Equal(store.WhatsAppOutboxSent, result.Status)
+	assert.Equal("remote-1", result.RemoteMessageID)
+	assert.NotZero(result.MessageID)
 
 	duplicate, err := svc.SendMessage(ctx, SendMessageRequest{
 		ChatID:         "15557654321@s.whatsapp.net",
 		Body:           "hello",
 		LocalRequestID: "req-1",
 	})
-	requirepkg.NoError(t, err)
-	assertpkg.Equal(t, result, duplicate)
-	assertpkg.Equal(t, 1, sendCalls)
+	require.NoError(err)
+	assert.Equal(result, duplicate)
+	assert.Equal(1, sendCalls)
 
 	outbox, err := st.GetWhatsAppOutbox(ctx, result.OutboxID)
-	requirepkg.NoError(t, err)
-	assertpkg.Equal(t, store.WhatsAppOutboxSent, outbox.Status)
-	assertpkg.Equal(t, result.MessageID, outbox.MessageID.Int64)
+	require.NoError(err)
+	assert.Equal(store.WhatsAppOutboxSent, outbox.Status)
+	assert.Equal(result.MessageID, outbox.MessageID.Int64)
 
 	var body string
-	requirepkg.NoError(t, st.DB().QueryRow(st.Rebind(`
+	require.NoError(st.DB().QueryRow(st.Rebind(`
 		SELECT mb.body_text
 		FROM message_bodies mb
 		JOIN messages m ON m.id = mb.message_id
 		WHERE m.id = ?
 	`), result.MessageID).Scan(&body))
-	assertpkg.Equal(t, "hello", body)
+	assert.Equal("hello", body)
 
 	ref, err := st.GetWhatsAppMessageRef(ctx, result.MessageID)
-	requirepkg.NoError(t, err)
-	assertpkg.Equal(t, "15557654321@s.whatsapp.net", ref.ChatJID)
-	assertpkg.Equal(t, "remote-1", ref.RemoteMessageID)
-	assertpkg.True(t, ref.IsFromMe)
+	require.NoError(err)
+	assert.Equal("15557654321@s.whatsapp.net", ref.ChatJID)
+	assert.Equal("remote-1", ref.RemoteMessageID)
+	assert.True(ref.IsFromMe)
 }
 
 func TestServiceSendMessageRejectsNotReady(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	ctx := context.Background()
 	st := testutil.NewTestStore(t)
 	var called bool
@@ -179,29 +182,29 @@ func TestServiceSendMessageRejectsNotReady(t *testing.T) {
 		Store:     st,
 		Transport: transport,
 	})
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 
 	_, err = svc.SendMessage(ctx, SendMessageRequest{
 		ChatID: "15557654321@s.whatsapp.net",
 		Body:   "hello",
 	})
-	requirepkg.Error(t, err)
-	assertpkg.Contains(t, err.Error(), "ready=true")
-	assertpkg.False(t, called)
+	require.Error(err)
+	assert.Contains(err.Error(), "ready=true")
+	assert.False(called)
 }
 
 // newHistorySyncTestService sets up a store with one archived WhatsApp
 // message (usable as a RequestHistorySync anchor) for chatJID, and a Service
 // wired to a ready mockTransport. Individual tests override transport.status
 // or transport.requestHistorySync as needed.
-func newHistorySyncTestService(t *testing.T) (svc *Service, st *store.Store, chatJID string, transport *mockTransport) {
+func newHistorySyncTestService(t *testing.T) (svc *Service, chatJID string, transport *mockTransport) {
 	t.Helper()
-	st = testutil.NewTestStore(t)
+	st := testutil.NewTestStore(t)
 	source, err := st.GetOrCreateSource(store.WhatsAppSourceType, "15551234567@s.whatsapp.net")
-	requirepkg.NoError(t, err)
+	require.NoError(t, err)
 	chatJID = "15557654321@s.whatsapp.net"
 	convID, err := st.EnsureConversationWithType(source.ID, chatJID, "direct_chat", "")
-	requirepkg.NoError(t, err)
+	require.NoError(t, err)
 	_, err = st.UpsertMessage(&store.Message{
 		SourceID:        source.ID,
 		ConversationID:  convID,
@@ -210,14 +213,14 @@ func newHistorySyncTestService(t *testing.T) (svc *Service, st *store.Store, cha
 		SentAt:          sql.NullTime{Time: time.Date(2022, 1, 1, 0, 0, 0, 0, time.UTC), Valid: true},
 		IsFromMe:        true,
 	})
-	requirepkg.NoError(t, err)
+	require.NoError(t, err)
 
 	transport = &mockTransport{
 		status: Status{AccountJID: "15551234567@s.whatsapp.net", Paired: true, Connected: true, LoggedIn: true},
 	}
 	svc, err = NewService(ServiceOptions{Store: st, Transport: transport})
-	requirepkg.NoError(t, err)
-	return svc, st, chatJID, transport
+	require.NoError(t, err)
+	return svc, chatJID, transport
 }
 
 // TestServiceRequestHistorySyncUsesOldestArchivedMessageAsAnchor asserts the
@@ -225,13 +228,15 @@ func newHistorySyncTestService(t *testing.T) (svc *Service, st *store.Store, cha
 // recently inserted one), since WhatsApp's on-demand history-sync returns
 // messages strictly before the given anchor.
 func TestServiceRequestHistorySyncUsesOldestArchivedMessageAsAnchor(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	ctx := context.Background()
 	st := testutil.NewTestStore(t)
 	source, err := st.GetOrCreateSource(store.WhatsAppSourceType, "15551234567@s.whatsapp.net")
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 	chatJID := "15557654321@s.whatsapp.net"
 	convID, err := st.EnsureConversationWithType(source.ID, chatJID, "direct_chat", "")
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 
 	older := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 	newer := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -243,7 +248,7 @@ func TestServiceRequestHistorySyncUsesOldestArchivedMessageAsAnchor(t *testing.T
 		SentAt:          sql.NullTime{Time: newer, Valid: true},
 		IsFromMe:        false,
 	})
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 	_, err = st.UpsertMessage(&store.Message{
 		SourceID:        source.ID,
 		ConversationID:  convID,
@@ -252,7 +257,7 @@ func TestServiceRequestHistorySyncUsesOldestArchivedMessageAsAnchor(t *testing.T
 		SentAt:          sql.NullTime{Time: older, Valid: true},
 		IsFromMe:        true,
 	})
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 
 	var captured TransportRequestHistorySyncRequest
 	transport := &mockTransport{
@@ -263,20 +268,18 @@ func TestServiceRequestHistorySyncUsesOldestArchivedMessageAsAnchor(t *testing.T
 		},
 	}
 	svc, err := NewService(ServiceOptions{Store: st, Transport: transport})
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 
 	result, err := svc.RequestHistorySync(ctx, RequestHistorySyncRequest{ChatID: chatJID})
-	requirepkg.NoError(t, err)
-
-	assertpkg.Equal(t, chatJID, captured.ChatJID)
-	assertpkg.Equal(t, "older-msg", captured.AnchorMessageID)
-	assertpkg.True(t, captured.AnchorIsFromMe)
-	assertpkg.True(t, older.Equal(captured.AnchorTimestamp))
-	assertpkg.Equal(t, DefaultHistorySyncRequestCount, captured.Count)
-
-	assertpkg.Equal(t, chatJID, result.ChatJID)
-	assertpkg.Equal(t, "older-msg", result.AnchorMessageID)
-	assertpkg.Equal(t, DefaultHistorySyncRequestCount, result.RequestedCount)
+	require.NoError(err)
+	assert.Equal(chatJID, captured.ChatJID)
+	assert.Equal("older-msg", captured.AnchorMessageID)
+	assert.True(captured.AnchorIsFromMe)
+	assert.True(older.Equal(captured.AnchorTimestamp))
+	assert.Equal(DefaultHistorySyncRequestCount, captured.Count)
+	assert.Equal(chatJID, result.ChatJID)
+	assert.Equal("older-msg", result.AnchorMessageID)
+	assert.Equal(DefaultHistorySyncRequestCount, result.RequestedCount)
 }
 
 func TestServiceRequestHistorySyncClampsAndDefaultsCount(t *testing.T) {
@@ -292,19 +295,19 @@ func TestServiceRequestHistorySyncClampsAndDefaultsCount(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			svc, _, chatJID, _ := newHistorySyncTestService(t)
+			svc, chatJID, _ := newHistorySyncTestService(t)
 			result, err := svc.RequestHistorySync(context.Background(), RequestHistorySyncRequest{
 				ChatID: chatJID,
 				Count:  tt.in,
 			})
-			requirepkg.NoError(t, err)
-			assertpkg.Equal(t, tt.want, result.RequestedCount)
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, result.RequestedCount)
 		})
 	}
 }
 
 func TestServiceRequestHistorySyncRejectsNotReady(t *testing.T) {
-	svc, _, chatJID, transport := newHistorySyncTestService(t)
+	svc, chatJID, transport := newHistorySyncTestService(t)
 	transport.status.LoggedIn = false
 	var called bool
 	transport.requestHistorySync = func(context.Context, TransportRequestHistorySyncRequest) error {
@@ -313,17 +316,17 @@ func TestServiceRequestHistorySyncRejectsNotReady(t *testing.T) {
 	}
 
 	_, err := svc.RequestHistorySync(context.Background(), RequestHistorySyncRequest{ChatID: chatJID})
-	requirepkg.Error(t, err)
-	assertpkg.Contains(t, err.Error(), "ready=true")
-	assertpkg.False(t, called)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "ready=true")
+	assert.False(t, called)
 }
 
 func TestServiceRequestHistorySyncRequiresArchivedAnchor(t *testing.T) {
-	svc, _, _, _ := newHistorySyncTestService(t)
+	svc, _, _ := newHistorySyncTestService(t)
 
 	_, err := svc.RequestHistorySync(context.Background(), RequestHistorySyncRequest{ChatID: "15559999999@s.whatsapp.net"})
-	requirepkg.Error(t, err)
-	assertpkg.Contains(t, err.Error(), "no archived whatsapp messages found")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no archived whatsapp messages found")
 }
 
 func TestServiceRequestHistorySyncRequiresTransportSupport(t *testing.T) {
@@ -332,24 +335,26 @@ func TestServiceRequestHistorySyncRequiresTransportSupport(t *testing.T) {
 		status: Status{AccountJID: "15551234567@s.whatsapp.net", Paired: true, Connected: true, LoggedIn: true},
 	}
 	svc, err := NewService(ServiceOptions{Store: st, Transport: transport})
-	requirepkg.NoError(t, err)
+	require.NoError(t, err)
 
 	_, err = svc.RequestHistorySync(context.Background(), RequestHistorySyncRequest{ChatID: "15557654321@s.whatsapp.net"})
-	requirepkg.Error(t, err)
-	assertpkg.Contains(t, err.Error(), "not supported by this transport")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not supported by this transport")
 }
 
 func TestServiceRequestHistorySyncPropagatesTransportError(t *testing.T) {
-	svc, _, chatJID, transport := newHistorySyncTestService(t)
+	svc, chatJID, transport := newHistorySyncTestService(t)
 	transport.requestHistorySync = func(context.Context, TransportRequestHistorySyncRequest) error {
-		return assertpkg.AnError
+		return assert.AnError
 	}
 
 	_, err := svc.RequestHistorySync(context.Background(), RequestHistorySyncRequest{ChatID: chatJID})
-	requirepkg.Error(t, err)
+	require.Error(t, err)
 }
 
 func TestServiceArchiveHistorySyncBatchesStatsAndSkipsNotifications(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	ctx := context.Background()
 	st := testutil.NewTestStore(t)
 	notifications := 0
@@ -363,7 +368,7 @@ func TestServiceArchiveHistorySyncBatchesStatsAndSkipsNotifications(t *testing.T
 			notifications++
 		},
 	})
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 
 	messages := []InboundMessage{
 		{
@@ -387,28 +392,29 @@ func TestServiceArchiveHistorySyncBatchesStatsAndSkipsNotifications(t *testing.T
 			IsGroup:   true,
 		},
 	}
-	requirepkg.NoError(t, svc.ArchiveHistorySync(ctx, messages))
-	requirepkg.NoError(t, svc.ArchiveHistorySync(ctx, messages), "history sync retry is idempotent")
-	assertpkg.Zero(t, notifications)
+	require.NoError(svc.ArchiveHistorySync(ctx, messages))
+	require.NoError(svc.ArchiveHistorySync(ctx, messages), "history sync retry is idempotent")
+	assert.Zero(notifications)
 
 	var title string
 	var messageCount int64
 	var preview string
-	requirepkg.NoError(t, st.DB().QueryRow(st.Rebind(`
+	require.NoError(st.DB().QueryRow(st.Rebind(`
 		SELECT title, message_count, last_message_preview
 		FROM conversations
 		WHERE source_conversation_id = ?
 	`), "120363@g.us").Scan(&title, &messageCount, &preview))
-	assertpkg.Equal(t, "Beynac Team", title)
-	assertpkg.Equal(t, int64(2), messageCount)
-	assertpkg.Equal(t, "second", preview)
+	assert.Equal("Beynac Team", title)
+	assert.Equal(int64(2), messageCount)
+	assert.Equal("second", preview)
 }
 
 func TestServiceStartLoginKeepsReconnectContextAlive(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	ctx := context.Background()
 	st := testutil.NewTestStore(t)
-	loginCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	loginCtx := t.Context()
 
 	var connectCtx context.Context
 	var transport *mockTransport
@@ -431,16 +437,18 @@ func TestServiceStartLoginKeepsReconnectContextAlive(t *testing.T) {
 		Transport:    transport,
 		LoginContext: loginCtx,
 	})
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 
 	state, err := svc.StartLogin(ctx)
-	requirepkg.NoError(t, err)
-	requirepkg.NotNil(t, connectCtx)
-	assertpkg.True(t, state.Status.Ready)
-	assertpkg.NoError(t, connectCtx.Err())
+	require.NoError(err)
+	require.NotNil(connectCtx)
+	assert.True(state.Status.Ready)
+	assert.NoError(connectCtx.Err())
 }
 
 func TestServiceSendReactionUpdatesLocalReaction(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	ctx := context.Background()
 	st := testutil.NewTestStore(t)
 	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
@@ -466,7 +474,7 @@ func TestServiceSendReactionUpdatesLocalReaction(t *testing.T) {
 		Transport: transport,
 		Now:       func() time.Time { return now },
 	})
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 
 	targetID, err := svc.ArchiveInbound(ctx, InboundMessage{
 		Account:   "15551234567@s.whatsapp.net",
@@ -476,35 +484,36 @@ func TestServiceSendReactionUpdatesLocalReaction(t *testing.T) {
 		Text:      "target",
 		Timestamp: now.Add(-time.Minute),
 	})
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 
 	result, err := svc.SendReaction(ctx, SendReactionRequest{
 		MessageID:      targetID,
 		Emoji:          "👍",
 		LocalRequestID: "react-1",
 	})
-	requirepkg.NoError(t, err)
-	assertpkg.Equal(t, store.WhatsAppOutboxSent, result.Status)
-	assertpkg.Equal(t, "15557654321@s.whatsapp.net", reactionReq.ChatJID)
-	assertpkg.Equal(t, "15557654321@s.whatsapp.net", reactionReq.SenderJID)
-	assertpkg.Equal(t, "target-1", reactionReq.RemoteMessageID)
-	assertpkg.Equal(t, "👍", reactionReq.Emoji)
+	require.NoError(err)
+	assert.Equal(store.WhatsAppOutboxSent, result.Status)
+	assert.Equal("15557654321@s.whatsapp.net", reactionReq.ChatJID)
+	assert.Equal("15557654321@s.whatsapp.net", reactionReq.SenderJID)
+	assert.Equal("target-1", reactionReq.RemoteMessageID)
+	assert.Equal("👍", reactionReq.Emoji)
 	outbox, err := st.GetWhatsAppOutbox(ctx, result.OutboxID)
-	requirepkg.NoError(t, err)
-	assertpkg.Equal(t, targetID, outbox.MessageID.Int64)
+	require.NoError(err)
+	assert.Equal(targetID, outbox.MessageID.Int64)
 
 	selfID, err := st.EnsureParticipantByIdentifier(store.WhatsAppSourceType, "15551234567@s.whatsapp.net", "")
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 	var active string
-	requirepkg.NoError(t, st.DB().QueryRow(st.Rebind(`
+	require.NoError(st.DB().QueryRow(st.Rebind(`
 		SELECT reaction_value
 		FROM reactions
 		WHERE message_id = ? AND participant_id = ? AND removed_at IS NULL
 	`), targetID, selfID).Scan(&active))
-	assertpkg.Equal(t, "👍", active)
+	assert.Equal("👍", active)
 }
 
 func TestServiceArchiveInboundReactionClearsReaction(t *testing.T) {
+	require := require.New(t)
 	ctx := context.Background()
 	st := testutil.NewTestStore(t)
 	now := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC)
@@ -516,7 +525,7 @@ func TestServiceArchiveInboundReactionClearsReaction(t *testing.T) {
 		Transport: transport,
 		Now:       func() time.Time { return now },
 	})
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 
 	targetID, err := svc.ArchiveInbound(ctx, InboundMessage{
 		Account:   "15551234567@s.whatsapp.net",
@@ -527,7 +536,7 @@ func TestServiceArchiveInboundReactionClearsReaction(t *testing.T) {
 		Timestamp: now.Add(-time.Minute),
 		IsGroup:   true,
 	})
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 
 	_, err = svc.ArchiveInbound(ctx, InboundMessage{
 		Account:   "15551234567@s.whatsapp.net",
@@ -541,7 +550,7 @@ func TestServiceArchiveInboundReactionClearsReaction(t *testing.T) {
 			Emoji:           "❤️",
 		},
 	})
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 
 	_, err = svc.ArchiveInbound(ctx, InboundMessage{
 		Account:   "15551234567@s.whatsapp.net",
@@ -555,20 +564,22 @@ func TestServiceArchiveInboundReactionClearsReaction(t *testing.T) {
 			Emoji:           "",
 		},
 	})
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 
 	participantID, err := st.EnsureParticipantByIdentifier(store.WhatsAppSourceType, "15557654321@s.whatsapp.net", "")
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 	var activeCount int
-	requirepkg.NoError(t, st.DB().QueryRow(st.Rebind(`
+	require.NoError(st.DB().QueryRow(st.Rebind(`
 		SELECT COUNT(*)
 		FROM reactions
 		WHERE message_id = ? AND participant_id = ? AND removed_at IS NULL
 	`), targetID, participantID).Scan(&activeCount))
-	assertpkg.Equal(t, 0, activeCount)
+	assert.Equal(t, 0, activeCount)
 }
 
 func TestServiceLogoutReturnsBeforeAndAfterStatus(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	ctx := context.Background()
 	st := testutil.NewTestStore(t)
 	var gotReq TransportLogoutRequest
@@ -592,15 +603,15 @@ func TestServiceLogoutReturnsBeforeAndAfterStatus(t *testing.T) {
 		Store:     st,
 		Transport: transport,
 	})
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 
 	result, err := svc.Logout(ctx, LogoutRequest{ForceLocal: true})
-	requirepkg.NoError(t, err)
-	assertpkg.True(t, gotReq.ForceLocal)
-	assertpkg.True(t, result.StatusBefore.Paired)
-	assertpkg.False(t, result.StatusAfter.Paired)
-	assertpkg.True(t, result.RemoteLogout)
-	assertpkg.True(t, result.LocalSessionCleared)
+	require.NoError(err)
+	assert.True(gotReq.ForceLocal)
+	assert.True(result.StatusBefore.Paired)
+	assert.False(result.StatusAfter.Paired)
+	assert.True(result.RemoteLogout)
+	assert.True(result.LocalSessionCleared)
 }
 
 type serviceContextKey string
@@ -623,11 +634,11 @@ func TestServiceStartLoginUsesLoginContextForQRPairing(t *testing.T) {
 		Transport:    transport,
 		LoginContext: loginCtx,
 	})
-	requirepkg.NoError(t, err)
+	require.NoError(t, err)
 
 	_, err = svc.StartLogin(ctx)
-	requirepkg.NoError(t, err)
-	assertpkg.Equal(t, "daemon", gotScope)
+	require.NoError(t, err)
+	assert.Equal(t, "daemon", gotScope)
 }
 
 func TestServiceStartLoginUsesLoginContextForReconnect(t *testing.T) {
@@ -654,11 +665,11 @@ func TestServiceStartLoginUsesLoginContextForReconnect(t *testing.T) {
 		Transport:    transport,
 		LoginContext: loginCtx,
 	})
-	requirepkg.NoError(t, err)
+	require.NoError(t, err)
 
 	_, err = svc.StartLogin(ctx)
-	requirepkg.NoError(t, err)
-	assertpkg.Equal(t, "daemon", gotScope)
+	require.NoError(t, err)
+	assert.Equal(t, "daemon", gotScope)
 }
 
 // attachmentRow is a minimal snapshot of one `attachments` row, read via raw
@@ -689,13 +700,15 @@ func queryWhatsAppAttachment(t *testing.T, st *store.Store, messageID int64) (at
 
 func queryMessageAttachmentStats(t *testing.T, st *store.Store, messageID int64) (hasAttachments bool, count int64) {
 	t.Helper()
-	requirepkg.NoError(t, st.DB().QueryRow(st.Rebind(`
+	require.NoError(t, st.DB().QueryRow(st.Rebind(`
 		SELECT has_attachments, attachment_count FROM messages WHERE id = ?
 	`), messageID).Scan(&hasAttachments, &count))
 	return hasAttachments, count
 }
 
 func TestServiceArchiveInboundStoresDownloadedAttachment(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	ctx := context.Background()
 	st := testutil.NewTestStore(t)
 	attachmentsDir := t.TempDir()
@@ -707,7 +720,7 @@ func TestServiceArchiveInboundStoresDownloadedAttachment(t *testing.T) {
 		Transport:      transport,
 		AttachmentsDir: attachmentsDir,
 	})
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 
 	content := []byte("%PDF-1.4 synthetic bank details")
 	messageID, err := svc.ArchiveInbound(ctx, InboundMessage{
@@ -723,32 +736,32 @@ func TestServiceArchiveInboundStoresDownloadedAttachment(t *testing.T) {
 			Data:      content,
 		},
 	})
-	requirepkg.NoError(t, err, "a captionless attachment message must still archive")
-	requirepkg.NotZero(t, messageID)
+	require.NoError(err, "a captionless attachment message must still archive")
+	require.NotZero(messageID)
 
 	row, ok := queryWhatsAppAttachment(t, st, messageID)
-	requirepkg.True(t, ok, "attachment row must exist for downloaded media")
-	assertpkg.Equal(t, "RIB.pdf", row.filename)
-	assertpkg.Equal(t, "application/pdf", row.mimeType)
-	assertpkg.Equal(t, "document", row.mediaType)
-	assertpkg.Equal(t, int64(len(content)), row.size)
-	assertpkg.NotEmpty(t, row.contentHash)
+	require.True(ok, "attachment row must exist for downloaded media")
+	assert.Equal("RIB.pdf", row.filename)
+	assert.Equal("application/pdf", row.mimeType)
+	assert.Equal("document", row.mediaType)
+	assert.Equal(int64(len(content)), row.size)
+	assert.NotEmpty(row.contentHash)
 
 	storedPath, err := export.StoragePath(attachmentsDir, row.contentHash)
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 	stored, err := os.ReadFile(storedPath)
-	requirepkg.NoError(t, err)
-	assertpkg.Equal(t, content, stored)
+	require.NoError(err)
+	assert.Equal(content, stored)
 
 	hasAttachments, count := queryMessageAttachmentStats(t, st, messageID)
-	assertpkg.True(t, hasAttachments)
-	assertpkg.Equal(t, int64(1), count)
+	assert.True(hasAttachments)
+	assert.Equal(int64(1), count)
 
 	var sizeEstimate int64
-	requirepkg.NoError(t, st.DB().QueryRow(st.Rebind(`
+	require.NoError(st.DB().QueryRow(st.Rebind(`
 		SELECT size_estimate FROM messages WHERE id = ?
 	`), messageID).Scan(&sizeEstimate))
-	assertpkg.Equal(t, int64(len(content)), sizeEstimate, "size_estimate must include downloaded attachment bytes")
+	assert.Equal(int64(len(content)), sizeEstimate, "size_estimate must include downloaded attachment bytes")
 }
 
 func TestServiceArchiveInboundDownloadFailureLeavesPendingMarkerRow(t *testing.T) {
@@ -781,6 +794,8 @@ func TestServiceArchiveInboundDownloadFailureLeavesPendingMarkerRow(t *testing.T
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			assert := assert.New(t)
+			require := require.New(t)
 			ctx := context.Background()
 			st := testutil.NewTestStore(t)
 			var dir string
@@ -797,7 +812,7 @@ func TestServiceArchiveInboundDownloadFailureLeavesPendingMarkerRow(t *testing.T
 				AttachmentsDir: dir,
 				Notify:         func(_ context.Context, e InboundEvent) { gotEvent = e },
 			})
-			requirepkg.NoError(t, err)
+			require.NoError(err)
 
 			messageID, err := svc.ArchiveInbound(ctx, InboundMessage{
 				Account:    "15551234567@s.whatsapp.net",
@@ -807,39 +822,40 @@ func TestServiceArchiveInboundDownloadFailureLeavesPendingMarkerRow(t *testing.T
 				Timestamp:  time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC),
 				Attachment: tt.attachment,
 			})
-			requirepkg.NoError(t, err, "a failed/unstorable download must not drop the message")
-			requirepkg.NotZero(t, messageID)
+			require.NoError(err, "a failed/unstorable download must not drop the message")
+			require.NotZero(messageID)
 
 			// A failed download must not leave the message looking
 			// attachment-free: a marker row records that real media was sent
 			// even though its bytes were never durably stored.
 			row, ok := queryWhatsAppAttachment(t, st, messageID)
-			requirepkg.True(t, ok, "a marker row must exist so the failure is visible/queryable")
-			assertpkg.Equal(t, "RIB.pdf", row.filename)
-			assertpkg.Empty(t, row.contentHash, "no content hash: bytes were never durably stored")
-			assertpkg.Contains(t, row.storagePath, "whatsapp:pending:")
+			require.True(ok, "a marker row must exist so the failure is visible/queryable")
+			assert.Equal("RIB.pdf", row.filename)
+			assert.Empty(row.contentHash, "no content hash: bytes were never durably stored")
+			assert.Contains(row.storagePath, "whatsapp:pending:")
 
 			hasAttachments, count := queryMessageAttachmentStats(t, st, messageID)
-			assertpkg.True(t, hasAttachments, "message must not look attachment-free")
-			assertpkg.Equal(t, int64(1), count)
+			assert.True(hasAttachments, "message must not look attachment-free")
+			assert.Equal(int64(1), count)
 
 			// size_estimate mirrors Gmail/IMAP's "size of the fetched
 			// message": it reflects bytes actually downloaded (Data), not
 			// whether local CAS storage was configured/succeeded.
 			var sizeEstimate int64
-			requirepkg.NoError(t, st.DB().QueryRow(st.Rebind(`
+			require.NoError(st.DB().QueryRow(st.Rebind(`
 				SELECT size_estimate FROM messages WHERE id = ?
 			`), messageID).Scan(&sizeEstimate))
-			assertpkg.Equal(t, int64(len(tt.attachment.Data)), sizeEstimate)
-
-			assertpkg.False(t, gotEvent.HasAttachment, "webhook must not point consumers at bytes that were never stored")
-			assertpkg.Empty(t, gotEvent.AttachmentMediaType)
-			assertpkg.Empty(t, gotEvent.AttachmentFilename)
+			assert.Equal(int64(len(tt.attachment.Data)), sizeEstimate)
+			assert.False(gotEvent.HasAttachment, "webhook must not point consumers at bytes that were never stored")
+			assert.Empty(gotEvent.AttachmentMediaType)
+			assert.Empty(gotEvent.AttachmentFilename)
 		})
 	}
 }
 
 func TestServiceArchiveInboundAttachmentStoreFailureDoesNotFailMessage(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	ctx := context.Background()
 	st := testutil.NewTestStore(t)
 	// A regular file where a directory is expected forces
@@ -847,7 +863,7 @@ func TestServiceArchiveInboundAttachmentStoreFailureDoesNotFailMessage(t *testin
 	// (mirroring a real misconfigured or unwritable AttachmentsDir), rather
 	// than a stubbed one.
 	badDir := filepath.Join(t.TempDir(), "not-a-dir")
-	requirepkg.NoError(t, os.WriteFile(badDir, []byte("x"), 0o600))
+	require.NoError(os.WriteFile(badDir, []byte("x"), 0o600))
 
 	notifications := 0
 	transport := &mockTransport{status: Status{AccountJID: "15551234567@s.whatsapp.net", Paired: true}}
@@ -857,7 +873,7 @@ func TestServiceArchiveInboundAttachmentStoreFailureDoesNotFailMessage(t *testin
 		AttachmentsDir: badDir,
 		Notify:         func(context.Context, InboundEvent) { notifications++ },
 	})
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 
 	messageID, err := svc.ArchiveInbound(ctx, InboundMessage{
 		Account:   "15551234567@s.whatsapp.net",
@@ -872,16 +888,18 @@ func TestServiceArchiveInboundAttachmentStoreFailureDoesNotFailMessage(t *testin
 			Data:      []byte("bank details"),
 		},
 	})
-	requirepkg.NoError(t, err, "an attachment store failure must not fail an already-committed message")
-	requirepkg.NotZero(t, messageID)
-	assertpkg.Equal(t, 1, notifications, "recomputeStats/notify must still run despite the attachment failure")
+	require.NoError(err, "an attachment store failure must not fail an already-committed message")
+	require.NotZero(messageID)
+	assert.Equal(1, notifications, "recomputeStats/notify must still run despite the attachment failure")
 
 	var count int
-	requirepkg.NoError(t, st.DB().QueryRow(st.Rebind(`SELECT COUNT(*) FROM messages WHERE id = ?`), messageID).Scan(&count))
-	assertpkg.Equal(t, 1, count, "the message itself must still be committed")
+	require.NoError(st.DB().QueryRow(st.Rebind(`SELECT COUNT(*) FROM messages WHERE id = ?`), messageID).Scan(&count))
+	assert.Equal(1, count, "the message itself must still be committed")
 }
 
 func TestServiceArchiveInboundNotifiesAttachmentMetadataOnSuccess(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	ctx := context.Background()
 	st := testutil.NewTestStore(t)
 	var gotEvent InboundEvent
@@ -892,7 +910,7 @@ func TestServiceArchiveInboundNotifiesAttachmentMetadataOnSuccess(t *testing.T) 
 		AttachmentsDir: t.TempDir(),
 		Notify:         func(_ context.Context, e InboundEvent) { gotEvent = e },
 	})
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 
 	messageID, err := svc.ArchiveInbound(ctx, InboundMessage{
 		Account:   "15551234567@s.whatsapp.net",
@@ -907,16 +925,17 @@ func TestServiceArchiveInboundNotifiesAttachmentMetadataOnSuccess(t *testing.T) 
 			Data:      []byte("bank details"),
 		},
 	})
-	requirepkg.NoError(t, err)
-	requirepkg.NotZero(t, messageID)
-
-	assertpkg.True(t, gotEvent.HasAttachment)
-	assertpkg.Equal(t, "document", gotEvent.AttachmentMediaType)
-	assertpkg.Equal(t, "RIB.pdf", gotEvent.AttachmentFilename)
-	assertpkg.Equal(t, messageID, gotEvent.StoreMessageID)
+	require.NoError(err)
+	require.NotZero(messageID)
+	assert.True(gotEvent.HasAttachment)
+	assert.Equal("document", gotEvent.AttachmentMediaType)
+	assert.Equal("RIB.pdf", gotEvent.AttachmentFilename)
+	assert.Equal(messageID, gotEvent.StoreMessageID)
 }
 
 func TestServiceArchiveInboundCaptionlessAttachmentMessageIsRetrievable(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
 	ctx := context.Background()
 	st := testutil.NewTestStore(t)
 	attachmentsDir := t.TempDir()
@@ -928,7 +947,7 @@ func TestServiceArchiveInboundCaptionlessAttachmentMessageIsRetrievable(t *testi
 		Transport:      transport,
 		AttachmentsDir: attachmentsDir,
 	})
-	requirepkg.NoError(t, err)
+	require.NoError(err)
 
 	// Regression coverage for the reported bug: a bare document with no
 	// caption text used to be silently dropped (MessageText returned "" and
@@ -946,13 +965,13 @@ func TestServiceArchiveInboundCaptionlessAttachmentMessageIsRetrievable(t *testi
 			Data:      []byte("bank details"),
 		},
 	})
-	requirepkg.NoError(t, err)
-	requirepkg.NotZero(t, messageID)
+	require.NoError(err)
+	require.NotZero(messageID)
 
 	var storagePath string
-	requirepkg.NoError(t, st.DB().QueryRow(st.Rebind(`
+	require.NoError(st.DB().QueryRow(st.Rebind(`
 		SELECT storage_path FROM attachments WHERE message_id = ?
 	`), messageID).Scan(&storagePath))
-	assertpkg.NotEmpty(t, storagePath)
-	assertpkg.Equal(t, filepath.ToSlash(storagePath), storagePath, "storage path uses the CAS convention (hash[:2]/hash)")
+	assert.NotEmpty(storagePath)
+	assert.Equal(filepath.ToSlash(storagePath), storagePath, "storage path uses the CAS convention (hash[:2]/hash)")
 }

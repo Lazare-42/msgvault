@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"sync"
 	"testing"
+	"testing/synctest"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -16,6 +17,7 @@ import (
 )
 
 func TestSemanticCoverageContextNarrowsSources(t *testing.T) {
+	t.Parallel()
 	scope := vector.NewBuildScope(nil, []int64{3, 7})
 
 	t.Run("unfiltered context adopts the scope sources", func(t *testing.T) {
@@ -176,6 +178,7 @@ func getSearchCoverage(t *testing.T, srv *Server, body string) SearchCoverageRes
 }
 
 func TestSearchCoverageReportsEveryNamedStateInFilteredContext(t *testing.T) {
+	t.Parallel()
 	generation := vector.Generation{
 		ID: 7, Model: "test", Dimension: 2, Fingerprint: "test:2", State: vector.GenerationActive,
 	}
@@ -259,6 +262,7 @@ func TestSearchCoverageReportsEveryNamedStateInFilteredContext(t *testing.T) {
 }
 
 func TestSameCoverageGenerationRejectsInPlaceTopUp(t *testing.T) {
+	t.Parallel()
 	want := vector.Generation{
 		ID: 7, State: vector.GenerationActive, Fingerprint: "test:2", MessageCount: 10,
 	}
@@ -269,6 +273,7 @@ func TestSameCoverageGenerationRejectsInPlaceTopUp(t *testing.T) {
 }
 
 func TestSearchCoverageIntersectsCanonicalContextWithEmbeddingScope(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	engine := newExploreDuckDBFixture(t)
 	generation := vector.Generation{ID: 9, Fingerprint: "test:2", State: vector.GenerationActive}
@@ -293,6 +298,7 @@ func TestSearchCoverageIntersectsCanonicalContextWithEmbeddingScope(t *testing.T
 }
 
 func TestSearchCoverageResolvesIdentityFilterOnce(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	fixture := newExploreIdentityAPIFixture(t)
 	backend := &filteredCoverageBackend{
@@ -324,6 +330,7 @@ func TestSearchCoverageResolvesIdentityFilterOnce(t *testing.T) {
 // rather than rewrite the source predicate into something the query
 // validator rejects.
 func TestSearchCoverageReportsZeroForIdentityOutsideEmbedScope(t *testing.T) {
+	t.Parallel()
 	assertions := assert.New(t)
 	fixture := newExploreIdentityAPIFixture(t)
 	backend := &filteredCoverageBackend{
@@ -351,6 +358,7 @@ func TestSearchCoverageReportsZeroForIdentityOutsideEmbedScope(t *testing.T) {
 }
 
 func TestSearchCoverageOpenAPIContract(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	require := require.New(t)
 	doc := OpenAPIDocument()
@@ -377,6 +385,7 @@ func TestSearchCoverageOpenAPIContract(t *testing.T) {
 }
 
 func TestSearchCoverageComputesCountsInOneScanWithBoundedBatches(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	const total = 700
@@ -400,6 +409,7 @@ func TestSearchCoverageComputesCountsInOneScanWithBoundedBatches(t *testing.T) {
 }
 
 func TestSearchCoverageSkipsArchiveScanWithoutUsableGeneration(t *testing.T) {
+	t.Parallel()
 	vectorCfg := vector.Config{
 		Enabled: true,
 		Embeddings: vector.EmbeddingsConfig{
@@ -455,6 +465,7 @@ func TestSearchCoverageSkipsArchiveScanWithoutUsableGeneration(t *testing.T) {
 }
 
 func TestSearchCoverageServesCachedCountsUntilRevisionOrGenerationChanges(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	engine := &coverageScanEngine{revision: "cache:one", total: 700}
@@ -487,6 +498,7 @@ func TestSearchCoverageServesCachedCountsUntilRevisionOrGenerationChanges(t *tes
 }
 
 func TestSearchCoverageCachesPerFilterContext(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	engine := newExploreDuckDBFixture(t)
 	backend := &filteredCoverageBackend{
@@ -503,6 +515,7 @@ func TestSearchCoverageCachesPerFilterContext(t *testing.T) {
 }
 
 func TestSearchCoverageCacheSeparatesResolvedIdentitiesAndDirections(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	fixture := newExploreIdentityAPIFixture(t)
 	require.NoError(fixture.store.AddAccountIdentity(1, "alice@example.com", "manual"))
@@ -539,6 +552,7 @@ func TestSearchCoverageCacheSeparatesResolvedIdentitiesAndDirections(t *testing.
 // the same participant set after a merge, yet envelope-first filtering makes
 // their predicates select different populations.
 func TestSearchCoverageContextHashSeparatesEmailIdentifier(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	identity := func(emailIdentifier string) query.Context {
 		return query.Context{Identity: &query.IdentityPredicate{
@@ -563,6 +577,7 @@ func TestSearchCoverageContextHashSeparatesEmailIdentifier(t *testing.T) {
 // with no embed schedule keeps reporting ready coverage computed from
 // obsolete startup source IDs until some vector search fires the preflight.
 func TestSearchCoverageDetectsScopeDrift(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	engine := &coverageScanEngine{revision: "cache:test", total: 3}
 	backend := &filteredCoverageBackend{
@@ -585,6 +600,7 @@ func TestSearchCoverageDetectsScopeDrift(t *testing.T) {
 }
 
 func TestSearchCoverageRejectsGenerationActivationDuringScan(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	backend := &filteredCoverageBackend{
@@ -626,6 +642,7 @@ func TestSearchCoverageRejectsGenerationActivationDuringScan(t *testing.T) {
 }
 
 func TestSearchCoverageStopsOnScanErrorAndCancellation(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		err  error
@@ -660,6 +677,7 @@ func TestSearchCoverageStopsOnScanErrorAndCancellation(t *testing.T) {
 }
 
 func TestSearchCoverageReportsUnavailableWhenIntersectionFails(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	engine := &coverageScanEngine{revision: "cache:test", total: 700}
 	backend := &filteredCoverageBackend{
@@ -678,6 +696,7 @@ func TestSearchCoverageReportsUnavailableWhenIntersectionFails(t *testing.T) {
 }
 
 func TestSearchCoverageRetryDoesNotRequireCLIRunner(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	engine := newExploreDuckDBFixture(t)
 	readOnlyStore := struct{ MessageStore }{MessageStore: &mockStore{stats: &StoreStats{}}}
@@ -694,6 +713,7 @@ func TestSearchCoverageRetryDoesNotRequireCLIRunner(t *testing.T) {
 }
 
 func TestSearchCoverageResolvesGenerationStateAndRefreshesStale(t *testing.T) {
+	t.Parallel()
 	vectorCfg := vector.Config{
 		Enabled: true,
 		Embeddings: vector.EmbeddingsConfig{
@@ -798,4 +818,42 @@ func TestSearchCoverageResolvesGenerationStateAndRefreshesStale(t *testing.T) {
 			assert.ElementsMatch(tt.wantAction, body.Actions)
 		})
 	}
+}
+
+func TestSearchCoverageStaleRestartAdvice(t *testing.T) {
+	t.Parallel()
+	cfg := vector.Config{Enabled: true}
+	backend := &filteredCoverageBackend{active: vector.Generation{ID: 1, Fingerprint: cfg.GenerationFingerprint()}}
+	srv := NewServerWithOptions(ServerOptions{
+		Config: &config.Config{Vector: cfg}, Store: &mockStore{stats: &StoreStats{}},
+		Engine: newExploreDuckDBFixture(t), Backend: backend, VectorCfg: cfg, Logger: testLogger(),
+	})
+	srv.SetVectorRestartFingerprint(func(context.Context) (string, error) {
+		return "model-b", nil
+	})
+	backend.active = vector.Generation{ID: 2, Fingerprint: "model-b"}
+	body := getSearchCoverage(t, srv, `{}`)
+	{
+		assert := assert.New(t)
+		assert.Equal(SearchCoverageStale, body.Status)
+		assert.Equal("model-b", body.VectorFingerprint)
+		assert.Contains(body.Detail, "msgvault daemon restart")
+		assert.NotContains(body.Actions, SearchCoverageActionBuildIndex)
+	}
+
+	t.Run("timeout", func(t *testing.T) {
+		backend := &filteredCoverageBackend{active: vector.Generation{ID: 2, Fingerprint: "model-b"}}
+		srv := NewServerWithOptions(ServerOptions{
+			Config: &config.Config{Vector: cfg}, Store: &mockStore{stats: &StoreStats{}},
+			Engine: newExploreDuckDBFixture(t), Backend: backend, VectorCfg: cfg, Logger: testLogger(),
+		})
+		srv.SetVectorRestartFingerprint(func(ctx context.Context) (string, error) {
+			<-ctx.Done()
+			return "", ctx.Err()
+		})
+		synctest.Test(t, func(t *testing.T) {
+			body := getSearchCoverage(t, srv, `{}`)
+			assert.Equal(t, []SearchCoverageAction{SearchCoverageActionRetry}, body.Actions)
+		})
+	})
 }

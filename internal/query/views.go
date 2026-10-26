@@ -6,13 +6,28 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
+
+	"go.kenn.io/msgvault/internal/identityindex"
 )
 
 // QueryResult holds raw SQL query results in a columnar format.
 type QueryResult struct {
-	Columns  []string `json:"columns"`
-	Rows     [][]any  `json:"rows"`
-	RowCount int      `json:"row_count"`
+	Columns  []string        `json:"columns"`
+	Rows     [][]any         `json:"rows"`
+	RowCount int             `json:"row_count"`
+	Cache    *CacheFreshness `json:"cache,omitempty"`
+}
+
+// CacheFreshness describes the committed analytics publication used by a SQL
+// result. The engine sets its generation while holding the cache read lock;
+// callers may add source-database drift details after the query completes.
+type CacheFreshness struct {
+	Generation       string    `json:"generation"`
+	PublishedAt      time.Time `json:"published_at"`
+	StaleReason      string    `json:"stale_reason,omitempty"`
+	PendingAdditions int64     `json:"pending_additions,omitempty"`
+	Building         bool      `json:"building,omitempty"`
 }
 
 // SQLQuerier is implemented by engines that support raw SQL queries.
@@ -22,10 +37,11 @@ type SQLQuerier interface {
 
 // probeColumns checks which columns exist in a Parquet file.
 // Returns a set of column names present in the schema.
-// On any error, returns an empty map (callers supply defaults).
+// Missing optional schemas return an empty map (callers supply defaults).
+// Context cancellation remains an error so incomplete probes are not cached.
 func probeColumns(
-	db *sql.DB, pathPattern string, hivePartitioning bool,
-) map[string]bool {
+	ctx context.Context, db *sql.DB, pathPattern string, hivePartitioning bool,
+) (map[string]bool, error) {
 	cols := make(map[string]bool)
 	hiveOpt := ""
 	if hivePartitioning {
@@ -36,9 +52,9 @@ func probeColumns(
 		"DESCRIBE SELECT * FROM read_parquet('%s'%s)",
 		escaped, hiveOpt,
 	)
-	rows, err := db.Query(q)
+	rows, err := db.QueryContext(ctx, q)
 	if err != nil {
-		return cols
+		return cols, ctx.Err()
 	}
 	defer func() { _ = rows.Close() }()
 	for rows.Next() {
@@ -53,9 +69,9 @@ func probeColumns(
 		}
 	}
 	if rows.Err() != nil {
-		return cols
+		return cols, ctx.Err()
 	}
-	return cols
+	return cols, ctx.Err()
 }
 
 // viewDef holds the parameters needed to create one DuckDB view
@@ -116,42 +132,54 @@ func buildViewSQL(def viewDef, probedCols map[string]bool) string {
 // probeAllOptionalColumns probes Parquet schemas for all tables that
 // have optional columns, returning a map of table name -> column set.
 // Used by both RegisterViews and RegisterViewsWithColumns.
-func probeAllOptionalColumns(db *sql.DB, analyticsDir string) map[string]map[string]bool {
+func probeAllOptionalColumns(ctx context.Context, db *sql.DB, analyticsDir string) (map[string]map[string]bool, error) {
 	msgGlob := filepath.Join(analyticsDir, datasetMessages, "**", "*.parquet")
 	tablePath := func(name string) string {
 		return filepath.Join(analyticsDir, name, "*.parquet")
 	}
-	return map[string]map[string]bool{
-		datasetMessages:      probeColumns(db, msgGlob, true),
-		datasetParticipants:  probeColumns(db, tablePath(datasetParticipants), false),
-		datasetConversations: probeColumns(db, tablePath(datasetConversations), false),
-		"attachments":        probeColumns(db, tablePath("attachments"), false),
-		"sources":            probeColumns(db, tablePath("sources"), false),
-		"message_recipients": probeColumns(db, tablePath("message_recipients"), false),
+	cols := make(map[string]map[string]bool)
+	for _, table := range []string{datasetMessages, datasetParticipants, datasetConversations, "attachments", "sources", "message_recipients"} {
+		path := tablePath(table)
+		partitioned := table == datasetMessages
+		if partitioned {
+			path = msgGlob
+		}
+		var err error
+		cols[table], err = probeColumns(ctx, db, path, partitioned)
+		if err != nil {
+			return nil, err
+		}
 	}
+	return cols, nil
 }
 
 // RegisterViews creates DuckDB views over the Parquet files in
 // analyticsDir. Each view normalises types and supplies defaults
 // for optional columns that may be absent in older cache files.
-func RegisterViews(db *sql.DB, analyticsDir string) error {
-	optCols := probeAllOptionalColumns(db, analyticsDir)
-	return RegisterViewsWithColumns(db, analyticsDir, optCols)
+func RegisterViews(ctx context.Context, db *sql.DB, analyticsDir string) error {
+	optCols, err := probeAllOptionalColumns(ctx, db, analyticsDir)
+	if err != nil {
+		return err
+	}
+	return RegisterViewsWithColumns(ctx, db, analyticsDir, optCols)
 }
 
 // RegisterViewsWithColumns is like RegisterViews but uses pre-computed
 // optional column info instead of probing Parquet schemas. Used by
 // NewDuckDBEngine which already probed columns during initialisation.
-func RegisterViewsWithColumns(db *sql.DB, analyticsDir string, optCols map[string]map[string]bool) error {
-	if err := createBaseViews(db, analyticsDir, optCols); err != nil {
+func RegisterViewsWithColumns(ctx context.Context, db *sql.DB, analyticsDir string, optCols map[string]map[string]bool) error {
+	if err := createBaseViews(ctx, db, analyticsDir, optCols); err != nil {
 		return fmt.Errorf("create base views: %w", err)
 	}
-	return createConvenienceViews(db)
+	if err := createRelationshipActivityView(ctx, db, analyticsDir); err != nil {
+		return err
+	}
+	return createConvenienceViews(ctx, db)
 }
 
 // createBaseViews creates the raw Parquet-backed views using the
 // pre-computed optional column map so no additional Parquet probes occur.
-func createBaseViews(db *sql.DB, analyticsDir string, optCols map[string]map[string]bool) error {
+func createBaseViews(ctx context.Context, db *sql.DB, analyticsDir string, optCols map[string]map[string]bool) error {
 	msgGlob := filepath.Join(
 		analyticsDir, datasetMessages, "**", "*.parquet",
 	)
@@ -184,8 +212,11 @@ func createBaseViews(db *sql.DB, analyticsDir string, optCols map[string]map[str
 					"CAST(snippet AS VARCHAR) AS snippet",
 					"CAST(size_estimate AS BIGINT) AS size_estimate",
 					"COALESCE(TRY_CAST(has_attachments AS BOOLEAN), false) AS has_attachments",
+					"CAST(archive_only AS BOOLEAN) AS archive_only",
 				},
 				optionalCols: []optionalCol{
+					{name: "account_address", replaceExpr: "CAST(account_address AS VARCHAR) AS account_address", defaultExpr: "NULL::VARCHAR AS account_address"},
+					{name: "account_path", replaceExpr: "CAST(account_path AS VARCHAR) AS account_path", defaultExpr: "NULL::VARCHAR AS account_path"},
 					{
 						name:        "attachment_count",
 						replaceExpr: "COALESCE(TRY_CAST(attachment_count AS INTEGER), 0) AS attachment_count",
@@ -205,6 +236,11 @@ func createBaseViews(db *sql.DB, analyticsDir string, optCols map[string]map[str
 						name:        messageTypeDimension,
 						replaceExpr: "COALESCE(CAST(message_type AS VARCHAR), '') AS message_type",
 						defaultExpr: "'' AS message_type",
+					},
+					{
+						name:        "list_id",
+						replaceExpr: "CAST(list_id AS VARCHAR) AS list_id",
+						defaultExpr: "NULL::VARCHAR AS list_id",
 					},
 					{
 						name:        "deleted_at",
@@ -250,16 +286,29 @@ func createBaseViews(db *sql.DB, analyticsDir string, optCols map[string]map[str
 					"CAST(recipient_type AS VARCHAR) AS recipient_type",
 					"CAST(display_name AS VARCHAR) AS display_name",
 				},
-				optionalCols: []optionalCol{{
-					// Envelope address snapshot (cache schema v17). The ''
-					// default keeps pre-v17 caches readable: an empty
-					// envelope makes identity filters fall back to
-					// participant matching (see
-					// buildIdentityPredicateCondition).
-					name:        "email_address",
-					replaceExpr: "COALESCE(CAST(email_address AS VARCHAR), '') AS email_address",
-					defaultExpr: "'' AS email_address",
-				}},
+				optionalCols: []optionalCol{
+					{
+						// Resolved recipient address (cache schema v26): the
+						// header address when one was recorded, otherwise the
+						// participant's current address. NULL only for
+						// participants without an email address.
+						name:        "email_address",
+						replaceExpr: "CAST(email_address AS VARCHAR) AS email_address",
+						defaultExpr: "NULL::VARCHAR AS email_address",
+					},
+					{
+						// Header address exactly as recorded (cache schema
+						// v26); NULL when none was — chat, calendar, and mail
+						// ingested before the store column existed. Identity
+						// filters key on its presence (see
+						// buildIdentityPredicateCondition); a cache without
+						// the column reads as NULL and falls back to
+						// participant matching.
+						name:        "envelope_address",
+						replaceExpr: "CAST(envelope_address AS VARCHAR) AS envelope_address",
+						defaultExpr: "NULL::VARCHAR AS envelope_address",
+					},
+				},
 			},
 			probe: colsFor("message_recipients"),
 		},
@@ -378,8 +427,39 @@ func createBaseViews(db *sql.DB, analyticsDir string, optCols map[string]map[str
 			probe = map[string]bool{}
 		}
 		stmt := buildViewSQL(d.def, probe)
-		if _, err := db.Exec(stmt); err != nil {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("create view %s: %w", d.def.name, err)
+		}
+	}
+	return nil
+}
+
+// The normalized relationship view is used by internal query paths even when
+// legacy analytical views are disabled.
+func createRelationshipActivityView(ctx context.Context, db *sql.DB, analyticsDir string) error {
+	activityFiles, err := filepath.Glob(filepath.Join(analyticsDir, identityindex.DatasetActivity, "*", "*.parquet"))
+	if err != nil {
+		return fmt.Errorf("find relationship activity: %w", err)
+	}
+	if len(activityFiles) > 0 {
+		parquet := func(dataset string, hive bool) string {
+			glob := filepath.Join(analyticsDir, dataset, "*.parquet")
+			options := ""
+			if hive {
+				glob = filepath.Join(analyticsDir, dataset, "**", "*.parquet")
+				options = ", hive_partitioning=true, union_by_name=true"
+			}
+			return "read_parquet('" + quoteIdentitySQLPath(glob) + "'" + options + ")"
+		}
+		relation := identityindex.ExpandedActivityRelation(
+			parquet(identityindex.DatasetActivity, true),
+			parquet(datasetConversationParticipants, false),
+			parquet(datasetParticipants, false),
+			parquet(datasetParticipantClusters, false),
+			parquet(datasetOwnerParticipants, false),
+		)
+		if _, err := db.ExecContext(ctx, "CREATE OR REPLACE VIEW relationship_activity_expanded AS SELECT * FROM "+relation); err != nil {
+			return fmt.Errorf("create relationship activity view: %w", err)
 		}
 	}
 	return nil
@@ -388,7 +468,7 @@ func createBaseViews(db *sql.DB, analyticsDir string, optCols map[string]map[str
 // createConvenienceViews builds higher-level views on top of the
 // base Parquet views. Each view joins or aggregates the base views
 // to provide ready-to-query datasets.
-func createConvenienceViews(db *sql.DB) error {
+func createConvenienceViews(ctx context.Context, db *sql.DB) error {
 	views := []struct {
 		name string
 		sql  string
@@ -401,7 +481,7 @@ func createConvenienceViews(db *sql.DB) error {
 		{"analytical_entries", sqlAnalyticalEntries},
 	}
 	for _, v := range views {
-		if _, err := db.Exec(v.sql); err != nil {
+		if _, err := db.ExecContext(ctx, v.sql); err != nil {
 			return fmt.Errorf("create view %s: %w", v.name, err)
 		}
 	}
@@ -460,6 +540,7 @@ func buildScalarAnalyticalEntriesCTE(name string, includeAttachmentSummary bool)
 		COALESCE(c.conversation_type, '') AS conversation_type,
 		COALESCE(c.title, '') AS conversation_title,
 		COALESCE(m.message_type, '') AS message_type,
+		m.list_id,
 		m.sender_id,
 		COALESCE(NULLIF(sender.email_address, ''), NULLIF(sender.phone_number, ''), '') AS sender_identifier,
 		COALESCE(NULLIF(sender.display_name, ''), NULLIF(sender.phone_number, ''), sender.email_address, '') AS sender_display,
@@ -470,6 +551,7 @@ func buildScalarAnalyticalEntriesCTE(name string, includeAttachmentSummary bool)
 		m.is_from_me,
 		m.size_estimate,
 		m.deleted_at IS NOT NULL AS internally_deleted,
+		m.archive_only,
 		m.deleted_from_source_at IS NOT NULL AS deleted_from_source,
 		COALESCE(m.has_attachments, false) AS has_attachments,` + attachmentColumns + `
 	FROM messages m
@@ -521,6 +603,7 @@ SELECT
     COALESCE(c.conversation_type, '') AS conversation_type,
     COALESCE(c.title, '') AS conversation_title,
     COALESCE(m.message_type, '') AS message_type,
+    m.list_id,
     m.sender_id,
     COALESCE(NULLIF(sender.email_address, ''), NULLIF(sender.phone_number, ''), '') AS sender_identifier,
     COALESCE(NULLIF(sender.display_name, ''), NULLIF(sender.phone_number, ''), sender.email_address, '') AS sender_display,
@@ -531,6 +614,7 @@ SELECT
     m.is_from_me,
 	m.size_estimate,
 	m.deleted_at IS NOT NULL AS internally_deleted,
+	m.archive_only,
     m.deleted_from_source_at IS NOT NULL AS deleted_from_source,
     COALESCE(m.has_attachments, false) AS has_attachments,
     COALESCE(att.attachment_count, 0) AS attachment_count,

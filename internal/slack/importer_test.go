@@ -20,6 +20,7 @@ import (
 var tsBase = time.Now().Add(-25 * time.Hour).UTC().Truncate(time.Second)
 
 func TestImporterScopesParticipantResolver(t *testing.T) {
+	t.Parallel()
 	requirements := require.New(t)
 	st := testutil.NewTestStore(t)
 	source, err := st.GetOrCreateSource(sourceTypeSlack, "team-a:user-a")
@@ -27,10 +28,9 @@ func TestImporterScopesParticipantResolver(t *testing.T) {
 	runID, err := st.StartSync(source.ID, sourceTypeSlack)
 	requirements.NoError(err)
 	scoped := NewImporter(st, nil, "team-a").scopedToSync(source.ID, runID)
-	_, err = st.StartSync(source.ID, sourceTypeSlack)
-	requirements.NoError(err)
+	requirements.NoError(st.FailSync(runID, "worker stopped"))
 
-	_, err = scoped.res.resolveID("user-a")
+	_, err = scoped.res.resolveID(t.Context(), "user-a")
 	requirements.ErrorIs(err, store.ErrSyncRunSuperseded)
 }
 
@@ -102,21 +102,229 @@ func testWorkspace(t *testing.T) *fakeSlack {
 // replies (the root re-upserts in place).
 const totalWorkspaceMessages = 13
 
+func TestImportPublicChannelsWithoutSearch(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		limit     int
+		runs      int
+		wantCount int
+	}{
+		{name: "unlimited", runs: 1, wantCount: 12},
+		{name: "limited thread walk", limit: 3, runs: 20, wantCount: 13},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			requirements := require.New(t)
+			assertions := assert.New(t)
+			f := testWorkspace(t)
+			f.scopes = "channels:read,channels:history,users:read,users:read.email"
+			f.searchMissingScope = true
+			f.onSearch = func(string, int) { assertions.Fail("token without search scope must not search") }
+			f.convs = append(f.convs, &fakeConv{
+				ID: "C03", Name: "announcements", Kind: "public", NotMember: true,
+				Members: []string{"UALICE"},
+				Msgs:    []fakeMsg{{TS: ts(40), User: "UALICE", Text: "public announcement"}},
+			})
+			imp, opts := testImporter(t, f)
+			now := tsBase.Add(24 * time.Hour)
+			imp.now = func() time.Time { return now }
+
+			sum, err := imp.Import(context.Background(), opts)
+			requirements.NoError(err)
+			assertions.Equal(2, sum.ConversationsProcessed)
+			var count int
+			requirements.NoError(imp.store.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&count))
+			assertions.Equal(11, count, "public messages and replies, including an unjoined channel")
+			requirements.NoError(imp.store.DB().QueryRow(`SELECT COUNT(*) FROM conversations WHERE source_conversation_id IN ('C02', 'G01', 'D01')`).Scan(&count))
+			assertions.Zero(count, "private conversations must not enter the archive")
+
+			// The first reply to an old, previously unthreaded message cannot be
+			// found through an incremental history window. It requires a new walk.
+			f.convs[0].Msgs[0].Replies = []fakeMsg{{TS: ts(1500), ThreadTS: ts(0), User: "UALICE", Text: "late public reply"}}
+			if tc.limit > 0 {
+				f.convs[0].Msgs = append(f.convs[0].Msgs, fakeMsg{TS: ts(1501), User: "UALICE", Text: "new root"})
+			}
+			now = now.Add(2 * time.Hour)
+			opts.Limit = tc.limit
+			for range tc.runs {
+				sum, err = imp.Import(context.Background(), opts)
+				requirements.NoError(err)
+			}
+			if tc.limit == 0 {
+				assertions.Positive(sum.RepliesFetched)
+			}
+			requirements.NoError(imp.store.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&count))
+			assertions.Equal(tc.wantCount, count, "resumed thread walks must leave room for new channel messages")
+
+			_, err = imp.Import(context.Background(), opts)
+			requirements.NoError(err)
+			requirements.NoError(imp.store.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&count))
+			assertions.Equal(tc.wantCount, count, "re-reading threads must not duplicate messages")
+		})
+	}
+}
+
 func testImporter(t *testing.T, f *fakeSlack) (*Importer, ImportOptions) {
 	t.Helper()
-	prevInterval := checkpointMinInterval
-	checkpointMinInterval = 0
-	t.Cleanup(func() { checkpointMinInterval = prevInterval })
 
 	srv := f.serve()
 	client := NewClient(srv.URL, "xoxp-test")
 	client.disableRateLimits()
 	st := testutil.NewTestStore(t)
 	imp := NewImporter(st, client, "T01")
+	require.Equal(t, defaultCheckpointMinInterval, imp.checkpointMinInterval)
+	imp.checkpointMinInterval = 0
 	return imp, ImportOptions{TeamID: "T01", UserID: "UME", NoMedia: true}
 }
 
+func TestIncludeConversationSelectionPolicy(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		conv Conversation
+		opts ImportOptions
+		want bool
+	}{
+		{name: "default dm", conv: Conversation{IsIM: true}, want: true},
+		{name: "excluded dm", conv: Conversation{IsIM: true}, opts: ImportOptions{ExcludeDMs: true}},
+		{name: "default group dm", conv: Conversation{IsMpim: true}, want: true},
+		{name: "excluded group dm", conv: Conversation{IsMpim: true}, opts: ImportOptions{ExcludeGroupDMs: true}},
+		{name: "included channel", conv: Conversation{Name: "general"}, opts: ImportOptions{IncludeChannels: []string{"general"}}, want: true},
+		{name: "excluded channel", conv: Conversation{Name: "general"}, opts: ImportOptions{ExcludeChannels: []string{"general"}}},
+		{name: "private channel unaffected by dm toggle", conv: Conversation{Name: "private", IsPrivate: true}, opts: ImportOptions{ExcludeDMs: true, ExcludeGroupDMs: true}, want: true},
+		{name: "dm ignores channel names", conv: Conversation{Name: "general", IsIM: true}, opts: ImportOptions{IncludeChannels: []string{"general"}, ExcludeDMs: true}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, includeConversation(&tt.conv, &tt.opts))
+		})
+	}
+}
+
+func TestImportPrivateChannelsAndDMsAreIndependent(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name       string
+		excludeDMs bool
+		want       []string
+	}{
+		{name: "keep DMs", want: []string{"C01", "D01", "G01"}},
+		{name: "public only", excludeDMs: true, want: []string{"C01"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			requirements := require.New(t)
+			f := testWorkspace(t)
+			imp, opts := testImporter(t, f)
+			opts.ExcludePrivateChannels = true
+			opts.ExcludeDMs = tt.excludeDMs
+			opts.ExcludeGroupDMs = tt.excludeDMs
+			_, err := imp.Import(t.Context(), opts)
+			requirements.NoError(err)
+			var ids []string
+			rows, err := imp.store.DB().Query(`SELECT source_conversation_id FROM conversations ORDER BY source_conversation_id`)
+			requirements.NoError(err)
+			defer func() { requirements.NoError(rows.Close()) }()
+			for rows.Next() {
+				var id string
+				requirements.NoError(rows.Scan(&id))
+				ids = append(ids, id)
+			}
+			requirements.NoError(rows.Err())
+			assert.Equal(t, tt.want, ids)
+		})
+	}
+}
+
+func TestExcludedDMRetainsResumeStateAndThreadDebt(t *testing.T) {
+	t.Parallel()
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	f := newFakeSlack(t)
+	f.users = []map[string]any{
+		{"id": "UME", "name": "me", "profile": map[string]any{"email": "me@example.com"}},
+		{"id": "UALICE", "name": "alice", "profile": map[string]any{"email": "alice@example.com"}},
+	}
+	rootTS := ts(0)
+	f.convs = []*fakeConv{{
+		ID: "D01", Kind: "im", IMUser: "UALICE",
+		Msgs: []fakeMsg{{
+			TS: rootTS, User: "UALICE", Text: "root",
+			Replies: []fakeMsg{
+				{TS: ts(1), ThreadTS: rootTS, User: "UME", Text: "reply one"},
+				{TS: ts(2), ThreadTS: rootTS, User: "UALICE", Text: "reply two"},
+			},
+		}},
+	}}
+	imp, opts := testImporter(t, f)
+	limited := opts
+	limited.Limit = 1
+	_, err := imp.Import(context.Background(), limited)
+	requirements.NoError(err)
+	src, err := imp.store.GetOrCreateSource(sourceTypeSlack, "T01:UME")
+	requirements.NoError(err)
+	before := requireResumeState(t, imp, src.ID).Conversations["D01"]
+	requirements.NotNil(before)
+	requirements.NotEmpty(before.PendingThreads)
+	beforeCopy := *before
+	beforeCopy.PendingThreads = append([]PendingThread(nil), before.PendingThreads...)
+
+	f.mu.Lock()
+	f.historyCalls = 0
+	f.mu.Unlock()
+	excluded := opts
+	excluded.ExcludeDMs = true
+	sum, err := imp.Import(context.Background(), excluded)
+	requirements.NoError(err)
+	assertions.Zero(sum.ConversationsProcessed)
+	assertions.Zero(f.historyCalls)
+	after := requireResumeState(t, imp, src.ID).Conversations["D01"]
+	requirements.NotNil(after)
+	assertions.Equal(beforeCopy, *after)
+}
+
+func TestReincludedDMRepaysThreadDebt(t *testing.T) {
+	t.Parallel()
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	f := newFakeSlack(t)
+	f.users = []map[string]any{
+		{"id": "UME", "name": "me", "profile": map[string]any{"email": "me@example.com"}},
+		{"id": "UALICE", "name": "alice", "profile": map[string]any{"email": "alice@example.com"}},
+	}
+	rootTS := ts(0)
+	f.convs = []*fakeConv{{
+		ID: "D01", Kind: "im", IMUser: "UALICE",
+		Msgs: []fakeMsg{{
+			TS: rootTS, User: "UALICE", Text: "root",
+			Replies: []fakeMsg{{TS: ts(1), ThreadTS: rootTS, User: "UME", Text: "reply"}},
+		}},
+	}}
+	imp, opts := testImporter(t, f)
+	limited := opts
+	limited.Limit = 1
+	_, err := imp.Import(context.Background(), limited)
+	requirements.NoError(err)
+
+	excluded := opts
+	excluded.ExcludeDMs = true
+	_, err = imp.Import(context.Background(), excluded)
+	requirements.NoError(err)
+
+	sum, err := imp.Import(context.Background(), opts)
+	requirements.NoError(err)
+	assertions.Equal(1, sum.ConversationsProcessed)
+	src, err := imp.store.GetOrCreateSource(sourceTypeSlack, "T01:UME")
+	requirements.NoError(err)
+	state := requireResumeState(t, imp, src.ID)
+	assertions.Empty(state.Conversations["D01"].PendingThreads)
+	var replies int
+	requirements.NoError(imp.store.DB().QueryRow(imp.store.Rebind(
+		`SELECT COUNT(*) FROM messages WHERE source_message_id = ?`), "D01:"+ts(1)).Scan(&replies))
+	assertions.Equal(1, replies)
+}
+
 func TestImportEndToEnd(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := testWorkspace(t)
@@ -249,6 +457,7 @@ func TestImportEndToEnd(t *testing.T) {
 }
 
 func TestImportUsesNextCursorWhenHasMoreIsFalse(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f := testWorkspace(t)
 	f.forceHasMoreFalse = true
@@ -260,24 +469,8 @@ func TestImportUsesNextCursorWhenHasMoreIsFalse(t *testing.T) {
 		"a non-empty next_cursor must continue history and reply pagination regardless of has_more")
 }
 
-func TestFullRepairReportsUpdatesRatherThanAdds(t *testing.T) {
-	require := require.New(t)
-	f := testWorkspace(t)
-	imp, opts := testImporter(t, f)
-
-	first, err := imp.Import(context.Background(), opts)
-	require.NoError(err)
-	require.Equal(totalWorkspaceMessages, first.MessagesAdded)
-	require.Zero(first.MessagesUpdated)
-
-	opts.Full = true
-	second, err := imp.Import(context.Background(), opts)
-	require.NoError(err)
-	assert.Zero(t, second.MessagesAdded)
-	assert.Equal(t, totalWorkspaceMessages, second.MessagesUpdated)
-}
-
 func TestImportIncrementalCatchesNewMessagesAndLateReplies(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := testWorkspace(t)
@@ -313,6 +506,7 @@ func TestImportIncrementalCatchesNewMessagesAndLateReplies(t *testing.T) {
 }
 
 func TestReplySweepPersistsDirectChatRecipients(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f := testWorkspace(t)
 	imp, opts := testImporter(t, f)
@@ -354,6 +548,7 @@ func TestReplySweepPersistsDirectChatRecipients(t *testing.T) {
 }
 
 func TestImportIncrementalMidWindowFailureDoesNotAdvanceCursor(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f := testWorkspace(t)
 	imp, opts := testImporter(t, f)
@@ -395,6 +590,7 @@ func TestImportIncrementalMidWindowFailureDoesNotAdvanceCursor(t *testing.T) {
 }
 
 func TestBackfillThreadFetchFailureParksDrainDebt(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := testWorkspace(t)
@@ -432,6 +628,7 @@ func TestBackfillThreadFetchFailureParksDrainDebt(t *testing.T) {
 }
 
 func TestImportHistoryFailureLeavesConversationResumable(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := testWorkspace(t)
@@ -459,28 +656,30 @@ func TestImportHistoryFailureLeavesConversationResumable(t *testing.T) {
 }
 
 func TestImportInterruptResumesWithoutDuplicates(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := testWorkspace(t)
 	imp, opts := testImporter(t, f)
 	st := imp.store
 
-	// Cancel partway through the first run: as soon as the first history
-	// page has been served, mid-conversation-walk.
+	// Cancel partway through the first run when the fake serves the second
+	// history page, mid-conversation-walk.
 	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		for {
-			f.mu.Lock()
-			served := f.historyCalls > 0
-			f.mu.Unlock()
-			if served {
-				cancel()
-				return
-			}
-			time.Sleep(time.Millisecond)
+	defer cancel()
+	historyCalls := 0
+	f.mu.Lock()
+	f.onHistory = func(string) {
+		historyCalls++
+		if historyCalls == 2 {
+			cancel()
 		}
-	}()
+	}
+	f.mu.Unlock()
 	_, _ = imp.Import(ctx, opts)
+	f.mu.Lock()
+	f.onHistory = nil
+	f.mu.Unlock()
 
 	// Resume to completion: every message exactly once.
 	_, err := imp.Import(context.Background(), opts)
@@ -493,14 +692,17 @@ func TestImportInterruptResumesWithoutDuplicates(t *testing.T) {
 }
 
 func TestImportFullReUpsertsInPlace(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := testWorkspace(t)
 	imp, opts := testImporter(t, f)
 	st := imp.store
 
-	_, err := imp.Import(context.Background(), opts)
+	first, err := imp.Import(context.Background(), opts)
 	require.NoError(err)
+	require.Equal(totalWorkspaceMessages, first.MessagesAdded)
+	require.Zero(first.MessagesUpdated)
 
 	// An old message is edited at the source; only --full re-walks it.
 	f.mu.Lock()
@@ -509,8 +711,10 @@ func TestImportFullReUpsertsInPlace(t *testing.T) {
 
 	full := opts
 	full.Full = true
-	_, err = imp.Import(context.Background(), full)
+	second, err := imp.Import(context.Background(), full)
 	require.NoError(err)
+	assert.Zero(second.MessagesAdded)
+	assert.Equal(totalWorkspaceMessages, second.MessagesUpdated)
 
 	var body string
 	require.NoError(st.DB().QueryRow(st.Rebind(`
@@ -523,6 +727,7 @@ func TestImportFullReUpsertsInPlace(t *testing.T) {
 }
 
 func TestImportLimitLeavesBackfillResumable(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := testWorkspace(t)
@@ -539,7 +744,7 @@ func TestImportLimitLeavesBackfillResumable(t *testing.T) {
 	require.NoError(err)
 	var partial int
 	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages WHERE message_type='slack'`).Scan(&partial))
-	assert.Less(partial, totalWorkspaceMessages)
+	assert.Less(partial, 11, "limited run must stop before all top-level messages are archived")
 
 	// An uncapped run completes the backfill: every message exactly once.
 	_, err = imp.Import(context.Background(), opts)
@@ -573,6 +778,7 @@ func oldThreadWorkspace(t *testing.T) (*fakeSlack, string) {
 }
 
 func TestSweepFindsLateReplyToAncientThread(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f, rootTS := oldThreadWorkspace(t)
 	imp, opts := testImporter(t, f)
@@ -606,6 +812,7 @@ func TestSweepFindsLateReplyToAncientThread(t *testing.T) {
 // boundary may advance (the debt entry owns recovery), the run stays
 // partial, and the next run's drain-first step archives the reply.
 func TestSweepFetchFailureParksAsDrainDebt(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f, rootTS := oldThreadWorkspace(t)
@@ -648,6 +855,7 @@ func TestSweepFetchFailureParksAsDrainDebt(t *testing.T) {
 }
 
 func TestSweepOverlapRecoversLateIndexedReplies(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f, rootTS := oldThreadWorkspace(t)
 	imp, opts := testImporter(t, f)
@@ -693,6 +901,7 @@ func TestSweepOverlapRecoversLateIndexedReplies(t *testing.T) {
 }
 
 func TestCanonicalThreadAuditRecoversReplyNeverServedBySearch(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f, rootTS := oldThreadWorkspace(t)
 	imp, opts := testImporter(t, f)
@@ -729,6 +938,7 @@ func TestCanonicalThreadAuditRecoversReplyNeverServedBySearch(t *testing.T) {
 }
 
 func TestWindowOverlapAbsorbsClockSkew(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f := testWorkspace(t)
 	imp, opts := testImporter(t, f)
@@ -758,6 +968,7 @@ func TestWindowOverlapAbsorbsClockSkew(t *testing.T) {
 }
 
 func TestLoadResumeStateNewestBlobWins(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := testWorkspace(t)
@@ -801,6 +1012,7 @@ func TestLoadResumeStateNewestBlobWins(t *testing.T) {
 }
 
 func TestImportRejectsMalformedNewestResumeState(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f := testWorkspace(t)
 	imp, opts := testImporter(t, f)
@@ -819,6 +1031,7 @@ func TestImportRejectsMalformedNewestResumeState(t *testing.T) {
 }
 
 func TestFullImportRepairsMalformedNewestResumeState(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name string
 		blob string
@@ -854,6 +1067,7 @@ func TestFullImportRepairsMalformedNewestResumeState(t *testing.T) {
 }
 
 func TestLoadResumeStateSurfacesDatabaseReadFailure(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := testWorkspace(t)
@@ -864,12 +1078,13 @@ func TestLoadResumeStateSurfacesDatabaseReadFailure(t *testing.T) {
 	require.NoError(err)
 	require.NoError(st.DB().Close())
 
-	_, err = imp.loadResumeState(src.ID)
+	_, err = imp.loadResumeState(t.Context(), src.ID)
 	require.Error(err)
 	assert.ErrorContains(err, "read latest Slack checkpoint")
 }
 
 func TestImportRestartsExpiredPersistedWindowCursorAtPinnedBound(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := newFakeSlack(t)
@@ -920,6 +1135,7 @@ func TestImportRestartsExpiredPersistedWindowCursorAtPinnedBound(t *testing.T) {
 }
 
 func TestImportRestartsExpiredPersistedCatchUpCursorAtPinnedBound(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := newFakeSlack(t)
@@ -971,6 +1187,7 @@ func TestImportRestartsExpiredPersistedCatchUpCursorAtPinnedBound(t *testing.T) 
 }
 
 func TestImportSurfacesInvalidCursorWithoutPersistedPageCursor(t *testing.T) {
+	t.Parallel()
 	f := newFakeSlack(t)
 	f.users = []map[string]any{{
 		"id": "UME", "name": "me", "real_name": "Test User",
@@ -998,12 +1215,13 @@ func mustMarshal(t *testing.T, s *SyncState) string {
 
 func requireResumeState(t *testing.T, imp *Importer, sourceID int64) *SyncState {
 	t.Helper()
-	state, err := imp.loadResumeState(sourceID)
+	state, err := imp.loadResumeState(t.Context(), sourceID)
 	require.NoError(t, err)
 	return state
 }
 
 func TestBackfillMediaReportsInvalidRaw(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f := testWorkspace(t)
 	f.conv("C01").Msgs[6].Files = []map[string]any{
@@ -1011,14 +1229,12 @@ func TestBackfillMediaReportsInvalidRaw(t *testing.T) {
 			"url_private": "https://files.slack.com/files-pri/T01-F_RAWBAD/b.png",
 			"permalink":   "https://testers.slack.com/files/F_RAWBAD"},
 	}
-	prevInterval := checkpointMinInterval
-	checkpointMinInterval = 0
-	t.Cleanup(func() { checkpointMinInterval = prevInterval })
 	srv := f.serve()
 	client := NewClient(srv.URL, "xoxp-test")
 	client.disableRateLimits()
 	st := testutil.NewTestStore(t)
 	imp := NewImporter(st, client, "T01")
+	imp.checkpointMinInterval = 0
 
 	// Import with media deferred: the file becomes a pending marker.
 	opts := ImportOptions{TeamID: "T01", UserID: "UME", NoMedia: true, AttachmentsDir: t.TempDir()}
@@ -1047,6 +1263,7 @@ func TestBackfillMediaReportsInvalidRaw(t *testing.T) {
 }
 
 func TestBackfillMediaReportsMissingRaw(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f := testWorkspace(t)
 	f.conv("C01").Msgs[6].Files = []map[string]any{
@@ -1075,6 +1292,7 @@ func TestBackfillMediaReportsMissingRaw(t *testing.T) {
 }
 
 func TestSweepDebtSurvivesDeletedAnchorReply(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f, rootTS := oldThreadWorkspace(t)
 	imp, opts := testImporter(t, f)
@@ -1130,6 +1348,7 @@ func TestSweepDebtSurvivesDeletedAnchorReply(t *testing.T) {
 }
 
 func TestGapRecoveryResetsInFlightCatchUp(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f := newFakeSlack(t)
 	f.users = []map[string]any{
@@ -1205,6 +1424,7 @@ func TestGapRecoveryResetsInFlightCatchUp(t *testing.T) {
 }
 
 func TestFileWithoutPermalinkKeepsPendingMarker(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f := testWorkspace(t)
 	// Slack serves a hosted file with NO permalink: the marker row must
@@ -1214,15 +1434,13 @@ func TestFileWithoutPermalinkKeepsPendingMarker(t *testing.T) {
 		{"id": "F_NOPERM", "name": "n.png", "mimetype": "image/png", "size": 5,
 			"url_private": "https://files.slack.com/files-pri/T01-F_NOPERM/n.png"},
 	}
-	prevInterval := checkpointMinInterval
-	checkpointMinInterval = 0
-	t.Cleanup(func() { checkpointMinInterval = prevInterval })
 	srv := f.serve()
 	client := NewClient(srv.URL, "xoxp-test")
 	client.disableRateLimits()
 	client.mediaTransport = &recordingTransport{body: "png07"}
 	st := testutil.NewTestStore(t)
 	imp := NewImporter(st, client, "T01")
+	imp.checkpointMinInterval = 0
 
 	opts := ImportOptions{TeamID: "T01", UserID: "UME", NoMedia: true, AttachmentsDir: t.TempDir()}
 	_, err := imp.Import(context.Background(), opts)
@@ -1242,6 +1460,7 @@ func TestFileWithoutPermalinkKeepsPendingMarker(t *testing.T) {
 }
 
 func TestCatchUpDebtNotStarvedBySaturatedWindows(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f := newFakeSlack(t)
 	f.users = []map[string]any{
@@ -1296,6 +1515,7 @@ func TestCatchUpDebtNotStarvedBySaturatedWindows(t *testing.T) {
 }
 
 func TestCrashBeforeSweepStampsCoverage(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f := testWorkspace(t)
 	imp, opts := testImporter(t, f)
@@ -1306,11 +1526,11 @@ func TestCrashBeforeSweepStampsCoverage(t *testing.T) {
 	// no adoption happens. The completing walk must have stamped its own
 	// coverage: later runs advance Cursor with every window, and a
 	// boundary guessed from Cursor would sit past the interval.
-	checkpointMinInterval = time.Hour
+	imp.checkpointMinInterval = time.Hour
 	f.mu.Lock()
 	f.onHistory = func(channelID string) {
 		if channelID == "D01" {
-			_, _ = st.DB().Exec(`DROP TABLE reactions`)
+			_ = dropReactionsTable(st.DB())
 		}
 	}
 	f.mu.Unlock()
@@ -1342,6 +1562,7 @@ func TestCrashBeforeSweepStampsCoverage(t *testing.T) {
 }
 
 func TestLegacyStampLessStateTriggersCatchUp(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f, rootTS := oldThreadWorkspace(t)
 	imp, opts := testImporter(t, f)
@@ -1382,6 +1603,7 @@ func TestLegacyStampLessStateTriggersCatchUp(t *testing.T) {
 }
 
 func TestMaintenanceRepairsReplyEdits(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f, rootTS := oldThreadWorkspace(t)
@@ -1418,6 +1640,7 @@ func TestMaintenanceRepairsReplyEdits(t *testing.T) {
 }
 
 func TestMaintenanceNoThreadsRepairsOnlyTopLevelMessages(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := testWorkspace(t)
@@ -1453,6 +1676,7 @@ func TestMaintenanceNoThreadsRepairsOnlyTopLevelMessages(t *testing.T) {
 }
 
 func TestFirstReplyToUnthreadedMessageRecoveredByCatchUp(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f := newFakeSlack(t)
 	f.users = []map[string]any{
@@ -1502,6 +1726,7 @@ func TestFirstReplyToUnthreadedMessageRecoveredByCatchUp(t *testing.T) {
 }
 
 func TestFailedRunPersistsFinalState(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := testWorkspace(t)
@@ -1519,14 +1744,14 @@ func TestFailedRunPersistsFinalState(t *testing.T) {
 	// suppressed, the ONLY record of the first conversation's completed
 	// window is the failure-path checkpoint — a plain FailSync would
 	// resume from the pre-run baseline and silently discard that progress.
-	checkpointMinInterval = time.Hour
+	imp.checkpointMinInterval = time.Hour
 	okMsg, badMsg := tsFresh(0), tsFresh(1)
 	f.mu.Lock()
 	f.conv("C01").Msgs = append(f.conv("C01").Msgs, fakeMsg{TS: okMsg, User: "UALICE", Text: "fine"})
 	f.conv("D01").Msgs = append(f.conv("D01").Msgs, fakeMsg{TS: badMsg, User: "UALICE", Text: "plain"})
 	f.onHistory = func(channelID string) {
 		if channelID == "D01" {
-			_, _ = st.DB().Exec(`DROP TABLE reactions`)
+			_ = dropReactionsTable(st.DB())
 		}
 	}
 	f.mu.Unlock()
@@ -1552,6 +1777,7 @@ func TestFailedRunPersistsFinalState(t *testing.T) {
 }
 
 func TestInitialWalkPinPersistsAcrossResumedRuns(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f, rootTS := oldThreadWorkspace(t)
 	imp, opts := testImporter(t, f)
@@ -1592,6 +1818,7 @@ func TestInitialWalkPinPersistsAcrossResumedRuns(t *testing.T) {
 }
 
 func TestStoreWriteFailureHoldsCursorAndResumes(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f := testWorkspace(t)
 	imp, opts := testImporter(t, f)
@@ -1609,7 +1836,7 @@ func TestStoreWriteFailureHoldsCursorAndResumes(t *testing.T) {
 	f.conv("C01").Msgs = append(f.conv("C01").Msgs, fakeMsg{TS: fresh, User: "UALICE", Text: "reacted",
 		Reactions: []map[string]any{{"name": "tada", "users": []string{"UME", "UBOB"}, "count": 2}}})
 	f.mu.Unlock()
-	_, err = st.DB().Exec(`DROP TABLE reactions`)
+	err = dropReactionsTable(st.DB())
 	require.NoError(err)
 
 	imp.now = func() time.Time { return time.Now().Add(time.Minute) }
@@ -1633,6 +1860,7 @@ func TestStoreWriteFailureHoldsCursorAndResumes(t *testing.T) {
 }
 
 func TestAttachmentRowFailureFailsRun(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f := testWorkspace(t)
 	imp, opts := testImporter(t, f)
@@ -1706,6 +1934,7 @@ func installAttachmentInsertFailure(t *testing.T, st *store.Store) func() {
 }
 
 func TestMembershipFetchFailureMarksRunPartial(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f := testWorkspace(t)
 	f.failMembers["C01"] = true
@@ -1724,6 +1953,7 @@ func TestMembershipFetchFailureMarksRunPartial(t *testing.T) {
 }
 
 func TestMPIMMembershipFailureHoldsHistoryUntilRecipientsAvailable(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := testWorkspace(t)
@@ -1760,6 +1990,7 @@ func TestMPIMMembershipFailureHoldsHistoryUntilRecipientsAvailable(t *testing.T)
 }
 
 func TestLimitedSweepDrainsBigTailAcrossRuns(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f, rootTS := oldThreadWorkspace(t)
@@ -1811,6 +2042,7 @@ func TestLimitedSweepDrainsBigTailAcrossRuns(t *testing.T) {
 }
 
 func TestRepairCompletesDespiteDepartedConversations(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := testWorkspace(t)
@@ -1846,6 +2078,7 @@ func TestRepairCompletesDespiteDepartedConversations(t *testing.T) {
 }
 
 func TestLimitOneSweepConverges(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f, rootTS := oldThreadWorkspace(t)
 	imp, opts := testImporter(t, f)
@@ -1877,6 +2110,7 @@ func TestLimitOneSweepConverges(t *testing.T) {
 }
 
 func TestFullRepairSurvivesInterruption(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := testWorkspace(t)
@@ -1887,9 +2121,17 @@ func TestFullRepairSurvivesInterruption(t *testing.T) {
 	require.NoError(err)
 
 	// An old message is edited at the source; --full is the repair path.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	historyCalls := 0
 	f.mu.Lock()
 	f.conv("C01").Msgs[0].Text = "hello 0 (repaired)"
-	baseline := f.historyCalls
+	f.onHistory = func(string) {
+		historyCalls++
+		if historyCalls == 2 {
+			cancel()
+		}
+	}
 	f.mu.Unlock()
 
 	// The repair run dies mid-walk. Its generation-stamped checkpoint must
@@ -1898,20 +2140,10 @@ func TestFullRepairSurvivesInterruption(t *testing.T) {
 	// abandon the repair half-done.
 	full := opts
 	full.Full = true
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		for {
-			f.mu.Lock()
-			served := f.historyCalls > baseline
-			f.mu.Unlock()
-			if served {
-				cancel()
-				return
-			}
-			time.Sleep(time.Millisecond)
-		}
-	}()
 	_, _ = imp.Import(ctx, full)
+	f.mu.Lock()
+	f.onHistory = nil
+	f.mu.Unlock()
 
 	// A PLAIN run continues (and completes) the repair session.
 	_, err = imp.Import(context.Background(), opts)
@@ -1934,6 +2166,7 @@ func TestFullRepairSurvivesInterruption(t *testing.T) {
 }
 
 func TestScopedFullRepairConverges(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := testWorkspace(t)
@@ -1970,6 +2203,7 @@ func TestScopedFullRepairConverges(t *testing.T) {
 }
 
 func TestSweepProcessesUnarchivedParent(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f, _ := oldThreadWorkspace(t)
 	imp, opts := testImporter(t, f)
@@ -2004,6 +2238,7 @@ func TestSweepProcessesUnarchivedParent(t *testing.T) {
 }
 
 func TestSoloSweepEntryReanchorsToTrueRoot(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f, _ := oldThreadWorkspace(t)
 	imp, opts := testImporter(t, f)
@@ -2041,6 +2276,7 @@ func TestSoloSweepEntryReanchorsToTrueRoot(t *testing.T) {
 }
 
 func TestSweepFetchDoesNotRefreshArchivedParent(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f, rootTS := oldThreadWorkspace(t)
@@ -2077,6 +2313,7 @@ func TestSweepFetchDoesNotRefreshArchivedParent(t *testing.T) {
 }
 
 func TestSweepTruncatedDayFailsOnceAndConvergesViaCatchUp(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f, rootTS := oldThreadWorkspace(t)
@@ -2134,6 +2371,7 @@ func TestSweepTruncatedDayFailsOnceAndConvergesViaCatchUp(t *testing.T) {
 }
 
 func TestSweepLimitOneConvergesPastTruncatedDayOverlap(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f, rootTS := oldThreadWorkspace(t)
@@ -2210,6 +2448,7 @@ func TestSweepLimitOneConvergesPastTruncatedDayOverlap(t *testing.T) {
 }
 
 func TestTruncatedSweepDuringRepairUnwedgesSession(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f, rootTS := oldThreadWorkspace(t)
@@ -2260,6 +2499,7 @@ func TestTruncatedSweepDuringRepairUnwedgesSession(t *testing.T) {
 }
 
 func TestSweepRecoversGapForReIncludedChannel(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f, rootTS := oldThreadWorkspace(t)
 	// A second channel that stays included throughout, so sweeps keep
@@ -2308,48 +2548,8 @@ func TestSweepRecoversGapForReIncludedChannel(t *testing.T) {
 	assert.Equal(t, 1, n, "a reply created while its channel was excluded must be recovered on re-entry")
 }
 
-func TestImportLimitBoundsThreadReplies(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	f := newFakeSlack(t)
-	f.users = []map[string]any{
-		{"id": "UME", "name": "me", "profile": map[string]any{"email": "me@example.com"}},
-	}
-	busyRoot := fakeMsg{TS: ts(0), User: "UME", Text: "busy root"}
-	for i := range 12 {
-		busyRoot.Replies = append(busyRoot.Replies,
-			fakeMsg{TS: ts(i + 1), ThreadTS: busyRoot.TS, User: "UME", Text: "reply " + strconv.Itoa(i)})
-	}
-	f.convs = []*fakeConv{{
-		ID: "C20", Name: "busy", Kind: "public", Members: []string{"UME"},
-		Msgs: []fakeMsg{busyRoot},
-	}}
-	imp, opts := testImporter(t, f)
-	st := imp.store
-
-	// One discovered thread must not blow through the budget: its
-	// reply_count forecast charges the run at recording time, and the drain
-	// fetches on budget-sized pages, parking the remainder as durable debt.
-	limited := opts
-	limited.Limit = 3
-	_, err := imp.Import(context.Background(), limited)
-	require.NoError(err)
-	var partial int
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages WHERE message_type='slack'`).Scan(&partial))
-	assert.Positive(partial)
-	assert.LessOrEqual(partial, 4, "--limit 3 must bound thread replies, not just top-level history")
-
-	// The unlimited run completes the thread: every message exactly once.
-	_, err = imp.Import(context.Background(), opts)
-	require.NoError(err)
-	var total, distinct int
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages WHERE message_type='slack'`).Scan(&total))
-	require.NoError(st.DB().QueryRow(`SELECT COUNT(DISTINCT source_message_id) FROM messages WHERE message_type='slack'`).Scan(&distinct))
-	assert.Equal(13, total, "resumed runs must recover the budget-clipped replies")
-	assert.Equal(distinct, total)
-}
-
 func TestStandingLimitConvergesThroughThreadDebt(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := newFakeSlack(t)
@@ -2389,7 +2589,63 @@ func TestStandingLimitConvergesThroughThreadDebt(t *testing.T) {
 	assert.Equal(distinct, total)
 }
 
+func TestImportLimitBoundsThreadRepliesThenConverges(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newFakeSlack(t)
+	f.users = []map[string]any{
+		{"id": "UME", "name": "me", "profile": map[string]any{"email": "me@example.com"}},
+	}
+	// The root has more replies than the standing limit, so the drain
+	// must carry the thread across runs.
+	busyRoot := fakeMsg{TS: ts(0), User: "UME", Text: "busy root"}
+	for i := range 12 {
+		busyRoot.Replies = append(busyRoot.Replies,
+			fakeMsg{TS: ts(i + 1), ThreadTS: busyRoot.TS, User: "UME", Text: "reply " + strconv.Itoa(i)})
+	}
+	conv := &fakeConv{ID: "C30", Name: "steady", Kind: "public", Members: []string{"UME"}, Msgs: []fakeMsg{busyRoot}}
+	f.convs = []*fakeConv{conv}
+	imp, opts := testImporter(t, f)
+	st := imp.store
+	now := tsBase.Add(time.Hour)
+	imp.now = func() time.Time { return now }
+
+	// One discovered thread must stay within the reply budget.
+	limited := opts
+	limited.Limit = 3
+	_, err := imp.Import(context.Background(), limited)
+	require.NoError(err)
+	var partial int
+	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages WHERE message_type='slack'`).Scan(&partial))
+	assert.Positive(partial)
+	assert.LessOrEqual(partial, 4, "--limit 3 must bound thread replies, not just top-level history")
+
+	// Newer top-level messages must also be recovered while replies drain.
+	f.mu.Lock()
+	for i := range 5 {
+		conv.Msgs = append(conv.Msgs, fakeMsg{TS: ts(100 + i), User: "UME", Text: "top " + strconv.Itoa(i)})
+	}
+	f.mu.Unlock()
+	now = now.Add(time.Hour)
+
+	// A standing --limit cron must converge to a complete archive BY
+	// ITSELF: each run makes durable progress (history pages, then reply
+	// drain resumed from the per-thread drained-to ts) — no unlimited run
+	// required, no stall.
+	for range 12 {
+		_, err := imp.Import(context.Background(), limited)
+		require.NoError(err)
+	}
+	var total, distinct int
+	require.NoError(st.DB().QueryRow(`SELECT COUNT(*) FROM messages WHERE message_type='slack'`).Scan(&total))
+	require.NoError(st.DB().QueryRow(`SELECT COUNT(DISTINCT source_message_id) FROM messages WHERE message_type='slack'`).Scan(&distinct))
+	assert.Equal(18, total, "repeated limited runs must drain the whole archive, thread included")
+	assert.Equal(distinct, total)
+}
+
 func TestGapCatchUpCoversPostBackfillRoots(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f, rootTS := oldThreadWorkspace(t)
 	// A legacy G-prefixed private channel (name-filterable, but outside the
@@ -2444,39 +2700,8 @@ func TestGapCatchUpCoversPostBackfillRoots(t *testing.T) {
 	require.Equal(1, n, "gap recovery must anchor threads rooted after the backfill pin")
 }
 
-func TestStandingLimitSweepsLateReplies(t *testing.T) {
-	require := require.New(t)
-	f, rootTS := oldThreadWorkspace(t)
-	imp, opts := testImporter(t, f)
-	st := imp.store
-
-	// A standing --limit schedule must still discover replies: the sweep
-	// participates in limited runs with a work budget instead of being
-	// skipped outright (which would mean a permanently-capped sync NEVER
-	// archives another reply).
-	limited := opts
-	limited.Limit = 6
-	for range 4 {
-		_, err := imp.Import(context.Background(), limited)
-		require.NoError(err)
-	}
-	lateReply := tsFresh(0)
-	f.mu.Lock()
-	root := f.conv("C09").findRoot(rootTS)
-	root.Replies = append(root.Replies, fakeMsg{TS: lateReply, ThreadTS: rootTS, User: "UME", Text: "late reply"})
-	f.mu.Unlock()
-
-	for range 4 {
-		_, err := imp.Import(context.Background(), limited)
-		require.NoError(err)
-	}
-	var n int
-	require.NoError(st.DB().QueryRow(st.Rebind(
-		`SELECT COUNT(*) FROM messages WHERE source_message_id = ?`), "C09:"+lateReply).Scan(&n))
-	require.Equal(1, n, "limited runs must sweep in late replies — no unlimited run required")
-}
-
 func TestStandingLimitPaysCatchUpDebt(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := newFakeSlack(t)
@@ -2525,6 +2750,7 @@ func TestStandingLimitPaysCatchUpDebt(t *testing.T) {
 }
 
 func TestCatchUpClearsDebtForGoneConversation(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := testWorkspace(t)
@@ -2552,6 +2778,7 @@ func TestCatchUpClearsDebtForGoneConversation(t *testing.T) {
 }
 
 func TestSweepDayBoundariesFollowHistoricalDST(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	ny, err := time.LoadLocation("America/New_York")
@@ -2590,6 +2817,7 @@ func TestSweepDayBoundariesFollowHistoricalDST(t *testing.T) {
 }
 
 func TestSweepSkipsNotDoneConversations(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f, rootTS := oldThreadWorkspace(t)
@@ -2638,6 +2866,7 @@ func TestSweepSkipsNotDoneConversations(t *testing.T) {
 }
 
 func TestImportLimitBoundsProcessedMessages(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := testWorkspace(t)
@@ -2659,6 +2888,7 @@ func TestImportLimitBoundsProcessedMessages(t *testing.T) {
 }
 
 func TestImportLimitedRunsDrainIncrementalBacklog(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f := testWorkspace(t)
 	imp, opts := testImporter(t, f)
@@ -2696,6 +2926,7 @@ func TestImportLimitedRunsDrainIncrementalBacklog(t *testing.T) {
 }
 
 func TestImportDiscoversFirstReplyToOlderMessage(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f, rootTS := oldThreadWorkspace(t)
 	// The 10-day-old message starts with NO replies: it is archived as a
@@ -2726,6 +2957,7 @@ func TestImportDiscoversFirstReplyToOlderMessage(t *testing.T) {
 }
 
 func TestMaintenanceRescanIsExplicit(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := testWorkspace(t)
@@ -2763,6 +2995,7 @@ func TestMaintenanceRescanIsExplicit(t *testing.T) {
 }
 
 func TestImportGoneConversationIsSkippedNotFatal(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := testWorkspace(t)
@@ -2786,6 +3019,7 @@ func TestImportGoneConversationIsSkippedNotFatal(t *testing.T) {
 }
 
 func TestImportChannelFilters(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := testWorkspace(t)
@@ -2800,10 +3034,108 @@ func TestImportChannelFilters(t *testing.T) {
 	require.NoError(st.DB().QueryRow(st.Rebind(`
 		SELECT COUNT(*) FROM conversations WHERE source_conversation_id = ?`), "C01").Scan(&n))
 	assert.Zero(n, "excluded channel must not be archived")
-	// DMs are never filtered.
+	// Name filters never apply to DMs or group DMs.
 	require.NoError(st.DB().QueryRow(st.Rebind(`
 		SELECT COUNT(*) FROM conversations WHERE source_conversation_id = ?`), "D01").Scan(&n))
 	assert.Equal(1, n)
+	require.NoError(st.DB().QueryRow(st.Rebind(`
+		SELECT COUNT(*) FROM conversations WHERE source_conversation_id = ?`), "G01").Scan(&n))
+	assert.Equal(1, n)
+}
+
+func TestSweepRecoversGapForReEnabledDM(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	f := newFakeSlack(t)
+	f.users = []map[string]any{
+		{"id": "UME", "name": "me", "profile": map[string]any{"email": "me@example.com"}},
+		{"id": "UALICE", "name": "alice", "profile": map[string]any{"email": "alice@example.com"}},
+	}
+	rootTS := ts(-14400)
+	f.convs = []*fakeConv{
+		{ID: "D09", Kind: "im", IMUser: "UALICE", Msgs: []fakeMsg{{
+			TS: rootTS, User: "UALICE", Text: "ancient root",
+			Replies: []fakeMsg{{TS: ts(-14390), ThreadTS: rootTS, User: "UME", Text: "ancient reply"}},
+		}, {TS: ts(0), User: "UALICE", Text: "recent chatter"}}},
+		{ID: "C11", Name: "keep", Kind: "public", Members: []string{"UME"},
+			Msgs: []fakeMsg{{TS: ts(1), User: "UME", Text: "keep hi"}}},
+	}
+	imp, opts := testImporter(t, f)
+	sum, err := imp.Import(context.Background(), opts)
+	require.NoError(err)
+
+	gapReply := tsFresh(0)
+	f.mu.Lock()
+	f.conv("D09").findRoot(rootTS).Replies = append(f.conv("D09").findRoot(rootTS).Replies,
+		fakeMsg{TS: gapReply, ThreadTS: rootTS, User: "UME", Text: "reply while excluded"})
+	f.mu.Unlock()
+
+	imp.now = func() time.Time { return time.Now().Add(time.Hour) }
+	excluded := opts
+	excluded.ExcludeDMs = true
+	_, err = imp.Import(context.Background(), excluded)
+	require.NoError(err)
+	state := requireResumeState(t, imp, sum.SourceID)
+	require.True(tsLess(gapReply, state.SweepWatermark),
+		"test setup: the watermark must have certified past the excluded DM reply")
+	var n int
+	require.NoError(imp.store.DB().QueryRow(imp.store.Rebind(
+		`SELECT COUNT(*) FROM messages WHERE source_message_id = ?`), "D09:"+gapReply).Scan(&n))
+	require.Zero(n, "the reply must not be archived while its DM is excluded")
+
+	// The first run's sweep flags the gap; the next run performs the catch-up walk.
+	imp.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	_, err = imp.Import(context.Background(), opts)
+	require.NoError(err)
+	imp.now = func() time.Time { return time.Now().Add(3 * time.Hour) }
+	_, err = imp.Import(context.Background(), opts)
+	require.NoError(err)
+	require.NoError(imp.store.DB().QueryRow(imp.store.Rebind(
+		`SELECT COUNT(*) FROM messages WHERE source_message_id = ?`), "D09:"+gapReply).Scan(&n))
+	assert.Equal(1, n, "a reply created while a DM was excluded must be recovered on re-entry")
+}
+
+func TestFullRepairWithExcludedDMsCoversSelectedConversations(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	assert := assert.New(t)
+	f := testWorkspace(t)
+	historyCalls := map[string]int{}
+	f.onHistory = func(channelID string) { historyCalls[channelID]++ }
+	imp, opts := testImporter(t, f)
+	_, err := imp.Import(context.Background(), opts)
+	require.NoError(err)
+	var beforeMessages int
+	require.NoError(imp.store.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&beforeMessages))
+
+	full := opts
+	full.Full = true
+	full.ExcludeDMs = true
+	historyCalls["D01"] = 0
+
+	sum, err := imp.Import(context.Background(), full)
+	require.NoError(err)
+	assert.Equal(3, sum.ConversationsProcessed)
+	assert.Zero(historyCalls["D01"])
+	var afterExcludedMessages int
+	require.NoError(imp.store.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&afterExcludedMessages))
+	assert.Equal(beforeMessages, afterExcludedMessages, "full repair must retain archived messages for an excluded DM")
+
+	state := requireResumeState(t, imp, sum.SourceID)
+	assert.False(state.RepairPending)
+	assert.NotContains(state.Conversations, "D01")
+	for _, id := range []string{"C01", "C02", "G01"} {
+		assert.True(state.Conversations[id].Done, id)
+	}
+
+	_, err = imp.Import(context.Background(), opts)
+	require.NoError(err)
+	state = requireResumeState(t, imp, sum.SourceID)
+	assert.Contains(state.Conversations, "D01")
+	var afterReentryMessages int
+	require.NoError(imp.store.DB().QueryRow(`SELECT COUNT(*) FROM messages`).Scan(&afterReentryMessages))
+	assert.Equal(beforeMessages, afterReentryMessages, "re-entry must not duplicate archived messages")
 }
 
 // tsAgo renders a Slack ts for a moment shortly in the past — close enough
@@ -2835,6 +3167,7 @@ func tombstoneWorkspace(t *testing.T) (*fakeSlack, string, string) {
 }
 
 func TestTombstoneNeverOverwritesArchivedOriginal(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f, rootTS, _ := tombstoneWorkspace(t)
@@ -2894,6 +3227,7 @@ func TestTombstoneNeverOverwritesArchivedOriginal(t *testing.T) {
 }
 
 func TestTombstonePlaceholderKeepsOrphanedReplies(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f, rootTS, replyTS := tombstoneWorkspace(t)
@@ -2933,6 +3267,7 @@ func TestTombstonePlaceholderKeepsOrphanedReplies(t *testing.T) {
 }
 
 func TestTombstonePlaceholderRetriesIncompletePersistence(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f, rootTS, _ := tombstoneWorkspace(t)
@@ -2943,7 +3278,7 @@ func TestTombstonePlaceholderRetriesIncompletePersistence(t *testing.T) {
 	// Break the final auxiliary snapshot write. The message row and body have
 	// already been upserted, but the tombstone is not complete and must remain
 	// eligible for retry.
-	_, err := st.DB().Exec(`DROP TABLE reactions`)
+	err := dropReactionsTable(st.DB())
 	require.NoError(err)
 	_, err = imp.Import(context.Background(), opts)
 	require.Error(err, "the auxiliary store failure must abort the run")
@@ -2973,6 +3308,7 @@ func TestTombstonePlaceholderRetriesIncompletePersistence(t *testing.T) {
 }
 
 func TestMessageReappearanceClearsSlackTombstone(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	f, rootTS, _ := tombstoneWorkspace(t)
 	imp, opts := testImporter(t, f)
@@ -2994,6 +3330,7 @@ func TestMessageReappearanceClearsSlackTombstone(t *testing.T) {
 }
 
 func TestParentArchivedRequiresRawCompletionMarker(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := newFakeSlack(t)
@@ -3012,24 +3349,25 @@ func TestParentArchivedRequiresRawCompletionMarker(t *testing.T) {
 	})
 	require.NoError(err)
 
-	archived, err := imp.parentArchived(src.ID, "C80", "123.000100")
+	archived, err := imp.parentArchived(t.Context(), src.ID, "C80", "123.000100")
 	require.NoError(err)
 	assert.False(archived,
 		"a partial row must remain eligible when a replies response re-serves its parent")
 
 	require.NoError(st.UpsertMessageRawWithFormat(messageID, []byte(`{"type":"message"}`), "slack_json"))
-	archived, err = imp.parentArchived(src.ID, "C80", "123.000100")
+	archived, err = imp.parentArchived(t.Context(), src.ID, "C80", "123.000100")
 	require.NoError(err)
 	assert.True(archived,
 		"row plus raw archive is a complete parent snapshot")
 
 	_, err = st.DB().Exec(`DROP TABLE message_raw`)
 	require.NoError(err)
-	_, err = imp.parentArchived(src.ID, "C80", "123.000100")
+	_, err = imp.parentArchived(t.Context(), src.ID, "C80", "123.000100")
 	require.Error(err, "a failed completion probe must hold thread debt instead of refreshing the parent")
 }
 
 func TestLateIndexedReplyMovesParkedDrainBackward(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f, rootTS := oldThreadWorkspace(t)
@@ -3084,6 +3422,7 @@ func TestLateIndexedReplyMovesParkedDrainBackward(t *testing.T) {
 }
 
 func TestCatchUpFullDrainOverridesParkedTailSeed(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := newFakeSlack(t)
@@ -3154,11 +3493,17 @@ func TestCatchUpFullDrainOverridesParkedTailSeed(t *testing.T) {
 }
 
 func TestSweepSmallPagesBeyondWalkBoundRecordedAsDebt(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f, rootTS := oldThreadWorkspace(t)
 	imp, opts := testImporter(t, f)
 	st := imp.store
+	// Start at noon UTC on the day after the fixture messages. Keep the
+	// importer and new replies on one clock so the burst cannot cross midnight.
+	start := tsBase.Truncate(24 * time.Hour).Add(36 * time.Hour)
+	now := start
+	imp.now = func() time.Time { return now }
 
 	_, err := imp.Import(context.Background(), opts)
 	require.NoError(err)
@@ -3174,14 +3519,14 @@ func TestSweepSmallPagesBeyondWalkBoundRecordedAsDebt(t *testing.T) {
 	bigRoot := f.conv("C09").findRoot(rootTS)
 	for i := range 101 {
 		bigRoot.Replies = append(bigRoot.Replies,
-			fakeMsg{TS: tsFresh(i), ThreadTS: rootTS, User: "UME", Text: "burst " + strconv.Itoa(i)})
+			fakeMsg{TS: tsFormat(start.Add(time.Duration(2+i) * time.Second)), ThreadTS: rootTS, User: "UME", Text: "burst " + strconv.Itoa(i)})
 	}
-	beyondWalk := tsFresh(110)
+	beyondWalk := tsFormat(start.Add(112 * time.Second))
 	other := f.conv("C09").findRoot(ts(0))
 	other.Replies = append(other.Replies, fakeMsg{TS: beyondWalk, ThreadTS: ts(0), User: "UME", Text: "past the page walk"})
 	f.mu.Unlock()
 
-	imp.now = func() time.Time { return time.Now().Add(5 * time.Minute) }
+	now = start.Add(5 * time.Minute)
 	_, err = imp.Import(context.Background(), opts)
 	require.Error(err, "a day the pager cannot fully consume must fail loudly, not certify past unserved hits")
 	src, err := st.GetOrCreateSource("slack", "T01:UME")
@@ -3191,9 +3536,9 @@ func TestSweepSmallPagesBeyondWalkBoundRecordedAsDebt(t *testing.T) {
 
 	// The catch-up walk recovers the reply the pager could never serve;
 	// once the day is behind the boundary the sweep runs clean again.
-	imp.now = func() time.Time { return time.Now().Add(25 * time.Hour) }
+	now = start.Add(25 * time.Hour)
 	_, _ = imp.Import(context.Background(), opts)
-	imp.now = func() time.Time { return time.Now().Add(26 * time.Hour) }
+	now = start.Add(26 * time.Hour)
 	_, err = imp.Import(context.Background(), opts)
 	require.NoError(err)
 	var n int
@@ -3207,6 +3552,7 @@ func TestSweepSmallPagesBeyondWalkBoundRecordedAsDebt(t *testing.T) {
 }
 
 func TestBackfillMediaDownloadsDespiteNoMediaConfig(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := testWorkspace(t)
@@ -3215,15 +3561,13 @@ func TestBackfillMediaDownloadsDespiteNoMediaConfig(t *testing.T) {
 			"url_private": "https://files.slack.com/files-pri/T01-F_CFGOFF/c.png",
 			"permalink":   "https://testers.slack.com/files/F_CFGOFF"},
 	}
-	prevInterval := checkpointMinInterval
-	checkpointMinInterval = 0
-	t.Cleanup(func() { checkpointMinInterval = prevInterval })
 	srv := f.serve()
 	client := NewClient(srv.URL, "xoxp-test")
 	client.disableRateLimits()
 	client.mediaTransport = &recordingTransport{body: "png03"}
 	st := testutil.NewTestStore(t)
 	imp := NewImporter(st, client, "T01")
+	imp.checkpointMinInterval = 0
 
 	// [slack].media = false shapes the options with NoMedia set — for the
 	// sync AND, via the shared options builder, for backfill-slack-media.
@@ -3247,6 +3591,7 @@ func TestBackfillMediaDownloadsDespiteNoMediaConfig(t *testing.T) {
 }
 
 func TestSweepPagesServeOneSnapshotDespiteMidWalkDeletion(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f, rootTS := oldThreadWorkspace(t)
@@ -3295,6 +3640,7 @@ func TestSweepPagesServeOneSnapshotDespiteMidWalkDeletion(t *testing.T) {
 }
 
 func TestMaintenanceRepairsRecentReplyUnderAncientRoot(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	f := newFakeSlack(t)
@@ -3360,4 +3706,14 @@ func TestMaintenanceRepairsRecentReplyUnderAncientRoot(t *testing.T) {
 	require.NoError(err)
 	assert.Equal("recent reply (stealth edit)", readBody(),
 		"--maintenance must repair a recent reply even when its thread root predates the rescan window")
+}
+
+// dropReactionsTable breaks reaction writes on both backends; PostgreSQL
+// refuses to drop reactions while reaction_source_events references it.
+func dropReactionsTable(db *sql.DB) error {
+	if _, err := db.Exec(`DROP TABLE IF EXISTS reaction_source_events`); err != nil {
+		return err
+	}
+	_, err := db.Exec(`DROP TABLE reactions`)
+	return err
 }

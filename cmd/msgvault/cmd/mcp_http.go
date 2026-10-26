@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -42,6 +43,10 @@ Example Claude Desktop config (with port-forward):
     }
   }`,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		state := invocationFromCommand(cmd)
+		if state == nil || state.cfg == nil || isAgentMode(state) {
+			return errors.New("owner configuration is required")
+		}
 		// Validate security: require an API key for non-loopback addresses
 		// unless the operator has explicitly opted into insecure exposure.
 		host, _, _ := net.SplitHostPort(mcpSSEAddr)
@@ -66,26 +71,16 @@ Example Claude Desktop config (with port-forward):
 		ctx, cancel := context.WithCancel(cmd.Context())
 		defer cancel()
 
-		opts, err := daemonMCPServeOptions(ctx, st)
-		if err != nil {
-			return err
-		}
+		opts := daemonMCPServeOptions(ctx, st, state)
 		opts.GmailFactory = buildMailFactory(ctx, st)
-		opts.GoogleDocsFactory = buildGoogleDocsFactory()
+		opts.GoogleDocsFactory = buildGoogleDocsFactory(ctx)
 
-		// Graceful shutdown on SIGINT/SIGTERM
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		go func() {
-			<-sigCh
-			fmt.Fprintf(os.Stderr, "Shutting down MCP HTTP server...\n")
-			cancel()
-		}()
+		// Stop the server when the command is canceled or interrupted.
+		ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
 
 		fmt.Fprintf(os.Stderr, "Starting MCP HTTP server on %s\n", mcpSSEAddr)
-		return serveMCPHTTPWithOptions(ctx, opts, mcpserver.HTTPOptions{
-			Addr: mcpSSEAddr, APIKey: mcpSSEAPIKey, AllowWrites: true,
-		})
+		return serveMCPHTTPWithOptions(ctx, opts, mcpserver.HTTPOptions{Addr: mcpSSEAddr, APIKey: mcpSSEAPIKey, AllowWrites: true})
 	},
 }
 

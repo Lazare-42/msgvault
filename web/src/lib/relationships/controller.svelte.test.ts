@@ -1112,6 +1112,154 @@ describe('RelationshipsController.openTarget', () => {
   });
 });
 
+describe('RelationshipsController calendar day selection', () => {
+  it('keeps other filters across day pagination and restores the original date range on clear', async () => {
+    const bodies: Array<{ filters?: unknown[]; cursor?: string }> = [];
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      const path = pathOf(request);
+      if (path === '/api/v1/participants/1') return Response.json(person(1));
+      if (path === '/api/v1/participants/1/summary') return Response.json({ summary: person(1) });
+      if (path === '/api/v1/relationships/1/calendar') return Response.json({}, { status: 404 });
+      if (path === '/api/v1/relationships/1/timeline') {
+        const body = await request.json();
+        bodies.push(body);
+        return Response.json({
+          canonical_id: 1, identity_revision: 1, cache_revision: 'cache-rel',
+          rows: [timelineRow(body.cursor ? 'next' : 'first')],
+          next_cursor: body.cursor ? undefined : 'page-2'
+        });
+      }
+      throw new Error(`unexpected path ${path}`);
+    });
+    const controller = new RelationshipsController(createAPIClient(fetchFn), () => 'UTC');
+    const predicate: ExplorePredicate = { presentation: 'table', filters: [
+      { dimension: 'source', values: ['2'] },
+      { dimension: 'after', values: ['2025-01-01'] },
+      { dimension: 'before', values: ['2027-01-01'] }
+    ] };
+    await controller.openTarget('cluster:1', predicate);
+    await controller.selectTimelineDay({
+      date: '2026-07-19', start: '2026-07-19T00:00:00.000Z', end: '2026-07-20T00:00:00.000Z'
+    });
+    expect(bodies.at(-1)?.filters).toEqual([
+      { dimension: 'source', values: ['2'] },
+      { dimension: 'after', values: ['2026-07-19T00:00:00.000Z'] },
+      { dimension: 'before', values: ['2026-07-20T00:00:00.000Z'] }
+    ]);
+    await controller.loadMoreTimeline();
+    expect(bodies.at(-1)).toMatchObject({ cursor: 'page-2', filters: [
+      { dimension: 'source', values: ['2'] },
+      { dimension: 'after', values: ['2026-07-19T00:00:00.000Z'] },
+      { dimension: 'before', values: ['2026-07-20T00:00:00.000Z'] }
+    ] });
+    expect(controller.timelineRows.map((row) => row.key)).toEqual(['first', 'next']);
+    await controller.selectTimelineDay(null);
+    expect(bodies.at(-1)?.filters).toEqual(predicate.filters);
+    expect(bodies.at(-1)?.cursor).toBeUndefined();
+    expect(controller.timelineRows.map((row) => row.key)).toEqual(['first']);
+    expect(controller.timelineDay).toBeNull();
+    controller.destroy();
+  });
+
+  it('keeps the selected day and calendar year when retrying a header that was still building', async () => {
+    vi.useFakeTimers();
+    let summaryCalls = 0;
+    const timelineFilters: unknown[] = [];
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      const path = pathOf(request);
+      if (path === '/api/v1/participants/1') return Response.json({ ...person(1), first_at: '2018-01-02T00:00:00Z' });
+      if (path === '/api/v1/participants/1/summary') {
+        summaryCalls += 1;
+        if (summaryCalls === 1) return Response.json({
+          error: 'analytical_cache_unavailable', message: 'The analytical cache is being prepared',
+          readiness: 'building', recovery_action: ''
+        }, { status: 503 });
+        return Response.json({ summary: { ...person(1), activity_count: 7 } });
+      }
+      if (path === '/api/v1/relationships/1/calendar') return Response.json({}, { status: 404 });
+      if (path === '/api/v1/relationships/1/timeline') {
+        timelineFilters.push((await request.json()).filters);
+        return Response.json({
+          canonical_id: 1, identity_revision: 1, cache_revision: 'cache-rel', rows: [timelineRow('row')]
+        });
+      }
+      throw new Error(`unexpected path ${path}`);
+    });
+    const controller = new RelationshipsController(createAPIClient(fetchFn), () => 'UTC');
+    const sourceFilter = { dimension: 'source' as const, values: ['2'] };
+    await controller.openTarget('cluster:1', { presentation: 'table', filters: [sourceFilter] });
+    await controller.loadRelationshipYear(2025);
+    await controller.selectTimelineDay({
+      date: '2025-03-08', start: '2025-03-08T00:00:00.000Z', end: '2025-03-09T00:00:00.000Z'
+    });
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    await vi.waitFor(() => expect(controller.detail?.activity_count).toBe(7));
+    expect(controller.timelineDay?.date).toBe('2025-03-08');
+    expect(controller.relationshipCalendarYear).toBe(2025);
+    expect(timelineFilters.at(-1)).toEqual([
+      sourceFilter,
+      { dimension: 'after', values: ['2025-03-08T00:00:00.000Z'] },
+      { dimension: 'before', values: ['2025-03-09T00:00:00.000Z'] }
+    ]);
+
+    controller.destroy();
+    vi.useRealTimers();
+  });
+
+  it.each(['another day', 'clear date', 'another person'])(
+    'discards a late day response after selecting %s', async (action) => {
+      let resolveDay!: (response: Response) => void;
+      const fetchFn = vi.fn<typeof fetch>(async (input) => {
+        const request = input instanceof Request ? input : new Request(input);
+        const path = pathOf(request);
+        if (path === '/api/v1/participants/1') return Response.json(person(1));
+        if (path === '/api/v1/participants/2') return Response.json(person(2));
+        if (path.endsWith('/calendar')) return Response.json({}, { status: 404 });
+        if (path.endsWith('/timeline')) {
+          const body = await request.json();
+          if (body.filters?.some((filter: { values: string[] }) => filter.values.includes('2026-07-19T00:00:00.000Z'))) {
+            return new Promise<Response>((resolve) => { resolveDay = resolve; });
+          }
+          return Response.json({
+            canonical_id: path.includes('/2/') ? 2 : 1, identity_revision: 1,
+            rows: [timelineRow('current')], cache_revision: 'cache-rel'
+          });
+        }
+        throw new Error(`unexpected path ${path}`);
+      });
+      const controller = new RelationshipsController(createAPIClient(fetchFn), () => 'UTC');
+      await controller.openTarget('cluster:1', { filters: [], presentation: 'table' });
+      const pending = controller.selectTimelineDay({
+        date: '2026-07-19', start: '2026-07-19T00:00:00.000Z', end: '2026-07-20T00:00:00.000Z'
+      });
+      await vi.waitFor(() => expect(resolveDay).toBeTypeOf('function'));
+      if (action === 'another day') {
+        await controller.selectTimelineDay({
+          date: '2026-07-20', start: '2026-07-20T00:00:00.000Z', end: '2026-07-21T00:00:00.000Z'
+        });
+      } else if (action === 'clear date') {
+        await controller.selectTimelineDay(null);
+      } else {
+        await controller.openTarget('cluster:2', { filters: [], presentation: 'table' });
+      }
+      resolveDay(Response.json({
+        canonical_id: 1, identity_revision: 1, rows: [timelineRow('stale')],
+        next_cursor: 'stale-page', cache_revision: 'cache-rel'
+      }));
+      await pending;
+      expect(controller.timelineRows.map((row) => row.key)).toEqual(['current']);
+      expect(controller.timelineCursor).toBeNull();
+      expect(controller.timelineLoading).toBe(false);
+      expect(controller.timelineDay?.date ?? null).toBe(action === 'another day' ? '2026-07-20' : null);
+      expect(controller.canonicalID).toBe(action === 'another person' ? 2 : 1);
+      controller.destroy();
+    }
+  );
+});
+
 describe('RelationshipsController filtered header metrics', () => {
   const sourceFilter = { dimension: 'source' as const, values: ['1'] };
   const filtered: ExplorePredicate = { filters: [sourceFilter], presentation: 'table' };
@@ -1123,14 +1271,18 @@ describe('RelationshipsController filtered header metrics', () => {
       file_count: 90,
       first_at: '2010-01-01T00:00:00Z',
       identifiers: [
-        { participant_id: id, type: 'email', value: `p${id}@example.com`, is_primary: true, provenance: 'message_headers' }
+        { participant_id: id, type: 'beeper', value: 'beeper:8:whatsapp:9:@user:x.y', is_primary: true, provenance: 'participant_identifiers',
+          service_slug: 'whatsapp', service_label: 'WhatsApp', scope_kind: 'account', scope_value: 'local-whatsapp_ba_example',
+          participant_display_name: 'Alias Example' }
       ],
       cluster: { canonical_id: id, member_ids: [id, id + 100], edges: [{ participant_a: id, participant_b: id + 100 }] }
     };
   }
 
   function filteredPersonSummary(id: number): PersonSummary {
-    return { ...person(id), activity_count: 7, file_count: 2, first_at: '2026-01-05T00:00:00Z', identifiers: null };
+    return { ...person(id), activity_count: 7, file_count: 2, first_at: '2026-01-05T00:00:00Z', identifiers: [
+      { participant_id: id, type: 'beeper', value: 'beeper:8:whatsapp:9:@user:x.y', is_primary: true, provenance: 'participant_identifiers' }
+    ] };
   }
 
   it('shows the contextual person summary metrics, keeping cluster metadata from the unfiltered GET', async () => {
@@ -1677,6 +1829,64 @@ describe('RelationshipsController.linkParticipants / unlinkParticipants', () => 
     expect(outcome).toEqual({
       ok: false, code: 'already_linked', message: 'these participants are already connected through other links'
     });
+  });
+
+  it('returns a strictly validated merge-required outcome without replaying the link', async () => {
+    const conflict = {
+      error: 'person_merge_required', message: 'Choose a survivor', profiles: [
+        { etag: '"person-7-r4"', person: { id: 7, revision: 4 } },
+        { etag: '"person-9-r2"', person: { id: 9, revision: 2 } }
+      ]
+    };
+    const fetchFn = vi.fn<typeof fetch>(async () => Response.json(conflict, { status: 409 }));
+    const controller = new RelationshipsController(createAPIClient(fetchFn), () => 'UTC');
+
+    await expect(controller.linkParticipants(1, 2)).resolves.toEqual({
+      ok: false, code: 'merge_required', message: 'Choose a survivor', conflict
+    });
+    expect(fetchFn).toHaveBeenCalledOnce();
+
+    const malformed = vi.fn<typeof fetch>(async () => Response.json({
+      ...conflict, profiles: [conflict.profiles[0], conflict.profiles[0]]
+    }, { status: 409 }));
+    const malformedController = new RelationshipsController(createAPIClient(malformed), () => 'UTC');
+    await expect(malformedController.linkParticipants(1, 2)).resolves.toEqual({
+      ok: false, code: 'error', message: 'Choose a survivor'
+    });
+  });
+
+  it('reconciles only the captured target and list context without replaying identity linking', async () => {
+    const requests: Request[] = [];
+    const fetchFn = vi.fn<typeof fetch>(async (input) => {
+      const request = input instanceof Request ? input : new Request(input);
+      requests.push(request);
+      const path = pathOf(request);
+      if (path === '/api/v1/relationships') return Response.json({ rows: [], total_count: 0 });
+      if (path === '/api/v1/participants/1') return Response.json(person(1));
+      if (path === '/api/v1/relationships/1/timeline') return Response.json({
+        canonical_id: 1, identity_revision: 1, rows: [], total_count: 0, cache_revision: 'cache-rel'
+      });
+      throw new Error(`unexpected path ${path}`);
+    });
+    const controller = new RelationshipsController(createAPIClient(fetchFn), () => 'UTC');
+    const predicate = { filters: [], presentation: 'table' as const };
+    await controller.loadList(predicate);
+    await controller.openTarget('cluster:1', predicate);
+    const context = controller.personMergeContextSnapshot();
+    requests.length = 0;
+
+    await controller.reconcilePersonMerge(context);
+
+    expect(requests.some((request) => pathOf(request) === '/api/v1/identity/links')).toBe(false);
+    expect(requests.filter((request) => pathOf(request) === '/api/v1/participants/1')).toHaveLength(1);
+    expect(requests.filter((request) => pathOf(request) === '/api/v1/relationships')).toHaveLength(1);
+
+    const staleContext = controller.personMergeContextSnapshot();
+    controller.target = 'cluster:2';
+    controller.query = 'different list';
+    requests.length = 0;
+    await controller.reconcilePersonMerge(staleContext);
+    expect(requests).toHaveLength(0);
   });
 
   it('maps a 400 body to code invalid', async () => {

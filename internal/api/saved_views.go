@@ -3,7 +3,8 @@ package api
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -28,14 +29,15 @@ type SavedViewStore interface {
 }
 
 type SavedView struct {
-	ID             int64                        `json:"id"`
-	Name           string                       `json:"name"`
-	Description    *string                      `json:"description,omitempty"`
-	CanonicalState store.SavedViewStateEnvelope `json:"canonical_state"`
-	SchemaVersion  int                          `json:"schema_version"`
-	Revision       int64                        `json:"revision"`
-	CreatedAt      time.Time                    `json:"created_at"`
-	UpdatedAt      time.Time                    `json:"updated_at"`
+	IncompatibilityReason string         `json:"incompatibility_reason,omitempty" doc:"Definition validation error that prevents this Saved View from executing"`
+	ID                    int64          `json:"id"`
+	Name                  string         `json:"name"`
+	Description           *string        `json:"description,omitzero" nullable:"false"`
+	CanonicalState        jsontext.Value `json:"canonical_state" doc:"Stored definition, including incompatible values; check incompatibility_reason before execution"`
+	SchemaVersion         int            `json:"schema_version"`
+	Revision              int64          `json:"revision"`
+	CreatedAt             time.Time      `json:"created_at"`
+	UpdatedAt             time.Time      `json:"updated_at"`
 }
 
 type SavedViewsResponse struct {
@@ -44,16 +46,16 @@ type SavedViewsResponse struct {
 
 type CreateSavedViewRequest struct {
 	Name           string                       `json:"name"`
-	Description    *string                      `json:"description,omitempty"`
+	Description    *string                      `json:"description,omitzero" nullable:"false"`
 	CanonicalState store.SavedViewStateEnvelope `json:"canonical_state"`
 	SchemaVersion  int                          `json:"schema_version"`
 }
 
 type PatchSavedViewRequest struct {
-	Name           *string                       `json:"name,omitempty"`
-	Description    *string                       `json:"description,omitempty"`
-	CanonicalState *store.SavedViewStateEnvelope `json:"canonical_state,omitempty"`
-	SchemaVersion  *int                          `json:"schema_version,omitempty"`
+	Name           *string                       `json:"name,omitzero" nullable:"false"`
+	Description    *string                       `json:"description,omitzero" nullable:"false"`
+	CanonicalState *store.SavedViewStateEnvelope `json:"canonical_state,omitzero" nullable:"false"`
+	SchemaVersion  *int                          `json:"schema_version,omitzero" nullable:"false"`
 }
 
 func (s *Server) registerSavedViewRoutes(api huma.API) {
@@ -76,6 +78,7 @@ func (s *Server) registerSavedViewRoutes(api huma.API) {
 	registerRawHumaRoute(api, get, s.handleGetSavedView)
 
 	patch := rawAPIV1Operation("patchSavedView", http.MethodPatch, "/saved-views/{id}", "Update a shared analytical Saved View")
+	patch.Description = "Sending canonical_state without schema_version keeps the stored schema version, so schema 1 keeps pipes as literal text. Send schema_version 2 to adopt pipe OR."
 	addSavedViewIDParameter(&patch)
 	addSavedViewIfMatchParameter(&patch)
 	patch.RequestBody = jsonRequestBodyFor[PatchSavedViewRequest](api)
@@ -94,6 +97,8 @@ func (s *Server) registerSavedViewRoutes(api huma.API) {
 		http.StatusConflict, http.StatusNotFound, http.StatusPreconditionRequired,
 		http.StatusInternalServerError, http.StatusServiceUnavailable)
 	registerRawHumaRoute(api, remove, s.handleDeleteSavedView)
+
+	s.registerRunSavedViewRoute(api)
 }
 
 func addSavedViewIDParameter(operation *huma.Operation) {
@@ -137,12 +142,8 @@ func (s *Server) handleListSavedViews(w http.ResponseWriter, r *http.Request) {
 	}
 	response := SavedViewsResponse{SavedViews: make([]SavedView, 0, len(views))}
 	for i := range views {
-		view, err := savedViewResponse(&views[i])
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, "saved_view_read_failed", err.Error())
-			return
-		}
-		response.SavedViews = append(response.SavedViews, view)
+		_, err := prepareSavedView(views[i])
+		response.SavedViews = append(response.SavedViews, savedViewResponse(&views[i], err))
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, response)
@@ -163,16 +164,18 @@ func (s *Server) handleCreateSavedView(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	input := savedViewInput(request.Name, request.Description, canonicalState, request.SchemaVersion)
+	if _, err := prepareSavedView(store.SavedView{
+		CanonicalState: input.CanonicalState, SchemaVersion: input.SchemaVersion,
+	}); err != nil {
+		s.writeSavedViewError(w, err)
+		return
+	}
 	created, err := s.savedViewStore.CreateSavedView(r.Context(), input)
 	if err != nil {
 		s.writeSavedViewError(w, err)
 		return
 	}
-	response, err := savedViewResponse(created)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "saved_view_read_failed", err.Error())
-		return
-	}
+	response := savedViewResponse(created, nil)
 	w.Header().Set(etagHeaderName, savedViewETag(*created))
 	w.Header().Set("Location", savedViewsPath+"/"+strconv.FormatInt(created.ID, 10))
 	w.Header().Set("Cache-Control", "no-store")
@@ -192,11 +195,8 @@ func (s *Server) handleGetSavedView(w http.ResponseWriter, r *http.Request) {
 		s.writeSavedViewError(w, err)
 		return
 	}
-	response, err := savedViewResponse(view)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "saved_view_read_failed", err.Error())
-		return
-	}
+	_, incompatibility := prepareSavedView(*view)
+	response := savedViewResponse(view, incompatibility)
 	w.Header().Set(etagHeaderName, savedViewETag(*view))
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, response)
@@ -247,21 +247,23 @@ func (s *Server) handlePatchSavedView(w http.ResponseWriter, r *http.Request) {
 		input.Description = normalizedDescription(request.Description)
 	}
 	if request.CanonicalState != nil {
-		input.CanonicalState = append(json.RawMessage(nil), fields["canonical_state"]...)
+		input.CanonicalState = append(jsontext.Value(nil), fields["canonical_state"]...)
 	}
 	if request.SchemaVersion != nil {
 		input.SchemaVersion = *request.SchemaVersion
+	}
+	if _, err := prepareSavedView(store.SavedView{
+		CanonicalState: input.CanonicalState, SchemaVersion: input.SchemaVersion,
+	}); err != nil {
+		s.writeSavedViewError(w, err)
+		return
 	}
 	updated, err := s.savedViewStore.UpdateSavedView(r.Context(), id, revision, input)
 	if err != nil {
 		s.writeSavedViewError(w, err)
 		return
 	}
-	response, err := savedViewResponse(updated)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "saved_view_read_failed", err.Error())
-		return
-	}
+	response := savedViewResponse(updated, nil)
 	w.Header().Set(etagHeaderName, savedViewETag(*updated))
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, response)
@@ -297,7 +299,7 @@ func (s *Server) requireSavedViewStore(w http.ResponseWriter) bool {
 
 func decodeSavedViewRequest(
 	w http.ResponseWriter, r *http.Request, target any,
-) (map[string]json.RawMessage, bool) {
+) (map[string]jsontext.Value, bool) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 1<<20))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid Saved View request")
@@ -307,18 +309,17 @@ func decodeSavedViewRequest(
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid Saved View request")
 		return nil, false
 	}
-	decoder := json.NewDecoder(bytes.NewReader(body))
-	decoder.DisallowUnknownFields()
-	decoder.UseNumber()
-	if err := decoder.Decode(target); err != nil {
+	decoder := jsontext.NewDecoder(bytes.NewReader(body), json.RejectUnknownMembers(true), jsonexact.PreserveNumbers)
+
+	if err := json.UnmarshalDecode(decoder, target); err != nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid Saved View request")
 		return nil, false
 	}
-	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+	if err := json.UnmarshalDecode(decoder, &struct{}{}); !errors.Is(err, io.EOF) {
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid Saved View request")
 		return nil, false
 	}
-	var fields map[string]json.RawMessage
+	var fields map[string]jsontext.Value
 	if err := json.Unmarshal(body, &fields); err != nil || fields == nil {
 		writeError(w, http.StatusBadRequest, "bad_request", "Invalid Saved View request")
 		return nil, false
@@ -326,16 +327,16 @@ func decodeSavedViewRequest(
 	return fields, true
 }
 
-func isJSONNull(value json.RawMessage) bool {
+func isJSONNull(value jsontext.Value) bool {
 	return bytes.Equal(bytes.TrimSpace(value), []byte("null"))
 }
 
 func savedViewInput(
-	name string, description *string, state json.RawMessage, schemaVersion int,
+	name string, description *string, state jsontext.Value, schemaVersion int,
 ) store.SavedViewInput {
 	return store.SavedViewInput{
 		Name: name, Description: normalizedDescription(description),
-		CanonicalState: append(json.RawMessage(nil), state...), SchemaVersion: schemaVersion,
+		CanonicalState: append(jsontext.Value(nil), state...), SchemaVersion: schemaVersion,
 	}
 }
 
@@ -347,18 +348,20 @@ func normalizedDescription(description *string) *string {
 	return &value
 }
 
-func savedViewResponse(view *store.SavedView) (SavedView, error) {
-	var state store.SavedViewStateEnvelope
-	decoder := json.NewDecoder(strings.NewReader(string(view.CanonicalState)))
-	decoder.UseNumber()
-	if err := decoder.Decode(&state); err != nil {
-		return SavedView{}, fmt.Errorf("decode Saved View %d canonical state: %w", view.ID, err)
+// savedViewResponse preserves the stored definition even when preparation failed.
+// Callers reuse their preparation result so constructing a response never validates
+// or decodes the definition again.
+func savedViewResponse(view *store.SavedView, incompatibility error) SavedView {
+	var reason string
+	if incompatibility != nil {
+		reason = incompatibility.Error()
 	}
 	return SavedView{
-		ID: view.ID, Name: view.Name, Description: view.Description,
-		CanonicalState: state, SchemaVersion: view.SchemaVersion, Revision: view.Revision,
+		IncompatibilityReason: reason,
+		ID:                    view.ID, Name: view.Name, Description: view.Description,
+		CanonicalState: view.CanonicalState, SchemaVersion: view.SchemaVersion, Revision: view.Revision,
 		CreatedAt: view.CreatedAt, UpdatedAt: view.UpdatedAt,
-	}, nil
+	}
 }
 
 func savedViewID(w http.ResponseWriter, r *http.Request) (int64, bool) {

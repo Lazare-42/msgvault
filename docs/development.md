@@ -1,13 +1,17 @@
 ---
-title: Development and Roadmap
+title: Development
 description: Build, test, lint, and code conventions.
 ---
 
 ## Build
 
-Source builds require Go 1.27+, Bun 1.3.14+, and a C/C++ compiler. The Make
-targets install the pinned browser dependencies when `web/package.json` or
-`web/bun.lock` changes, then embed the production UI in the Go binary.
+The macOS and Linux builds require Go 1.27.3+, Bun 1.4.4+, Node.js (22.23.4+ on
+22.x, 24.22.1+ on 24.x, or 26.12.1+), and a C/C++ compiler. The Make targets install
+the pinned browser dependencies when `web/package.json` or `web/bun.lock`
+changes, then embed the production UI in the Go binary; Node runs the embed
+validator in that path. On Debian/Ubuntu also install `libsqlite3-dev`, which
+provides the `sqlite3.h` header needed to compile the default `sqlite_vec`
+extension.
 
 ### macOS and Linux
 
@@ -24,15 +28,19 @@ make install
 
 ### Windows
 
-Use the PowerShell build helper from the repository root. It provides the same
-debug and release builds as the Make targets and selects the host architecture
-automatically:
+Use the PowerShell helper from the repository root to compile the Go binary.
+It selects the host architecture automatically and embeds assets already in
+`internal/web/dist`; it does not build the browser application.
+
+For a binary with the Web UI, first run `make web-embed` in an MSYS2 shell
+with GNU Make, Bun, and Node.js available. This builds and validates the browser
+assets. Then run the PowerShell helper:
 
 ```powershell
-# Debug build (equivalent to make build)
+# Debug Go build
 .\scripts\build.ps1
 
-# Optimized, stripped build (equivalent to make build-release)
+# Optimized, stripped Go build
 .\scripts\build.ps1 -Release
 ```
 
@@ -57,6 +65,42 @@ compiles the pinned DuckDB native library, and caches both under
 `MSGVAULT_BUILD_CACHE` to use another cache location, or pass `-RebuildDuckDB`
 to rebuild the cached library.
 
+### Container builds
+
+The repository's `Dockerfile` builds the embedded Web UI and the msgvault
+binary. To build a local image and run its runtime checks:
+
+```bash
+docker buildx build --load --tag msgvault:dev .
+scripts/smoke-container.sh msgvault:dev
+```
+
+For portable image archives, Docker Bake provides an `oci` target:
+
+```bash
+docker buildx bake oci
+```
+
+It exports `dist/amd64.oci.tar` and `dist/arm64.oci.tar` for Linux AMD64 and
+ARM64. The builder needs support for both target architectures, either through
+native workers or emulation. Override `OCI_OUTPUT_DIR` to change the output
+directory. `VERSION`, `COMMIT`, and `BUILD_DATE` set the binary metadata;
+`OCI_VERSION` and `REVISION` set the image's version and source-revision labels.
+Defaults identify a development build.
+
+Image builds run checks against a temporary empty archive: database
+initialization, a DuckDB query, and the embedded Web UI and its JavaScript
+asset. The runtime smoke also starts from environment variables without a
+config file and verifies that its minted daemon key survives a restart.
+`scripts/smoke-container.sh` repeats these checks in the loaded image
+with networking disabled. These commands build and check local artifacts; they
+do not publish them.
+
+Repository-owned release-publishing workflows and the old release/tagging
+scripts have been removed. Pushing a tag no longer invokes those publishers. The
+Docker inputs, local build commands, installers, and ordinary CI remain
+available.
+
 ## Test
 
 ```bash
@@ -65,7 +109,114 @@ make test
 
 # Verbose output
 make test-v
+
+# Build the CLI and exercise search and thread reading on a synthetic archive
+make test-cli-e2e
 ```
+
+`test-cli-e2e` uses an isolated archive and a fixed synthetic embedding provider.
+Linux CI runs it against the built release binary. To reuse a binary locally,
+set `MSGVAULT_E2E_BINARY` to its absolute path.
+
+### Build tags and assertions
+
+All Go test runs need `-tags "fts5 sqlite_vec"`; the Make targets supply these
+automatically. Use `assert` and `require` from testify, with expected values
+first. See [AGENTS.md](https://github.com/kenn-io/msgvault/blob/main/AGENTS.md)
+for repository testing rules.
+
+### Timing waits
+
+Use `testing/synctest` bubbles for work owned by the test process, including
+goroutines, channels, timers, tickers, and fakes. Advance virtual time with
+`synctest.Sleep` and wait for durable state with `synctest.Wait`.
+
+Keep real waits for PostgreSQL and SQLite locks, database clocks, network
+requests, subprocesses, DuckDB, and operating-system events.
+
+`make lint` and `make lint-ci` build a pinned golangci-lint with Kit's
+`kennlint` plugin and run its `sleeptest` and `deadlinetest` checks. Outside a
+`synctest.Test` bubble, `sleeptest` rejects `time.Sleep` and `deadlinetest`
+rejects sub-second `context.WithTimeout`, `context.WithDeadline`, `time.After`,
+`time.NewTimer`, `time.AfterFunc` and testify `Eventually` budgets, plus zero
+or negative `Never` windows. A kept real wait carries `//nolint:kennlint //
+<what it waits for>` on the flagged line; for a deadline, that is only when its
+expiry is the asserted result or a `select` shows an event does not happen.
+
+### PostgreSQL tests
+
+`MSGVAULT_TEST_DB=postgres://...` runs PostgreSQL-backed
+tests. pgvector tests require a PostgreSQL instance with the `vector`
+extension and the `pgvector` build tag.
+
+`MSGVAULT_TEST_DB=postgres://... make test-pg-nocgo` checks the PostgreSQL-only
+library profile. It builds the store, query engine, Slack and Discord importers,
+and HTTP API with `CGO_ENABLED=0`, then tests archive writes, full-text search,
+and reads against PostgreSQL. It deliberately omits the `fts5` and `sqlite_vec`
+build tags. SQLite archives, local SQLite imports, and DuckDB/Parquet analytics
+require the normal CGO build; this profile does not build the standalone CLI.
+
+The PostgreSQL deadlock tests also require permission to set
+`deadlock_timeout`. They defer the blocker transaction's deadlock detector
+so the write under test is the deadlock victim. For a non-superuser test
+role, have the database administrator run:
+
+```sql
+GRANT SET ON PARAMETER deadlock_timeout TO test_role;
+```
+
+Replace `test_role` with the role in `MSGVAULT_TEST_DB`. This parameter grant
+is sufficient; the test role does not need superuser access.
+
+There are two PostgreSQL configurations to cover: the pgvector build
+(`make test-pg`) and the shipped build, which has no pgvector tag
+(`make test-pg-shipped`). Run `make test-pg-both` rather than both of those —
+the tag changes the test binary of only the packages listed in
+`PG_SHIPPED_ONLY_PKGS` in the Makefile, so the second full run would reprove
+the first. Each test binary builds the schema once into a template — a
+SQLite file copied per test, or a PostgreSQL template database cloned per
+test with `CREATE DATABASE ... TEMPLATE` (`internal/testutil/sqlite_template.go`,
+`internal/testutil/pg_template.go`) — instead of replaying `InitSchema()` for
+every fixture. Nothing runs in the background, so no fixture ever issues a
+schema statement while a test body is running. Each database is still private
+to its test, still produced by the same `InitSchema()` path, and still dropped
+on cleanup. A PostgreSQL template is owned through a session advisory lock the
+server releases when the binary exits, so the next binary reclaims whatever an
+earlier one left behind; a role without `CREATEDB` falls back to a private
+schema in the configured database.
+
+
+### Local test scheduling
+
+`make test` automatically overlaps the CLI, store, API, and query package shards
+with the remaining SQLite packages when at least 32 CPUs and 64 GiB of available
+memory are detected. The planner reserves four test-process slots for the
+unsharded remainder, then divides the remaining slots across the sharded
+packages, up to 16 shards each. Each slot budgets two Go execution threads
+(`GOMAXPROCS=2`) and a 2 GiB memory allowance. For four sharded packages, a
+32-CPU budget permits three shards per package; 128 CPUs permits fifteen,
+provided memory also permits them. This changes scheduling, not test coverage.
+
+The planner emits the per-process and remainder settings with its shard count,
+so execution uses the same aggregate budget. Shard builds use `go -p=1`; the
+remainder uses `go test -p=4`. Memory allowances guide scheduling and do not
+enforce per-process limits, including native allocations.
+
+Detection accounts for CPU affinity and `GOMAXPROCS`. On Linux it also accounts
+for visible cgroup v2 ancestor CPU quotas and remaining memory under both hard
+and soft limits. macOS uses available system memory. Smaller budgets, cgroup v1,
+other platforms, and unreadable limits retain the standard schedule. Detection
+is a snapshot, not a reservation of resources against other workloads.
+
+Use `TEST_PROFILE=standard` to disable automatic scaling. Setting `TEST_SHARDS`
+explicitly also retains sequential package jobs with the requested shard count.
+The PostgreSQL targets keep their existing connection-oriented concurrency
+limits; setting `MSGVAULT_TEST_DB` disables automatic scaling in `make test` too.
+CI's explicit `test-unsharded` and package-shard jobs keep their existing layout.
+
+Successful Bash shards and the Windows slow-packages job print named passing
+and skipped test outcomes, including subtests, followed by the package result.
+Failed runs print the full verbose test output for diagnosis.
 
 ## Lint & Format
 
@@ -73,12 +224,194 @@ make test-v
 # Format code
 make fmt
 
-# Run linter (requires golangci-lint)
+# Run linter (builds the pinned golangci-lint with Kit's plugin; needs git)
 make lint
 
 # Check for issues
 go vet ./...
 ```
+
+## Profile Web UI search
+
+Inspect the `Server-Timing` headers on successful `/api/v1/explore` responses in
+browser developer tools. Failed requests may contain only the phases completed
+before the error. Durations are milliseconds:
+
+| Metric | Work measured |
+| --- | --- |
+| `candidates` | Resolve the search candidate pool, including the search phases below |
+| `lexical` | Count full-text matches and fetch bounded, ranked message IDs |
+| `embedding` | Embed the semantic or hybrid query |
+| `retrieval` | Retrieve vector or fused results; `desc` names the accelerator path |
+| `projection` | Build result rows from the analytical cache |
+| `identities` | Hydrate identity matches for the returned rows |
+
+The `candidates` duration includes `lexical`, `embedding`, and `retrieval` work;
+do not add those subphases to it. A reused semantic candidate snapshot skips
+embedding and retrieval, so those metrics are absent. Group requests to
+`/api/v1/explore/groups` report `grouping` for the analytical aggregation.
+
+Run the synthetic HTTP benchmark to measure candidate resolution through the
+real SQLite full-text index and DuckDB result projection:
+
+```bash
+go test -tags 'fts5 sqlite_vec' ./internal/api -run '^$' \
+  -bench '^BenchmarkExploreFullText$' -benchtime=3x -count=3 -benchmem
+```
+
+It creates an isolated 20,000-message archive and measures rare, common, and
+candidate-limited queries. Setup and a warm-up request are excluded. Compare
+the same fixture and machine before and after a change; these timings do not
+predict latency on a larger archive.
+
+For analytical grouping and domain drill-downs, build the larger synthetic
+cache once in an empty scratch directory, then reuse it:
+
+```bash
+explore_bench_root=$(mktemp -d)
+go test -tags 'fts5 sqlite_vec' ./internal/query -run '^$' \
+  -bench '^BenchmarkExploreScaleBuild$' -benchtime=1x \
+  -args -relationship-bench-root="$explore_bench_root"
+go test -tags 'fts5 sqlite_vec' ./internal/query -run '^$' \
+  -bench '^BenchmarkExploreScaleQueries$' -benchtime=4x \
+  -args -relationship-bench-root="$explore_bench_root"
+```
+
+This fixture has 2,562,000 messages and 71,486 people. The query benchmark
+reports the first request and the median of later requests separately. It uses
+the default interactive memory limit; DuckDB can spill work to temporary disk.
+Add `-relationship-bench-memory=8GB` for diagnostic comparisons with older
+queries that exceed that limit. Add
+`-relationship-bench-profile` to write DuckDB operator profiles into the scratch
+directory. Run timing comparisons without other heavy workloads, and retain
+the same memory limit and thread settings. This fixture uses uniform senders
+and one chat roster; it does not model real participant skew or attachments.
+
+To separate local vector retrieval from embedding-provider latency, run:
+
+```bash
+go test -tags 'fts5 sqlite_vec' ./internal/vector/sqlitevec -run '^$' \
+  -bench '^BenchmarkVectorRetrieval$' -benchtime=3x -count=3 -benchmem
+```
+
+This benchmark uses 100,000 synthetic messages with one 64-dimensional vector
+each. It measures exact semantic retrieval and rare/common hybrid retrieval,
+without an accelerator, embedding calls, or HTTP result projection. Use the
+request timing headers to determine which phase needs attention on a real
+archive before comparing it with this narrower benchmark.
+
+### SQLite metadata substring search
+
+Compare indexed candidates with the historical scan on one generated
+20,000-message archive:
+
+```bash
+go test -tags 'fts5 sqlite_vec' ./internal/query -run '^$' \
+  -bench '^BenchmarkMetadataSubstring$' -benchtime=3x -count=3 -benchmem
+```
+
+Setup and index maintenance are excluded. The benchmark covers rare subject,
+participant, and recipient-name matches, common terms, short terms, and
+common-term narrow-date counts. The scoped case keeps the existing date query
+path. Use the same machine and corpus for comparisons; these numbers
+do not predict latency on a larger archive.
+
+The built-in fuzz target compares ordered pages, exact counts, and stats with
+the original substring predicate over generated metadata:
+
+```bash
+go test -tags 'fts5 sqlite_vec' ./internal/query -run '^$' \
+  -fuzz '^FuzzMetadataSearchParity$' -fuzztime=30s -parallel=2
+```
+
+### Synthetic filename discovery measurements
+
+Use generated metadata to compare the Directory verifier and bounded filename
+suggestions without a private archive:
+
+```bash
+go test -tags 'fts5 sqlite_vec' ./internal/store \
+  -run '^TestFilenameDiscoverySyntheticRecall$' -count=1
+go test -tags 'fts5 sqlite_vec' ./internal/namematch -run '^$' \
+  -bench '^BenchmarkDirectoryVerifier$' -benchmem -count=3
+go test -tags 'fts5 sqlite_vec sqlite_dbstat' ./internal/store -run '^$' \
+  -bench '^BenchmarkFilenameDiscovery$' -benchtime=3x -benchmem -count=3
+```
+
+The existing native-driver `sqlite_dbstat` diagnostic tag enables physical
+projection table and index page-byte measurement. Ordinary correctness and
+shipped builds retain their usual tags. The filename benchmark uses durable
+SQLite at 1k, 10k and 100k generated names plus one 512-rune filename, with 64
+synthetic identities bound to one person. Exact, typo, short-prefix, no-hit,
+dense-collision, restrictive-empty, maximum-name and 64-person cases share the
+same fixture and policy.
+
+Indexed timings cover in-process HTTP dispatch and response decoding. The
+exhaustive baseline scans the same fixture's filename metadata in memory,
+applies the same policy and sorts results; it is test-only and excludes HTTP
+overhead. Setup and warmup are outside request timings. Separate metrics report
+durable bootstrap, one journaled rename, one idle maintenance batch, physical
+index bytes, posting rows, admitted/verified IDs, returned rows, recall, and
+missing matches for limited results. Repeated short samples characterize this
+synthetic workload; they do not predict every archive or impose latency
+thresholds on correctness tests. Complete results must equal the exhaustive
+oracle within the requested output limit; limited results report their missing
+output and candidate-pool matches explicitly.
+
+Run the recall test with `MSGVAULT_TEST_DB` set to a disposable PostgreSQL test
+database for backend parity. Existing native query-plan tests exercise indexed
+posting seeks and bounded authority/provenance reads on both backends.
+
+## MCP memory measurements
+
+`TestMCPMemory` guards the retained Go heap of a `msgvault mcp` process. It
+samples two fresh child processes, because the package caches tool catalogs and
+resolved SDK schemas for reuse:
+
+- `startup`: package initialization, before a server exists.
+- `initialized`: a server after `initialize` and `tools/list` over OS pipes,
+  with every backend a daemon-backed stdio proxy can enable. The backends are
+  empty stand-ins; neither sample opens an archive or calls a tool.
+
+Each sample must keep less than 64 MiB of Go heap after garbage collection.
+The budget catches eager construction of tool catalogs, which retained over
+300 MiB in v0.20.0, without setting a startup-time target. If you add a catalog
+capability, enable it in `daemonProxyMemoryOptions`; the test fails until you do.
+
+Run the guard and the allocation benchmarks:
+
+```bash
+go test -tags 'fts5 sqlite_vec' ./internal/mcp -run '^TestMCPMemory$' -count=1 -v
+go test -tags 'fts5 sqlite_vec' ./internal/mcp -run '^$' \
+  -bench '^BenchmarkOperationCatalogMemory$' -benchtime=3x -benchmem
+```
+
+The `cold` benchmark builds one catalog, `cached` looks it up again, and
+`server` constructs a server with warmed caches, as the stateless HTTP listener
+does for each request. Benchmark bytes are allocations, not retained heap.
+
+To profile one phase, run the child test directly so the profile covers the
+measured process rather than the parent:
+
+```bash
+MSGVAULT_MCP_MEMORY_PHASE=initialized go test -tags 'fts5 sqlite_vec' ./internal/mcp \
+  -run '^TestMCPMemoryChild$' -count=1 -v -memprofile=/tmp/mcp.heap
+go tool pprof -top -inuse_space /tmp/mcp.heap
+```
+
+`HeapAlloc` is live Go heap; `TotalAlloc` counts cumulative allocation. Neither
+includes native allocations or executable mappings. Linux RSS and the macOS
+`top` MEM column (physical footprint, which includes compressed memory) measure
+different things, so do not compare them directly with Go heap figures.
+
+For several simultaneous clients, see [transport selection](usage/chat.md#choose-a-transport-for-concurrent-sessions).
+
+## Evaluate search quality
+
+Use [`msgvault eval`](cli-reference.md#eval) to compare keyword, semantic, and
+hybrid results against queries and relevance ratings you supply. Keep the
+archive, topics, and ratings the same when comparing runs. The command reports
+ranking quality and query timings; it does not create the ratings for you.
 
 ## vCard registry maintenance
 
@@ -98,6 +431,43 @@ The codec preserves ordered properties, source spelling, parameter quoting,
 unknown extensions, and raw values. Keep new registry elements covered by an
 explicit handling declaration so an upstream addition cannot be silently
 ignored.
+
+## Archive schema version maintenance
+
+`internal/store/schema_version.go` owns `store.SchemaVersion`, the monotonic
+integer for required main archive schema work. Increase it whenever the main
+archive schema changes, including indexes, or a required data migration changes.
+Embedded readers require an exact version match. Once an archive is migrated to
+a higher version, applications using an older `pkg/archive` must upgrade too,
+even if the schema change only added an index.
+
+Filename suggestions require archive schema version 6 and API schema 3.15,
+newer than the latest release. Version 6 creates empty projection tables;
+background maintenance establishes readiness separately. Schema migration does
+not scan attachments or populate the index, and suggestion requests never
+perform setup or backfill. Embedded readers require completed version-6 setup.
+
+`TestSchemaVersionContract` hashes the schema and migration ledger a fresh archive
+gets on each backend, plus the legacy column statements only older archives run,
+and fails until the version moves; its message gives the digest to append.
+Append entries for the new version to both `schemaContractDigests` and
+`schemaContractPostgresDigests`; keep earlier entries unchanged. The SQLite lane
+also requires a PostgreSQL entry. Obtain that digest by running the store tests
+with `MSGVAULT_TEST_DB` set to a PostgreSQL URL. Without local PostgreSQL, use the digest from the CI
+PostgreSQL lane's failure log, append it, and rerun CI to verify it.
+
+A data-only repair that runs outside the migration ledger leaves both digests
+alone, so bump the version by hand for one. SQLite and PostgreSQL use the
+`schema_version` key in `archive_metadata`. `InitSchemaContext` refuses future
+versions before DDL and stamps this version only after its required steps succeed,
+using the caller's context. Keep optional and best-effort maintenance behavior separate from that
+completion guarantee.
+
+The initial contract is new on `main`, after v0.21.0. Existing archives start at
+`0`; successful initialization upgrades them to the binary's expected version.
+The [CLI reference](cli-reference.md#schema-version) owns the probe contract,
+and [Setup](setup.md#migrate-before-replacing-the-executable) owns the operator
+upgrade procedure.
 
 ## Code Conventions
 
@@ -139,7 +509,7 @@ WHERE EXISTS (
 | Library | Purpose |
 |---|---|
 | `svelte` | Embedded analytical Web UI |
-| `openapi-fetch` | Typed browser API client |
+| `orval` | Typed browser API client generation |
 | `cobra` | CLI framework |
 | `charmbracelet/bubbletea` | TUI framework |
 | `charmbracelet/lipgloss` | TUI styling |
@@ -147,6 +517,27 @@ WHERE EXISTS (
 | `duckdb/duckdb-go/v2` | DuckDB driver for Parquet |
 | `gogs/chardet` | Character set detection |
 | `golang.org/x/text` | Text encoding conversion |
+
+## Documentation
+
+The site has three reading levels: the product overview at `/`, the archive
+lifecycle at `/guide/`, and task guides and references at `/docs/`. Keep
+technical setup and command details in the documentation tier.
+
+From the repository root:
+
+```bash
+make docs-install
+make docs-build
+make docs-check
+```
+
+`make docs-check` validates Markdown, builds the real site with its asset
+branches, and checks pages, links, metadata, and redirects. Use `make docs-serve`
+to inspect the complete site at `http://127.0.0.1:8000`.
+
+See the [documentation contributor guide](https://github.com/kenn-io/msgvault/blob/main/docs/README.md)
+for content ownership, historical designs, and media maintenance.
 
 ## Community
 

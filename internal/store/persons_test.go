@@ -33,7 +33,7 @@ func TestPersonPromoteGetListUpdateAndRevisionConflict(t *testing.T) {
 	assert.Equal(revisionBeforePromotion+1, revisionAfterPromotion)
 	assert.Positive(created.ID)
 	assert.Regexp(`^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$`, created.VCardUID)
-	assert.Nil(created.DisplayName)
+	assert.Equal(new("alice"), created.DisplayName)
 	assert.Equal(int64(1), created.Revision)
 	assert.Equal([]int64{alice, alias}, created.ParticipantIDs)
 
@@ -66,6 +66,21 @@ func TestPersonPromoteGetListUpdateAndRevisionConflict(t *testing.T) {
 
 	_, err = f.Store.UpdatePersonDisplayName(created.ID, created.Revision, &displayName)
 	assert.ErrorIs(err, store.ErrPersonRevisionConflict)
+}
+
+func TestListPersonUIDsIncludesCanonicalAndRetiredAliases(t *testing.T) {
+	t.Parallel()
+	require := require.New(t)
+	f := storetest.New(t)
+	participantID := f.EnsureParticipant("person@example.test", "person", "example.test")
+	person, _, err := f.Store.CreatePersonFromParticipant(participantID)
+	require.NoError(err)
+	_, err = f.Store.RetirePersonUIDAliasContext(t.Context(), "retired-person-uid", &person.ID, "test")
+	require.NoError(err)
+
+	uids, err := f.Store.ListPersonUIDsContext(t.Context(), person.ID)
+	require.NoError(err)
+	assert.Equal(t, []string{person.VCardUID, "retired-person-uid"}, uids)
 }
 
 func TestLinkParticipantsRejectsDifferentCuratedPersons(t *testing.T) {

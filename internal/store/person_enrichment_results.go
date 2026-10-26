@@ -5,7 +5,8 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"net/url"
@@ -33,7 +34,7 @@ const (
 )
 
 // PersonEnrichmentCitation is the bounded public citation metadata linked to
-// one provider attempt. It contains no credential or private identifier.
+// provider attempts. It contains no credential or private identifier.
 type PersonEnrichmentCitation struct {
 	ID           int64      `json:"id"`
 	PersonID     int64      `json:"person_id"`
@@ -274,6 +275,12 @@ func (s *Store) commitPreparedPersonEnrichmentResult(
 		if err := s.lockPersonEnrichmentAuthorityMutationTx(ctx, tx); err != nil {
 			return err
 		}
+		// The nested fact resolver needs the catalog after recheck locks the
+		// person. Join catalog coordination first, retaining authority as the
+		// outermost gate, so definition exposure cannot invert those locks.
+		if err := s.lockAttributeDefinitionCatalogTx(ctx, tx, false); err != nil {
+			return err
+		}
 		disposition, err := s.recheckPersonEnrichmentCommitTx(
 			ctx, tx, prepared.Commit, prepared.Profile, prepared.Generation,
 			prepared.OwnershipRejectedGeneration)
@@ -445,7 +452,7 @@ func (s *Store) recheckPersonEnrichmentCommitTx(
 				"%w: fact generation key", errPersonEnrichmentResultEnvelopeChanged)
 		}
 		switch attempt.State {
-		case "succeeded":
+		case personEnrichmentStateSucceeded:
 			if generationKey != normalKey {
 				return enrichmentCommitDisposition{}, fmt.Errorf(
 					"%w: succeeded ownership generation", errPersonEnrichmentResultEnvelopeChanged)
@@ -498,15 +505,12 @@ func (s *Store) recheckPersonEnrichmentCommitTx(
 	if !tracked {
 		return enrichmentCommitDisposition{Status: personenrichment.ClaimPolicyRejected}, nil
 	}
-	var consentID int64
-	err = tx.QueryRowContext(ctx, `SELECT id FROM person_enrichment_consents
-		WHERE profile_fingerprint = ? AND revoked_at IS NULL ORDER BY id DESC LIMIT 1`+
-		s.dialect.SelectForUpdate(), profile.Fingerprint).Scan(&consentID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return enrichmentCommitDisposition{Status: personenrichment.ClaimPolicyRejected}, nil
-	}
+	active, err := lockActiveConsentTx(ctx, tx, s.dialect, ConsentPersonEnrichment, profile.Fingerprint)
 	if err != nil {
 		return enrichmentCommitDisposition{}, fmt.Errorf("lock enrichment consent: %w", err)
+	}
+	if !active {
+		return enrichmentCommitDisposition{Status: personenrichment.ClaimPolicyRejected}, nil
 	}
 	digests, err := commit.VerifiedReturnedIdentifierDigests()
 	if err != nil {
@@ -563,7 +567,7 @@ func claimsWithIdentityScore(
 		result[i] = claims[i]
 		result[i].Target.Choices = slices.Clone(claims[i].Target.Choices)
 		result[i].Target.Fields = slices.Clone(claims[i].Target.Fields)
-		result[i].SubmittedValue = append(json.RawMessage(nil), claims[i].SubmittedValue...)
+		result[i].SubmittedValue = append(jsontext.Value(nil), claims[i].SubmittedValue...)
 		result[i].Evidence = slices.Clone(claims[i].Evidence)
 		result[i].ValidFrom = copyEnrichmentTimePointer(claims[i].ValidFrom)
 		result[i].ValidUntil = copyEnrichmentTimePointer(claims[i].ValidUntil)
@@ -677,7 +681,7 @@ func (s *Store) completePersonEnrichmentClaimTx(
 	if status == personenrichment.ClaimApplied {
 		refreshAt := completionTime.Add(profile.RefreshInterval)
 		return s.completePersonEnrichmentAttemptTx(ctx, tx, token, personEnrichmentAttemptCompletion{
-			State: "succeeded", ActualCost: commit.Result().Cost,
+			State: personEnrichmentStateSucceeded, ActualCost: commit.Result().Cost,
 			ActualCostMissing: commit.Result().Cost == (personenrichment.Cost{}),
 			FactGenerationKey: generation.GenerationKey, CompletedAt: completionTime,
 			RefreshAt: &refreshAt, RefreshGeneration: "refresh:" + generation.GenerationKey,
@@ -896,7 +900,7 @@ type storedPersonEnrichmentPolicy struct {
 	AllowSensitiveTargets           bool                               `json:"allow_sensitive_targets"`
 	RetentionPosture                string                             `json:"retention_posture"`
 	TrainingPosture                 string                             `json:"training_posture"`
-	RefreshInterval                 time.Duration                      `json:"refresh_interval"`
+	RefreshInterval                 int64                              `json:"refresh_interval"`
 	MaxRequestsPerRun               int64                              `json:"max_requests_per_run"`
 	MaxRequestsPerDay               int64                              `json:"max_requests_per_day"`
 	MaxCostUSDMicrosPerPersonPerDay int64                              `json:"max_cost_usd_micros_per_person_per_day"`
@@ -933,7 +937,7 @@ func (s *Store) loadPersonEnrichmentProfile(
 		AllowedIdentifiers: slices.Clone(policy.AllowedIdentifiers), TargetKeys: targetKeys,
 		AllowSensitiveTargets: policy.AllowSensitiveTargets,
 		RetentionPosture:      policy.RetentionPosture, TrainingPosture: policy.TrainingPosture,
-		RefreshInterval: policy.RefreshInterval, RequestTimeout: time.Second,
+		RefreshInterval: time.Duration(policy.RefreshInterval), RequestTimeout: time.Second,
 		PollInterval: time.Second, MaxJobAge: time.Second,
 		MaxRequestsPerRun: policy.MaxRequestsPerRun, MaxRequestsPerDay: policy.MaxRequestsPerDay,
 		MaxCostUSDMicrosPerPersonPerDay: policy.MaxCostUSDMicrosPerPersonPerDay,
@@ -1213,9 +1217,11 @@ func (s *Store) recheckPersonEnrichmentCatalogTx(
 func personEnrichmentCitationMatches(
 	stored PersonEnrichmentCitation, citation personenrichment.Citation,
 ) bool {
+	// The citation keeps its first retrieval time; each attempt's evidence
+	// records that attempt's retrieval time.
 	if stored.CitationKey != citation.Key || stored.CanonicalURL != citation.URL ||
 		stored.Title != citation.Title || stored.Publisher != citation.Publisher ||
-		stored.Excerpt != citation.Excerpt || !stored.RetrievedAt.Equal(citation.RetrievedAt) {
+		stored.Excerpt != citation.Excerpt {
 		return false
 	}
 	if citation.PublishedAt.IsZero() {

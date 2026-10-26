@@ -40,6 +40,7 @@ func BuildFilter(ctx context.Context, db *sql.DB, rebind func(string) string, q 
 	if q == nil {
 		return f, nil
 	}
+	f.AccountScopes = append(search.AccountScopesFromQuery(q), search.CloneAccountScopes(q.AccountScopes)...)
 	if rebind == nil {
 		rebind = identityRebind
 	}
@@ -93,11 +94,28 @@ func BuildFilter(ctx context.Context, db *sql.DB, rebind func(string) string, q 
 	if len(q.SubjectTerms) > 0 {
 		f.SubjectSubstrings = append([]string(nil), q.SubjectTerms...)
 	}
+	f.FilenameSubstrings = append([]string(nil), q.Filenames...)
+	if len(q.ListIDs) > 0 {
+		f.ListIDSubstrings = append([]string(nil), q.ListIDs...)
+	}
+	if len(q.ListIDExactGroups) > 0 {
+		f.ListIDExactGroups = make([][]string, len(q.ListIDExactGroups))
+		for i, group := range q.ListIDExactGroups {
+			f.ListIDExactGroups[i] = append([]string(nil), group...)
+		}
+	}
 	if len(q.MessageTypes) > 0 {
 		f.MessageTypes = append([]string(nil), q.MessageTypes...)
 	}
 	if len(q.AccountIDs) > 0 {
 		f.SourceIDs = append([]int64(nil), q.AccountIDs...)
+	}
+	if q.ConversationIDs != nil {
+		if len(q.ConversationIDs) == 0 {
+			f.ConversationIDs = []int64{noMatchSentinel}
+		} else {
+			f.ConversationIDs = append([]int64(nil), q.ConversationIDs...)
+		}
 	}
 	return f, nil
 }
@@ -123,8 +141,10 @@ func ApplyMessageFilter(
 		}
 	}
 
+	f.AccountScopes = append(f.AccountScopes, search.CloneAccountScopes(structured.AccountScopes)...)
 	derived := query.MergeFilterIntoQuery(&search.Query{}, structured)
 	intersectSourceIDs(f, derived.AccountIDs)
+	intersectConversationIDs(f, derived.ConversationIDs)
 	if derived.AfterDate != nil {
 		if f.After == nil || derived.AfterDate.After(*f.After) {
 			f.After = derived.AfterDate
@@ -141,6 +161,9 @@ func ApplyMessageFilter(
 	}
 	if len(derived.MessageTypes) > 0 {
 		f.MessageTypes = intersectMessageTypes(f.MessageTypes, derived.MessageTypes)
+	}
+	if structured.ListID != "" {
+		f.ListID = structured.ListID
 	}
 
 	if structured.Sender != "" {
@@ -200,6 +223,30 @@ func intersectSourceIDs(f *vector.Filter, exact []int64) {
 		out = []int64{noMatchSentinel}
 	}
 	f.SourceIDs = out
+}
+
+func intersectConversationIDs(f *vector.Filter, exact []int64) {
+	if exact == nil {
+		return
+	}
+	if len(f.ConversationIDs) == 0 {
+		f.ConversationIDs = append([]int64(nil), exact...)
+		return
+	}
+	allowed := make(map[int64]struct{}, len(exact))
+	for _, id := range exact {
+		allowed[id] = struct{}{}
+	}
+	out := f.ConversationIDs[:0]
+	for _, id := range f.ConversationIDs {
+		if _, ok := allowed[id]; ok {
+			out = append(out, id)
+		}
+	}
+	if len(out) == 0 {
+		out = []int64{noMatchSentinel}
+	}
+	f.ConversationIDs = out
 }
 
 func intersectMessageTypes(existing, exact []string) []string {

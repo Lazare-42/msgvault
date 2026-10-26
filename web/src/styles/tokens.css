@@ -1,8 +1,4 @@
 :root {
-  /* Kit's default muted ink is below AA contrast on the archive's dense,
-   * small metadata labels. Keep the quiet hierarchy while making those
-   * labels readable on app surfaces in both themes. */
-  --text-muted: color-mix(in srgb, var(--text-primary) 66%, var(--bg-surface));
   --font-reading: Charter, 'Bitstream Charter', Georgia, serif;
   --bg-canvas: var(--bg-surface);
   --bg-subtle: var(--bg-inset);
@@ -26,6 +22,13 @@
   --status-error-ink: color-mix(in srgb, var(--accent-red) 72%, var(--text-primary));
   --status-destructive-bg: var(--status-error-bg);
   --status-destructive-ink: var(--status-error-ink);
+  --page-gutter: var(--space-6);
+}
+
+@media (max-width: 760px) {
+  :root {
+    --page-gutter: var(--space-4);
+  }
 }
 
 :where(body, button, input, select, textarea) {
@@ -40,24 +43,19 @@
   font-family: var(--font-mono);
 }
 
-/* Dual-voice typography: UI text speaks the native sans stack; data values
- * (timestamps, counts, scores, sizes, identifiers) speak mono at a slightly
- * smaller optical size so both voices sit on the same baseline weight. */
+/* Data values (timestamps, counts, sizes) keep the UI typeface with tabular
+ * figures so columns align. Identifiers use <code> or [data-metadata]. */
 :where([data-mono]) {
-  font-family: var(--font-mono);
-  font-size: 0.92em;
   font-variant-numeric: tabular-nums;
 }
 
-/* Third voice: small-caps letterspaced section labels for pane headers,
- * month markers, and group headings — never bold-text-as-header. */
+/* Pane headers, month markers, and group headings: small sentence-case
+ * labels, never uppercase. */
 :where([data-section-label]) {
   color: var(--text-muted);
   font-family: var(--font-sans);
   font-size: var(--font-size-xs);
   font-weight: 600;
-  letter-spacing: 0.07em;
-  text-transform: uppercase;
 }
 
 /* Inner-pane scrollbars: thin, muted, darkens on hover. */
@@ -81,6 +79,19 @@
   border-color: color-mix(in srgb, var(--accent-blue) 80%, var(--bg-primary));
 }
 
+/* Kit fades unchecked filter-menu items to half opacity, which drops their
+ * labels below AA contrast. The dot and check mark already show the state. */
+:root .kit-filter-dropdown__panel .kit-filter-dropdown__item:not(.active) {
+  opacity: 1;
+}
+
+/* Kit mixes the muted chip text 25% toward its own background, which drops
+ * the label below AA contrast (3.18:1 in the light theme). The word is the
+ * whole status, so use the palette's muted text token as-is. */
+:root .kit-chip.kit-chip--tone-muted {
+  color: var(--text-muted);
+}
+
 :where([data-artifact]) {
   color: var(--artifact-ink);
 }
@@ -99,7 +110,9 @@
   *::before,
   *::after {
     scroll-behavior: auto !important;
-    transition-duration: 0.01ms !important;
+    /* Even a tiny transition leaves inherited label colors one frame behind
+     * a changed button surface. Apply both colors immediately. */
+    transition-duration: 0s !important;
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
   }

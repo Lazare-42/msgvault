@@ -5,36 +5,71 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/api"
+	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/deletion"
-	"go.kenn.io/msgvault/internal/store"
+	"go.kenn.io/msgvault/internal/microsoft"
 	"go.kenn.io/msgvault/internal/testutil"
+	"golang.org/x/oauth2"
 )
 
-func TestDeleteStaged_PermanentAndYesMutuallyExclusive(t *testing.T) {
-	cmd := &cobra.Command{
-		Use:  "delete-staged",
-		RunE: func(cmd *cobra.Command, args []string) error { return nil },
+func TestRemoteDeleteEnabledUsesConfigOrEnvironment(t *testing.T) {
+	cfg := testConfigValue()
+
+	t.Setenv(daemonCLISubprocessEnv, "")
+	tests := []struct {
+		name          string
+		configEnabled bool
+		envValue      string
+		want          bool
+	}{
+		{name: "both false"},
+		{name: "config only", configEnabled: true, want: true},
+		{name: "environment one only", envValue: "1", want: true},
+		{name: "both true", configEnabled: true, envValue: "1", want: true},
+		{name: "environment zero preserves config", configEnabled: true, envValue: "0", want: true},
+		{name: "environment zero does not enable", envValue: "0"},
+		{name: "environment true does not enable", envValue: "true"},
 	}
-	var permanent, yes bool
-	cmd.Flags().BoolVar(&permanent, "permanent", false, "")
-	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "")
-	cmd.MarkFlagsMutuallyExclusive("permanent", "yes")
-	cmd.SetArgs([]string{"--permanent", "--yes"})
-	cmd.SetOut(new(bytes.Buffer))
-	cmd.SetErr(new(bytes.Buffer))
-	err := cmd.Execute()
-	require.Error(t, err, "want mutual-exclusion error")
-	assert.Contains(t, err.Error(), "permanent")
-	assert.Contains(t, err.Error(), "yes")
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv(remoteDeleteEnvVar, tt.envValue)
+			savedCfg := cfg
+			cfg = config.NewDefaultConfig()
+			cfg.Deletion.RemoteEnabled = tt.configEnabled
+			testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+			t.Cleanup(func() { cfg = savedCfg })
+
+			assert.Equal(t, tt.want, remoteDeleteEnabled(
+				false,
+				invocationFromContext(testCtx),
+			))
+		})
+	}
+
+	t.Run("captured daemon subprocess ignores config after parent marker changes", func(t *testing.T) {
+		t.Setenv(remoteDeleteEnvVar, "")
+		t.Setenv(daemonCLISubprocessEnv, "")
+		savedCfg := cfg
+		cfg = config.NewDefaultConfig()
+		cfg.Deletion.RemoteEnabled = true
+		testCtx := testInvocationContext(t.Context(), cfg, invocationOptions{})
+		t.Cleanup(func() { cfg = savedCfg })
+
+		assert.False(t, remoteDeleteEnabled(true, invocationFromContext(testCtx)))
+	})
 }
 
 func TestListDeletions_ShowsCancelled(t *testing.T) {
@@ -92,7 +127,7 @@ func TestDeleteStagedFailsFastWhenArchiveOwned(t *testing.T) {
 			New(t)
 
 	dataDir := t.TempDir()
-	withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	testCtx := withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
 	t.Setenv(remoteDeleteEnvVar, "1")
 
 	savedPermanent := deletePermanent
@@ -128,7 +163,8 @@ func TestDeleteStagedFailsFastWhenArchiveOwned(t *testing.T) {
 	t.Cleanup(func() { require.NoError(owner.Close(), "close owner lock") })
 
 	cmd := &cobra.Command{Use: "delete-staged"}
-	cmd.SetContext(context.Background())
+	cmd.SetContext(testCtx)
+	cmd.SetContext(testCtx)
 	err = deleteStagedCmd.RunE(cmd, nil)
 	require.Error(err, "delete-staged should fail while the archive is owned")
 	assert.Contains(err.Error(), "write operation is in progress")
@@ -140,7 +176,8 @@ func TestBuildDeleteStagedPlanPinsPlannedBatches(t *testing.T) {
 	assert := assert.New(t)
 
 	dataDir := t.TempDir()
-	withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	testCtx := withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	_ = testCtx
 
 	mgr, err := deletion.NewManager(filepath.Join(dataDir, "deletions"))
 	require.NoError(err, "NewManager")
@@ -150,6 +187,7 @@ func TestBuildDeleteStagedPlanPinsPlannedBatches(t *testing.T) {
 	require.NoError(err, "CreateManifest second")
 
 	plan, err := buildDeleteStagedPlan(deleteStagedPlanOptions{
+		Invocation:          invocationFromContext(testCtx),
 		RemoteDeleteEnabled: true,
 		Yes:                 true,
 	})
@@ -161,6 +199,7 @@ func TestBuildDeleteStagedPlanPinsPlannedBatches(t *testing.T) {
 	require.NoError(err, "CreateManifest new")
 
 	pinned, err := buildDeleteStagedPlan(deleteStagedPlanOptions{
+		Invocation:          invocationFromContext(testCtx),
 		PlannedBatchIDs:     plan.PlannedBatchIDs,
 		RemoteDeleteEnabled: true,
 		Yes:                 true,
@@ -172,6 +211,7 @@ func TestBuildDeleteStagedPlanPinsPlannedBatches(t *testing.T) {
 	first.GmailIDs = append(first.GmailIDs, "gmail-4")
 	require.NoError(mgr.SaveManifest(first), "SaveManifest changed first")
 	changed, err := buildDeleteStagedPlan(deleteStagedPlanOptions{
+		Invocation:          invocationFromContext(testCtx),
 		PlannedBatchIDs:     plan.PlannedBatchIDs,
 		RemoteDeleteEnabled: true,
 		Yes:                 true,
@@ -180,12 +220,67 @@ func TestBuildDeleteStagedPlanPinsPlannedBatches(t *testing.T) {
 	assert.NotEqual(plan.PlanFingerprint, changed.PlanFingerprint, "fingerprint should change when confirmed manifest content changes")
 }
 
+func TestBuildDeleteStagedPlanListGuidanceNamesBothConsentPaths(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	dataDir := t.TempDir()
+	testCtx := withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	_ = testCtx
+	mgr, err := deletion.NewManager(filepath.Join(dataDir, "deletions"))
+	require.NoError(err)
+	manifest := deletion.NewManifestForSource("pending", []string{"gm-1"}, deletion.SourceReference{
+		ID: 11, Type: "gmail", Identifier: "source@example.invalid",
+	})
+	require.NoError(mgr.SaveManifest(manifest))
+
+	listPlan, err := buildDeleteStagedPlan(deleteStagedPlanOptions{
+		Invocation: invocationFromContext(testCtx),
+		List:       true,
+	})
+	require.NoError(err)
+	durable := "[deletion] remote_enabled = true"
+	oneCommand := "One-command alternative: MSGVAULT_ENABLE_REMOTE_DELETE=1"
+	require.Contains(listPlan.Stdout, durable)
+	require.Contains(listPlan.Stdout, oneCommand)
+	assert.Less(strings.Index(listPlan.Stdout, durable), strings.Index(listPlan.Stdout, oneCommand),
+		"list guidance must present durable invoking-CLI config first")
+}
+
+func TestBuildDeleteStagedPlanBlockedErrorNamesBothConsentPaths(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	dataDir := t.TempDir()
+	testCtx := withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	_ = testCtx
+	mgr, err := deletion.NewManager(filepath.Join(dataDir, "deletions"))
+	require.NoError(err)
+	manifest := deletion.NewManifestForSource("pending", []string{"gm-1"}, deletion.SourceReference{
+		ID: 11, Type: "gmail", Identifier: "source@example.invalid",
+	})
+	require.NoError(mgr.SaveManifest(manifest))
+
+	blockedPlan, err := buildDeleteStagedPlan(deleteStagedPlanOptions{
+		Invocation: invocationFromContext(testCtx),
+		Yes:        true,
+	})
+	require.NoError(err)
+	durable := "[deletion] remote_enabled = true"
+	require.Contains(blockedPlan.BlockedError, durable)
+	require.Contains(blockedPlan.BlockedError, "invoking CLI's config.toml for durable consent")
+	require.Contains(blockedPlan.BlockedError, "one-command alternative: MSGVAULT_ENABLE_REMOTE_DELETE=1")
+	assert.Less(strings.Index(blockedPlan.BlockedError, durable), strings.Index(blockedPlan.BlockedError, remoteDeleteEnvVar),
+		"blocked error must present durable invoking-CLI config first")
+}
+
 func TestBuildDeleteStagedPlanFiltersVersionTwoBySourceID(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 
 	dataDir := t.TempDir()
-	withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	testCtx := withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	_ = testCtx
 	mgr, err := deletion.NewManager(filepath.Join(dataDir, "deletions"))
 	require.NoError(err)
 	first := deletion.NewManifestForSource("first", []string{"gm-1"}, deletion.SourceReference{
@@ -198,7 +293,8 @@ func TestBuildDeleteStagedPlanFiltersVersionTwoBySourceID(t *testing.T) {
 	require.NoError(mgr.SaveManifest(second))
 
 	plan, err := buildDeleteStagedPlan(deleteStagedPlanOptions{
-		SourceID: 22, SourceIDSet: true, List: true,
+		Invocation: invocationFromContext(testCtx),
+		SourceID:   22, SourceIDSet: true, List: true,
 		ResolvedSourceType: "gmail", ResolvedSourceIdentifier: "second@example.invalid",
 	})
 	require.NoError(err)
@@ -209,7 +305,8 @@ func TestBuildDeleteStagedPlanFiltersVersionTwoBySourceID(t *testing.T) {
 
 func TestBuildDeleteStagedPlanDoesNotSelectVersionTwoByLegacyFilterAccount(t *testing.T) {
 	dataDir := t.TempDir()
-	withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	testCtx := withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	_ = testCtx
 	mgr, err := deletion.NewManager(filepath.Join(dataDir, "deletions"))
 	require.NoError(t, err)
 	manifest := deletion.NewManifestForSource("durable source", []string{"gm-1"}, deletion.SourceReference{
@@ -219,7 +316,8 @@ func TestBuildDeleteStagedPlanDoesNotSelectVersionTwoByLegacyFilterAccount(t *te
 	require.NoError(t, mgr.SaveManifest(manifest))
 
 	_, err = buildDeleteStagedPlan(deleteStagedPlanOptions{
-		BatchID: manifest.ID, Account: "other@example.invalid", List: true,
+		Invocation: invocationFromContext(testCtx),
+		BatchID:    manifest.ID, Account: "other@example.invalid", List: true,
 	})
 	require.ErrorContains(t, err, "does not match the requested source")
 }
@@ -229,14 +327,16 @@ func TestBuildDeleteStagedPlanAllowsExplicitSelectorForUnboundLegacyManifest(t *
 	assert := assert.New(t)
 
 	dataDir := t.TempDir()
-	withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	testCtx := withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	_ = testCtx
 	mgr, err := deletion.NewManager(filepath.Join(dataDir, "deletions"))
 	require.NoError(err)
 	manifest, err := mgr.CreateManifest("legacy", []string{"gm-1"}, deletion.Filters{})
 	require.NoError(err)
 
 	plan, err := buildDeleteStagedPlan(deleteStagedPlanOptions{
-		Account: "source@example.invalid", List: true,
+		Invocation: invocationFromContext(testCtx),
+		Account:    "source@example.invalid", List: true,
 	})
 	require.NoError(err)
 	assert.Equal([]string{manifest.ID}, plan.PlannedBatchIDs)
@@ -247,7 +347,8 @@ func TestBuildDeleteStagedPlanAllowsSourceIDForLegacyManifestWithMatchingAccount
 	assert := assert.New(t)
 
 	dataDir := t.TempDir()
-	withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	testCtx := withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	_ = testCtx
 	mgr, err := deletion.NewManager(filepath.Join(dataDir, "deletions"))
 	require.NoError(err)
 	manifest, err := mgr.CreateManifest("legacy", []string{"gm-1"}, deletion.Filters{
@@ -260,7 +361,8 @@ func TestBuildDeleteStagedPlanAllowsSourceIDForLegacyManifestWithMatchingAccount
 	require.NoError(err)
 
 	plan, err := buildDeleteStagedPlan(deleteStagedPlanOptions{
-		SourceID: 11, SourceIDSet: true, List: true,
+		Invocation: invocationFromContext(testCtx),
+		SourceID:   11, SourceIDSet: true, List: true,
 		ResolvedSourceType: "gmail", ResolvedSourceIdentifier: "source@example.invalid",
 	})
 	require.NoError(err)
@@ -282,7 +384,7 @@ func TestBuildDeleteStagedPlanInspectsUnboundLegacyManifestMixedWithVersionTwo(t
 			require := require.New(t)
 			assert := assert.New(t)
 			dataDir := t.TempDir()
-			withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+			testCtx := withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
 			mgr, err := deletion.NewManager(filepath.Join(dataDir, "deletions"))
 			require.NoError(err)
 			legacy, err := mgr.CreateManifest("legacy", []string{"gm-1"}, deletion.Filters{})
@@ -292,6 +394,7 @@ func TestBuildDeleteStagedPlanInspectsUnboundLegacyManifestMixedWithVersionTwo(t
 			})
 			require.NoError(mgr.SaveManifest(bound))
 
+			tt.opts.Invocation = invocationFromContext(testCtx)
 			plan, err := buildDeleteStagedPlan(tt.opts)
 			require.NoError(err)
 			assert.ElementsMatch([]string{legacy.ID, bound.ID}, plan.PlannedBatchIDs)
@@ -304,7 +407,8 @@ func TestBuildDeleteStagedPlanInspectsUnboundLegacyManifestMixedWithVersionTwo(t
 func TestBuildDeleteStagedPlanRejectsUnboundLegacyManifestMixedWithVersionTwoDuringExecution(t *testing.T) {
 	require := require.New(t)
 	dataDir := t.TempDir()
-	withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	testCtx := withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	_ = testCtx
 	mgr, err := deletion.NewManager(filepath.Join(dataDir, "deletions"))
 	require.NoError(err)
 	_, err = mgr.CreateManifest("legacy", []string{"gm-1"}, deletion.Filters{})
@@ -313,7 +417,11 @@ func TestBuildDeleteStagedPlanRejectsUnboundLegacyManifestMixedWithVersionTwoDur
 		ID: 11, Type: "gmail", Identifier: "source@example.invalid",
 	})))
 
-	_, err = buildDeleteStagedPlan(deleteStagedPlanOptions{RemoteDeleteEnabled: true, Yes: true})
+	_, err = buildDeleteStagedPlan(deleteStagedPlanOptions{
+		Invocation:          invocationFromContext(testCtx),
+		RemoteDeleteEnabled: true,
+		Yes:                 true,
+	})
 	require.ErrorContains(err, "legacy deletion manifest")
 }
 
@@ -366,14 +474,13 @@ func TestDeleteStagedRejectsUnsupportedSourceBeforeClaim(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	dataDir := t.TempDir()
-	withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	cfg := lifecycleTestConfig(dataDir)
+	testCtx := withStoreResolverConfig(t, cfg)
 	t.Setenv(remoteDeleteEnvVar, "1")
 	t.Setenv(daemonCLISubprocessEnv, strconv.Itoa(os.Getppid()))
 	resetDeleteStagedRoutingGlobals(t)
 
-	st, err := store.Open(cfg.DatabaseDSN())
-	require.NoError(err)
-	require.NoError(st.InitSchema())
+	st := testutil.NewSQLiteTestStoreAt(t, cfg.DatabaseDSN())
 	source, err := st.GetOrCreateSource("slack", "workspace.example.invalid")
 	require.NoError(err)
 	require.NoError(st.Close())
@@ -386,11 +493,12 @@ func TestDeleteStagedRejectsUnsupportedSourceBeforeClaim(t *testing.T) {
 	require.NoError(mgr.SaveManifest(manifest))
 
 	cmd := newDeleteStagedRoutingTestCommand()
+	cmd.SetContext(testCtx)
 	cmd.SetOut(new(bytes.Buffer))
 	cmd.SetErr(new(bytes.Buffer))
 	cmd.SetArgs([]string{"--yes", manifest.ID})
 	err = cmd.Execute()
-	require.ErrorContains(err, "not a gmail or imap source")
+	require.ErrorContains(err, "not a gmail, imap or msmail source")
 	assert.FileExists(filepath.Join(mgr.PendingDir(), manifest.ID+".json"))
 	assert.NoFileExists(filepath.Join(mgr.InProgressDir(), manifest.ID+".json"))
 }
@@ -399,14 +507,13 @@ func TestDeleteStagedOAuthSetupFailureLeavesManifestPending(t *testing.T) {
 	assert := assert.New(t)
 	require := require.New(t)
 	dataDir := t.TempDir()
-	withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	cfg := lifecycleTestConfig(dataDir)
+	testCtx := withStoreResolverConfig(t, cfg)
 	t.Setenv(remoteDeleteEnvVar, "1")
 	t.Setenv(daemonCLISubprocessEnv, strconv.Itoa(os.Getppid()))
 	resetDeleteStagedRoutingGlobals(t)
 
-	st, err := store.Open(cfg.DatabaseDSN())
-	require.NoError(err)
-	require.NoError(st.InitSchema())
+	st := testutil.NewSQLiteTestStoreAt(t, cfg.DatabaseDSN())
 	source, err := st.GetOrCreateSource("gmail", "account@example.invalid")
 	require.NoError(err)
 	require.NoError(st.Close())
@@ -419,6 +526,7 @@ func TestDeleteStagedOAuthSetupFailureLeavesManifestPending(t *testing.T) {
 	require.NoError(mgr.SaveManifest(manifest))
 
 	cmd := newDeleteStagedRoutingTestCommand()
+	cmd.SetContext(testCtx)
 	cmd.SetOut(new(bytes.Buffer))
 	cmd.SetErr(new(bytes.Buffer))
 	cmd.SetArgs([]string{"--yes", manifest.ID})
@@ -473,7 +581,7 @@ func TestBuildDeleteStagedPlanInspectsMultipleVersionTwoSources(t *testing.T) {
 			require := require.New(t)
 			assert := assert.New(t)
 			dataDir := t.TempDir()
-			withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+			testCtx := withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
 			mgr, err := deletion.NewManager(filepath.Join(dataDir, "deletions"))
 			require.NoError(err)
 			first := deletion.NewManifestForSource("first", []string{"gm-1"}, deletion.SourceReference{
@@ -485,6 +593,7 @@ func TestBuildDeleteStagedPlanInspectsMultipleVersionTwoSources(t *testing.T) {
 			require.NoError(mgr.SaveManifest(first))
 			require.NoError(mgr.SaveManifest(second))
 
+			tt.opts.Invocation = invocationFromContext(testCtx)
 			plan, err := buildDeleteStagedPlan(tt.opts)
 			require.NoError(err)
 			assert.ElementsMatch([]string{first.ID, second.ID}, plan.PlannedBatchIDs)
@@ -497,7 +606,8 @@ func TestBuildDeleteStagedPlanInspectsMultipleVersionTwoSources(t *testing.T) {
 func TestBuildDeleteStagedPlanRejectsMultipleVersionTwoSourcesDuringExecution(t *testing.T) {
 	require := require.New(t)
 	dataDir := t.TempDir()
-	withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	testCtx := withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	_ = testCtx
 	mgr, err := deletion.NewManager(filepath.Join(dataDir, "deletions"))
 	require.NoError(err)
 	require.NoError(mgr.SaveManifest(deletion.NewManifestForSource("first", []string{"gm-1"}, deletion.SourceReference{
@@ -507,7 +617,11 @@ func TestBuildDeleteStagedPlanRejectsMultipleVersionTwoSourcesDuringExecution(t 
 		ID: 22, Type: "gmail", Identifier: "second@example.invalid",
 	})))
 
-	_, err = buildDeleteStagedPlan(deleteStagedPlanOptions{RemoteDeleteEnabled: true, Yes: true})
+	_, err = buildDeleteStagedPlan(deleteStagedPlanOptions{
+		Invocation:          invocationFromContext(testCtx),
+		RemoteDeleteEnabled: true,
+		Yes:                 true,
+	})
 	require.ErrorContains(err, "multiple sources")
 }
 
@@ -531,7 +645,8 @@ func TestBuildDeleteStagedPlanRejectsMethodFlagMismatch(t *testing.T) {
 	assert := assert.New(t)
 
 	dataDir := t.TempDir()
-	withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	testCtx := withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	_ = testCtx
 
 	mgr, err := deletion.NewManager(filepath.Join(dataDir, "deletions"))
 	require.NoError(err, "NewManager")
@@ -543,13 +658,18 @@ func TestBuildDeleteStagedPlanRejectsMethodFlagMismatch(t *testing.T) {
 	require.NoError(err, "ClaimManifest")
 	require.Equal(deletion.MethodDelete, claimed.Execution.Method)
 
-	_, err = buildDeleteStagedPlan(deleteStagedPlanOptions{RemoteDeleteEnabled: true, Yes: true})
+	_, err = buildDeleteStagedPlan(deleteStagedPlanOptions{
+		Invocation:          invocationFromContext(testCtx),
+		RemoteDeleteEnabled: true,
+		Yes:                 true,
+	})
 	require.Error(err, "trash-flag resume of a permanent batch must be refused")
 	assert.Contains(err.Error(), "must be resumed with it")
 	assert.Contains(err.Error(), "--permanent")
 
 	// The same batch plans cleanly once the flag matches the stored method.
 	plan, err := buildDeleteStagedPlan(deleteStagedPlanOptions{
+		Invocation:          invocationFromContext(testCtx),
 		RemoteDeleteEnabled: true, Yes: true, Permanent: true,
 	})
 	require.NoError(err, "matching flag plans cleanly")
@@ -560,8 +680,11 @@ func TestPlanCLIDeleteStagedReportsDeletionScopeEscalation(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 
-	_, restore := seedTokenEnv(t, gmailOnlyTokenJSON)
+	tokenPath, restore := seedTokenEnv(t, gmailOnlyTokenJSON)
 	defer restore()
+	cfg := testConfigValue()
+	cfg.OAuth.ClientSecrets = filepath.Join(filepath.Dir(filepath.Dir(tokenPath)), "client_secret.json")
+	testCtx := testInvocationContext(context.Background(), cfg, invocationOptions{})
 
 	st := testutil.NewTestStore(t)
 	_, err := st.GetOrCreateSource(sourceTypeGmail, scopeEscalationAccount)
@@ -572,7 +695,7 @@ func TestPlanCLIDeleteStagedReportsDeletionScopeEscalation(t *testing.T) {
 	manifest, err := mgr.CreateManifest("permanent batch", []string{"gmail-1"}, deletion.Filters{Account: scopeEscalationAccount})
 	require.NoError(err, "CreateManifest")
 
-	got, err := planCLIDeleteStaged(context.Background(), st, api.CLIDeleteStagedPlanRequest{
+	got, err := planCLIDeleteStaged(testCtx, st, api.CLIDeleteStagedPlanRequest{
 		Permanent:           true,
 		Yes:                 true,
 		RemoteDeleteEnabled: true,
@@ -591,12 +714,93 @@ func TestPlanCLIDeleteStagedReportsDeletionScopeEscalation(t *testing.T) {
 	assert.Empty(got.ScopeEscalationOAuthApp, "default app binding")
 }
 
+// An msmail batch passes the source check. A read-only Graph token needs the
+// scope upgrade, and a token with Mail.ReadWrite does not. The plan names the
+// account so the frontend can authorize before starting the daemon subprocess.
+func TestPlanCLIDeleteStagedMSMailScopeEscalation(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	dataDir := t.TempDir()
+	cfg := lifecycleTestConfig(dataDir)
+	testCtx := withStoreResolverConfig(t, cfg)
+	st := testutil.NewTestStore(t)
+	source, err := st.GetOrCreateSource(sourceTypeMSMail, "user@company.example")
+	require.NoError(err)
+	mgr, err := deletion.NewManager(filepath.Join(dataDir, "deletions"))
+	require.NoError(err)
+	require.NoError(mgr.SaveManifest(deletion.NewManifestForSource("graph mail", []string{"AAMk-1"}, deletion.SourceReference{
+		ID: source.ID, Type: source.SourceType, Identifier: source.Identifier,
+	})))
+	tokenPath := microsoft.NewGraphMailManager("", "", "", cfg.TokensDir(), nil).TokenPath(source.Identifier)
+	require.NoError(os.MkdirAll(filepath.Dir(tokenPath), 0o700))
+	saveScopes := func(scopes []string) {
+		data, err := json.Marshal(map[string]any{"access_token": "a", "token_type": "Bearer", "scopes": scopes})
+		require.NoError(err)
+		require.NoError(os.WriteFile(tokenPath, data, 0o600))
+	}
+	req := api.CLIDeleteStagedPlanRequest{Yes: true, RemoteDeleteEnabled: true}
+
+	saveScopes(microsoft.GraphMailScopes())
+	got, err := planCLIDeleteStaged(testCtx, st, req)
+	require.NoError(err)
+	assert.True(got.NeedsScopeEscalation)
+	assert.Contains(got.ScopeEscalationBodyLines, "Deletion requires the Microsoft Graph Mail.ReadWrite permission.")
+	assert.Equal(source.Identifier, got.ScopeEscalationAccount)
+	assert.Equal(sourceTypeMSMail, got.ScopeEscalationSourceType)
+
+	saveScopes(microsoft.GraphMailWriteScopes())
+	got, err = planCLIDeleteStaged(testCtx, st, req)
+	require.NoError(err)
+	assert.True(got.NeedsExecution)
+	assert.False(got.NeedsScopeEscalation)
+}
+
+func TestPreflightDeleteStagedGraphHeadless(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	resetDeleteStagedRoutingGlobals(t)
+	deleteHeadless = true
+	cfg := lifecycleTestConfig(t.TempDir())
+	cfg.Microsoft.ClientID = "test-client"
+	testCtx := withStoreResolverConfig(t, cfg)
+	account := "user@example.com"
+	tokenPath := newGraphMailManager(invocationFromContext(testCtx)).TokenPath(account)
+	require.NoError(os.MkdirAll(filepath.Dir(tokenPath), 0o700))
+	original := []byte(`{"access_token":"existing-read-token"}`)
+	require.NoError(os.WriteFile(tokenPath, original, 0o600))
+
+	// Intercept only the OAuth HTTP boundary. Reaching the device endpoint
+	// proves the frontend selected Graph and headless authorization; failure
+	// must propagate to the caller without replacing the existing token.
+	requestErr := errors.New("device endpoint unavailable")
+	requests := 0
+	httpClient := &http.Client{Transport: testTransport(func(req *http.Request) (*http.Response, error) {
+		requests++
+		assert.Equal(http.MethodPost, req.Method)
+		assert.Equal("https://login.microsoftonline.com/common/oauth2/v2.0/devicecode", req.URL.String())
+		require.NoError(req.ParseForm())
+		assert.Equal("test-client", req.Form.Get("client_id"))
+		assert.Contains(strings.Fields(req.Form.Get("scope")), "https://graph.microsoft.com/Mail.ReadWrite")
+		return nil, requestErr
+	})}
+	testCtx = context.WithValue(testCtx, oauth2.HTTPClient, httpClient)
+	err := preflightDeleteStagedScopeEscalation(testCtx, &daemonclient.CLIDeleteStagedPlan{
+		ScopeEscalationAccount: account, ScopeEscalationSourceType: sourceTypeMSMail,
+	})
+	require.ErrorIs(err, requestErr)
+	assert.Equal(1, requests)
+	after, err := os.ReadFile(tokenPath)
+	require.NoError(err)
+	assert.Equal(original, after)
+}
+
 func TestPlanCLIDeleteStagedResolvesDisplayNameBeforeFiltering(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
 
 	dataDir := t.TempDir()
-	withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
+	testCtx := withStoreResolverConfig(t, lifecycleTestConfig(dataDir))
 	st := testutil.NewTestStore(t)
 	gmailSource, err := st.GetOrCreateSource(sourceTypeGmail, "source@example.invalid")
 	require.NoError(err)
@@ -615,7 +819,7 @@ func TestPlanCLIDeleteStagedResolvesDisplayNameBeforeFiltering(t *testing.T) {
 	})
 	require.NoError(mgr.SaveManifest(gmailManifest))
 
-	got, err := planCLIDeleteStaged(context.Background(), st, api.CLIDeleteStagedPlanRequest{
+	got, err := planCLIDeleteStaged(testCtx, st, api.CLIDeleteStagedPlanRequest{
 		Account: "Work", Yes: true, RemoteDeleteEnabled: true,
 	})
 	require.NoError(err)
@@ -628,8 +832,11 @@ func TestPlanCLIDeleteStagedEscalatesLegacyGmailTokenForPermanentDelete(t *testi
 	require := require.New(t)
 	assert := assert.New(t)
 
-	_, restore := seedTokenEnv(t, legacyTokenJSON)
+	tokenPath, restore := seedTokenEnv(t, legacyTokenJSON)
 	defer restore()
+	cfg := testConfigValue()
+	cfg.OAuth.ClientSecrets = filepath.Join(filepath.Dir(filepath.Dir(tokenPath)), "client_secret.json")
+	testCtx := testInvocationContext(context.Background(), cfg, invocationOptions{})
 
 	st := testutil.NewTestStore(t)
 	_, err := st.GetOrCreateSource(sourceTypeGmail, scopeEscalationAccount)
@@ -640,7 +847,7 @@ func TestPlanCLIDeleteStagedEscalatesLegacyGmailTokenForPermanentDelete(t *testi
 	_, err = mgr.CreateManifest("legacy token batch", []string{"gmail-1"}, deletion.Filters{Account: scopeEscalationAccount})
 	require.NoError(err, "CreateManifest")
 
-	got, err := planCLIDeleteStaged(context.Background(), st, api.CLIDeleteStagedPlanRequest{
+	got, err := planCLIDeleteStaged(testCtx, st, api.CLIDeleteStagedPlanRequest{
 		Permanent:           true,
 		Yes:                 true,
 		RemoteDeleteEnabled: true,

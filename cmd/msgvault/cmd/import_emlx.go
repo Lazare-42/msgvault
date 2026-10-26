@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -20,7 +21,9 @@ import (
 var (
 	importEmlxSourceType         string
 	importEmlxNoResume           bool
+	importEmlxFullReconcile      bool
 	importEmlxCheckpointInterval int
+	importEmlxMaxMessageBytes    int64
 	importEmlxNoAttachments      bool
 	importEmlxAccountsDB         string
 	importEmlxAccounts           []string
@@ -59,9 +62,19 @@ Examples:
 
   # Legacy two-arg form (deprecated, still works)
   msgvault import-emlx me@gmail.com ~/Library/Mail/V10/SOME-GUID
-	`,
+  `,
 	Args: cobra.MaximumNArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if cmd.Flags().Changed("max-message-bytes") &&
+			(importEmlxMaxMessageBytes <= 0 || importEmlxMaxMessageBytes == math.MaxInt64) {
+			return usageErr(cmd, fmt.Errorf("--max-message-bytes must be positive and at most %d bytes",
+				int64(math.MaxInt64-1)))
+		}
+		state := invocationFromCommand(cmd)
+		if state == nil || state.cfg == nil {
+			return errors.New("configuration is unavailable")
+		}
+		cfg := state.cfg
 		if !isDaemonCLISubprocess() {
 			return runDaemonCLICommandHTTPFromCobra(cmd, args)
 		}
@@ -150,7 +163,7 @@ Examples:
 			}
 		}()
 
-		st, cleanup, err := openWritableStoreAndInitForIngest()
+		st, cleanup, err := openWritableStoreAndInitForIngestInvocation(state)
 		if err != nil {
 			return err
 		}
@@ -171,7 +184,7 @@ Examples:
 			importErr = importAutoAccounts(ctx, cmd, st, mailDir, attachmentsDir)
 		}
 
-		return errors.Join(importErr, rebuildCacheAfterWrite(dbPath))
+		return errors.Join(importErr, rebuildCacheAfterWrite(dbPath, state))
 	},
 }
 
@@ -181,13 +194,22 @@ func importSingleAccount(
 	st *store.Store,
 	mailDir, identifier, attachmentsDir string,
 ) error {
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	logger := state.logger
 	summary, err := importer.ImportEmlxDir(
 		ctx, st, mailDir, importer.EmlxImportOptions{
 			SourceType:         importEmlxSourceType,
 			Identifier:         identifier,
 			NoResume:           importEmlxNoResume,
+			FullReconcile:      importEmlxFullReconcile,
 			CheckpointInterval: importEmlxCheckpointInterval,
+			MaxMessageBytes:    importEmlxMaxMessageBytes,
 			AttachmentsDir:     attachmentsDir,
+			RemoteImages:       configuredRemoteImageFetcher(cfg),
 			Logger:             logger,
 		},
 	)
@@ -199,7 +221,7 @@ func importSingleAccount(
 	// retry — see comment in account_identity.go.
 	if ctx.Err() == nil && !summary.HardErrors && !noDefaultIdentityImportEmlx {
 		if summary.SourceID != 0 {
-			confirmDefaultIdentity(cmd.OutOrStdout(), st, summary.SourceID, identifier, identifier, "account-identifier")
+			confirmDefaultIdentity(cmd.OutOrStdout(), st, summary.SourceID, identifier, identifier, "account-identifier", state.logger)
 		} else {
 			logger.Warn("auto-default-identity: missing source id", "identifier", identifier)
 		}
@@ -215,7 +237,7 @@ func importSingleAccount(
 		// next invocation retries and prints the summary then. UX
 		// polish tracked separately in
 		// private/drafts/2026-05-02-issue-import-migration-error-ux.md.
-		if err := runPostSourceCreateMigrations(st); err != nil {
+		if err := runPostSourceCreateMigrationsForInvocation(st, state); err != nil {
 			return fmt.Errorf("post-source-create migrations: %w", err)
 		}
 	}
@@ -230,6 +252,12 @@ func importAutoAccounts(
 	st *store.Store,
 	mailDir, attachmentsDir string,
 ) error {
+	state := invocationFromContext(ctx)
+	if state == nil || state.cfg == nil {
+		return errors.New("configuration is unavailable")
+	}
+	cfg := state.cfg
+	logger := state.logger
 	accountsDBPath := importEmlxAccountsDB
 	if strings.HasPrefix(accountsDBPath, "~/") {
 		home, _ := os.UserHomeDir()
@@ -319,8 +347,11 @@ func importAutoAccounts(
 				SourceType:         importEmlxSourceType,
 				Identifier:         identifier,
 				NoResume:           importEmlxNoResume,
+				FullReconcile:      importEmlxFullReconcile,
 				CheckpointInterval: importEmlxCheckpointInterval,
+				MaxMessageBytes:    importEmlxMaxMessageBytes,
 				AttachmentsDir:     attachmentsDir,
+				RemoteImages:       configuredRemoteImageFetcher(cfg),
 				Logger:             logger,
 			},
 		)
@@ -329,7 +360,7 @@ func importAutoAccounts(
 			continue
 		}
 
-		if summary.MailboxesTotal == 0 {
+		if summary.MailboxesTotal == 0 && !summary.HardErrors {
 			_, _ = fmt.Fprintf(out, "Skipping %s: no mailboxes found\n", identifier)
 			continue
 		}
@@ -342,7 +373,7 @@ func importAutoAccounts(
 				accountDisplay = account.Email
 			}
 			if summary.SourceID != 0 {
-				confirmDefaultIdentity(cmd.OutOrStdout(), st, summary.SourceID, accountDisplay, identifier, "account-identifier")
+				confirmDefaultIdentity(cmd.OutOrStdout(), st, summary.SourceID, accountDisplay, identifier, "account-identifier", state.logger)
 			} else {
 				logger.Warn("auto-default-identity: missing source id", "identifier", identifier)
 			}
@@ -354,7 +385,7 @@ func importAutoAccounts(
 			// above. UX polish tracked in
 			// private/drafts/2026-05-02-issue-import-migration-error-ux.md
 			// for a follow-up PR.
-			if err := runPostSourceCreateMigrations(st); err != nil {
+			if err := runPostSourceCreateMigrationsForInvocation(st, state); err != nil {
 				importErrors = append(importErrors, fmt.Errorf("%s: post-source-create migrations: %w", identifier, err))
 				continue
 			}
@@ -370,7 +401,9 @@ func importAutoAccounts(
 		grandTotal.MessagesAdded += summary.MessagesAdded
 		grandTotal.MessagesUpdated += summary.MessagesUpdated
 		grandTotal.MessagesSkipped += summary.MessagesSkipped
+		grandTotal.FilesUnchanged += summary.FilesUnchanged
 		grandTotal.PartialFiles += summary.PartialFiles
+		grandTotal.AttachmentsRestored += summary.AttachmentsRestored
 		grandTotal.Errors += summary.Errors
 		if summary.HardErrors {
 			grandTotal.HardErrors = true
@@ -445,10 +478,14 @@ func printImportStats(out io.Writer, summary importer.EmlxImportSummary) {
 		"  Skipped (dup):  %d messages\n",
 		summary.MessagesSkipped,
 	)
+	if summary.FilesUnchanged > 0 {
+		_, _ = fmt.Fprintf(out, "  Unchanged:      %d files (content reads avoided)\n", summary.FilesUnchanged)
+	}
 	if summary.PartialFiles > 0 {
 		_, _ = fmt.Fprintf(out,
-			"  Partial files:  %d (body imported; attachments not cached by Apple Mail)\n",
+			"  Partial files:  %d (%d attachments restored from Apple Mail's Attachments/ directory)\n",
 			summary.PartialFiles,
+			summary.AttachmentsRestored,
 		)
 	}
 	_, _ = fmt.Fprintf(out,
@@ -466,12 +503,16 @@ func init() {
 	)
 	importEmlxCmd.Flags().BoolVar(
 		&importEmlxNoResume, "no-resume", false,
-		"Do not resume from an interrupted import",
+		"Ignore interrupted progress; completed file receipts remain usable (use --full-reconcile to revisit every file)",
 	)
+	importEmlxCmd.Flags().BoolVar(&importEmlxFullReconcile, "full-reconcile", false,
+		"Revisit every file and reconcile archived content, attachments, and search")
 	importEmlxCmd.Flags().IntVar(
 		&importEmlxCheckpointInterval, "checkpoint-interval", 200,
 		"Save progress every N messages",
 	)
+	importEmlxCmd.Flags().Int64Var(&importEmlxMaxMessageBytes, "max-message-bytes", 0,
+		"Maximum EMLX file and merged MIME bytes, including encoding (1..9223372036854775806; default 128 MiB)")
 	importEmlxCmd.Flags().BoolVar(
 		&importEmlxNoAttachments, "no-attachments", false,
 		"Do not store attachments on disk",

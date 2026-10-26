@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -128,11 +129,23 @@ func TestEnsureRecipientEnvelopeUniqueIndex_LegacyTableRebuild(t *testing.T) {
 
 	// 3) An alias snapshot for the same participant now inserts, while a
 	//    case variant of an existing snapshot is still rejected.
+	var journalBaseline int
+	require.NoError(st.db.QueryRow(`
+		SELECT COUNT(*) FROM cache_related_change_journal
+		WHERE dataset = 'message_recipients' AND message_id = ?
+	`, msgID).Scan(&journalBaseline), "count recipient cache events before alias")
 	_, err = st.db.Exec(`
 		INSERT INTO message_recipients (message_id, participant_id, recipient_type, display_name, email_address)
 		VALUES (?, ?, 'to', 'Primary', 'alias@example.test')
 	`, msgID, participantID)
 	require.NoError(err, "alias envelope row must insert after the migration")
+	var journalCount int
+	require.NoError(st.db.QueryRow(`
+		SELECT COUNT(*) FROM cache_related_change_journal
+		WHERE dataset = 'message_recipients' AND message_id = ?
+	`, msgID).Scan(&journalCount), "count recipient cache events after migration")
+	assert.Equal(journalBaseline+1, journalCount,
+		"recipient cache triggers must survive the legacy table swap")
 	_, err = st.db.Exec(`
 		INSERT INTO message_recipients (message_id, participant_id, recipient_type, display_name, email_address)
 		VALUES (?, ?, 'to', 'Primary', 'ALIAS@example.test')
@@ -150,6 +163,17 @@ func TestEnsureRecipientEnvelopeUniqueIndex_LegacyTableRebuild(t *testing.T) {
 		`SELECT COUNT(*) FROM message_recipients WHERE message_id = ?`, msgID,
 	).Scan(&rowCount), "count recipient rows")
 	assert.Equal(2, rowCount, "no-op rerun must not change row count")
+	var factsBaseline int
+	require.NoError(st.db.QueryRow(`SELECT COUNT(*) FROM cache_related_change_journal
+		WHERE dataset = 'message_facts' AND message_id = ?`, msgID).Scan(&factsBaseline))
+	_, err = st.db.Exec(`INSERT INTO message_recipients
+		(message_id, participant_id, recipient_type, email_address)
+		VALUES (?, ?, 'from', 'primary@example.test')`, msgID, participantID)
+	require.NoError(err, "insert From row after legacy recipient table rebuild")
+	var factsCount int
+	require.NoError(st.db.QueryRow(`SELECT COUNT(*) FROM cache_related_change_journal
+		WHERE dataset = 'message_facts' AND message_id = ?`, msgID).Scan(&factsCount))
+	assert.Equal(factsBaseline+1, factsCount, "From-facts trigger must survive legacy table swap")
 }
 
 func TestInitSchema_RepairsDanglingLegacyRecipients(t *testing.T) {
@@ -484,4 +508,84 @@ func TestEnsureRecipientEnvelopeUniqueIndex_PGLegacyConstraintDrop(t *testing.T)
 	applied, err := st.IsMigrationApplied(migrationRecipientEnvelopeUnique)
 	require.NoError(err, "read migration ledger")
 	assert.True(applied, "migration must be marked applied")
+}
+
+func TestInitSchemaLegacyRecipientTableCreatesFromAddressIndexAfterColumns(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	st, err := Open(filepath.Join(t.TempDir(), "legacy_from_index.db"))
+	require.NoError(err)
+	t.Cleanup(func() { _ = st.Close() })
+	// Legacy stores need the envelope column before the address index can be built.
+	_, err = st.db.Exec(`CREATE TABLE message_recipients (
+		id INTEGER PRIMARY KEY,
+		message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+		participant_id INTEGER NOT NULL REFERENCES participants(id) ON DELETE CASCADE,
+		recipient_type TEXT NOT NULL,
+		display_name TEXT,
+		UNIQUE(message_id, participant_id, recipient_type)
+	)`)
+	require.NoError(err)
+	logs := captureSlog(t)
+	require.NoError(st.InitSchema())
+	assert.Contains(logs.String(), `"msg":"building index","index":"idx_message_recipients_email_from"`)
+	assert.Contains(logs.String(), `"msg":"built index","index":"idx_message_recipients_email_from"`)
+	var indexes int
+	require.NoError(st.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_message_recipients_email_from'`).Scan(&indexes))
+	assert.Equal(1, indexes)
+	logs.Reset()
+	require.NoError(st.InitSchema(), "index creation is idempotent")
+	assert.NotContains(logs.String(), "idx_message_recipients_email_from", "an existing index is not announced")
+}
+
+func TestIdentityRefreshSelectionsUseIndexes(t *testing.T) {
+	require := require.New(t)
+	st, err := Open(filepath.Join(t.TempDir(), "from_index_plan.db"))
+	require.NoError(err)
+	t.Cleanup(func() { _ = st.Close() })
+	require.NoError(st.InitSchema())
+	plan := func(query string, args ...any) string {
+		t.Helper()
+		rows, err := st.db.Query("EXPLAIN QUERY PLAN "+query, args...)
+		require.NoError(err)
+		defer func() { _ = rows.Close() }()
+		var steps []string
+		for rows.Next() {
+			var id, parent, unused int
+			var detail string
+			require.NoError(rows.Scan(&id, &parent, &unused, &detail))
+			steps = append(steps, detail)
+		}
+		require.NoError(rows.Err())
+		return strings.Join(steps, "\n")
+	}
+	assert.Contains(t, plan(fmt.Sprintf(identityEnvelopeSelection, "LOWER(?)"), int64(1), "alias@example.test"), "SEARCH mr USING INDEX idx_message_recipients_email_from")
+	source, err := st.GetOrCreateSource("gmail", "plan@example.test")
+	require.NoError(err)
+	conv, err := st.EnsureConversation(source.ID, "plan", "Plan")
+	require.NoError(err)
+	_, err = st.db.Exec(`WITH RECURSIVE n(id) AS (SELECT 1 UNION ALL SELECT id+1 FROM n WHERE id<10000)
+		INSERT INTO participants(id, email_address) SELECT id, 'sender-' || id || '@example.test' FROM n`)
+	require.NoError(err)
+	_, err = st.db.Exec(`WITH RECURSIVE n(id) AS (SELECT 1 UNION ALL SELECT id+1 FROM n WHERE id<100000)
+		INSERT INTO messages(conversation_id, source_id, message_type, sender_id)
+		SELECT ?, ?, 'email', (id-1)%10000+1 FROM n`, conv, source.ID)
+	require.NoError(err)
+	for _, stats := range []string{"absent", "analyzed"} {
+		if stats == "analyzed" {
+			_, err = st.db.Exec("ANALYZE")
+			require.NoError(err)
+		}
+		for _, count := range []int{2, 500} {
+			t.Run(fmt.Sprintf("%s/%d", stats, count), func(t *testing.T) {
+				args := []any{source.ID}
+				for id := 1; id <= count; id++ {
+					args = append(args, int64(id))
+				}
+				query := fmt.Sprintf(identitySenderSelection, strings.TrimSuffix(strings.Repeat("?,", count), ","))
+				assert.Contains(t, plan(query, args...), "SEARCH m USING INDEX idx_messages_sender")
+			})
+		}
+	}
 }

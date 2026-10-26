@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -59,6 +60,12 @@ func writeEmbeddings(t *testing.T, w http.ResponseWriter, vecs [][]float32) {
 	require.NoError(t, json.NewEncoder(w).Encode(payload), "encode response")
 }
 
+type embeddingRequest struct {
+	Input      []string `json:"input"`
+	Model      string   `json:"model"`
+	Dimensions *int     `json:"dimensions"`
+}
+
 func decodeRequest(t *testing.T, r *http.Request) embeddingRequest {
 	t.Helper()
 	var req embeddingRequest
@@ -66,7 +73,7 @@ func decodeRequest(t *testing.T, r *http.Request) embeddingRequest {
 	return req
 }
 
-func newRecordingOpenAIClient(t *testing.T) (*Client, *[][]string) {
+func newRecordingOpenAIClient(t *testing.T, dim int) (*Client, *[][]string) {
 	t.Helper()
 	calls := &[][]string{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -74,18 +81,19 @@ func newRecordingOpenAIClient(t *testing.T) (*Client, *[][]string) {
 		*calls = append(*calls, append([]string(nil), req.Input...))
 		vectors := make([][]float32, len(req.Input))
 		for i := range req.Input {
-			vectors[i] = []float32{float32(i + 1)}
+			vectors[i] = make([]float32, dim)
+			vectors[i][0] = float32(i + 1)
 		}
 		writeEmbeddings(t, w, vectors)
 	}))
 	t.Cleanup(srv.Close)
-	return NewClient(Config{Endpoint: srv.URL, Model: "test-model", Dimension: 1}), calls
+	return NewClient(Config{Endpoint: srv.URL, Model: "test-model", Dimension: dim}), calls
 }
 
 // TestClient_EmbedDocumentsFlattensWithoutChangingOrder catches adapters that
 // reorder chunks or lose document boundaries around a flat provider request.
 func TestClient_EmbedDocumentsFlattensWithoutChangingOrder(t *testing.T) {
-	client, calls := newRecordingOpenAIClient(t)
+	client, calls := newRecordingOpenAIClient(t, 1)
 	docs := []DocumentInput{{Chunks: []string{"a", "b"}}, {Chunks: []string{"c"}}}
 
 	got, err := client.EmbedDocuments(context.Background(), docs)
@@ -98,7 +106,7 @@ func TestClient_EmbedDocumentsFlattensWithoutChangingOrder(t *testing.T) {
 // TestClient_EmbedQueryUsesSingleInput catches query adapters that batch or
 // discard the one vector returned by the flat provider request.
 func TestClient_EmbedQueryUsesSingleInput(t *testing.T) {
-	client, calls := newRecordingOpenAIClient(t)
+	client, calls := newRecordingOpenAIClient(t, 1)
 
 	got, err := client.EmbedQuery(context.Background(), "find this")
 
@@ -329,6 +337,8 @@ func TestClient_Embed_Success(t *testing.T) {
 		req := decodeRequest(t, r)
 		assert.Len(req.Input, 2)
 		assert.Equal("test-model", req.Model)
+		// Dimension validates response width; servers must not be asked to truncate.
+		assert.Nil(req.Dimensions)
 		writeEmbeddings(t, w, [][]float32{
 			{0.1, 0.2, 0.3},
 			{0.4, 0.5, 0.6},
@@ -360,7 +370,7 @@ func TestClient_Embed_DimensionMismatch(t *testing.T) {
 	c := NewClient(Config{Endpoint: srv.URL, Model: "m", Dimension: 3})
 	_, err := c.Embed(context.Background(), []string{"a"})
 	require.Error(t, err, "expected dimension mismatch error")
-	assert.ErrorContains(t, err, "dimension mismatch")
+	assert.ErrorIs(t, err, vector.ErrInvalidProviderVector)
 }
 
 func TestClient_Embed_Retries5xx(t *testing.T) {
@@ -401,7 +411,7 @@ func TestClient_Embed_Does_Not_Retry_4xx(t *testing.T) {
 	require.Error(t, err, "expected error for 4xx")
 	assert.Equal(int32(1), attempts.Load(), "no retry on 4xx")
 	require.ErrorContains(t, err, "400")
-	assert.ErrorContains(err, "No models loaded")
+	assert.ErrorIs(err, ErrPermanent4xx)
 }
 
 func TestClient_Embed_AuthHeader(t *testing.T) {
@@ -453,29 +463,63 @@ func TestClient_Embed_GivesUpAfterMaxRetries(t *testing.T) {
 	_, err := c.Embed(context.Background(), []string{"a"})
 	require.Error(t, err, "expected error after exhausting retries")
 	assert.Equal(t, int32(2), attempts.Load())
-	assert.ErrorContains(t, err, "giving up")
+	assert.NotErrorIs(t, err, ErrPermanent4xx)
 }
 
 func TestClient_Embed_ContextCanceledDuringBackoff(t *testing.T) {
-	var attempts atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attempts.Add(1)
-		http.Error(w, "boom", http.StatusInternalServerError)
-	}))
-	defer srv.Close()
+	synctest.Test(t, func(t *testing.T) {
+		var attempts atomic.Int32
+		srv := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			attempts.Add(1)
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}))
 
-	c := NewClient(Config{Endpoint: srv.URL, Model: "m", Dimension: 3, MaxRetries: 10})
+		c := NewClient(Config{Endpoint: "http://127.0.0.1", Model: "m", Dimension: 3, MaxRetries: 10})
+		c.http.Transport = srv.Client().Transport
 
-	ctx, cancel := context.WithCancel(context.Background())
-	// Cancel shortly after start so we hit the backoff wait.
-	go func() {
-		time.Sleep(50 * time.Millisecond)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		// Cancel shortly after start so we hit the backoff wait.
+		go func() {
+			time.Sleep(50 * time.Millisecond)
+			cancel()
+		}()
+
+		_, err := c.Embed(ctx, []string{"a"})
+		require.Error(t, err, "expected error from canceled context")
+		assert.ErrorIs(t, err, context.Canceled)
+	})
+}
+
+func TestVoyageClient_ContextCancellationStopsRetryBackoff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		require := require.New(t)
+		var attempts atomic.Int32
+		server := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			attempts.Add(1)
+			http.Error(w, "transient", http.StatusServiceUnavailable)
+		}))
+		client := NewVoyageClient(VoyageConfig{Endpoint: "http://127.0.0.1", Model: "voyage-context-4", Dimension: 4, MaxRetries: 5})
+		client.http.Transport = server.Client().Transport
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			_, err := client.EmbedQuery(ctx, "query")
+			done <- err
+		}()
+		// In-memory I/O finishes before Wait observes the goroutine blocked on backoff.
+		synctest.Wait()
+		require.Equal(int32(1), attempts.Load())
+		require.Empty(done)
 		cancel()
-	}()
-
-	_, err := c.Embed(ctx, []string{"a"})
-	require.Error(t, err, "expected error from canceled context")
-	assert.ErrorIs(t, err, context.Canceled)
+		synctest.Wait()
+		require.Len(done, 1, "cancellation interrupts backoff before its timer fires")
+		err := <-done
+		require.ErrorIs(err, context.Canceled)
+		require.ErrorContains(err, "context canceled during backoff")
+		assert.Equal(t, int32(1), attempts.Load(), "cancellation prevents another request")
+	})
 }
 
 func TestClient_Embed_MissingIndex(t *testing.T) {
@@ -506,7 +550,7 @@ func TestClient_Embed_MissingIndex(t *testing.T) {
 	c := NewClient(Config{Endpoint: srv.URL, Model: "m", Dimension: 3})
 	_, err := c.Embed(context.Background(), []string{"a", "b"})
 	require.Error(t, err, "expected missing embedding error")
-	assert.ErrorContains(t, err, "missing embedding at index 1")
+	assert.ErrorIs(t, err, vector.ErrInvalidProviderShape)
 }
 
 // TestClient_Embed_Retries429 verifies 429 Too Many Requests is
@@ -539,31 +583,34 @@ func TestClient_Embed_Retries429(t *testing.T) {
 // a context-cancel error rather than racing the default-backoff
 // deadline.
 func TestClient_Embed_HonorsRetryAfterOverridesBackoff(t *testing.T) {
-	var attempts atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		attempts.Add(1)
-		w.Header().Set("Retry-After", "30") // much longer than default 200ms
-		http.Error(w, "rl", http.StatusTooManyRequests)
-	}))
-	defer srv.Close()
+	synctest.Test(t, func(t *testing.T) {
+		var attempts atomic.Int32
+		srv := httptest.NewTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			attempts.Add(1)
+			w.Header().Set("Retry-After", "30") // much longer than default 200ms
+			http.Error(w, "rl", http.StatusTooManyRequests)
+		}))
 
-	c := NewClient(Config{Endpoint: srv.URL, Model: "m", Dimension: 3, MaxRetries: 3})
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		cancel()
-	}()
-	start := time.Now()
-	_, err := c.Embed(ctx, []string{"a"})
-	elapsed := time.Since(start)
-	require.ErrorIs(t, err, context.Canceled)
-	// Should be interrupted at ~100ms by the cancel, well before
-	// 30s. A test failure here would mean Retry-After wasn't
-	// honored and the default backoff completed first.
-	assert.Less(t, elapsed, 500*time.Millisecond, "cancel during Retry-After wait")
-	// One attempt plus possibly a second before cancel; never
-	// enough to finish the Retry-After window.
-	assert.LessOrEqual(t, attempts.Load(), int32(2), "Retry-After should extend the wait")
+		c := NewClient(Config{Endpoint: "http://127.0.0.1", Model: "m", Dimension: 3, MaxRetries: 3})
+		c.http.Transport = srv.Client().Transport
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			time.Sleep(100 * time.Millisecond)
+			cancel()
+		}()
+		start := time.Now()
+		_, err := c.Embed(ctx, []string{"a"})
+		elapsed := time.Since(start)
+		require.ErrorIs(t, err, context.Canceled)
+		// Should be interrupted at ~100ms by the cancel, well before
+		// 30s. A test failure here would mean Retry-After wasn't
+		// honored and the default backoff completed first.
+		assert.Less(t, elapsed, 500*time.Millisecond, "cancel during Retry-After wait")
+		// One attempt plus possibly a second before cancel; never
+		// enough to finish the Retry-After window.
+		assert.LessOrEqual(t, attempts.Load(), int32(2), "Retry-After should extend the wait")
+	})
 }
 
 // TestClient_Embed_RetriesTruncatedBody verifies a truncated JSON
@@ -600,106 +647,27 @@ func TestClient_Embed_RetriesTruncatedBody(t *testing.T) {
 	assert.Len(t, vecs, 1)
 }
 
-// TestClient_parseRetryAfter covers the Retry-After formats (seconds,
-// HTTP-date, unparseable) and the cap that protects against absurd
-// server-supplied values. The (Duration, bool) return distinguishes
-// "Retry-After: 0" (parsed = true, immediate retry) from "missing or
-// unparseable" (parsed = false, use default backoff).
-func TestClient_parseRetryAfter(t *testing.T) {
-	assert := assert.New(t)
-	cases := []struct {
-		in      string
-		wantDur time.Duration
-		wantOk  bool
-	}{
-		{"", 0, false},
-		{"   ", 0, false},
-		{"abc", 0, false},
-		{"-5", 0, false},
-		{"0", 0, true}, // explicit immediate retry
-		{"2", 2 * time.Second, true},
+// The shared retry policy applies backoff even when Retry-After is zero.
+func TestClient_Embed_RetriesRateLimitAndTimeout(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusRequestTimeout} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var calls atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if calls.Add(1) == 1 {
+					w.Header().Set("Retry-After", "0")
+					w.WriteHeader(status)
+					return
+				}
+				writeEmbeddings(t, w, [][]float32{{1, 0, 0, 0}})
+			}))
+			t.Cleanup(srv.Close)
+			c := NewClient(Config{Endpoint: srv.URL, Model: "m", Dimension: 4, MaxRetries: 3})
+			vecs, err := c.Embed(t.Context(), []string{"hello"})
+			require.NoError(t, err)
+			require.Len(t, vecs, 1)
+			assert.Equal(t, int32(2), calls.Load())
+		})
 	}
-	for _, c := range cases {
-		gotDur, gotOk := parseRetryAfter(c.in)
-		assert.Equalf(c.wantDur, gotDur, "parseRetryAfter(%q) duration", c.in)
-		assert.Equalf(c.wantOk, gotOk, "parseRetryAfter(%q) ok", c.in)
-	}
-	// Cap: 7200 seconds is capped to 1 hour.
-	got, ok := parseRetryAfter("7200")
-	assert.Equal(time.Hour, got, "parseRetryAfter(7200) duration")
-	assert.True(ok, "parseRetryAfter(7200) ok")
-	// HTTP-date: one second in the future is a non-zero positive
-	// duration well under the cap.
-	future := time.Now().Add(5 * time.Second).UTC().Format(http.TimeFormat)
-	got, ok = parseRetryAfter(future)
-	assert.True(ok, "parseRetryAfter(%q) ok", future)
-	assert.Greater(got, time.Duration(0), "parseRetryAfter(%q) duration > 0", future)
-	assert.LessOrEqual(got, time.Hour, "parseRetryAfter(%q) duration <= 1h", future)
-}
-
-// TestClient_Embed_RetryAfterZero_RetriesImmediately regresses the
-// bug where Retry-After: 0 was indistinguishable from "no override"
-// and fell back to exponential backoff. With the (Duration, bool)
-// return, an explicit zero must take precedence and retry without
-// waiting. We assert by measuring elapsed time across two attempts:
-// the second attempt must start far sooner than the default
-// 200ms backoff for attempt #1.
-func TestClient_Embed_RetryAfterZero_RetriesImmediately(t *testing.T) {
-	require := require.New(t)
-	assert := assert.New(t)
-	var calls int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		if calls == 1 {
-			w.Header().Set("Retry-After", "0")
-			w.WriteHeader(http.StatusTooManyRequests)
-			return
-		}
-		writeEmbeddings(t, w, [][]float32{{1, 0, 0, 0}})
-	}))
-	defer srv.Close()
-
-	c := NewClient(Config{Endpoint: srv.URL, Model: "m", Dimension: 4, MaxRetries: 3})
-	start := time.Now()
-	vecs, err := c.Embed(context.Background(), []string{"hello"})
-	elapsed := time.Since(start)
-	require.NoError(err, "Embed")
-	require.Len(vecs, 1)
-	// Default backoff for attempt #1 is 1<<1 * 100ms = 200ms.
-	// Retry-After: 0 should drop that to ~0. Allow generous slack
-	// (50ms) for HTTP roundtrips on slow CI.
-	assert.Less(elapsed, 100*time.Millisecond, "Retry-After: 0 should bypass exponential backoff")
-	assert.Equal(2, calls)
-}
-
-func TestClient_Embed_4xxIsPermanent(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, `{"error":{"message":"Invalid input"}}`, http.StatusBadRequest)
-	}))
-	defer srv.Close()
-
-	c := NewClient(Config{
-		Endpoint: srv.URL, Model: "m", Dimension: 4, MaxRetries: 3,
-	})
-	_, err := c.Embed(context.Background(), []string{"hello"})
-	require.Error(t, err, "expected error on 400")
-	require.ErrorIs(t, err, ErrPermanent4xx)
-	// Existing contract: body must still be in the message.
-	assert.ErrorContains(t, err, "Invalid input")
-}
-
-func TestClient_Embed_5xxNotPermanent(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "boom", http.StatusInternalServerError)
-	}))
-	defer srv.Close()
-
-	c := NewClient(Config{
-		Endpoint: srv.URL, Model: "m", Dimension: 4, MaxRetries: 2,
-	})
-	_, err := c.Embed(context.Background(), []string{"hello"})
-	require.Error(t, err, "expected error after retries exhausted")
-	assert.NotErrorIs(t, err, ErrPermanent4xx, "5xx should NOT match ErrPermanent4xx")
 }
 
 func TestClient_Embed_429NotPermanent(t *testing.T) {
@@ -739,7 +707,7 @@ func TestClient_Embed_InvalidIndex(t *testing.T) {
 	c := NewClient(Config{Endpoint: srv.URL, Model: "m", Dimension: 3})
 	_, err := c.Embed(context.Background(), []string{"a"})
 	require.Error(t, err, "expected invalid index error")
-	assert.ErrorContains(t, err, "invalid index")
+	assert.ErrorIs(t, err, vector.ErrInvalidProviderShape)
 }
 
 // TestClient_Embed_RejectsExtraOrDuplicateResponseItems catches provider
@@ -787,7 +755,7 @@ func TestClient_Embed_RejectsExtraOrDuplicateResponseItems(t *testing.T) {
 			_, err := client.Embed(context.Background(), []string{"a"})
 
 			require.Error(t, err)
-			assert.ErrorContains(t, err, "response count mismatch: got 2, expected 1")
+			assert.ErrorIs(t, err, vector.ErrInvalidProviderShape)
 		})
 	}
 }

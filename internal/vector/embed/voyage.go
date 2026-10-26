@@ -3,7 +3,7 @@ package embed
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"go.kenn.io/msgvault/internal/httpretry"
 	"go.kenn.io/msgvault/internal/vector"
 )
 
@@ -119,6 +120,9 @@ func (c *VoyageClient) EmbedDocuments(ctx context.Context, documents []DocumentI
 		if err != nil {
 			return results, err
 		}
+		for _, document := range batch {
+			addEmbeddingPrefix(ctx, c.cfg.DocumentPrefix, len(document.Chunks))
+		}
 		results = append(results, batchResults...)
 	}
 	return results, nil
@@ -156,6 +160,7 @@ func (c *VoyageClient) embedRequest(ctx context.Context, inputs [][]string, inpu
 }
 
 func (c *VoyageClient) embedWithRetry(ctx context.Context, inputs [][]string, inputType string) ([][][]float32, error) {
+	ctx = withEmbeddingAttemptGroup(ctx)
 	body, err := json.Marshal(voyageRequest{
 		Inputs:             inputs,
 		Model:              c.cfg.Model,
@@ -163,7 +168,7 @@ func (c *VoyageClient) embedWithRetry(ctx context.Context, inputs [][]string, in
 		OutputDimension:    c.cfg.Dimension,
 		OutputDType:        "float",
 		EnableAutoChunking: false,
-	})
+	}, json.Deterministic(true))
 	if err != nil {
 		return nil, fmt.Errorf("marshal Voyage request: %w", err)
 	}
@@ -226,7 +231,7 @@ func (c *VoyageClient) doVoyageOnce(ctx context.Context, body []byte, inputs [][
 		return nil, ErrEmbeddingProviderRedirect
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
-		retryAfter, ok := parseRetryAfter(resp.Header.Get("Retry-After"))
+		retryAfter, ok := httpretry.ParseRetryAfter(resp.Header.Get("Retry-After"), time.Hour, time.Now())
 		return nil, &retryError{
 			err:           errors.New("embed: Voyage HTTP 429 (rate limited)"),
 			retryAfter:    retryAfter,
@@ -241,7 +246,7 @@ func (c *VoyageClient) doVoyageOnce(ctx context.Context, body []byte, inputs [][
 	}
 
 	var response voyageResponse
-	if err := json.NewDecoder(resp.Body).Decode(&response); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &response); err != nil {
 		return nil, &retryError{err: fmt.Errorf("decode Voyage response: %w", err)}
 	}
 	return c.decodeVoyageResponse(response, inputs)
@@ -368,4 +373,15 @@ func isVoyageSizeMessage(message string) bool {
 		}
 	}
 	return false
+}
+
+func prependPrefix(inputs []string, prefix string) []string {
+	if prefix == "" || len(inputs) == 0 {
+		return inputs
+	}
+	prefixed := make([]string, len(inputs))
+	for i, input := range inputs {
+		prefixed[i] = prefix + input
+	}
+	return prefixed
 }

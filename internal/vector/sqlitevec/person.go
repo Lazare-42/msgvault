@@ -5,7 +5,7 @@ package sqlitevec
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"strconv"
@@ -350,11 +350,7 @@ func (b *Backend) SearchPeople(ctx context.Context, gen vector.GenerationID, que
 	return hits, nil
 }
 
-type personGenerationQueryer interface {
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-}
-
-func personGeneration(ctx context.Context, q personGenerationQueryer, gen vector.GenerationID) (int, error) {
+func personGeneration(ctx context.Context, q rowQueryer, gen vector.GenerationID) (int, error) {
 	var dim int
 	var state vector.GenerationState
 	err := q.QueryRowContext(ctx,
@@ -375,7 +371,7 @@ func deleteSQLitePersons(ctx context.Context, tx *sql.Tx, vecTable string, gen v
 	if ids == nil {
 		ids = []int64{}
 	}
-	encoded, err := json.Marshal(ids)
+	encoded, err := json.Marshal(ids, json.Deterministic(true))
 	if err != nil {
 		return fmt.Errorf("encode person ids: %w", err)
 	}

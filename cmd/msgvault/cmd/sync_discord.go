@@ -40,6 +40,9 @@ argument is supplied. Guilds run sequentially in stable source order, and one
 guild failure does not prevent later guilds from running.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if invocationFromContext(cmd.Context()) != nil && deps.bind != nil {
+				deps = deps.bind(cmd.Context())
+			}
 			selector := ""
 			if len(args) == 1 {
 				selector = args[0]
@@ -49,6 +52,7 @@ guild failure does not prevent later guilds from running.`,
 	}
 	cmd.Flags().BoolVar(&opts.Full, "full", false, "ignore stored cursors and re-fetch all available history")
 	cmd.Flags().StringVar(&opts.After, "after", "", "exclusive lower bound (YYYY-MM-DD or RFC3339)")
+	addManualSyncCacheFlags(cmd)
 	return cmd
 }
 
@@ -62,7 +66,7 @@ func runSyncDiscord(cmd *cobra.Command, deps discordCommandDeps, selector string
 		return err
 	}
 	defer cleanup()
-	sources, err := resolveDiscordSources(st, selector)
+	sources, err := resolveDiscordSyncSources(st, selector)
 	if err != nil {
 		return usageErr(cmd, err)
 	}
@@ -74,10 +78,12 @@ func runSyncDiscord(cmd *cobra.Command, deps discordCommandDeps, selector string
 			ctx, st, source, deps, opts.Full, after, writeDiscordProgress(cmd.OutOrStdout()),
 		)
 		writeDiscordSyncIssues(cmd.OutOrStdout(), summary)
-		// A nonzero sync run means the importer reached its durable lifecycle.
+		// A re-derivation pass runs before sync creation and can commit archive
+		// changes before cancellation or a fatal repair error. Either that pass
+		// or a sync run requires cache maintenance.
 		// Core message persistence can precede later participant, media, or
 		// reply failures, so MessagesProcessed is not a safe write indicator.
-		if summary != nil && summary.SyncRunID != 0 {
+		if discordSummaryNeedsCacheRefresh(summary) {
 			anyWrites = true
 		}
 		if importErr != nil {
@@ -94,11 +100,21 @@ func runSyncDiscord(cmd *cobra.Command, deps discordCommandDeps, selector string
 	return runErr
 }
 
+func discordSummaryNeedsCacheRefresh(summary *discord.ImportSummary) bool {
+	return summary != nil && (summary.RepairRan || summary.SyncRunID != 0)
+}
+
 func writeDiscordSyncSummary(out io.Writer, label string, summary *discord.ImportSummary) {
 	_, _ = fmt.Fprintf(out, "Discord sync complete: %s\n", label)
 	_, _ = fmt.Fprintf(out, "  Containers processed: %d\n", summary.ContainersProcessed)
 	_, _ = fmt.Fprintf(out, "  Messages added: %d\n", summary.MessagesAdded)
 	_, _ = fmt.Fprintf(out, "  Messages updated: %d\n", summary.MessagesUpdated)
+	if summary.RepairRan {
+		_, _ = fmt.Fprintf(out, "  Message metadata repaired: %d\n", summary.MessageMetadataRepaired)
+		_, _ = fmt.Fprintf(out, "  Attachments retagged from archive: %d\n", summary.AttachmentsRetagged)
+		_, _ = fmt.Fprintf(out, "  Archived payloads not decoded: %d\n", summary.RepairUndecodable)
+		_, _ = fmt.Fprintf(out, "  Derived metadata repair errors: %d\n", summary.RepairErrors)
+	}
 	_, _ = fmt.Fprintf(out, "  Media downloaded: %d\n", summary.MediaDownloaded)
 	_, _ = fmt.Fprintf(out, "  Media pending: %d\n", summary.MediaPending)
 	_, _ = fmt.Fprintf(out, "  Media skipped by policy: %d\n", summary.MediaSkipped)

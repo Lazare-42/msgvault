@@ -251,7 +251,7 @@ func (s *Store) GetOldestWhatsAppMessage(ctx context.Context, sourceID int64, ch
 	var sentAt sql.NullTime
 	if err := row.Scan(&anchor.SourceMessageID, &anchor.IsFromMe, &sentAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, nil
+			return nil, nil //nolint:nilnil // A chat with no archived messages has no history anchor.
 		}
 		return nil, fmt.Errorf("get oldest whatsapp message: %w", err)
 	}

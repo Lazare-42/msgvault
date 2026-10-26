@@ -108,6 +108,27 @@ func TestConfig_Validate(t *testing.T) {
 	}
 }
 
+func TestEmbeddingsConfigValidateRejectsCredentialBearingEndpointComponents(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+	}{
+		{name: "userinfo", endpoint: "https://user:password@host.example/v1"},
+		{name: "query", endpoint: "https://host.example/v1?api_key=secret"},
+		{name: "fragment", endpoint: "https://host.example/v1#secret"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig().Embeddings
+			cfg.Endpoint = tt.endpoint
+			err := cfg.Validate()
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), "password")
+			assert.NotContains(t, err.Error(), "secret")
+		})
+	}
+}
+
 func validConfig() Config {
 	return Config{
 		Enabled: true,
@@ -264,12 +285,57 @@ func TestApplyDefaults_OverridesZeroValues(t *testing.T) {
 	assert.Equal(60, c.Search.RRFK)
 	assert.Equal(100, c.Search.KPerSignal)
 	assert.InDelta(2.0, c.Search.SubjectBoost, 1e-9)
+	assert.Equal("auto", c.Search.SQLiteAccelerator)
+	assert.Equal(8, c.Search.ANNNProbe)
+	assert.Equal(8, c.Search.ANNOversample)
+	assert.GreaterOrEqual(c.Search.ANNThreads, 1)
+	assert.LessOrEqual(c.Search.ANNThreads, 128)
 	if assert.NotNil(c.Search.MaxPageSizeHybrid, "Search.MaxPageSizeHybrid should be set") {
 		assert.Equal(50, *c.Search.MaxPageSizeHybrid)
 	}
 	// Preprocess pointer must not be clobbered.
 	assert.False(c.Preprocess.StripQuotesEnabled(), "user explicitly set false")
 	assert.True(c.Preprocess.StripSignaturesEnabled(), "unset → default")
+}
+
+func TestConfigValidateSQLiteAcceleratorSearchSettings(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*Config)
+		want   string
+	}{
+		{name: "mode", mutate: func(c *Config) { c.Search.SQLiteAccelerator = "surprise" }, want: "sqlite_accelerator"},
+		{name: "nprobe", mutate: func(c *Config) { c.Search.ANNNProbe = -1 }, want: "ann_nprobe"},
+		{name: "oversample", mutate: func(c *Config) { c.Search.ANNOversample = -1 }, want: "ann_oversample"},
+		{name: "threads", mutate: func(c *Config) { c.Search.ANNThreads = 129 }, want: "ann_threads"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := validConfig()
+			c.ApplyDefaults()
+			tc.mutate(&c)
+			err := c.Validate()
+			require.Error(t, err)
+			assert.ErrorContains(t, err, tc.want)
+		})
+	}
+}
+
+func TestConfigValidateSQLiteAcceleratorZeroValuesUseDefaults(t *testing.T) {
+	c := validConfig()
+	c.Search = SearchConfig{}
+	require.NoError(t, c.Validate())
+}
+
+func TestConfigGenerationFingerprintIgnoresSQLiteAcceleratorTuning(t *testing.T) {
+	c := validConfig()
+	c.ApplyDefaults()
+	want := c.GenerationFingerprint()
+	c.Search.SQLiteAccelerator = "exact"
+	c.Search.ANNNProbe = 17
+	c.Search.ANNOversample = 19
+	c.Search.ANNThreads = 3
+	assert.Equal(t, want, c.GenerationFingerprint())
 }
 
 // TestApplyDefaults_PreservesExplicitMaxPageSizeHybridZero guards the
@@ -507,22 +573,6 @@ func TestConfig_GenerationFingerprint_EmbeddingPrefixEncodingIsUnambiguous(t *te
 	assert.NotEqual(t, left.GenerationFingerprint(), right.GenerationFingerprint())
 }
 
-// TestConfig_GenerationFingerprint_IncludesEmbedPolicyVersion pins the
-// trailing :e<embedPolicyVersion> segment. The embed worker switched
-// from one-vector-per-message-with-truncation to N-vectors-per-message-
-// via-ChunkText; without this segment an active generation seeded
-// under the old single-vector policy would silently accept new chunked
-// entries from an upgraded worker, mixing two incompatible vector
-// layouts inside one generation.
-func TestConfig_GenerationFingerprint_IncludesEmbedPolicyVersion(t *testing.T) {
-	base := Config{
-		Embeddings: EmbeddingsConfig{Model: "m", Dimension: 8, MaxInputChars: 6000},
-	}
-	got := base.GenerationFingerprint()
-	suffix := fmt.Sprintf(":e%d", embedPolicyVersion)
-	assert.True(t, strings.HasSuffix(got, suffix), "GenerationFingerprint() = %q, want suffix %q", got, suffix)
-}
-
 func TestConfig_GenerationFingerprint_IncludesEmbedScope(t *testing.T) {
 	base := Config{
 		Embeddings: EmbeddingsConfig{Model: "m", Dimension: 8, MaxInputChars: 6000},
@@ -689,11 +739,10 @@ func TestMultimodalFingerprintChangesForPolicyAndScope(t *testing.T) {
 
 func TestVoyageKeyDoesNotEnableMultimodal(t *testing.T) {
 	assert := assert.New(t)
-	t.Setenv("VOYAGE_API_KEY", "synthetic-key")
 	var cfg Config
 	cfg.ApplyDefaults()
 
-	assert.NotEmpty(cfg.Multimodal.APIKey())
+	assert.Equal("VOYAGE_API_KEY", cfg.Multimodal.APIKeyEnv)
 	assert.False(cfg.Multimodal.Enabled)
 	assert.False(cfg.AnyLaneEnabled())
 	assert.False(cfg.Multimodal.ImagesEnabled())

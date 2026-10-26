@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
@@ -27,36 +28,15 @@ func (b *Backend) PublishScope(ctx context.Context, gen vector.GenerationID, sco
 	}})
 }
 
-type validatedSQLiteScopePublication struct {
-	publication vector.DocumentScopePublication
-	docByMember map[int64]string
-	desiredKeys []string
-}
-
 // PublishScopes atomically publishes a bounded set of affected scopes and
 // refreshes generation accounting once for the whole batch.
 func (b *Backend) PublishScopes(ctx context.Context, gen vector.GenerationID, scopes []vector.DocumentScopePublication) error {
 	if len(scopes) == 0 {
 		return nil
 	}
-	validated := make([]validatedSQLiteScopePublication, len(scopes))
-	seenScopes := make(map[string]struct{}, len(scopes))
-	for i, publication := range scopes {
-		if publication.ScopeKey == "" {
-			return errors.New("publish scope: empty scope key")
-		}
-		if _, exists := seenScopes[publication.ScopeKey]; exists {
-			return fmt.Errorf("publish scopes: duplicate scope key %q", publication.ScopeKey)
-		}
-		seenScopes[publication.ScopeKey] = struct{}{}
-		docByMember, desiredKeys, err := validateDocumentPublication(
-			publication.SourceSequence, publication.Documents, publication.Chunks, publication.FenceOnly)
-		if err != nil {
-			return err
-		}
-		validated[i] = validatedSQLiteScopePublication{
-			publication: publication, docByMember: docByMember, desiredKeys: desiredKeys,
-		}
+	validated, err := vector.ValidateScopePublications(scopes)
+	if err != nil {
+		return err
 	}
 
 	tx, err := b.db.BeginTx(ctx, nil)
@@ -78,8 +58,12 @@ func (b *Backend) PublishScopes(ctx context.Context, gen vector.GenerationID, sc
 	if state == vector.GenerationRetired {
 		return fmt.Errorf("%w: %d", vector.ErrGenerationRetired, gen)
 	}
+	accelerator, err := b.readyAcceleratorForWrite(ctx, tx, gen, dim)
+	if err != nil {
+		return err
+	}
 	for _, scope := range validated {
-		for _, chunk := range scope.publication.Chunks {
+		for _, chunk := range scope.Publication.Chunks {
 			if len(chunk.Vector) != dim {
 				return fmt.Errorf("%w: chunk %d for msg %d has %d dims, gen has %d",
 					vector.ErrDimensionMismatch, chunk.ChunkIndex, chunk.MessageID, len(chunk.Vector), dim)
@@ -90,8 +74,8 @@ func (b *Backend) PublishScopes(ctx context.Context, gen vector.GenerationID, sc
 	now := time.Now().Unix()
 	applied := false
 	for _, scope := range validated {
-		accepted, err := claimSQLiteScopeSequence(ctx, tx, gen, scope.publication.ScopeKey,
-			scope.publication.SourceSequence)
+		accepted, err := claimSQLiteScopeSequence(ctx, tx, gen, scope.Publication.ScopeKey,
+			scope.Publication.SourceSequence)
 		if err != nil {
 			return err
 		}
@@ -99,13 +83,13 @@ func (b *Backend) PublishScopes(ctx context.Context, gen vector.GenerationID, sc
 			continue
 		}
 		applied = true
-		if scope.publication.FenceOnly {
-			if err := fenceSQLiteScope(ctx, tx, gen, scope.publication, now); err != nil {
+		if scope.Publication.FenceOnly {
+			if err := fenceSQLiteScope(ctx, tx, gen, scope.Publication, now); err != nil {
 				return err
 			}
 			continue
 		}
-		if err := b.publishSQLiteScope(ctx, tx, gen, dim, scope, now); err != nil {
+		if err := b.publishSQLiteScope(ctx, tx, gen, dim, scope, now, accelerator); err != nil {
 			return err
 		}
 	}
@@ -117,6 +101,9 @@ func (b *Backend) PublishScopes(ctx context.Context, gen vector.GenerationID, sc
 		   )
 		 WHERE id = ?`, int64(gen), int64(gen)); err != nil {
 			return fmt.Errorf("refresh generation message count: %w", err)
+		}
+		if err := syncReadyAccelerator(ctx, tx, accelerator); err != nil {
+			return err
 		}
 	}
 	if err := tx.Commit(); err != nil {
@@ -146,9 +133,9 @@ func claimSQLiteScopeSequence(
 }
 
 func (b *Backend) publishSQLiteScope(ctx context.Context, tx *sql.Tx, gen vector.GenerationID, dim int,
-	scope validatedSQLiteScopePublication, now int64) error {
-	publication := scope.publication
-	ownedIDs, err := sqliteOwnedMembersForPublication(ctx, tx, gen, publication.ScopeKey, scope.desiredKeys)
+	scope vector.ValidatedScopePublication, now int64, accelerator *AcceleratorStatus) error {
+	publication := scope.Publication
+	ownedIDs, err := sqliteOwnedMembersForPublication(ctx, tx, gen, publication.ScopeKey, scope.DesiredKeys)
 	if err != nil {
 		return err
 	}
@@ -156,18 +143,18 @@ func (b *Backend) publishSQLiteScope(ctx context.Context, tx *sql.Tx, gen vector
 	if err != nil {
 		return err
 	}
-	preserved, err := validatedPreservedSQLiteMembers(current, publication.Documents)
+	preserved, err := vector.PreservedDocumentMembers(current, publication.Documents)
 	if err != nil {
 		return err
 	}
-	for messageID := range scope.docByMember {
+	for messageID := range scope.DocByMember {
 		ownedIDs[messageID] = struct{}{}
 	}
 	for messageID := range preserved {
 		delete(ownedIDs, messageID)
 	}
-	ids := sortedDocumentIDs(ownedIDs)
-	if err := deleteForMessageIDs(ctx, tx, VectorTableName(dim), gen, ids); err != nil {
+	ids := slices.Sorted(maps.Keys(ownedIDs))
+	if err := deleteForMessageIDs(ctx, tx, VectorTableName(dim), acceleratorTable(accelerator), gen, ids); err != nil {
 		return fmt.Errorf("clear replaced document vectors: %w", err)
 	}
 
@@ -183,7 +170,7 @@ func (b *Backend) publishSQLiteScope(ctx context.Context, tx *sql.Tx, gen vector
 		   )`, int64(gen), int64(gen), publication.ScopeKey); err != nil {
 		return fmt.Errorf("clear old scope membership: %w", err)
 	}
-	for _, key := range scope.desiredKeys {
+	for _, key := range scope.DesiredKeys {
 		if _, err := tx.ExecContext(ctx,
 			`DELETE FROM embedding_document_members WHERE generation_id = ? AND document_key = ?`,
 			int64(gen), key); err != nil {
@@ -231,87 +218,7 @@ func (b *Backend) publishSQLiteScope(ctx context.Context, tx *sql.Tx, gen vector
 		}
 	}
 
-	return sqliteInsertDocumentChunks(ctx, tx, gen, dim, publication.Chunks, now)
-}
-
-func validateDocumentPublication(
-	sourceSequence int64, docs []vector.DocumentPublication, chunks []vector.Chunk, fenceOnly bool,
-) (map[int64]string, []string, error) {
-	if fenceOnly && len(chunks) != 0 {
-		return nil, nil, errors.New("publish scope: fence-only publication cannot contain chunks")
-	}
-	docByMember := make(map[int64]string)
-	preserved := make(map[int64]struct{})
-	seenKeys := make(map[string]struct{}, len(docs))
-	keys := make([]string, 0, len(docs))
-	for _, doc := range docs {
-		if doc.SourceSequence != sourceSequence {
-			return nil, nil, fmt.Errorf("publish scope: document %q source sequence %d does not match scope sequence %d", doc.Key, doc.SourceSequence, sourceSequence)
-		}
-		if doc.Key == "" || doc.Kind == "" || doc.Revision == "" {
-			return nil, nil, errors.New("publish scope: document key, kind, and revision are required")
-		}
-		if _, exists := seenKeys[doc.Key]; exists {
-			return nil, nil, fmt.Errorf("publish scope: duplicate document key %q", doc.Key)
-		}
-		seenKeys[doc.Key] = struct{}{}
-		keys = append(keys, doc.Key)
-		for _, messageID := range doc.Members {
-			if owner, exists := docByMember[messageID]; exists {
-				return nil, nil, fmt.Errorf("publish scope: message %d belongs to both %q and %q", messageID, owner, doc.Key)
-			}
-			docByMember[messageID] = doc.Key
-			if doc.PreserveVectors {
-				preserved[messageID] = struct{}{}
-			}
-		}
-	}
-	chunked := make(map[int64]struct{}, len(chunks))
-	for _, chunk := range chunks {
-		if _, exists := docByMember[chunk.MessageID]; !exists {
-			return nil, nil, fmt.Errorf("publish scope: chunk message %d has no desired document owner", chunk.MessageID)
-		}
-		if _, exists := preserved[chunk.MessageID]; exists {
-			return nil, nil, fmt.Errorf("publish scope: preserved document member %d also has a replacement chunk", chunk.MessageID)
-		}
-		chunked[chunk.MessageID] = struct{}{}
-	}
-	for messageID := range preserved {
-		chunked[messageID] = struct{}{}
-	}
-	if !fenceOnly {
-		for messageID := range docByMember {
-			if _, exists := chunked[messageID]; !exists {
-				return nil, nil, fmt.Errorf("publish scope: document member %d has no chunk", messageID)
-			}
-		}
-	}
-	slices.Sort(keys)
-	return docByMember, keys, nil
-}
-
-func validatedPreservedSQLiteMembers(
-	current []vector.DocumentRecord, desired []vector.DocumentPublication,
-) (map[int64]struct{}, error) {
-	currentByKey := make(map[string]vector.DocumentRecord, len(current))
-	for _, record := range current {
-		currentByKey[record.Key] = record
-	}
-	preserved := make(map[int64]struct{})
-	for _, doc := range desired {
-		if !doc.PreserveVectors {
-			continue
-		}
-		record, ok := currentByKey[doc.Key]
-		if !ok || record.Kind != doc.Kind || record.PublishedRevision != doc.Revision ||
-			!slices.Equal(record.Members, doc.Members) {
-			return nil, fmt.Errorf("%w: preserved document %q changed", vector.ErrDocumentFenceChanged, doc.Key)
-		}
-		for _, messageID := range doc.Members {
-			preserved[messageID] = struct{}{}
-		}
-	}
-	return preserved, nil
+	return insertMessageChunks(ctx, tx, gen, dim, publication.Chunks, now, accelerator)
 }
 
 func fenceSQLiteScope(
@@ -322,7 +229,7 @@ func fenceSQLiteScope(
 	if err != nil {
 		return err
 	}
-	if !sameFenceDocuments(current, publication.Documents) {
+	if !vector.SameFenceDocuments(current, publication.Documents) {
 		return fmt.Errorf("%w: %q", vector.ErrDocumentFenceChanged, publication.ScopeKey)
 	}
 	if _, err := tx.ExecContext(ctx, `
@@ -339,6 +246,7 @@ func fenceSQLiteScope(
 func sqliteScopeDocumentsTx(
 	ctx context.Context, tx *sql.Tx, gen vector.GenerationID, scopeKey string,
 ) ([]vector.DocumentRecord, error) {
+	//nolint:rowserrcheck // ScanScopeDocuments owns rows and checks Err.
 	rows, err := tx.QueryContext(ctx, `
 		SELECT d.document_key, d.kind, d.published_revision, m.message_id
 		  FROM embedding_documents d
@@ -349,44 +257,7 @@ func sqliteScopeDocumentsTx(
 	if err != nil {
 		return nil, fmt.Errorf("read scope %q document fence: %w", scopeKey, err)
 	}
-	defer func() { _ = rows.Close() }()
-	records := make([]vector.DocumentRecord, 0)
-	for rows.Next() {
-		var key, kind, revision string
-		var member sql.NullInt64
-		if err := rows.Scan(&key, &kind, &revision, &member); err != nil {
-			return nil, fmt.Errorf("scan scope %q document fence: %w", scopeKey, err)
-		}
-		if len(records) == 0 || records[len(records)-1].Key != key {
-			records = append(records, vector.DocumentRecord{Key: key, Kind: kind,
-				PublishedRevision: revision, Members: []int64{}})
-		}
-		if member.Valid {
-			records[len(records)-1].Members = append(records[len(records)-1].Members, member.Int64)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("read scope %q document fence rows: %w", scopeKey, err)
-	}
-	return records, nil
-}
-
-func sameFenceDocuments(current []vector.DocumentRecord, desired []vector.DocumentPublication) bool {
-	if len(current) != len(desired) {
-		return false
-	}
-	desiredByKey := make(map[string]vector.DocumentPublication, len(desired))
-	for _, doc := range desired {
-		desiredByKey[doc.Key] = doc
-	}
-	for _, record := range current {
-		doc, ok := desiredByKey[record.Key]
-		if !ok || record.Kind != doc.Kind || record.PublishedRevision != doc.Revision ||
-			!slices.Equal(record.Members, doc.Members) {
-			return false
-		}
-	}
-	return true
+	return vector.ScanScopeDocuments(rows, scopeKey)
 }
 
 func sqliteOwnedMembersForPublication(ctx context.Context, tx *sql.Tx, gen vector.GenerationID, scopeKey string, desiredKeys []string) (map[int64]struct{}, error) {
@@ -426,54 +297,6 @@ func stringsToAny(values []string) []any {
 		out[i] = value
 	}
 	return out
-}
-
-func sortedDocumentIDs(ids map[int64]struct{}) []int64 {
-	out := make([]int64, 0, len(ids))
-	for id := range ids {
-		out = append(out, id)
-	}
-	slices.Sort(out)
-	return out
-}
-
-func sqliteInsertDocumentChunks(ctx context.Context, tx *sql.Tx, gen vector.GenerationID, dim int, chunks []vector.Chunk, now int64) error {
-	if len(chunks) == 0 {
-		return nil
-	}
-	embedStmt, err := tx.PrepareContext(ctx, `
-		INSERT INTO embeddings
-			(generation_id, message_id, chunk_index, embedded_at, source_char_len,
-			 chunk_char_start, chunk_char_end, source_basis, truncated)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		RETURNING embedding_id`)
-	if err != nil {
-		return fmt.Errorf("prepare document embedding insert: %w", err)
-	}
-	defer func() { _ = embedStmt.Close() }()
-	vecStmt, err := tx.PrepareContext(ctx, fmt.Sprintf(
-		`INSERT INTO %s (generation_id, embedding_id, embedding) VALUES (?, ?, ?)`, VectorTableName(dim)))
-	if err != nil {
-		return fmt.Errorf("prepare document vector insert: %w", err)
-	}
-	defer func() { _ = vecStmt.Close() }()
-	for _, chunk := range chunks {
-		truncated := 0
-		if chunk.Truncated {
-			truncated = 1
-		}
-		var embeddingID int64
-		if err := embedStmt.QueryRowContext(ctx,
-			int64(gen), chunk.MessageID, chunk.ChunkIndex, now, chunk.SourceCharLen,
-			chunk.ChunkCharStart, chunk.ChunkCharEnd, int(chunk.SourceBasis), truncated,
-		).Scan(&embeddingID); err != nil {
-			return fmt.Errorf("insert document embedding (msg %d chunk %d): %w", chunk.MessageID, chunk.ChunkIndex, err)
-		}
-		if _, err := vecStmt.ExecContext(ctx, int64(gen), embeddingID, float32SliceBlob(chunk.Vector)); err != nil {
-			return fmt.Errorf("insert document vector (msg %d chunk %d): %w", chunk.MessageID, chunk.ChunkIndex, err)
-		}
-	}
-	return nil
 }
 
 func (b *Backend) GetDocument(ctx context.Context, gen vector.GenerationID, key string) (vector.DocumentRecord, error) {
@@ -647,21 +470,22 @@ func (b *Backend) CleanupDocumentJournalIfUnused(ctx context.Context) error {
 		return fmt.Errorf("open coordinated contextual journal cleanup: %w", err)
 	}
 	defer func() { _ = conn.Close() }()
-	tx, err := conn.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin contextual journal cleanup: %w", err)
-	}
-	defer func() { _ = tx.Rollback() }()
 
+	// Inspect outside the transaction so its first statement can wait for the writer lock.
 	var schemaReady int
-	if err := tx.QueryRowContext(ctx, `
+	if err := conn.QueryRowContext(ctx, `
 		SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embedding_change_clock')
 		   AND EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'embedding_changes')`).Scan(&schemaReady); err != nil {
 		return fmt.Errorf("inspect contextual journal schema: %w", err)
 	}
 	if schemaReady == 0 {
-		return tx.Commit()
+		return nil
 	}
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin contextual journal cleanup: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE embedding_change_clock SET sequence = sequence WHERE singleton = 1`); err != nil {
 		return fmt.Errorf("lock contextual journal for cleanup: %w", err)

@@ -9,7 +9,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"encoding/pem"
 	"errors"
 	"fmt"
@@ -52,7 +53,8 @@ const (
 	// scopeOfflineAccess is the OAuth scope requesting a refresh token.
 	scopeOfflineAccess = "offline_access"
 	// scopeEmail is the OpenID "email" scope requested alongside the IMAP scope.
-	scopeEmail = "email"
+	scopeEmail   = "email"
+	scopeProfile = "profile"
 	// logKeyEmail is the structured-log field key carrying the account email.
 	logKeyEmail = "email"
 )
@@ -66,7 +68,7 @@ func scopesForEmail(email string) []string {
 		imapScope = ScopeIMAPPersonal
 		smtpScope = ScopeSMTPPersonal
 	}
-	return []string{imapScope, smtpScope, scopeOfflineAccess, "openid", scopeEmail}
+	return []string{imapScope, smtpScope, scopeOfflineAccess, "openid", scopeEmail, scopeProfile}
 }
 
 // isPersonalMicrosoftAccount returns true for common consumer Microsoft domains.
@@ -136,6 +138,12 @@ type Manager struct {
 	redirectURI string
 	tokensDir   string
 	logger      *slog.Logger
+	// deviceCode selects the device-code flow instead of the browser flow.
+	deviceCode bool
+	// signInName is the Microsoft sign-in name when it differs from the mailbox.
+	signInName string
+	// authorityURL overrides the Microsoft identity host for testing.
+	authorityURL string
 
 	// browserFlowFn overrides browserFlow for testing. Returns (token, nonce, error).
 	browserFlowFn func(ctx context.Context, email string, scopes []string) (*oauth2.Token, string, error)
@@ -159,16 +167,35 @@ func NewManager(clientID, tenantID, redirectURI, tokensDir string, logger *slog.
 	}
 }
 
+// UseDeviceCode makes Authorize sign in with a device code: the user opens a
+// Microsoft URL on any device and enters a code, so no local browser or
+// localhost callback is needed.
+func (m *Manager) UseDeviceCode() {
+	m.deviceCode = true
+}
+
+// UseSignInName accepts name as the signed-in account for the mailbox, for
+// accounts whose sign-in name differs from their address. It is also the
+// browser login hint.
+func (m *Manager) UseSignInName(name string) {
+	m.signInName = name
+}
+
 func (m *Manager) oauthConfig(scopes []string) *oauth2.Config {
 	return m.oauthConfigWithTenant(m.tenantID, scopes)
 }
 
 func (m *Manager) oauthConfigWithTenant(tenantID string, scopes []string) *oauth2.Config {
+	authority := "https://login.microsoftonline.com"
+	if m.authorityURL != "" {
+		authority = m.authorityURL
+	}
 	return &oauth2.Config{
 		ClientID: m.clientID,
 		Endpoint: oauth2.Endpoint{
-			AuthURL:  fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/authorize", tenantID),
-			TokenURL: fmt.Sprintf("https://login.microsoftonline.com/%s/oauth2/v2.0/token", tenantID),
+			AuthURL:       fmt.Sprintf("%s/%s/oauth2/v2.0/authorize", authority, tenantID),
+			TokenURL:      fmt.Sprintf("%s/%s/oauth2/v2.0/token", authority, tenantID),
+			DeviceAuthURL: fmt.Sprintf("%s/%s/oauth2/v2.0/devicecode", authority, tenantID),
 		},
 		RedirectURL: m.redirectURI,
 		Scopes:      scopes,
@@ -177,14 +204,18 @@ func (m *Manager) oauthConfigWithTenant(tenantID string, scopes []string) *oauth
 
 func (m *Manager) Authorize(ctx context.Context, email string) error {
 	scopes := scopesForEmail(email)
+	hint := email
+	if m.signInName != "" {
+		hint = m.signInName
+	}
 	flow := m.doBrowserFlow
-	token, nonce, err := flow(ctx, email, scopes)
+	token, nonce, err := flow(ctx, hint, scopes)
 	if err != nil {
 		return err
 	}
 	_, claims, err := m.resolveTokenEmail(ctx, email, token, nonce)
 	if err != nil {
-		return err
+		return m.signInHint(email, claims, err)
 	}
 
 	// Correct IMAP scope if the domain-based guess was wrong.
@@ -200,14 +231,14 @@ func (m *Manager) Authorize(ctx context.Context, email string) error {
 				"from", scopes[0],
 				"to", correctIMAPScope,
 			)
-			scopes = []string{correctIMAPScope, smtpScopeForTenant(claims.TenantID), scopeOfflineAccess, "openid", scopeEmail}
-			token, nonce, err = flow(ctx, email, scopes)
+			scopes = []string{correctIMAPScope, smtpScopeForTenant(claims.TenantID), scopeOfflineAccess, "openid", scopeEmail, scopeProfile}
+			token, nonce, err = flow(ctx, hint, scopes)
 			if err != nil {
 				return fmt.Errorf("re-authorize with correct IMAP scope: %w", err)
 			}
 			_, claims, err = m.resolveTokenEmail(ctx, email, token, nonce)
 			if err != nil {
-				return err
+				return m.signInHint(email, claims, err)
 			}
 		}
 	}
@@ -219,18 +250,56 @@ func (m *Manager) Authorize(ctx context.Context, email string) error {
 	return m.saveToken(email, token, scopes, tenantID)
 }
 
-// doBrowserFlow dispatches to browserFlowFn (test hook) or the real browserFlow.
+// signInHint explains a mismatch that came from the sign-in name, since that
+// name may legitimately differ from the mailbox.
+func (m *Manager) signInHint(email string, claims *idTokenClaims, err error) error {
+	var mismatch *TokenMismatchError
+	if !errors.As(err, &mismatch) || claims == nil || claims.Email != "" {
+		return err
+	}
+	if m.signInName != "" {
+		return fmt.Errorf("%w; that account is not the --sign-in name %s either", err, m.signInName)
+	}
+	return fmt.Errorf("%w; sign in as %s, or if %s is your own sign-in name for that mailbox, pass it with --sign-in",
+		err, email, mismatch.Actual)
+}
+
+// doBrowserFlow dispatches to browserFlowFn (test hook), the device-code flow,
+// or the real browserFlow.
 func (m *Manager) doBrowserFlow(ctx context.Context, email string, scopes []string) (*oauth2.Token, string, error) {
 	if m.browserFlowFn != nil {
 		return m.browserFlowFn(ctx, email, scopes)
 	}
+	if m.deviceCode {
+		return m.deviceFlow(ctx, scopes)
+	}
 	return m.browserFlow(ctx, email, scopes)
+}
+
+// deviceFlow runs the OAuth device authorization grant (RFC 8628). It returns
+// an empty nonce: the device flow sends none, so the ID token carries none.
+func (m *Manager) deviceFlow(ctx context.Context, scopes []string) (*oauth2.Token, string, error) {
+	cfg := m.oauthConfig(scopes)
+	da, err := cfg.DeviceAuth(ctx)
+	if err != nil {
+		return nil, "", fmt.Errorf("request device code: %w", err)
+	}
+	fmt.Printf("To sign in, open %s on any device and enter the code %s\n", da.VerificationURI, da.UserCode)
+	fmt.Printf("Waiting for authorization...\n\n")
+	token, err := cfg.DeviceAccessToken(ctx, da)
+	if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+		return nil, "", errors.New("the device code expired before sign-in finished; run the command again")
+	}
+	if err != nil {
+		return nil, "", fmt.Errorf("device code authorization: %w", err)
+	}
+	return token, "", nil
 }
 
 // tokenRefreshTimeout bounds how long a single token refresh HTTP request
 // may take. Prevents indefinite hangs when Microsoft's token endpoint is
 // unreachable, while still being generous enough for slow networks.
-const tokenRefreshTimeout = 30 * time.Second
+var tokenRefreshTimeout = 30 * time.Second
 
 // TokenSource returns a function that provides fresh access tokens.
 // Suitable for passing to imap.WithTokenSource. The returned function
@@ -303,14 +372,24 @@ func (m *Manager) TokenSource(ctx context.Context, email string) (func(context.C
 	// operations; tying it to a cancellable context would cause silent
 	// failures on the next call after cancellation.
 	ts := oauthCfg.TokenSource(context.Background(), &tf.Token)
+	return refreshingAccessToken(ts, tf, email, "Microsoft", func(tok *oauth2.Token) error {
+		return m.saveToken(email, tok, scopes, tf.TenantID)
+	}), nil
+}
 
+// refreshingAccessToken wraps ts so each call is bounded by
+// tokenRefreshTimeout and the caller's context, and persists every token that
+// differs from the last one seen. product names the token in errors.
+func refreshingAccessToken(
+	ts oauth2.TokenSource, tf *tokenFile, email, product string, save func(*oauth2.Token) error,
+) func(context.Context) (string, error) {
+	lowerProduct := strings.ToLower(product)
 	var (
 		mu               sync.Mutex
 		lastAccessToken  = tf.AccessToken
 		lastRefreshToken = tf.RefreshToken
 		lastExpiry       = tf.Expiry
 	)
-
 	return func(callCtx context.Context) (string, error) {
 		// Run ts.Token() in a goroutine bounded by a timeout and the
 		// caller's context. The oauth2 TokenSource is internally
@@ -334,13 +413,13 @@ func (m *Manager) TokenSource(ctx context.Context, email string) (func(context.C
 		select {
 		case res := <-ch:
 			if res.err != nil {
-				return "", fmt.Errorf("refresh Microsoft token: %w", res.err)
+				return "", fmt.Errorf("refresh %s token: %w", product, res.err)
 			}
 			tok = res.tok
 		case <-timer.C:
-			return "", fmt.Errorf("microsoft token refresh timed out after %s — check network connectivity", tokenRefreshTimeout)
+			return "", fmt.Errorf("%s token refresh timed out after %s — check network connectivity", lowerProduct, tokenRefreshTimeout)
 		case <-callCtx.Done():
-			return "", fmt.Errorf("microsoft token refresh cancelled: %w", callCtx.Err())
+			return "", fmt.Errorf("%s token refresh cancelled: %w", lowerProduct, callCtx.Err())
 		}
 
 		mu.Lock()
@@ -355,13 +434,13 @@ func (m *Manager) TokenSource(ctx context.Context, email string) (func(context.C
 		mu.Unlock()
 
 		if changed {
-			if saveErr := m.saveToken(email, tok, scopes, tf.TenantID); saveErr != nil {
-				return "", fmt.Errorf("save refreshed microsoft token for %s: %w (token refreshed but not persisted — re-run may require re-authorization)", email, saveErr)
+			if saveErr := save(tok); saveErr != nil {
+				return "", fmt.Errorf("save refreshed %s token for %s: %w (token refreshed but not persisted — re-run may require re-authorization)", lowerProduct, email, saveErr)
 			}
 		}
 
 		return tok.AccessToken, nil
-	}, nil
+	}
 }
 
 // IMAPHost returns the correct IMAP hostname for the given email based on the
@@ -609,6 +688,7 @@ func generateSelfSignedCert(hosts []string) (tls.Certificate, error) {
 // resolveTokenEmail verifies the ID token and validates the authenticated
 // email matches the expected address. Uses OIDC signature/issuer/audience
 // validation in production, or verifyIDTokenFn in tests.
+// Claims are returned only after ID token verification succeeds.
 func (m *Manager) resolveTokenEmail(ctx context.Context, email string, token *oauth2.Token, nonce string) (string, *idTokenClaims, error) {
 	rawIDToken, _ := token.Extra("id_token").(string)
 	if rawIDToken == "" {
@@ -634,20 +714,12 @@ func (m *Manager) resolveTokenEmail(ctx context.Context, email string, token *oa
 		return claims.Email, claims, nil
 	}
 
-	// Fall back to "preferred_username". In Entra/O365 setups the UPN
-	// (sign-in identifier) can differ from the SMTP mailbox address, so a
-	// mismatch is not necessarily an error — trust the user-entered email as
-	// the mailbox address and log a warning. If the address is wrong, IMAP
-	// authentication will fail with an explicit error pointing back here.
-	if claims.PreferredUsername != "" {
-		if !strings.EqualFold(claims.PreferredUsername, email) {
-			m.logger.Warn("Microsoft sign-in UPN differs from the address you specified — "+
-				"proceeding with your address as the IMAP mailbox; "+
-				"if sync fails with an authentication error, re-run 'add-o365' "+
-				"using the UPN shown below as the email argument",
-				"specified", email,
-				"upn", claims.PreferredUsername,
-			)
+	// Fall back to "preferred_username". In Entra/O365 setups the UPN can
+	// differ from the mailbox address, so a differing UPN is accepted only
+	// when the user named it as their sign-in.
+	if upn := claims.PreferredUsername; upn != "" {
+		if !strings.EqualFold(upn, email) && !strings.EqualFold(upn, m.signInName) {
+			return "", claims, &TokenMismatchError{Expected: email, Actual: upn}
 		}
 		return email, claims, nil
 	}
@@ -740,45 +812,32 @@ func (m *Manager) TokenPath(email string) string {
 }
 
 func (m *Manager) saveToken(email string, token *oauth2.Token, scopes []string, tenantID string) error {
-	if err := fileutil.SecureMkdirAll(m.tokensDir, 0700); err != nil {
+	return saveTokenFile(m.tokensDir, m.TokenPath(email), token, scopes, tenantID)
+}
+
+func (m *Manager) loadTokenFile(email string) (*tokenFile, error) {
+	return readTokenFile(m.TokenPath(email))
+}
+
+// saveTokenFile atomically persists token in the shared tokenFile format.
+func saveTokenFile(tokensDir, path string, token *oauth2.Token, scopes []string, tenantID string) error {
+	if err := fileutil.SecureMkdirAll(tokensDir, 0700); err != nil {
 		return err
 	}
 
 	tf := tokenFile{Token: *token, Scopes: scopes, TenantID: tenantID}
-	data, err := json.MarshalIndent(tf, "", "  ")
+	data, err := json.Marshal(tf, jsontext.WithIndent("  "), json.Deterministic(true))
 	if err != nil {
 		return err
 	}
 
-	path := m.TokenPath(email)
-	tmpFile, err := os.CreateTemp(m.tokensDir, ".ms-token-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp token file: %w", err)
-	}
-	tmpPath := tmpFile.Name()
-
-	if _, err := tmpFile.Write(data); err != nil {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("write temp token file: %w", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("close temp token file: %w", err)
-	}
-	if err := fileutil.SecureChmod(tmpPath, 0600); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("chmod temp token file: %w", err)
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("rename temp token file: %w", err)
+	if err := fileutil.SecureReplaceFile(path, data, 0o600); err != nil {
+		return fmt.Errorf("write token file: %w", err)
 	}
 	return nil
 }
 
-func (m *Manager) loadTokenFile(email string) (*tokenFile, error) {
-	path := m.TokenPath(email)
+func readTokenFile(path string) (*tokenFile, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err

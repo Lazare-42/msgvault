@@ -12,6 +12,12 @@ import (
 // ParseDBTime is exported for testing unexported timestamp parsing behavior.
 var ParseDBTime = parseDBTime
 
+// DBPathForTest returns the backend address used by a Store so an integration
+// test can open a second independent handle to the same isolated database.
+func DBPathForTest(s *Store) string {
+	return s.dbPath
+}
+
 // MessagesTableColumns returns the live column names of the messages table on
 // whichever backend the store uses. Test-only: it exists so
 // TestMessagesColumnClassificationIsExhaustive can compare the real table
@@ -46,6 +52,12 @@ func MessagesTableColumns(s *Store) ([]string, error) {
 // unavailable — the symptom that motivates a rebuild in the first place.
 func SetFTS5AvailableForTest(s *Store, v bool) {
 	s.fts5Available = v
+}
+
+// SetSenderRepairMessageLockHookForTest pauses sender repair immediately after
+// it has acquired the message-level recipient-write lock.
+func (s *Store) SetSenderRepairMessageLockHookForTest(fn func()) {
+	s.senderRepairMessageLockHook = fn
 }
 
 // SetCardDAVConflictResolutionSnapshotHookForTest pauses keep-remote after its
@@ -125,12 +137,85 @@ func (s *Store) SetAttributeSeedReadHookForTest(fn func(slug string)) func() {
 	return func() { s.attributeSeedReadHook = nil }
 }
 
+// SetOrganizationProfileRootReadHookForTest installs a hook between the profile
+// root read and its child reads. Returns a restore func that clears the hook.
+func (s *Store) SetOrganizationProfileRootReadHookForTest(fn func()) func() {
+	s.organizationProfileRootReadHook = fn
+	return func() { s.organizationProfileRootReadHook = nil }
+}
+
 // SetAttachmentRoleRepairPreparedHookForTest installs a hook after historical
 // MIME evidence has been prepared but before the repair transaction begins.
 // Tests use it to reproduce a concurrent resync that changes attachment bytes.
 func (s *Store) SetAttachmentRoleRepairPreparedHookForTest(fn func()) func() {
 	s.attachmentRoleRepairPreparedHook = fn
 	return func() { s.attachmentRoleRepairPreparedHook = nil }
+}
+
+// SetListIDRepairBeforeApplyHookForTest installs a hook before List-Id repair
+// begins its maintenance transaction.
+// Tests use it to reproduce a concurrent raw-MIME resync without stubbing the
+// database writer or fighting a SQLite reader lock.
+func (s *Store) SetListIDRepairBeforeApplyHookForTest(fn func()) func() {
+	s.listIDRepairBeforeApplyHook = fn
+	return func() { s.listIDRepairBeforeApplyHook = nil }
+}
+
+// SetListIDRepairAfterScanMutationForTest runs a real raw-MIME and List-Id
+// replacement on the repair transaction after a candidate has been decoded and
+// before its conditional fingerprint update. It keeps SQLite race coverage in
+// one transaction, avoiding an impossible competing-writer lock interleaving.
+func (s *Store) SetListIDRepairAfterScanMutationForTest(
+	fn func(messageID int64, replaceRawAndListID func([]byte, string) error) error,
+) func() {
+	s.listIDRepairAfterScanHook = func(
+		ctx context.Context, tx *loggedTx, updates []listIDRepairUpdate,
+	) error {
+		for _, update := range updates {
+			if err := fn(update.row.id, func(rawData []byte, listID string) error {
+				if _, err := tx.ExecContext(ctx,
+					`UPDATE message_raw SET raw_data = ?, compression = NULL WHERE message_id = ?`, rawData, update.row.id); err != nil {
+					return err
+				}
+				_, err := tx.ExecContext(ctx,
+					`UPDATE messages SET list_id = ? WHERE id = ?`, listID, update.row.id)
+				return err
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return func() { s.listIDRepairAfterScanHook = nil }
+}
+
+// SetListIDRepairAfterFingerprintLockHookForTest pauses after PostgreSQL has
+// acquired the candidate's fingerprint lock and before its conditional update.
+func (s *Store) SetListIDRepairAfterFingerprintLockHookForTest(fn func()) func() {
+	s.listIDRepairAfterFingerprintLockHook = fn
+	return func() { s.listIDRepairAfterFingerprintLockHook = nil }
+}
+
+// SetIMAPLabelRepairPerMessageHookForTest installs a hook called with each
+// message's ID just before RepairIMAPSourceLabels processes it. Tests use it
+// to cancel the context mid-repair without needing a source large enough to
+// make cancellation a race.
+func (s *Store) SetIMAPLabelRepairPerMessageHookForTest(fn func(messageID int64)) func() {
+	s.imapLabelRepairPerMessageHook = fn
+	return func() { s.imapLabelRepairPerMessageHook = nil }
+}
+
+// ReconcileMessageLabelsTxContextForTest runs the context-aware label
+// reconciliation on its own transaction. The transaction is deliberately begun
+// without ctx: BeginTx would otherwise reject a cancelled context first, and
+// the test could not tell whether the statements inside carry ctx or not.
+func ReconcileMessageLabelsTxContextForTest(
+	ctx context.Context, s *Store, messageID int64, labelIDs []int64, replace bool,
+) error {
+	return s.withTx(func(tx *loggedTx) error {
+		_, err := s.reconcileMessageLabelsTxContext(ctx, tx, messageID, labelIDs, replace)
+		return err
+	})
 }
 
 // SetIdentityMatchAcceptBeforeDecisionHookForTest pauses a user acceptance
@@ -140,6 +225,11 @@ func (s *Store) SetIdentityMatchAcceptBeforeDecisionHookForTest(fn func()) func(
 	return func() { s.identityMatchAcceptBeforeDecisionHook = nil }
 }
 
+func (s *Store) SetIdentityMatchReviewAfterDecisionHookForTest(fn func()) func() {
+	s.identityMatchReviewAfterDecisionHook = fn
+	return func() { s.identityMatchReviewAfterDecisionHook = nil }
+}
+
 // SetPersonOperationBeforeIdentityLockHookForTest installs a per-Store barrier
 // immediately before merge and split transactions acquire the identity lock.
 // Concurrency tests use it to prove every competing transaction is open and at
@@ -147,6 +237,20 @@ func (s *Store) SetIdentityMatchAcceptBeforeDecisionHookForTest(fn func()) func(
 func (s *Store) SetPersonOperationBeforeIdentityLockHookForTest(fn func()) func() {
 	s.personOperationBeforeIdentityLockHook = fn
 	return func() { s.personOperationBeforeIdentityLockHook = nil }
+}
+
+// SetSourceMergeAfterJournalCheckHookForTest pauses a merge after its initial
+// idempotency lookup and before it acquires source execution locks.
+func (s *Store) SetSourceMergeAfterJournalCheckHookForTest(fn func()) func() {
+	s.sourceMergeAfterJournalCheckHook = fn
+	return func() { s.sourceMergeAfterJournalCheckHook = nil }
+}
+
+// SetPersonMatchBlockingBeforeLockHookForTest runs fn after scoring candidate
+// discovery has chosen its pairs and before each pair takes the identity lock.
+func (s *Store) SetPersonMatchBlockingBeforeLockHookForTest(fn func()) func() {
+	s.personMatchBlockingBeforeLockHook = fn
+	return func() { s.personMatchBlockingBeforeLockHook = nil }
 }
 
 // SetPersonMergeAfterSnapshotHookForTest installs a barrier after a merge has
@@ -238,3 +342,28 @@ func RollbackPersonEnrichmentAttemptCompletionForTest(
 	}
 	return err
 }
+
+// SetPersonNetworkSourceReadHookForTest records the finite layer budget and
+// raw adjacency rows consumed before edge deduplication or hydration.
+func (s *Store) SetPersonNetworkSourceReadHookForTest(fn func(limit, count int)) func() {
+	s.personNetworkSourceReadHook = fn
+	return func() { s.personNetworkSourceReadHook = nil }
+}
+
+func (s *Store) SetCardDAVPublicationReviewBeforePersonLockHookForTest(fn func()) {
+	s.cardDAVReviewPersonLockHook = fn
+}
+
+// RefreshSourceMessageAttributionForTest is the full-refresh oracle for targeted attribution.
+func RefreshSourceMessageAttributionForTest(s *Store, sourceID int64) error {
+	return s.withTxContext(context.Background(), func(tx *loggedTx) error {
+		return refreshSourceMessageAttributionContext(context.Background(), tx, sourceID)
+	})
+}
+
+// Owner-address SQL builders, exported for their isolation test.
+var (
+	OwnerEmailMatch      = ownerEmailMatch
+	OwnerIdentifierMatch = ownerIdentifierMatch
+	SenderOwnerFallback  = senderOwnerFallback
+)

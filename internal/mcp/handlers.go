@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/skip2/go-qrcode"
+	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/export"
 	"go.kenn.io/msgvault/internal/gmail"
@@ -24,6 +25,7 @@ import (
 	"go.kenn.io/msgvault/internal/personscope"
 	personresolver "go.kenn.io/msgvault/internal/personscope/resolver"
 	"go.kenn.io/msgvault/internal/query"
+	"go.kenn.io/msgvault/internal/savedview"
 	"go.kenn.io/msgvault/internal/search"
 	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/vector"
@@ -58,6 +60,10 @@ const (
 	toolArgBefore        = "before"
 	toolArgAccount       = "account"
 	toolArgOffset        = "offset"
+	toolArgLength        = "length"
+	toolArgSourceMsgID   = "source_message_id"
+	toolArgSourceID      = "source_id"
+	toolArgThreadID      = "thread_id"
 	toolArgMinScore      = "min_score"
 	toolArgMaxChars      = "max_chars"
 	toolArgAttachmentID  = "attachment_id"
@@ -66,6 +72,7 @@ const (
 	toolArgGroupBy       = "group_by"
 	toolArgDomains       = "domains"
 	toolArgSender        = "sender"
+	toolArgList          = "list"
 	// maxBodyChars caps the body slice returned by get_message regardless of what
 	// the caller requests via max_chars. Prevents a single tool call from flooding
 	// the context window; callers page forward using offset.
@@ -140,22 +147,40 @@ func listLimitArg(args map[string]any) int {
 }
 
 type handlers struct {
-	engine             query.Engine
-	attachmentsDir     string
-	attachmentReader   AttachmentReader
-	manifestSaver      DeletionManifestSaver
-	hybridSearcher     HybridSearcher
-	similarSearcher    SimilarSearcher
-	dataDir            string
-	gmailFactory       GmailClientFactory
-	whatsAppFactory    WhatsAppClientFactory
-	whatsAppLoginURL   string
-	whatsAppArchive    WhatsAppArchiveReader
-	googleDocsFactory  GoogleDocsClientFactory
-	ocr                OCRClient
-	documentSearcher   DocumentSearcher
-	personFileSearcher PersonFileSearcher
-	peopleBackend      peoplebrowser.Backend
+	embeddingStatus      EmbeddingStatusReader
+	delegatedOnly        bool
+	downloads            *downloadCache
+	engine               query.Engine
+	archiveSQLQuerier    ArchiveSQLQuerier
+	attachmentsDir       string
+	attachmentReader     AttachmentReader
+	manifestSaver        DeletionManifestSaver
+	hybridSearcher       HybridSearcher
+	similarSearcher      SimilarSearcher
+	dataDir              string
+	documentSearcher     DocumentSearcher
+	mediaSearcher        MediaSearcher
+	personFileSearcher   PersonFileSearcher
+	peopleBackend        peoplebrowser.Backend
+	directoryBackend     peoplebrowser.DirectoryLister
+	savedViews           savedview.Service
+	meetings             MeetingBackend
+	calendar             CalendarBackend
+	personAgendaBackend  PersonAgendaBackend
+	kata                 KataBackend
+	identityReview       IdentityReviewBackend
+	personCardDAV        PersonCardDAVBackend
+	messageTags          MessageTagBackend
+	identityScoring      IdentityScoringBackend
+	drafts               DraftRunner
+	contactRoutesBackend ContactRoutesBackend
+	chatDiscoveryBackend ChatDiscoveryBackend
+	gmailFactory         GmailClientFactory
+	whatsAppFactory      WhatsAppClientFactory
+	whatsAppLoginURL     string
+	googleDocsFactory    GoogleDocsClientFactory
+	ocr                  OCRClient
+	whatsAppArchive      WhatsAppArchiveReader
 
 	// Optional vector-search wiring. When hybridEngine is nil, the
 	// search_message_bodies handler rejects mode=vector and mode=hybrid with
@@ -166,6 +191,34 @@ type handlers struct {
 	vectorCfg      vector.Config
 	backend        vector.Backend
 	visualSearcher VisualSearcher
+}
+
+// ArchiveSQLQuerier executes SQL confined to published archive analytics data.
+type ArchiveSQLQuerier interface {
+	QueryArchiveSQL(ctx context.Context, sql string, fresh bool) (*query.QueryResult, *daemonclient.CacheBuildAccepted, error)
+}
+
+func (h *handlers) querySQL(ctx context.Context, req toolRequest) (*toolResult, error) {
+	args := req.GetArguments()
+	sql, ok := args["sql"].(string)
+	if !ok || strings.TrimSpace(sql) == "" {
+		return toolErrorResult("sql is required"), nil
+	}
+	if err := query.EnsureReadOnly(sql); err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
+	fresh, _ := args["fresh"].(bool)
+	if h.archiveSQLQuerier == nil {
+		return toolErrorResult("SQL queries are unavailable"), nil
+	}
+	result, accepted, err := h.archiveSQLQuerier.QueryArchiveSQL(ctx, sql, fresh)
+	if err != nil {
+		return nil, newInternalError("query SQL", err)
+	}
+	if accepted != nil {
+		return jsonResult(accepted)
+	}
+	return jsonResult(result)
 }
 
 type VisualSearcher interface {
@@ -290,7 +343,10 @@ func (h *handlers) searchVisualAttachments(ctx context.Context, req toolRequest)
 		After: after, Before: before,
 	})
 	if err != nil {
-		return toolErrorResult("visual_search_failed: " + err.Error()), nil //nolint:nilerr // MCP tool errors are successful protocol responses.
+		if result := translateDaemonRequestError(err); result != nil {
+			return result, nil
+		}
+		return toolErrorResult("visual_search_failed: " + err.Error()), nil
 	}
 	return jsonResult(response)
 }
@@ -398,10 +454,10 @@ type AttachmentReader interface {
 }
 
 type OCRClient interface {
-	OCRStatus(context.Context) (*store.OCRRuntimeStatus, error)
-	SearchOCR(context.Context, string, int) ([]store.OCRSearchHit, error)
-	GetOCRResult(context.Context, string, bool) (*store.OCRResult, error)
-	RequestOCR(context.Context, string, string) (*store.OCRResult, error)
+	OCRStatus(ctx context.Context) (*store.OCRRuntimeStatus, error)
+	SearchOCR(ctx context.Context, query string, limit int) ([]store.OCRSearchHit, error)
+	GetOCRResult(ctx context.Context, hash string, includePages bool) (*store.OCRResult, error)
+	RequestOCR(ctx context.Context, hash string, fingerprint string) (*store.OCRResult, error)
 }
 
 // readAttachmentFile loads a content-addressed attachment for draft uploads.
@@ -413,7 +469,7 @@ type OCRClient interface {
 // attachment that has been packed, which export_attachment and get_attachment
 // (both already routed through attachmentService) do not.
 func (h *handlers) readAttachmentFile(ctx context.Context, contentHash string) ([]byte, error) {
-	data, err := h.attachmentService().read(ctx, contentHash)
+	data, err := h.attachmentService().read(ctx, contentHash, maxAttachmentSize)
 	if err != nil {
 		if unavailable, ok := errors.AsType[*attachmentUnavailableError](err); ok {
 			return nil, errors.New(unavailable.message)
@@ -441,7 +497,7 @@ func (h *handlers) searchAttachmentText(ctx context.Context, request toolRequest
 	if err != nil {
 		return toolErrorResult(fmt.Sprintf("search attachment text: %v", err)), nil
 	}
-	return jsonArrayResult("results", hits)
+	return jsonResult(hits)
 }
 
 func (h *handlers) getAttachmentText(ctx context.Context, request toolRequest) (*toolResult, error) {
@@ -485,6 +541,7 @@ type HybridSearchRequest struct {
 	Query          string
 	Mode           string
 	Account        string
+	AccountScopes  []search.AccountScope
 	Limit          int
 	Offset         int
 	IncludeMatches bool
@@ -511,8 +568,17 @@ type HybridSearchHit struct {
 type HybridSearchResult struct {
 	Hits          []HybridSearchHit
 	PoolSaturated bool
+	Accelerator   string
 	Generation    HybridGeneration
 	HasMore       bool
+	TookMS        int64
+	Timings       HybridSearchTimings
+}
+
+type HybridSearchTimings struct {
+	QueryEmbeddingMS int64 `json:"query_embedding_ms"`
+	RetrievalMS      int64 `json:"retrieval_ms"`
+	HydrationMS      int64 `json:"hydration_ms"`
 }
 
 type SimilarSearcher interface {
@@ -520,6 +586,7 @@ type SimilarSearcher interface {
 }
 
 type SimilarSearchRequest struct {
+	AccountScopes []search.AccountScope
 	MessageID     int64
 	Limit         int
 	Account       string
@@ -553,8 +620,21 @@ func translateDaemonRequestError(err error) *toolResult {
 
 	var message string
 	switch coded.APIErrorCode() {
+	case "permission_denied", "unsupported_agent_scope":
+		// The daemon's message names the missing permission or the supported scope.
+		message = coded.APIErrorCode() + ": " + daemonErrorMessage(err)
+	case "unauthorized":
+		message = "unauthorized: Archive authentication failed"
+	case "visual_search_not_ready":
+		message = "visual_search_not_ready: visual attachment search is unavailable"
+	case "vector_initializing":
+		message = "vector_initializing: vector search is still initializing"
+	case "vector_init_failed":
+		message = "vector_init_failed: vector search failed to initialize"
 	case "invalid_query":
 		message = "invalid_query: search query is invalid"
+	case "unsupported_filter_mode":
+		message = "unsupported_filter_mode: a filter is not supported in this search mode"
 	case "invalid_account":
 		message = "invalid_account: account filter is invalid"
 	case "account_not_found":
@@ -568,13 +648,20 @@ func translateDaemonRequestError(err error) *toolResult {
 	case "body_search_unavailable":
 		message = "body_search_unavailable: exact message body search is unavailable"
 	case "body_search_index_unavailable":
-		message = "body_search_index_unavailable: message body search index is unavailable"
+		message = "body_search_index_unavailable: message body search index is unavailable; ask the archive owner to search or run rebuild-fts, then retry"
 	case "invalid_message_id":
 		message = "invalid_message_id: seed message ID is invalid"
 	default:
 		return nil
 	}
 	return toolErrorResult(message)
+}
+
+func daemonErrorMessage(err error) string {
+	if apiErr, ok := errors.AsType[*daemonclient.APIError](err); ok && apiErr.Message != "" {
+		return apiErr.Message
+	}
+	return "grant does not authorize this operation or account scope"
 }
 
 func dependencyError(operation string, err error) (*toolResult, error) {
@@ -623,9 +710,12 @@ func translateVectorErr(err error) *toolResult {
 			"vector_not_enabled: vector search is not configured",
 		)
 	case errors.Is(err, vector.ErrIndexStale):
+		if apiErr, ok := errors.AsType[*daemonclient.APIError](err); ok && apiErr.Message != "" {
+			return toolErrorResult("index_stale: " + apiErr.Message)
+		}
 		return toolErrorResult(
 			"index_stale: the vector index does not match configured embedding settings; " +
-				"align [vector.embed.scope] accounts for an existing account-scoped index, or run `msgvault embeddings build --full-rebuild`",
+				"if the embedding settings on the archive host changed since its daemon started, restart that daemon; otherwise align [vector.embed.scope] accounts for an existing account-scoped index, or run `msgvault embeddings build --full-rebuild`",
 		)
 	case errors.Is(err, vector.ErrIndexBuilding):
 		return toolErrorResult(
@@ -650,38 +740,11 @@ func translateVectorErr(err error) *toolResult {
 	return nil
 }
 
-type messageSummaryCompact struct {
-	ID                   int64     `json:"id"`
-	SourceMessageID      string    `json:"source_message_id"`
-	ConversationID       int64     `json:"conversation_id"`
-	SourceConversationID string    `json:"source_conversation_id"`
-	Subject              string    `json:"subject"`
-	FromEmail            string    `json:"from_email"`
-	FromName             string    `json:"from_name"`
-	SentAt               time.Time `json:"sent_at"`
-	HasAttachments       bool      `json:"has_attachments"`
-}
-
-func compactMessageSummaries(results []query.MessageSummary) []messageSummaryCompact {
-	out := make([]messageSummaryCompact, len(results))
-	for i, msg := range results {
-		out[i] = messageSummaryCompact{
-			ID:                   msg.ID,
-			SourceMessageID:      msg.SourceMessageID,
-			ConversationID:       msg.ConversationID,
-			SourceConversationID: msg.SourceConversationID,
-			Subject:              msg.Subject,
-			FromEmail:            msg.FromEmail,
-			FromName:             msg.FromName,
-			SentAt:               msg.SentAt,
-			HasAttachments:       msg.HasAttachments,
-		}
-	}
-	return out
-}
-
-// getAccountID looks up a source ID by email address.
-// Returns nil if account is empty (no filter), or an error if not found.
+// getAccountID looks up a source ID by its identifier, preferring an exact
+// match and otherwise ignoring letter case, so "Me@gmail.com" names the same
+// source as "me@gmail.com"; failing that, by its display name, which for an
+// IMAP source is often its mailbox address. Returns nil if account is empty
+// (no filter), or an error if not found.
 func (h *handlers) getAccountID(ctx context.Context, account string) (*int64, error) {
 	if account == "" {
 		return nil, nil //nolint:nilnil // empty input -> no filter, not an error
@@ -690,18 +753,27 @@ func (h *handlers) getAccountID(ctx context.Context, account string) (*int64, er
 	if err != nil {
 		return nil, newInternalError("list accounts", err)
 	}
-	var matched *int64
-	for _, acc := range accounts {
-		if acc.Identifier == account {
+	for _, same := range []func(query.AccountInfo) bool{
+		func(acc query.AccountInfo) bool { return acc.Identifier == account },
+		func(acc query.AccountInfo) bool { return strings.EqualFold(acc.Identifier, account) },
+		func(acc query.AccountInfo) bool {
+			return acc.DisplayName != "" && strings.EqualFold(acc.DisplayName, account)
+		},
+	} {
+		var matched *int64
+		for _, acc := range accounts {
+			if !same(acc) {
+				continue
+			}
 			if matched != nil {
 				return nil, &expectedHandlerError{message: "account matches multiple sources: " + account}
 			}
 			id := acc.ID
 			matched = &id
 		}
-	}
-	if matched != nil {
-		return matched, nil
+		if matched != nil {
+			return matched, nil
+		}
 	}
 	return nil, &expectedHandlerError{message: "account not found: " + account}
 }
@@ -740,8 +812,8 @@ type searchMessageItem struct {
 	// MatchesTruncated is true when more than maxContextSnippets (5) match
 	// excerpts were found; only the first 5 are returned.
 	Matches          []messageMatch        `json:"matches,omitempty"`
-	MatchesTruncated bool                  `json:"matches_truncated,omitempty"`
-	Score            *hybridScoreBreakdown `json:"score,omitempty"`
+	MatchesTruncated bool                  `json:"matches_truncated,omitzero"`
+	Score            *hybridScoreBreakdown `json:"score,omitzero"`
 }
 
 // maxDraftAttachmentsSize caps the combined raw size of attachments on a single
@@ -792,7 +864,7 @@ func parseNewAttachmentArgs(args map[string]any) ([]newDraftAttachmentInput, err
 		mimeType := strings.TrimSpace(stringField(obj, "mime_type"))
 		if mimeType != "" {
 			if _, _, err := stdmime.ParseMediaType(mimeType); err != nil {
-				return nil, fmt.Errorf("new_attachments[%d]: invalid mime_type %q: %v", i, mimeType, err)
+				return nil, fmt.Errorf("new_attachments[%d]: invalid mime_type %q: %w", i, mimeType, err)
 			}
 		}
 		inputs = append(inputs, newDraftAttachmentInput{filename: filename, mimeType: mimeType, contentBase64: contentBase64})
@@ -825,7 +897,7 @@ func (h *handlers) resolveDraftAttachments(ctx context.Context, args map[string]
 		return nil, nil
 	}
 	if len(ids) > 0 && h.attachmentsDir == "" && h.attachmentReader == nil {
-		return nil, fmt.Errorf("attachments directory not configured")
+		return nil, errors.New("attachments directory not configured")
 	}
 
 	var atts []gmail.DraftAttachment
@@ -837,14 +909,14 @@ func (h *handlers) resolveDraftAttachments(ctx context.Context, args map[string]
 		}
 		att, err := h.engine.GetAttachment(ctx, id)
 		if err != nil {
-			return nil, fmt.Errorf("get attachment %d: %v", id, err)
+			return nil, fmt.Errorf("get attachment %d: %w", id, err)
 		}
 		if att == nil {
 			return nil, fmt.Errorf("attachment %d not found", id)
 		}
 		data, err := h.readAttachmentFile(ctx, att.ContentHash)
 		if err != nil {
-			return nil, fmt.Errorf("attachment %d: %v", id, err)
+			return nil, fmt.Errorf("attachment %d: %w", id, err)
 		}
 		total += int64(len(data))
 		if total > maxDraftAttachmentsSize {
@@ -860,7 +932,7 @@ func (h *handlers) resolveDraftAttachments(ctx context.Context, args map[string]
 	for i, na := range newAttachments {
 		content, err := base64.StdEncoding.DecodeString(na.contentBase64)
 		if err != nil {
-			return nil, fmt.Errorf("new_attachments[%d]: content_base64 is invalid: %v", i, err)
+			return nil, fmt.Errorf("new_attachments[%d]: content_base64 is invalid: %w", i, err)
 		}
 		if int64(len(content)) > maxAttachmentSize {
 			return nil, fmt.Errorf("new_attachments[%d]: attachment too large: %d bytes (max %d)", i, len(content), maxAttachmentSize)
@@ -907,40 +979,45 @@ func (h *handlers) searchMetadata(ctx context.Context, req toolRequest) (*toolRe
 		return toolErrorResult("query parameter is required"), nil
 	}
 
-	q := search.Parse(queryStr)
+	q := search.ParseOR(queryStr)
 	if err := q.Err(); err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
-	if msg := unsupportedSearchOperatorMessage(q); msg != "" {
-		return toolErrorResult(msg), nil
-	}
-
 	limit := searchLimitArg(args)
-	offset := limitArg(args, toolArgOffset, 0)
+	offset := intArg(args, toolArgOffset, 0)
 
 	account, _ := args[toolArgAccount].(string)
-	sourceID, err := h.getAccountID(ctx, account)
+	selection, err := h.resolveAccount(ctx, account)
 	if err != nil {
 		return dependencyError("resolve metadata-search account", err)
 	}
 
-	if sourceID != nil {
-		q.AccountIDs = []int64{*sourceID}
+	if selection.sourceID != nil {
+		q.AccountIDs = []int64{*selection.sourceID}
 	}
 
-	filter := query.MessageFilter{SourceID: sourceID}
+	var filter query.MessageFilter
+	selection.applyToFilter(&filter)
 
-	results, err := h.engine.SearchFast(ctx, q, filter, limit, offset)
+	// Fetch one extra row so unknown totals still support reliable pagination.
+	result, err := h.engine.SearchFastWithStats(ctx, q, queryStr, filter, query.ViewNoStats, limit+1, offset)
 	if err != nil {
 		return nil, newInternalError("search metadata", err)
 	}
-
-	totalMatched, err := h.engine.SearchFastCount(ctx, q, filter)
-	if err != nil {
-		return nil, newInternalError("count metadata search", err)
+	hasMore := len(result.Messages) > limit
+	if hasMore {
+		result.Messages = result.Messages[:limit]
 	}
+	if result.TotalCount < 0 {
+		return jsonResult(searchMetadataResponse{
+			paginatedResponse: newPaginatedResponseNoTotal(result.Messages, offset, hasMore), IndexState: result.IndexState,
+		})
+	}
+	return metadataSearchResult(result.Messages, result.TotalCount, offset, result.IndexState)
+}
 
-	return jsonResult(searchMetadataResponse(newPaginatedResponse(results, totalMatched, offset)))
+func metadataSearchResult(messages []query.MessageSummary, total int64, offset int, state string) (*toolResult, error) {
+	return jsonResult(searchMetadataResponse{paginatedResponse: newPaginatedResponse(messages, total, offset), IndexState: state})
 }
 
 func (h *handlers) searchDocuments(ctx context.Context, req toolRequest) (*toolResult, error) {
@@ -1059,28 +1136,6 @@ func (h *handlers) searchDocuments(ctx context.Context, req toolRequest) (*toolR
 	return jsonResult(response)
 }
 
-func unsupportedSearchOperatorMessage(q *search.Query) string {
-	if len(q.UnsupportedOperators) == 0 {
-		return ""
-	}
-
-	names := make([]string, 0, len(q.UnsupportedOperators))
-	seen := make(map[string]bool, len(q.UnsupportedOperators))
-	for _, op := range q.UnsupportedOperators {
-		name := op.Name + ":"
-		if !seen[name] {
-			names = append(names, name)
-			seen[name] = true
-		}
-	}
-
-	return fmt.Sprintf(
-		"unsupported_search_operator: %s is Gmail-only syntax; msgvault does not index List-ID locally. "+
-			"Use the Gmail connector for List-ID validation, or use msgvault-supported operators.",
-		strings.Join(names, ", "),
-	)
-}
-
 // searchMessageBodies searches message bodies by keyword, vector, or hybrid.
 // It returns messages whose body matches the query, plus matches — short
 // excerpts centered on each matched term. Requires at least one free-text term
@@ -1114,21 +1169,16 @@ func (h *handlers) searchMessageBodies(ctx context.Context, req toolRequest) (*t
 	if err := q.Err(); err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
-	if msg := unsupportedSearchOperatorMessage(q); msg != "" {
-		return toolErrorResult(msg), nil
-	}
-
 	limit := searchLimitArg(args)
-	offset := limitArg(args, toolArgOffset, 0)
+	offset := intArg(args, toolArgOffset, 0)
 
 	account, _ := args[toolArgAccount].(string)
-	sourceID, err := h.getAccountID(ctx, account)
+	selection, err := h.resolveAccount(ctx, account)
 	if err != nil {
 		return dependencyError("resolve body-search account", err)
 	}
-
-	if sourceID != nil {
-		q.AccountIDs = []int64{*sourceID}
+	if err := selection.applyToQuery(q); err != nil {
+		return toolErrorResult(err.Error()), nil
 	}
 
 	if len(q.TextTerms) == 0 {
@@ -1143,10 +1193,11 @@ func (h *handlers) searchMessageBodies(ctx context.Context, req toolRequest) (*t
 	if !ok {
 		return toolErrorResult("search_message_bodies is unavailable: the query engine does not support exact body-only search"), nil
 	}
-	results, err := bodySearcher.SearchMessageBodies(ctx, q, limit+1, offset)
+	result, err := bodySearcher.SearchMessageBodies(ctx, q, limit+1, offset)
 	if err != nil {
 		return bodySearchError(err)
 	}
+	results := result.Messages
 
 	hasMore := len(results) > limit
 	if hasMore {
@@ -1173,6 +1224,7 @@ func (h *handlers) searchMessageBodies(ctx context.Context, req toolRequest) (*t
 	return jsonResult(searchMessageBodiesResponse{
 		paginatedResponse: newPaginatedResponseNoTotal(data, offset, hasMore),
 		Mode:              searchModeKeyword,
+		IndexState:        result.IndexState,
 	})
 }
 
@@ -1207,10 +1259,6 @@ func (h *handlers) semanticSearchMessages(ctx context.Context, req toolRequest) 
 	if err := q.Err(); err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
-	if msg := unsupportedSearchOperatorMessage(q); msg != "" {
-		return toolErrorResult(msg), nil
-	}
-
 	return h.searchMessageBodiesHybrid(ctx, args, queryStr, q, mode, explain)
 }
 
@@ -1219,10 +1267,10 @@ func (h *handlers) semanticSearchMessages(ctx context.Context, req toolRequest) 
 // can be distinguished from a legitimate 0.0 score. RRF is omitted in
 // mode=vector (only one signal, nothing to fuse).
 type hybridScoreBreakdown struct {
-	RRF            *float64 `json:"rrf,omitempty"`
-	BM25           *float64 `json:"bm25,omitempty"`
-	Vector         *float64 `json:"vector,omitempty"`
-	SubjectBoosted bool     `json:"subject_boosted,omitempty"`
+	RRF            *float64 `json:"rrf,omitzero"`
+	BM25           *float64 `json:"bm25,omitzero"`
+	Vector         *float64 `json:"vector,omitzero"`
+	SubjectBoosted bool     `json:"subject_boosted,omitzero"`
 }
 
 // HybridGeneration describes the active vector-index generation used to answer
@@ -1243,9 +1291,13 @@ type hybridGenerationSummary = HybridGeneration
 type searchMessageBodiesResponse struct {
 	paginatedResponse[searchMessageItem]
 
+	IndexState    string                  `json:"index_state,omitempty"`
 	Mode          string                  `json:"mode"`
 	PoolSaturated bool                    `json:"pool_saturated"`
+	Accelerator   string                  `json:"accelerator,omitempty"`
 	Generation    hybridGenerationSummary `json:"generation"`
+	TookMS        int64                   `json:"took_ms"`
+	Timings       HybridSearchTimings     `json:"timings"`
 }
 
 // searchMessageBodiesHybrid runs vector or hybrid search via the configured
@@ -1266,16 +1318,18 @@ func (h *handlers) searchMessageBodiesHybrid(
 			"vector_not_enabled: vector search is not configured on this server",
 		), nil
 	}
+	started := time.Now()
 
 	// Resolve account filter to a source ID for the structured Filter.
 	account, _ := args[toolArgAccount].(string)
-	sourceID, err := h.getAccountID(ctx, account)
+	selection, err := h.resolveAccount(ctx, account)
 	if err != nil {
 		return dependencyError("resolve semantic-search account", err)
 	}
+	sourceID := selection.sourceID
 
 	limit := searchLimitArg(args)
-	offset := limitArg(args, toolArgOffset, 0)
+	offset := intArg(args, toolArgOffset, 0)
 
 	freeText := strings.Join(parsed.TextTerms, " ")
 
@@ -1301,6 +1355,7 @@ func (h *handlers) searchMessageBodiesHybrid(
 	if sourceID != nil {
 		filter.SourceIDs = []int64{*sourceID}
 	}
+	filter.AccountScopes = append(filter.AccountScopes, selection.scopes()...)
 
 	maxPage := h.vectorCfg.Search.MaxPageSizeHybridClamp()
 	requestedEnd := offset + limit
@@ -1334,6 +1389,7 @@ func (h *handlers) searchMessageBodiesHybrid(
 	if err != nil {
 		return dependencyError("search semantic index", err)
 	}
+	hydrationStarted := time.Now()
 
 	// Bulk-hydrate hits in one round-trip instead of looping
 	// GetMessage per result (which fetches body, From, To, Cc, Bcc,
@@ -1387,6 +1443,7 @@ func (h *handlers) searchMessageBodiesHybrid(
 	if err := h.attachVectorChunkMatches(ctx, meta.Generation.ID, meta.QueryVector, page, minScore); err != nil {
 		return nil, err
 	}
+	hydrationDuration := time.Since(hydrationStarted)
 
 	nextPageServable := maxPage == 0 || requestedEnd < maxPage
 	hasMore := false
@@ -1402,12 +1459,19 @@ func (h *handlers) searchMessageBodiesHybrid(
 		paginatedResponse: newPaginatedResponseNoTotal(page, offset, hasMore),
 		Mode:              mode,
 		PoolSaturated:     meta.PoolSaturated,
+		Accelerator:       meta.Accelerator,
 		Generation: hybridGenerationSummary{
 			ID:          int64(meta.Generation.ID),
 			Model:       meta.Generation.Model,
 			Dimension:   meta.Generation.Dimension,
 			Fingerprint: meta.Generation.Fingerprint,
 			State:       string(meta.Generation.State),
+		},
+		TookMS: time.Since(started).Milliseconds(),
+		Timings: HybridSearchTimings{
+			QueryEmbeddingMS: meta.QueryEmbeddingDuration.Milliseconds(),
+			RetrievalMS:      meta.RetrievalDuration.Milliseconds(),
+			HydrationMS:      hydrationDuration.Milliseconds(),
 		},
 	})
 }
@@ -1417,7 +1481,7 @@ func (h *handlers) searchMessageBodiesHybridViaSearcher(
 	queryStr string, parsed *search.Query, mode string, explain bool,
 ) (*toolResult, error) {
 	limit := searchLimitArg(args)
-	offset := limitArg(args, toolArgOffset, 0)
+	offset := intArg(args, toolArgOffset, 0)
 
 	freeText := strings.Join(parsed.TextTerms, " ")
 	if freeText == "" {
@@ -1427,11 +1491,15 @@ func (h *handlers) searchMessageBodiesHybridViaSearcher(
 		), nil
 	}
 
-	account, _ := args[toolArgAccount].(string)
+	account, accountScopes, err := h.resolveForwardedAccount(ctx, stringArgument(args, toolArgAccount))
+	if err != nil {
+		return dependencyError("resolve semantic-search account", err)
+	}
 	result, err := h.hybridSearcher.SearchHybrid(ctx, HybridSearchRequest{
 		Query:          queryStr,
 		Mode:           mode,
 		Account:        account,
+		AccountScopes:  accountScopes,
 		Limit:          limit,
 		Offset:         offset,
 		IncludeMatches: true,
@@ -1496,7 +1564,10 @@ func (h *handlers) searchMessageBodiesHybridViaSearcher(
 		paginatedResponse: newPaginatedResponseNoTotal(items, offset, hasMore),
 		Mode:              mode,
 		PoolSaturated:     result.PoolSaturated,
+		Accelerator:       result.Accelerator,
 		Generation:        result.Generation,
+		TookMS:            result.TookMS,
+		Timings:           result.Timings,
 	})
 }
 
@@ -1612,7 +1683,10 @@ func (h *handlers) findSimilarMessagesViaSearcher(ctx context.Context, req toolR
 	if maxPage := h.vectorCfg.Search.MaxPageSizeHybridClamp(); maxPage > 0 && limit > maxPage {
 		limit = maxPage
 	}
-	account, _ := args[toolArgAccount].(string)
+	account, accountScopes, err := h.resolveForwardedAccount(ctx, stringArgument(args, toolArgAccount))
+	if err != nil {
+		return dependencyError("resolve similar-search account", err)
+	}
 	messageType, _ := args["message_type"].(string)
 	after, err := getDateArg(args, toolArgAfter)
 	if err != nil {
@@ -1628,6 +1702,7 @@ func (h *handlers) findSimilarMessagesViaSearcher(ctx context.Context, req toolR
 	}
 
 	result, err := h.similarSearcher.FindSimilar(ctx, SimilarSearchRequest{
+		AccountScopes: accountScopes,
 		MessageID:     seedID,
 		Limit:         limit,
 		Account:       account,
@@ -1664,13 +1739,14 @@ func (h *handlers) filterFromFindSimilarArgs(ctx context.Context, args map[strin
 	var f vector.Filter
 
 	account, _ := args[toolArgAccount].(string)
-	srcID, err := h.getAccountID(ctx, account)
+	selection, err := h.resolveAccount(ctx, account)
 	if err != nil {
 		return f, err
 	}
-	if srcID != nil {
-		f.SourceIDs = []int64{*srcID}
+	if selection.sourceID != nil {
+		f.SourceIDs = []int64{*selection.sourceID}
 	}
+	f.AccountScopes = selection.scopes()
 	if messageType, _ := args["message_type"].(string); messageType != "" {
 		f.MessageTypes = vector.NewBuildScope([]string{messageType}, nil).MessageTypes
 	}
@@ -1782,38 +1858,34 @@ func lineNumberAt(body string, byteOffset int) int {
 }
 
 type getMessageResponse struct {
-	ID                   int64  `json:"id"`
-	SourceMessageID      string `json:"source_message_id"`
-	ConversationID       int64  `json:"conversation_id"`
-	SourceConversationID string `json:"source_conversation_id"`
-	// RFC822MessageID is the RFC 5322 Message-ID header, angle brackets
-	// included exactly as received (e.g. "<abc@mail.gmail.com>"). Empty when
-	// the source never carried one. This is the value create_draft's
-	// in_reply_to parameter expects when replying to this message — without
-	// it, a reply's thread_id alone does not reliably thread the draft (see
-	// gmail.DraftCompose.InReplyTo's doc comment).
-	RFC822MessageID string                 `json:"rfc822_message_id,omitempty"`
-	Subject         string                 `json:"subject"`
-	MessageType     string                 `json:"message_type,omitempty"`
-	Snippet         string                 `json:"snippet"`
-	SentAt          time.Time              `json:"sent_at"`
-	ReceivedAt      *time.Time             `json:"received_at,omitempty"`
-	DeletedAt       *time.Time             `json:"deleted_at,omitempty"`
-	SizeEstimate    int64                  `json:"size_estimate"`
-	HasAttachments  bool                   `json:"has_attachments"`
-	From            []query.Address        `json:"from"`
-	To              []query.Address        `json:"to"`
-	Cc              []query.Address        `json:"cc"`
-	Bcc             []query.Address        `json:"bcc"`
-	BodyText        string                 `json:"body_text"`
-	BodyHTML        string                 `json:"body_html"`
-	BodyFormat      string                 `json:"body_format,omitempty"`
-	BodyLength      int                    `json:"body_length"`
-	BodyReturned    int                    `json:"body_returned"`
-	Offset          int                    `json:"offset"`
-	HasMore         bool                   `json:"has_more"`
-	Labels          []string               `json:"labels"`
-	Attachments     []query.AttachmentInfo `json:"attachments"`
+	WebURL               string                 `json:"web_url,omitempty"`
+	ID                   int64                  `json:"id"`
+	SourceMessageID      string                 `json:"source_message_id"`
+	ConversationID       int64                  `json:"conversation_id"`
+	SourceConversationID string                 `json:"source_conversation_id"`
+	Subject              string                 `json:"subject"`
+	MessageType          string                 `json:"message_type,omitempty"`
+	RelatedMessageID     *int64                 `json:"related_message_id,omitempty"`
+	Snippet              string                 `json:"snippet"`
+	SentAt               time.Time              `json:"sent_at"`
+	ReceivedAt           *time.Time             `json:"received_at,omitempty"`
+	DeletedAt            *time.Time             `json:"deleted_at,omitempty"`
+	SizeEstimate         int64                  `json:"size_estimate"`
+	HasAttachments       bool                   `json:"has_attachments"`
+	From                 []query.Address        `json:"from"`
+	To                   []query.Address        `json:"to"`
+	Cc                   []query.Address        `json:"cc"`
+	Bcc                  []query.Address        `json:"bcc"`
+	BodyText             string                 `json:"body_text"`
+	BodyHTML             string                 `json:"body_html"`
+	BodyFormat           string                 `json:"body_format,omitempty"`
+	BodyLength           int                    `json:"body_length"`
+	BodyReturned         int                    `json:"body_returned"`
+	Offset               int                    `json:"offset"`
+	HasMore              bool                   `json:"has_more"`
+	Labels               []string               `json:"labels"`
+	Attachments          []query.AttachmentInfo `json:"attachments"`
+	RFC822MessageID      string                 `json:"rfc822_message_id,omitempty"`
 }
 
 func (h *handlers) getMessage(ctx context.Context, req toolRequest) (*toolResult, error) {
@@ -1883,6 +1955,7 @@ func (h *handlers) getMessage(ctx context.Context, req toolRequest) (*toolResult
 	}
 
 	return jsonResult(getMessageResponse{
+		WebURL:               msg.WebURL,
 		ID:                   msg.ID,
 		SourceMessageID:      msg.SourceMessageID,
 		ConversationID:       msg.ConversationID,
@@ -1890,6 +1963,7 @@ func (h *handlers) getMessage(ctx context.Context, req toolRequest) (*toolResult
 		RFC822MessageID:      msg.RFC822MessageID,
 		Subject:              msg.Subject,
 		MessageType:          msg.MessageType,
+		RelatedMessageID:     msg.RelatedMessageID,
 		Snippet:              msg.Snippet,
 		SentAt:               msg.SentAt,
 		ReceivedAt:           msg.ReceivedAt,
@@ -2022,7 +2096,7 @@ func (h *handlers) searchInMessage(ctx context.Context, req toolRequest) (*toolR
 
 	mode, _ := args[toolArgMode].(string)
 	limit := limitArg(args, toolArgLimit, 10)
-	offset := limitArg(args, toolArgOffset, 0)
+	offset := intArg(args, toolArgOffset, 0)
 
 	switch mode {
 	case "", "keyword":
@@ -2098,20 +2172,65 @@ func (h *handlers) getAttachment(ctx context.Context, req toolRequest) (*toolRes
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
+	chunkReq, chunked, err := chunkArgs(args)
+	if err != nil {
+		return toolErrorResult(err.Error()), nil
+	}
 
-	payload, err := h.attachmentService().load(ctx, id)
+	var payload *attachmentPayload
+	var snapshot *downloadSnapshot
+	if chunked {
+		snapshot, err = h.downloads.get(ctx, downloadKey{attachment: id}, chunkReq, func() (*downloadSnapshot, error) {
+			payload, err := h.attachmentService().loadBounded(ctx, id, maxDownloadBytes)
+			if err != nil {
+				return nil, err
+			}
+			snapshot := &downloadSnapshot{data: payload.data, attachment: payload}
+			if h.delegatedOnly {
+				snapshot.validate = func(ctx context.Context) error {
+					current, err := h.engine.GetAttachment(ctx, id)
+					if err != nil {
+						return newInternalError("authorize attachment chunk", err)
+					}
+					if current == nil || current.ContentHash != payload.metadata.ContentHash {
+						return errDownloadExpired
+					}
+					return nil
+				}
+			}
+			return snapshot, nil
+		})
+		if err == nil {
+			payload = snapshot.attachment
+		}
+	} else {
+		payload, err = h.attachmentService().load(ctx, id)
+	}
 	if err != nil {
 		if unavailable, ok := errors.AsType[*attachmentUnavailableError](err); ok {
 			return toolErrorResult(unavailable.message), nil
 		}
+		if errors.Is(err, errDownloadExpired) || errors.Is(err, errDownloadTooLarge) {
+			return toolErrorResult(err.Error()), nil
+		}
 		return nil, err
 	}
 	att := payload.metadata
-
 	metaObj := getAttachmentResponse{
+		Docbank:  att.Docbank,
 		Filename: att.Filename,
 		MIMEType: payload.mimeType,
 		Size:     att.Size,
+	}
+	if chunked {
+		chunk, err := sliceChunk(snapshot.data, snapshot.digest, chunkReq)
+		if err != nil {
+			return toolErrorResult(err.Error()), nil
+		}
+		metaObj.Size = chunk.Size
+		metaObj.Offset, metaObj.Length = &chunk.Offset, &chunk.Length
+		metaObj.SHA256, metaObj.Complete, metaObj.DataBase64 = &chunk.SHA256, &chunk.Complete, &chunk.DataBase64
+		return jsonResult(metaObj)
 	}
 	result, err := jsonResult(metaObj)
 	if err != nil {
@@ -2197,18 +2316,18 @@ func (h *handlers) listMessages(ctx context.Context, req toolRequest) (*toolResu
 
 	// Look up account filter
 	account, _ := args[toolArgAccount].(string)
-	sourceID, err := h.getAccountID(ctx, account)
+	selection, err := h.resolveAccount(ctx, account)
 	if err != nil {
 		return dependencyError("resolve message-list account", err)
 	}
 
 	filter := query.MessageFilter{
-		SourceID: sourceID,
 		Pagination: query.Pagination{
 			Limit:  listLimitArg(args) + 1,
-			Offset: limitArg(args, toolArgOffset, 0),
+			Offset: intArg(args, toolArgOffset, 0),
 		},
 	}
+	selection.applyToFilter(&filter)
 
 	if v, ok := args[toolArgFrom].(string); ok && v != "" {
 		// If it looks like an email address, filter by email; otherwise by display name.
@@ -2259,7 +2378,7 @@ func (h *handlers) listMessages(ctx context.Context, req toolRequest) (*toolResu
 type getStatsResponse struct {
 	Stats        *query.TotalStats   `json:"stats"`
 	Accounts     []query.AccountInfo `json:"accounts"`
-	VectorSearch *vector.StatsView   `json:"vector_search,omitempty"`
+	VectorSearch *vector.StatsView   `json:"vector_search,omitzero"`
 }
 
 func (h *handlers) getStats(ctx context.Context, _ toolRequest) (*toolResult, error) {
@@ -2271,6 +2390,18 @@ func (h *handlers) getStats(ctx context.Context, _ toolRequest) (*toolResult, er
 	accounts, err := h.engine.ListAccounts(ctx)
 	if err != nil {
 		return nil, newInternalError("list archive accounts", err)
+	}
+	if lister, ok := h.engine.(query.VirtualAccountLister); ok {
+		// The catalog is extra detail; get_stats answers without it, keeping
+		// the last known children the account list already carries.
+		virtual, err := lister.ListVirtualAccounts(ctx)
+		if err != nil {
+			slog.Warn("MCP statistics use the last known virtual accounts", "error", err)
+		} else {
+			for i := range accounts {
+				accounts[i].VirtualAccounts = virtual[accounts[i].ID]
+			}
+		}
 	}
 
 	vs, vsErr := vector.CollectStats(ctx, h.backend)
@@ -2295,14 +2426,15 @@ func (h *handlers) aggregate(ctx context.Context, req toolRequest) (*toolResult,
 
 	// Look up account filter
 	account, _ := args[toolArgAccount].(string)
-	sourceID, err := h.getAccountID(ctx, account)
+	selection, err := h.resolveAccount(ctx, account)
 	if err != nil {
 		return dependencyError("resolve aggregate account", err)
 	}
 
 	opts := query.AggregateOptions{
-		SourceID: sourceID,
-		Limit:    limitArg(args, toolArgLimit, 50),
+		SourceID:      selection.sourceID,
+		AccountScopes: selection.scopes(),
+		Limit:         limitArg(args, toolArgLimit, 50),
 	}
 
 	if opts.After, err = getDateArg(args, toolArgAfter); err != nil {
@@ -2317,6 +2449,7 @@ func (h *handlers) aggregate(ctx context.Context, req toolRequest) (*toolResult,
 		"recipient":   query.ViewRecipients,
 		"domain":      query.ViewDomains,
 		"label":       query.ViewLabels,
+		toolArgList:   query.ViewLists,
 		"time":        query.ViewTime,
 	}
 
@@ -2333,11 +2466,9 @@ func (h *handlers) aggregate(ctx context.Context, req toolRequest) (*toolResult,
 	return jsonResult(aggregateResponse{Data: nonNilSlice(rows)})
 }
 
-// limitArg extracts a non-negative integer limit from a map, with a default.
-// JSON numbers arrive as float64. Clamps to maxLimit to prevent excessive
-// result sets.
 // intArg extracts a non-negative integer from args without the maxLimit clamp
-// used by limitArg. Suitable for body-text offsets and similar unbounded values.
+// used by limitArg. It reads unbounded non-negative integers such as
+// pagination and body offsets.
 func intArg(args map[string]any, key string, def int) int {
 	v, ok := args[key].(float64)
 	if !ok {
@@ -2349,6 +2480,9 @@ func intArg(args map[string]any, key string, def int) int {
 	return int(v)
 }
 
+// limitArg extracts a non-negative integer limit from a map, with a default.
+// JSON numbers arrive as float64. Clamps to maxLimit to prevent excessive
+// result sets.
 func limitArg(args map[string]any, key string, def int) int {
 	v, ok := args[key].(float64)
 	if !ok {
@@ -2380,6 +2514,19 @@ func positiveInt64Arg(args map[string]any, key string) (int64, error) {
 	if !ok || math.IsNaN(value) || math.IsInf(value, 0) || value <= 0 ||
 		value >= float64(math.MaxInt64) || math.Trunc(value) != value {
 		return 0, fmt.Errorf("%s must be a positive integer", key)
+	}
+	return int64(value), nil
+}
+
+func nonnegativeInt64Arg(args map[string]any, key string) (int64, error) {
+	raw, found := args[key]
+	if !found {
+		return 0, nil
+	}
+	value, ok := raw.(float64)
+	if !ok || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 ||
+		value >= float64(math.MaxInt64) || value > maxJSONSafeInteger || math.Trunc(value) != value {
+		return 0, fmt.Errorf("%s must be a nonnegative safe integer", key)
 	}
 	return int64(value), nil
 }
@@ -2432,10 +2579,11 @@ func (h *handlers) stageDeletion(ctx context.Context, req toolRequest) (*toolRes
 
 	// Look up account filter
 	account, _ := args[toolArgAccount].(string)
-	sourceID, err := h.getAccountID(ctx, account)
+	selection, err := h.resolveAccount(ctx, account)
 	if err != nil {
 		return dependencyError("resolve deletion account", err)
 	}
+	sourceID := selection.sourceID
 
 	// Check for query vs structured filters
 	queryStr, _ := args[toolArgQuery].(string)
@@ -2478,30 +2626,35 @@ func (h *handlers) stageDeletion(ctx context.Context, req toolRequest) (*toolRes
 
 	var targets []query.DeletionTarget
 	var description string
+	var searchNote string
 
 	if hasQuery {
 		// Query-based search
-		q := search.Parse(queryStr)
-		if msg := unsupportedSearchOperatorMessage(q); msg != "" {
-			return toolErrorResult(msg), nil
+		q := search.ParseOR(queryStr)
+		if err := q.Err(); err != nil {
+			return toolErrorResult(err.Error()), nil
 		}
-		if sourceID != nil {
-			q.AccountIDs = []int64{*sourceID}
+		if q.IsEmpty() {
+			return toolErrorResult("query must contain at least one search term or filter"), nil
+		}
+		// The selection travels in the query so the FTS fallback keeps it.
+		if err := selection.applyToQuery(q); err != nil {
+			return toolErrorResult(err.Error()), nil
 		}
 
-		// Try fast search first
-		filter := query.MessageFilter{SourceID: sourceID}
-		results, err := h.engine.SearchFast(ctx, q, filter, maxStageDeletionResults, 0)
+		var results []query.MessageSummary
+		if q.HasOR() && q.HasTextTerms() {
+			results, err = h.engine.Search(ctx, q, maxStageDeletionResults, 0)
+			searchNote = "Full-text OR search includes body matches. "
+		} else {
+			filter := query.MessageFilter{SourceID: sourceID}
+			results, err = h.engine.SearchFast(ctx, q, filter, maxStageDeletionResults, 0)
+			if err == nil && len(results) == 0 && q.HasTextTerms() {
+				results, err = h.engine.Search(ctx, q, maxStageDeletionResults, 0)
+			}
+		}
 		if err != nil {
 			return nil, newInternalError("search messages for deletion", err)
-		}
-
-		// Fall back to FTS if no results and query has text terms
-		if len(results) == 0 && len(q.TextTerms) > 0 {
-			results, err = h.engine.Search(ctx, q, maxStageDeletionResults, 0)
-			if err != nil {
-				return nil, newInternalError("fallback search messages for deletion", err)
-			}
 		}
 
 		for _, msg := range results {
@@ -2538,6 +2691,7 @@ func (h *handlers) stageDeletion(ctx context.Context, req toolRequest) (*toolRes
 				Limit: maxStageDeletionResults,
 			},
 		}
+		selection.applyToFilter(&filter)
 
 		var err error
 		targets, err = h.engine.GetDeletionTargetsByFilter(ctx, filter)
@@ -2615,7 +2769,7 @@ func (h *handlers) stageDeletion(ctx context.Context, req toolRequest) (*toolRes
 		BatchID:      manifest.ID,
 		MessageCount: len(gmailIDs),
 		Status:       string(manifest.Status),
-		NextStep:     "Run 'MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged' to execute deletion (gated for v1), or 'msgvault cancel-deletion " + manifest.ID + "' to cancel",
+		NextStep:     searchNote + "In the invoking CLI's config.toml, set '[deletion] remote_enabled = true' for durable consent and run 'msgvault delete-staged'; for one command instead, run 'MSGVAULT_ENABLE_REMOTE_DELETE=1 msgvault delete-staged'. Run 'msgvault cancel-deletion " + manifest.ID + "' to cancel",
 	}
 
 	return jsonResult(resp)
@@ -2655,7 +2809,10 @@ func (h *handlers) searchByDomains(ctx context.Context, req toolRequest) (*toolR
 	}
 
 	limit := limitArg(args, toolArgLimit, 100)
-	offset := limitArg(args, toolArgOffset, 0)
+	if limit == 0 {
+		limit = 100
+	}
+	offset := intArg(args, toolArgOffset, 0)
 
 	afterDate, err := getDateArg(args, toolArgAfter)
 	if err != nil {
@@ -2666,12 +2823,13 @@ func (h *handlers) searchByDomains(ctx context.Context, req toolRequest) (*toolR
 		return toolErrorResult(err.Error()), nil
 	}
 
-	results, err := h.engine.SearchByDomains(ctx, domains, afterDate, beforeDate, limit, offset)
+	result, err := h.engine.SearchByDomains(ctx, domains, afterDate, beforeDate, limit, offset, nil)
 	if err != nil {
 		return nil, newInternalError("search messages by domain", err)
 	}
 
-	return jsonResult(searchByDomainsResponse{Data: nonNilSlice(results)})
+	return jsonResult(searchByDomainsResponse(newPaginatedResponseNoTotal(
+		result.Messages, offset, result.HasMore)))
 }
 
 func nonNilSlice[T any](values []T) []T {
@@ -2685,7 +2843,7 @@ func nonNilSlice[T any](values []T) []T {
 
 func (h *handlers) getWhatsAppClient(ctx context.Context, args map[string]any) (whatsapplive.Client, string, error) {
 	if h.whatsAppFactory == nil {
-		return nil, "", fmt.Errorf("WhatsApp live client not configured")
+		return nil, "", errors.New("WhatsApp live client not configured")
 	}
 
 	account, _ := args["account"].(string)
@@ -2710,7 +2868,7 @@ func (h *handlers) getWhatsAppClient(ctx context.Context, args map[string]any) (
 		case 1:
 			account = whatsAppAccounts[0].Identifier
 		default:
-			return nil, "", fmt.Errorf("multiple WhatsApp accounts configured, specify 'account' parameter")
+			return nil, "", errors.New("multiple WhatsApp accounts configured, specify 'account' parameter")
 		}
 	} else if len(whatsAppAccounts) > 0 {
 		found := false
@@ -2752,6 +2910,7 @@ type whatsappLoginClient interface {
 
 type whatsAppLoginResponse struct {
 	whatsapplive.LoginState
+
 	QRCode         string `json:"qr_code,omitempty"`
 	QRPNGBase64    string `json:"qr_png_base64,omitempty"`
 	QRPageURL      string `json:"qr_page_url,omitempty"`
@@ -2765,11 +2924,11 @@ type whatsAppLoginResponse struct {
 
 func (h *handlers) whatsAppStartLogin(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
-	loginClient, state, err := h.getWhatsAppLoginClient(ctx, args)
+	loginClient, err := h.getWhatsAppLoginClient(ctx, args)
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
-	state, err = loginClient.StartLogin(ctx)
+	state, err := loginClient.StartLogin(ctx)
 	if err != nil {
 		return toolErrorResult(fmt.Sprintf("start whatsapp login: %v", err)), nil
 	}
@@ -2786,11 +2945,11 @@ func (h *handlers) whatsAppStartLogin(ctx context.Context, req toolRequest) (*to
 
 func (h *handlers) whatsAppLoginStatus(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
-	loginClient, state, err := h.getWhatsAppLoginClient(ctx, args)
+	loginClient, err := h.getWhatsAppLoginClient(ctx, args)
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
-	state, err = loginClient.LoginState(ctx)
+	state, err := loginClient.LoginState(ctx)
 	if err != nil {
 		return toolErrorResult(fmt.Sprintf("whatsapp login status: %v", err)), nil
 	}
@@ -2821,20 +2980,16 @@ func (h *handlers) whatsAppLogout(ctx context.Context, req toolRequest) (*toolRe
 	return jsonResult(result)
 }
 
-func (h *handlers) getWhatsAppLoginClient(ctx context.Context, args map[string]any) (whatsappLoginClient, whatsapplive.LoginState, error) {
+func (h *handlers) getWhatsAppLoginClient(ctx context.Context, args map[string]any) (whatsappLoginClient, error) {
 	client, _, err := h.getWhatsAppClient(ctx, args)
 	if err != nil {
-		return nil, whatsapplive.LoginState{}, err
+		return nil, err
 	}
 	loginClient, ok := client.(whatsappLoginClient)
 	if !ok {
-		return nil, whatsapplive.LoginState{}, fmt.Errorf("WhatsApp live client does not support MCP login")
+		return nil, errors.New("WhatsApp live client does not support MCP login")
 	}
-	state, err := loginClient.LoginState(ctx)
-	if err != nil {
-		return nil, whatsapplive.LoginState{}, err
-	}
-	return loginClient, state, nil
+	return loginClient, nil
 }
 
 func waitForWhatsAppLoginCode(ctx context.Context, client whatsappLoginClient, state whatsapplive.LoginState, wait time.Duration) (whatsapplive.LoginState, error) {
@@ -3019,6 +3174,7 @@ func (h *handlers) whatsAppRequestHistorySync(ctx context.Context, req toolReque
 	}
 	return jsonResult(struct {
 		whatsapplive.RequestHistorySyncResult
+
 		Message string `json:"message"`
 	}{
 		RequestHistorySyncResult: result,
@@ -3033,6 +3189,7 @@ func (h *handlers) whatsAppRequestHistorySync(ctx context.Context, req toolReque
 
 type googleDocsSearchResult struct {
 	googledocs.File
+
 	Snippet       string `json:"snippet"`
 	TextLength    int    `json:"text_length"`
 	TextTruncated bool   `json:"text_truncated"`
@@ -3040,7 +3197,7 @@ type googleDocsSearchResult struct {
 
 func (h *handlers) getGoogleDocsClient(ctx context.Context) (googledocs.Client, error) {
 	if h.googleDocsFactory == nil {
-		return nil, fmt.Errorf("Google Docs API not configured")
+		return nil, errors.New("google docs API not configured")
 	}
 	client, err := h.googleDocsFactory(ctx)
 	if err != nil {
@@ -3223,10 +3380,7 @@ func googleDocsSnippet(text, query string, maxChars int) string {
 	startRune := 0
 	if needle != "" {
 		if idx := strings.Index(strings.ToLower(text), needle); idx >= 0 {
-			startRune = utf8.RuneCountInString(text[:idx]) - maxChars/4
-			if startRune < 0 {
-				startRune = 0
-			}
+			startRune = max(utf8.RuneCountInString(text[:idx])-maxChars/4, 0)
 		}
 	}
 	endRune := min(len(runes), startRune+maxChars)
@@ -3245,7 +3399,7 @@ func googleDocsSnippet(text, query string, maxChars int) string {
 // getMailClient resolves the account email and returns an authenticated mail
 // API client (Gmail OAuth or IMAP, depending on the account's source type).
 // The caller must close the returned client.
-func (h *handlers) getMailClient(ctx context.Context, args map[string]any) (gmail.API, error) {
+func (h *handlers) getMailClient(ctx context.Context, args map[string]any) (gmail.LiveAPI, error) {
 	if h.gmailFactory == nil {
 		return nil, errors.New("live mail API not configured (Gmail OAuth credentials or an IMAP account needed)")
 	}
@@ -3281,7 +3435,7 @@ func (h *handlers) listDrafts(ctx context.Context, req toolRequest) (*toolResult
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	queryStr, _ := args["query"].(string)
 	limit := limitArg(args, "limit", 20)
@@ -3321,7 +3475,7 @@ func (h *handlers) getDraft(ctx context.Context, req toolRequest) (*toolResult, 
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	draftID, _ := args["draft_id"].(string)
 	if draftID == "" {
@@ -3343,7 +3497,7 @@ func (h *handlers) createDraft(ctx context.Context, req toolRequest) (*toolResul
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	body, _ := args["body"].(string)
 	if body == "" {
@@ -3421,7 +3575,7 @@ func (h *handlers) updateDraft(ctx context.Context, req toolRequest) (*toolResul
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	draftID, _ := args["draft_id"].(string)
 	if draftID == "" {
@@ -3500,7 +3654,7 @@ func (h *handlers) deleteDraft(ctx context.Context, req toolRequest) (*toolResul
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	draftID, _ := args["draft_id"].(string)
 	if draftID == "" {
@@ -3527,7 +3681,7 @@ func (h *handlers) sendDraft(ctx context.Context, req toolRequest) (*toolResult,
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	draftID, _ := args["draft_id"].(string)
 	if draftID == "" {
@@ -3561,7 +3715,7 @@ func (h *handlers) modifyLabels(ctx context.Context, req toolRequest) (*toolResu
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	messageIDsStr, _ := args["message_ids"].(string)
 	if messageIDsStr == "" {
@@ -3608,7 +3762,7 @@ func (h *handlers) createLabel(ctx context.Context, req toolRequest) (*toolResul
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	name, _ := args["name"].(string)
 	if name == "" {
@@ -3630,7 +3784,7 @@ func (h *handlers) deleteLabel(ctx context.Context, req toolRequest) (*toolResul
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	labelID, _ := args["label_id"].(string)
 	if labelID == "" {
@@ -3657,7 +3811,7 @@ func (h *handlers) listGmailLabels(ctx context.Context, req toolRequest) (*toolR
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	labels, err := client.ListLabels(ctx)
 	if err != nil {

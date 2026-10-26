@@ -1,9 +1,12 @@
 ---
+last_edited: "2026-09-22"
 title: Remote Deployment
 description: Run msgvault in Docker on a remote host and provision it from a machine with a browser.
 ---
 
-msgvault supports a remote-first workflow where you configure a remote instance using a local browser session, then deploy and sync on headless hardware. This works with any always-on host: a NAS (a good choice for RAID fault tolerance), a cloud VM, a Raspberry Pi, or any Linux server with Docker.
+Run your archive on an always-on server and use it from your own computer.
+Set up source credentials on a machine with a browser, then copy a deployment
+bundle to a Linux host with Docker, such as a NAS, cloud VM, or Raspberry Pi.
 
 The flow is built on three capabilities:
 
@@ -25,19 +28,15 @@ The flow is built on three capabilities:
 
 ## Docker Image
 
-The image is published to GitHub Container Registry:
+Choose a published image from the [container package](https://github.com/kenn-io/msgvault/pkgs/container/msgvault)
+and set its full name in your Compose file. Version tags omit the leading `v`:
+for example, release 0.19.3 uses `ghcr.io/kenn-io/msgvault:0.19.3`.
 
-```bash
-docker pull ghcr.io/kenn-io/msgvault:latest
-```
-
-| Tag | Description |
-|-----|-------------|
-| `latest` | Latest stable release from main branch |
-| `v1.2.3` | Specific version |
-| `1.2` | Latest patch of minor version |
-| `1` | Latest minor/patch of major version |
-| `sha-abc1234` | Specific commit (for debugging) |
+`latest` is not a stable-release guarantee and can refer to an older development
+snapshot. Repository-owned image publishing has been removed, so a new commit
+or release tag does not automatically update GHCR. Check that the image you
+choose contains the version you need. To deploy current source before a matching
+image is published, follow [Container builds](../development.md#container-builds).
 
 **Architectures:** `linux/amd64` (Intel/AMD NAS, standard servers) and `linux/arm64` (Raspberry Pi 4/5, newer NAS). Docker selects the correct one automatically.
 
@@ -116,6 +115,10 @@ services:
       start_period: 10s
 ```
 
+The wizard currently writes `:latest` as shown above. Before deployment, change
+`image` to your chosen published version or digest. For an image built and
+loaded locally, use its local tag and remove `pull_policy: always`.
+
 ## 2) Deploy to Remote Host
 
 Copy the bundle and start services via SSH:
@@ -159,10 +162,12 @@ msgvault export-token you@gmail.com \
 
     If you ran `msgvault setup` and configured a remote server, the wizard already set `allow_insecure = true` in your local config, so `--allow-insecure` is not needed on the command line.
 
-The command uploads to `POST /api/v1/auth/token/{email}` and also posts to `POST /api/v1/accounts` to register:
+The command uploads to `POST /api/v1/auth/token/{email}` and, by default, also posts to `POST /api/v1/accounts` to register:
 
 - default sync schedule `0 2 * * *`
 - account enabled
+
+For Calendar-only access, use `msgvault export-token <email> --upload-only` to upload the token without creating a Gmail sync schedule. Then register Calendar on the server with `msgvault add-calendar <email>`.
 
 If you did not configure remote details during setup, you can also set:
 
@@ -225,7 +230,7 @@ curl -H "X-API-Key: YOUR_API_KEY" http://remote-host:8080/api/v1/scheduler/statu
     `msgvault add-calendar you@gmail.com` on a machine with a browser, copy the
     token to the server (it now carries Gmail + Calendar), then add a `[[gcal]]`
     entry with a cron `schedule` so the daemon syncs it. See
-    [Google Calendar](/usage/calendar/).
+    [Google Calendar](/docs/usage/calendar/).
 
 After setup, your data directory contains:
 
@@ -248,7 +253,7 @@ regular remote use, terminate HTTPS at a reverse proxy and add only that
 proxy's address or CIDR to `server.trusted_proxies`; the daemon uses trusted
 forwarding information to mark its browser session cookie `Secure`. Plain HTTP
 on a private network is supported as an explicit tradeoff and produces a UI
-warning because the cookie is not encrypted in transit. See [Web UI](/web-ui/)
+warning because the cookie is not encrypted in transit. See [Web UI](/docs/web-ui/)
 for the complete session and proxy model.
 
 ## Using the Local CLI Against Remote
@@ -268,6 +273,59 @@ Use `--local` only when you explicitly want the command to talk to this machine'
 
 !!! tip "Remote TUI"
     The interactive TUI (`msgvault tui`) connects to the remote server automatically when `[remote]` is configured. All views, drill-downs, search, filtering, deletion staging, and attachment export work through the selected daemon. Staged deletion manifests are saved on the daemon host; attachment export streams bytes from the daemon and writes the zip file on the CLI machine. Use `--local` to force the local daemon instead of the configured remote server.
+
+### Read-only remote clients
+
+Give a laptop or another person read access without handing out the owner `api_key`. Each remote client gets its own key, and the server accepts it on the same listener as the owner key.
+
+1. On the server, generate a key file next to `config.toml` (the folder mounted at `/data` in the generated bundle):
+
+    ```bash
+    mkdir -p remote-keys
+    openssl rand -hex 32 > remote-keys/laptop
+    chmod 600 remote-keys/laptop
+    ```
+
+    Follow [server credential permissions](/docs/configuration/#server), including owner-only ACLs on Windows.
+
+2. List it in the server's `config.toml`. The server needs its own API key too, from any [server credential source](/docs/configuration/#server). Relative paths resolve the same way as the server's `api_key_file`.
+
+    ```toml
+    [[server.remote_clients]]
+    client_id = "laptop"
+    api_key_file = "remote-keys/laptop"
+    # collections_write = true
+    ```
+
+3. Restart the server. Keys load at startup, so restart after adding, removing, or rotating a key.
+
+4. Copy the key file to the client machine and point `[remote] api_key_file` at it.
+
+    ```toml
+    [remote]
+    url = "https://archive.tail12345.ts.net"
+    api_key_file = "~/.msgvault/remote-key"
+    ```
+
+    For a plain HTTP URL on a trusted network, such as `http://nas.tail12345.ts.net:8080`, also set `allow_insecure = true`.
+
+Reach the server over the same private network as the owner key, such as Tailscale. If you put an HTTPS reverse proxy on that network in front of the main listener, forward the `X-Api-Key` header unchanged. A reader key still reads the whole archive, so the advice in [Security Notes](#security-notes) about not exposing the server to the internet applies to it too.
+
+A remote client key can search, show messages and whole threads, export original or raw MIME and attachments, and list accounts, collections, identities, and stats. With `collections_write = true` it can also create, edit, and delete collections. Aggregate views aren't available, so `list-senders`, `list-domains`, `list-labels`, `query`, vector search, `tui`, and `mcp` fail with a remote client key. Every other request gets HTTP 403, including settings, token upload, SQL queries, sync, backups, agent tokens, the Web UI, `/openapi.json`, and `/debug/pprof/`.
+
+Direct connections retain [API rate limiting](/docs/api-server/#rate-limiting), so a throttled thread export keeps files completed before the failed request.
+
+Remote client responses have fixed limits:
+
+| Limit | Value | Response when exceeded |
+|---|---|---|
+| Search results per request | 500 | 400 `remote_search_limit` |
+| Message content or raw MIME | 64 MiB | 413 `remote_message_too_large` |
+| Original-message endpoint | 64 MiB | 413 `original_message_too_large` |
+| Whole-thread export (`export-eml --thread`) | 500 messages | 413 `remote_thread_too_large` |
+| Attachment | 1 GiB | 413 `remote_attachment_too_large` |
+
+A reader key can't show a message whose text exceeds 64 MiB or list that message's attachments. When stored text is missing, the raw MIME used to build message details must also fit the 64 MiB limit. `export-eml` still exports raw MIME when it fits that limit.
 
 ## Platform Notes
 
@@ -309,7 +367,7 @@ Initial sync of large mailboxes will be slower on Pi hardware. Use `--limit` to 
 ## Security Notes
 
 - **Use Tailscale.** The recommended way to access your NAS remotely is via [Tailscale](https://tailscale.com/). It encrypts all traffic and avoids the need for TLS certificates, port forwarding, or reverse proxies. Use your Tailscale hostname (e.g., `http://nas.tail12345.ts.net:8080`) with `--allow-insecure`.
-- **API key protects all API access.** The server requires `api_key` for non-loopback addresses. Anyone with the key can read your entire archive, so treat it like a password.
+- **API key protects all API access.** The server requires `api_key` for non-loopback addresses. Anyone with the key can read your entire archive, so treat it like a password. [Remote client keys](#read-only-remote-clients) can also read the entire archive, but can't change settings or run syncs.
 - **Don't expose port 8080 to the internet.** msgvault is designed for trusted networks. If you need internet access, use Tailscale rather than opening ports on your router.
 - The generated bundle sets `user: root` in Docker Compose, which works around common NAS ACL quirks (for example Synology). On a standard Linux server you can change this to a non-root user.
 
@@ -327,10 +385,10 @@ docker exec -it msgvault msgvault tui  # Interactive TUI
 # Restart using the currently installed image
 docker-compose restart
 
-# Reconcile the service; generated bundles check for a newer latest image
+# Reconcile the service with the image configured in Compose
 docker-compose up -d
 
-# Explicitly update to the latest image
+# Pull the configured image after choosing the version to deploy
 docker-compose pull
 docker-compose up -d
 
@@ -339,9 +397,10 @@ docker-compose down
 ```
 
 `restart` does not check the registry or replace the image. Generated bundles
-set `pull_policy: always`, so `up -d` reconciles against GHCR. The explicit
-`pull` followed by `up -d` sequence remains the clearest update procedure
-across NAS Compose implementations.
+set `pull_policy: always`, so `up -d` checks the configured tag in GHCR. A
+version-pinned service stays on that version until you edit `image`. Back up
+before upgrading and keep the client and daemon versions compatible. Then use
+`pull` followed by `up -d` to deploy the selected image.
 
 Bundles generated before `pull_policy: always` was added are not rewritten
 automatically. Existing installations should either regenerate the bundle,
@@ -423,4 +482,4 @@ Verify the account exists in the server config:
 curl -H "X-API-Key: YOUR_API_KEY" http://remote-host:8080/api/v1/accounts
 ```
 
-If missing, re-run `export-token`, which also posts account metadata.
+If missing, re-run `export-token` without `--upload-only`, which also posts account metadata.

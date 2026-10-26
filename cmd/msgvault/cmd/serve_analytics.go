@@ -147,6 +147,7 @@ func prepareDaemonAnalyticsEngine(
 		return nil, "", startupCacheBuildOutcomeNone, false,
 			errors.New("daemon analytics engine unavailable")
 	}
+	logger := loggerFromContext(ctx)
 
 	engineMode := c.Analytics.Engine
 	if engineMode == "" {
@@ -179,10 +180,17 @@ func prepareDaemonAnalyticsEngine(
 	}
 }
 
+// daemonAnalyticsCacheWorkTracker keeps cache initialization alive across
+// daemon idle checks. Cache concurrency is enforced by the cache builder and
+// reader locks, pinned snapshots, and publication checks, not the archive
+// mutation gate.
+func daemonAnalyticsCacheWorkTracker(idleTracker scheduler.WorkTracker) scheduler.WorkTracker {
+	return combineWorkTrackers(idleTracker)
+}
+
 // startDaemonAnalyticsInitializer performs final cache selection after the
-// HTTP listener starts. The operation tracker prevents scheduled/API writes
-// from racing cache export and keeps an idle-shutdown daemon alive until the
-// worker exits.
+// HTTP listener starts. Its tracker keeps an idle-shutdown daemon alive until
+// the worker exits.
 func startDaemonAnalyticsInitializer(
 	ctx context.Context,
 	c *config.Config,
@@ -195,6 +203,7 @@ func startDaemonAnalyticsInitializer(
 	h := newDaemonAnalyticsInitHandle()
 	apiServer.SetAnalyticsInitializationActive(true)
 	go func() {
+		logger := loggerFromContext(ctx)
 		defer close(h.done)
 		defer apiServer.SetAnalyticsInitializationActive(false)
 		if tracker != nil {

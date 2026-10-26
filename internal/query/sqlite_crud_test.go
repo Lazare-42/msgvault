@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/search"
+	"go.kenn.io/msgvault/internal/store"
 	"go.kenn.io/msgvault/internal/testutil/dbtest"
 )
 
@@ -40,8 +41,9 @@ func TestMessageFilter_Clone(t *testing.T) {
 	assert := assert.New(t)
 	// Create original filter with EmptyValueTargets
 	original := MessageFilter{
-		Sender: "alice@example.com",
-		Label:  "INBOX",
+		Sender:    "alice@example.com",
+		Label:     "INBOX",
+		SourceIDs: []int64{},
 		EmptyValueTargets: map[ViewType]bool{
 			ViewSenders: true,
 		},
@@ -53,6 +55,7 @@ func TestMessageFilter_Clone(t *testing.T) {
 	// Verify scalar fields are copied
 	assert.Equal("alice@example.com", clone.Sender)
 	assert.Equal("INBOX", clone.Label)
+	assert.NotNil(clone.SourceIDs, "an explicit empty source scope must stay distinct from no scope")
 
 	// Verify EmptyValueTargets is deeply copied
 	assert.True(clone.MatchesEmpty(ViewSenders), "clone should have ViewSenders in EmptyValueTargets")
@@ -242,11 +245,14 @@ func TestGetMessage(t *testing.T) {
 
 	_, err := env.DB.Exec(`UPDATE messages SET is_from_me = TRUE WHERE id = 1`)
 	require.NoError(err, "mark message as sent by the account owner")
+	_, err = env.DB.Exec(`UPDATE conversations SET title = 'Team chat' WHERE id = (SELECT conversation_id FROM messages WHERE id = 1)`)
+	require.NoError(err)
 
 	msg, err := env.Engine.GetMessage(env.Ctx, 1)
 	require.NoError(err, "GetMessage")
 	require.NotNil(msg, "expected message")
 	assert.Equal("Hello World", msg.Subject)
+	assert.Equal("Team chat", msg.ConversationTitle)
 	assert.True(msg.IsFromMe)
 	require.Len(msg.From, 1, "from list")
 	assert.Equal("alice@example.com", msg.From[0].Email)
@@ -391,12 +397,24 @@ func TestDuplicateCASAliasRetainsHashAcrossAttachmentQueries(t *testing.T) {
 }
 
 func TestGetMessageBySourceID(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
 	env := newTestEnv(t)
 
-	msg, err := env.Engine.GetMessageBySourceID(env.Ctx, "msg3")
-	require.NoError(t, err, "GetMessageBySourceID")
-	require.NotNil(t, msg, "expected message")
-	assert.Equal(t, "Follow up", msg.Subject)
+	msg, err := env.Engine.GetMessageBySourceID(env.Ctx, "msg3", nil)
+	requirements.NoError(err, "GetMessageBySourceID")
+	requirements.NotNil(msg, "expected message")
+	assertions.Equal("Follow up", msg.Subject)
+	for _, ids := range [][]int64{{msg.SourceID}, {}, {msg.SourceID + 1000}} {
+		scoped, err := env.Engine.GetMessageBySourceID(env.Ctx, "msg3", ids)
+		requirements.NoError(err)
+		if len(ids) == 1 && ids[0] == msg.SourceID {
+			requirements.NotNil(scoped)
+			assertions.Equal(msg.ID, scoped.ID)
+		} else {
+			assertions.Nil(scoped)
+		}
+	}
 }
 
 func TestListAccounts(t *testing.T) {
@@ -406,6 +424,27 @@ func TestListAccounts(t *testing.T) {
 	require.NoError(t, err, "ListAccounts")
 	require.Len(t, accounts, 1)
 	assert.Equal(t, "test@gmail.com", accounts[0].Identifier)
+}
+
+func TestListAccountsLastSyncAt(t *testing.T) {
+	checks := assert.New(t)
+	must := require.New(t)
+	env := newTestEnv(t)
+
+	accounts, err := env.Engine.ListAccounts(env.Ctx)
+	must.NoError(err, "ListAccounts before sync")
+	must.Len(accounts, 1)
+	checks.Nil(accounts[0].LastSyncAt, "never-synced source has no last sync time")
+
+	syncedAt := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	_, err = env.DB.Exec(`UPDATE sources SET last_sync_at = ? WHERE id = ?`, syncedAt, accounts[0].ID)
+	must.NoError(err, "set last_sync_at")
+
+	accounts, err = env.Engine.ListAccounts(env.Ctx)
+	must.NoError(err, "ListAccounts after sync")
+	must.Len(accounts, 1)
+	must.NotNil(accounts[0].LastSyncAt)
+	checks.True(syncedAt.Equal(*accounts[0].LastSyncAt), "last sync time %v", accounts[0].LastSyncAt)
 }
 
 func TestGetTotalStats(t *testing.T) {
@@ -670,11 +709,11 @@ func TestGetMessageBySourceIDIncludesDeleted(t *testing.T) {
 
 	env.MarkDeletedBySourceID("msg3")
 
-	msg, err := env.Engine.GetMessageBySourceID(env.Ctx, "msg3")
+	msg, err := env.Engine.GetMessageBySourceID(env.Ctx, "msg3", nil)
 	require.NoError(err, "GetMessageBySourceID")
 	assert.NotNil(msg, "expected deleted message to be returned")
 
-	msg, err = env.Engine.GetMessageBySourceID(env.Ctx, "msg2")
+	msg, err = env.Engine.GetMessageBySourceID(env.Ctx, "msg2", nil)
 	require.NoError(err, "GetMessageBySourceID")
 	assert.NotNil(msg, "expected message")
 }
@@ -751,6 +790,427 @@ func TestGetDeletionTargetsByFilter_Label(t *testing.T) {
 
 			require.NoError(t, err, "GetDeletionTargetsByFilter")
 			assert.Len(t, ids, tt.wantLen)
+		})
+	}
+}
+
+func TestGetDeletionTargetsByFilterExcludesPortableArchiveOnlyMarker(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	env := newTestEnv(t)
+	_, err := env.DB.Exec(`
+		INSERT INTO source_merge_archive_only_messages (message_id) VALUES (1)
+	`)
+	require.NoError(err)
+
+	var provenanceCount int
+	require.NoError(env.DB.QueryRow(
+		`SELECT COUNT(*) FROM source_merge_messages WHERE message_id = 1`,
+	).Scan(&provenanceCount))
+	assert.Zero(provenanceCount, "subset archives may retain a portable marker without merge provenance")
+
+	targets, err := deletionTargetSourceMessageIDs(env.Engine.GetDeletionTargetsByFilter(env.Ctx, MessageFilter{}))
+	require.NoError(err, "GetDeletionTargetsByFilter")
+	assert.NotContains(targets, "msg1", "portable archive-only markers must exclude provider deletion targets")
+	assert.Contains(targets, "msg2", "ordinary provider messages remain eligible")
+}
+
+func TestGetDeletionTargetsByFilter_DomainIsCaseInsensitive(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	env := newTestEnv(t)
+
+	ids, err := deletionTargetSourceMessageIDs(env.Engine.GetDeletionTargetsByFilter(
+		env.Ctx, MessageFilter{Domain: "EXAMPLE.COM"},
+	))
+
+	requirements.NoError(err)
+	assertions.ElementsMatch([]string{"msg1", "msg2", "msg3"}, ids)
+}
+
+func TestGetDeletionTargetsByFilter_ConversationID(t *testing.T) {
+	env := newTestEnv(t)
+	_, err := env.DB.Exec(`
+		INSERT INTO conversations (
+			id, source_id, source_conversation_id, conversation_type, title
+		) VALUES (2, 1, 'thread2', 'email_thread', 'Other Thread');
+		UPDATE messages SET conversation_id = 2 WHERE id IN (3, 4, 5)
+	`)
+	require.NoError(t, err, "create unrelated conversation")
+	conversationID := int64(1)
+
+	ids, err := deletionTargetSourceMessageIDs(env.Engine.GetDeletionTargetsByFilter(
+		env.Ctx, MessageFilter{ConversationID: &conversationID},
+	))
+
+	require.NoError(t, err, "GetDeletionTargetsByFilter")
+	assert.ElementsMatch(t, []string{"msg1", "msg2"}, ids)
+}
+
+func TestSQLiteEngine_ListIDScopesFastSearchAndDeletionLiterally(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	env := newTestEnv(t)
+	_, err := env.DB.Exec(`UPDATE messages SET list_id = CASE id
+		WHEN 1 THEN '<dev_1@example.test>'
+		WHEN 2 THEN '<DEV_1@EXAMPLE.TEST>'
+		WHEN 3 THEN '<devA1@example.test>'
+		ELSE NULL END`)
+	require.NoError(err)
+
+	filter := MessageFilter{ListID: "<DEV_1@EXAMPLE.TEST>"}
+	q := search.Parse("")
+
+	messages, err := env.Engine.SearchFast(env.Ctx, q, filter, 100, 0)
+	require.NoError(err)
+	require.Len(messages, 2)
+	assert.ElementsMatch([]int64{1, 2}, []int64{messages[0].ID, messages[1].ID})
+
+	count, err := env.Engine.SearchFastCount(env.Ctx, q, filter)
+	require.NoError(err)
+	assert.Equal(int64(2), count)
+
+	withStats, err := env.Engine.SearchFastWithStats(env.Ctx, q, "", filter, ViewLists, 100, 0)
+	require.NoError(err)
+	require.Len(withStats.Messages, 2)
+	assert.ElementsMatch([]int64{1, 2}, []int64{withStats.Messages[0].ID, withStats.Messages[1].ID})
+	assert.Equal(int64(2), withStats.TotalCount)
+	require.NotNil(withStats.Stats)
+	assert.Equal(int64(2), withStats.Stats.MessageCount)
+
+	targets, err := deletionTargetSourceMessageIDs(env.Engine.GetDeletionTargetsByFilter(env.Ctx, filter))
+	require.NoError(err)
+	assert.ElementsMatch([]string{"msg1", "msg2"}, targets)
+}
+
+func TestSQLiteEngine_GetDeletionTargetsByAggregateSearch_List(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	env := newTestEnv(t)
+	listID := "<dev@example.test>"
+	_, err := env.DB.Exec(`UPDATE messages SET list_id = ? WHERE id IN (1, 2)`, listID)
+	require.NoError(err)
+
+	targets, err := env.Engine.GetDeletionTargetsByAggregateSearch(
+		env.Ctx, "Hello", MessageFilter{MessageType: messageTypeEmail}, ViewLists, listID,
+	)
+	require.NoError(err)
+	ids, err := deletionTargetSourceMessageIDs(targets, nil)
+	require.NoError(err)
+	assert.ElementsMatch([]string{"msg1", "msg2"}, ids)
+}
+
+func TestSQLiteEngine_GetDeletionTargetsByAggregateSearch_TimeGranularity(t *testing.T) {
+	env := newTestEnv(t)
+	tests := []struct {
+		name        string
+		period      string
+		granularity TimeGranularity
+		want        []string
+	}{
+		{name: "month inferred from key", period: "2024-01", want: []string{"msg1", "msg2"}},
+		{name: "explicit year", period: "2024", granularity: TimeYear, want: []string{"msg1", "msg2"}},
+		{name: "explicit day", period: "2024-01-15", granularity: TimeDay, want: []string{"msg1"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			targets, err := env.Engine.GetDeletionTargetsByAggregateSearch(
+				env.Ctx,
+				"Hello",
+				MessageFilter{
+					MessageType: messageTypeEmail,
+					TimeRange:   TimeRange{Period: tt.period, Granularity: tt.granularity},
+				},
+				ViewTime,
+				tt.period,
+			)
+			require.NoError(t, err)
+			ids, err := deletionTargetSourceMessageIDs(targets, nil)
+			require.NoError(t, err)
+			assert.ElementsMatch(t, tt.want, ids)
+		})
+	}
+}
+
+func TestGetDeletionTargetsByFilter_EmptyBuckets(t *testing.T) {
+	env := newTestEnvWithEmptyBuckets(t)
+
+	tests := []struct {
+		name string
+		view ViewType
+		want []string
+	}{
+		{name: "sender", view: ViewSenders, want: []string{"msg100"}},
+		{name: "sender name", view: ViewSenderNames, want: []string{"msg100"}},
+		{name: "recipient", view: ViewRecipients, want: []string{"msg100", "msg101"}},
+		{name: "recipient name", view: ViewRecipientNames, want: []string{"msg100", "msg101"}},
+		{name: "domain", view: ViewDomains, want: []string{"msg100", "msg102"}},
+		{name: "label", view: ViewLabels, want: []string{"msg100", "msg101", "msg102", "msg103"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			targets, err := env.Engine.GetDeletionTargetsByFilter(env.Ctx, MessageFilter{
+				EmptyValueTargets: emptyTargets(tt.view),
+			})
+			require.NoError(t, err)
+			ids, err := deletionTargetSourceMessageIDs(targets, nil)
+			require.NoError(t, err)
+			assert.ElementsMatch(t, tt.want, ids)
+		})
+	}
+}
+
+func TestGetDeletionTargetsBySearchCombinesSearchFilterAndActiveScope(t *testing.T) {
+	env := newTestEnv(t)
+	env.EnableFTS()
+	env.MarkDeletedBySourceID("msg2")
+
+	for _, mode := range []DeletionSearchMode{DeletionSearchFast, DeletionSearchDeep} {
+		t.Run(string(mode), func(t *testing.T) {
+			targets, err := env.Engine.GetDeletionTargetsBySearch(env.Ctx, search.Parse("Hello"), MessageFilter{
+				Sender:     "alice@example.com",
+				Pagination: Pagination{Offset: 100, Limit: 1},
+			}, mode)
+			require.NoError(t, err)
+			ids, err := deletionTargetSourceMessageIDs(targets, nil)
+			require.NoError(t, err)
+			assert.Equal(t, []string{"msg1"}, ids)
+		})
+	}
+}
+
+func TestGetDeletionTargetsBySearchMatchesNormalFilterComposition(t *testing.T) {
+	env := newTestEnv(t)
+
+	for _, mode := range []DeletionSearchMode{DeletionSearchFast, DeletionSearchDeep} {
+		t.Run(string(mode), func(t *testing.T) {
+			assertions := assert.New(t)
+			requirements := require.New(t)
+			targets, err := env.Engine.GetDeletionTargetsBySearch(env.Ctx,
+				search.Parse("from:bob@company.org"),
+				MessageFilter{Sender: "alice@example.com"}, mode)
+			requirements.NoError(err)
+			ids, err := deletionTargetSourceMessageIDs(targets, nil)
+			requirements.NoError(err)
+			assertions.Empty(ids, "view filters are independent from query operators")
+		})
+	}
+}
+
+func TestDeepSearchAndDeletionUseExactRecipientPredicates(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	env := newTestEnv(t)
+	aliceID := env.MustLookupParticipant("alice@example.com")
+	copyEmail := "copy@example.net"
+	copyName := "Copy Person"
+	copyID := env.AddParticipant(dbtest.ParticipantOpts{Email: &copyEmail, DisplayName: &copyName, Domain: "example.net"})
+	otherEmail := "other@example.net"
+	otherName := "Other Person"
+	otherID := env.AddParticipant(dbtest.ParticipantOpts{Email: &otherEmail, DisplayName: &otherName, Domain: "example.net"})
+
+	env.AddMessage(dbtest.MessageOpts{
+		Subject: "Deep recipient needle",
+		SentAt:  "2024-04-02 10:00:00",
+		FromID:  aliceID,
+		CcIDs:   []int64{copyID},
+	})
+	env.AddMessage(dbtest.MessageOpts{
+		Subject: "Deep recipient needle",
+		SentAt:  "2024-04-02 11:00:00",
+		FromID:  aliceID,
+		BccIDs:  []int64{copyID},
+	})
+	env.AddMessage(dbtest.MessageOpts{
+		Subject: "Deep recipient needle",
+		SentAt:  "2024-04-02 12:00:00",
+		FromID:  aliceID,
+		ToIDs:   []int64{copyID},
+		CcIDs:   []int64{otherID},
+	})
+	env.EnableFTS()
+
+	parsed := search.Parse("Deep recipient needle")
+	filter := MessageFilter{Recipient: copyEmail, RecipientName: copyName}
+	displayed, err := env.Engine.SearchDeep(env.Ctx, parsed, filter, 100, 0)
+	requirements.NoError(err)
+	requirements.Len(displayed, 3)
+
+	targets, err := env.Engine.GetDeletionTargetsBySearch(env.Ctx, parsed, filter, DeletionSearchDeep)
+	requirements.NoError(err)
+	ids, err := deletionTargetSourceMessageIDs(targets, nil)
+	requirements.NoError(err)
+	assertions.ElementsMatch([]string{"msg100", "msg101", "msg102"}, ids)
+
+	crossRow := MessageFilter{Recipient: copyEmail, RecipientName: otherName}
+	displayed, err = env.Engine.SearchDeep(env.Ctx, parsed, crossRow, 100, 0)
+	requirements.NoError(err)
+	assertions.Empty(displayed, "recipient email and name must match the same row")
+}
+
+func TestFastSearchAndDeletionUseExactViewPredicates(t *testing.T) {
+	env := newTestEnv(t)
+	aliceID := env.MustLookupParticipant("alice@example.com")
+
+	t.Run("recipient includes cc and bcc", func(t *testing.T) {
+		assertions := assert.New(t)
+		requirements := require.New(t)
+		ccEmail := "copy@example.net"
+		ccID := env.AddParticipant(dbtest.ParticipantOpts{Email: &ccEmail, Domain: "example.net"})
+		env.AddMessage(dbtest.MessageOpts{
+			Subject: "Scoped recipient needle",
+			SentAt:  "2024-04-02 10:00:00",
+			FromID:  aliceID,
+			CcIDs:   []int64{ccID},
+		})
+		env.AddMessage(dbtest.MessageOpts{
+			Subject: "Scoped recipient needle",
+			SentAt:  "2024-04-02 11:00:00",
+			FromID:  aliceID,
+			BccIDs:  []int64{ccID},
+		})
+
+		parsed := search.Parse("Scoped recipient needle")
+		filter := MessageFilter{Recipient: ccEmail}
+		displayed, err := env.Engine.SearchFast(env.Ctx, parsed, filter, 100, 0)
+		requirements.NoError(err)
+		requirements.Len(displayed, 2)
+
+		targets, err := env.Engine.GetDeletionTargetsBySearch(env.Ctx, parsed, filter, DeletionSearchFast)
+		requirements.NoError(err)
+		ids, err := deletionTargetSourceMessageIDs(targets, nil)
+		requirements.NoError(err)
+		assertions.ElementsMatch([]string{displayed[0].SourceMessageID, displayed[1].SourceMessageID}, ids)
+	})
+
+	t.Run("domain treats wildcard characters literally", func(t *testing.T) {
+		assertions := assert.New(t)
+		requirements := require.New(t)
+		wantedEmail := "sender@team_ops.example"
+		wantedID := env.AddParticipant(dbtest.ParticipantOpts{Email: &wantedEmail, Domain: "team_ops.example"})
+		otherEmail := "sender@teamXops.example"
+		otherID := env.AddParticipant(dbtest.ParticipantOpts{Email: &otherEmail, Domain: "teamXops.example"})
+		env.AddMessage(dbtest.MessageOpts{Subject: "Scoped domain needle", SentAt: "2024-04-03 10:00:00", FromID: wantedID})
+		env.AddMessage(dbtest.MessageOpts{Subject: "Scoped domain needle", SentAt: "2024-04-04 10:00:00", FromID: otherID})
+
+		parsed := search.Parse("Scoped domain needle")
+		filter := MessageFilter{Domain: "TEAM_OPS.EXAMPLE"}
+		displayed, err := env.Engine.SearchFast(env.Ctx, parsed, filter, 100, 0)
+		requirements.NoError(err)
+		requirements.Len(displayed, 1)
+
+		targets, err := env.Engine.GetDeletionTargetsBySearch(env.Ctx, parsed, filter, DeletionSearchFast)
+		requirements.NoError(err)
+		ids, err := deletionTargetSourceMessageIDs(targets, nil)
+		requirements.NoError(err)
+		assertions.Equal([]string{displayed[0].SourceMessageID}, ids)
+	})
+}
+
+func TestGetDeletionTargetsBySearchPreservesUnsupportedFilterPredicates(t *testing.T) {
+	env := newTestEnvWithEmptyBuckets(t)
+
+	targets, err := env.Engine.GetDeletionTargetsBySearch(env.Ctx,
+		search.Parse("No Sender"),
+		MessageFilter{EmptyValueTargets: emptyTargets(ViewSenders)},
+		DeletionSearchFast)
+	require.NoError(t, err)
+	ids, err := deletionTargetSourceMessageIDs(targets, nil)
+	require.NoError(t, err)
+	assert.Len(t, ids, 1)
+}
+
+func TestFastSearchAndDeletionKeepViewLabelExact(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	env := newTestEnv(t)
+	aliceID := env.MustLookupParticipant("alice@example.com")
+	bobID := env.MustLookupParticipant("bob@company.org")
+	homeworkID := env.AddLabel(dbtest.LabelOpts{Name: "Homework"})
+	homeworkMessageID := env.AddMessage(dbtest.MessageOpts{
+		Subject: "Hello homework",
+		SentAt:  "2024-04-01 10:00:00",
+		FromID:  aliceID,
+		ToIDs:   []int64{bobID},
+	})
+	env.AddMessageLabel(homeworkMessageID, homeworkID)
+
+	parsed := search.Parse("Hello")
+	filter := MessageFilter{Label: "Work"}
+	displayed, err := env.Engine.SearchFast(env.Ctx, parsed, filter, 100, 0)
+	require.NoError(err)
+	require.Len(displayed, 1)
+	assert.Equal("msg1", displayed[0].SourceMessageID)
+
+	targets, err := env.Engine.GetDeletionTargetsBySearch(env.Ctx, parsed, filter, DeletionSearchFast)
+	require.NoError(err)
+	ids, err := deletionTargetSourceMessageIDs(targets, nil)
+	require.NoError(err)
+	assert.Equal([]string{"msg1"}, ids)
+}
+
+func TestDeepSearchDeletionKeepsViewDomainExact(t *testing.T) {
+	assertions := assert.New(t)
+	requirements := require.New(t)
+	env := newTestEnv(t)
+	wantedEmail := "sender@team_ops.example"
+	wantedID := env.AddParticipant(dbtest.ParticipantOpts{Email: &wantedEmail, Domain: "team_ops.example"})
+	otherEmail := "sender@teamXops.example"
+	otherID := env.AddParticipant(dbtest.ParticipantOpts{Email: &otherEmail, Domain: "teamXops.example"})
+	env.AddMessage(dbtest.MessageOpts{Subject: "Deep domain needle", SentAt: "2024-04-03 10:00:00", FromID: wantedID})
+	env.AddMessage(dbtest.MessageOpts{Subject: "Deep domain needle", SentAt: "2024-04-04 10:00:00", FromID: otherID})
+	env.EnableFTS()
+
+	targets, err := env.Engine.GetDeletionTargetsBySearch(env.Ctx, search.Parse("Deep domain needle"), MessageFilter{
+		Domain: "team_ops.example",
+	}, DeletionSearchDeep)
+	requirements.NoError(err)
+	ids, err := deletionTargetSourceMessageIDs(targets, nil)
+	requirements.NoError(err)
+	assertions.Equal([]string{"msg100"}, ids)
+}
+
+func TestDeepSearchAndDeletionKeepExactViewFilters(t *testing.T) {
+	env := newTestEnvWithEmptyBuckets(t)
+	env.EnableFTS()
+
+	tests := []struct {
+		name   string
+		query  string
+		filter MessageFilter
+		want   []string
+	}{
+		{name: "sender name", query: "Message", filter: MessageFilter{SenderName: "Alice"}, want: []string{"msg1", "msg2", "msg3"}},
+		{name: "recipient name", query: "Message", filter: MessageFilter{RecipientName: "Bob"}, want: []string{"msg1", "msg2", "msg3"}},
+		{name: "empty sender", query: "No", filter: MessageFilter{EmptyValueTargets: emptyTargets(ViewSenders)}, want: []string{"msg100"}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assertions := assert.New(t)
+			requirements := require.New(t)
+			parsed := search.Parse(tt.query)
+			displayed, err := env.Engine.SearchDeep(env.Ctx, parsed, tt.filter, 100, 0)
+			requirements.NoError(err)
+			displayedIDs := make([]string, len(displayed))
+			for i := range displayed {
+				displayedIDs[i] = displayed[i].SourceMessageID
+			}
+			assertions.ElementsMatch(tt.want, displayedIDs)
+
+			targets, err := env.Engine.GetDeletionTargetsBySearch(env.Ctx, parsed, tt.filter, DeletionSearchDeep)
+			requirements.NoError(err)
+			targetIDs, err := deletionTargetSourceMessageIDs(targets, nil)
+			requirements.NoError(err)
+			assertions.ElementsMatch(displayedIDs, targetIDs)
+
+			result, err := env.Engine.SearchDeepWithStats(env.Ctx, parsed, tt.filter, 100, 0)
+			requirements.NoError(err)
+			requirements.NotNil(result.Stats)
+			assertions.Equal(int64(len(tt.want)), result.TotalCount)
+			assertions.Equal(int64(len(tt.want)), result.Stats.MessageCount)
 		})
 	}
 }
@@ -960,6 +1420,57 @@ func TestGetDeletionTargetsByFilter_RecipientEmailAndName_SameToRow(t *testing.T
 		"same-row recipient email+name must still match")
 }
 
+func TestSQLiteRecipientPhoneFilter(t *testing.T) {
+	env := newTestEnv(t)
+	phoneID := env.AddParticipant(dbtest.ParticipantOpts{
+		Phone:       new("+15551234567"),
+		DisplayName: new("Phone Recipient"),
+	})
+	emailID := env.MustLookupParticipant("bob@company.org")
+	messageID := env.AddMessage(dbtest.MessageOpts{
+		Subject: "Phone recipient", SentAt: "2024-06-10 10:00:00",
+		ToIDs: []int64{phoneID, emailID},
+	})
+
+	for _, tc := range []struct {
+		name          string
+		recipientName string
+		wantIDs       []int64
+	}{
+		{name: "phone", wantIDs: []int64{messageID}},
+		{name: "phone and same-row name", recipientName: "Phone Recipient", wantIDs: []int64{messageID}},
+		{name: "phone and other-row name", recipientName: "Bob"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require := require.New(t)
+			assert := assert.New(t)
+			filter := MessageFilter{Recipient: "+15551234567", RecipientName: tc.recipientName}
+			messages, err := env.Engine.ListMessages(env.Ctx, filter)
+			require.NoError(err)
+			assertMessageIDs(t, messages, tc.wantIDs)
+
+			messages, err = env.Engine.SearchFast(env.Ctx, &search.Query{}, filter, 100, 0)
+			require.NoError(err)
+			assertMessageIDs(t, messages, tc.wantIDs)
+			count, err := env.Engine.SearchFastCount(env.Ctx, &search.Query{}, filter)
+			require.NoError(err)
+			assert.Equal(int64(len(tc.wantIDs)), count)
+
+			stats, err := env.Engine.GetTotalStats(env.Ctx, StatsOptions{Filter: &filter})
+			require.NoError(err)
+			assert.Equal(int64(len(tc.wantIDs)), stats.MessageCount)
+
+			targets, err := env.Engine.GetDeletionTargetsByFilter(env.Ctx, filter)
+			require.NoError(err)
+			ids := make([]int64, 0, len(targets))
+			for _, target := range targets {
+				ids = append(ids, target.MessageID)
+			}
+			assert.ElementsMatch(tc.wantIDs, ids)
+		})
+	}
+}
+
 func TestGetDeletionTargetsByFilter_RecipientName(t *testing.T) {
 	env := newTestEnv(t)
 
@@ -977,7 +1488,7 @@ func TestGetDeletionTargetsByFilter_RecipientName_WithMatchEmptyRecipient(t *tes
 	}
 	ids, err := deletionTargetSourceMessageIDs(env.Engine.GetDeletionTargetsByFilter(env.Ctx, filter))
 	require.NoError(t, err, "GetDeletionTargetsByFilter")
-	assert.Len(t, ids, 3, "expected 3 gmail IDs")
+	assert.Empty(t, ids, "a named recipient cannot also be in the empty-recipient bucket")
 }
 
 func TestListMessages_ConversationIDFilter(t *testing.T) {
@@ -1403,6 +1914,63 @@ func TestSQLiteMessageSummariesIncludeSourceID(t *testing.T) {
 	assert.Equal(sourceID, detail.SourceID)
 }
 
+// TestGetMessageSummariesByIDs_ChunksLargeIDSetsAndPreservesOrder is the
+// regression for the SQLite bound-parameter ceiling: one id is one bound
+// parameter in this query's IN-list, and a caller hydrating a large ranked
+// result set (eval's dense vector/hybrid modes at a large -n) can ask for far
+// more ids than SQLite's default 32766-parameter-per-statement limit allows
+// in a single call. Requesting more ids than messageSummaryIDChunk must still
+// return every one of them, in the caller's own order — not chunk order —
+// since that order is the search rank the caller reassembles by. The label
+// hydration that follows the base query binds ids into its own IN-list too,
+// so a message on each side of the chunk boundary carries a label to prove
+// that pass is chunked as well, not just the base fetch.
+func TestGetMessageSummariesByIDs_ChunksLargeIDSetsAndPreservesOrder(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	env := newTestEnv(t)
+	sourceID := env.AddSource(dbtest.SourceOpts{Identifier: "chunk-source"})
+	conversationID := env.AddConversation(dbtest.ConversationOpts{SourceID: sourceID})
+
+	const total = messageSummaryIDChunk + 3
+	ids := make([]int64, total)
+	for i := range total {
+		ids[i] = env.AddMessage(dbtest.MessageOpts{
+			SourceID:       sourceID,
+			ConversationID: conversationID,
+			Subject:        fmt.Sprintf("chunk-regression-%d", i),
+		})
+	}
+
+	firstChunkLabel := env.AddLabel(dbtest.LabelOpts{SourceID: sourceID, Name: "first-chunk"})
+	env.AddMessageLabel(ids[0], firstChunkLabel)
+	lastChunkLabel := env.AddLabel(dbtest.LabelOpts{SourceID: sourceID, Name: "second-chunk"})
+	env.AddMessageLabel(ids[total-1], lastChunkLabel)
+
+	// Reverse the request order so a bug that silently reassembled results in
+	// chunk (insertion) order rather than caller order would fail loudly.
+	requested := make([]int64, total)
+	for i, id := range ids {
+		requested[total-1-i] = id
+	}
+
+	hydrated, err := env.Engine.GetMessageSummariesByIDs(env.Ctx, requested)
+	require.NoError(err, "GetMessageSummariesByIDs")
+	require.Len(hydrated, total, "every id across the chunk boundary must come back")
+	for i, m := range hydrated {
+		assert.Equal(requested[i], m.ID, "result order must match the caller's request order, not chunk order")
+	}
+
+	byID := make(map[int64]MessageSummary, len(hydrated))
+	for _, m := range hydrated {
+		byID[m.ID] = m
+	}
+	assert.Equal([]string{"first-chunk"}, byID[ids[0]].Labels,
+		"a message hydrated in the first label chunk must carry its label")
+	assert.Equal([]string{"second-chunk"}, byID[ids[total-1]].Labels,
+		"a message hydrated in the second label chunk must carry its label too")
+}
+
 func TestGetTotalStats_SearchScopeCountsMatchingLabelsAndSources(t *testing.T) {
 	env := newTestEnv(t)
 	source2 := env.AddSource(dbtest.SourceOpts{
@@ -1582,8 +2150,19 @@ func TestGetTotalStats_FilteredCountsMatchDuckDBPopulation(t *testing.T) {
 			wantMessages: 1, wantLabels: 1, wantAccounts: 1,
 		},
 		{
-			name: "explicit empty source IDs",
-			opts: StatsOptions{SourceIDs: []int64{}},
+			name: "complete message filter",
+			opts: StatsOptions{
+				SearchQuery: "filterpopulationneedle",
+				Filter:      &MessageFilter{Label: "Filtered First A"},
+			},
+			wantMessages: 1, wantLabels: 2, wantAccounts: 1,
+		},
+		{
+			name: "complete filter with explicit empty source IDs",
+			opts: StatsOptions{
+				SourceIDs: []int64{},
+				Filter:    &MessageFilter{Label: "Filtered First A"},
+			},
 		},
 	}
 	for _, tc := range tests {
@@ -1848,6 +2427,37 @@ func TestGetDeletionTargetsByMessageIDsPreservesDuplicateGmailIDSource(t *testin
 	}, targets[0])
 }
 
+func TestDeletionTargetResolversExcludeArchiveOnlyMergeHistory(t *testing.T) {
+	env := newTestEnv(t)
+	// Subsets preserve this portable marker even when merge provenance is omitted.
+	_, err := env.DB.Exec(`INSERT INTO source_merge_archive_only_messages(message_id) VALUES (1)`)
+	require.NoError(t, err)
+	_, err = env.DB.Exec(`UPDATE messages SET list_id = ? WHERE id IN (1, 2)`, "<dev@example.test>")
+	require.NoError(t, err)
+	env.EnableFTS()
+
+	assertNoArchivedTarget := func(name string, targets []DeletionTarget, err error) {
+		t.Helper()
+		require.NoError(t, err, name)
+		for _, target := range targets {
+			assert.NotEqual(t, int64(1), target.MessageID, "%s must exclude archive-only merge history", name)
+		}
+	}
+
+	sourceID := int64(1)
+	targets, err := env.Engine.GetDeletionTargetsByFilter(env.Ctx, MessageFilter{SourceID: &sourceID})
+	assertNoArchivedTarget("filter", targets, err)
+	targets, err = env.Engine.GetDeletionTargetsByMessageIDs(env.Ctx, []int64{1, 2})
+	assertNoArchivedTarget("message IDs", targets, err)
+	for _, mode := range []DeletionSearchMode{DeletionSearchFast, DeletionSearchDeep} {
+		targets, err = env.Engine.GetDeletionTargetsBySearch(env.Ctx, search.Parse("Hello"), MessageFilter{}, mode)
+		assertNoArchivedTarget(string(mode), targets, err)
+	}
+	targets, err = env.Engine.GetDeletionTargetsByAggregateSearch(
+		env.Ctx, "Hello", MessageFilter{}, ViewLists, "<dev@example.test>")
+	assertNoArchivedTarget("aggregate search", targets, err)
+}
+
 func TestGetDeletionTargetsByFilterPreservesSource(t *testing.T) {
 	require := require.New(t)
 	assert := assert.New(t)
@@ -1884,12 +2494,23 @@ func TestGetDeletionTargetsByMessageIDs_ExcludesNonQualifying(t *testing.T) {
 	require.NoError(err, "insert source-deleted message")
 	_, err = env.DB.Exec(`INSERT INTO messages (id, conversation_id, source_id, source_message_id, message_type, sent_at, deleted_at) VALUES (903, 1, 1, 'dedup-1', 'email', '2024-01-03', '2024-06-01')`)
 	require.NoError(err, "insert dedup-deleted message")
+	_, err = env.DB.Exec(`INSERT INTO messages (id, conversation_id, source_id, source_message_id, message_type, sent_at) VALUES (904, 1, 1, '', 'email', '2024-01-04')`)
+	require.NoError(err, "insert message without provider ID")
+	_, err = env.DB.Exec(`INSERT INTO messages (id, conversation_id, source_id, source_message_id, message_type, sent_at) VALUES (905, 1, 1, 'legacy-empty', '', '2024-01-05')`)
+	require.NoError(err, "insert legacy empty-type message")
+	_, err = env.DB.Exec(`INSERT INTO messages (id, conversation_id, source_id, source_message_id, message_type, sent_at) VALUES (?, 1, 1, 'chat-1', ?, '2024-01-07')`, 907, store.MessageTypeGoogleChat)
+	require.NoError(err, "insert Gmail Chat message")
 
-	targets, err := env.Engine.GetDeletionTargetsByMessageIDs(env.Ctx, []int64{1, 901, 902, 903})
+	_, err = env.DB.Exec(`INSERT INTO sources (id, source_type, identifier) VALUES (98, 'msmail', 'm@example.com'), (97, 'imap', 'i@example.com')`)
+	require.NoError(err, "insert msmail and imap sources")
+	_, err = env.DB.Exec(`INSERT INTO messages (id, conversation_id, source_id, source_message_id, message_type, sent_at) VALUES (908, 1, 98, 'AAMk-1', 'email', '2024-01-08'), (909, 1, 97, 'INBOX|1', 'email', '2024-01-09')`)
+	require.NoError(err, "insert msmail and imap messages")
+
+	targets, err := env.Engine.GetDeletionTargetsByMessageIDs(env.Ctx, []int64{1, 901, 902, 903, 904, 905, 907, 908, 909})
 	require.NoError(err, "resolve mixed ids")
 	ids, err := deletionTargetSourceMessageIDs(targets, nil)
 	require.NoError(err)
-	assert.ElementsMatch([]string{"msg1"}, ids, "non-Gmail, source-deleted, and dedup-deleted must be dropped")
+	assert.ElementsMatch([]string{"msg1", "legacy-empty", "AAMk-1"}, ids, "WhatsApp, IMAP, Gmail Chat, source-deleted, dedup-deleted, and provider-ID-less messages must be dropped")
 }
 
 func TestGetDeletionTargetsByMessageIDs_LargeSelectionExceedsSingleQueryLimit(t *testing.T) {

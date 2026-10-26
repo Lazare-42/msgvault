@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/remoteimage"
 )
 
 // fakePNG is a minimal PNG signature — enough for a byte-identity check; the
@@ -75,12 +76,9 @@ func (s *remoteImageSeams) dialedAddresses() []string {
 func newRemoteImageTestServer(t *testing.T, seams *remoteImageSeams) *Server {
 	t.Helper()
 	srv, _ := newTestServerWithMockStore(t)
-	srv.remoteImages = &remoteImageFetcher{
-		lookupNetIP:  seams.lookup,
-		dialContext:  seams.dial,
-		maxBytes:     remoteImageMaxBytes,
-		maxRedirects: remoteImageMaxRedirects,
-	}
+	srv.remoteImages = remoteimage.NewFetcher()
+	srv.remoteImages.LookupNetIP = seams.lookup
+	srv.remoteImages.DialContext = seams.dial
 	return srv
 }
 
@@ -102,6 +100,7 @@ func postRemoteImage(t *testing.T, srv *Server, target string) *httptest.Respons
 }
 
 func TestRemoteImageRejectsProhibitedTargetsBeforeAnyNetworkUse(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name     string
 		url      string
@@ -140,7 +139,7 @@ func TestRemoteImageRejectsProhibitedTargetsBeforeAnyNetworkUse(t *testing.T) {
 		{"javascript scheme", "javascript:alert(1)", "invalid_url"},
 		{"userinfo", "http://user:pass@images.example/a.png", "invalid_url"},
 		{"empty host", "http:///a.png", "invalid_url"},
-		{"overlong url", "http://images.example/" + strings.Repeat("a", remoteImageMaxURLBytes), "invalid_url"},
+		{"overlong url", "http://images.example/" + strings.Repeat("a", 4096), "invalid_url"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -159,6 +158,7 @@ func TestRemoteImageRejectsProhibitedTargetsBeforeAnyNetworkUse(t *testing.T) {
 }
 
 func TestRemoteImageRejectsMissingOrInvalidBody(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name     string
 		body     string
@@ -193,6 +193,7 @@ func TestRemoteImageRejectsMissingOrInvalidBody(t *testing.T) {
 // via <img> or navigation as a CSRF-safe method with ambient session
 // cookies attached.
 func TestRemoteImageGetIsNotServed(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	seams := &remoteImageSeams{answers: map[string][]netip.Addr{
 		"images.example": {netip.MustParseAddr("203.0.113.7")},
@@ -215,6 +216,7 @@ func TestRemoteImageGetIsNotServed(t *testing.T) {
 // origin/CSRF middleware before the fetcher is reached, while a well-formed
 // same-origin POST with the session's CSRF token still proxies the image.
 func TestRemoteImageSessionCSRFEnforcement(t *testing.T) {
+	t.Parallel()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
 		_, _ = w.Write(fakePNG)
@@ -258,12 +260,9 @@ func TestRemoteImageSessionCSRFEnforcement(t *testing.T) {
 				answers:  map[string][]netip.Addr{"images.example": {netip.MustParseAddr("203.0.113.7")}},
 				upstream: upstream.Listener.Addr().String(),
 			}
-			srv.remoteImages = &remoteImageFetcher{
-				lookupNetIP:  seams.lookup,
-				dialContext:  seams.dial,
-				maxBytes:     remoteImageMaxBytes,
-				maxRedirects: remoteImageMaxRedirects,
-			}
+			srv.remoteImages = remoteimage.NewFetcher()
+			srv.remoteImages.LookupNetIP = seams.lookup
+			srv.remoteImages.DialContext = seams.dial
 
 			login := performSessionRequest(t, srv, http.MethodPost, sessionLoginPath,
 				[]byte(`{"api_key":"`+testSessionAPIKey+`"}`), nil, false)
@@ -300,6 +299,7 @@ func TestRemoteImageSessionCSRFEnforcement(t *testing.T) {
 // include a private address. Every A/AAAA answer is validated, so a single
 // private answer rejects the fetch before any dial.
 func TestRemoteImageRejectsRebindingResolution(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name    string
 		answers []netip.Addr
@@ -339,6 +339,7 @@ func TestRemoteImageRejectsRebindingResolution(t *testing.T) {
 // the local-use space, where the layout is unknown and the whole /48 is
 // rejected.
 func TestProhibitedRemoteIPTranslatedIPv4(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name string
 		addr string
@@ -368,6 +369,7 @@ func TestProhibitedRemoteIPTranslatedIPv4(t *testing.T) {
 // destination is private, reaching the LAN through the translator. Every
 // such answer must be rejected before any dial.
 func TestRemoteImageRejectsTranslatedPrivateResolution(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name   string
 		answer string
@@ -396,12 +398,13 @@ func TestRemoteImageRejectsTranslatedPrivateResolution(t *testing.T) {
 }
 
 func TestRemoteImageHappyPathPinsValidatedAddress(t *testing.T) {
+	t.Parallel()
 	require := require.New(t)
 	assert := assert.New(t)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Empty(r.Header.Get("Cookie"), "no cookies may travel outbound")
 		assert.Equal("image/*", r.Header.Get("Accept"))
-		assert.Equal(remoteImageUserAgent, r.Header.Get("User-Agent"))
+		assert.Equal("msgvault-image-proxy", r.Header.Get("User-Agent"))
 		w.Header().Set("Content-Type", "image/png")
 		_, _ = w.Write(fakePNG)
 	}))
@@ -426,6 +429,7 @@ func TestRemoteImageHappyPathPinsValidatedAddress(t *testing.T) {
 }
 
 func TestRemoteImageRedirectToPrivateTargetIsRejected(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Location", "http://internal-service.example/secret.png")
@@ -455,6 +459,7 @@ func TestRemoteImageRedirectToPrivateTargetIsRejected(t *testing.T) {
 // NAT64 address embedding a private IPv4 destination and must be rejected
 // without a second dial.
 func TestRemoteImageRedirectToNAT64PrivateTargetIsRejected(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Location", "http://nat64-gateway.example/secret.png")
@@ -480,6 +485,7 @@ func TestRemoteImageRedirectToNAT64PrivateTargetIsRejected(t *testing.T) {
 }
 
 func TestRemoteImageRedirectToPrivateLiteralIsRejected(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Location", "http://169.254.169.254/latest/meta-data")
@@ -501,6 +507,7 @@ func TestRemoteImageRedirectToPrivateLiteralIsRejected(t *testing.T) {
 }
 
 func TestRemoteImageRedirectChainIsCapped(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", "http://images.example"+r.URL.Path+"x")
@@ -518,11 +525,12 @@ func TestRemoteImageRedirectChainIsCapped(t *testing.T) {
 
 	assert.Equal(http.StatusBadGateway, resp.Code, "body: %s", resp.Body.String())
 	assert.Contains(resp.Body.String(), "too_many_redirects")
-	assert.Equal(remoteImageMaxRedirects+1, seams.dialCount(),
+	assert.Equal(srv.remoteImages.MaxRedirects+1, seams.dialCount(),
 		"the chain must stop after the redirect cap")
 }
 
 func TestRemoteImageRejectsNonImageContent(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name        string
 		contentType string
@@ -562,6 +570,7 @@ func TestRemoteImageRejectsNonImageContent(t *testing.T) {
 }
 
 func TestRemoteImageEnforcesByteCapWhileStreaming(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "image/png")
@@ -574,7 +583,7 @@ func TestRemoteImageEnforcesByteCapWhileStreaming(t *testing.T) {
 		upstream: upstream.Listener.Addr().String(),
 	}
 	srv := newRemoteImageTestServer(t, seams)
-	srv.remoteImages.maxBytes = 1024
+	srv.remoteImages.MaxBytes = 1024
 
 	resp := postRemoteImage(t, srv, "http://images.example/huge.png")
 
@@ -583,6 +592,7 @@ func TestRemoteImageEnforcesByteCapWhileStreaming(t *testing.T) {
 }
 
 func TestRemoteImageUpstreamErrorStatus(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.Error(w, "gone", http.StatusNotFound)
@@ -603,6 +613,7 @@ func TestRemoteImageUpstreamErrorStatus(t *testing.T) {
 }
 
 func TestRemoteImageRequiresAuthentication(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	const key = "remote-image-test-key"
 	srv := NewServer(
@@ -610,12 +621,9 @@ func TestRemoteImageRequiresAuthentication(t *testing.T) {
 		nil, nil, testLogger(),
 	)
 	seams := &remoteImageSeams{answers: map[string][]netip.Addr{}}
-	srv.remoteImages = &remoteImageFetcher{
-		lookupNetIP:  seams.lookup,
-		dialContext:  seams.dial,
-		maxBytes:     remoteImageMaxBytes,
-		maxRedirects: remoteImageMaxRedirects,
-	}
+	srv.remoteImages = remoteimage.NewFetcher()
+	srv.remoteImages.LookupNetIP = seams.lookup
+	srv.remoteImages.DialContext = seams.dial
 
 	resp := postRemoteImage(t, srv, "http://images.example/chart.png")
 

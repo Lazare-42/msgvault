@@ -2,7 +2,7 @@ package ocr
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"net"
@@ -33,9 +33,9 @@ func (c *Client) Extract(ctx context.Context, filename, mimeType string, size in
 	if err != nil {
 		return Response{}, fmt.Errorf("call OCR executor: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var out Response
-	if err := json.NewDecoder(io.LimitReader(resp.Body, 128<<20)).Decode(&out); err != nil {
+	if err := json.UnmarshalRead(io.LimitReader(resp.Body, 128<<20), &out); err != nil {
 		return Response{}, fmt.Errorf("decode OCR response: %w", err)
 	}
 	return out, nil

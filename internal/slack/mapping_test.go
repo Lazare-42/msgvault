@@ -2,6 +2,7 @@ package slack
 
 import (
 	"encoding/json"
+	"math"
 	"testing"
 	"time"
 
@@ -9,7 +10,29 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestMapMessageSizeEstimate(t *testing.T) {
+	t.Parallel()
+	lookup := func(string) string { return "" }
+	tests := []struct {
+		name string
+		msg  Message
+		add  int64
+	}{
+		{"text uses body bytes", Message{TS: "1.000001", Text: "deploy is green"}, 0},
+		{"files add positive sizes", Message{TS: "1.000002", Text: "logs attached", Files: []File{{Name: "a.log", Size: 2048}, {Name: "b.log", Size: 0}, {Name: "c.log", Size: -1}}}, 2048},
+		{"overflowing size ignored", Message{TS: "1.000003", Text: "see logs", Files: []File{{Name: "huge.log", Size: math.MaxInt64}, {Name: "small.log", Size: 15}}}, 15},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg, body := mapMessage(&tt.msg, "C1", 1, 1, false, lookup)
+			require.NotEmpty(t, body)
+			assert.Equal(t, int64(len(body))+tt.add, msg.SizeEstimate)
+		})
+	}
+}
+
 func TestRenderText(t *testing.T) {
+	t.Parallel()
 	names := map[string]string{"UALICE": "Alice"}
 	lookup := func(id string) string { return names[id] }
 	tests := []struct {
@@ -33,11 +56,13 @@ func TestRenderText(t *testing.T) {
 }
 
 func TestMentionedUserIDs(t *testing.T) {
+	t.Parallel()
 	m := Message{Text: "<@UALICE> meet <@WBOB|bob>, again <@UALICE>; not <#C1|chan> or <!here>"}
 	assert.Equal(t, []string{"UALICE", "WBOB"}, m.MentionedUserIDs())
 }
 
 func TestTsTimeAndOrdering(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	tm := tsTime("1734567890.123456")
 	assert.Equal(time.Date(2024, 12, 19, 0, 24, 50, 123456000, time.UTC), tm)
@@ -50,6 +75,7 @@ func TestTsTimeAndOrdering(t *testing.T) {
 }
 
 func TestMessageRawCapturedOnDecode(t *testing.T) {
+	t.Parallel()
 	blob := `{"type":"message","ts":"1.000001","text":"hi","unmodeled_field":{"kept":true}}`
 	var m Message
 	require.NoError(t, json.Unmarshal([]byte(blob), &m))
@@ -57,6 +83,7 @@ func TestMessageRawCapturedOnDecode(t *testing.T) {
 }
 
 func TestThreadPredicates(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	root := Message{TS: "5.0", ThreadTS: "5.0", ReplyCount: 2}
 	reply := Message{TS: "6.0", ThreadTS: "5.0"}
@@ -70,6 +97,7 @@ func TestThreadPredicates(t *testing.T) {
 }
 
 func TestPayloadTextExtraction(t *testing.T) {
+	t.Parallel()
 	lookup := func(string) string { return "" }
 
 	t.Run("fallback wins per attachment", func(t *testing.T) {
@@ -123,6 +151,7 @@ func TestPayloadTextExtraction(t *testing.T) {
 }
 
 func TestMapMessagePayloadRules(t *testing.T) {
+	t.Parallel()
 	lookup := func(string) string { return "" }
 	unfurl := []LegacyAttachment{{Fallback: "Some Page Title — example.com"}}
 
@@ -152,6 +181,7 @@ func TestMapMessagePayloadRules(t *testing.T) {
 }
 
 func TestConversationTypeAndTitle(t *testing.T) {
+	t.Parallel()
 	assert := assert.New(t)
 	lookup := func(id string) string {
 		if id == "UALICE" {
