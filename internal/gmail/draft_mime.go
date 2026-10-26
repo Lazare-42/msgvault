@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	gomail "github.com/emersion/go-message/mail"
+	"github.com/google/uuid"
 )
 
 // BuildDraftMIME builds an RFC 822 message from DraftCompose fields.
@@ -26,6 +27,9 @@ func BuildDraftMIME(d *DraftCompose) ([]byte, error) {
 func buildDraftHeader(d *DraftCompose) gomail.Header {
 	var h gomail.Header
 	h.Set("MIME-Version", "1.0")
+	// IMAP stores this MIME unchanged in Drafts and Sent; neither APPEND nor
+	// the SMTP envelope supplies a Message-ID for those archived copies.
+	h.Set("Message-ID", "<"+uuid.NewString()+"@msgvault.local>")
 	setAddressHeader(&h, "To", d.To)
 	setAddressHeader(&h, "Cc", d.Cc)
 	setAddressHeader(&h, "Bcc", d.Bcc)

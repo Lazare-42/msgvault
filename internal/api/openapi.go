@@ -377,7 +377,8 @@ import (
 // 3.24.0 adds authenticated streamed Muesli recording imports.
 // 3.25.0 adds archived chat discovery ranked by the best matching name or title.
 // 3.26.0 adds the fork attachment OCR routes and owner IMAP sync configuration.
-const APISchemaVersion = "3.26.0"
+// 3.27.0 exposes the original Message-ID in message details for reply threading.
+const APISchemaVersion = "3.27.0"
 
 // OpenAPIDocument builds the API schema from the same Huma route registration
 // used by the daemon. It binds no socket and needs no database.

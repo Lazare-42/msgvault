@@ -329,6 +329,8 @@ type MessageSummary struct {
 type MessageDetail struct {
 	MessageSummary
 
+	RFC822MessageID string `json:"rfc822_message_id,omitempty" doc:"Original Message-ID header for In-Reply-To and References when composing a reply."`
+
 	RelatedMessageID  *int64 `json:"related_message_id,omitempty"`
 	ConversationTitle string `json:"conversation_title,omitempty" doc:"Conversation title, when available."`
 
@@ -560,6 +562,7 @@ func messageDetailFromQuery(qMsg *query.MessageDetail) MessageDetail {
 	}
 
 	return MessageDetail{
+		RFC822MessageID:   qMsg.RFC822MessageID,
 		RelatedMessageID:  qMsg.RelatedMessageID,
 		ConversationTitle: qMsg.ConversationTitle,
 
@@ -799,6 +802,7 @@ func (s *Server) handleGetMessage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	detail := MessageDetail{
+		RFC822MessageID:   msg.RFC822MessageID,
 		RelatedMessageID:  msg.RelatedMessageID,
 		MessageSummary:    toMessageSummary(*msg),
 		ConversationTitle: msg.ConversationTitle,

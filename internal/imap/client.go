@@ -2189,6 +2189,9 @@ func (c *Client) GetDraft(ctx context.Context, draftID string) (*gmailapi.Compos
 }
 
 func (c *Client) CreateDraft(ctx context.Context, compose *gmailapi.DraftCompose) (*gmailapi.ComposedDraft, error) {
+	if compose != nil && compose.ThreadID != "" && strings.TrimSpace(compose.InReplyTo) == "" {
+		return nil, errors.New("IMAP replies require in_reply_to with the original Message-ID; thread_id alone cannot thread a reply")
+	}
 	raw, err := gmailapi.BuildDraftMIME(compose)
 	if err != nil {
 		return nil, fmt.Errorf("build draft MIME: %w", err)
