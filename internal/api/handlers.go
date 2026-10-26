@@ -327,8 +327,8 @@ type MessageSummary struct {
 
 // MessageDetail represents a full message response.
 type MessageDetail struct {
-	RFC822MessageID string `json:"rfc822_message_id,omitempty" doc:"Original Message-ID header for In-Reply-To and References when composing a reply."`
 	MessageSummary
+	RFC822MessageID string `json:"rfc822_message_id,omitempty" doc:"Original Message-ID header for In-Reply-To and References when composing a reply."`
 
 	RelatedMessageID  *int64 `json:"related_message_id,omitempty"`
 	ConversationTitle string `json:"conversation_title,omitempty" doc:"Conversation title, when available."`
