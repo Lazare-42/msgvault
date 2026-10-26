@@ -156,7 +156,7 @@ func TestLiveMailFactoryRetainsInvocationForHTTPRequest(t *testing.T) {
 	st, err := daemonclient.New(daemonclient.Config{URL: daemon.URL, AllowInsecure: true})
 	require.NoError(err)
 	defer func() { assert.NoError(t, st.Close()) }()
-	factory := buildGmailFactory(ctx, st)
+	factory := buildMailFactory(ctx, st)
 	require.NotNil(factory)
 	// HTTP request contexts do not carry the CLI invocation.
 	client, err := factory(t.Context(), email)

@@ -3396,10 +3396,10 @@ func googleDocsSnippet(text, query string, maxChars int) string {
 
 // --- Draft handlers ---
 
-// getGmailClient resolves the account email and returns an authenticated mail
+// getMailClient resolves the account email and returns an authenticated mail
 // API client (Gmail OAuth or IMAP, depending on the account's source type).
 // The caller must close the returned client.
-func (h *handlers) getGmailClient(ctx context.Context, args map[string]any) (gmail.LiveAPI, error) {
+func (h *handlers) getMailClient(ctx context.Context, args map[string]any) (gmail.LiveAPI, error) {
 	if h.gmailFactory == nil {
 		return nil, errors.New("live mail API not configured (Gmail OAuth credentials or an IMAP account needed)")
 	}
@@ -3431,7 +3431,7 @@ func (h *handlers) getGmailClient(ctx context.Context, args map[string]any) (gma
 func (h *handlers) listDrafts(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	client, err := h.getGmailClient(ctx, args)
+	client, err := h.getMailClient(ctx, args)
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
@@ -3471,7 +3471,7 @@ func (h *handlers) listDrafts(ctx context.Context, req toolRequest) (*toolResult
 func (h *handlers) getDraft(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	client, err := h.getGmailClient(ctx, args)
+	client, err := h.getMailClient(ctx, args)
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
@@ -3493,7 +3493,7 @@ func (h *handlers) getDraft(ctx context.Context, req toolRequest) (*toolResult, 
 func (h *handlers) createDraft(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	client, err := h.getGmailClient(ctx, args)
+	client, err := h.getMailClient(ctx, args)
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
@@ -3508,6 +3508,15 @@ func (h *handlers) createDraft(ctx context.Context, req toolRequest) (*toolResul
 		Body: body,
 	}
 
+	if v, ok := args["from"].(string); ok {
+		compose.From = v
+	}
+	if v, ok := args["reply_to"].(string); ok {
+		compose.ReplyTo = []string{}
+		if strings.TrimSpace(v) != "" {
+			compose.ReplyTo = []string{v}
+		}
+	}
 	if v, _ := args["to"].(string); v != "" {
 		compose.To = splitCSV(v)
 	}
@@ -3562,7 +3571,7 @@ func (h *handlers) createDraft(ctx context.Context, req toolRequest) (*toolResul
 func (h *handlers) updateDraft(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	client, err := h.getGmailClient(ctx, args)
+	client, err := h.getMailClient(ctx, args)
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
@@ -3582,6 +3591,15 @@ func (h *handlers) updateDraft(ctx context.Context, req toolRequest) (*toolResul
 		Body: body,
 	}
 
+	if v, ok := args["from"].(string); ok {
+		compose.From = v
+	}
+	if v, ok := args["reply_to"].(string); ok {
+		compose.ReplyTo = []string{}
+		if strings.TrimSpace(v) != "" {
+			compose.ReplyTo = []string{v}
+		}
+	}
 	if v, _ := args["to"].(string); v != "" {
 		compose.To = splitCSV(v)
 	}
@@ -3632,7 +3650,7 @@ func (h *handlers) updateDraft(ctx context.Context, req toolRequest) (*toolResul
 func (h *handlers) deleteDraft(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	client, err := h.getGmailClient(ctx, args)
+	client, err := h.getMailClient(ctx, args)
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
@@ -3659,7 +3677,7 @@ func (h *handlers) deleteDraft(ctx context.Context, req toolRequest) (*toolResul
 func (h *handlers) sendDraft(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	client, err := h.getGmailClient(ctx, args)
+	client, err := h.getMailClient(ctx, args)
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
@@ -3693,7 +3711,7 @@ func (h *handlers) sendDraft(ctx context.Context, req toolRequest) (*toolResult,
 func (h *handlers) modifyLabels(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	client, err := h.getGmailClient(ctx, args)
+	client, err := h.getMailClient(ctx, args)
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
@@ -3740,7 +3758,7 @@ func (h *handlers) modifyLabels(ctx context.Context, req toolRequest) (*toolResu
 func (h *handlers) createLabel(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	client, err := h.getGmailClient(ctx, args)
+	client, err := h.getMailClient(ctx, args)
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
@@ -3762,7 +3780,7 @@ func (h *handlers) createLabel(ctx context.Context, req toolRequest) (*toolResul
 func (h *handlers) deleteLabel(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	client, err := h.getGmailClient(ctx, args)
+	client, err := h.getMailClient(ctx, args)
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
@@ -3789,7 +3807,7 @@ func (h *handlers) deleteLabel(ctx context.Context, req toolRequest) (*toolResul
 func (h *handlers) listGmailLabels(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	client, err := h.getGmailClient(ctx, args)
+	client, err := h.getMailClient(ctx, args)
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}

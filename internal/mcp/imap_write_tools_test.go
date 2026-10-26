@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/gmail"
 	imaplib "go.kenn.io/msgvault/internal/imap"
+	"go.kenn.io/msgvault/internal/mailclient"
 	msgmime "go.kenn.io/msgvault/internal/mime"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/query/querytest"
@@ -69,11 +70,12 @@ func imapFactory(t *testing.T, port int) GmailClientFactory {
 	t.Helper()
 	return func(_ context.Context, email string) (gmail.LiveAPI, error) {
 		assert.Equal(t, testIMAPAccount, email, "factory should receive the resolved account email")
-		return imaplib.NewClient(&imaplib.Config{
+		backend := imaplib.NewClient(&imaplib.Config{
 			Host:     "127.0.0.1",
 			Port:     port,
 			Username: testIMAPAccount,
-		}, testIMAPPassword), nil
+		}, testIMAPPassword)
+		return mailclient.New(backend, email, nil)
 	}
 }
 
@@ -93,10 +95,12 @@ func TestDraftAndLabelToolsOverIMAP(t *testing.T) {
 		DraftID string `json:"draft_id"`
 		Subject string `json:"subject"`
 	}](t, ToolCreateDraft, h.createDraft, map[string]any{
-		"account": testIMAPAccount,
-		"to":      "alice@example.com",
-		"subject": "Quarterly report",
-		"body":    "Please find the summary below.",
+		"account":  testIMAPAccount,
+		"to":       "alice@example.com",
+		"subject":  "Quarterly report",
+		"from":     "Reports <user@example.com>",
+		"reply_to": `"Owner, Example" <owner@example.com>`,
+		"body":     "Please find the summary below.",
 	})
 	require.NotEmpty(created.DraftID, "create_draft should return a draft ID")
 	assert.Equal("Quarterly report", created.Subject)
@@ -140,6 +144,10 @@ func TestDraftAndLabelToolsOverIMAP(t *testing.T) {
 	})
 	assert.Equal("updated", updated.Status)
 	require.NotEmpty(updated.DraftID)
+	routing := runTool[gmail.ComposedDraft](t, ToolGetDraft, h.getDraft, map[string]any{"account": testIMAPAccount, "draft_id": updated.DraftID})
+	assert.Contains(routing.Message.From, "user@example.com")
+	require.Len(routing.Message.ReplyTo, 1)
+	assert.Contains(routing.Message.ReplyTo[0], "owner@example.com")
 
 	// create_label creates an IMAP mailbox
 	label := runTool[struct {

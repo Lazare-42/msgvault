@@ -2617,3 +2617,16 @@ func TestOCRResourceValidation(t *testing.T) {
 		})
 	}
 }
+
+func TestMailAccountSenderPolicyLoads(t *testing.T) {
+	assert := assert.New(t)
+	require := require.New(t)
+	path := filepath.Join(t.TempDir(), "config.toml")
+	require.NoError(os.WriteFile(path, []byte(`[mail.accounts."owner@example.com"]
+allowed_from = ["reports@example.com"]
+`), 0600))
+	cfg, err := Load(path, "")
+	require.NoError(err)
+	assert.Equal([]string{"reports@example.com"}, cfg.Mail.Accounts["owner@example.com"].AllowedFrom)
+	assert.Empty(cfg.Mail.Accounts["other@example.com"].AllowedFrom)
+}

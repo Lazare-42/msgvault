@@ -72,7 +72,7 @@ Example Claude Desktop config (with port-forward):
 		defer cancel()
 
 		opts := daemonMCPServeOptions(ctx, st, state)
-		opts.GmailFactory = buildGmailFactory(ctx, st)
+		opts.GmailFactory = buildMailFactory(ctx, st)
 		opts.GoogleDocsFactory = buildGoogleDocsFactory(ctx)
 
 		// Stop the server when the command is canceled or interrupted.

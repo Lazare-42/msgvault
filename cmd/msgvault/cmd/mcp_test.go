@@ -21,6 +21,9 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/deletion"
+	"go.kenn.io/msgvault/internal/gmail"
+	imaplib "go.kenn.io/msgvault/internal/imap"
+	"go.kenn.io/msgvault/internal/mailclient"
 	mcpserver "go.kenn.io/msgvault/internal/mcp"
 )
 
@@ -686,4 +689,28 @@ func TestDaemonMCPDocbankProbeFailureIsLogged(t *testing.T) {
 	assert.False(opts.KataDocbank)
 	assert.Contains(logs.String(), "Kata transcript citations hidden because the Docbank status probe failed")
 	assert.Contains(logs.String(), "503")
+}
+
+func TestMailFactoryAppliesSenderPolicyToIMAP(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal("/api/v1/cli/accounts", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write([]byte(`{"accounts":[{"email":"owner@example.com","type":"imap","sync_config":"{\"host\":\"imap.example.com\",\"username\":\"owner@example.com\"}"}]}`))
+		assert.NoError(err)
+	}))
+	defer daemon.Close()
+	ctx := withStoreResolverConfig(t, &config.Config{Data: config.DataConfig{DataDir: t.TempDir()}, Mail: config.MailConfig{Accounts: map[string]config.MailAccountConfig{"owner@example.com": {AllowedFrom: []string{"reports@example.com"}}}}})
+	require.NoError(imaplib.SaveCredentials(invocationFromContext(ctx).cfg.TokensDir(), "owner@example.com", "synthetic-password"))
+	st, err := daemonclient.New(daemonclient.Config{URL: daemon.URL, AllowInsecure: true})
+	require.NoError(err)
+	factory := buildMailFactory(ctx, st)
+	require.NotNil(factory)
+	client, err := factory(t.Context(), "owner@example.com")
+	require.NoError(err)
+	defer func() { assert.NoError(client.Close()) }()
+	assert.IsType(&mailclient.Client{}, client)
+	_, err = client.CreateDraft(t.Context(), &gmail.DraftCompose{From: "unconfigured@example.com", Body: "body"})
+	require.ErrorContains(err, "not allowed")
 }

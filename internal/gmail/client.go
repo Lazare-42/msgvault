@@ -211,6 +211,9 @@ func (c *Client) requestWithRetryBudget(ctx context.Context, op Operation, metho
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
+			if op == OpDraftsSend {
+				return nil, &SendOutcomeError{Err: err}
+			}
 			if remoteMutation {
 				// A token failure, such as a refresh that could not be saved,
 				// happens before any Gmail request is sent.
@@ -238,6 +241,9 @@ func (c *Client) requestWithRetryBudget(ctx context.Context, op Operation, metho
 		respBody, err := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		if err != nil {
+			if op == OpDraftsSend {
+				return nil, &SendOutcomeError{Accepted: resp.StatusCode >= 200 && resp.StatusCode < 300, Err: err}
+			}
 			if remoteMutation {
 				return nil, fmt.Errorf("%w: read response: %w", errWriteOutcomeUnknown, err)
 			}
@@ -251,6 +257,10 @@ func (c *Client) requestWithRetryBudget(ctx context.Context, op Operation, metho
 		// Check for success
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return respBody, nil
+		}
+
+		if op == OpDraftsSend && resp.StatusCode >= 500 {
+			return nil, &SendOutcomeError{Err: fmt.Errorf("server error (%d)", resp.StatusCode)}
 		}
 
 		// Handle specific error codes
@@ -1047,7 +1057,13 @@ func parseDraft(d gmailDraft) *ComposedDraft {
 		for _, h := range msg.Payload.Headers {
 			switch strings.ToLower(h.Name) {
 			case "from":
-				dm.From = h.Value
+				if dm.From != "" {
+					dm.From += ", " + h.Value
+				} else {
+					dm.From = h.Value
+				}
+			case "reply-to":
+				dm.ReplyTo = append(dm.ReplyTo, h.Value)
 			case "to":
 				dm.To = splitAddresses(h.Value)
 			case "cc":
@@ -1306,7 +1322,7 @@ func (c *LiveClient) SendDraft(ctx context.Context, draftID string) (*SentMessag
 		LabelIDs []string `json:"labelIds"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return nil, fmt.Errorf("parse send response: %w", err)
+		return nil, &SendOutcomeError{Accepted: true, Err: fmt.Errorf("parse send response: %w", err)}
 	}
 
 	return &SentMessage{

@@ -572,7 +572,16 @@ func (b *BackupConfig) Validate() error {
 	return fmt.Errorf("invalid [backup] zstd_level %d (want 0 or 1-19)", b.ZstdLevel)
 }
 
+type MailConfig struct {
+	Accounts map[string]MailAccountConfig `toml:"accounts"`
+}
+
+type MailAccountConfig struct {
+	AllowedFrom []string `toml:"allowed_from"`
+}
+
 type Config struct {
+	Mail               MailConfig                      `toml:"mail"`
 	Data               DataConfig                      `toml:"data"`
 	Log                LogConfig                       `toml:"log"`
 	OAuth              OAuthConfig                     `toml:"oauth"`

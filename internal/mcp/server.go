@@ -32,13 +32,16 @@ import (
 	whatsapplive "go.kenn.io/msgvault/internal/whatsapp/live"
 )
 
-// GmailClientFactory creates authenticated mail API clients for a given
+// MailClientFactory creates authenticated mail API clients for a given
 // account email. The returned client is a gmail.LiveAPI implementation — the
 // Gmail OAuth client for Gmail accounts, or the IMAP client (which also
 // satisfies gmail.LiveAPI, including drafts and label/folder operations) for
 // IMAP-backed accounts such as Microsoft 365. The caller is responsible
 // for closing the client.
-type GmailClientFactory func(ctx context.Context, email string) (gmail.LiveAPI, error)
+type MailClientFactory func(ctx context.Context, email string) (gmail.LiveAPI, error)
+
+// GmailClientFactory is retained for compatibility. Use MailClientFactory.
+type GmailClientFactory = MailClientFactory
 
 // WhatsAppClientFactory creates a live WhatsApp client for an archive account.
 type WhatsAppClientFactory func(ctx context.Context, account string) (whatsapplive.Client, error)
@@ -858,9 +861,11 @@ func getDraftTool() mcp.Tool {
 
 func createDraftTool() mcp.Tool {
 	return mcp.NewTool(ToolCreateDraft,
-		mcp.WithDescription("Create a new email draft in Gmail. The draft is saved but NOT sent. Use send_draft to send it. For rich formatting (links, bold, etc.), set content_type to text/html and provide HTML body. To reply to an existing message, set thread_id AND in_reply_to (the original Message-ID, from get_message's rfc822_message_id field on that message) so the draft threads as a true reply in every mail client, not just Gmail — thread_id alone is not reliable on its own."),
+		mcp.WithDescription("Create a new email draft in the selected mail account. The draft is saved but NOT sent. Use send_draft to send it. For rich formatting (links, bold, etc.), set content_type to text/html and provide HTML body. To reply to an existing message, set thread_id AND in_reply_to (the original Message-ID, from get_message's rfc822_message_id field on that message) so the draft threads as a true reply in every mail client, not just Gmail — thread_id alone is not reliable on its own."),
 		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
+		mcp.WithString("from", mcp.Description("Visible sender address with optional display name. Defaults to the account; alternate addresses must be configured in mail.accounts allowed_from and authorized by the provider. Omit on update to preserve.")),
+		mcp.WithString("reply_to", mcp.Description("Reply destination address list, independent of in_reply_to threading. Omit on update to preserve; pass an empty string to clear.")),
 		mcp.WithString("to",
 			mcp.Description("Recipient email address(es), comma-separated"),
 		),
@@ -898,9 +903,11 @@ func createDraftTool() mcp.Tool {
 
 func updateDraftTool() mcp.Tool {
 	return mcp.NewTool(ToolUpdateDraft,
-		mcp.WithDescription("Update an existing Gmail draft. Replaces the entire draft content."),
+		mcp.WithDescription("Update an existing email draft. Replaces content; omitted from and reply_to preserve the existing routing headers."),
 		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
+		mcp.WithString("from", mcp.Description("Visible sender address with optional display name. Defaults to the account; alternate addresses must be configured in mail.accounts allowed_from and authorized by the provider. Omit on update to preserve.")),
+		mcp.WithString("reply_to", mcp.Description("Reply destination address list, independent of in_reply_to threading. Omit on update to preserve; pass an empty string to clear.")),
 		mcp.WithString("draft_id",
 			mcp.Required(),
 			mcp.Description("Draft ID to update (from list_drafts response)"),
@@ -942,7 +949,7 @@ func updateDraftTool() mcp.Tool {
 
 func deleteDraftTool() mcp.Tool {
 	return mcp.NewTool(ToolDeleteDraft,
-		mcp.WithDescription("Permanently delete a Gmail draft."),
+		mcp.WithDescription("Permanently delete an email draft."),
 		withAccount(),
 		mcp.WithString("draft_id",
 			mcp.Required(),
@@ -953,7 +960,7 @@ func deleteDraftTool() mcp.Tool {
 
 func sendDraftTool() mcp.Tool {
 	return mcp.NewTool(ToolSendDraft,
-		mcp.WithDescription("Send an existing Gmail draft. The draft is removed and a sent message is created. This action cannot be undone."),
+		mcp.WithDescription("Send an existing email draft. The draft is removed and a sent message is created. This action cannot be undone."),
 		withAccount(),
 		mcp.WithString("draft_id",
 			mcp.Required(),

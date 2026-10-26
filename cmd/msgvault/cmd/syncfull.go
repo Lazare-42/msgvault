@@ -361,7 +361,7 @@ func configuredTrustedSentMailboxes(identifier string, cfg *config.Config) []str
 
 // buildIMAPAPIClient constructs an IMAP-backed gmail.API client from a
 // source's sync_config JSON. Shared by the sync path (buildAPIClient) and
-// the MCP factory (buildGmailFactory), which resolves accounts through the
+// the MCP factory (buildMailFactory), which resolves accounts through the
 // daemon rather than a local *store.Source. Handles both auth models:
 // XOAUTH2 (Microsoft 365 delegated or app-only certificate flow) and
 // password (stored credentials in the tokens dir).
