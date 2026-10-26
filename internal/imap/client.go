@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/mail"
 	"slices"
 	"strconv"
 	"strings"
@@ -1729,6 +1730,14 @@ func (c *Client) GetDraft(ctx context.Context, draftID string) (*gmailapi.Draft,
 }
 
 func (c *Client) CreateDraft(ctx context.Context, compose *gmailapi.DraftCompose) (*gmailapi.Draft, error) {
+	if compose == nil {
+		return nil, errors.New("draft compose is nil")
+	}
+	prepared := *compose
+	if prepared.From == "" {
+		prepared.From = c.config.Username
+	}
+	compose = &prepared
 	raw, err := gmailapi.BuildDraftMIME(compose)
 	if err != nil {
 		return nil, fmt.Errorf("build draft MIME: %w", err)
@@ -1756,6 +1765,8 @@ func (c *Client) CreateDraft(ctx context.Context, compose *gmailapi.DraftCompose
 				ID:       id,
 				ThreadID: id,
 				LabelIDs: []string{mailbox},
+				From:     compose.From,
+				ReplyTo:  slices.Clone(compose.ReplyTo),
 				To:       slices.Clone(compose.To),
 				Cc:       slices.Clone(compose.Cc),
 				Bcc:      slices.Clone(compose.Bcc),
@@ -1862,16 +1873,35 @@ func (c *Client) SendDraft(ctx context.Context, draftID string) (*gmailapi.SentM
 	if len(recipients) == 0 {
 		return nil, errors.New("draft has no To/Cc/Bcc recipients")
 	}
-	from := c.config.Username
-	if err := c.sendSMTP(ctx, from, recipients, raw.Raw); err != nil {
-		return nil, err
-	}
-
 	draftMailbox, draftUID, err := parseCompositeID(draftID)
 	if err != nil {
 		return nil, err
 	}
 
+	err = c.withConn(ctx, func(_ *imapclient.Client) error {
+		mailbox, err := c.draftsMailboxLocked()
+		if err != nil {
+			return err
+		}
+		if !strings.EqualFold(draftMailbox, mailbox) {
+			return errors.New("message is not in the drafts mailbox")
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	from := draft.Message.From
+	if from == "" {
+		from = c.config.Username
+	}
+	sender, err := gmailapi.ParseSender(from)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.sendSMTP(ctx, sender.Address, recipients, raw.Raw); err != nil {
+		return nil, err
+	}
 	var sent *gmailapi.SentMessage
 	err = c.withConn(ctx, func(conn *imapclient.Client) error {
 		draftsMailbox, err := c.draftsMailboxLocked()
@@ -1903,7 +1933,7 @@ func (c *Client) SendDraft(ctx context.Context, draftID string) (*gmailapi.SentM
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, &gmailapi.SendOutcomeError{Accepted: true, Err: err}
 	}
 	return sent, nil
 }
@@ -1955,11 +1985,9 @@ func (c *Client) sendSMTP(ctx context.Context, from string, to []string, raw []b
 		return fmt.Errorf("SMTP XOAUTH2 authenticate: %w (ensure SMTP AUTH is enabled for the mailbox/tenant and the account was re-authorized with SMTP.Send)", err)
 	}
 	if err := client.SendMail(from, to, bytes.NewReader(raw)); err != nil {
-		return fmt.Errorf("SMTP send mail: %w", err)
+		return &gmailapi.SendOutcomeError{Err: fmt.Errorf("SMTP submission: %w", err)}
 	}
-	if err := client.Quit(); err != nil {
-		return fmt.Errorf("SMTP quit: %w", err)
-	}
+	_ = client.Quit() // DATA was accepted; a QUIT error must not invite a resend.
 	return nil
 }
 
@@ -1982,6 +2010,18 @@ func draftFromRaw(raw *gmailapi.RawMessage) (*gmailapi.Draft, error) {
 	if raw == nil {
 		return nil, errors.New("draft raw message is nil")
 	}
+	headers, err := mail.ReadMessage(bytes.NewReader(raw.Raw))
+	if err != nil {
+		return nil, fmt.Errorf("read draft headers: %w", err)
+	}
+	if len(headers.Header["From"]) > 1 {
+		return nil, errors.New("draft has multiple From headers")
+	}
+	if from := headers.Header.Get("From"); from != "" {
+		if _, err := gmailapi.ParseSender(from); err != nil {
+			return nil, err
+		}
+	}
 	parsed, err := msgmime.Parse(raw.Raw)
 	if err != nil {
 		return nil, fmt.Errorf("parse draft MIME %q: %w", raw.ID, err)
@@ -2002,6 +2042,7 @@ func draftFromRaw(raw *gmailapi.RawMessage) (*gmailapi.Draft, error) {
 			LabelIDs: slices.Clone(raw.LabelIDs),
 			Snippet:  snippet(body),
 			From:     firstAddress(parsed.From),
+			ReplyTo:  formattedAddresses(parsed.ReplyTo),
 			To:       addressList(parsed.To),
 			Cc:       addressList(parsed.Cc),
 			Bcc:      addressList(parsed.Bcc),
@@ -2029,7 +2070,7 @@ func firstAddress(addrs []msgmime.Address) string {
 	if addrs[0].Name == "" {
 		return addrs[0].Email
 	}
-	return fmt.Sprintf("%s <%s>", addrs[0].Name, addrs[0].Email)
+	return (&mail.Address{Name: addrs[0].Name, Address: addrs[0].Email}).String()
 }
 
 func snippet(body string) string {
@@ -2473,4 +2514,12 @@ func (c *Client) clearMessageCaches() {
 	c.messageListCache = nil
 	c.msgIDToLabels = nil
 	c.seenRFC822IDs = nil
+}
+
+func formattedAddresses(addresses []msgmime.Address) []string {
+	var result []string
+	for _, a := range addresses {
+		result = append(result, (&mail.Address{Name: a.Name, Address: a.Email}).String())
+	}
+	return result
 }

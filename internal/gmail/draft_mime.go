@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	stdmime "mime"
+	"net/mail"
 	"strings"
 
 	gomail "github.com/emersion/go-message/mail"
@@ -17,6 +18,28 @@ func BuildDraftMIME(d *DraftCompose) ([]byte, error) {
 		return nil, errors.New("draft compose is nil")
 	}
 
+	if d.From != "" {
+		if _, err := ParseSender(d.From); err != nil {
+			return nil, err
+		}
+	}
+	for _, value := range d.ReplyTo {
+		if strings.ContainsAny(value, "\r\n\x00") {
+			return nil, errors.New("invalid Reply-To address")
+		}
+		addresses, err := mail.ParseAddressList(value)
+		if err != nil {
+			return nil, fmt.Errorf("invalid Reply-To address: %w", err)
+		}
+		if len(addresses) == 0 {
+			return nil, errors.New("Reply-To address list is empty")
+		}
+		for _, address := range addresses {
+			if strings.ContainsAny(address.Name+address.Address, "\r\n\x00") {
+				return nil, errors.New("invalid Reply-To address")
+			}
+		}
+	}
 	if len(d.Attachments) == 0 {
 		return buildSinglePartDraftMIME(d)
 	}
@@ -26,6 +49,10 @@ func BuildDraftMIME(d *DraftCompose) ([]byte, error) {
 func buildDraftHeader(d *DraftCompose) gomail.Header {
 	var h gomail.Header
 	h.Set("MIME-Version", "1.0")
+	if d.From != "" {
+		setAddressHeader(&h, "From", []string{d.From})
+	}
+	setAddressHeader(&h, "Reply-To", d.ReplyTo)
 	setAddressHeader(&h, "To", d.To)
 	setAddressHeader(&h, "Cc", d.Cc)
 	setAddressHeader(&h, "Bcc", d.Bcc)
@@ -185,4 +212,19 @@ func writeDraftAttachment(mw *gomail.Writer, a *DraftAttachment) error {
 		return fmt.Errorf("close attachment %q: %w", a.Filename, err)
 	}
 	return nil
+}
+
+// ParseSender validates exactly one mailbox without permitting header injection.
+func ParseSender(value string) (*mail.Address, error) {
+	if strings.ContainsAny(value, "\r\n\x00") {
+		return nil, errors.New("invalid From address")
+	}
+	address, err := mail.ParseAddress(value)
+	if err != nil {
+		return nil, fmt.Errorf("invalid From address: %w", err)
+	}
+	if strings.ContainsAny(address.Name+address.Address, "\r\n\x00") {
+		return nil, errors.New("invalid From address")
+	}
+	return address, nil
 }

@@ -216,6 +216,7 @@ type DraftMessage struct {
 	LabelIDs []string
 	Snippet  string
 	From     string
+	ReplyTo  []string // Reply destinations, independent of conversation threading.
 	To       []string
 	Cc       []string
 	Bcc      []string
@@ -226,6 +227,8 @@ type DraftMessage struct {
 
 // DraftCompose holds the fields for creating or updating a draft.
 type DraftCompose struct {
+	From        string   // Visible sender; empty defaults to the selected account.
+	ReplyTo     []string // nil preserves on update; an empty slice clears Reply-To.
 	To          []string
 	Cc          []string
 	Bcc         []string

@@ -18,6 +18,9 @@ import (
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonclient"
 	"go.kenn.io/msgvault/internal/deletion"
+	"go.kenn.io/msgvault/internal/gmail"
+	imaplib "go.kenn.io/msgvault/internal/imap"
+	"go.kenn.io/msgvault/internal/mailclient"
 	mcpserver "go.kenn.io/msgvault/internal/mcp"
 )
 
@@ -100,7 +103,7 @@ func TestMCPCommandForwardsHTTPPolicy(t *testing.T) {
 				"database_size_bytes": 0
 			}`))
 		case "/api/v1/cli/accounts":
-			// Queried by buildGmailFactory to detect IMAP accounts.
+			// Queried by buildMailFactory to detect IMAP accounts.
 			_, _ = w.Write([]byte(`{"accounts": []}`))
 		default:
 			assert.Fail("unexpected daemon path", r.URL.Path)
@@ -436,4 +439,28 @@ func TestNormalizeMCPHTTPAddr(t *testing.T) {
 		_, err := normalizeMCPHTTPAddr("not-a-port", false, false)
 		require.Error(t, err, "expected error for non-port, non-host:port")
 	})
+}
+
+func TestMailFactoryAppliesSenderPolicyToIMAP(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal("/api/v1/cli/accounts", r.URL.Path)
+		w.Header().Set("Content-Type", "application/json")
+		_, err := w.Write([]byte(`{"accounts":[{"email":"owner@example.com","type":"imap","sync_config":"{\"host\":\"imap.example.com\",\"username\":\"owner@example.com\"}"}]}`))
+		assert.NoError(err)
+	}))
+	defer daemon.Close()
+	withStoreResolverConfig(t, &config.Config{Data: config.DataConfig{DataDir: t.TempDir()}, Mail: config.MailConfig{Accounts: map[string]config.MailAccountConfig{"owner@example.com": {AllowedFrom: []string{"reports@example.com"}}}}})
+	require.NoError(imaplib.SaveCredentials(cfg.TokensDir(), "owner@example.com", "synthetic-password"))
+	st, err := daemonclient.New(daemonclient.Config{URL: daemon.URL, AllowInsecure: true})
+	require.NoError(err)
+	factory := buildMailFactory(t.Context(), st)
+	require.NotNil(factory)
+	client, err := factory(t.Context(), "owner@example.com")
+	require.NoError(err)
+	defer func() { assert.NoError(client.Close()) }()
+	assert.IsType(&mailclient.Client{}, client)
+	_, err = client.CreateDraft(t.Context(), &gmail.DraftCompose{From: "unconfigured@example.com", Body: "body"})
+	require.ErrorContains(err, "not allowed")
 }

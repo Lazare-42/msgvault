@@ -294,6 +294,59 @@ sync. Required only if you use `add-o365`, `add-teams`, or `sync-teams`.
 
 See [OAuth Setup: Microsoft 365](/guides/oauth-setup/#microsoft-365-outlook-hotmail) for app registration steps. Teams uses the same `client_id` but requests Microsoft Graph scopes and stores tokens under `tokens/teams_<email>.json`; Outlook/Hotmail IMAP OAuth uses `tokens/microsoft_<email>.json`.
 
+### `[mail.accounts."<account-address>"]`
+
+Mail write tools keep the authenticated account, visible sender, and reply
+destination separate. By default, `create_draft` uses the selected `account`
+as `From`. Configure additional sender addresses in the config file used by
+the MCP process, then restart that process:
+
+```toml
+[mail.accounts."owner@example.com"]
+allowed_from = ["reports@example.com"]
+```
+
+This allowlist does not grant provider permissions. The address must also be an
+authorized Gmail send-as identity or have the required Exchange Send As
+permission. Without both, sending may fail or the provider may rewrite From.
+Selecting a separately configured reports mailbox with `account` avoids the need
+for an alternate sender on the personal account.
+
+For example, `create_draft` accepts:
+
+```json
+{
+  "account": "owner@example.com",
+  "from": "Reports <reports@example.com>",
+  "reply_to": "Owner <owner@example.com>",
+  "to": "reader@example.com",
+  "subject": "Report",
+  "body": "Report contents"
+}
+```
+
+Use the same `account` for `get_draft`, `update_draft`, and `send_draft`.
+`reply_to` is an address list; `in_reply_to` is a message ID for conversation
+threading. Quoted display names containing commas are supported. Updating a
+draft preserves omitted `from` and `reply_to` fields. Set `reply_to` to an empty
+string to remove that header. Other content fields retain their existing
+replacement semantics.
+
+IMAP drafts are stored in the selected account's Drafts and Sent folders. SMTP
+still authenticates as that account; its envelope sender follows the draft's
+From mailbox, never Reply-To. Gmail delegates envelope handling to its API.
+The sender allowlist is checked again before sending an externally editable
+draft; provider authorization remains the final enforcement. Do not edit a
+draft concurrently with a send operation.
+
+A send error reporting an **accepted** or **unknown** outcome requires inspection
+of Sent Items before any retry. SMTP acceptance followed by a failure saving the
+sent copy or removing the draft is reported as accepted, not safe to resend.
+Gmail send requests are not automatically retried after transport errors or
+server errors with an uncertain outcome. These checks do not provide durable
+exactly-once delivery: unattended callers should retain their own delivery
+receipts and reconcile uncertain outcomes.
+
 ### `[[fastmail]]`
 
 Optional source-scoped Fastmail JMAP identity inventory. This does not replace

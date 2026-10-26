@@ -127,6 +127,9 @@ func (c *Client) request(ctx context.Context, op Operation, method, path string,
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
+			if op == OpDraftsSend {
+				return nil, &SendOutcomeError{Err: err}
+			}
 			lastErr = fmt.Errorf("http request: %w", err)
 			continue // Retry on network errors
 		}
@@ -134,6 +137,9 @@ func (c *Client) request(ctx context.Context, op Operation, method, path string,
 		respBody, err := io.ReadAll(resp.Body)
 		_ = resp.Body.Close()
 		if err != nil {
+			if op == OpDraftsSend {
+				return nil, &SendOutcomeError{Accepted: resp.StatusCode >= 200 && resp.StatusCode < 300, Err: err}
+			}
 			lastErr = fmt.Errorf("read response: %w", err)
 			continue
 		}
@@ -141,6 +147,10 @@ func (c *Client) request(ctx context.Context, op Operation, method, path string,
 		// Check for success
 		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 			return respBody, nil
+		}
+
+		if op == OpDraftsSend && resp.StatusCode >= 500 {
+			return nil, &SendOutcomeError{Err: fmt.Errorf("server error (%d)", resp.StatusCode)}
 		}
 
 		// Handle specific error codes
@@ -670,7 +680,13 @@ func parseDraft(d gmailDraft) *Draft {
 		for _, h := range msg.Payload.Headers {
 			switch strings.ToLower(h.Name) {
 			case "from":
-				dm.From = h.Value
+				if dm.From != "" {
+					dm.From += ", " + h.Value
+				} else {
+					dm.From = h.Value
+				}
+			case "reply-to":
+				dm.ReplyTo = append(dm.ReplyTo, h.Value)
 			case "to":
 				dm.To = splitAddresses(h.Value)
 			case "cc":
@@ -930,7 +946,7 @@ func (c *Client) SendDraft(ctx context.Context, draftID string) (*SentMessage, e
 		LabelIDs []string `json:"labelIds"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
-		return nil, fmt.Errorf("parse send response: %w", err)
+		return nil, &SendOutcomeError{Accepted: true, Err: fmt.Errorf("parse send response: %w", err)}
 	}
 
 	return &SentMessage{
