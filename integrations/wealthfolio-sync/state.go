@@ -1,7 +1,8 @@
 package main
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -60,7 +61,7 @@ func saveState(path string, st *syncState) error {
 		st.Attachments = make(map[string]seenAttachment)
 	}
 
-	data, err := json.MarshalIndent(st, "", "  ")
+	data, err := json.Marshal(st, jsontext.WithIndent("  "))
 	if err != nil {
 		return fmt.Errorf("marshal state: %w", err)
 	}

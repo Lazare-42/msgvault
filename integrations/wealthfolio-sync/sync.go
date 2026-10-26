@@ -2,7 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"os"
@@ -408,7 +409,7 @@ func copyFileAtomic(srcPath, dstPath string) error {
 }
 
 func writeJSONAtomic(path string, value any) error {
-	data, err := json.MarshalIndent(value, "", "  ")
+	data, err := json.Marshal(value, jsontext.WithIndent("  "))
 	if err != nil {
 		return err
 	}

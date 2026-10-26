@@ -3,7 +3,8 @@ package cmd
 import (
 	"context"
 	"crypto/subtle"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"html/template"
@@ -60,9 +61,7 @@ var whatsappStatusCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(status)
+		return json.MarshalWrite(os.Stdout, status, jsontext.WithIndent("  "))
 	},
 }
 
@@ -393,7 +392,7 @@ func (h *whatsappPairingHandler) statusJSON(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(struct {
+	if err := json.MarshalWrite(w, struct {
 		Status  whatsapplive.Status         `json:"status"`
 		Pairing whatsapplive.QRPairingState `json:"pairing"`
 	}{

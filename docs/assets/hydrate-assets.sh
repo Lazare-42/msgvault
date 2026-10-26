@@ -8,6 +8,7 @@ repo_root="$(cd "$docs_root/.." && pwd)"
 static_branch="${MSGVAULT_DOCS_ASSETS_BRANCH:-docs-assets}"
 generated_branch="${MSGVAULT_DOCS_GENERATED_ASSETS_BRANCH:-docs-generated-assets}"
 use_local_branches="${MSGVAULT_DOCS_USE_LOCAL_ASSET_BRANCHES:-false}"
+asset_remote="${MSGVAULT_DOCS_ASSETS_REMOTE:-https://github.com/wesm/msgvault.git}"
 
 static_target="$docs_root/assets/static"
 generated_target="$docs_root/assets/generated"
@@ -81,6 +82,7 @@ use_local_branches_enabled() {
 
 resolve_asset_ref() {
   local branch="$1"
+  local cache_ref="refs/msgvault-docs-assets/$branch"
 
   if use_local_branches_enabled; then
     if git -C "$repo_root" rev-parse --verify --quiet "$branch" >/dev/null; then
@@ -89,14 +91,14 @@ resolve_asset_ref() {
     fi
   fi
 
-  if ! git -C "$repo_root" fetch --force --depth=1 origin \
-    "+refs/heads/$branch:refs/remotes/origin/$branch" >/dev/null; then
-    printf 'docs assets not hydrated: failed to fetch origin/%s\n' "$branch" >&2
+  if ! git -C "$repo_root" fetch --force --depth=1 "$asset_remote" \
+    "+refs/heads/$branch:$cache_ref" >/dev/null; then
+    printf 'docs assets not hydrated: failed to fetch %s from %s\n' "$branch" "$asset_remote" >&2
     return 1
   fi
 
-  if git -C "$repo_root" rev-parse --verify --quiet "origin/$branch" >/dev/null; then
-    printf 'origin/%s\n' "$branch"
+  if git -C "$repo_root" rev-parse --verify --quiet "$cache_ref" >/dev/null; then
+    printf '%s\n' "$cache_ref"
     return 0
   fi
 

@@ -66,6 +66,11 @@ and copies the static marketing site to `/`. `make docs-check` runs source
 validation, builds that actual layout, and checks the output and redirects.
 Use `make docs-serve` to inspect it at `http://127.0.0.1:8000`.
 
+Documentation artwork is fetched from the upstream asset branches so this fork
+can build new upstream pages without copying binary assets into main. Set
+`MSGVAULT_DOCS_ASSETS_REMOTE` to a Git remote name or URL to use custom asset
+branches instead.
+
 Every public page has a Markdown companion. The build copies documentation
 sources to matching paths such as `/docs/setup.md` and `/docs/usage/searching.md`;
 the documentation index is `/docs/index.md`. HTML pages link to their Markdown

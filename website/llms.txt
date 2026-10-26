@@ -68,6 +68,8 @@ below, or replace a page's trailing slash with `.md`: `/docs/setup/` becomes
 - [Daemon Lifecycle](https://msgvault.io/docs/guides/daemon-migration.md)
 - [Troubleshooting](https://msgvault.io/docs/troubleshooting.md)
 
+- [Triage queue](https://msgvault.io/docs/usage/triage.md): deterministic action and follow-up queues
+
 ## Reference and Integrations
 
 - [CLI Reference](https://msgvault.io/docs/cli-reference.md): every command and flag
@@ -93,6 +95,8 @@ below, or replace a page's trailing slash with `.md`: `/docs/setup/` becomes
 
 - [Development](https://msgvault.io/docs/development.md)
 - [Why msgvault?](https://msgvault.io/docs/introduction.md)
+
+- [Research services reference](https://msgvault.io/docs/research-services-reference.md): integration notes for web research providers
 
 ## Optional
 
