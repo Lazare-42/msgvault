@@ -518,6 +518,91 @@ func (t *WhatsmeowTransport) SendReaction(ctx context.Context, req TransportSend
 	}, nil
 }
 
+// CreateGroup creates a WhatsApp group with the given name and participants.
+// WhatsApp implicitly adds the linked account itself — req.Participants
+// should list only the other members. There is no idempotency at this layer
+// (whatsmeow's CreateKey only dedupes the JOIN notification, not the create
+// call itself): calling this twice creates two groups, so callers that need
+// "create once, reuse after" must persist the returned JID themselves.
+func (t *WhatsmeowTransport) CreateGroup(ctx context.Context, req TransportCreateGroupRequest) (TransportCreateGroupResult, error) {
+	participants := make([]types.JID, 0, len(req.Participants))
+	for _, p := range req.Participants {
+		jid, err := ParseChatJID(p)
+		if err != nil {
+			return TransportCreateGroupResult{}, fmt.Errorf("participant %q: %w", p, err)
+		}
+		participants = append(participants, jid)
+	}
+	info, err := t.client.CreateGroup(ctx, whatsmeow.ReqCreateGroup{
+		Name:         req.Name,
+		Participants: participants,
+	})
+	if err != nil {
+		return TransportCreateGroupResult{}, fmt.Errorf("create whatsapp group: %w", err)
+	}
+	return TransportCreateGroupResult{
+		JID:          info.JID.String(),
+		Name:         info.Name,
+		Participants: convertGroupParticipants(info.Participants),
+	}, nil
+}
+
+func convertGroupParticipants(in []types.GroupParticipant) []GroupParticipantInfo {
+	out := make([]GroupParticipantInfo, 0, len(in))
+	for _, p := range in {
+		out = append(out, GroupParticipantInfo{
+			JID:     p.JID.String(),
+			IsAdmin: p.IsAdmin || p.IsSuperAdmin,
+			Error:   p.Error,
+		})
+	}
+	return out
+}
+
+// GetGroupInfo fetches a group's current member list from WhatsApp's
+// servers. Unlike CreateGroup's returned Participants (which reflects
+// add-time outcomes), this reflects who is actually in the group right now.
+func (t *WhatsmeowTransport) GetGroupInfo(ctx context.Context, req TransportGetGroupInfoRequest) (TransportGroupInfoResult, error) {
+	jid, err := ParseChatJID(req.JID)
+	if err != nil {
+		return TransportGroupInfoResult{}, fmt.Errorf("get whatsapp group info: %w", err)
+	}
+	info, err := t.client.GetGroupInfo(ctx, jid)
+	if err != nil {
+		return TransportGroupInfoResult{}, fmt.Errorf("get whatsapp group info: %w", err)
+	}
+	return TransportGroupInfoResult{
+		JID:          info.JID.String(),
+		Name:         info.Name,
+		Participants: convertGroupParticipants(info.Participants),
+	}, nil
+}
+
+// UpdateGroupParticipants adds, removes, promotes or demotes members of an
+// existing group. Per-participant failures (e.g. their privacy settings
+// blocked a direct add) show up as a nonzero Error in the returned
+// GroupParticipantInfo, not as a call-level error.
+func (t *WhatsmeowTransport) UpdateGroupParticipants(ctx context.Context, req TransportUpdateGroupParticipantsRequest) (TransportGroupParticipantsResult, error) {
+	jid, err := ParseChatJID(req.JID)
+	if err != nil {
+		return TransportGroupParticipantsResult{}, fmt.Errorf("update whatsapp group participants: %w", err)
+	}
+	participants := make([]types.JID, 0, len(req.Participants))
+	for _, p := range req.Participants {
+		pjid, err := ParseChatJID(p)
+		if err != nil {
+			return TransportGroupParticipantsResult{}, fmt.Errorf("participant %q: %w", p, err)
+		}
+		participants = append(participants, pjid)
+	}
+	action := whatsmeow.ParticipantChange(req.Action)
+	updated, err := t.client.UpdateGroupParticipants(ctx, jid, participants, action)
+	if err != nil {
+		return TransportGroupParticipantsResult{}, fmt.Errorf("update whatsapp group participants: %w", err)
+	}
+	return TransportGroupParticipantsResult{Participants: convertGroupParticipants(updated)}, nil
+}
+
 // RequestHistorySync asks WhatsApp's own on-demand history-sync mechanism
 // (whatsmeow's Client.BuildHistorySyncRequest) for more messages older than
 // req.AnchorMessageID in one chat. The built protocol message is sent via

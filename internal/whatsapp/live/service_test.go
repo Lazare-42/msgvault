@@ -15,14 +15,17 @@ import (
 )
 
 type mockTransport struct {
-	status             Status
-	connect            func(context.Context) error
-	logout             func(context.Context, TransportLogoutRequest) (TransportLogoutResult, error)
-	startQRPairing     func(context.Context) error
-	pairingState       QRPairingState
-	sendMessage        func(context.Context, TransportSendMessageRequest) (TransportSendResult, error)
-	sendReaction       func(context.Context, TransportSendReactionRequest) (TransportSendResult, error)
-	requestHistorySync func(context.Context, TransportRequestHistorySyncRequest) error
+	status                  Status
+	connect                 func(context.Context) error
+	logout                  func(context.Context, TransportLogoutRequest) (TransportLogoutResult, error)
+	startQRPairing          func(context.Context) error
+	pairingState            QRPairingState
+	sendMessage             func(context.Context, TransportSendMessageRequest) (TransportSendResult, error)
+	sendReaction            func(context.Context, TransportSendReactionRequest) (TransportSendResult, error)
+	createGroup             func(context.Context, TransportCreateGroupRequest) (TransportCreateGroupResult, error)
+	getGroupInfo            func(context.Context, TransportGetGroupInfoRequest) (TransportGroupInfoResult, error)
+	updateGroupParticipants func(context.Context, TransportUpdateGroupParticipantsRequest) (TransportGroupParticipantsResult, error)
+	requestHistorySync      func(context.Context, TransportRequestHistorySyncRequest) error
 }
 
 func (m *mockTransport) Status(context.Context) (Status, error) { return m.status, nil }
@@ -53,6 +56,24 @@ func (m *mockTransport) SendMessage(ctx context.Context, req TransportSendMessag
 }
 func (m *mockTransport) SendReaction(ctx context.Context, req TransportSendReactionRequest) (TransportSendResult, error) {
 	return m.sendReaction(ctx, req)
+}
+func (m *mockTransport) CreateGroup(ctx context.Context, req TransportCreateGroupRequest) (TransportCreateGroupResult, error) {
+	if m.createGroup != nil {
+		return m.createGroup(ctx, req)
+	}
+	return TransportCreateGroupResult{}, nil
+}
+func (m *mockTransport) GetGroupInfo(ctx context.Context, req TransportGetGroupInfoRequest) (TransportGroupInfoResult, error) {
+	if m.getGroupInfo != nil {
+		return m.getGroupInfo(ctx, req)
+	}
+	return TransportGroupInfoResult{}, nil
+}
+func (m *mockTransport) UpdateGroupParticipants(ctx context.Context, req TransportUpdateGroupParticipantsRequest) (TransportGroupParticipantsResult, error) {
+	if m.updateGroupParticipants != nil {
+		return m.updateGroupParticipants(ctx, req)
+	}
+	return TransportGroupParticipantsResult{}, nil
 }
 
 // RequestHistorySync makes mockTransport satisfy the optional
@@ -86,6 +107,15 @@ func (m *minimalTransport) SendMessage(context.Context, TransportSendMessageRequ
 }
 func (m *minimalTransport) SendReaction(context.Context, TransportSendReactionRequest) (TransportSendResult, error) {
 	return TransportSendResult{}, nil
+}
+func (m *minimalTransport) CreateGroup(context.Context, TransportCreateGroupRequest) (TransportCreateGroupResult, error) {
+	return TransportCreateGroupResult{}, nil
+}
+func (m *minimalTransport) GetGroupInfo(context.Context, TransportGetGroupInfoRequest) (TransportGroupInfoResult, error) {
+	return TransportGroupInfoResult{}, nil
+}
+func (m *minimalTransport) UpdateGroupParticipants(context.Context, TransportUpdateGroupParticipantsRequest) (TransportGroupParticipantsResult, error) {
+	return TransportGroupParticipantsResult{}, nil
 }
 
 func TestServiceSendMessageArchivesAndOutbox(t *testing.T) {

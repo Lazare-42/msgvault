@@ -1066,6 +1066,9 @@ var (
 		legacyDefinition(whatsAppLogoutTool(), toolSecurityWrite, (*handlers).whatsAppLogout),
 		legacyDefinition(sendWhatsAppMessageTool(), toolSecurityWrite, (*handlers).sendWhatsAppMessage),
 		legacyDefinition(sendWhatsAppReactionTool(), toolSecurityWrite, (*handlers).sendWhatsAppReaction),
+		legacyDefinition(createWhatsAppGroupTool(), toolSecurityWrite, (*handlers).createWhatsAppGroup),
+		legacyDefinition(getWhatsAppGroupInfoTool(), toolSecurityRead, (*handlers).getWhatsAppGroupInfo),
+		legacyDefinition(updateWhatsAppGroupParticipantsTool(), toolSecurityWrite, (*handlers).updateWhatsAppGroupParticipants),
 		legacyDefinition(whatsAppRequestHistorySyncTool(), toolSecurityWrite, (*handlers).whatsAppRequestHistorySync),
 	}
 	whatsAppArchiveOperationDefinitions = []toolDefinition{

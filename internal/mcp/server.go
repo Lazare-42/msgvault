@@ -59,96 +59,99 @@ type GoogleDocsClientFactory func(ctx context.Context) (googledocs.Client, error
 
 // Tool name constants.
 const (
-	ToolDraftReply                 = "draft_reply"
-	ToolDraftCompose               = "draft_compose"
-	ToolDraftForward               = "draft_forward"
-	ToolDraftGet                   = "draft_get"
-	ToolDraftEdit                  = "draft_edit"
-	ToolDraftDelete                = "draft_delete"
-	ToolDraftRecover               = "draft_recover"
-	ToolDraftSendAs                = "draft_send_as"
-	ToolSearchMessages             = "search_messages"
-	ToolQuerySQL                   = "query_sql"
-	ToolSearchMetadata             = "search_metadata"
-	ToolSearchMessageBodies        = "search_message_bodies"
-	ToolSemanticSearchMessages     = "semantic_search_messages"
-	ToolGetMessage                 = "get_message"
-	ToolGetAttachment              = "get_attachment"
-	ToolExportAttachment           = "export_attachment"
-	ToolExportEML                  = "export_eml"
-	ToolListThread                 = "list_thread"
-	ToolListMessages               = "list_messages"
-	ToolGetStats                   = "get_stats"
-	ToolAggregate                  = "aggregate"
-	ToolStageDeletion              = "stage_deletion"
-	ToolSearchByDomains            = "search_by_domains"
-	ToolFindSimilarMessages        = "find_similar_messages"
-	ToolSearchVisualAttachments    = "search_visual_attachments"
-	ToolSearchInMessage            = "search_in_message"
-	ToolSearchDocuments            = "search_document_attachments"
-	ToolSearchPersonFiles          = "search_person_files"
-	ToolSearchPeople               = "search_people"
-	ToolListDirectoryPeople        = "list_directory_people"
-	ToolFindChat                   = "find_chat"
-	ToolGetPersonNotes             = "get_person_notes"
-	ToolGetPersonProfile           = "get_person_profile"
-	ToolGetPersonRelationship      = "get_person_relationship"
-	ToolGetPersonAgenda            = "get_person_agenda"
-	ToolFindContactCandidates      = "find_contact_candidates"
-	ToolGetPersonMessagingRoutes   = "get_person_messaging_routes"
-	ToolPromotePerson              = "promote_person"
-	ToolUpdatePersonNotes          = "update_person_notes"
-	ToolListSavedViews             = "list_saved_views"
-	ToolGetSavedView               = "get_saved_view"
-	ToolRunSavedView               = "run_saved_view"
-	ToolCreateSavedView            = "create_saved_view"
-	ToolUpdateSavedView            = "update_saved_view"
-	ToolDeleteSavedView            = "delete_saved_view"
-	ToolGetMeetingContext          = "get_meeting_context"
-	ToolListMeetingActionItems     = "list_meeting_action_items"
-	ToolGetMeetingMetrics          = "get_meeting_metrics"
-	ToolListIdentityMatches        = "list_identity_matches"
-	ToolGetIdentityMatch           = "get_identity_match"
-	ToolAcceptIdentityMatch        = "accept_identity_match"
-	ToolRejectIdentityMatch        = "reject_identity_match"
-	ToolGetPersonMergeContext      = "get_person_merge_context"
-	ToolMergePerson                = "merge_person"
-	ToolGetCardDAVPublication      = "get_carddav_publication"
-	ToolPreviewCardDAVPublication  = "preview_carddav_publication"
-	ToolApproveCardDAVPublication  = "approve_carddav_publication"
-	ToolSyncCardDAV                = "sync_carddav"
-	ToolGetCardDAVSyncStatus       = "get_carddav_sync_status"
-	ToolGetIdentityScoringStatus   = "get_identity_scoring_status"
-	ToolScoreIdentityMatches       = "score_identity_matches"
-	ToolListIdentityJudgments      = "list_identity_judgments"
-	ToolListDrafts                 = "list_drafts"
-	ToolGetDraft                   = "get_draft"
-	ToolCreateDraft                = "create_draft"
-	ToolUpdateDraft                = "update_draft"
-	ToolDeleteDraft                = "delete_draft"
-	ToolSendDraft                  = "send_draft"
-	ToolModifyLabels               = "modify_labels"
-	ToolCreateLabel                = "create_label"
-	ToolDeleteLabel                = "delete_label"
-	ToolListGmailLabels            = "list_gmail_labels"
-	ToolWhatsAppStatus             = "whatsapp_status"
-	ToolWhatsAppStartLogin         = "whatsapp_start_login"
-	ToolWhatsAppLoginStatus        = "whatsapp_login_status"
-	ToolWhatsAppLogout             = "whatsapp_logout"
-	ToolSendWhatsAppMessage        = "send_whatsapp_message"
-	ToolSendWhatsAppReaction       = "send_whatsapp_reaction"
-	ToolListGoogleDocs             = "list_google_docs"
-	ToolSearchGoogleDocs           = "search_google_docs"
-	ToolGetGoogleDoc               = "get_google_doc"
-	ToolAppendGoogleDocText        = "append_google_doc_text"
-	ToolReplaceGoogleDocText       = "replace_google_doc_text"
-	ToolWhatsAppRequestHistorySync = "whatsapp_request_history_sync"
-	ToolListWhatsAppChats          = "list_whatsapp_chats"
-	ToolListWhatsAppMessages       = "list_whatsapp_messages"
-	ToolSearchAttachmentText       = "search_attachment_text"
-	ToolGetAttachmentText          = "get_attachment_text"
-	ToolRequestAttachmentText      = "request_attachment_text"
-	ToolGetOCRStatus               = "get_ocr_status"
+	ToolDraftReply                      = "draft_reply"
+	ToolDraftCompose                    = "draft_compose"
+	ToolDraftForward                    = "draft_forward"
+	ToolDraftGet                        = "draft_get"
+	ToolDraftEdit                       = "draft_edit"
+	ToolDraftDelete                     = "draft_delete"
+	ToolDraftRecover                    = "draft_recover"
+	ToolDraftSendAs                     = "draft_send_as"
+	ToolSearchMessages                  = "search_messages"
+	ToolQuerySQL                        = "query_sql"
+	ToolSearchMetadata                  = "search_metadata"
+	ToolSearchMessageBodies             = "search_message_bodies"
+	ToolSemanticSearchMessages          = "semantic_search_messages"
+	ToolGetMessage                      = "get_message"
+	ToolGetAttachment                   = "get_attachment"
+	ToolExportAttachment                = "export_attachment"
+	ToolExportEML                       = "export_eml"
+	ToolListThread                      = "list_thread"
+	ToolListMessages                    = "list_messages"
+	ToolGetStats                        = "get_stats"
+	ToolAggregate                       = "aggregate"
+	ToolStageDeletion                   = "stage_deletion"
+	ToolSearchByDomains                 = "search_by_domains"
+	ToolFindSimilarMessages             = "find_similar_messages"
+	ToolSearchVisualAttachments         = "search_visual_attachments"
+	ToolSearchInMessage                 = "search_in_message"
+	ToolSearchDocuments                 = "search_document_attachments"
+	ToolSearchPersonFiles               = "search_person_files"
+	ToolSearchPeople                    = "search_people"
+	ToolListDirectoryPeople             = "list_directory_people"
+	ToolFindChat                        = "find_chat"
+	ToolGetPersonNotes                  = "get_person_notes"
+	ToolGetPersonProfile                = "get_person_profile"
+	ToolGetPersonRelationship           = "get_person_relationship"
+	ToolGetPersonAgenda                 = "get_person_agenda"
+	ToolFindContactCandidates           = "find_contact_candidates"
+	ToolGetPersonMessagingRoutes        = "get_person_messaging_routes"
+	ToolPromotePerson                   = "promote_person"
+	ToolUpdatePersonNotes               = "update_person_notes"
+	ToolListSavedViews                  = "list_saved_views"
+	ToolGetSavedView                    = "get_saved_view"
+	ToolRunSavedView                    = "run_saved_view"
+	ToolCreateSavedView                 = "create_saved_view"
+	ToolUpdateSavedView                 = "update_saved_view"
+	ToolDeleteSavedView                 = "delete_saved_view"
+	ToolGetMeetingContext               = "get_meeting_context"
+	ToolListMeetingActionItems          = "list_meeting_action_items"
+	ToolGetMeetingMetrics               = "get_meeting_metrics"
+	ToolListIdentityMatches             = "list_identity_matches"
+	ToolGetIdentityMatch                = "get_identity_match"
+	ToolAcceptIdentityMatch             = "accept_identity_match"
+	ToolRejectIdentityMatch             = "reject_identity_match"
+	ToolGetPersonMergeContext           = "get_person_merge_context"
+	ToolMergePerson                     = "merge_person"
+	ToolGetCardDAVPublication           = "get_carddav_publication"
+	ToolPreviewCardDAVPublication       = "preview_carddav_publication"
+	ToolApproveCardDAVPublication       = "approve_carddav_publication"
+	ToolSyncCardDAV                     = "sync_carddav"
+	ToolGetCardDAVSyncStatus            = "get_carddav_sync_status"
+	ToolGetIdentityScoringStatus        = "get_identity_scoring_status"
+	ToolScoreIdentityMatches            = "score_identity_matches"
+	ToolListIdentityJudgments           = "list_identity_judgments"
+	ToolListDrafts                      = "list_drafts"
+	ToolGetDraft                        = "get_draft"
+	ToolCreateDraft                     = "create_draft"
+	ToolUpdateDraft                     = "update_draft"
+	ToolDeleteDraft                     = "delete_draft"
+	ToolSendDraft                       = "send_draft"
+	ToolModifyLabels                    = "modify_labels"
+	ToolCreateLabel                     = "create_label"
+	ToolDeleteLabel                     = "delete_label"
+	ToolListGmailLabels                 = "list_gmail_labels"
+	ToolWhatsAppStatus                  = "whatsapp_status"
+	ToolWhatsAppStartLogin              = "whatsapp_start_login"
+	ToolWhatsAppLoginStatus             = "whatsapp_login_status"
+	ToolWhatsAppLogout                  = "whatsapp_logout"
+	ToolSendWhatsAppMessage             = "send_whatsapp_message"
+	ToolSendWhatsAppReaction            = "send_whatsapp_reaction"
+	ToolCreateWhatsAppGroup             = "create_whatsapp_group"
+	ToolGetWhatsAppGroupInfo            = "get_whatsapp_group_info"
+	ToolUpdateWhatsAppGroupParticipants = "update_whatsapp_group_participants"
+	ToolListGoogleDocs                  = "list_google_docs"
+	ToolSearchGoogleDocs                = "search_google_docs"
+	ToolGetGoogleDoc                    = "get_google_doc"
+	ToolAppendGoogleDocText             = "append_google_doc_text"
+	ToolReplaceGoogleDocText            = "replace_google_doc_text"
+	ToolWhatsAppRequestHistorySync      = "whatsapp_request_history_sync"
+	ToolListWhatsAppChats               = "list_whatsapp_chats"
+	ToolListWhatsAppMessages            = "list_whatsapp_messages"
+	ToolSearchAttachmentText            = "search_attachment_text"
+	ToolGetAttachmentText               = "get_attachment_text"
+	ToolRequestAttachmentText           = "request_attachment_text"
+	ToolGetOCRStatus                    = "get_ocr_status"
 )
 
 // search_message_bodies/search_in_message mode values (wire format).
@@ -544,6 +547,9 @@ func WhatsAppToolNames() []string {
 		ToolWhatsAppLogout,
 		ToolSendWhatsAppMessage,
 		ToolSendWhatsAppReaction,
+		ToolCreateWhatsAppGroup,
+		ToolGetWhatsAppGroupInfo,
+		ToolUpdateWhatsAppGroupParticipants,
 		ToolWhatsAppRequestHistorySync,
 		ToolListWhatsAppChats,
 		ToolListWhatsAppMessages,
@@ -1096,6 +1102,59 @@ func sendWhatsAppMessageTool() mcp.Tool {
 		),
 		mcp.WithString("local_request_id",
 			mcp.Description("Optional caller-provided idempotency/audit key"),
+		),
+	)
+}
+
+func createWhatsAppGroupTool() mcp.Tool {
+	return mcp.NewTool(ToolCreateWhatsAppGroup,
+		mcp.WithDescription("Create a new WhatsApp group through the linked live account and return its JID. Requires whatsapp_status ready=true. The linked account is added implicitly — list only the other members in participants. No dedup: calling this twice with the same participants creates two separate groups, so callers that need one group per recipient must remember the returned jid themselves."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithIdempotentHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(true),
+		withAccount(),
+		mcp.WithString("name",
+			mcp.Required(),
+			mcp.Description("Group name, max 25 characters (WhatsApp hard limit — longer names are rejected)."),
+		),
+		mcp.WithArray("participants",
+			mcp.Required(),
+			mcp.Description("Other group members: international phone numbers or full JID strings."),
+			mcp.Items(map[string]any{"type": "string"}),
+		),
+	)
+}
+
+func getWhatsAppGroupInfoTool() mcp.Tool {
+	return mcp.NewTool(ToolGetWhatsAppGroupInfo,
+		mcp.WithDescription("Fetch a WhatsApp group's current member list from WhatsApp's servers. Requires whatsapp_status ready=true. Use this to check who is ACTUALLY in a group right now — create_whatsapp_group's own response only reflects add outcomes at creation time, and a participant with a nonzero error code there is not actually a member."),
+		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithIdempotentHintAnnotation(true), mcp.WithOpenWorldHintAnnotation(true),
+		withAccount(),
+		mcp.WithString("jid",
+			mcp.Required(),
+			mcp.Description("Group JID, e.g. \"120363428130382724@g.us\"."),
+		),
+	)
+}
+
+func updateWhatsAppGroupParticipantsTool() mcp.Tool {
+	return mcp.NewTool(ToolUpdateWhatsAppGroupParticipants,
+		mcp.WithDescription("Add, remove, promote, or demote members of an existing WhatsApp group. Requires whatsapp_status ready=true. Per-participant failures (e.g. their privacy settings blocked a direct add) show up as a nonzero error on that participant in the response, not as a tool-call error — check every participant's error field, don't just trust a successful call."),
+		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(true),
+		mcp.WithIdempotentHintAnnotation(false), mcp.WithOpenWorldHintAnnotation(true),
+		withAccount(),
+		mcp.WithString("jid",
+			mcp.Required(),
+			mcp.Description("Group JID, e.g. \"120363428130382724@g.us\"."),
+		),
+		mcp.WithString("action",
+			mcp.Required(),
+			mcp.Description("One of: add, remove, promote, demote."),
+		),
+		mcp.WithArray("participants",
+			mcp.Required(),
+			mcp.Description("Phone numbers or full JID strings to act on."),
+			mcp.Items(map[string]any{"type": "string"}),
 		),
 	)
 }

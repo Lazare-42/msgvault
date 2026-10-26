@@ -834,7 +834,7 @@ func queryDetailFromAPIMessage(msg *store.APIMessage) *query.MessageDetail {
 		SizeEstimate:         msg.SizeEstimate,
 		HasAttachments:       msg.HasAttachments,
 		Labels:               msg.Labels,
-		BodyText:             msg.Body,
+		BodyText:             apiMessageBodyText(msg),
 		BodyHTML:             msg.BodyHTML,
 		From:                 apiMessageFromAddress(msg),
 		To:                   apiMessageAddresses(msg.To),
@@ -856,6 +856,19 @@ func queryDetailFromAPIMessage(msg *store.APIMessage) *query.MessageDetail {
 		detail.HasAttachments = true
 	}
 	return detail
+}
+
+// apiMessageBodyText returns the plain-text body. store.APIMessage.Body falls
+// back to the HTML when there is no text part; that must not be reported as
+// text, or body_format=auto/html never sees the HTML.
+func apiMessageBodyText(msg *store.APIMessage) string {
+	if msg.BodyText != "" {
+		return msg.BodyText
+	}
+	if msg.Body == msg.BodyHTML {
+		return ""
+	}
+	return msg.Body
 }
 
 func apiMessageFromAddress(msg *store.APIMessage) []query.Address {

@@ -3473,3 +3473,58 @@ func TestScheduledDiscordGuildFailureDoesNotBlockLaterGuild(t *testing.T) {
 	assert.Equal([]string{first.Identifier, second.Identifier}, rebuilt,
 		"each scheduled guild invocation rebuilds its cache exactly once")
 }
+
+func TestRunScheduledIMAPSync_AppliesConfiguredSkipFolders(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+
+	addr, _ := testutil.StartIMAPMemServer(t, map[string]int{
+		"INBOX":    1,
+		"Metadata": 2,
+	})
+	host, portString, err := net.SplitHostPort(addr)
+	require.NoError(err)
+	port, err := strconv.Atoi(portString)
+	require.NoError(err)
+
+	dataDir := t.TempDir()
+	cfg := &config.Config{
+		Data: config.DataConfig{DataDir: dataDir},
+		Accounts: []config.AccountSchedule{{
+			Email:       "user@example.com",
+			Schedule:    "0 * * * *",
+			Enabled:     true,
+			SkipFolders: []string{"metadata"},
+		}},
+	}
+	s, err := store.Open(filepath.Join(dataDir, "msgvault.db"))
+	require.NoError(err)
+	t.Cleanup(func() { _ = s.Close() })
+	require.NoError(s.InitSchema())
+
+	imapCfg := &imaplib.Config{
+		Host: host, Port: port, Username: testutil.IMAPTestUsername,
+	}
+	src, err := s.GetOrCreateSource(sourceTypeIMAP, imapCfg.Identifier())
+	require.NoError(err)
+	require.NoError(s.UpdateSourceDisplayName(src.ID, "user@example.com"))
+	configJSON, err := imapCfg.ToJSON()
+	require.NoError(err)
+	require.NoError(s.UpdateSourceSyncConfig(src.ID, configJSON))
+	require.NoError(imaplib.SaveCredentials(
+		cfg.TokensDir(), imapCfg.Identifier(), testutil.IMAPTestPassword))
+
+	src, err = s.GetSourceByID(src.ID)
+	require.NoError(err)
+	summary, err := runScheduledIMAPSync(
+		testInvocationContext(t.Context(), cfg, invocationOptions{}), src, s, nil, "user@example.com")
+	require.NoError(err)
+	assert.Equal(int64(1), summary.MessagesFound)
+	assert.Equal(int64(1), summary.MessagesAdded)
+	assert.Empty(summary.Errors)
+
+	counts, err := s.CountMessagesPerMailbox(src.ID)
+	require.NoError(err)
+	assert.Equal(int64(1), counts["INBOX"])
+	assert.NotContains(counts, "Metadata")
+}
