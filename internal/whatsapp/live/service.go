@@ -385,7 +385,7 @@ func (s *Service) CreateGroup(ctx context.Context, req CreateGroupRequest) (Crea
 	if len(req.Participants) == 0 {
 		return CreateGroupResult{}, errors.New("participants is required")
 	}
-	if _, err := s.requireReady(ctx); err != nil {
+	if err := s.requireReady(ctx); err != nil {
 		return CreateGroupResult{}, err
 	}
 
@@ -410,7 +410,7 @@ func (s *Service) GetGroupInfo(ctx context.Context, req GetGroupInfoRequest) (Gr
 	if req.JID == "" {
 		return GroupInfoResult{}, errors.New("jid is required")
 	}
-	if _, err := s.requireReady(ctx); err != nil {
+	if err := s.requireReady(ctx); err != nil {
 		return GroupInfoResult{}, err
 	}
 	source, err := s.sourceForAccount(ctx, req.Account)
@@ -441,7 +441,7 @@ func (s *Service) UpdateGroupParticipants(ctx context.Context, req UpdateGroupPa
 	default:
 		return GroupParticipantsResult{}, fmt.Errorf("action must be one of add/remove/promote/demote, got %q", req.Action)
 	}
-	if _, err := s.requireReady(ctx); err != nil {
+	if err := s.requireReady(ctx); err != nil {
 		return GroupParticipantsResult{}, err
 	}
 	source, err := s.sourceForAccount(ctx, req.Account)

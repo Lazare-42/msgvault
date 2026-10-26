@@ -3528,4 +3528,3 @@ func TestRunScheduledIMAPSync_AppliesConfiguredSkipFolders(t *testing.T) {
 	assert.Equal(int64(1), counts["INBOX"])
 	assert.NotContains(counts, "Metadata")
 }
-
