@@ -402,7 +402,7 @@ func (s *Service) CreateGroup(ctx context.Context, req CreateGroupRequest) (Crea
 	if err != nil {
 		return CreateGroupResult{}, err
 	}
-	return CreateGroupResult{JID: remote.JID, Name: remote.Name, Participants: remote.Participants}, nil
+	return CreateGroupResult(remote), nil
 }
 
 func (s *Service) GetGroupInfo(ctx context.Context, req GetGroupInfoRequest) (GroupInfoResult, error) {
@@ -424,7 +424,7 @@ func (s *Service) GetGroupInfo(ctx context.Context, req GetGroupInfoRequest) (Gr
 	if err != nil {
 		return GroupInfoResult{}, err
 	}
-	return GroupInfoResult{JID: remote.JID, Name: remote.Name, Participants: remote.Participants}, nil
+	return GroupInfoResult(remote), nil
 }
 
 func (s *Service) UpdateGroupParticipants(ctx context.Context, req UpdateGroupParticipantsRequest) (GroupParticipantsResult, error) {
@@ -457,7 +457,7 @@ func (s *Service) UpdateGroupParticipants(ctx context.Context, req UpdateGroupPa
 	if err != nil {
 		return GroupParticipantsResult{}, err
 	}
-	return GroupParticipantsResult{Participants: remote.Participants}, nil
+	return GroupParticipantsResult(remote), nil
 }
 
 func (s *Service) SendReaction(ctx context.Context, req SendReactionRequest) (SendResult, error) {

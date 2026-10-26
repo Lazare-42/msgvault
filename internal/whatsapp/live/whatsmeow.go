@@ -538,7 +538,7 @@ func (t *WhatsmeowTransport) CreateGroup(ctx context.Context, req TransportCreat
 		Participants: participants,
 	})
 	if err != nil {
-		return TransportCreateGroupResult{}, err
+		return TransportCreateGroupResult{}, fmt.Errorf("create whatsapp group: %w", err)
 	}
 	return TransportCreateGroupResult{
 		JID:          info.JID.String(),
@@ -565,11 +565,11 @@ func convertGroupParticipants(in []types.GroupParticipant) []GroupParticipantInf
 func (t *WhatsmeowTransport) GetGroupInfo(ctx context.Context, req TransportGetGroupInfoRequest) (TransportGroupInfoResult, error) {
 	jid, err := ParseChatJID(req.JID)
 	if err != nil {
-		return TransportGroupInfoResult{}, err
+		return TransportGroupInfoResult{}, fmt.Errorf("get whatsapp group info: %w", err)
 	}
 	info, err := t.client.GetGroupInfo(ctx, jid)
 	if err != nil {
-		return TransportGroupInfoResult{}, err
+		return TransportGroupInfoResult{}, fmt.Errorf("get whatsapp group info: %w", err)
 	}
 	return TransportGroupInfoResult{
 		JID:          info.JID.String(),
@@ -585,7 +585,7 @@ func (t *WhatsmeowTransport) GetGroupInfo(ctx context.Context, req TransportGetG
 func (t *WhatsmeowTransport) UpdateGroupParticipants(ctx context.Context, req TransportUpdateGroupParticipantsRequest) (TransportGroupParticipantsResult, error) {
 	jid, err := ParseChatJID(req.JID)
 	if err != nil {
-		return TransportGroupParticipantsResult{}, err
+		return TransportGroupParticipantsResult{}, fmt.Errorf("update whatsapp group participants: %w", err)
 	}
 	participants := make([]types.JID, 0, len(req.Participants))
 	for _, p := range req.Participants {
@@ -598,7 +598,7 @@ func (t *WhatsmeowTransport) UpdateGroupParticipants(ctx context.Context, req Tr
 	action := whatsmeow.ParticipantChange(req.Action)
 	updated, err := t.client.UpdateGroupParticipants(ctx, jid, participants, action)
 	if err != nil {
-		return TransportGroupParticipantsResult{}, err
+		return TransportGroupParticipantsResult{}, fmt.Errorf("update whatsapp group participants: %w", err)
 	}
 	return TransportGroupParticipantsResult{Participants: convertGroupParticipants(updated)}, nil
 }

@@ -25,11 +25,11 @@ func TestGeneratedDetailKeepsBodyHTML(t *testing.T) {
 	// reported as text.
 	msg = generatedDetailToAPIMessage(&generated.MessageDetail{Body: html, BodyHTML: &html})
 	detail = queryDetailFromAPIMessage(msg)
-	assert.Equal("", detail.BodyText)
+	assert.Empty(detail.BodyText)
 	assert.Equal(html, detail.BodyHTML)
 
 	// Text-only: unchanged.
 	detail = queryDetailFromAPIMessage(&store.APIMessage{Body: "plain"})
 	assert.Equal("plain", detail.BodyText)
-	assert.Equal("", detail.BodyHTML)
+	assert.Empty(detail.BodyHTML)
 }
