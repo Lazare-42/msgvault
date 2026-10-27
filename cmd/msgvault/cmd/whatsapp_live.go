@@ -210,7 +210,10 @@ func init() {
 }
 
 func serveWhatsAppLiveHTTP(ctx context.Context, addr string, st *store.Store, service *whatsapplive.Service, transport *whatsapplive.WhatsmeowTransport, opts mcpserver.ServeOptions, pairingToken string, basePath string, apiToken string) error {
-	mcpHTTP := mcpserver.NewHTTPServer(opts, mcpserver.HTTPOptions{APIKey: apiToken, AllowWrites: true})
+	// /mcp stays open to loopback clients (daily brief, team tasks, pricing, mcpproxy, the
+	// connection watchdogs), as before 2026-10-26: requiring apiToken here returned 401 to all of
+	// them. The bridge binds 127.0.0.1 and the public vhost blocks /mcp; apiToken guards /api only.
+	mcpHTTP := mcpserver.NewHTTPServer(opts, mcpserver.HTTPOptions{AllowWrites: true})
 	defer func() { _ = mcpHTTP.Shutdown(context.Background()) }()
 	mcpHandler := mcpHTTP.Handler
 	pairing := &whatsappPairingHandler{
