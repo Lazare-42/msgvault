@@ -17,6 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/config"
+	"go.kenn.io/msgvault/internal/gmail"
 	imaplib "go.kenn.io/msgvault/internal/imap"
 )
 
@@ -28,6 +29,7 @@ func startMemIMAPServer(t *testing.T, username, password string) int {
 	memServer := imapmemserver.New()
 	user := imapmemserver.NewUser(username, password)
 	require.NoError(t, user.Create("INBOX", nil))
+	require.NoError(t, user.Create("Drafts", nil))
 	memServer.AddUser(user)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -165,4 +167,53 @@ func TestLiveMailFactoryRetainsInvocationForHTTPRequest(t *testing.T) {
 	labels, err := client.ListLabels(t.Context())
 	require.NoError(err)
 	require.NotEmpty(labels)
+}
+
+// IMAP sources are stored under their imaps:// identifier. Drafts must still
+// default to, and allowlist, the login address rather than the URL.
+func TestLiveMailFactoryUsesIMAPLoginAsSender(t *testing.T) {
+	require := require.New(t)
+	const email, password = "owner@example.com", "test-password"
+	cfg := config.NewDefaultConfig()
+	cfg.HomeDir = t.TempDir()
+	cfg.Data.DataDir = cfg.HomeDir
+	cfg.Mail.Accounts = map[string]config.MailAccountConfig{
+		email: {AllowedFrom: []string{"reports@example.com"}},
+	}
+	ctx := withStoreResolverConfig(t, cfg)
+	port := startMemIMAPServer(t, email, password)
+	imapCfg := &imaplib.Config{Host: "127.0.0.1", Port: port, Username: email}
+	identifier := imapCfg.Identifier()
+	require.NoError(imaplib.SaveCredentials(cfg.TokensDir(), identifier, password))
+	syncConfig, err := imapCfg.ToJSON()
+	require.NoError(err)
+	daemon := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		assert.NoError(t, json.NewEncoder(w).Encode(map[string]any{"accounts": []map[string]any{{
+			"email": identifier, "type": "imap", "sync_config": syncConfig,
+		}}}))
+	}))
+	defer daemon.Close()
+	st, err := daemonclient.New(daemonclient.Config{URL: daemon.URL, AllowInsecure: true})
+	require.NoError(err)
+	defer func() { assert.NoError(t, st.Close()) }()
+	factory := buildMailFactory(ctx, st)
+	require.NotNil(factory)
+
+	client, err := factory(t.Context(), identifier)
+	require.NoError(err)
+	defer func() { assert.NoError(t, client.Close()) }()
+
+	draft, err := client.CreateDraft(t.Context(), &gmail.DraftCompose{
+		To: []string{"reader@example.com"}, Subject: "default sender", Body: "body",
+	})
+	require.NoError(err)
+	read, err := client.GetDraft(t.Context(), draft.ID)
+	require.NoError(err)
+	assert.Contains(t, read.Message.From, email)
+
+	_, err = client.CreateDraft(t.Context(), &gmail.DraftCompose{
+		From: "Reports <reports@example.com>", To: []string{"reader@example.com"}, Subject: "alternate", Body: "body",
+	})
+	assert.NoError(t, err, "allowed_from keyed by the login address applies to the IMAP source")
 }

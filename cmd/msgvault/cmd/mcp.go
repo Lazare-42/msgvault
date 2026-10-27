@@ -18,6 +18,7 @@ import (
 	"go.kenn.io/msgvault/internal/deletion"
 	"go.kenn.io/msgvault/internal/gmail"
 	"go.kenn.io/msgvault/internal/googledocs"
+	imaplib "go.kenn.io/msgvault/internal/imap"
 	"go.kenn.io/msgvault/internal/mailclient"
 	mcpserver "go.kenn.io/msgvault/internal/mcp"
 	"go.kenn.io/msgvault/internal/providercredentials"
@@ -575,12 +576,19 @@ func buildMailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.Ma
 	}
 
 	return func(ctx context.Context, email string) (client gmail.LiveAPI, err error) {
+		// IMAP accounts are identified by an imaps:// URL; their sender is the
+		// login address from the source config.
+		sender := email
 		defer func() {
 			if err != nil || client == nil {
 				return
 			}
 			backend := client
-			client, err = mailclient.New(backend, email, cfg.Mail.Accounts[email].AllowedFrom)
+			mailAccount, ok := cfg.Mail.Accounts[sender]
+			if !ok {
+				mailAccount = cfg.Mail.Accounts[email]
+			}
+			client, err = mailclient.New(backend, sender, mailAccount.AllowedFrom)
 			if err != nil {
 				_ = backend.Close()
 			}
@@ -604,6 +612,9 @@ func buildMailFactory(ctx context.Context, st *daemonclient.Client) mcpserver.Ma
 
 		switch account.Type {
 		case sourceTypeIMAP:
+			if imapCfg, cfgErr := imaplib.ConfigFromJSON(account.SyncConfig); cfgErr == nil && imapCfg.Username != "" {
+				sender = imapCfg.Username
+			}
 			return buildIMAPAPIClient(ctx, account.Email, account.SyncConfig)
 
 		case sourceTypeGmail, "":
