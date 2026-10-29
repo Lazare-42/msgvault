@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -25,6 +26,7 @@ import (
 	"go.kenn.io/msgvault/internal/apiprotocol"
 	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonclient"
+	"go.kenn.io/msgvault/internal/gmail"
 	imaplib "go.kenn.io/msgvault/internal/imap"
 	mcpserver "go.kenn.io/msgvault/internal/mcp"
 	"go.kenn.io/msgvault/internal/store"
@@ -398,5 +400,29 @@ func TestMCPDraftCapabilityGate(t *testing.T) {
 				require.Equal(int64(2), healthCalls.Load(), "startup compatibility and capability probes")
 			})
 		}
+	}
+}
+
+func TestHideUnusedManagedDraftTools(t *testing.T) {
+	liveFactory := mcpserver.GmailClientFactory(func(context.Context, string) (gmail.LiveAPI, error) { return nil, errors.New("not dialed") })
+	tests := []struct {
+		name    string
+		factory mcpserver.GmailClientFactory
+		cfg     *config.Config
+		want    bool
+	}{
+		{"live tools and no grants hide draft tools", liveFactory, &config.Config{}, false},
+		{"enabled IMAP grant keeps draft tools", liveFactory, &config.Config{IMAP: config.IMAPConfig{Drafts: []config.IMAPDraftSource{{SourceID: 1, Enabled: true}}}}, true},
+		{"disabled grant still hides", liveFactory, &config.Config{IMAP: config.IMAPConfig{Drafts: []config.IMAPDraftSource{{SourceID: 1}}}}, false},
+		{"enabled Gmail grant keeps draft tools", liveFactory, &config.Config{Gmail: config.GmailConfig{Drafts: []config.GmailDraftSource{{SourceID: 1, Enabled: true}}}}, true},
+		{"no live tools keeps draft tools", nil, &config.Config{}, true},
+		{"remote daemon keeps its own grants", liveFactory, &config.Config{Remote: config.RemoteConfig{URL: "https://daemon.example.com"}}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			opts := mcpserver.ServeOptions{GmailFactory: tt.factory, DraftCommands: mcpDraftCommands(false)}
+			hideUnusedManagedDraftTools(&opts, tt.cfg)
+			assert.Equal(t, tt.want, len(opts.DraftCommands) > 0)
+		})
 	}
 }

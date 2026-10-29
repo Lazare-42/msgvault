@@ -135,6 +135,7 @@ Add to Claude Desktop config:
 		if !isAgentMode(state) {
 			opts.GmailFactory = buildMailFactory(ctx, st)
 			opts.GoogleDocsFactory = buildGoogleDocsFactory(ctx)
+			hideUnusedManagedDraftTools(&opts, cfg)
 		}
 
 		if httpAddr != "" {

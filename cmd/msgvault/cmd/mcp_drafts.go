@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/msgvault/internal/api"
+	"go.kenn.io/msgvault/internal/config"
 	"go.kenn.io/msgvault/internal/daemonclient"
 	mcpserver "go.kenn.io/msgvault/internal/mcp"
 )
@@ -84,4 +85,34 @@ func (r daemonMCPDraftRunner) RunDraftCommand(ctx context.Context, request mcpse
 		return result, &mcpserver.DraftCommandError{Message: err.Error(), Stderr: result.Stderr}
 	}
 	return result, err
+}
+
+// hideUnusedManagedDraftTools drops the daemon-managed draft_* tools from an
+// owner session that already has the live mail tools (create_draft and
+// friends) and no enabled [[imap.drafts]], [[gmail.drafts]], or
+// [[beeper.drafts]] grant. Without a grant every draft_* call returns
+// draft_disabled, and listing both families leads agents to the wrong one.
+// Only a local daemon is known to read this same config; a remote daemon
+// keeps its own grants, so its draft tools stay listed.
+func hideUnusedManagedDraftTools(opts *mcpserver.ServeOptions, cfg *config.Config) {
+	if opts.GmailFactory == nil || cfg == nil || cfg.Remote.URL != "" || managedDraftGrantsEnabled(cfg) {
+		return
+	}
+	opts.DraftCommands = nil
+}
+
+func managedDraftGrantsEnabled(cfg *config.Config) bool {
+	for _, grant := range cfg.IMAP.Drafts {
+		if grant.Enabled {
+			return true
+		}
+	}
+	for _, grants := range [][]config.GmailDraftSource{cfg.Gmail.Drafts, cfg.Beeper.Drafts} {
+		for _, grant := range grants {
+			if grant.Enabled {
+				return true
+			}
+		}
+	}
+	return false
 }

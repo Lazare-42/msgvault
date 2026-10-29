@@ -74,6 +74,7 @@ Example Claude Desktop config (with port-forward):
 		opts := daemonMCPServeOptions(ctx, st, state)
 		opts.GmailFactory = buildMailFactory(ctx, st)
 		opts.GoogleDocsFactory = buildGoogleDocsFactory(ctx)
+		hideUnusedManagedDraftTools(&opts, state.cfg)
 
 		// Stop the server when the command is canceled or interrupted.
 		ctx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)

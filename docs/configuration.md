@@ -736,11 +736,19 @@ For example, `create_draft` accepts:
 ```
 
 Use the same `account` for `get_draft`, `update_draft`, and `send_draft`.
-`reply_to` is an address list; `in_reply_to` is a message ID for conversation
-threading. Quoted display names containing commas are supported. Updating a
-draft preserves omitted `from` and `reply_to` fields. Set `reply_to` to an empty
-string to remove that header. Other content fields retain their existing
-replacement semantics.
+`reply_to` is an address list, not threading. Quoted display names containing
+commas are supported. Updating a draft preserves omitted `from`, `reply_to`,
+and threading headers. Set `reply_to` to an empty string to remove that header.
+Other content fields retain their existing replacement semantics.
+
+To reply, pass the archived message's ID as `reply_to_message_id`. msgvault
+reads that message and sets `In-Reply-To`, the full `References` chain, and
+the Gmail thread, using the same reply builder as `draft_reply`. Unless given,
+the subject becomes `Re:` the original and the reply goes to the original
+sender, or with `reply_all` also to the original To and Cc recipients except
+this account. Do not combine it with `thread_id`, `in_reply_to`, or
+`references`. The `create_draft` result and `get_draft` show the threading
+headers that were saved.
 
 IMAP drafts are stored in the selected account's Drafts and Sent folders. SMTP
 still authenticates as that account; its envelope sender follows the draft's

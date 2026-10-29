@@ -2531,6 +2531,9 @@ func draftFromRaw(raw *gmailapi.RawMessage) (*gmailapi.ComposedDraft, error) {
 			Subject:  parsed.Subject,
 			Body:     body,
 			Date:     date,
+
+			InReplyTo:  headers.Header.Get("In-Reply-To"),
+			References: headers.Header.Get("References"),
 		},
 	}, nil
 }

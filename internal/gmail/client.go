@@ -1072,6 +1072,10 @@ func parseDraft(d gmailDraft) *ComposedDraft {
 				dm.Bcc = splitAddresses(h.Value)
 			case "subject":
 				dm.Subject = h.Value
+			case "in-reply-to":
+				dm.InReplyTo = h.Value
+			case "references":
+				dm.References = h.Value
 			}
 		}
 

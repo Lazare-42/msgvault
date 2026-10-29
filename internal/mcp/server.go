@@ -843,7 +843,7 @@ func requestAttachmentTextTool() mcp.Tool {
 
 func listDraftsTool() mcp.Tool {
 	return mcp.NewTool(ToolListDrafts,
-		mcp.WithDescription("List email drafts from Gmail. Returns draft ID, subject, recipients, and body preview for each draft."),
+		mcp.WithDescription("List email drafts in the selected mail account (Gmail or IMAP). Returns draft ID, subject, recipients, and body preview for each draft."),
 		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
 		mcp.WithString("query",
@@ -855,7 +855,7 @@ func listDraftsTool() mcp.Tool {
 
 func getDraftTool() mcp.Tool {
 	return mcp.NewTool(ToolGetDraft,
-		mcp.WithDescription("Get full details of a single Gmail draft by draft ID, including body text, recipients, and subject."),
+		mcp.WithDescription("Get full details of a single email draft by draft ID, including body text, recipients, subject, and the InReplyTo/References threading headers."),
 		mcp.WithReadOnlyHintAnnotation(true), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
 		mcp.WithString("draft_id",
@@ -867,7 +867,7 @@ func getDraftTool() mcp.Tool {
 
 func createDraftTool() mcp.Tool {
 	return mcp.NewTool(ToolCreateDraft,
-		mcp.WithDescription("Create a new email draft in the selected mail account. The draft is saved but NOT sent. Use send_draft to send it. For rich formatting (links, bold, etc.), set content_type to text/html and provide HTML body. To reply to an existing message, set thread_id AND in_reply_to (the original Message-ID, from get_message's rfc822_message_id field on that message) so the draft threads as a true reply in every mail client, not just Gmail — thread_id alone is not reliable on its own."),
+		mcp.WithDescription("Create a new email draft in the selected mail account. The draft is saved but NOT sent. Use send_draft to send it. For rich formatting (links, bold, etc.), set content_type to text/html and provide HTML body. To reply to an archived message, set reply_to_message_id: msgvault reads that message and sets In-Reply-To, References, the Gmail thread, a Re: subject, and (when to and cc are omitted) the reply recipients, so the draft threads in every mail client. The result echoes the threading headers it set."),
 		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
 		mcp.WithString("from", mcp.Description("Visible sender address with optional display name. Defaults to the account; alternate addresses must be configured in mail.accounts allowed_from and authorized by the provider. Omit on update to preserve.")),
@@ -891,14 +891,20 @@ func createDraftTool() mcp.Tool {
 		mcp.WithString("content_type",
 			mcp.Description("Body content type: 'text/plain' (default) or 'text/html' for rich formatting with links, bold, etc."),
 		),
+		mcp.WithNumber("reply_to_message_id",
+			mcp.Description("Archived message ID (get_message id) to reply to. Sets In-Reply-To, References, and the Gmail thread from that message; do not also pass thread_id, in_reply_to, or references. Subject defaults to Re: the original, and recipients default to the original sender when to and cc are omitted."),
+		),
+		mcp.WithBoolean("reply_all",
+			mcp.Description("With reply_to_message_id and no to/cc: also address the original To and Cc recipients, excluding this account."),
+		),
 		mcp.WithString("thread_id",
-			mcp.Description("Thread ID to create a reply draft within an existing thread"),
+			mcp.Description("Low-level: Gmail thread ID. Prefer reply_to_message_id."),
 		),
 		mcp.WithString("in_reply_to",
-			mcp.Description("RFC 5322 Message-ID of the message being replied to, including angle brackets (e.g. '<abc@mail.gmail.com>'). Sets the In-Reply-To header so the draft is a true reply that nests correctly in any mail client, not just Gmail — thread_id alone does not reliably thread a reply without this. Get this from get_message's rfc822_message_id field on the message being replied to."),
+			mcp.Description("Low-level: RFC 5322 Message-ID being replied to, with angle brackets. Prefer reply_to_message_id, which also builds the full References chain."),
 		),
 		mcp.WithString("references",
-			mcp.Description("Space-separated Message-ID reference chain for the reply (the original References header plus the message being replied to). Defaults to in_reply_to when omitted."),
+			mcp.Description("Low-level: space-separated Message-ID reference chain. Defaults to in_reply_to alone, which breaks longer threads in some clients. Prefer reply_to_message_id."),
 		),
 		mcp.WithString("attachment_ids",
 			mcp.Description("Attachment IDs to attach, comma-separated (from get_message). Attaches the archived file directly — no need to export first."),
@@ -909,7 +915,7 @@ func createDraftTool() mcp.Tool {
 
 func updateDraftTool() mcp.Tool {
 	return mcp.NewTool(ToolUpdateDraft,
-		mcp.WithDescription("Update an existing email draft. Replaces content; omitted from and reply_to preserve the existing routing headers."),
+		mcp.WithDescription("Update an existing email draft. Replaces content; omitted from, reply_to, and threading headers (in_reply_to, references) are kept from the existing draft. IMAP drafts get a new draft_id on update."),
 		mcp.WithReadOnlyHintAnnotation(false), mcp.WithDestructiveHintAnnotation(false),
 		withAccount(),
 		mcp.WithString("from", mcp.Description("Visible sender address with optional display name. Defaults to the account; alternate addresses must be configured in mail.accounts allowed_from and authorized by the provider. Omit on update to preserve.")),

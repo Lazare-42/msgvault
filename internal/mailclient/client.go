@@ -34,6 +34,9 @@ func New(backend gmail.LiveAPI, account string, allowedFrom []string) (*Client, 
 	return c, nil
 }
 
+// Sender is the account's own address, used when a draft omits From.
+func (c *Client) Sender() string { return c.account }
+
 func (c *Client) checkFrom(value string) error {
 	address, err := gmail.ParseSender(value)
 	if err != nil {
@@ -67,14 +70,16 @@ func (c *Client) CreateDraft(ctx context.Context, compose *gmail.DraftCompose) (
 	return c.LiveAPI.CreateDraft(ctx, prepared)
 }
 
-// UpdateDraft preserves routing fields omitted by a body/content replacement.
-// A non-nil empty ReplyTo slice explicitly removes the reply destination.
+// UpdateDraft preserves routing and threading fields omitted by a
+// body/content replacement. A non-nil empty ReplyTo slice explicitly removes
+// the reply destination.
 func (c *Client) UpdateDraft(ctx context.Context, id string, compose *gmail.DraftCompose) (*gmail.ComposedDraft, error) {
 	if compose == nil {
 		return nil, errors.New("draft compose is nil")
 	}
 	prepared := *compose
-	if prepared.From == "" || prepared.ReplyTo == nil {
+	keepThreading := prepared.InReplyTo == "" && prepared.References == ""
+	if prepared.From == "" || prepared.ReplyTo == nil || keepThreading {
 		previous, err := c.GetDraft(ctx, id)
 		if err != nil {
 			return nil, fmt.Errorf("read draft routing before update: %w", err)
@@ -84,6 +89,15 @@ func (c *Client) UpdateDraft(ctx context.Context, id string, compose *gmail.Draf
 		}
 		if prepared.ReplyTo == nil {
 			prepared.ReplyTo = slices.Clone(previous.Message.ReplyTo)
+		}
+		// Both providers rebuild the whole message on update, so a reply
+		// would otherwise lose its In-Reply-To and References headers.
+		if keepThreading && previous.Message.InReplyTo != "" {
+			prepared.InReplyTo = previous.Message.InReplyTo
+			prepared.References = previous.Message.References
+			if prepared.ThreadID == "" {
+				prepared.ThreadID = previous.Message.ThreadID
+			}
 		}
 	}
 	replacement, err := c.prepare(&prepared)

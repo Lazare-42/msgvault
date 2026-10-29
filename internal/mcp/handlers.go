@@ -3504,8 +3504,14 @@ func googleDocsSnippet(text, query string, maxChars int) string {
 // API client (Gmail OAuth or IMAP, depending on the account's source type).
 // The caller must close the returned client.
 func (h *handlers) getMailClient(ctx context.Context, args map[string]any) (gmail.LiveAPI, error) {
+	client, _, err := h.getMailClientForAccount(ctx, args)
+	return client, err
+}
+
+// getMailClientForAccount also returns the account identifier it resolved.
+func (h *handlers) getMailClientForAccount(ctx context.Context, args map[string]any) (gmail.LiveAPI, string, error) {
 	if h.gmailFactory == nil {
-		return nil, errors.New("live mail API not configured (Gmail OAuth credentials or an IMAP account needed)")
+		return nil, "", errors.New("live mail API not configured (Gmail OAuth credentials or an IMAP account needed)")
 	}
 
 	account, _ := args["account"].(string)
@@ -3513,23 +3519,23 @@ func (h *handlers) getMailClient(ctx context.Context, args map[string]any) (gmai
 		// If no account specified, try to use the first/only account
 		accounts, err := h.engine.ListAccounts(ctx)
 		if err != nil {
-			return nil, fmt.Errorf("failed to list accounts: %w", err)
+			return nil, "", fmt.Errorf("failed to list accounts: %w", err)
 		}
 		if len(accounts) == 0 {
-			return nil, errors.New("no accounts configured")
+			return nil, "", errors.New("no accounts configured")
 		}
 		if len(accounts) > 1 {
-			return nil, errors.New("multiple accounts configured, specify 'account' parameter (use get_stats to list accounts)")
+			return nil, "", errors.New("multiple accounts configured, specify 'account' parameter (use get_stats to list accounts)")
 		}
 		account = accounts[0].Identifier
 	}
 
 	client, err := h.gmailFactory(ctx, account)
 	if err != nil {
-		return nil, fmt.Errorf("authenticate %s: %w", account, err)
+		return nil, "", fmt.Errorf("authenticate %s: %w", account, err)
 	}
 
-	return client, nil
+	return client, account, nil
 }
 
 func (h *handlers) listDrafts(ctx context.Context, req toolRequest) (*toolResult, error) {
@@ -3597,7 +3603,7 @@ func (h *handlers) getDraft(ctx context.Context, req toolRequest) (*toolResult, 
 func (h *handlers) createDraft(ctx context.Context, req toolRequest) (*toolResult, error) {
 	args := req.GetArguments()
 
-	client, err := h.getMailClient(ctx, args)
+	client, account, err := h.getMailClientForAccount(ctx, args)
 	if err != nil {
 		return toolErrorResult(err.Error()), nil
 	}
@@ -3645,6 +3651,11 @@ func (h *handlers) createDraft(ctx context.Context, req toolRequest) (*toolResul
 	if v, _ := args["references"].(string); v != "" {
 		compose.References = v
 	}
+	if _, ok := args["reply_to_message_id"]; ok {
+		if err := h.applyReplyContext(ctx, args, account, draftSender(client, args), compose); err != nil {
+			return toolErrorResult(err.Error()), nil
+		}
+	}
 
 	atts, err := h.resolveDraftAttachments(ctx, args)
 	if err != nil {
@@ -3658,13 +3669,21 @@ func (h *handlers) createDraft(ctx context.Context, req toolRequest) (*toolResul
 	}
 
 	resp := struct {
-		DraftID     string `json:"draft_id"`
-		Subject     string `json:"subject"`
-		Attachments int    `json:"attachments"`
-		NextStep    string `json:"next_step"`
+		DraftID     string   `json:"draft_id"`
+		Subject     string   `json:"subject"`
+		To          []string `json:"to,omitempty"`
+		Cc          []string `json:"cc,omitempty"`
+		InReplyTo   string   `json:"in_reply_to,omitempty"`
+		References  string   `json:"references,omitempty"`
+		Attachments int      `json:"attachments"`
+		NextStep    string   `json:"next_step"`
 	}{
 		DraftID:     draft.ID,
 		Subject:     draft.Message.Subject,
+		To:          compose.To,
+		Cc:          compose.Cc,
+		InReplyTo:   compose.InReplyTo,
+		References:  compose.References,
 		Attachments: len(atts),
 		NextStep:    "Use send_draft to send, update_draft to modify, or delete_draft to discard",
 	}

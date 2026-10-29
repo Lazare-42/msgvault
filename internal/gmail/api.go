@@ -291,6 +291,10 @@ type DraftMessage struct {
 	Subject  string
 	Body     string // Plain text body (or HTML if no plain text)
 	Date     int64  // Unix milliseconds
+	// InReplyTo and References are the draft's threading headers, so callers
+	// can confirm a reply will thread under its parent.
+	InReplyTo  string
+	References string
 }
 
 // DraftCompose holds the fields for creating or updating a draft.

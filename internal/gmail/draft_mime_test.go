@@ -26,3 +26,12 @@ func TestBuildDraftMIMEGeneratesDistinctMessageIDs(t *testing.T) {
 	}
 	assert.NotEqual(ids[0], ids[1])
 }
+
+func TestParseDraftReadsThreadingHeaders(t *testing.T) {
+	draft := parseDraft(gmailDraft{ID: "d1", Message: gmailDraftMessage{Payload: &gmailPayload{Headers: []gmailHeader{
+		{Name: "In-Reply-To", Value: "<parent@example.com>"},
+		{Name: "References", Value: "<root@example.com> <parent@example.com>"},
+	}}}})
+	assert.Equal(t, "<parent@example.com>", draft.Message.InReplyTo)
+	assert.Equal(t, "<root@example.com> <parent@example.com>", draft.Message.References)
+}
