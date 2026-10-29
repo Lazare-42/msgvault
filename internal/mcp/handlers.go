@@ -3651,8 +3651,8 @@ func (h *handlers) createDraft(ctx context.Context, req toolRequest) (*toolResul
 	if v, _ := args["references"].(string); v != "" {
 		compose.References = v
 	}
-	if _, ok := args["reply_to_message_id"]; ok {
-		if err := h.applyReplyContext(ctx, args, account, draftSender(client, args), compose); err != nil {
+	if replyRequested(args) {
+		if err := h.applyReplyContext(ctx, args, client, account, draftSender(client, args), compose); err != nil {
 			return toolErrorResult(err.Error()), nil
 		}
 	}

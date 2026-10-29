@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"mime"
 	"net/mail"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,7 +19,14 @@ import (
 // raw headers decide In-Reply-To, References, the reply subject, and, when the
 // caller gives no recipients, who the reply goes to. It uses the same reply
 // builder as draft_reply, so both tool families thread identically.
-func (h *handlers) applyReplyContext(ctx context.Context, args map[string]any, account, sender string, compose *gmail.DraftCompose) error {
+func (h *handlers) applyReplyContext(ctx context.Context, args map[string]any, client gmail.LiveAPI, account, sender string, compose *gmail.DraftCompose) error {
+	if v, ok := args["reply_to_message_id"].(string); ok {
+		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		if err != nil {
+			return fmt.Errorf("reply_to_message_id must be a positive integer, got %q", v)
+		}
+		args["reply_to_message_id"] = float64(n)
+	}
 	parentID, err := getIDArg(args, "reply_to_message_id")
 	if err != nil {
 		return err
@@ -42,13 +50,12 @@ func (h *handlers) applyReplyContext(ctx context.Context, args map[string]any, a
 	if err != nil {
 		return fmt.Errorf("read raw message %d: %w", parentID, err)
 	}
-	replyAll, _ := args["reply_all"].(bool)
-	selfAddress := sender
-	if address, err := gmail.ParseSender(sender); err == nil {
-		selfAddress = address.Address
+	if len(raw) == 0 {
+		return fmt.Errorf("message %d has no archived original MIME, so its threading headers are unknown; pass in_reply_to and references instead", parentID)
 	}
+	replyAll, _ := args["reply_all"].(bool)
 	reply, err := imaplib.BuildReplyWithOptions(raw, sender, "", imaplib.ReplyOptions{
-		ReplyAll: replyAll, SelfAddresses: []string{selfAddress},
+		ReplyAll: replyAll, SelfAddresses: selfAddresses(client, sender),
 	}, time.Now(), "")
 	if err != nil {
 		return fmt.Errorf("build reply to message %d: %w", parentID, err)
@@ -106,6 +113,34 @@ func headerAddresses(header mail.Header, name string) ([]string, error) {
 		out = append(out, address.String())
 	}
 	return out, nil
+}
+
+// replyRequested treats a missing, null, or zero reply_to_message_id as absent,
+// since model callers often fill optional fields with zero values.
+func replyRequested(args map[string]any) bool {
+	switch v := args["reply_to_message_id"].(type) {
+	case nil:
+		return false
+	case float64:
+		return v != 0
+	case string:
+		return strings.TrimSpace(v) != "" && strings.TrimSpace(v) != "0"
+	default:
+		return true
+	}
+}
+
+// selfAddresses lists the addresses a reply-all must skip: the sender and,
+// for the live mail client, the account and its allowed alternate senders.
+func selfAddresses(client gmail.LiveAPI, sender string) []string {
+	var out []string
+	if address, err := gmail.ParseSender(sender); err == nil {
+		out = append(out, address.Address)
+	}
+	if s, ok := client.(interface{ SelfAddresses() []string }); ok {
+		out = append(out, s.SelfAddresses()...)
+	}
+	return out
 }
 
 // draftSender returns the visible sender a new draft will use.

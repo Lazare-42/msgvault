@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 
@@ -36,6 +37,12 @@ func New(backend gmail.LiveAPI, account string, allowedFrom []string) (*Client, 
 
 // Sender is the account's own address, used when a draft omits From.
 func (c *Client) Sender() string { return c.account }
+
+// SelfAddresses lists the account and its allowed alternate senders, which a
+// reply-all must not address.
+func (c *Client) SelfAddresses() []string {
+	return slices.Sorted(maps.Keys(c.allowed))
+}
 
 func (c *Client) checkFrom(value string) error {
 	address, err := gmail.ParseSender(value)

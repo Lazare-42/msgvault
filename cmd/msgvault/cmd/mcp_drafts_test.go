@@ -422,7 +422,8 @@ func TestHideUnusedManagedDraftTools(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			opts := mcpserver.ServeOptions{GmailFactory: tt.factory, DraftCommands: mcpDraftCommands(false)}
 			hideUnusedManagedDraftTools(&opts, tt.cfg)
-			assert.Equal(t, tt.want, len(opts.DraftCommands) > 0)
+			assert.Equal(t, tt.want, len(opts.DraftCommands) > 1)
+			assert.Contains(t, opts.DraftCommands, "draft-send-as", "send-as listing needs no grant")
 		})
 	}
 }

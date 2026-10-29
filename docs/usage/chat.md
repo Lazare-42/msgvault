@@ -76,7 +76,7 @@ non-dry-run plan through client elicitation.
 
 These tools run the matching CLI commands through your selected daemon. They require API schema 3.0.0 or newer. The daemon enforces source opt-ins, confirmed sender identities, and the caller's grants. Msgvault never sends.
 
-An owner session that also offers the live mail tools (`create_draft`, `send_draft`, and related tools) hides these draft tools when it uses a local daemon and the config enables no `[[imap.drafts]]`, `[[gmail.drafts]]`, or `[[beeper.drafts]]` entry, because every call would return `draft_disabled`. Agent-token sessions and remote daemons always list them.
+An owner session that also offers the live mail tools (`create_draft`, `send_draft`, and related tools) hides these draft tools, except `draft_send_as`, when it uses a local daemon and the config enables no `[[imap.drafts]]`, `[[gmail.drafts]]`, or `[[beeper.drafts]]` entry, because creating or editing a draft would return `draft_disabled`. Agent-token sessions and remote daemons always list them.
 
 `draft_delete` and `draft_recover` require client confirmation for the specific tool and arguments, because deletion removes a draft and recovery can finish an interrupted deletion. The client must show the proposed action and get your approval before responding, and msgvault checks that the response matches the pending call. Clients that can't answer confirmation prompts, including Claude Desktop, can still create, read, and edit drafts but can't delete or recover them.
 

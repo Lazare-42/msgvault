@@ -1,11 +1,15 @@
 package mcp
 
 import (
+	"context"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/msgvault/internal/gmail"
+	imaplib "go.kenn.io/msgvault/internal/imap"
+	"go.kenn.io/msgvault/internal/mailclient"
 	"go.kenn.io/msgvault/internal/query"
 	"go.kenn.io/msgvault/internal/query/querytest"
 )
@@ -100,4 +104,42 @@ func TestCreateDraftReplyRejectsManualThreading(t *testing.T) {
 		"in_reply_to": "<other@example.com>", "body": "x",
 	})
 	assert.Contains(t, resultText(t, result), "omit in_reply_to")
+}
+
+func TestCreateDraftReplyEdgeArguments(t *testing.T) {
+	port := startIMAPTestServer(t)
+	engine := &querytest.MockEngine{
+		Messages: map[int64]*query.MessageDetail{42: {ID: 42, SourceID: 1}, 43: {ID: 43, SourceID: 1}},
+		RawMessages: map[int64][]byte{42: []byte(strings.Replace(threadingParentRaw,
+			"Cc: carol@example.com", "Cc: carol@example.com, Reports <reports@example.com>", 1))},
+	}
+	h := &handlers{engine: engine, gmailFactory: func(_ context.Context, email string) (gmail.LiveAPI, error) {
+		backend := imaplib.NewClient(&imaplib.Config{Host: "127.0.0.1", Port: port, Username: testIMAPAccount}, testIMAPPassword)
+		return mailclient.New(backend, email, []string{"reports@example.com"})
+	}}
+
+	t.Run("zero id creates a plain draft", func(t *testing.T) {
+		created := runTool[threadingDraftResult](t, ToolCreateDraft, h.createDraft, map[string]any{
+			"account": testIMAPAccount, "reply_to_message_id": float64(0), "to": "a@example.com", "body": "x",
+		})
+		assert.Empty(t, created.InReplyTo)
+	})
+	t.Run("string id is accepted", func(t *testing.T) {
+		created := runTool[threadingDraftResult](t, ToolCreateDraft, h.createDraft, map[string]any{
+			"account": testIMAPAccount, "reply_to_message_id": "42", "body": "x",
+		})
+		assert.Equal(t, "<parent@example.com>", created.InReplyTo)
+	})
+	t.Run("reply-all skips allowed alternate senders", func(t *testing.T) {
+		created := runTool[threadingDraftResult](t, ToolCreateDraft, h.createDraft, map[string]any{
+			"account": testIMAPAccount, "reply_to_message_id": float64(42), "reply_all": true, "body": "x",
+		})
+		assert.Equal(t, []string{"<carol@example.com>"}, created.Cc)
+	})
+	t.Run("missing original MIME explains the fallback", func(t *testing.T) {
+		result := runToolExpectError(t, ToolCreateDraft, h.createDraft, map[string]any{
+			"account": testIMAPAccount, "reply_to_message_id": float64(43), "body": "x",
+		})
+		assert.Contains(t, resultText(t, result), "no archived original MIME")
+	})
 }

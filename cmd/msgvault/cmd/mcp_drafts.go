@@ -90,15 +90,16 @@ func (r daemonMCPDraftRunner) RunDraftCommand(ctx context.Context, request mcpse
 // hideUnusedManagedDraftTools drops the daemon-managed draft_* tools from an
 // owner session that already has the live mail tools (create_draft and
 // friends) and no enabled [[imap.drafts]], [[gmail.drafts]], or
-// [[beeper.drafts]] grant. Without a grant every draft_* call returns
-// draft_disabled, and listing both families leads agents to the wrong one.
-// Only a local daemon is known to read this same config; a remote daemon
-// keeps its own grants, so its draft tools stay listed.
+// [[beeper.drafts]] grant. Without a grant, creating or editing a managed
+// draft returns draft_disabled, and listing both families leads agents to the
+// wrong one. draft_send_as needs no grant, so it stays listed. Only a local
+// daemon is known to read this same config; a remote daemon keeps its own
+// grants, so its draft tools stay listed.
 func hideUnusedManagedDraftTools(opts *mcpserver.ServeOptions, cfg *config.Config) {
 	if opts.GmailFactory == nil || cfg == nil || cfg.Remote.URL != "" || managedDraftGrantsEnabled(cfg) {
 		return
 	}
-	opts.DraftCommands = nil
+	opts.DraftCommands = slices.DeleteFunc(opts.DraftCommands, func(command string) bool { return command != "draft-send-as" })
 }
 
 func managedDraftGrantsEnabled(cfg *config.Config) bool {
