@@ -67,16 +67,7 @@ func TestEmailRetriesFailedRowsAndResumesAfterCancellation(t *testing.T) {
 	require.NoError(st.UpsertMessageRaw(bad, []byte("invalid MIME")))
 	failed := archiveEmail(t, st, src, "failed", "stale")
 	last := archiveEmail(t, st, src, "last", "stale")
-	query := fmt.Sprintf(`CREATE TRIGGER fail_retry_snippet BEFORE UPDATE OF snippet ON messages WHEN NEW.id = %d BEGIN SELECT RAISE(ABORT, 'snippet failure'); END`, failed)
-	drop := "DROP TRIGGER fail_retry_snippet"
-	if st.IsPostgreSQL() {
-		_, err := st.DB().Exec(fmt.Sprintf(`CREATE FUNCTION fail_retry_snippet() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.id = %d THEN RAISE EXCEPTION 'snippet failure'; END IF; RETURN NEW; END $$`, failed))
-		require.NoError(err)
-		query = `CREATE TRIGGER fail_retry_snippet BEFORE UPDATE OF snippet ON messages FOR EACH ROW EXECUTE FUNCTION fail_retry_snippet()`
-		drop += " ON messages"
-	}
-	_, err := st.DB().Exec(query)
-	require.NoError(err)
+	drop := failSnippetUpdates(t, st, failed)
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	sum, err := Run(ctx, st, src.SourceType, src.Identifier, src.ID, func(string) { cancel() })
@@ -97,8 +88,7 @@ func TestEmailRetriesFailedRowsAndResumesAfterCancellation(t *testing.T) {
 	sum, _, err = RunIfStale(t.Context(), st, src.SourceType, src.Identifier, src.ID, nil)
 	require.NoError(err)
 	assert.Equal(int64(1), sum.MessagesScanned, "a sync retries only unresolved MIME rows")
-	_, err = st.DB().Exec(drop)
-	require.NoError(err)
+	drop()
 	sum, _, err = RunIfStale(t.Context(), st, src.SourceType, src.Identifier, src.ID, nil)
 	require.NoError(err)
 	assert.Equal(int64(1), sum.MessagesScanned)
@@ -112,6 +102,120 @@ func TestEmailRetriesFailedRowsAndResumesAfterCancellation(t *testing.T) {
 	sum, err = Run(t.Context(), st, src.SourceType, src.Identifier, src.ID, nil)
 	require.NoError(err)
 	assert.Equal(int64(3), sum.MessagesScanned, "manual repair still inspects the whole archive")
+}
+
+// failSnippetUpdates makes snippet writes to one message fail until the
+// returned function drops the trigger.
+func failSnippetUpdates(t *testing.T, st *store.Store, id int64) func() {
+	t.Helper()
+	query := fmt.Sprintf(`CREATE TRIGGER fail_retry_snippet BEFORE UPDATE OF snippet ON messages WHEN NEW.id = %d BEGIN SELECT RAISE(ABORT, 'snippet failure'); END`, id)
+	drop := "DROP TRIGGER fail_retry_snippet"
+	if st.IsPostgreSQL() {
+		_, err := st.DB().Exec(fmt.Sprintf(`CREATE FUNCTION fail_retry_snippet() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.id = %d THEN RAISE EXCEPTION 'snippet failure'; END IF; RETURN NEW; END $$`, id))
+		require.NoError(t, err)
+		query = `CREATE TRIGGER fail_retry_snippet BEFORE UPDATE OF snippet ON messages FOR EACH ROW EXECUTE FUNCTION fail_retry_snippet()`
+		drop += " ON messages"
+	}
+	_, err := st.DB().Exec(query)
+	require.NoError(t, err)
+	return func() {
+		_, err := st.DB().Exec(drop)
+		require.NoError(t, err)
+	}
+}
+
+// A sync preempted mid-walk must keep its progress, or an archive whose walk
+// outlasts the preemption window never finishes the pass.
+func TestEmailResumesInterruptedWalkFromCheckpoint(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	previous := emailCheckpointEvery
+	emailCheckpointEvery = 2
+	t.Cleanup(func() { emailCheckpointEvery = previous })
+	st, src, failed := archiveEmailSource(t, "gmail", "stale")
+	ids := []int64{failed}
+	for i := range 4 {
+		ids = append(ids, archiveEmail(t, st, src, strconv.Itoa(i), "stale"))
+	}
+	drop := failSnippetUpdates(t, st, failed)
+	ledger := LedgerKey(src.SourceType, src.Identifier, emailVersion)
+
+	// The failed row and one repaired row reach the first checkpoint; the
+	// second repaired row is past it when the sync is preempted.
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	repaired := 0
+	_, _, err := RunIfStale(ctx, st, src.SourceType, src.Identifier, src.ID, func(string) {
+		if repaired++; repaired == 2 {
+			cancel()
+		}
+	})
+	require.ErrorIs(err, context.Canceled)
+
+	sum, _, err := RunIfStale(t.Context(), st, src.SourceType, src.Identifier, src.ID, nil)
+	require.NoError(err)
+	assert.Equal(int64(3), sum.MessagesScanned, "the walk resumes after its checkpoint")
+	assert.Equal(int64(1), sum.Errors, "a failure recorded before the checkpoint stays unresolved")
+	for _, id := range ids[1:] {
+		body, err := st.GetMessageBodyText(id)
+		require.NoError(err)
+		assert.Equal("Heizkörper", body)
+	}
+	applied, err := st.IsMigrationApplied(ledger)
+	require.NoError(err)
+	assert.False(applied)
+	checkpoint, err := st.NextMigrationKeyContext(t.Context(), ledger+emailCheckpoint, "")
+	require.NoError(err)
+	assert.Empty(checkpoint, "a finished walk clears its checkpoint")
+
+	drop()
+	sum, _, err = RunIfStale(t.Context(), st, src.SourceType, src.Identifier, src.ID, nil)
+	require.NoError(err)
+	assert.Equal(int64(1), sum.MessagesScanned, "only the carried failure is retried")
+	assert.Zero(sum.Errors)
+	applied, err = st.IsMigrationApplied(ledger)
+	require.NoError(err)
+	assert.True(applied)
+}
+
+// Repeated preemption must only delay the pass: each attempt resumes where the
+// last checkpoint left it, so the walk finishes and rewrites each row once.
+func TestEmailWalkFinishesUnderRepeatedPreemption(t *testing.T) {
+	require := require.New(t)
+	assert := assert.New(t)
+	previous := emailCheckpointEvery
+	emailCheckpointEvery = 2
+	t.Cleanup(func() { emailCheckpointEvery = previous })
+	st, src, _ := archiveEmailSource(t, "gmail", "stale")
+	for i := range 5 {
+		archiveEmail(t, st, src, strconv.Itoa(i), "stale")
+	}
+	var rewritten, interrupted int64
+	for attempt := 1; ; attempt++ {
+		require.LessOrEqual(attempt, 6, "the walk must make progress on every attempt")
+		ctx, cancel := context.WithCancel(t.Context())
+		rows := 0
+		sum, ran, err := RunIfStale(ctx, st, src.SourceType, src.Identifier, src.ID, func(string) {
+			if rows++; rows == 3 {
+				cancel()
+			}
+		})
+		cancel()
+		if sum != nil {
+			rewritten += sum.BodiesRewritten
+		}
+		if err == nil {
+			require.True(ran)
+			break
+		}
+		require.ErrorIs(err, context.Canceled)
+		interrupted++
+	}
+	assert.GreaterOrEqual(interrupted, int64(2))
+	assert.Equal(int64(6), rewritten, "no row is rewritten twice")
+	applied, err := st.IsMigrationApplied(LedgerKey(src.SourceType, src.Identifier, emailVersion))
+	require.NoError(err)
+	assert.True(applied)
 }
 
 func archiveCurrentEmail(t *testing.T, st *store.Store, src *store.Source, key string) {
@@ -142,10 +246,11 @@ func TestEmailFirstSyncBoundsReadQueries(t *testing.T) {
 	require.NoError(err)
 	require.Equal(int64(32), sum.MessagesScanned)
 	reads := strings.Count(logs.String(), `"kind":"query`)
-	// Each row needs its MIME/envelope scan and FTS comparison. The four
-	// fixed reads check completion, check the retry phase, finish the scan, and
-	// check whether a prior interrupted repair still needs a cache revision.
-	require.LessOrEqual(reads, 2*32+4, "first-sync repair must share stored-envelope reads with the bounded MIME scan")
+	// Each row needs its MIME/envelope scan and FTS comparison. The five
+	// fixed reads check completion, check the retry phase, look for a resume
+	// checkpoint, finish the scan, and check whether a prior interrupted repair
+	// still needs a cache revision.
+	require.LessOrEqual(reads, 2*32+5, "first-sync repair must share stored-envelope reads with the bounded MIME scan")
 }
 
 func TestEmailPreservesProviderSnippets(t *testing.T) {
